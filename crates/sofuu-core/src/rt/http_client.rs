@@ -96,6 +96,20 @@ struct FetchReq {
     hops: c_int,
     /* 1 once opensocket_cb refused a link-local/metadata address (net-4). */
     refused: c_int,
+    /* H-02(b) (AUDIT-2026-10-29): the network policy, resolved ONCE per fetch
+     * and then enforced on the RESOLVED address libcurl is about to dial — for
+     * the initial connection and every redirect hop — so a DNS name (or a 302)
+     * cannot smuggle the request into a range the policy forbids.
+     *   1 = net.ssrf / net.allow_private:false → refuse internal ranges
+     *   the list = net.deny entries that are IP literals
+     * Both stay 0/empty when this runtime has no policy: the zero-overhead
+     * path the audit asks for (no extra DNS, no extra JSON parse). */
+    policy_ssrf: c_int,
+    policy_deny_ips: Vec<std::net::IpAddr>,
+    /* The R7 rule that refused the resolved address (None = the built-in
+     * metadata guard fired, or nothing did), so the DONE path can word the
+     * rejection truthfully and name its rule. */
+    policy_refused: Option<&'static str>,
     /* Parsed request headers, kept so each redirect hop can rebuild a fresh
      * slist (credentials get stripped on origin change — net-5). CurlSlist
      * is opaque in the FFI, so the list cannot be walked/rebuilt in place. */
@@ -1416,7 +1430,17 @@ unsafe fn check_multi_info_global() {
                 /* net-4: when opensocket refused a link-local/metadata
                  * target, say so — the generic connect error hides the why. */
                 let msg_c = if (*req).refused != 0 {
-                    CString::new("fetch blocked: link-local/metadata address refused").unwrap()
+                    match (*req).policy_refused {
+                        /* H-02(b): the policy refused the RESOLVED address. */
+                        Some(rule) => CString::new(format!(
+                            "E_PERMISSION_DENIED: address refused by network policy ({rule})"
+                        ))
+                        .unwrap_or_default(),
+                        None => CString::new(
+                            "fetch blocked: link-local/metadata address refused",
+                        )
+                        .unwrap(),
+                    }
                 } else if (*req).cap_hit != 0 {
                     /* js-9: write_body_cb aborted this transfer on the
                      * caller's maxBodyBytes — name the cap instead of
@@ -1715,9 +1739,52 @@ unsafe fn sockaddr_is_linklocal(sa: *const curl::CurlSockaddr) -> bool {
     }
 }
 
+/// The IP libcurl is about to connect to, decoded from the resolved sockaddr
+/// (same probe-verified layout as sockaddr_is_linklocal).
+unsafe fn sockaddr_ip(sa: *const curl::CurlSockaddr) -> Option<std::net::IpAddr> {
+    let sa = &*sa;
+    match sa.family {
+        libc::AF_INET => {
+            if sa.addrlen < 6 {
+                return None;
+            }
+            Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                sa.addr[4], sa.addr[5], sa.addr[6], sa.addr[7],
+            )))
+        }
+        libc::AF_INET6 => {
+            if sa.addrlen < 24 {
+                return None;
+            }
+            let mut o = [0u8; 16];
+            o.copy_from_slice(&sa.addr[8..24]);
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::from(o)))
+        }
+        _ => None,
+    }
+}
+
+/// H-02(b): does the request's policy refuse the address curl resolved?
+/// Deliberately judged on the SOCKADDR, not on the URL host: a name that
+/// resolves to a denied/private address (and a redirect to one) is caught at
+/// the last moment before connect(2), with no extra DNS lookup.
+unsafe fn policy_refuses_address(
+    req: *mut FetchReq,
+    address: *mut curl::CurlSockaddr,
+) -> Option<&'static str> {
+    let ip = sockaddr_ip(address)?;
+    if crate::rt::policy::ip_denied(&(*req).policy_deny_ips, ip) {
+        return Some("R7.1/net.deny");
+    }
+    if (*req).policy_ssrf != 0 && crate::rt::policy::ip_is_internal(ip) {
+        return Some("R7.1/net.ssrf");
+    }
+    None
+}
+
 /// CURLOPT_OPENSOCKETFUNCTION — replaces socket(2) for every connection
-/// libcurl makes (libcurl sets the fd non-blocking itself). Refusing
-/// link-local targets: returning CURL_SOCKET_BAD aborts the connection with
+/// libcurl makes (libcurl sets the fd non-blocking itself). Refusing an
+/// address: returning CURL_SOCKET_BAD aborts the connection with
 /// CURLE_COULDNT_CONNECT, the documented IP-block-listing mechanism.
 unsafe extern "C" fn opensocket_cb(
     clientp: *mut c_void,
@@ -1727,9 +1794,20 @@ unsafe extern "C" fn opensocket_cb(
     if address.is_null() {
         return curl::CURL_SOCKET_BAD;
     }
+    let req = clientp as *mut FetchReq;
+    let live = !req.is_null() && (*req).magic == REQ_MAGIC;
+    /* H-02(b): policy first (net.deny IPs + SSRF), then the built-in
+     * metadata guard. Both abort the transfer; the flag lets the DONE path
+     * word the rejection truthfully. */
+    if live {
+        if let Some(rule) = policy_refuses_address(req, address) {
+            (*req).refused = 1;
+            (*req).policy_refused = Some(rule);
+            return curl::CURL_SOCKET_BAD;
+        }
+    }
     if sockaddr_is_linklocal(address) {
-        let req = clientp as *mut FetchReq;
-        if !req.is_null() && (*req).magic == REQ_MAGIC {
+        if live {
             (*req).refused = 1;
         }
         return curl::CURL_SOCKET_BAD;
@@ -1770,6 +1848,17 @@ unsafe fn redirect_reissue(
     }
     if let Some(reason) = ssrf_url_reject(next_url) {
         return Err(reason);
+    }
+    /* H-02(b): the policy's host rules bind every hop, not just the URL the
+     * caller asked for — otherwise `net.deny: ["*.evil.example"]` is one 302
+     * away from being bypassed. (The resolved-address half of the same policy
+     * runs in opensocket_cb for this hop too.) */
+    let hop_host = match url_parts(next_url) {
+        Some((_scheme, authority, _path)) => crate::rt::policy::norm_host(authority),
+        None => crate::rt::policy::norm_host(next_url),
+    };
+    if crate::rt::policy::gate_net_host((*req).ctx, &hop_host).is_err() {
+        return Err("E_PERMISSION_DENIED: redirect target refused by network policy");
     }
     /* Method conversion (fetch spec): 303 → GET unless HEAD; 301/302 → GET
      * when the original was POST. 307/308 keep the method and body. */
@@ -1890,6 +1979,22 @@ unsafe extern "C" fn js_sofuu_fetch(
             qjs::sofuu_js_free_cstring(ctx, url_ptr);
             return qjs::JS_ThrowTypeError(ctx, c"fetch blocked: http(s) only".as_ptr());
         }
+        /* H-02(b) (AUDIT-2026-10-29): the policy's network rules used to be
+         * advisory here — sofuu.policy.explain({'op':'net.fetch'}) answered
+         * "deny" for a host while fetch() dialled it anyway. Ask the SAME
+         * evaluator every other surface asks, on the host this URL will
+         * actually reach, before curl is handed the URL at all. The
+         * resolved-address half runs in opensocket_cb below, which covers DNS
+         * answers and redirect hops. */
+        let host_of_url = match url_parts(&url_str) {
+            Some((_scheme, authority, _path)) => crate::rt::policy::norm_host(authority),
+            None => crate::rt::policy::norm_host(&url_str),
+        };
+        if let Err(denied) = crate::rt::policy::gate_net_host(ctx, &host_of_url) {
+            qjs::sofuu_js_free_cstring(ctx, url_ptr);
+            /* typed refusal: .code / .rule survive to the JS caller */
+            return crate::rt::policy::throw_denied(ctx, &denied);
+        }
     }
     /* curl only delivers response headers to CURLOPT_HEADERFUNCTION when
      * CURLOPT_HEADER is set (curl >= 7.85 splits HTTP/2 pseudo-headers). */
@@ -1898,6 +2003,9 @@ unsafe extern "C" fn js_sofuu_fetch(
     const CURL_HTTP_VERSION_1_1: c_long = 2;
     const CURLOPT_ACCEPT_ENCODING: c_int = 10102;
 
+    /* Resolved once: every hop of this fetch is judged against the policy
+     * that was in force when the caller asked (see FetchReq.policy_*). */
+    let net_policy = crate::rt::policy::net_policy(ctx);
     let mut req = Box::new(FetchReq {
         magic: REQ_MAGIC,
         ctx,
@@ -1910,6 +2018,9 @@ unsafe extern "C" fn js_sofuu_fetch(
         req_headers: ptr::null_mut(),
         hops: 0,
         refused: 0,
+        policy_ssrf: net_policy.ssrf as c_int,
+        policy_deny_ips: net_policy.deny_ips,
+        policy_refused: None,
         headers_vec: Vec::new(),
         method: None,
         max_body: 0,
@@ -3055,6 +3166,9 @@ function go(f) {
                 req_headers: ptr::null_mut(),
                 hops: 0,
                 refused: 0,
+                policy_ssrf: 0,
+                policy_deny_ips: Vec::new(),
+                policy_refused: None,
                 headers_vec: Vec::new(),
                 method: None,
                 max_body: 0,

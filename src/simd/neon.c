@@ -7,6 +7,58 @@
 #include "simd.h"
 #include <math.h>
 
+/* ── R-27: extreme-magnitude escape hatch ──────────────────────────────
+ * The kernels below accumulate cosine in float32: a single product
+ * overflows once |a_i| > 1.8e19 (x*x > FLT_MAX) and the *sum* of squares
+ * overflows once n*x^2 > 3.4e38 (768 components of 1e18 already reach
+ * 7.7e38 on arm64 and on the Pi 5 alike). dot/denom then evaluates
+ * Inf/Inf = NaN, or a silent 0.0 when only one side overflowed.
+ *
+ * An f32 sum that overflowed can never come back to a finite value
+ * (Inf +- finite = Inf, Inf - Inf = NaN), so a non-finite accumulator is
+ * an EXACT overflow detector — no second guess, no heuristic. Only when it
+ * fires do we recompute after scaling each vector by its own max |component|
+ * in f64; cosine is scale-invariant, so the answer is the same one the
+ * unscaled f64 reference gives, it just can no longer overflow (every
+ * product is <= 1 and every partial sum <= n).
+ *
+ * Ordinary magnitudes never take this branch: the accumulate loops are
+ * untouched (still branch-free, still one memory traversal) and produce
+ * bit-identical results to before.
+ *
+ * Zero-length / zero-vector inputs keep returning 0.0f; NaN/Inf inputs keep
+ * returning NaN (they are not an overflow of ours to repair). */
+static float sofuu_cosine_scaled_f32(const float *a, const float *b, size_t n) {
+    double sa = 0.0, sb = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double x = fabs((double)a[i]);
+        double y = fabs((double)b[i]);
+        if (!isfinite(x) || !isfinite(y)) return NAN;
+        if (x > sa) sa = x;
+        if (y > sb) sb = y;
+    }
+    /* All-zero vector (or one that never had a non-zero lane): the
+     * documented "no direction" answer, identical to the fast path. */
+    if (sa == 0.0 || sb == 0.0) return 0.0f;
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double x = (double)a[i] / sa;
+        double y = (double)b[i] / sb;
+        dot += x * y;
+        na  += x * x;
+        nb  += y * y;
+    }
+    double den = sqrt(na) * sqrt(nb);
+    if (!(den > 1e-10)) return 0.0f; /* also catches den == NaN */
+    double r = dot / den;
+    /* Cosine is bounded by construction; clamp the scaled result so callers
+     * that rely on the documented [-1,1] range (memory ranking thresholds)
+     * can never see 1.0000001 from accumulated rounding. */
+    if (r > 1.0) r = 1.0;
+    else if (r < -1.0) r = -1.0;
+    return (float)r;
+}
+
 #if defined(__aarch64__) || defined(__ARM_NEON)
 #include <arm_neon.h>
 
@@ -121,6 +173,12 @@ float sofuu_cosine_f32(const float *a, const float *b, size_t n) {
         normb += b[i] * b[i];
     }
     float denom = sqrtf(norma) * sqrtf(normb);
+    /* R-27: overflow (Inf/NaN anywhere) or a norm that underflowed to zero
+     * cannot be answered from these f32 sums — redo it scaled in f64. The
+     * checks are four compares *after* the loop, never inside it. */
+    if (!isfinite(dot) || !isfinite(norma) || !isfinite(normb) ||
+        !isfinite(denom) || norma == 0.0f || normb == 0.0f)
+        return sofuu_cosine_scaled_f32(a, b, n);
     if (denom < 1e-10f) return 0.0f;
     return dot / denom;
 }
@@ -150,6 +208,10 @@ float sofuu_cosine_f32(const float *a, const float *b, size_t n) {
         nb  += b[i] * b[i];
     }
     float den = sqrtf(na) * sqrtf(nb);
+    /* R-27: see sofuu_cosine_scaled_f32 — same overflow/underflow escape. */
+    if (!isfinite(dot) || !isfinite(na) || !isfinite(nb) || !isfinite(den) ||
+        na == 0.0f || nb == 0.0f)
+        return sofuu_cosine_scaled_f32(a, b, n);
     if (den < 1e-10f) return 0.0f;
     return dot / den;
 }

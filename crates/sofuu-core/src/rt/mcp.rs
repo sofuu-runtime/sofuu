@@ -36,6 +36,26 @@ const MAX_PENDING: usize = 64;
 const MCP_READ_BUF: usize = 65536;
 const MAX_TOOLS: usize = 64;
 
+/* ── R-30: the client's OWN error codes ──────────────────────────────
+ * A server's JSON-RPC codes (-32700…-32603 and its own -32000..-32099
+ * band) now pass through the rejected `Error.code` unchanged. The five
+ * constants below are produced by THIS client for failures that never got
+ * a JSON-RPC answer, so a caller can branch on "the server said no" vs
+ * "the transport broke". They live in JSON-RPC's implementation-defined
+ * server-error band, are documented in the MCP client error map
+ * (REMEDIATION §7.1 / R-mcp.md), and are never written to the wire. */
+/// Child exited, stdout closed, or a write failed: the pipe is gone.
+const MCP_ERR_TRANSPORT_LOST: i32 = -32000;
+/// `client.call(..., {timeoutMs})` (or `mcp.callTimeoutMs`) expired.
+const MCP_ERR_TIMEOUT: i32 = -32001;
+/// `mcp.connect()` could not spawn the command (ENOENT, EACCES, …).
+const MCP_ERR_CONNECT_FAILED: i32 = -32002;
+/// The requested transport does not exist in the native client (a URL
+/// argument, where only the JS layer owns Streamable HTTP).
+const MCP_ERR_TRANSPORT_UNAVAILABLE: i32 = -32003;
+/// The peer violated the framing (e.g. an over-long line with no newline).
+const MCP_ERR_PROTOCOL: i32 = -32004;
+
 /// g_next_id (C static).
 static NEXT_ID: AtomicI32 = AtomicI32::new(1);
 
@@ -213,7 +233,19 @@ unsafe fn mcp_process_line(client: *mut McpClient, line: &[u8]) {
         return;
     };
     match crate::mcp::jsonrpc::parse(input) {
-        Inbound::Response { id, result, error } => mcp_handle_response(client, id, result, error),
+        Inbound::Response { id, result, error } => {
+            /* R-30: `RpcError` carries code+message only, so the server's
+             * `error.data` is read from the raw line here — it is part of
+             * the typed error the caller sees. */
+            let error_data = if error.is_some() {
+                serde_json::from_str::<serde_json::Value>(input.trim())
+                    .ok()
+                    .and_then(|v| v.get("error").and_then(|e| e.get("data")).cloned())
+            } else {
+                None
+            };
+            mcp_handle_response(client, id, result, error, error_data)
+        }
         /* M1 (2026-10-23): a server may send REQUESTS and NOTIFICATIONS.
          * Dropping them (the old behavior: "not for us") violates the
          * spec — a server's ping would never be answered and list_changed
@@ -295,6 +327,7 @@ unsafe fn mcp_handle_response(
     id: u64,
     result: Option<serde_json::Value>,
     error: Option<crate::mcp::jsonrpc::RpcError>,
+    error_data: Option<serde_json::Value>,
 ) {
     let ctx = (*client).ctx;
     let msg_id = id as i32;
@@ -336,9 +369,18 @@ unsafe fn mcp_handle_response(
             sofuu_promise_resolve(promise, jresult);
             qjs::sofuu_js_free_value(ctx, jresult);
         } else if let Some(error_v) = error {
-            let msg_text = error_v.message.as_str();
-            let mc = cstr_text(msg_text);
-            let jerr = qjs::sofuu_js_new_string(ctx, mc.as_ptr());
+            /* R-30: the JSON-RPC code and data survive to JS — the old
+             * path rejected with `error_v.message` as a BARE STRING, so
+             * -32601, -32602 and a dropped connection all looked alike. */
+            let msg = if error_v.message.is_empty() {
+                format!("MCP error {}", error_v.code)
+            } else {
+                error_v.message.clone()
+            };
+            let data_text = error_data
+                .as_ref()
+                .map(|d| serde_json::to_string(d).unwrap_or_else(|_| "null".into()));
+            let jerr = mcp_error_value(ctx, error_v.code as i32, &msg, data_text.as_deref());
             sofuu_promise_reject(promise, jerr); /* reject consumes jerr */
         } else {
             sofuu_promise_resolve(promise, qjs::sofuu_js_null());
@@ -429,6 +471,109 @@ fn jsonrpc_error_cstr(id: i32, code: i32, message: &str) -> CString {
     cstr_json(&s)
 }
 
+/// JSON-RPC error response that also carries `data` (the `-32602` schema
+/// violations name the field, the expected type and the actual type there).
+/// Built through serde so message/field escaping is never hand-rolled;
+/// `crate::mcp::jsonrpc::error` has no data slot and that module is not
+/// part of this change's file set.
+fn jsonrpc_error_data_cstr(id: i32, code: i32, message: &str, data: &serde_json::Value) -> CString {
+    let v = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message, "data": data },
+    });
+    let mut s = serde_json::to_string(&v)
+        .unwrap_or_else(|_| format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":{code},\"message\":\"error\"}}}}"));
+    s.push('\n');
+    cstr_json(&s)
+}
+
+/* ── R-30: ONE error shape for every client rejection ────────────────
+ * The old stdio path rejected with a bare JS string, so `typeof e` was
+ * "string", `e.code` was undefined for -32601 AND -32602, and a caller
+ * could not tell a protocol refusal from a spawn failure. Every rejection
+ * below now goes through `mcp_error_value`: a real `Error` carrying
+ * `.code` (JSON-RPC code passed through, or one of the MCP_ERR_* codes),
+ * `.data` (the server's error data, `null` when it sent none) and the
+ * server's own message. */
+
+/// Build an `Error` with `.code`, `.data` and `message`. Ownership of the
+/// returned value passes to the caller (reject, or free).
+unsafe fn mcp_error_value(
+    ctx: *mut JSContext,
+    code: i32,
+    message: &str,
+    data_json: Option<&str>,
+) -> JSValue {
+    let err = qjs::JS_NewError(ctx);
+    if qjs::is_exception(err) {
+        return err;
+    }
+    let mc = cstr_text(message);
+    let msg = qjs::sofuu_js_new_string(ctx, mc.as_ptr());
+    qjs::sofuu_js_set_property_str(ctx, err, c"message".as_ptr(), msg);
+    let code_v = qjs::sofuu_js_new_int32(ctx, code);
+    qjs::sofuu_js_set_property_str(ctx, err, c"code".as_ptr(), code_v);
+    let data_v = match data_json {
+        Some(d) => {
+            let dc = cstr_json(d);
+            let v = qjs::JS_ParseJSON(ctx, dc.as_ptr(), dc.as_bytes().len(), c"<mcp-error>".as_ptr());
+            if qjs::is_exception(v) {
+                /* Unparseable data must not poison the error: clear the
+                 * pending exception and expose null instead. */
+                qjs::sofuu_js_get_exception(ctx);
+                qjs::sofuu_js_null()
+            } else {
+                v
+            }
+        }
+        None => qjs::sofuu_js_null(),
+    };
+    qjs::sofuu_js_set_property_str(ctx, err, c"data".as_ptr(), data_v);
+    err
+}
+
+/// A `TypeError` (the shape JS callers expect for a misuse) that still
+/// carries `.code`, built from `JS_ThrowTypeError` so `instanceof
+/// TypeError` holds. Ownership passes to the caller.
+unsafe fn mcp_type_error_value(ctx: *mut JSContext, message: &str, code: i32) -> JSValue {
+    let mc = cstr_text(message);
+    let _ = qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), mc.as_ptr());
+    let err = qjs::sofuu_js_get_exception(ctx);
+    if qjs::is_exception(err) {
+        return err;
+    }
+    if !qjs::is_object(err) {
+        /* No Error object to decorate (should not happen after
+         * JS_ThrowTypeError): fall back to a fresh Error rather than
+         * setting properties on a primitive/null. */
+        qjs::sofuu_js_free_value(ctx, err);
+        return mcp_error_value(ctx, code, message, None);
+    }
+    let code_v = qjs::sofuu_js_new_int32(ctx, code);
+    qjs::sofuu_js_set_property_str(ctx, err, c"code".as_ptr(), code_v);
+    let data_v = qjs::sofuu_js_null();
+    qjs::sofuu_js_set_property_str(ctx, err, c"data".as_ptr(), data_v);
+    err
+}
+
+/// Reject a FRESH promise with `err` (ownership moves). Connect-time
+/// failures happen before a client exists, and the API is a promise —
+/// returning a rejection keeps `.catch()`/`await` uniform instead of
+/// throwing out of a call the caller wrapped in `.then`. No job flush: the
+/// reaction the caller attaches right after must win the race against the
+/// unhandled-rejection tracker (the loop pumps jobs after this returns).
+unsafe fn mcp_rejected_promise(ctx: *mut JSContext, err: JSValue) -> JSValue {
+    let mut out: *mut PromiseHandle = ptr::null_mut();
+    let promise = sofuu_promise_new(ctx, &mut out);
+    if qjs::is_exception(promise) {
+        qjs::sofuu_js_free_value(ctx, err);
+        return promise;
+    }
+    sofuu_promise_reject(out, err); /* consumes err */
+    promise
+}
+
 /* ── M1d: per-call deadlines (2026-10-23) ──────────────────────────
  * `client.call(method, params, {timeoutMs})` arms one unref'd repeating
  * timer per client. On expiry the request is cancelled on the wire
@@ -484,9 +629,11 @@ unsafe extern "C" fn mcp_timeout_tick(timer: *mut UvTimer) {
         let notif = jsonrpc_notify_cstr("notifications/cancelled", Some(&params));
         mcp_client_send(client, notif.as_bytes());
         let msg = format!("MCP call timed out after {} ms", ms);
-        let cm = cstr_text(&msg);
-        let err = qjs::sofuu_js_new_string(ctx, cm.as_ptr());
-        sofuu_promise_reject(promise, err);
+        /* R-30: a timeout is a DISTINCT typed code, not a bare string. */
+        let data = serde_json::json!({ "requestId": id, "timeoutMs": ms });
+        let data_text = serde_json::to_string(&data).unwrap_or_else(|_| "null".into());
+        let err = mcp_error_value(ctx, MCP_ERR_TIMEOUT, &msg, Some(&data_text));
+        sofuu_promise_reject(promise, err); /* consumes err */
         (*client).pending[i] = (*client).pending[(*client).pending_count - 1];
         (*client).pending_count -= 1;
         expired_any = true;
@@ -515,11 +662,13 @@ unsafe extern "C" fn mcp_on_read(stream: *mut UvStream, nread: isize, buf: *cons
             c.read_buf[0] = 0;
             uv::uv_read_stop(stream);
             if !c.connect_promise.is_null() {
-                let err = qjs::sofuu_js_new_string(
+                let err = mcp_error_value(
                     c.ctx,
-                    c"MCP server sent an over-long line (>64KB)".as_ptr(),
+                    MCP_ERR_PROTOCOL,
+                    "MCP server sent an over-long line (>64KB)",
+                    None,
                 );
-                sofuu_promise_reject(c.connect_promise, err);
+                sofuu_promise_reject(c.connect_promise, err); /* consumes err */
                 c.connect_promise = ptr::null_mut();
             }
             if !buf.is_null() && !(*buf).base.is_null() {
@@ -562,7 +711,7 @@ unsafe extern "C" fn mcp_on_read(stream: *mut UvStream, nread: isize, buf: *cons
         /* Connection broken */
         if !(*client).connect_promise.is_null() {
             let ctx = (*client).ctx;
-            let err = qjs::sofuu_js_new_string(ctx, c"MCP server disconnected".as_ptr());
+            let err = mcp_error_value(ctx, MCP_ERR_TRANSPORT_LOST, "MCP server disconnected", None);
             sofuu_promise_reject((*client).connect_promise, err); /* consumes err */
             sofuu_flush_jobs(ctx);
             (*client).connect_promise = ptr::null_mut();
@@ -593,14 +742,20 @@ unsafe extern "C" fn mcp_on_exit(_proc: *mut UvProcess, _exit_status: i64, _term
         if (*client).pending[i].promise.is_null() {
             continue;
         }
-        let err = qjs::sofuu_js_new_string(ctx, c"MCP server process exited".as_ptr());
+        let err =
+            mcp_error_value(ctx, MCP_ERR_TRANSPORT_LOST, "MCP server process exited", None);
         sofuu_promise_reject((*client).pending[i].promise, err); /* consumes err */
     }
     (*client).pending_count = 0;
 
     /* Reject the connect promise if still pending */
     if !(*client).connect_promise.is_null() {
-        let err = qjs::sofuu_js_new_string(ctx, c"MCP server exited before initialize".as_ptr());
+        let err = mcp_error_value(
+            ctx,
+            MCP_ERR_TRANSPORT_LOST,
+            "MCP server exited before initialize",
+            None,
+        );
         sofuu_promise_reject((*client).connect_promise, err); /* consumes err */
         (*client).connect_promise = ptr::null_mut();
     }
@@ -747,7 +902,12 @@ unsafe extern "C" fn js_mcp_call(
          * MAX_PENDING wedges the client. */
         let p = (*client).pending[(*client).pending_count - 1].promise;
         (*client).pending_count -= 1;
-        let err = qjs::sofuu_js_new_string(ctx, c"MCP write failed (server unreachable)".as_ptr());
+        let err = mcp_error_value(
+            ctx,
+            MCP_ERR_TRANSPORT_LOST,
+            "MCP write failed (server unreachable)",
+            None,
+        );
         sofuu_promise_reject(p, err); /* consumes err */
         sofuu_flush_jobs(ctx);
     } else if timeout_ms > 0 {
@@ -916,6 +1076,33 @@ fn tokenize_command(cmd: &str) -> Vec<String> {
 
 // ── JS: sofuu.mcp.connect(command) → Promise<MCPClient> ─────────────
 
+/// The URL a connect() argument names, if any: an explicit `{url}` (the
+/// shape the JS wrapper uses for the Streamable HTTP transport, which would
+/// only reach the native client when that wrapper is not loaded) or a
+/// scheme-prefixed command string.
+unsafe fn mcp_url_argument(ctx: *mut JSContext, opts: JSValueConst, cmd: &str) -> Option<String> {
+    if !qjs::is_undefined(opts) {
+        let uv_ = qjs::sofuu_js_get_property_str(ctx, opts, c"url".as_ptr());
+        let mut url = String::new();
+        if qjs::sofuu_js_is_string(uv_) != 0 {
+            let p = qjs::sofuu_js_to_cstring(ctx, uv_);
+            if !p.is_null() {
+                url = CStr::from_ptr(p).to_string_lossy().into_owned();
+                qjs::sofuu_js_free_cstring(ctx, p);
+            }
+        }
+        qjs::sofuu_js_free_value(ctx, uv_);
+        if !url.is_empty() {
+            return Some(url);
+        }
+    }
+    let head = cmd.trim_start().to_ascii_lowercase();
+    if head.starts_with("http://") || head.starts_with("https://") {
+        return Some(cmd.trim_start().to_string());
+    }
+    None
+}
+
 unsafe extern "C" fn js_mcp_connect(
     ctx: *mut JSContext,
     _this: JSValueConst,
@@ -956,6 +1143,19 @@ unsafe extern "C" fn js_mcp_connect(
     }
     if cmd.is_empty() {
         return qjs::JS_ThrowTypeError(ctx, c"mcp.connect: command required".as_ptr());
+    }
+
+    /* R-30: `mcp.connect("http://…")` used to reach uv_spawn, which tried to
+     * exec the URL and failed with `TypeError: no such file or directory`.
+     * The native client is stdio-only (Streamable HTTP lives in the JS
+     * layer), so a URL is refused with a typed, actionable TypeError — and
+     * as a REJECTION, because connect() is a promise API. */
+    if let Some(url) = mcp_url_argument(ctx, opts_val, &cmd) {
+        let msg = format!(
+            "mcp.connect: HTTP transport not available in the native client for '{url}' — pass a command to spawn, or use sofuu.mcp.connect({{ url: '{url}', transport: 'http' }})"
+        );
+        let err = mcp_type_error_value(ctx, &msg, MCP_ERR_TRANSPORT_UNAVAILABLE);
+        return mcp_rejected_promise(ctx, err);
     }
 
     let mut args_arr = tokenize_command(&cmd);
@@ -1135,7 +1335,20 @@ unsafe extern "C" fn js_mcp_connect(
         uv::uv_close(process as *mut UvHandle, Some(free_pipe_cb));
         uv::uv_close(timeout_timer as *mut UvHandle, Some(free_pipe_cb));
         drop(Box::from_raw(client_ptr));
-        return qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), uv::uv_strerror(r));
+        /* R-30: a spawn failure is its own typed code (-32002), rejectable
+         * like any other connect failure — not a bare `TypeError: no such
+         * file or directory` that a caller cannot branch on. */
+        let estr = uv::uv_strerror(r);
+        let detail = if estr.is_null() {
+            format!("error {r}")
+        } else {
+            CStr::from_ptr(estr).to_string_lossy().into_owned()
+        };
+        let msg = format!("mcp.connect: cannot spawn '{cmd}': {detail}");
+        let data = serde_json::json!({ "command": cmd, "error": detail });
+        let data_text = serde_json::to_string(&data).unwrap_or_else(|_| "null".into());
+        let err = mcp_error_value(ctx, MCP_ERR_CONNECT_FAILED, &msg, Some(&data_text));
+        return mcp_rejected_promise(ctx, err);
     }
 
     /* CRITICAL: proc->data must point back at the client so mcp_on_exit
@@ -1196,9 +1409,11 @@ unsafe extern "C" fn js_mcp_connect(
          * registration (null promise — it rides on connect_promise);
          * mcp_on_exit later sees count 0 / null handle and no-ops. */
         if !(*client_ptr).connect_promise.is_null() {
-            let err = qjs::sofuu_js_new_string(
+            let err = mcp_error_value(
                 ctx,
-                c"MCP write failed (server unreachable)".as_ptr(),
+                MCP_ERR_TRANSPORT_LOST,
+                "MCP write failed (server unreachable)",
+                None,
             );
             sofuu_promise_reject((*client_ptr).connect_promise, err); /* consumes err */
             (*client_ptr).connect_promise = ptr::null_mut();
@@ -1214,11 +1429,305 @@ unsafe extern "C" fn js_mcp_connect(
 
 static MCP_SERVER_CLASS_ID: AtomicU32 = AtomicU32::new(0);
 
+/* ── H-10: the JSON-Schema subset this server validates AND advertises ──
+ * The tool's `schema` option is parsed ONCE at registration. `tools/list`
+ * advertises that registered value verbatim; `tools/call` validates against
+ * `JsonSchema`, the projection of the SAME value — so what a client is told
+ * and what the server enforces cannot drift. Supported keywords: type,
+ * required, properties, items, enum, additionalProperties. Any other
+ * keyword is advertised but NOT enforced (that is the documented subset). */
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SchemaType {
+    Object,
+    Array,
+    String,
+    Number,
+    Integer,
+    Boolean,
+    Null,
+}
+
+impl SchemaType {
+    fn parse(s: &str) -> Option<SchemaType> {
+        match s {
+            "object" => Some(SchemaType::Object),
+            "array" => Some(SchemaType::Array),
+            "string" => Some(SchemaType::String),
+            "number" => Some(SchemaType::Number),
+            "integer" => Some(SchemaType::Integer),
+            "boolean" => Some(SchemaType::Boolean),
+            "null" => Some(SchemaType::Null),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            SchemaType::Object => "object",
+            SchemaType::Array => "array",
+            SchemaType::String => "string",
+            SchemaType::Number => "number",
+            SchemaType::Integer => "integer",
+            SchemaType::Boolean => "boolean",
+            SchemaType::Null => "null",
+        }
+    }
+
+    fn accepts(self, v: &serde_json::Value) -> bool {
+        match self {
+            SchemaType::Object => v.is_object(),
+            SchemaType::Array => v.is_array(),
+            SchemaType::String => v.is_string(),
+            SchemaType::Number => v.is_number(),
+            SchemaType::Integer => {
+                v.is_i64() || v.is_u64() || v.as_f64().map(|f| f.fract() == 0.0).unwrap_or(false)
+            }
+            SchemaType::Boolean => v.is_boolean(),
+            SchemaType::Null => v.is_null(),
+        }
+    }
+}
+
+/// The JSON type name of a value ("object", "string", …) — the "got Y" half
+/// of the `expected X, got Y` part of a -32602 message.
+fn json_type_name(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct JsonSchema {
+    types: Vec<SchemaType>,
+    required: Vec<String>,
+    properties: Vec<(String, JsonSchema)>,
+    items: Option<Box<JsonSchema>>,
+    enum_values: Option<Vec<serde_json::Value>>,
+    additional_properties: Option<bool>,
+}
+
+/// One violation, in the shape both the -32602 `message` and its `data`
+/// payload use.
+#[derive(Clone, Debug)]
+struct SchemaViolation {
+    field: String,
+    expected: String,
+    actual: String,
+    /* "missing_required" | "wrong_type" | "enum" | "additional_property" */
+    reason: &'static str,
+}
+
+impl JsonSchema {
+    /// Parse the supported subset. An unsupported/misshaped schema yields an
+    /// EMPTY schema (accepts anything) instead of a half-enforced one.
+    fn parse(v: &serde_json::Value) -> JsonSchema {
+        let mut out = JsonSchema::default();
+        let Some(obj) = v.as_object() else {
+            return out;
+        };
+        match obj.get("type") {
+            Some(serde_json::Value::String(s)) => {
+                if let Some(t) = SchemaType::parse(s) {
+                    out.types.push(t);
+                }
+            }
+            Some(serde_json::Value::Array(list)) => {
+                for item in list {
+                    if let Some(s) = item.as_str() {
+                        if let Some(t) = SchemaType::parse(s) {
+                            out.types.push(t);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(serde_json::Value::Array(req)) = obj.get("required") {
+            for name in req {
+                if let Some(s) = name.as_str() {
+                    out.required.push(s.to_string());
+                }
+            }
+        }
+        if let Some(serde_json::Value::Object(props)) = obj.get("properties") {
+            for (name, sub) in props {
+                out.properties.push((name.clone(), JsonSchema::parse(sub)));
+            }
+        }
+        if let Some(it) = obj.get("items") {
+            out.items = Some(Box::new(JsonSchema::parse(it)));
+        }
+        if let Some(serde_json::Value::Array(vals)) = obj.get("enum") {
+            out.enum_values = Some(vals.clone());
+        }
+        if let Some(b) = obj.get("additionalProperties").and_then(|b| b.as_bool()) {
+            out.additional_properties = Some(b);
+        }
+        out
+    }
+
+    /// The expected type(s) as one string, for the -32602 message.
+    fn type_label(&self) -> String {
+        if self.types.is_empty() {
+            "any".to_string()
+        } else {
+            self.types
+                .iter()
+                .map(|t| t.name())
+                .collect::<Vec<_>>()
+                .join("|")
+        }
+    }
+
+    /// Validate from the root (`arguments`); returns the FIRST violation —
+    /// one -32602 that names one field is what a caller can act on.
+    fn validate(&self, value: &serde_json::Value) -> Option<SchemaViolation> {
+        let mut out: Vec<SchemaViolation> = Vec::new();
+        self.validate_at(value, "", &mut out);
+        out.into_iter().next()
+    }
+
+    fn validate_at(&self, value: &serde_json::Value, path: &str, out: &mut Vec<SchemaViolation>) {
+        if !out.is_empty() {
+            return;
+        }
+        if !self.types.is_empty() && !self.types.iter().any(|t| t.accepts(value)) {
+            out.push(SchemaViolation {
+                field: path_label(path),
+                expected: self.type_label(),
+                actual: json_type_name(value).to_string(),
+                reason: "wrong_type",
+            });
+            return;
+        }
+        if let Some(vals) = &self.enum_values {
+            if !vals.iter().any(|e| e == value) {
+                out.push(SchemaViolation {
+                    field: path_label(path),
+                    expected: serde_json::Value::Array(vals.clone()).to_string(),
+                    actual: value.to_string(),
+                    reason: "enum",
+                });
+                return;
+            }
+        }
+        if let Some(obj) = value.as_object() {
+            for name in &self.required {
+                if !obj.contains_key(name) {
+                    let expected = self
+                        .properties
+                        .iter()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, s)| s.type_label())
+                        .unwrap_or_else(|| "any".to_string());
+                    out.push(SchemaViolation {
+                        field: child_path(path, name),
+                        expected,
+                        actual: "missing".to_string(),
+                        reason: "missing_required",
+                    });
+                    return;
+                }
+            }
+            for (name, sub) in &self.properties {
+                if let Some(v) = obj.get(name) {
+                    sub.validate_at(v, &child_path(path, name), out);
+                    if !out.is_empty() {
+                        return;
+                    }
+                }
+            }
+            if self.additional_properties == Some(false) {
+                for name in obj.keys() {
+                    if !self.properties.iter().any(|(k, _)| k == name) {
+                        out.push(SchemaViolation {
+                            field: child_path(path, name),
+                            expected: "no additional property".to_string(),
+                            actual: obj
+                                .get(name)
+                                .map(json_type_name)
+                                .unwrap_or("value")
+                                .to_string(),
+                            reason: "additional_property",
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+        if let Some(items) = &self.items {
+            if let Some(arr) = value.as_array() {
+                for (i, v) in arr.iter().enumerate() {
+                    items.validate_at(v, &format!("{path}[{i}]"), out);
+                    if !out.is_empty() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Field label for a schema path: the root object is `arguments`.
+fn path_label(path: &str) -> String {
+    if path.is_empty() {
+        "arguments".to_string()
+    } else {
+        path.to_string()
+    }
+}
+
+fn child_path(path: &str, name: &str) -> String {
+    if path.is_empty() {
+        name.to_string()
+    } else {
+        format!("{path}.{name}")
+    }
+}
+
+/// The -32602 response for a schema violation: the message names the field
+/// and BOTH types; `data` carries the same facts machine-readably.
+fn mcp_schema_violation_cstr(req_id: i32, v: &SchemaViolation) -> CString {
+    let msg = match v.reason {
+        "missing_required" => format!(
+            "Invalid params: missing required field '{}' (expected {})",
+            v.field, v.expected
+        ),
+        "enum" => format!(
+            "Invalid params: field '{}' must be one of {} (got {})",
+            v.field, v.expected, v.actual
+        ),
+        "additional_property" => format!("Invalid params: field '{}' is not allowed", v.field),
+        _ => format!(
+            "Invalid params: field '{}' expects {} but got {}",
+            v.field, v.expected, v.actual
+        ),
+    };
+    let data = serde_json::json!({
+        "field": v.field,
+        "expected": v.expected,
+        "actual": v.actual,
+        "reason": v.reason,
+    });
+    jsonrpc_error_data_cstr(req_id, -32602, &msg, &data)
+}
+
 struct McpTool {
     name: Vec<u8>,        /* up to 127 bytes (C: char[128]) */
     description: CString, /* heap — unbounded */
-    schema_json: CString, /* JSON string for input schema */
-    handler: JSValue,     /* JS async function */
+    /* H-10: ONE source for the advertised and the enforced schema. The
+     * registered value is what `tools/list` advertises verbatim; `schema` is
+     * its parsed projection, used by `tools/call`. Both are built once, at
+     * registration, from the same JS value — they cannot drift. */
+    schema_json: serde_json::Value,
+    schema: JsonSchema,
+    handler: JSValue, /* JS async function */
 }
 
 struct McpResource {
@@ -1368,8 +1877,10 @@ unsafe extern "C" fn mcp_tool_reject_cb(
     let mut req_id: i32 = -1;
     qjs::JS_ToInt32(ctx, &mut req_id, *data);
     let srv = mcp_tool_data_server(data);
-    /* M3: a rejected handler is an in-band tool failure. */
-    let body = mcp_iserror_body(ctx, *argv, "tool error");
+    /* M3: a rejected handler is an in-band tool failure. H-10: the reason's
+     * REAL message is what the client must see. */
+    let msg = mcp_value_message(ctx, *argv);
+    let body = mcp_iserror_text(&msg);
     let resp = jsonrpc_response_cstr(req_id, &body);
     mcp_tool_write_response(srv, resp.as_bytes());
     qjs::sofuu_js_undefined()
@@ -1392,29 +1903,81 @@ unsafe fn mcp_json_text(ctx: *mut JSContext, val: JSValue) -> Option<String> {
     out
 }
 
-/// MCP tools/call result for a successful handler value. An object gain
-/// structuredContent; everything else is text (JSON-encoded).
+/// MCP tools/call result for a successful handler value.
+///
+/// H-10: `TextContent.text` MUST be a JSON *string*. It used to be the raw
+/// `JSON.stringify` output, so an object result emitted `"text":{...}` — an
+/// object where the spec requires a string. Now:
+///   * object result → text = the JSON text (a string), PLUS
+///     `structuredContent` = the object itself (per spec);
+///   * string result → text = that string (not its quoted form);
+///   * anything else → text = its JSON text (`"42"`, `"null"`, `"[1,2]"`).
 unsafe fn mcp_success_body(ctx: *mut JSContext, val: JSValue) -> String {
     let js = mcp_json_text(ctx, val).unwrap_or_else(|| "\"\"".into());
-    if qjs::is_object(val) && js.trim_start().starts_with('{') {
+    let parsed: serde_json::Value =
+        serde_json::from_str(&js).unwrap_or(serde_json::Value::Null);
+    let text = match &parsed {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let text_json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into());
+    if parsed.is_object() {
+        let structured = serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".into());
         return format!(
-            "{{\"content\":[{{\"type\":\"text\",\"text\":{js}}}],\"structuredContent\":{js}}}"
+            "{{\"content\":[{{\"type\":\"text\",\"text\":{text_json}}}],\"structuredContent\":{structured}}}"
         );
     }
-    format!("{{\"content\":[{{\"type\":\"text\",\"text\":{js}}}]}}")
+    format!("{{\"content\":[{{\"type\":\"text\",\"text\":{text_json}}}]}}")
 }
 
 /// M3: a TOOL failure is in-band (`isError:true` with content), never a
-/// JSON-RPC error — the model must see it as a tool result.
-unsafe fn mcp_iserror_body(ctx: *mut JSContext, val: JSValue, prefix: &str) -> String {
-    let raw = mcp_json_text(ctx, val).unwrap_or_else(|| "\"\"".into());
-    let msg = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| raw.trim_matches('"').to_string());
-    let full = format!("{prefix}: {msg}");
-    let esc = serde_json::to_string(&full).unwrap_or_else(|_| "\"tool error\"".into());
+/// JSON-RPC error — the model must see it as a tool result. H-10: `text` is
+/// the handler's OWN message (a string), not the old placeholder.
+fn mcp_iserror_text(msg: &str) -> String {
+    let esc = serde_json::to_string(msg).unwrap_or_else(|_| "\"tool error\"".into());
     format!("{{\"content\":[{{\"type\":\"text\",\"text\":{esc}}}],\"isError\":true}}")
+}
+
+/// The message a thrown/rejected JS value carries: `err.message` when the
+/// value is Error-like, else `String(value)`. Shared by the synchronous
+/// throw path and the async rejection path so both report the handler's own
+/// words (H-10 — the old code answered the literal "handler threw" and sent
+/// the real text to stderr only).
+unsafe fn mcp_value_message(ctx: *mut JSContext, val: JSValueConst) -> String {
+    if qjs::is_undefined(val) || qjs::is_null(val) {
+        return "tool handler failed".to_string();
+    }
+    let mv = qjs::sofuu_js_get_property_str(ctx, val, c"message".as_ptr());
+    let mut out = String::new();
+    if qjs::sofuu_js_is_string(mv) != 0 {
+        let p = qjs::sofuu_js_to_cstring(ctx, mv);
+        if !p.is_null() {
+            out = CStr::from_ptr(p).to_string_lossy().into_owned();
+            qjs::sofuu_js_free_cstring(ctx, p);
+        }
+    }
+    qjs::sofuu_js_free_value(ctx, mv);
+    if out.is_empty() {
+        let p = qjs::sofuu_js_to_cstring(ctx, val);
+        if !p.is_null() {
+            out = CStr::from_ptr(p).to_string_lossy().into_owned();
+            qjs::sofuu_js_free_cstring(ctx, p);
+        }
+    }
+    if out.is_empty() {
+        "tool handler failed".to_string()
+    } else {
+        out
+    }
+}
+
+/// Take (and CLEAR) the pending exception, returning its message — a
+/// pending exception left behind would poison the next allocation.
+unsafe fn mcp_take_exception_message(ctx: *mut JSContext) -> String {
+    let exc = qjs::sofuu_js_get_exception(ctx);
+    let msg = mcp_value_message(ctx, exc);
+    qjs::sofuu_js_free_value(ctx, exc);
+    msg
 }
 
 /// Cursor is an opaque `off:<n>` string; absent = 0.
@@ -1488,7 +2051,9 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
             let tool = &tool_list[i];
             let name = String::from_utf8_lossy(&tool.name);
             let d = tool.description.to_string_lossy();
-            let sc = tool.schema_json.to_string_lossy();
+            /* The advertised schema is the registered value itself (the same
+             * one `tools/call` validates against). */
+            let sc = serde_json::to_string(&tool.schema_json).unwrap_or_else(|_| "{}".to_string());
             tools_json.push_str(&format!(
                 "{{\"name\":\"{}\",\"description\":\"{}\",\"inputSchema\":{}}}",
                 json_escape(&name),
@@ -1705,17 +2270,21 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
 
     /* --- tools/call (M3: tool failures are in-band isError) --- */
     } else if method == "tools/call" {
-        let mut toolname: Option<String> = None;
-        let mut args_str: Option<CString> = None;
-        if let Some(p) = req_params.as_ref() {
-            if let Some(name) = p.get("name").and_then(|n| n.as_str()) {
-                toolname = Some(name.to_string());
-            }
-            if let Some(args) = p.get("arguments") {
-                let s = serde_json::to_string(args).unwrap_or_else(|_| "{}".into());
-                args_str = Some(cstr_json(&s));
-            }
-        }
+        /* H-10: `params.name` must name a registered tool and its
+         * `arguments` must satisfy that tool's inputSchema BEFORE anything
+         * is dispatched. The old code ran whatever arrived (`echo {}` with
+         * the required `message` missing, `add {a:"forty"}` concatenating)
+         * and never emitted -32602 at all. */
+        let toolname = req_params
+            .as_ref()
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            .map(|s| s.to_string());
+        let args_value = req_params
+            .as_ref()
+            .and_then(|p| p.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
 
         /* Find the tool */
         let mut tool: Option<usize> = None;
@@ -1730,76 +2299,110 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
 
         match tool {
             None => {
-                let err = jsonrpc_error_cstr(req_id, -32601, "Tool not found");
+                /* Protocol: an unknown TOOL is "invalid params" (-32602) —
+                 * the METHOD (`tools/call`) exists. -32601 stays reserved
+                 * for an unknown method (see the else branch below). */
+                let msg = match &toolname {
+                    Some(n) => format!("Invalid params: unknown tool '{n}'"),
+                    None => "Invalid params: tools/call requires params.name (string)".to_string(),
+                };
+                let data = serde_json::json!({
+                    "field": "name",
+                    "expected": "a registered tool name",
+                    "actual": toolname.clone().unwrap_or_default(),
+                    "reason": "unknown_tool",
+                });
+                let err = jsonrpc_error_data_cstr(req_id, -32602, &msg, &data);
                 mcp_server_write_str(srv, err.as_bytes());
             }
             Some(ti) => {
-                /* Parse args into JS object */
-                let js_args = if let Some(ac) = &args_str {
-                    let parsed = qjs::JS_ParseJSON(ctx, ac.as_ptr(), ac.as_bytes().len(), c"<mcp-args>".as_ptr());
-                    if qjs::is_exception(parsed) {
+                /* Validate against the SAME schema tools/list advertises. A
+                 * handler never runs with invalid params. */
+                // `&*srv` is written out explicitly: an implicit autoref of a
+                // raw-pointer deref is denied by rustc (implicit_autorefs).
+                let violation = (&*srv).tools[ti].schema.validate(&args_value);
+                if let Some(v) = violation {
+                    let err = mcp_schema_violation_cstr(req_id, &v);
+                    mcp_server_write_str(srv, err.as_bytes());
+                } else {
+                    /* Parse the (validated) arguments into a JS object. */
+                    let arg_text =
+                        serde_json::to_string(&args_value).unwrap_or_else(|_| "{}".to_string());
+                    let ac = cstr_json(&arg_text);
+                    let parsed = qjs::JS_ParseJSON(
+                        ctx,
+                        ac.as_ptr(),
+                        ac.as_bytes().len(),
+                        c"<mcp-args>".as_ptr(),
+                    );
+                    let js_args = if qjs::is_exception(parsed) {
+                        /* Clear the pending exception before allocating. */
+                        qjs::sofuu_js_get_exception(ctx);
                         qjs::sofuu_js_new_object(ctx)
                     } else {
                         parsed
-                    }
-                } else {
-                    qjs::sofuu_js_new_object(ctx)
-                };
+                    };
 
-                /* Call the JS handler and handle both sync and async results */
-                let srv_ref = &*srv;
-                let handler = srv_ref.tools[ti].handler;
-                let ret = qjs::JS_Call(ctx, handler, qjs::sofuu_js_undefined(), 1, &js_args);
-                qjs::sofuu_js_free_value(ctx, js_args);
+                    /* Call the JS handler and handle both sync and async results */
+                    let handler = (&*srv).tools[ti].handler;
+                    let ret = qjs::JS_Call(ctx, handler, qjs::sofuu_js_undefined(), 1, &js_args);
+                    qjs::sofuu_js_free_value(ctx, js_args);
 
-                if qjs::is_exception(ret) {
-                    qjs::js_std_dump_error(ctx);
-                    /* M3: a thrown handler is a TOOL failure, not a protocol
-                     * error — answer isError:true with content. */
-                    let threw = qjs::sofuu_js_new_string(ctx, c"handler threw".as_ptr());
-                    let body = mcp_iserror_body(ctx, threw, "tool error");
-                    qjs::sofuu_js_free_value(ctx, threw);
-                    let resp = jsonrpc_response_cstr(req_id, &body);
-                    mcp_server_write_str(srv, resp.as_bytes());
-                } else {
-                    /* Check if the return value is a Promise by testing for
-                     * a callable .then property. */
-                    let then_fn = qjs::sofuu_js_get_property_str(ctx, ret, c"then".as_ptr());
-                    let is_promise = qjs::JS_IsFunction(ctx, then_fn) != 0;
-                    qjs::sofuu_js_free_value(ctx, then_fn);
-
-                    if is_promise {
-                        let js_id = qjs::sofuu_js_new_int32(ctx, req_id);
-                        let js_srv = qjs::sofuu_js_dup_value(ctx, (*srv).self_val);
-                        let mut data_arr: [JSValue; 2] = [js_id, js_srv];
-
-                        let then_ok =
-                            qjs::JS_NewCFunctionData(ctx, mcp_tool_then_cb, 1, 0, 2, data_arr.as_mut_ptr());
-                        let then_err =
-                            qjs::JS_NewCFunctionData(ctx, mcp_tool_reject_cb, 1, 0, 2, data_arr.as_mut_ptr());
-
-                        let handlers: [JSValueConst; 2] = [then_ok, then_err];
-                        let ret2 = qjs::JS_Call(ctx, then_fn, ret, 2, handlers.as_ptr());
-                        if qjs::is_exception(ret2) {
-                            qjs::js_std_dump_error(ctx);
-                            let err = jsonrpc_error_cstr(req_id, -32603, "Internal error in promise chain");
-                            mcp_server_write_str(srv, err.as_bytes());
-                        }
-
-                        qjs::sofuu_js_free_value(ctx, then_err);
-                        qjs::sofuu_js_free_value(ctx, then_ok);
-                        qjs::sofuu_js_free_value(ctx, ret2);
-                        qjs::sofuu_js_free_value(ctx, data_arr[1]);
-                        qjs::sofuu_js_free_value(ctx, data_arr[0]);
-
-                        sofuu_flush_jobs(ctx);
-                    } else {
-                        let body = mcp_success_body(ctx, ret);
+                    if qjs::is_exception(ret) {
+                        /* H-10: the handler's REAL message goes to the
+                         * client. The old code answered the literal
+                         * "handler threw" and let the message reach only
+                         * the server's stderr. */
+                        let msg = mcp_take_exception_message(ctx);
+                        eprintln!(
+                            "[sofuu mcp] tool '{}' threw: {}",
+                            toolname.clone().unwrap_or_default(),
+                            msg
+                        );
+                        let body = mcp_iserror_text(&msg);
                         let resp = jsonrpc_response_cstr(req_id, &body);
                         mcp_server_write_str(srv, resp.as_bytes());
-                    }
+                    } else {
+                        /* Check if the return value is a Promise by testing for
+                         * a callable .then property. */
+                        let then_fn = qjs::sofuu_js_get_property_str(ctx, ret, c"then".as_ptr());
+                        let is_promise = qjs::JS_IsFunction(ctx, then_fn) != 0;
+                        qjs::sofuu_js_free_value(ctx, then_fn);
 
-                    qjs::sofuu_js_free_value(ctx, ret);
+                        if is_promise {
+                            let js_id = qjs::sofuu_js_new_int32(ctx, req_id);
+                            let js_srv = qjs::sofuu_js_dup_value(ctx, (*srv).self_val);
+                            let mut data_arr: [JSValue; 2] = [js_id, js_srv];
+
+                            let then_ok =
+                                qjs::JS_NewCFunctionData(ctx, mcp_tool_then_cb, 1, 0, 2, data_arr.as_mut_ptr());
+                            let then_err =
+                                qjs::JS_NewCFunctionData(ctx, mcp_tool_reject_cb, 1, 0, 2, data_arr.as_mut_ptr());
+
+                            let handlers: [JSValueConst; 2] = [then_ok, then_err];
+                            let ret2 = qjs::JS_Call(ctx, then_fn, ret, 2, handlers.as_ptr());
+                            if qjs::is_exception(ret2) {
+                                let msg = mcp_take_exception_message(ctx);
+                                eprintln!("[sofuu mcp] tool promise chain failed: {}", msg);
+                                let err = jsonrpc_error_cstr(req_id, -32603, "Internal error in promise chain");
+                                mcp_server_write_str(srv, err.as_bytes());
+                            }
+
+                            qjs::sofuu_js_free_value(ctx, then_err);
+                            qjs::sofuu_js_free_value(ctx, then_ok);
+                            qjs::sofuu_js_free_value(ctx, ret2);
+                            qjs::sofuu_js_free_value(ctx, data_arr[1]);
+                            qjs::sofuu_js_free_value(ctx, data_arr[0]);
+
+                            sofuu_flush_jobs(ctx);
+                        } else {
+                            let body = mcp_success_body(ctx, ret);
+                            let resp = jsonrpc_response_cstr(req_id, &body);
+                            mcp_server_write_str(srv, resp.as_bytes());
+                        }
+
+                        qjs::sofuu_js_free_value(ctx, ret);
+                    }
                 }
             }
         }
@@ -1904,7 +2507,10 @@ unsafe extern "C" fn js_server_tool(
     qjs::sofuu_js_free_cstring(ctx, name_ptr);
 
     let mut description: CString = CString::new("").unwrap_or_default();
-    let mut schema_json: CString = CString::new("{}").unwrap_or_default();
+    /* H-10: the schema below is BOTH advertised (tools/list) and enforced
+     * (tools/call). `{}` — the default for a schema-less tool — accepts any
+     * arguments, which is the old permissive behavior for those tools. */
+    let mut schema_value: serde_json::Value = serde_json::json!({});
 
     /* opts: { description, schema } */
     if qjs::is_object(*argv.add(1)) {
@@ -1924,10 +2530,20 @@ unsafe extern "C" fn js_server_tool(
             if !qjs::is_exception(json) {
                 let s = qjs::sofuu_js_to_cstring(ctx, json);
                 if !s.is_null() {
-                    schema_json = CString::new(CStr::from_ptr(s).to_bytes()).unwrap_or_default();
+                    let text = CStr::from_ptr(s).to_string_lossy().into_owned();
                     qjs::sofuu_js_free_cstring(ctx, s);
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                        if v.is_object() {
+                            schema_value = v;
+                        }
+                    }
                 }
                 qjs::sofuu_js_free_value(ctx, json);
+            } else {
+                /* A schema that cannot be stringified (cycle, throwing
+                 * toJSON) must not leave an exception pending for the next
+                 * JS call to trip over. */
+                qjs::sofuu_js_get_exception(ctx);
             }
         }
         qjs::sofuu_js_free_value(ctx, schema);
@@ -1937,10 +2553,13 @@ unsafe extern "C" fn js_server_tool(
         return qjs::JS_ThrowTypeError(ctx, c"tool: handler must be a function".as_ptr());
     }
     let handler = qjs::sofuu_js_dup_value(ctx, *argv.add(2));
+    /* The validator is parsed from the very value tools/list advertises. */
+    let validator = JsonSchema::parse(&schema_value);
     (*srv).tools.push(McpTool {
         name,
         description,
-        schema_json,
+        schema_json: schema_value,
+        schema: validator,
         handler,
     });
     (*srv).tool_count += 1;
@@ -2268,6 +2887,69 @@ pub unsafe extern "C" fn mod_mcp_register(ctx: *mut JSContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// H-10: the validator enforces the documented subset and reports the
+    /// field plus the expected/actual type for each class of violation —
+    /// these are the strings the -32602 message and its `data` carry.
+    #[test]
+    fn schema_subset_validates_type_required_enum_items_and_additional() {
+        let advertised = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message": { "type": "string" },
+                "count": { "type": "integer" },
+                "tags": { "type": "array", "items": { "type": "string" } },
+                "mode": { "type": "string", "enum": ["fast", "slow"] }
+            },
+            "required": ["message"],
+            "additionalProperties": false
+        });
+        /* The validator is a projection of the advertised value — same
+         * source, so tools/list and tools/call cannot disagree. */
+        let s = JsonSchema::parse(&advertised);
+        assert_eq!(s.type_label(), "object");
+
+        let ok = serde_json::json!({"message": "hi", "count": 2, "tags": ["a"], "mode": "fast"});
+        assert!(s.validate(&ok).is_none(), "valid arguments must pass");
+
+        let v = s.validate(&serde_json::json!({})).expect("missing required must fail");
+        assert_eq!(v.reason, "missing_required");
+        assert_eq!(v.field, "message");
+        assert_eq!(v.expected, "string");
+
+        let v = s
+            .validate(&serde_json::json!({"message": 42}))
+            .expect("wrong type must fail");
+        assert_eq!(v.reason, "wrong_type");
+        assert_eq!(v.field, "message");
+        assert_eq!(v.expected, "string");
+        assert_eq!(v.actual, "number");
+
+        let v = s
+            .validate(&serde_json::json!({"message": "hi", "mode": "wrong"}))
+            .expect("enum must fail");
+        assert_eq!(v.reason, "enum");
+        assert_eq!(v.field, "mode");
+        assert!(v.expected.contains("fast") && v.actual.contains("wrong"));
+
+        let v = s
+            .validate(&serde_json::json!({"message": "hi", "tags": ["a", 7]}))
+            .expect("items must fail");
+        assert_eq!(v.reason, "wrong_type");
+        assert_eq!(v.field, "tags[1]");
+        assert_eq!(v.actual, "number");
+
+        let v = s
+            .validate(&serde_json::json!({"message": "hi", "nope": 1}))
+            .expect("extra property must fail");
+        assert_eq!(v.reason, "additional_property");
+        assert_eq!(v.field, "nope");
+
+        /* A schema-less tool (`{}`) accepts anything — the old permissive
+         * behavior, preserved deliberately. */
+        let any = JsonSchema::parse(&serde_json::json!({}));
+        assert!(any.validate(&serde_json::json!({"anything": [1, 2, 3]})).is_none());
+    }
 
     /// P0-2 regression (AUDIT-2026-09-07): a real MCP disconnect must run
     /// the 4-handle close fence to completion. Before the fix, stdin/stderr
@@ -2630,7 +3312,7 @@ mod tests {
             qjs::sofuu_js_set_property_str(ctx, global, c"p9".as_ptr(), ret);
             qjs::sofuu_js_free_value(ctx, global);
             let r = eval_or_panic(ctx, c"<mcp-p1-9-catch>",
-                c"globalThis.p9msg = null; globalThis.p9.catch(function (e) { globalThis.p9msg = String(e); });");
+                c"globalThis.p9msg = null; globalThis.p9.catch(function (e) { globalThis.p9msg = (e instanceof Error) + '|' + e.code + '|' + e.message; });");
             qjs::sofuu_js_free_value(ctx, r);
             sofuu_flush_jobs(ctx);
             let r = eval_or_panic(ctx, c"<mcp-p1-9-read>", c"String(globalThis.p9msg)");
@@ -2639,9 +3321,11 @@ mod tests {
             let msg = CStr::from_ptr(s).to_string_lossy().into_owned();
             qjs::sofuu_js_free_cstring(ctx, s);
             qjs::sofuu_js_free_value(ctx, r);
+            /* R-30: a typed Error, not the old bare string — `.code` is the
+             * transport-lost code, `.message` the human text. */
             assert_eq!(
-                msg, "MCP write failed (server unreachable)",
-                "the pending promise must settle with the write-failure reason"
+                msg, "true|-32000|MCP write failed (server unreachable)",
+                "the pending promise must settle with a typed write-failure error"
             );
         }
 

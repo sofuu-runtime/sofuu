@@ -1966,6 +1966,12 @@ typedef struct {
     uint8_t *state_stack;
     size_t state_stack_size;
     size_t state_stack_len;
+
+    /* S2/C-02: backtracking steps remaining until the next
+     * lre_poll_interrupts() call. A plain countdown (never a clock read) so
+     * the hot path costs one decrement-and-branch; the user hook is what
+     * decides whether the deadline has expired. */
+    uint32_t interrupt_steps;
 } REExecContext;
 
 static int push_state(REExecContext *s,
@@ -2016,29 +2022,54 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
     int cbuf_type;
     uint32_t val, c;
     const uint8_t *cbuf_end;
-    
+    /* S2/C-02: countdown until the next interrupt poll, kept in a register
+     * so the hot path is one decrement-and-branch. s->interrupt_steps is
+     * only written when a nested call needs it (REOP_simple_greedy_quant)
+     * and on the exit paths. */
+    uint32_t steps = s->interrupt_steps;
+
     cbuf_type = s->cbuf_type;
     cbuf_end = s->cbuf_end;
 
     for(;;) {
+        /* S2/C-02: regexp matching runs in a single native frame, so the
+         * bytecode interrupt meter never gets a chance to run. Poll the
+         * embedder every LRE_INTERRUPT_POLL_STEPS steps so a catastrophic
+         * pattern (e.g. /(a+)+$/) can be cancelled. Counter only — no clock
+         * read here; lre_poll_interrupts() is a no-op until an interrupt
+         * handler is installed on the runtime. */
+        if (unlikely(--steps == 0)) {
+            steps = LRE_INTERRUPT_POLL_STEPS;
+            s->interrupt_steps = steps;
+            if (lre_poll_interrupts(s->opaque)) {
+                s->interrupt_steps = steps;
+                return LRE_ECODE_INTERRUPTED;
+            }
+        }
         //        printf("top=%p: pc=%d\n", th_list.top, (int)(pc - (bc_buf + RE_HEADER_LEN)));
         opcode = *pc++;
         switch(opcode) {
         case REOP_match:
             {
                 REExecState *rs;
-                if (no_recurse)
+                if (no_recurse) {
+                    s->interrupt_steps = steps;
                     return (intptr_t)cptr;
+                }
                 ret = 1;
                 goto recurse;
             no_match:
-                if (no_recurse)
+                if (no_recurse) {
+                    s->interrupt_steps = steps;
                     return 0;
+                }
                 ret = 0;
             recurse:
                 for(;;) {
-                    if (s->state_stack_len == 0)
+                    if (s->state_stack_len == 0) {
+                        s->interrupt_steps = steps;
                         return ret;
+                    }
                     rs = (REExecState *)(s->state_stack +
                                          (s->state_stack_len - 1) * s->state_size);
                     if (rs->type == RE_EXEC_STATE_SPLIT) {
@@ -2125,8 +2156,10 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                 }
                 ret = push_state(s, capture, stack, stack_len,
                                  pc1, cptr, RE_EXEC_STATE_SPLIT, 0);
-                if (ret < 0)
+                if (ret < 0) {
+                    s->interrupt_steps = steps;
                     return -1;
+                }
                 break;
             }
         case REOP_lookahead:
@@ -2137,8 +2170,10 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                              pc + (int)val, cptr,
                              RE_EXEC_STATE_LOOKAHEAD + opcode - REOP_lookahead,
                              0);
-            if (ret < 0)
+            if (ret < 0) {
+                s->interrupt_steps = steps;
                 return -1;
+            }
             break;
             
         case REOP_goto:
@@ -2382,10 +2417,14 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                 
                 q = 0;
                 for(;;) {
+                    s->interrupt_steps = steps;
                     res = lre_exec_backtrack(s, capture, stack, stack_len,
                                              pc1, cptr, TRUE);
-                    if (res == -1)
+                    steps = s->interrupt_steps;
+                    if (res < 0) {
+                        s->interrupt_steps = steps;
                         return res;
+                    }
                     if (!res)
                         break;
                     cptr = (uint8_t *)res;
@@ -2401,8 +2440,10 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
                                      pc1 - 16, cptr,
                                      RE_EXEC_STATE_GREEDY_QUANT,
                                      q - quant_min);
-                    if (ret < 0)
+                    if (ret < 0) {
+                        s->interrupt_steps = steps;
                         return -1;
+                    }
                 }
             }
             break;
@@ -2412,9 +2453,9 @@ static intptr_t lre_exec_backtrack(REExecContext *s, uint8_t **capture,
     }
 }
 
-/* Return 1 if match, 0 if not match or -1 if error. cindex is the
-   starting position of the match and must be such as 0 <= cindex <=
-   clen. */
+/* Return 1 if match, 0 if not match, -1 if error (out of memory) or -2 if
+   interrupted by lre_poll_interrupts(). cindex is the starting position of
+   the match and must be such as 0 <= cindex <= clen. */
 int lre_exec(uint8_t **capture,
              const uint8_t *bc_buf, const uint8_t *cbuf, int cindex, int clen,
              int cbuf_type, void *opaque)
@@ -2442,6 +2483,7 @@ int lre_exec(uint8_t **capture,
     s->state_stack = NULL;
     s->state_stack_len = 0;
     s->state_stack_size = 0;
+    s->interrupt_steps = LRE_INTERRUPT_POLL_STEPS;
     
     for(i = 0; i < s->capture_count * 2; i++)
         capture[i] = NULL;
@@ -2484,6 +2526,11 @@ BOOL lre_check_stack_overflow(void *opaque, size_t alloca_size)
 void *lre_realloc(void *opaque, void *ptr, size_t size)
 {
     return realloc(ptr, size);
+}
+
+int lre_poll_interrupts(void *opaque)
+{
+    return 0;
 }
 
 int main(int argc, char **argv)

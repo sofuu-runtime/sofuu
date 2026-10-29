@@ -238,6 +238,38 @@ pub fn publish(tmp: &str, target: &str) -> bool {
     true
 }
 
+/// Move a damaged file out of the way instead of deleting it (R-25,
+/// AUDIT-2026-10-29): `<path>.torn`, with a numeric suffix when that name is
+/// already taken. The bytes are kept for salvage — a torn brain segment is
+/// often still readable by hand — while nothing that walks a store's own
+/// naming scheme (`seg-*.qtsq`) will pick the quarantined copy up. Returns
+/// the quarantine path, or `None` when the rename failed (the caller then
+/// leaves the file exactly where it was and refuses to touch its records).
+pub fn quarantine(path: &str) -> Option<String> {
+    if !Path::new(path).exists() {
+        return None;
+    }
+    let base = format!("{path}.torn");
+    for n in 0..100u32 {
+        let candidate = if n == 0 {
+            base.clone()
+        } else {
+            format!("{base}.{n}")
+        };
+        if Path::new(&candidate).exists() {
+            continue;
+        }
+        if std::fs::rename(path, &candidate).is_err() {
+            return None;
+        }
+        if let Some(parent) = Path::new(path).parent() {
+            fsync_dir(&parent.to_string_lossy());
+        }
+        return Some(candidate);
+    }
+    None
+}
+
 /* ------------------------------------------------------------------ */
 /* Write-ahead journal                                                 */
 /* ------------------------------------------------------------------ */

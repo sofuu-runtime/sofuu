@@ -170,39 +170,34 @@ pub unsafe extern "C" fn sofuu_flush_jobs_bounded(ctx: *mut JSContext, max_jobs:
 
     loop {
         if executed >= max_jobs {
-            sofuu_rt_report_pending_rejections(ctx);
+            /* R-14: this bound is now hit routinely (every timer callback
+             * drains at most MICROTASK_BATCH jobs), so pending rejections are
+             * NOT reported here. A rejection deferred at job N can still be
+             * handled at job N+K of the SAME drain; reporting at the bound
+             * would call a handled rejection "unhandled" and set the C-01
+             * exit flag for a script that never left one unhandled. The
+             * report happens only when the queue is genuinely empty (below)
+             * or at shutdown. */
             return false;
         }
 
         let err = qjs::JS_ExecutePendingJob(rt, &mut ctx2);
         if err < 0 {
-            /* Unhandled exception that broke the microtask queue: give
-             * process.on('uncaughtException') a chance to handle it; fall
-             * back to the standard dump when no handler is registered. */
+            /* A job that threw. QuickJS converts a handler throw into a
+             * rejected derived promise, so what reaches here is either an
+             * allocation failure (the JS heap ceiling — the job queue can no
+             * longer grow, and a continuation that cannot be enqueued is
+             * dropped inside quickjs.c) or an exception escaping a
+             * continuation. Both are reported ONCE, under their real name,
+             * and remembered for the exit code (C-01); the heap case is also
+             * flagged fatal so the loop stops (C-03). */
             let exc = qjs::sofuu_js_get_exception(ctx2);
-            if process_dispatch_uncaught(ctx2, exc) == 0 {
-                let msg_v = qjs::JS_ToString(ctx2, exc);
-                let s = qjs::sofuu_js_to_cstring(ctx2, msg_v);
-                let msg = if s.is_null() {
-                    "?".to_string()
-                } else {
-                    CStr::from_ptr(s).to_string_lossy().into_owned()
-                };
-                eprintln!("\x1b[31m[sofuu] Unhandled Promise Rejection:\x1b[0m {}", msg);
-                if !s.is_null() {
-                    qjs::sofuu_js_free_cstring(ctx2, s);
-                }
-                let stack = qjs::sofuu_js_get_property_str(ctx2, exc, c"stack".as_ptr());
-                if !qjs::is_undefined(stack) {
-                    let ss = qjs::sofuu_js_to_cstring(ctx2, stack);
-                    if !ss.is_null() {
-                        let st = CStr::from_ptr(ss).to_string_lossy();
-                        eprintln!("{}", st);
-                        qjs::sofuu_js_free_cstring(ctx2, ss);
-                    }
-                }
-                qjs::sofuu_js_free_value(ctx2, stack);
-                qjs::sofuu_js_free_value(ctx2, msg_v);
+            if is_oom_reason(ctx2, exc) {
+                report_microtask_overflow(ctx2, executed);
+            } else if process_dispatch_uncaught(ctx2, exc) == 0 {
+                /* Not handled by JS — the same one-shot "UncaughtException"
+                 * formatting the engine uses for a synchronous throw. */
+                crate::rt::engine::report_uncaught(ctx2, exc);
             }
             qjs::sofuu_js_free_value(ctx2, exc);
             break;
@@ -245,9 +240,115 @@ thread_local! {
 /// A pathological flood with no drain prints the oldest eagerly (C: 64).
 const EAGER_CAP: usize = 64;
 
+/// Read a live JS value as a Rust string (borrowed value; nothing is freed).
+///
+/// # Safety
+/// `ctx` live; `val` a value of `ctx`.
+unsafe fn value_str(ctx: *mut JSContext, val: JSValueConst) -> Option<String> {
+    let s = qjs::sofuu_js_to_cstring(ctx, val);
+    if s.is_null() {
+        return None;
+    }
+    // SAFETY: s valid until freed below.
+    let out = CStr::from_ptr(s).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, s);
+    Some(out)
+}
+
+/// True when `reason` is QuickJS's out-of-memory sentinel rather than a real
+/// script error.
+///
+/// QuickJS throws JS_NULL when it cannot even allocate the Error object
+/// (`quickjs.c` `JS_ThrowError2`: "out of memory: throw JS_NULL to avoid
+/// recursing"), and that is the only value the ENGINE produces with no
+/// name/message/stack. A literal `throw null` is indistinguishable from it —
+/// the substrate ceiling is the overwhelmingly likely cause on this path, and
+/// the message says so. (`undefined` is NOT the sentinel: `Promise.reject()`
+/// is a normal rejection with an undefined reason and must keep printing as
+/// such.) A real `InternalError: out of memory` — where allocating the error
+/// object itself succeeded — is matched too.
+///
+/// # Safety
+/// `ctx` live; `reason` a value of `ctx` (borrowed).
+pub unsafe fn is_oom_reason(ctx: *mut JSContext, reason: JSValueConst) -> bool {
+    if qjs::is_null(reason) {
+        return true;
+    }
+    if qjs::is_undefined(reason) {
+        return false;
+    }
+    let name = qjs::sofuu_js_get_property_str(ctx, reason, c"name".as_ptr());
+    let msg = qjs::sofuu_js_get_property_str(ctx, reason, c"message".as_ptr());
+    let name_s = value_str(ctx, name).unwrap_or_default();
+    let msg_s = value_str(ctx, msg).unwrap_or_default();
+    qjs::sofuu_js_free_value(ctx, name);
+    qjs::sofuu_js_free_value(ctx, msg);
+    name_s == "InternalError" && msg_s.to_ascii_lowercase().contains("out of memory")
+}
+
+/// Report the C-03 substrate failure LOUDLY and once: a real, catchable
+/// RangeError with a message, instead of QuickJS's bare `null` (no
+/// name/message/stack) and a silent exit 0.
+///
+/// A registered `process.on('uncaughtException')` handler gets the same
+/// first shot every other fatal path gets; the failure is flagged fatal
+/// regardless, because the continuations QuickJS could not enqueue are gone
+/// — the runtime must not pretend the turn completed.
+///
+/// # Safety
+/// `ctx` live (loop thread).
+pub unsafe fn report_microtask_overflow(ctx: *mut JSContext, executed: usize) {
+    let limit_mib = crate::rt::engine::js_heap_limit() / (1024 * 1024);
+    let msg = format!(
+        "Maximum microtask queue depth exceeded: the JavaScript heap hit its {} MiB ceiling \
+         after {} continuation(s). QuickJS drops a promise continuation it cannot enqueue, so \
+         the runtime reports this instead of silently losing work — raise SOFUU_JS_HEAP_MB or \
+         reduce the fan-out width.",
+        limit_mib, executed
+    );
+    // SAFETY: err is an owned error object, freed below.
+    let err = crate::rt::engine::new_range_error(ctx, &msg);
+    if process_dispatch_uncaught(ctx, err) == 0 {
+        eprintln!("\x1b[31m[sofuu] UncaughtException:\x1b[0m {}", msg);
+    }
+    crate::rt::engine::note_fatal(ctx);
+    qjs::sofuu_js_free_value(ctx, err);
+}
+
+/// Retract every deferred rejection whose reason is `reason` (pointer
+/// identity). A synchronous module throw rejects BOTH the module promise and
+/// the async module function's internal promise with the same error object;
+/// the engine reports the throw once as `UncaughtException`, so the tracker
+/// must not print those copies again.
+///
+/// # Safety
+/// `ctx` live; `reason` a value of `ctx` (borrowed).
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_rt_suppress_rejections(ctx: *mut JSContext, reason: JSValueConst) {
+    let ptr = qjs::sofuu_js_value_get_ptr(reason);
+    PENDING.with(|p| {
+        let mut pending = p.borrow_mut();
+        let mut i = 0;
+        while i < pending.len() {
+            if qjs::sofuu_js_value_get_ptr(pending[i].reason) == ptr {
+                let old = pending.remove(i);
+                qjs::sofuu_js_free_value(ctx, old.promise);
+                qjs::sofuu_js_free_value(ctx, old.reason);
+            } else {
+                i += 1;
+            }
+        }
+    });
+}
+
 /// # Safety
 /// `ctx` live; `reason` a live value of `ctx`.
 unsafe fn print_rejection(ctx: *mut JSContext, reason: JSValueConst) {
+    // An OOM is not a script-level rejection: name the real cause (C-03).
+    if is_oom_reason(ctx, reason) {
+        report_microtask_overflow(ctx, 0);
+        return;
+    }
     // SAFETY: str_v is live; freed below.
     let str_v = qjs::JS_ToString(ctx, reason);
     let msg = qjs::sofuu_js_to_cstring(ctx, str_v);
@@ -257,7 +358,13 @@ unsafe fn print_rejection(ctx: *mut JSContext, reason: JSValueConst) {
         // SAFETY: msg valid until freed below.
         CStr::from_ptr(msg).to_string_lossy().into_owned()
     };
-    eprintln!("\x1b[31m[sofuu] UnhandledPromiseRejection:\x1b[0m {}", msg_s);
+    eprintln!(
+        "{}",
+        crate::rt::engine::paint(
+            "31",
+            &format!("[sofuu] UnhandledPromiseRejection: {}", msg_s)
+        )
+    );
     if !msg.is_null() {
         qjs::sofuu_js_free_cstring(ctx, msg);
     }
@@ -273,6 +380,9 @@ unsafe fn print_rejection(ctx: *mut JSContext, reason: JSValueConst) {
     }
     qjs::sofuu_js_free_value(ctx, stack);
     qjs::sofuu_js_free_value(ctx, str_v);
+    // C-01: an unhandled rejection is a fatal script error for the process
+    // status, even though the event loop keeps running to idle.
+    crate::rt::engine::note_uncaught_error(ctx);
 }
 
 /// Host promise rejection tracker (JS_SetHostPromiseRejectionTracker).
@@ -286,27 +396,12 @@ unsafe extern "C" fn rejection_tracker(
     is_handled: c_int,
     _opaque: *mut c_void,
 ) {
-    PENDING.with(|p| {
-        let mut pending = p.borrow_mut();
-        if is_handled == 0 {
-            /* Defer: may be retracted by a later is_handled=true event. A
-             * pathological flood with no drain prints the oldest eagerly. */
-            if pending.len() >= EAGER_CAP {
-                print_rejection(ctx, pending[0].reason);
-                qjs::sofuu_js_free_value(ctx, pending[0].promise);
-                qjs::sofuu_js_free_value(ctx, pending[0].reason);
-                pending.remove(0);
-            }
-            // SAFETY: dup'd refs owned by the pending entry (freed on report).
-            pending.push(PendingRej {
-                promise: qjs::sofuu_js_dup_value(ctx, promise),
-                reason: qjs::sofuu_js_dup_value(ctx, reason),
-                reported: false,
-            });
-        } else {
-            /* Handler attached after the fact → retract. Promises are
-             * objects; identity by underlying pointer is exact. */
-            let ptr = qjs::sofuu_js_value_get_ptr(promise);
+    if is_handled != 0 {
+        /* Handler attached after the fact → retract. Promises are objects;
+         * identity by underlying pointer is exact. */
+        let ptr = qjs::sofuu_js_value_get_ptr(promise);
+        PENDING.with(|p| {
+            let mut pending = p.borrow_mut();
             if let Some(i) = pending
                 .iter()
                 .position(|r| qjs::sofuu_js_value_get_ptr(r.promise) == ptr)
@@ -315,8 +410,44 @@ unsafe extern "C" fn rejection_tracker(
                 qjs::sofuu_js_free_value(ctx, old.promise);
                 qjs::sofuu_js_free_value(ctx, old.reason);
             }
+        });
+        return;
+    }
+
+    /* Defer: may be retracted by a later is_handled=true event. A
+     * pathological flood with no drain prints the oldest eagerly. The
+     * eviction is removed under the borrow and PRINTED outside it — printing
+     * runs JS (ToString/stack, an uncaughtException handler) and re-entering
+     * the promise machinery while PENDING is borrowed would panic. */
+    let evicted = PENDING.with(|p| {
+        let mut pending = p.borrow_mut();
+        let evicted = if pending.len() >= EAGER_CAP {
+            Some(pending.remove(0))
+        } else {
+            None
+        };
+        /* One entry per promise: QuickJS reports each rejection once, but a
+         * duplicate push (e.g. a promise re-reported by an embedded host)
+         * would print the same error twice. */
+        let ptr = qjs::sofuu_js_value_get_ptr(promise);
+        if !pending
+            .iter()
+            .any(|r| qjs::sofuu_js_value_get_ptr(r.promise) == ptr)
+        {
+            // SAFETY: dup'd refs owned by the pending entry (freed on report).
+            pending.push(PendingRej {
+                promise: qjs::sofuu_js_dup_value(ctx, promise),
+                reason: qjs::sofuu_js_dup_value(ctx, reason),
+                reported: false,
+            });
         }
+        evicted
     });
+    if let Some(old) = evicted {
+        print_rejection(ctx, old.reason);
+        qjs::sofuu_js_free_value(ctx, old.promise);
+        qjs::sofuu_js_free_value(ctx, old.reason);
+    }
 }
 
 /// Install the deferred-rejection tracker on a runtime. Replaces the C
@@ -334,22 +465,32 @@ pub unsafe extern "C" fn sofuu_rt_install_rejection_tracker(rt: *mut JSRuntime) 
 /// each completed microtask drain (end of sofuu_flush_jobs) and at shutdown
 /// (engine_destroy under SOFUU_RUST_CORE).
 ///
+/// The queue is drained under the PENDING borrow and PRINTED outside it:
+/// printing runs JS (ToString / `stack` / a user uncaughtException handler),
+/// which can re-enter the promise machinery and would otherwise panic on a
+/// second `borrow_mut` of the same RefCell.
+///
 /// # Safety
 /// `ctx` must be the live runtime context.
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_report_pending_rejections(ctx: *mut JSContext) {
-    PENDING.with(|p| {
+    let drained: Vec<JSValue> = PENDING.with(|p| {
         let mut pending = p.borrow_mut();
-        for r in pending.iter_mut() {
+        let mut reasons = Vec::new();
+        for r in pending.drain(..) {
             if !r.reported {
-                print_rejection(ctx, r.reason);
-                r.reported = true;
+                reasons.push(r.reason);
+            } else {
+                qjs::sofuu_js_free_value(ctx, r.reason);
             }
             qjs::sofuu_js_free_value(ctx, r.promise);
-            qjs::sofuu_js_free_value(ctx, r.reason);
         }
-        pending.clear();
+        reasons
     });
+    for reason in drained {
+        print_rejection(ctx, reason);
+        qjs::sofuu_js_free_value(ctx, reason);
+    }
 }
 
 #[cfg(test)]

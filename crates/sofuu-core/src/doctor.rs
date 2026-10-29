@@ -649,10 +649,29 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    if missing.is_empty() {
+    // A feature the target platform cannot provide (Metal on Linux/Windows) is
+    // not a degraded build. Counting it as a failure made `doctor` exit 1 on
+    // every healthy Linux install — and because `scripts/verify-dist.sh` gates
+    // on `doctor` exiting 0, the repo's own RULES §3.3 dist check could never
+    // pass on the Linux artefact.
+    let platform_absent: Vec<String> = caps
+        .pointer("/build/platform_absent")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let real_missing: Vec<&String> = missing
+        .iter()
+        .filter(|m| !platform_absent.iter().any(|p| p == *m))
+        .collect();
+    for m in &platform_absent {
+        info(&format!(
+            "capability absent on this platform: {m} — not provided by the target OS, so its APIs are unavailable by design"
+        ));
+    }
+    if real_missing.is_empty() {
         ok("all declared build features present");
     } else {
-        for m in &missing {
+        for m in real_missing {
             bad(&format!(
                 "capability missing: {m} — this binary was built without it and refuses the matching APIs loudly (rebuild with the feature enabled; see the Makefile guard)"
             ));

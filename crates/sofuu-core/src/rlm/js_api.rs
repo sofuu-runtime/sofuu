@@ -101,6 +101,11 @@ struct RequestJson {
 struct OptsJson {
     provider: String,
     model: String,
+    /// R-11 (RULES §1.2): the developer's system prompt, handed over by the
+    /// JS driver (agent.js -> rlm.js -> here) so the episode can emit it as
+    /// its first system message byte-for-byte instead of the protocol
+    /// displacing it. Absent/empty = no developer prompt (pre-R-11 shape).
+    system: String,
     max_depth: Option<u32>,
     max_llm_calls: Option<u32>,
     max_wall_ms: Option<u64>,
@@ -123,6 +128,7 @@ impl From<RequestJson> for RlmRequest {
         let mut opts = RlmOpts {
             provider: r.opts.provider,
             model: r.opts.model,
+            system: r.opts.system,
             tools: r.opts.tools,
             ..RlmOpts::default()
         };
@@ -208,7 +214,17 @@ fn rlm_new(arg: Option<String>) -> String {
         Ok(r) => r,
         Err(e) => return err_json(&format!("rlm: bad request JSON: {e}")),
     };
-    match Episode::new(reqj.into(), 0) {
+    let req: RlmRequest = reqj.into();
+    /* R-11 (RULES §1.2 prompt sovereignty): a developer system prompt rides
+     * the request here and the episode emits it as its first system message
+     * byte-for-byte. Cloned out before the move so the borrow does not
+     * outlive `req`; the prompt is small and this runs once per episode. */
+    let dev_system = if req.opts.system.trim().is_empty() {
+        None
+    } else {
+        Some(req.opts.system.clone())
+    };
+    match Episode::new_with_developer_system(req, 0, dev_system.as_deref()) {
         Err(e) => err_json(&e),
         Ok(ep) => {
             let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -856,5 +872,32 @@ mod tests {
         assert!(!text.contains("sk-DECOY-123"), "log leaks key: {text}");
         assert!(!text.contains("decoy.example"), "log leaks base_url: {text}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R-11 wire contract (RULES §1.2 prompt sovereignty): `opts.system` is
+    /// parsed off the __rlm_new JSON and preserved byte-for-byte in
+    /// RlmOpts, and an absent field means "no developer prompt". This is the
+    /// seam that used to swallow the prompt — the JS driver whitelists the
+    /// opts it sends, and a missing field here silently produced an episode
+    /// whose system turn was the protocol instead of the developer's prompt.
+    #[test]
+    fn developer_system_crosses_the_wire_byte_exact() {
+        let dev = "AGENT=sovereign.  Line two.\n· unicode ✓";
+        let raw = format!(
+            r#"{{"context":"c","question":"q","opts":{{"system":{}}}}}"#,
+            serde_json::to_string(dev).expect("escape")
+        );
+        let req: RlmRequest = serde_json::from_str::<RequestJson>(&raw).expect("parse").into();
+        assert_eq!(req.opts.system, dev, "developer prompt must survive the wire");
+        /* The episode accepts it (the composition itself — developer prompt
+         * as the first system segment, protocol delimited behind it — is
+         * asserted in episode.rs::developer_system_is_first_and_byte_exact,
+         * which can see the transcript). */
+        assert!(Episode::new_with_developer_system(req, 0, Some(dev)).is_ok());
+
+        // Absent field = the pre-R-11 shape (protocol owns the system turn).
+        let raw2 = r#"{"context":"c","question":"q","opts":{}}"#;
+        let req2: RlmRequest = serde_json::from_str::<RequestJson>(raw2).expect("parse").into();
+        assert!(req2.opts.system.is_empty());
     }
 }

@@ -51,6 +51,13 @@ pub struct RlmOpts {
     /// Recursion target identifier (used by the provider layer, not here).
     pub provider: String,
     pub model: String,
+    /// R-11 (RULES §1.2 prompt sovereignty): the CALLER's developer system
+    /// prompt, byte-preserved. The episode emits it as its first system
+    /// message verbatim and keeps its own protocol contract in a clearly
+    /// delimited block behind it (see
+    /// `Episode::new_with_developer_system`). Empty = no developer prompt:
+    /// the pre-R-11 shape, where the protocol owns the system turn.
+    pub system: String,
     /// Max recursion depth for `llm()` sub-calls (default 3).
     pub max_depth: u32,
     /// Max total `llm()`/`llmBatch()` sub-prompts per episode (default 24;
@@ -82,6 +89,7 @@ impl Default for RlmOpts {
         Self {
             provider: String::new(),
             model: String::new(),
+            system: String::new(),
             max_depth: 3,
             max_llm_calls: 24,
             max_wall_ms: 120_000,

@@ -86,6 +86,46 @@ pub const FORGET_FLOOR: f32 = 0.05;
 /// Pinned facts (written by /remember) survive decay + retain().
 pub const PIN_ROLE: &str = "user_pin";
 
+/// H-08 (AUDIT-2026-10-29): every marker a PIN actually carries. The Rust
+/// API and its tests write `role = PIN_ROLE`; the JS `/remember` path
+/// writes `role = "user", source = "pin"` (agent.js `cma.remember(v, t,
+/// 'user', 0, 'pin')`) and, for entity/turn pins, `entity_type = "pin"`.
+/// A pin is exempt from the recall floor under ALL of them — a user who
+/// explicitly asked to remember something must never find it silently
+/// unreachable because one surface spelled the marker differently.
+pub fn is_pinned(rec: &Record) -> bool {
+    rec.role == PIN_ROLE
+        || rec.role == "pin"
+        || rec.source == "pin"
+        || rec.entity_type.as_deref() == Some("pin")
+}
+
+/// H-08: the ranking strength a PIN is scored with. Decay is left alone
+/// for every record (the e-folding curve is the documented law); what the
+/// pin exemption changes is that a pinned fact is *ranked as if fresh*, so
+/// the strength term can never bury an exact match under unrelated rows.
+/// `strength` is capped at 1.0 everywhere else, so this is the ceiling.
+pub const PIN_RANK_STRENGTH: f32 = 1.0;
+
+/// H-07: the vector near-duplicate gate's search width. Identical strings
+/// never reach it — `Cma::text_index` answers those in O(1) — so this is
+/// the *near*-duplicate path only, and one candidate is all it has to
+/// resolve. The audit's "ef=128 duplicate gate" figure was `recall()`'s
+/// frontier (pool × 4 = 128), not this search: the gate has always asked
+/// for k=1. Kept tiny on purpose, and the whole gate can be switched off
+/// for bulk ingestion (`Cma::set_dup_gate(false)` / SOFUU_BRAIN_DUP_GATE=0)
+/// — the exact-text index still merges identical facts either way.
+pub const DUP_GATE_EF: usize = 8;
+
+/// H-07: recall's minimum search frontier on a corpus bigger than
+/// `HNSW_SMALL_GRAPH`. The old default was `pool * 4` (128 for a top-5
+/// query), which on a real graph is wide enough that the early-exit bound
+/// never fires before most of the corpus has been walked — the
+/// `0.9 ms + 1.07 µs · n` curve the audit measured. 48 keeps every slot
+/// the ranking pass needs (the search may return the whole `pool`) while
+/// terminating by width instead of by exhaustion.
+pub const RECALL_EF_MIN: usize = 48;
+
 /// A single memory record.
 #[derive(Clone, Debug)]
 pub struct Record {
@@ -286,6 +326,21 @@ pub struct Cma {
     /// died. Persisted as a top-level "deaths" array in the metadata (old
     /// files without it hydrate empty), newest last, capped.
     pub deaths: Vec<DeathEntry>,
+    /// H-07 (AUDIT-2026-10-29): exact-text index — `text -> id` of the
+    /// newest record carrying that string. Identical facts are resolved in
+    /// O(1) (a hash lookup plus, at most, ONE distance to that record)
+    /// instead of a graph search per insert. A cache of `records`: every
+    /// mutation path that writes `records[i].text` (remember, forget,
+    /// hydrate, import, consolidation, retain's renumbering) keeps it in
+    /// sync, and `rebuild_text_index()` re-derives it after anything that
+    /// bypasses those paths.
+    text_index: HashMap<String, u32>,
+    /// H-07: whether the VECTOR near-duplicate gate runs on insert (exact
+    /// text is always gated — this is the fuzzy 0.05-radius check).
+    /// Default on: "the same fact said differently" is the case it exists
+    /// for. Bulk ingestion can turn it off (SOFUU_BRAIN_DUP_GATE=0) and
+    /// lose nothing but paraphrase folding.
+    pub dup_gate: bool,
 }
 
 /// Above this many dirty ids, tracking per-record stops paying — the next
@@ -351,6 +406,64 @@ impl Cma {
             working: Vec::new(),
             working_next_seq: 0,
             deaths: Vec::new(),
+            text_index: HashMap::new(),
+            /* H-07: SOFUU_BRAIN_DUP_GATE=0 / false / off disables the fuzzy
+             * gate for a bulk load; unset keeps the shipped default. An
+             * explicit `set_dup_gate` always wins afterwards. */
+            dup_gate: std::env::var("SOFUU_BRAIN_DUP_GATE")
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    !(v == "0" || v == "false" || v == "off" || v == "no")
+                })
+                .unwrap_or(true),
+        }
+    }
+
+    /// H-07: turn the vector near-duplicate gate on/off. Exact-text
+    /// duplicates always merge — this only controls the 0.05-radius fuzzy
+    /// check that costs one graph search per insert.
+    pub fn set_dup_gate(&mut self, on: bool) {
+        self.dup_gate = on;
+    }
+
+    /// H-07: re-derive the exact-text index from `records`. Cheap (O(n) hash
+    /// inserts) and only needed after a path that rewrote text outside
+    /// `remember`/`forget`/`import_records` — retain's renumbering, hydrate
+    /// and consolidation call it themselves.
+    pub fn rebuild_text_index(&mut self) {
+        self.text_index.clear();
+        for rec in &self.records {
+            if rec.text.is_empty() {
+                continue;
+            }
+            /* Alive rows win over tombstones so a re-said fact reinforces
+             * the live one; among equals the LATER id (newest sighting)
+             * wins, matching what remember() would have stored. */
+            let prev = self.text_index.get(&rec.text).copied();
+            if let Some(prev) = prev {
+                if rec.tier == TIER_FORGOTTEN
+                    && self
+                        .records
+                        .get(prev as usize)
+                        .map(|p| p.tier != TIER_FORGOTTEN)
+                        .unwrap_or(false)
+                {
+                    continue;
+                }
+            }
+            self.text_index.insert(rec.text.clone(), rec.id);
+        }
+    }
+
+    /// H-07: the record an exact-text insert would resolve to, if any.
+    fn live_id_for_text(&self, text: &str) -> Option<u32> {
+        if text.is_empty() {
+            return None;
+        }
+        let id = *self.text_index.get(text)?;
+        match self.records.get(id as usize) {
+            Some(rec) if rec.tier != TIER_FORGOTTEN => Some(id),
+            _ => None,
         }
     }
 
@@ -580,6 +693,9 @@ impl Cma {
                 self.deaths = self.deaths.split_off(self.deaths.len() - DEATH_LEDGER_CAP);
             }
         }
+        /* H-07: the exact-text index is derived state — re-derive it from
+         * whatever the file carried (legacy files included). */
+        self.rebuild_text_index();
         true
     }
 
@@ -801,12 +917,27 @@ impl Cma {
                 their_created = 0;
             }
 
-            /* Dedup: a near-duplicate of an existing live record merges. */
-            let dup = if self.records.is_empty() {
+            /* Dedup: a near-duplicate of an existing live record merges.
+             * H-07: same two-stage policy as remember() — the exact-text
+             * index first (O(1)), then the bounded vector gate. */
+            if let Some(dup_id) = self.live_id_for_text(text) {
+                if sq_dist(self.index.vector(dup_id), v).sqrt() < DUP_DISTANCE {
+                    let rec = &mut self.records[dup_id as usize];
+                    if their_strength > rec.strength {
+                        rec.strength = their_strength;
+                    }
+                    if their_created > 0 && (rec.created_at == 0 || their_created < rec.created_at) {
+                        rec.created_at = their_created; /* earliest sighting wins */
+                    }
+                    stats.merged += 1;
+                    continue;
+                }
+            }
+            let dup = if self.records.is_empty() || !self.dup_gate {
                 None
             } else {
                 self.index
-                    .search(v, 1)
+                    .search_with_ef(v, 1, DUP_GATE_EF)
                     .first()
                     .copied()
                     .filter(|(id, d)| {
@@ -847,6 +978,12 @@ impl Cma {
             }
             self.records.push(rec);
             self.index.add_vector(v);
+            /* H-07: keep the exact-text index complete — an imported fact is
+             * a real record, and a later remember() of the same words must
+             * resolve it in O(1) instead of a graph search. */
+            if !text.is_empty() {
+                self.text_index.insert(text.to_string(), id);
+            }
             stats.added += 1;
         }
         stats
@@ -893,6 +1030,17 @@ impl Cma {
 
     /// B1.2: remember + record where the memory came from. A near-duplicate
     /// keeps its ORIGINAL source (the first sighting is the provenance).
+    ///
+    /// H-07 (AUDIT-2026-10-29): the duplicate decision is made in two
+    /// stages, cheapest first —
+    ///   1. EXACT TEXT: `text_index` resolves the same string to its record
+    ///      in O(1); one distance to that record settles it (`DIM` flops,
+    ///      no search). Identical facts therefore never touch the graph.
+    ///   2. VECTOR GATE: only when the text is new (or the same text embeds
+    ///      somewhere else) does the 0.05-radius HNSW probe run, at
+    ///      `DUP_GATE_EF` (k=1) and only if `dup_gate` is on.
+    /// Before this, EVERY insert ran stage 2 across the whole index — the
+    /// measured 409–410 facts/s.
     pub fn remember_with_source(
         &mut self,
         vec: &[f32],
@@ -902,9 +1050,24 @@ impl Cma {
         source: &str,
     ) -> i32 {
         debug_assert_eq!(vec.len(), self.vec_dim);
-        // Near-duplicate gate: reinforce if a very close memory exists.
-        if !self.records.is_empty() {
-            let hits = self.index.search(vec, 1);
+        /* Stage 1: exact text. */
+        if let Some(dup_id) = self.live_id_for_text(text) {
+            let same_place = sq_dist(self.index.vector(dup_id), vec).sqrt() < DUP_DISTANCE;
+            if same_place {
+                let rec = &mut self.records[dup_id as usize];
+                rec.strength = 1.0;
+                rec.age_seconds = 0;
+                self.mark_dirty(dup_id);
+                return dup_id as i32;
+            }
+            /* Same words, different embedding (re-said in a new context):
+             * not a duplicate by construction — fall through so the vector
+             * gate can still fold it into a near neighbour, and let the
+             * insert record the newer sighting in the text index. */
+        }
+        /* Stage 2: near-duplicate gate (optional, bounded). */
+        if self.dup_gate && !self.records.is_empty() {
+            let hits = self.index.search_with_ef(vec, 1, DUP_GATE_EF);
             if let Some((dup_id, dist)) = hits.first() {
                 if *dist < DUP_DISTANCE {
                     let rec = &mut self.records[*dup_id as usize];
@@ -923,28 +1086,52 @@ impl Cma {
         rec.source = source.to_string();
         self.records.push(rec);
         self.index.add_vector(vec);
+        if !text.is_empty() {
+            self.text_index.insert(text.to_string(), id);
+        }
         self.mark_dirty(id);
         id as i32
     }
 
     /// Recall top-k memories with composite scoring (strength × tier ×
     /// resonance), gravity boost, and reinforcement.
+    ///
+    /// H-07 (AUDIT-2026-10-29): the candidate set comes from the HNSW
+    /// graph search at a BOUNDED width. The old default frontier was
+    /// `pool * 4` (128 for a top-5 query), which is wide enough that on a
+    /// real graph the early-exit bound almost never fires — the search
+    /// walked most of the corpus and the latency curve read as a linear
+    /// scan (`0.9 ms + 1.07 µs · n`). Two documented fallbacks remain:
+    ///   · a corpus at or below `HNSW_SMALL_GRAPH` is searched EXACTLY
+    ///     (frontier = n): small brains get the true top-k, and every
+    ///     ranking fixture keeps its pinned numbers;
+    ///   · an explicit `set_ef_search` / SOFUU_BRAIN_EF_SEARCH always
+    ///     wins, so an operator can still buy recall with latency.
     pub fn recall(&mut self, query: &[f32], top_k: usize) -> Vec<RecallHit> {
         if self.records.is_empty() && self.working.is_empty() {
             return Vec::new();
         }
-        /* Candidate pool: the search returns the closest `pool` records.
-         * B5.3: SOFUU_BRAIN_EF_SEARCH (or set_ef_search) widens the search
-         * itself; unset keeps the pre-B5 width exactly. */
+        /* Candidate pool: the search returns the closest `pool` records. */
         let pool = (top_k * 3).max(32);
-        let ef = self.ef_search.unwrap_or((pool * 4).max(8));
+        let n = self.index.len();
+        let ef = match self.ef_search {
+            Some(ef) => ef,
+            None if n <= crate::memory::hnsw::HNSW_SMALL_GRAPH => n.max(1),
+            None => pool.max(RECALL_EF_MIN),
+        };
         let mut hits = self.index.search_with_ef(query, pool, ef);
         let now = now_secs();
         // Filter forgotten + too-weak, score.
         let mut scored: Vec<(u32, f32, f32)> = Vec::new(); // (id, dist, score)
         for (id, dist) in hits.drain(..) {
             let rec = &self.records[id as usize];
-            if rec.tier == TIER_FORGOTTEN || rec.strength < FORGET_FLOOR {
+            /* H-08: a PIN is never filtered by strength. It decays like
+             * everything else (the curve is unchanged), but an explicitly
+             * remembered fact must stay recallable forever — the audit
+             * found pins dropped from recall after ~3 idle days while
+             * retain() kept them on disk: retained, but unreachable. */
+            let pinned = is_pinned(rec);
+            if rec.tier == TIER_FORGOTTEN || (!pinned && rec.strength < FORGET_FLOOR) {
                 continue;
             }
             let tier_w = match rec.tier {
@@ -954,7 +1141,16 @@ impl Cma {
                 _ => 0.8,
             };
             let norm = dist / (dist + 1.0);
-            let mut score = (1.0 - norm) * rec.strength * tier_w;
+            /* H-08: rank a pin as if it had never decayed. Lifecycle
+             * (decay, retention, on-disk strength) is untouched — only the
+             * ordering term is floored, so an aged pin cannot be buried by
+             * a fresh, unrelated row with a tiny cosine edge. */
+            let rank_strength = if pinned {
+                rec.strength.max(PIN_RANK_STRENGTH)
+            } else {
+                rec.strength
+            };
+            let mut score = (1.0 - norm) * rank_strength * tier_w;
             // Resonance: engagement history boost (max ~30%).
             if rec.total_recalls > 0 {
                 let ratio = ((rec.positive_recalls as f32 + 1.0).ln())
@@ -1262,6 +1458,14 @@ impl Cma {
         if let Some(rec) = self.records.get_mut(id as usize) {
             rec.tier = TIER_FORGOTTEN;
             rec.death_reason = Some("forget".to_string());
+            /* H-07: a tombstoned row must not resolve an exact-text insert —
+             * forgetting a fact and remembering it again is a NEW sighting.
+             * `live_id_for_text` checks the tier anyway; dropping the entry
+             * here keeps the index from accumulating one per forgotten row. */
+            let gone = rec.text.clone();
+            if !gone.is_empty() && self.text_index.get(&gone) == Some(&id) {
+                self.text_index.remove(&gone);
+            }
             self.mark_dirty(id);
             true
         } else {
@@ -1300,7 +1504,12 @@ impl Cma {
         let is_dead = |rec: &Record| match rec.tier {
             TIER_FORGOTTEN => true,
             TIER_ENTITY => false,
-            _ => rec.strength < FORGET_FLOOR && rec.role != PIN_ROLE,
+            /* H-08: `is_pinned`, not just the Rust-side PIN_ROLE — the JS
+             * /remember path marks pins with `source = "pin"`, and a pin
+             * that retain() pruned was silently unrecoverable (the audit's
+             * "retained on disk, invisible to recall" was really "kept by
+             * role, dropped by any other spelling"). */
+            _ => rec.strength < FORGET_FLOOR && !is_pinned(rec),
         };
         /* Nothing dead → keep records/vectors/index exactly as they are
          * (the cheap no-op path a healthy brain hits every turn). */
@@ -1322,7 +1531,13 @@ impl Cma {
                     .death_reason
                     .clone()
                     .unwrap_or_else(|| "decay".to_string());
-                dead_notes.push((rec.text.clone(), reason));
+                /* R-26: a consolidated row was ALREADY ledged by
+                 * consolidate() when it became a tombstone — the physical
+                 * prune must not enter it twice. Every other death is only
+                 * observable here (the row is about to vanish). */
+                if rec.death_reason.as_deref() != Some("consolidated") {
+                    dead_notes.push((rec.text.clone(), reason));
+                }
                 continue;
             }
             remap.insert(rec.id, kept_records.len() as u32);
@@ -1347,6 +1562,8 @@ impl Cma {
         for v in &kept_vectors {
             self.index.add_vector(v);
         }
+        /* H-07: every id moved — the exact-text index is positional too. */
+        self.rebuild_text_index();
         /* B3.2: survivors renumbered — every persisted id is stale, so the
          * incremental path cannot express this. The next flush compacts. */
         self.dirty_ids.clear();
@@ -1404,6 +1621,8 @@ impl Cma {
         for v in &kept_vectors {
             self.index.add_vector(v);
         }
+        /* H-07: survivors renumbered — re-derive the exact-text index. */
+        self.rebuild_text_index();
         /* Survivors renumbered — the incremental store path cannot express
          * this, so the next flush rewrites (same contract as retain()). */
         self.dirty_ids.clear();
@@ -1419,24 +1638,34 @@ impl Cma {
         name: &str,
         etype: &str,
     ) -> i32 {
-        for rec in self.records.iter_mut() {
-            if rec.tier == TIER_ENTITY
-                && rec.entity_name.as_deref() == Some(name)
-            {
-                rec.text = text.to_string();
-                rec.strength = 1.0;
-                rec.age_seconds = 0;
-                // ml-5 (AUDIT-2026-09-07): the old upsert replaced only the
-                // side Vec and left the search store stale — the drift the
-                // audit flagged. The HNSW store IS the single vector store;
-                // set_vector lands the upsert there (search sees the new
-                // coordinates; neighbor links keep old-geometry decisions,
-                // the same trade C makes by memcpying without re-adding).
-                self.index.set_vector(rec.id, vec);
-                let id = rec.id;
-                self.mark_dirty(id);
-                return id as i32;
+        /* The upsert arm. Written as a find-then-mutate so the exact-text
+         * index (H-07) can be updated alongside: an entity's text is
+         * REPLACED here, and a stale `text -> id` entry would hand a later
+         * identical fact to the wrong row. */
+        let existing = self.records.iter().position(|rec| {
+            rec.tier == TIER_ENTITY && rec.entity_name.as_deref() == Some(name)
+        });
+        if let Some(i) = existing {
+            let id = self.records[i].id;
+            let old_text = std::mem::take(&mut self.records[i].text);
+            self.records[i].text = text.to_string();
+            self.records[i].strength = 1.0;
+            self.records[i].age_seconds = 0;
+            // ml-5 (AUDIT-2026-09-07): the old upsert replaced only the
+            // side Vec and left the search store stale — the drift the
+            // audit flagged. The HNSW store IS the single vector store;
+            // set_vector lands the upsert there (search sees the new
+            // coordinates; neighbor links keep old-geometry decisions,
+            // the same trade C makes by memcpying without re-adding).
+            self.index.set_vector(id, vec);
+            if !old_text.is_empty() && self.text_index.get(&old_text) == Some(&id) {
+                self.text_index.remove(&old_text);
             }
+            if !text.is_empty() {
+                self.text_index.insert(text.to_string(), id);
+            }
+            self.mark_dirty(id);
+            return id as i32;
         }
         /* Entity identity lands ONLY on a genuinely fresh insert. If the
          * dup gate merged us into an existing row, re-tiering it here
@@ -1498,7 +1727,7 @@ impl Cma {
             .iter()
             .filter(|r| {
                 r.tier == TIER_EPISODIC
-                    && r.role != PIN_ROLE
+                    && !is_pinned(r)
                     && r.strength < 0.25
                     && r.age_seconds > 86400
             })
@@ -1572,12 +1801,19 @@ impl Cma {
             summaries.push((ci, summary));
         }
         for &wid in &weak {
+            let text = self.records[wid as usize].text.clone();
             let rec = &mut self.records[wid as usize];
             rec.tier = TIER_FORGOTTEN;
             /* M2: a consolidated fact is not lost — it lives inside the
              * semantic summary — so the reason says exactly that. */
             rec.death_reason = Some("consolidated".to_string());
             self.mark_dirty(wid);
+            /* R-26 (AUDIT-2026-10-29): consolidation IS a death, and it
+             * must be on the ledger at the moment it happens. Without this
+             * the ledger only ever held retain()'s physical prunes, so
+             * `decay_eval`'s "every death is a consolidation" assertion ran
+             * over an empty collection and could never fail. */
+            self.ledger_death(&text, "consolidated");
         }
         let mut consolidated = 0usize;
         for (ci, summary) in summaries {
@@ -2232,6 +2468,144 @@ mod tests {
         // No-op retain reports zero and changes nothing.
         assert_eq!(cma.retain(), 0);
         assert_eq!(cma.records.len(), 3);
+    }
+
+    /* ── H-08 (AUDIT-2026-10-29): pins never become unrecallable ─────── */
+
+    /// The audit's exact failure: a pinned fact decays below FORGET_FLOOR
+    /// (0.0498 at ~3 days) and recall() filters it out, returning an
+    /// unrelated record instead. After 30 days — and after retain(), and
+    /// after a reload — the pin must still come back at distance ~0.
+    #[test]
+    fn pinned_fact_recalls_at_distance_zero_after_thirty_days() {
+        for (role, source) in [(PIN_ROLE, ""), ("user", "pin"), ("pin", "")] {
+            let mut cma = Cma::new(8);
+            let pin_v = unit(3, 8);
+            let pin = cma.remember_with_source(&pin_v, "the deploy bucket is sofuu-dist", role, 0, source)
+                as u32;
+            /* A fresh, unrelated record that used to win the slot once the
+             * pin's strength term collapsed. */
+            cma.remember(&unit(6, 8), "an unrelated entity", "user", 0);
+            /* 30 days of e-folding decay at the 1-day default. */
+            cma.decay_tick(30 * 86400);
+            assert!(
+                cma.records[pin as usize].strength < FORGET_FLOOR,
+                "{role}/{source}: the pin must really be below the floor (strength {})",
+                cma.records[pin as usize].strength
+            );
+
+            let hits = cma.recall(&pin_v, 5);
+            assert_eq!(
+                hits.first().map(|h| h.id),
+                Some(pin),
+                "{role}/{source}: a pinned fact must be the top hit of its own query"
+            );
+            assert!(
+                hits[0].distance < 0.01,
+                "{role}/{source}: the pin must come back at distance ~0, got {}",
+                hits[0].distance
+            );
+
+            /* …and it survives the retention sweep and a reload. */
+            cma.retain();
+            assert!(
+                cma.records.iter().any(|r| r.text == "the deploy bucket is sofuu-dist"),
+                "{role}/{source}: retain() must not prune a pin"
+            );
+            let n = cma.len();
+            let mut vecs = Vec::with_capacity(n * 8);
+            for i in 0..n {
+                vecs.extend_from_slice(cma.index.vector(i as u32));
+            }
+            let mut reloaded = Cma::new(8);
+            assert!(reloaded.hydrate(&vecs, n, 8, &cma.records_json()));
+            let after = reloaded.recall(&pin_v, 5);
+            assert!(
+                after.iter().any(|h| h.text == "the deploy bucket is sofuu-dist" && h.distance < 0.01),
+                "{role}/{source}: a reloaded pin must still recall at distance ~0"
+            );
+        }
+    }
+
+    /// The pin's RANK is floored, not its lifecycle: decay still moves the
+    /// stored strength (the documented e-folding law is untouched), but the
+    /// ordering term can never fall under a fresh row's — a zero-strength
+    /// pin beside a live row would otherwise score 0 and lose its own
+    /// neighbourhood.
+    #[test]
+    fn pin_ranking_strength_is_floored_at_one() {
+        let mut cma = Cma::new(4);
+        let pin_v = [1.0f32, 0.1, 0.0, 0.0];
+        let pin = cma.remember(&pin_v, "pinned anchor", PIN_ROLE, 0) as u32;
+        let other_v = [0.0f32, 1.0, 0.0, 0.0];
+        let other = cma.remember(&other_v, "fresh unrelated fact", "user", 0) as u32;
+        cma.decay_tick(90 * 86400);
+        /* The unrelated row is refreshed to model a live record; the pin
+         * keeps the strength 90 idle days left it with. */
+        cma.records[other as usize].strength = 1.0;
+        assert!(
+            cma.records[pin as usize].strength < PIN_RANK_STRENGTH,
+            "the stored strength still decayed — only the ranking term is floored"
+        );
+
+        let query = [1.0f32, 0.2, 0.0, 0.0];
+        let hits = cma.recall(&query, 5);
+        assert_eq!(hits.len(), 2, "both rows are recallable");
+        assert_eq!(
+            hits[0].id, pin,
+            "the pin is the nearest record and must rank first despite its decayed strength"
+        );
+    }
+
+    /* ── H-07 (AUDIT-2026-10-29): O(1) exact-text duplicate gate ─────── */
+
+    /// An identical string is resolved by the text index alone — with the
+    /// VECTOR gate switched off (the ingest knob) the dup still merges, so
+    /// the merge demonstrably did not come from a graph search. A
+    /// same-text/different-vector sighting still inserts, which is what
+    /// every ranking fixture relies on.
+    #[test]
+    fn exact_text_duplicate_merges_without_the_vector_gate() {
+        let mut cma = Cma::new(8);
+        cma.set_dup_gate(false);
+        let v = unit(2, 8);
+        let first = cma.remember(&v, "the port is 8080", "user", 0) as u32;
+        let again = cma.remember(&v, "the port is 8080", "user", 0) as u32;
+        assert_eq!(again, first, "identical text+vector is one fact");
+        assert_eq!(cma.len(), 1, "no second row, and no graph search involved");
+
+        /* Same words, a genuinely different embedding: a distinct record
+         * (the vector gate is off, so nothing may fold it either). */
+        let other = cma.remember(&unit(5, 8), "the port is 8080", "user", 0) as u32;
+        assert_ne!(other, first, "same text, different meaning → its own row");
+        assert_eq!(cma.len(), 2);
+        /* The index points at the newest sighting, and forgetting the
+         * newest re-opens the slot instead of resurrecting a tombstone. */
+        assert_eq!(cma.text_index.get("the port is 8080"), Some(&other));
+        cma.forget(other);
+        let revived = cma.remember(&unit(5, 8), "the port is 8080", "user", 0) as u32;
+        assert_ne!(revived, other, "a forgotten fact re-inserts, it does not revive");
+        assert_eq!(cma.len(), 3);
+    }
+
+    /// The vector gate still merges paraphrases (different text, same
+    /// place) — the behaviour `duplicate_reinforces` pins — and it is
+    /// skippable per store.
+    #[test]
+    fn vector_gate_is_optional_but_on_by_default() {
+        assert!(Cma::new(4).dup_gate, "the shipped default keeps the fuzzy gate");
+        let mut cma = Cma::new(4);
+        let mut v = vec![0.0; 4];
+        v[0] = 1.0;
+        cma.remember(&v, "a", "user", 0);
+        cma.remember(&v, "a again", "user", 0);
+        assert_eq!(cma.len(), 1, "near-duplicate text still folds into one row");
+
+        let mut off = Cma::new(4);
+        off.set_dup_gate(false);
+        off.remember(&v, "a", "user", 0);
+        off.remember(&v, "a again", "user", 0);
+        assert_eq!(off.len(), 2, "gate off → distinct texts stay distinct rows");
     }
 
     /// ml-3: hostile brain metadata carrying `half_life: 0` must

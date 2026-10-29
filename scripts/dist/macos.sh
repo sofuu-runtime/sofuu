@@ -70,6 +70,8 @@ build_arch() {
     cp "$DIST/libsofuu-darwin-$ARCH.a" "$TARBALL_DIR/" 2>/dev/null || true
     cp "$DIST/libsofuu-darwin-$ARCH.dylib" "$TARBALL_DIR/" 2>/dev/null || true
     cp include/sofuu_embed.h "$TARBALL_DIR/"
+    # H-06: an archive without LICENSE/NOTICE is a redistribution violation.
+    bash scripts/pack/stage_legal.sh "$TARBALL_DIR" "$PWD" >/dev/null 2>&1 || true
     tar -czf "$DIST/libsofuu-darwin-$ARCH.tar.gz" -C "$DIST" "$(basename $TARBALL_DIR)"
     rm -rf "$TARBALL_DIR"
 

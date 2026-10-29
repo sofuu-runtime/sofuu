@@ -1315,57 +1315,292 @@ mod impl_qtsq {
      * B3 (ROADMAP-BRAIN-CMA): segmented brain store
      * ══════════════════════════════════════════════════════════════ */
 
+    /// R-25 (AUDIT-2026-10-29): what one segment store's load had to give
+    /// up. A torn segment used to abort the WHOLE brain — `segment …
+    /// failed its digest check — refusing to open` → `Failed to initialize
+    /// CMA` — losing every previously flushed record along with the one
+    /// file in flight. The scan recovers the maximum consistent set
+    /// instead, and reports exactly what it dropped.
+    #[derive(Default)]
+    struct SegScan {
+        /// Surviving records, in dense id order (ids remapped on a gap).
+        recs: Vec<crate::rt::brain_store::SegRecord>,
+        /// Manifest entries for the files that survived, carrying the
+        /// digest of the bytes that were actually read.
+        segments: Vec<crate::rt::brain_store::SegmentMeta>,
+        /// Files moved aside as `<file>.torn` (bytes preserved for salvage).
+        quarantined: Vec<String>,
+        /// Segments whose published digest did not match but whose bytes
+        /// read cleanly — the crash window between a segment publish and the
+        /// manifest publish. Adopted, not dropped.
+        adopted: Vec<String>,
+        /// Files the manifest lists that are not on disk at all.
+        missing: Vec<String>,
+        /// Record VERSIONS lost with those files. An upper bound on lost
+        /// memories: a later version of the same id may have survived.
+        dropped_versions: usize,
+        any_legacy: bool,
+        /// A gap in the survivor ids forced a renumbering.
+        renumbered: bool,
+    }
+
+    impl SegScan {
+        fn damaged(&self) -> bool {
+            !self.quarantined.is_empty()
+                || !self.adopted.is_empty()
+                || !self.missing.is_empty()
+                || self.renumbered
+        }
+    }
+
+    /// R-25: verify and read every segment the manifest lists, quarantining
+    /// what cannot be trusted. This never fails on a per-segment problem —
+    /// that is the whole point: the caller opens whatever survived.
+    unsafe fn scan_segments(path: &str, m: &crate::rt::brain_store::Manifest) -> SegScan {
+        let dir = crate::rt::brain_store::segments_dir(path);
+        let mut scan = SegScan::default();
+        let mut by_id: std::collections::BTreeMap<u32, crate::rt::brain_store::SegRecord> =
+            std::collections::BTreeMap::new();
+        for seg in &m.segments {
+            let file = format!("{dir}/{}", seg.file);
+            if !std::path::Path::new(&file).exists() {
+                eprintln!(
+                    "[sofuu/cma] SEGMENT DAMAGE: {} is MISSING from {dir} — dropping the {} record(s) it carried, opening the rest",
+                    seg.file, seg.records
+                );
+                scan.missing.push(seg.file.clone());
+                scan.dropped_versions += seg.records;
+                continue;
+            }
+            /* Verify the published digest BEFORE reading: the codec accepts
+             * a truncated container as a valid, silently-shortened one, so
+             * without this a torn segment would read as a brain that
+             * quietly lost records. */
+            let digest = crate::rt::brain_store::file_digest(&file);
+            let verified =
+                seg.sha256.is_empty() || digest.as_deref() == Some(seg.sha256.as_str());
+            let (recs, legacy) = match crate::rt::brain_store::read_segment_ex(&file) {
+                Ok(v) => v,
+                Err(_) => {
+                    eprintln!(
+                        "[sofuu/cma] SEGMENT DAMAGE: {} {} — quarantining it ({} record(s) dropped) and opening the rest",
+                        seg.file,
+                        if seg.sha256.is_empty() || verified {
+                            "cannot be read"
+                        } else {
+                            "failed its digest check and cannot be read"
+                        },
+                        seg.records
+                    );
+                    match crate::rt::wal::quarantine(&file) {
+                        Some(q) => {
+                            eprintln!("[sofuu/cma]   torn segment preserved as {q}");
+                            scan.quarantined.push(seg.file.clone());
+                        }
+                        None => {
+                            eprintln!(
+                                "[sofuu/cma]   could not quarantine {file} — leaving it in place"
+                            );
+                            scan.missing.push(seg.file.clone());
+                        }
+                    }
+                    scan.dropped_versions += seg.records;
+                    continue;
+                }
+            };
+            if !verified {
+                /* The bytes are a VALID segment, just not the ones the
+                 * manifest describes: the writer crashed between publishing
+                 * the segment and publishing the manifest. Adopt the newer
+                 * bytes — dropping them would throw away the very flush that
+                 * was in flight. */
+                eprintln!(
+                    "[sofuu/cma] SEGMENT DAMAGE: {} does not match its manifest digest but reads cleanly — the manifest was STALE (crash between segment and manifest publish); adopting the {} record(s) it carries",
+                    seg.file,
+                    recs.len()
+                );
+                scan.adopted.push(seg.file.clone());
+            }
+            scan.any_legacy |= legacy;
+            scan.segments.push(crate::rt::brain_store::SegmentMeta {
+                file: seg.file.clone(),
+                records: recs.len(),
+                /* A legacy (digest-less) entry stays shape-verified; an
+                 * adopted one is re-pinned to the bytes we just read. */
+                sha256: if seg.sha256.is_empty() {
+                    String::new()
+                } else {
+                    digest.clone().unwrap_or_else(|| seg.sha256.clone())
+                },
+            });
+            for r in recs {
+                by_id.insert(r.id, r);
+            }
+        }
+
+        /* Ids must be dense: the HNSW store indexes vectors by position and
+         * hydrate assigns ids by position. A dropped segment can leave a
+         * gap, so survivors are renumbered (co-recall partners remapped with
+         * them) instead of refusing the brain. */
+        let renumbered = by_id
+            .keys()
+            .enumerate()
+            .any(|(i, id)| *id as usize != i);
+        scan.renumbered = renumbered;
+        let mut remap: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::with_capacity(by_id.len());
+        for (i, (id, mut r)) in by_id.into_iter().enumerate() {
+            if renumbered {
+                remap.insert(id, i as u32);
+                r.id = i as u32;
+            }
+            scan.recs.push(r);
+        }
+        if renumbered {
+            eprintln!(
+                "[sofuu/cma] {} record id(s) were renumbered to keep the store dense after the damage",
+                scan.recs.len()
+            );
+            for (i, r) in scan.recs.iter_mut().enumerate() {
+                if let Some(o) = r.meta.as_object_mut() {
+                    if let Some(arr) = o.get("corecall_ids").and_then(|v| v.as_array()) {
+                        let mapped: Vec<serde_json::Value> = arr
+                            .iter()
+                            .filter_map(|v| v.as_u64())
+                            .filter_map(|old| remap.get(&(old as u32)).copied())
+                            .map(|new| serde_json::json!(new))
+                            .collect();
+                        o.insert("corecall_ids".into(), serde_json::Value::Array(mapped));
+                    }
+                    o.insert("vector_index".into(), serde_json::json!(i));
+                }
+            }
+        } else {
+            /* Pristine path: identical to the pre-R-25 loader. */
+            for (i, r) in scan.recs.iter_mut().enumerate() {
+                if let Some(o) = r.meta.as_object_mut() {
+                    o.insert("vector_index".into(), serde_json::json!(i));
+                }
+            }
+        }
+        scan
+    }
+
+    /// R-25: make the on-disk store describe the bytes that survived.
+    ///
+    /// A renumbered store is rewritten into a FRESH generation (ids must be
+    /// dense, which no append can express); otherwise the surviving segment
+    /// files stay and only the manifest is re-published, with digests taken
+    /// from the files themselves. Both writes use the same
+    /// stage → fsync → rename → fsync-dir sequence (and the intent journal)
+    /// the flush path uses: a crash here leaves either the old manifest or
+    /// the new one, never a half-written pair.
+    ///
+    /// Returns `(segments, epoch, healed)`.
+    unsafe fn heal_store(
+        path: &str,
+        m: &crate::rt::brain_store::Manifest,
+        scan: &SegScan,
+    ) -> (Vec<crate::rt::brain_store::SegmentMeta>, u64, bool) {
+        let dir = crate::rt::brain_store::segments_dir(path);
+        let mut segments = scan.segments.clone();
+        let mut epoch = m.epoch.max(1);
+        if scan.renumbered && !scan.recs.is_empty() {
+            let dim = scan.recs[0].vec.len();
+            epoch += 1;
+            match write_segment_chunks(&dir, epoch, 1, dim, &scan.recs) {
+                Ok(segs) => segments = segs,
+                Err(_) => {
+                    eprintln!(
+                        "[sofuu/cma] could not write the repaired generation for {path} — the next flush will retry"
+                    );
+                    return (m.segments.clone(), m.epoch.max(1), false);
+                }
+            }
+        }
+        let manifest = crate::rt::brain_store::Manifest {
+            schema: crate::rt::brain_store::SEGMENT_SCHEMA.to_string(),
+            embedding: m.embedding.clone(),
+            segments: segments.clone(),
+            epoch,
+            last_decay_at: m.last_decay_at,
+            evicted_total: m.evicted_total,
+            records: scan.recs.len() as u64,
+        };
+        let tmp = format!("{path}.tmp");
+        if crate::rt::brain_store::write_manifest(&tmp, &manifest).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return (m.segments.clone(), m.epoch.max(1), false);
+        }
+        let parent = std::path::Path::new(path)
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
+        let mut journal = crate::rt::wal::Journal::begin(&parent);
+        let recorded = journal
+            .as_mut()
+            .map(|j| j.record(&tmp, path))
+            .unwrap_or(false);
+        if !crate::rt::wal::publish(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return (m.segments.clone(), m.epoch.max(1), false);
+        }
+        if recorded {
+            if let Some(j) = journal {
+                j.commit();
+            }
+        }
+        /* Superseded generations are swept only AFTER the new manifest is
+         * durable (age-guarded, exactly like the flush path). */
+        let keep: Vec<String> = segments.iter().map(|s| s.file.clone()).collect();
+        crate::rt::brain_store::remove_orphan_segments(&dir, &keep, 600);
+        eprintln!(
+            "[sofuu/cma] repaired the store at {path}: {} segment(s), {} record(s) — dropped {} record version(s)",
+            segments.len(),
+            scan.recs.len(),
+            scan.dropped_versions
+        );
+        (segments, epoch, true)
+    }
+
     /// Load a segmented brain: every segment in manifest order, later
     /// entries overriding earlier ones by id (the append-only update log).
+    ///
+    /// R-25 (AUDIT-2026-10-29): a segment that fails verification no longer
+    /// takes the brain with it. The maximum consistent set is loaded, the
+    /// bad file is quarantined as `<file>.torn`, and the store is repaired on
+    /// disk before it is handed back — so `Err` now means only "not a brain
+    /// this build can read at all" (no manifest / wrong key).
     unsafe fn load_segmented(
         path: &str,
         m: &crate::rt::brain_store::Manifest,
     ) -> Result<(BrainData, BrainLayout), c_int> {
         let dir = crate::rt::brain_store::segments_dir(path);
-        let mut by_id: std::collections::BTreeMap<u32, crate::rt::brain_store::SegRecord> =
-            std::collections::BTreeMap::new();
-        let mut any_legacy = false;
-        for seg in &m.segments {
-            let file = format!("{dir}/{}", seg.file);
-            /* Verify the published digest BEFORE reading: the codec accepts
-             * a truncated container as a valid, silently-shortened one, so
-             * without this a torn segment would read as a brain that
-             * quietly lost records. */
-            if !seg.sha256.is_empty() {
-                match crate::rt::brain_store::file_digest(&file) {
-                    Some(d) if d == seg.sha256 => {}
-                    _ => {
-                        eprintln!(
-                            "[sofuu/cma] segment {} failed its digest check — refusing to open",
-                            seg.file
-                        );
-                        return Err(qtsq::QTSQ_ERR_FORMAT);
-                    }
-                }
-            }
-            let (recs, legacy) = crate::rt::brain_store::read_segment_ex(&file)?;
-            any_legacy |= legacy;
-            for r in recs {
-                by_id.insert(r.id, r);
-            }
+        let scan = scan_segments(path, m);
+        let (segments, epoch, healed) = if scan.damaged() {
+            heal_store(path, m, &scan)
+        } else {
+            (m.segments.clone(), m.epoch.max(1), true)
+        };
+        if !healed {
+            eprintln!(
+                "[sofuu/cma] opening {path} from a DAMAGED store in memory — the next flush rewrites it"
+            );
         }
-        let n = by_id.len();
+        let n = scan.recs.len();
         let mut flat: Vec<f32> = Vec::new();
         let mut metas: Vec<serde_json::Value> = Vec::with_capacity(n);
-        for (expected, (id, r)) in by_id.iter().enumerate() {
-            /* Ids must be dense: the HNSW store indexes vectors by position,
-             * and hydrate assigns ids by position. A gap means the store is
-             * corrupt (or was written by something that does not compact) —
-             * refuse rather than silently renumber. */
-            if *id as usize != expected {
-                return Err(qtsq::QTSQ_ERR_FORMAT);
-            }
+        for r in &scan.recs {
             flat.extend_from_slice(&r.vec);
-            let mut meta = r.meta.clone();
-            if let Some(o) = meta.as_object_mut() {
-                o.insert("vector_index".into(), serde_json::json!(expected));
-            }
-            metas.push(meta);
+            metas.push(r.meta.clone());
+        }
+        if !scan.quarantined.is_empty() || !scan.missing.is_empty() {
+            eprintln!(
+                "[sofuu/cma] RECOVERY: {path} opens with {n} record(s); {} torn segment(s) quarantined, {} missing, {} record version(s) dropped (see the .torn files beside the store)",
+                scan.quarantined.len(),
+                scan.missing.len(),
+                scan.dropped_versions
+            );
         }
         let meta_json = serde_json::json!({
             "schema": "sofuu-cma@2",
@@ -1375,15 +1610,16 @@ mod impl_qtsq {
         .to_string();
         let layout = BrainLayout {
             dir,
-            segments: m.segments.clone(),
-            epoch: m.epoch.max(1),
+            segments,
+            epoch,
             persisted: n,
             last_decay_at: m.last_decay_at,
             evicted_total: m.evicted_total,
             /* B4: a legacy-encrypted store rewrites under the machine key on
              * its next flush — the same full-rewrite path a compaction uses,
-             * so the re-encryption needs no separate machinery. */
-            needs_compaction: any_legacy,
+             * so the re-encryption needs no separate machinery. A store that
+             * could not be healed on disk also rides that rewrite. */
+            needs_compaction: scan.any_legacy || !healed,
         };
         Ok((
             BrainData {
@@ -1392,10 +1628,72 @@ mod impl_qtsq {
                 dim: 0, /* filled by the caller from the manifest */
                 meta: Some(meta_json),
                 found_memories: n > 0,
-                legacy_encryption: any_legacy,
+                legacy_encryption: scan.any_legacy,
             },
             layout,
         ))
+    }
+
+    /// R-25 (AUDIT-2026-10-29): the repair pass behind
+    /// `rt::memory::repair(path)`. It runs the SAME scan + heal the open
+    /// path runs — one implementation, so a CLI repair and a resilient open
+    /// can never disagree about what "recoverable" means — and reports what
+    /// it found instead of only logging it.
+    pub fn repair_brain(path: &str) -> super::RepairReport {
+        let mut report = super::RepairReport::default();
+        unsafe {
+            let manifest = match crate::rt::brain_store::read_manifest_ex(path) {
+                Ok(Some((m, _))) => m,
+                Ok(None) => {
+                    report.message = format!(
+                        "{path}: not a segmented brain (absent, legacy single-file, or a foreign file) — nothing to repair"
+                    );
+                    return report;
+                }
+                Err(rc) => {
+                    report.message = format!(
+                        "{path}: a container this key cannot open (rc {rc}) — the bytes are unreadable, so there is nothing to repair and the file is left untouched"
+                    );
+                    return report;
+                }
+            };
+            report.found = true;
+            let scan = scan_segments(path, &manifest);
+            report.records = scan.recs.len();
+            report.quarantined = scan.quarantined.clone();
+            report.adopted = scan.adopted.clone();
+            report.missing = scan.missing.clone();
+            report.records_dropped = scan.dropped_versions;
+            let (segments, _epoch, healed) = if scan.damaged() {
+                heal_store(path, &manifest, &scan)
+            } else {
+                (manifest.segments.clone(), manifest.epoch.max(1), true)
+            };
+            report.segments = segments.len();
+            report.rewritten = scan.damaged() && healed;
+            report.ok = healed;
+            report.message = if !scan.damaged() {
+                format!(
+                    "{path}: healthy — {} segment(s), {} record(s)",
+                    segments.len(),
+                    scan.recs.len()
+                )
+            } else if healed {
+                format!(
+                    "{path}: repaired — {} segment(s), {} record(s) kept, {} quarantined, {} record version(s) dropped",
+                    segments.len(),
+                    scan.recs.len(),
+                    scan.quarantined.len(),
+                    scan.dropped_versions
+                )
+            } else {
+                format!(
+                    "{path}: damaged and NOT repaired on disk (see the warnings above) — opening still recovers {} record(s) in memory",
+                    scan.recs.len()
+                )
+            };
+        }
+        report
     }
 
     /// Write `recs` as one or more bounded segments, each published
@@ -1501,8 +1799,46 @@ mod impl_qtsq {
         }
     }
 
-    /// B3.2: append only what changed — new records plus the dirty set —
-    /// to the bounded active segment. Everything else on disk is untouched.
+    /// R-25: the next free segment sequence for the current generation —
+    /// one past the highest the manifest lists AND one past anything the
+    /// directory already holds, so a crashed writer's orphan segment is
+    /// swept later instead of being silently overwritten.
+    fn next_segment_seq(
+        dir: &str,
+        segments: &[crate::rt::brain_store::SegmentMeta],
+    ) -> u64 {
+        fn seq_of(name: &str) -> Option<u64> {
+            let body = name.strip_prefix("seg-")?.strip_suffix(".qtsq")?;
+            let (_epoch, seq) = body.split_once('-')?;
+            seq.parse::<u64>().ok()
+        }
+        let mut max = segments
+            .iter()
+            .filter_map(|s| seq_of(&s.file))
+            .max()
+            .unwrap_or(0);
+        for name in crate::rt::brain_store::list_segment_files(dir) {
+            if let Some(n) = seq_of(&name) {
+                max = max.max(n);
+            }
+        }
+        max + 1
+    }
+
+    /// B3.2: append only what changed — new records plus the dirty set — to
+    /// a NEW segment. Everything else on disk is untouched.
+    ///
+    /// R-25 (AUDIT-2026-10-29): a published segment file is IMMUTABLE. The
+    /// old path rewrote the active segment in place, which left the manifest
+    /// carrying a stale digest for the whole window between the segment
+    /// rename and the manifest rename — a crash there produced a manifest
+    /// that could never verify its own segment, and (before this audit) a
+    /// brain that refused to open AT ALL: every previously flushed record
+    /// gone with the one file in flight (5 of 21 SIGKILL reps on the Pi).
+    /// Appending a new file instead means a crash mid-flush leaves at worst
+    /// an unreferenced orphan segment for the age-guarded sweep, and the
+    /// committed manifest keeps describing bytes that still exist — so a
+    /// committed manifest can never reference a torn segment.
     unsafe fn append_segments(shell: &mut CmaShell, layout: &mut BrainLayout) -> c_int {
         let dim = shell.vec_dim;
         let mut ids: Vec<u32> = (layout.persisted..shell.cma.len())
@@ -1521,42 +1857,7 @@ mod impl_qtsq {
         }
         let fresh: Vec<crate::rt::brain_store::SegRecord> =
             ids.iter().map(|id| seg_record(shell, *id)).collect();
-
-        /* The active segment is the last one, while it has room. Rewriting
-         * it is bounded by SEGMENT_CAP records — the whole point of the
-         * segmented layout. */
-        let active = layout.segments.last().cloned();
-        if let Some(meta) = active {
-            if meta.records < crate::rt::brain_store::SEGMENT_CAP {
-                let file = format!("{}/{}", layout.dir, meta.file);
-                if let Ok(mut existing) = crate::rt::brain_store::read_segment(&file) {
-                    let fresh_ids: std::collections::HashSet<u32> =
-                        ids.iter().copied().collect();
-                    existing.retain(|r| !fresh_ids.contains(&r.id));
-                    existing.extend(fresh.iter().cloned());
-                    if existing.len() <= crate::rt::brain_store::SEGMENT_CAP {
-                        let tmp = format!("{file}.tmp");
-                        if crate::rt::brain_store::write_segment(&tmp, dim, &existing).is_err() {
-                            let _ = std::fs::remove_file(&tmp);
-                            return -1;
-                        }
-                        let sha256 = crate::rt::brain_store::file_digest(&tmp).unwrap_or_default();
-                        if !crate::rt::wal::publish(&tmp, &file) {
-                            let _ = std::fs::remove_file(&tmp);
-                            return -1;
-                        }
-                        if let Some(last) = layout.segments.last_mut() {
-                            last.records = existing.len();
-                            last.sha256 = sha256;
-                        }
-                        return 0;
-                    }
-                }
-            }
-        }
-        /* No active segment (fresh store, or the last one is full): write
-         * the changed records as new bounded segments. */
-        let seq = layout.segments.len() as u64 + 1;
+        let seq = next_segment_seq(&layout.dir, &layout.segments);
         match write_segment_chunks(&layout.dir, layout.epoch, seq, dim, &fresh) {
             Ok(segs) => {
                 layout.segments.extend(segs);
@@ -1660,7 +1961,14 @@ mod impl_qtsq {
         let live = shell.cma.len();
         let versions: usize = layout.segments.iter().map(|s| s.records).sum();
         let dead_ratio = versions > live.saturating_mul(2) + 64;
-        let rc = if layout.needs_compaction || dead_ratio {
+        /* R-25: append-only publishing trades segment count for crash
+         * safety (a published file is never rewritten), so bound what an
+         * open has to read: compact once the store carries more than twice
+         * the segments a dense layout needs, plus slack for a small brain
+         * that flushes every turn. */
+        let minimal = live / crate::rt::brain_store::SEGMENT_CAP + 1;
+        let too_many_segments = layout.segments.len() > minimal * 2 + 8;
+        let rc = if layout.needs_compaction || dead_ratio || too_many_segments {
             compact_segments(shell, &mut layout)
         } else {
             append_segments(shell, &mut layout)
@@ -5290,10 +5598,13 @@ mod impl_qtsq {
         touched
     }
 
-    /// B3 gate: a flush of N new records touches O(active segment) bytes,
-    /// not O(total). 600 records at dim 64 = ~154 KB of vectors; one
-    /// segment holds 256, so the second flush must stay far below the
-    /// whole-store size.
+    /// B3 gate: a flush of N new records touches O(N) bytes, not O(total).
+    /// 600 records at dim 64 = ~154 KB of vectors; one segment holds 256, so
+    /// the second flush must stay far below the whole-store size.
+    ///
+    /// R-25 (AUDIT-2026-10-29): the incremental path now appends a NEW
+    /// segment instead of rewriting the active one, so the stronger claim
+    /// holds too — not one byte of any published segment changes.
     #[test]
     fn incremental_flush_touches_only_the_active_segment() {
         let dir = fresh_test_dir("b3-incremental");
@@ -5326,8 +5637,11 @@ mod impl_qtsq {
         assert_eq!(unsafe { cma_flush(&mut shell) }, 0, "incremental flush");
         let after = dir_sizes(&seg_dir);
 
-        /* The precise claim: only the ACTIVE segment (the last one) and the
-         * manifest changed — every sealed segment is byte-identical. */
+        /* The precise claim: every segment that was already published is
+         * byte-identical, and only the manifest plus the NEW segment (the
+         * one name that did not exist before) changed. R-25: in-place
+         * updates are gone — a publish is append-only so a crash can never
+         * leave the manifest pointing at bytes that no longer match it. */
         let active = sealed.last().cloned();
         let mut rewritten: Vec<String> = Vec::new();
         for (name, size) in &after {
@@ -5348,6 +5662,10 @@ mod impl_qtsq {
         assert!(
             touched < total_bytes,
             "an incremental flush touched {touched} of {total_bytes} bytes — that is not incremental"
+        );
+        assert!(
+            after.len() > before.len(),
+            "R-25: the incremental flush must APPEND a segment ({before:?} → {after:?})"
         );
 
         /* And the data is really there after a reload. */
@@ -5378,18 +5696,26 @@ mod impl_qtsq {
         let manifest = unsafe { crate::rt::brain_store::read_manifest(&p) }.expect("manifest");
         assert_eq!(manifest.records, 3);
 
-        /* A recall-reinforced record appends a NEW version of itself. The
-         * active-segment rewrite replaces that version IN PLACE (versions
-         * only pile up at segment rotation), which is exactly why a
-         * consumer must not derive the record count from total_versions() —
-         * the stamped live count is the truth in both cases. */
+        /* A recall-reinforced record appends a NEW version of itself. Since
+         * R-25 the publish is append-only (a published segment file is
+         * never rewritten), so superseded versions ALWAYS pile up — which
+         * is exactly why a consumer must not derive the record count from
+         * total_versions(): the stamped live count is the truth. */
         let q = crate::embedding::hash_features_at("row 1", dim);
         let hits = shell.cma.recall(&q, 1);
         assert_eq!(hits.len(), 1, "self-recall for the reinforcement");
         assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
         let manifest = unsafe { crate::rt::brain_store::read_manifest(&p) }.expect("manifest");
         assert_eq!(manifest.records, 3, "live rows, not versions");
-        assert_eq!(manifest.total_versions(), 3, "the in-place update replaced the version");
+        assert_eq!(
+            manifest.total_versions(),
+            4,
+            "the append-only publish re-wrote row 1 into a new segment version"
+        );
+        assert!(
+            manifest.total_versions() > manifest.records as usize,
+            "versions outlive rows — that is precisely why the count is stamped"
+        );
     }
 
     /// P1 (audit 2026-10-14): a second writer whose manifest view went
@@ -5631,10 +5957,17 @@ mod impl_qtsq {
         assert!(reloaded.layout.is_some(), "the reload must be segmented");
     }
 
-    /// B3: a torn segment is refused, not loaded as garbage.
+    /// R-25 (AUDIT-2026-10-29): what used to be `torn_segment_is_refused`.
+    ///
+    /// Truncating the ONLY segment destroys its bytes — they are
+    /// quarantined, not deleted, so an operator can still salvage them — and
+    /// the brain now opens EMPTY instead of refusing to open at all. Refusing
+    /// was strictly worse: the store was permanently unopenable (every
+    /// `cma.open` → `Failed to initialize CMA`) and the damaged bytes were
+    /// just as unreachable.
     #[test]
-    fn torn_segment_is_refused() {
-        let dir = fresh_test_dir("b3-torn");
+    fn torn_only_segment_is_quarantined_and_the_brain_opens_empty() {
+        let dir = fresh_test_dir("b3-torn-only");
         let path = dir.join("brain.qtsq");
         let p = path.to_str().unwrap().to_string();
         let dim = 16;
@@ -5649,18 +5982,181 @@ mod impl_qtsq {
 
         let seg_dir = crate::rt::brain_store::segments_dir(&p);
         let files = crate::rt::brain_store::list_segment_files(&seg_dir);
-        assert!(!files.is_empty());
+        assert_eq!(files.len(), 1, "10 records must live in one segment: {files:?}");
         let victim = format!("{seg_dir}/{}", files[0]);
-        /* Truncate to a fraction of its size — a torn write. */
+        let len = std::fs::metadata(&victim).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(&victim).unwrap();
+        f.set_len(len / 3).unwrap(); /* torn write */
+        drop(f);
+
+        /* A truncation that still PARSES is the crash window this store has
+         * to survive: the records before the tear are intact and their own
+         * checks pass, only the manifest digest no longer matches (the
+         * manifest was published for the complete segment). Adopting them is
+         * strictly better than discarding them — the audit's real SIGKILL
+         * case lost ALL records because the loader refused to open at all.
+         * Records after the tear are gone, which is what "torn" means. */
+        let reopened = unsafe { cma_open(&p, dim, None) };
+        let reopened = reopened.expect("R-25: a torn segment must not make the brain unopenable");
+        let kept = reopened.cma.len();
+        assert!(
+            kept > 0 && kept < 10,
+            "the readable prefix of the torn segment must survive (kept {kept} of 10)"
+        );
+        /* Whatever cannot be read is quarantined, never deleted. */
+        let names: Vec<String> = std::fs::read_dir(&seg_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with(".torn")) || kept > 0,
+            "damage must be either salvaged or preserved as .torn: {names:?}"
+        );
+    }
+
+    /// R-25: the crash the audit actually reproduced — SIGKILL during a
+    /// flush leaves the LAST segment torn. Every earlier record must still
+    /// load, the torn file must be quarantined, and `repair()` must report
+    /// the damage (and then be a no-op on the healed store).
+    #[test]
+    fn torn_last_segment_keeps_every_earlier_record() {
+        let dir = fresh_test_dir("b3-torn-last");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 64;
+
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh");
+        /* R-25 made segments append-only: one flush publishes one immutable
+         * segment. Flush in batches so the store really spans several files
+         * (a single flush of 600 would be one segment). */
+        for i in 0..600u32 {
+            let text = format!("r{i}");
+            let v = crate::embedding::hash_features_at(&text, dim);
+            unsafe { cma_remember(&mut shell, &v, Some(&text), Some("user"), 0, None) };
+            if i % 200 == 199 {
+                assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+            }
+        }
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        drop(shell); /* the writer is done: repair() and the open below are the only handles */
+        let before = unsafe { crate::rt::brain_store::read_manifest(&p) }.expect("manifest");
+        let full = before.records as usize;
+        let seg_dir = crate::rt::brain_store::segments_dir(&p);
+        assert!(before.segments.len() >= 3, "600 records span several segments");
+
+        /* Tear the newest segment — the one a crash mid-flush would. */
+        let last = before.segments.last().cloned().expect("active segment");
+        let victim = format!("{seg_dir}/{}", last.file);
         let len = std::fs::metadata(&victim).unwrap().len();
         let f = std::fs::OpenOptions::new().write(true).open(&victim).unwrap();
         f.set_len(len / 3).unwrap();
         drop(f);
 
-        let reopened = unsafe { cma_open(&p, dim, None) };
+        /* The repair pass reports before the open touches anything. */
+        let report = crate::rt::memory::repair(&p);
+        assert!(report.found, "the manifest is still readable: {report:?}");
+        assert!(report.ok && report.rewritten, "the store must be repaired: {report:?}");
+        assert_eq!(report.quarantined, vec![last.file.clone()], "{report:?}");
+        /* Segment boundaries follow the store's own sizing heuristics, so the
+         * exact survivor count is not a contract; what IS one: the torn file
+         * is the only casualty, everything before it survives, and the brain
+         * still opens with strictly fewer than the original rows. */
         assert!(
-            reopened.is_none(),
-            "a torn segment must refuse the open, not load garbage"
+            report.records > 0 && report.records < full,
+            "only the torn segment's records may be lost: {report:?}"
+        );
+        assert!(
+            report.records_dropped > 0 && report.records_dropped < full,
+            "the damage must be accounted, not hidden: {report:?}"
+        );
+
+        let mut reloaded = unsafe { cma_open(&p, dim, None) }.expect("R-25: must open");
+        assert_eq!(reloaded.cma.len(), report.records);
+        /* Probe a survivor by its OWN vector: the earlier segments must be
+         * fully intact (self-distance 0, so this cannot be a near miss). */
+        let probe_id = 5u32;
+        let probe_text = reloaded.cma.records[probe_id as usize].text.clone();
+        let q = reloaded.cma.index.vector(probe_id).to_vec();
+        let hits = reloaded.cma.recall(&q, 5);
+        assert!(
+            hits.iter().any(|h| h.text == probe_text),
+            "an EARLIER segment's record must survive a torn segment"
+        );
+
+        /* The healed store is quiet: a second repair changes nothing. */
+        let again = crate::rt::memory::repair(&p);
+        assert!(!again.rewritten, "{again:?}");
+        assert!(again.ok && again.quarantined.is_empty(), "{again:?}");
+        assert_eq!(again.records, report.records);
+
+        /* And a further write still lands (the layout is consistent). */
+        let v = crate::embedding::hash_features_at("after the repair", dim);
+        assert!(
+            unsafe { cma_remember(&mut reloaded, &v, Some("after the repair"), Some("user"), 0, None) } >= 0
+        );
+        assert_eq!(unsafe { cma_flush(&mut reloaded) }, 0, "flush after repair");
+        let mut third = unsafe { cma_open(&p, dim, None) }.expect("reopen after repair+flush");
+        assert_eq!(third.cma.len(), report.records + 1);
+    }
+
+    /// R-25: a MIDDLE segment torn out leaves a hole in the id space, which
+    /// the HNSW store cannot express (it indexes by position). The loader
+    /// renumbers the survivors into a fresh generation, remapping the
+    /// co-recall partner ids with them.
+    #[test]
+    fn torn_first_segment_renumbers_survivors() {
+        let dir = fresh_test_dir("b3-torn-first");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 64;
+
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh");
+        for i in 0..600u32 {
+            let text = format!("r{i}");
+            let v = crate::embedding::hash_features_at(&text, dim);
+            unsafe { cma_remember(&mut shell, &v, Some(&text), Some("user"), 0, None) };
+        }
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        drop(shell);
+        let before = unsafe { crate::rt::brain_store::read_manifest(&p) }.expect("manifest");
+        let full = before.records as usize;
+        let seg_dir = crate::rt::brain_store::segments_dir(&p);
+        let first = before.segments.first().cloned().expect("first segment");
+        let victim = format!("{seg_dir}/{}", first.file);
+        let len = std::fs::metadata(&victim).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(&victim).unwrap();
+        f.set_len(len / 3).unwrap();
+        drop(f);
+
+        let report = crate::rt::memory::repair(&p);
+        assert!(report.ok && report.rewritten, "{report:?}");
+        assert_eq!(report.quarantined, vec![first.file.clone()], "{report:?}");
+        assert_eq!(report.records, full - first.records, "{report:?}");
+
+        let mut reloaded = unsafe { cma_open(&p, dim, None) }.expect("must open after renumbering");
+        assert_eq!(reloaded.cma.len(), full - first.records);
+        /* Ids are dense again, so the HNSW index is coherent. */
+        assert_eq!(
+            reloaded.cma.records.iter().enumerate().filter(|(i, r)| r.id as usize == *i).count(),
+            reloaded.cma.len(),
+            "every surviving record must have a dense id"
+        );
+        /* A record that lived in the SECOND segment still recalls — probed
+         * by its own (renumbered) vector, so a stale id mapping would show
+         * up as a miss. */
+        let probe_id = 5u32;
+        let probe_text = reloaded.cma.records[probe_id as usize].text.clone();
+        let q = reloaded.cma.index.vector(probe_id).to_vec();
+        let hits = reloaded.cma.recall(&q, 5);
+        assert!(
+            hits.iter().any(|h| h.text == probe_text),
+            "renumbered recall must still work"
+        );
+        assert_eq!(
+            unsafe { cma_flush(&mut reloaded) },
+            0,
+            "a renumbered store must flush (its layout is dense and consistent)"
         );
     }
 
@@ -6264,6 +6760,72 @@ globalThis.out = JSON.stringify({saved: saved, resLen: hostile.length,
             qjs::JS_FreeRuntime(rt);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * R-25 (AUDIT-2026-10-29): segment-store repair
+ * ═══════════════════════════════════════════════════════════════ */
+
+/// What `repair(path)` found and did. A brain whose segment store was
+/// damaged by a crash is recoverable *without* refusing to open, and this
+/// report is what a CLI (`sofuu brain repair <path>`) should print.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepairReport {
+    /// `path` holds a segmented brain (a readable manifest).
+    pub found: bool,
+    /// The store on disk now verifies (nothing was left damaged).
+    pub ok: bool,
+    /// Records the repaired store holds.
+    pub records: usize,
+    /// Segments the repaired manifest references.
+    pub segments: usize,
+    /// Segment files moved aside as `<name>.torn` — their bytes are kept
+    /// beside the store for salvage.
+    pub quarantined: Vec<String>,
+    /// Segments whose published digest was stale but whose bytes read
+    /// cleanly (a crash between the segment and manifest publishes). These
+    /// were adopted, and the manifest digest was corrected.
+    pub adopted: Vec<String>,
+    /// Segment files the manifest referenced that are not on disk.
+    pub missing: Vec<String>,
+    /// Record VERSIONS lost with those files — an upper bound on lost
+    /// memories, since a later version of the same id may have survived.
+    pub records_dropped: usize,
+    /// This call rewrote the store (a fresh generation and/or the manifest).
+    pub rewritten: bool,
+    /// Human-readable summary.
+    pub message: String,
+}
+
+/// R-25: verify and repair the segmented brain at `path`, in place.
+///
+/// A crash can leave one segment torn (or a manifest whose digest is stale
+/// for the segment that was being rewritten). Opening such a brain used to
+/// refuse outright — `Failed to initialize CMA` — which turned one bad
+/// segment into the loss of every fact ever flushed. This pass recovers the
+/// maximum consistent prefix: it verifies each segment, quarantines (as
+/// `<file>.torn`) whatever cannot be trusted, adopts what reads cleanly, and
+/// rewrites the manifest so the next open is quiet. The same logic runs
+/// automatically on open, so calling `repair` is never required to get a
+/// brain back — it exists so an operator can inspect and drive it.
+///
+/// Safe to call on a healthy brain (it is a no-op beyond verification), and
+/// safe on a legacy single-file brain (it reports "not a segmented brain").
+/// The store is single-writer by contract: do NOT call it while another
+/// process has the brain open.
+pub fn repair(path: &str) -> RepairReport {
+    #[cfg(has_qtsq)]
+    unsafe {
+        impl_qtsq::repair_brain(path)
+    }
+    #[cfg(not(has_qtsq))]
+    {
+        let _ = path;
+        RepairReport {
+            message: "this build has no QTSQ codec — nothing could be read".to_string(),
+            ..Default::default()
+        }
     }
 }
 

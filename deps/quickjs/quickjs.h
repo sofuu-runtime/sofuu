@@ -857,6 +857,9 @@ typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
 void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
 int JS_GetInterruptCounter(JSContext *ctx);
 void JS_SetInterruptCounter(JSContext *ctx, int counter);
+/* S2/C-02: 0 when the interrupt handler was called from a bytecode meter
+ * batch, 1 when it was called from the native regexp backtracking poll. */
+int JS_GetInterruptPollSource(JSRuntime *rt);
 /* if can_block is TRUE, Atomics.wait() can be used */
 void JS_SetCanBlock(JSRuntime *rt, JS_BOOL can_block);
 /* set the [IsHTMLDDA] internal slot */

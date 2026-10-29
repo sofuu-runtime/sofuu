@@ -18,7 +18,7 @@ use sofuu_ffi::qjs::{self, JSContext, JSValue, JSValueConst};
 use sofuu_ffi::uv::{self, UvCheck, UvHandle, UvTimer};
 
 use crate::rt::event_loop::sofuu_loop_get;
-use crate::rt::promise::{sofuu_flush_jobs, sofuu_flush_jobs_bounded, sofuu_promise_new, sofuu_promise_resolve, PromiseHandle};
+use crate::rt::promise::{sofuu_flush_jobs_bounded, sofuu_promise_new, sofuu_promise_resolve, PromiseHandle};
 
 extern "C" {
     /// mod_process.c — dispatch to process.on('uncaughtException'); stays C
@@ -108,26 +108,27 @@ unsafe extern "C" fn on_timer(handle: *mut UvTimer) {
     qjs::sofuu_js_free_value(ctx, prev_ctx);
     if qjs::is_exception(ret) {
         let exc = qjs::sofuu_js_get_exception(ctx);
-        /* process.on('uncaughtException') gets the first shot; fall back to
-         * the standard dump when no handler is registered. */
+        /* C-01: a throw inside a timer callback is a normal uncaught
+         * exception — not a runtime-internal "[timer]" event. It goes through
+         * the ONE reporting path (standard line + stack, recorded once) so
+         * the process exits 1, matching Node. A registered
+         * process.on('uncaughtException') handler suppresses the dump and the
+         * process continues (and exits 0), exactly as in Node. */
         if process_dispatch_uncaught(ctx, exc) == 0 {
-            let str_v = qjs::JS_ToString(ctx, exc);
-            let s = qjs::sofuu_js_to_cstring(ctx, str_v);
-            let msg = if s.is_null() {
-                "?".to_string()
-            } else {
-                std::ffi::CStr::from_ptr(s).to_string_lossy().into_owned()
-            };
-            eprintln!("[timer] Uncaught: {}", msg);
-            if !s.is_null() {
-                qjs::sofuu_js_free_cstring(ctx, s);
-            }
-            qjs::sofuu_js_free_value(ctx, str_v);
+            crate::rt::engine::report_uncaught(ctx, exc);
         }
         qjs::sofuu_js_free_value(ctx, exc);
     }
     qjs::sofuu_js_free_value(ctx, ret);
-    sofuu_flush_jobs_bounded(ctx, 1024);
+    {
+        /* R-14: claim this round's share instead of a full batch per callback. */
+        let allow = crate::rt::event_loop::take_round_allowance(
+            crate::rt::event_loop::MICROTASK_BATCH,
+        );
+        if allow > 0 {
+            sofuu_flush_jobs_bounded(ctx, allow);
+        }
+    }
 
     /* Check if the callback called clearInterval on THIS timer */
     if (*t).closing != 0 {
@@ -286,7 +287,19 @@ unsafe extern "C" fn on_sleep_timer(handle: *mut UvTimer) {
     (*req).promise = ptr::null_mut();
     uv::uv_timer_stop(handle);
     sofuu_promise_resolve(p, qjs::sofuu_js_undefined()); /* frees p */
-    sofuu_flush_jobs(ctx);
+    /* R-14: a sleep/yield timer resolves ONE continuation; draining the
+     * whole microtask queue here let 5,000 yielders re-arm their 0 ms timers
+     * and starve every other timer. Run a bounded round — the event loop
+     * gives libuv its turn next. */
+    {
+        /* R-14: claim this round's share instead of a full batch per callback. */
+        let allow = crate::rt::event_loop::take_round_allowance(
+            crate::rt::event_loop::MICROTASK_BATCH,
+        );
+        if allow > 0 {
+            sofuu_flush_jobs_bounded(ctx, allow);
+        }
+    }
 
     /* Schedule handle close — frees req in on_sleep_close */
     uv::uv_close(handle as *mut UvHandle, Some(on_sleep_close));

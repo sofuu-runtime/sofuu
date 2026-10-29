@@ -249,6 +249,11 @@
         chunkChars: opts.chunkChars,
         maxToolCalls: opts.maxToolCalls,
         trace: !!opts.trace,
+        /* R-11 (RULES §1.2 prompt sovereignty): the caller's developer
+         * system prompt. The episode emits it as its FIRST system message
+         * byte-for-byte and keeps its protocol contract in a delimited
+         * block behind it — a routed turn no longer silently drops it. */
+        system: String(opts.system == null ? '' : opts.system),
         tools: toolSpecs
       }
     })), 'new');

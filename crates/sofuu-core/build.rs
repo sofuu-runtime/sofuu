@@ -20,11 +20,32 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(emb_h_32,emb_h_36,emb_h_48,emb_h_64,emb_h_96,emb_h_128)");
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let is_windows = target_os == "windows";
+    // R-22 (AUDIT-2026-10-29): the probe used to end in a hardcoded absolute
+    // developer checkout path, which made the source non-portable and put an
+    // individual engineer's home directory in the repository. Resolution is
+    // now, in order:
+    //   1. SOFUU_QTSQ_DIR (the documented, CI-safe mechanism);
+    //   2. $HOME/projects/black-hole-disk — the same checkout expressed
+    //      relatively, so a developer box keeps working with no setup while
+    //      no absolute username path is compiled into the tree;
+    //   3. a vendored deps/qtsq inside this repository, if one is added later.
+    // A missing library compiles the memory module out exactly as before.
     let qtsq_dir = env::var("SOFUU_QTSQ_DIR")
         .map(PathBuf::from)
         .ok()
+        .filter(|p| p.join("libqtsq.a").exists())
         .or_else(|| {
-            let candidate = PathBuf::from("/Users/priyanshuboruah/projects/black-hole-disk");
+            let home = env::var("HOME").ok()?;
+            let candidate = PathBuf::from(home).join("projects").join("black-hole-disk");
+            if candidate.join("libqtsq.a").exists() {
+                Some(candidate)
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
+            let candidate = manifest.join("../../deps/qtsq");
             if candidate.join("libqtsq.a").exists() {
                 Some(candidate)
             } else {

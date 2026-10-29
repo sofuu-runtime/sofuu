@@ -87,6 +87,14 @@ jobs:
       - name: Size cap
         run: make size-check
 
+      # R-33 (AUDIT-2026-10-29): bc-check was only a prerequisite of
+      # headless-test, so a change that skipped that target, or an operator
+      # running the smoke job alone, could ship drifted bytecode. It is now an
+      # explicit gate: every `sofuu run` payload must be byte-identical to the
+      # committed .bc and gzip variants (RULES §3.2).
+      - name: Bytecode determinism (bc-check)
+        run: make bc-check
+
       - name: Print binary info
         run: |
           ls -lh sofuu
@@ -96,6 +104,14 @@ jobs:
       # ── H6: Headless CI gates ─────────────────────────────────────
       - name: Build libsofuu (embeddable library)
         run: make libsofuu
+
+      # R-33 (AUDIT-2026-10-29): verify-dist.sh is mandated by RULES §3.3 for
+      # every release, but no CI job ran it — which is how a Linux binary that
+      # could never pass `doctor` (exit 1 on every non-Apple build) shipped.
+      # Running it here means the install-integrity gate fails on the push that
+      # breaks it, not on the release that ships it.
+      - name: Install-integrity gate (verify-dist.sh)
+        run: bash scripts/verify-dist.sh
 
       - name: Headless embedding test (compile + run c_embed.c)
         run: make headless-test

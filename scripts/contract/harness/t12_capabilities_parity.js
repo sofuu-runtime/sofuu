@@ -104,9 +104,19 @@ async function main() {
     // C ABI exposes sofuu_rt_call to evaluate any dot-path under sofuu, including
     // "capabilities". Check that libsofuu exports sofuu_rt_call and that
     // the manifest structure matches the C ABI symbol specification.
-    const dylibCheck = await sh("ls dist/libsofuu.dylib dist/libsofuu.so dist/libsofuu.a >/dev/null 2>&1 && echo ok || echo missing");
-    if (dylibCheck.out.trim() === "ok") {
-        const nm = await sh("nm -gU dist/libsofuu.* 2>/dev/null | grep -c ' _*sofuu_rt_call' || echo 0");
+    // R-26 (AUDIT-2026-10-29): this used `ls a b c && echo ok`, which only
+    // succeeds when ALL THREE files exist — so on Linux (`.so`, no `.dylib`)
+    // and on macOS (`.dylib`, no `.so`) the C-ABI arm silently fell through to
+    // the "not present" branch and never ran. Probe each candidate instead, and
+    // use the platform-appropriate symbol dumper (`nm -gU` is Darwin-only;
+    // GNU nm on Linux rejects -U).
+    const libProbe = await sh("for f in dist/libsofuu.dylib dist/libsofuu.so dist/libsofuu.a; do [ -f \"$f\" ] && echo \"$f\" && break; done");
+    const libPath = String(libProbe.out).trim().split("\n")[0] || "";
+    if (libPath) {
+        const nmCmd = process.platform === "darwin"
+            ? `nm -gU ${JSON.stringify(libPath)} 2>/dev/null | grep -c ' _*sofuu_rt_call' || echo 0`
+            : `nm -g ${JSON.stringify(libPath)} 2>/dev/null | grep -c 'sofuu_rt_call' || echo 0`;
+        const nm = await sh(nmCmd);
         assert("C ABI: sofuu_rt_call symbol exported from libsofuu",
             Number(String(nm.out).trim().split("\n")[0]) >= 1);
     } else {

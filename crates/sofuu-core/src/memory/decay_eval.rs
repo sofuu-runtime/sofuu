@@ -146,7 +146,13 @@ fn decay_eval_death_ledger_records_retain_prunes_and_survives_reload() {
     assert_eq!(reloaded.deaths[1].reason, "forget");
 
     /* Consolidated rows are ledged with THEIR truth: content moved into a
-     * summary, not destroyed. */
+     * summary, not destroyed.
+     *
+     * R-26b (AUDIT-2026-10-29): this assertion used to be vacuous —
+     * consolidate() never called ledger_death, so `deaths` was empty and
+     * `.all()` was trivially true over it. It now runs over ten REAL
+     * deaths, and the count is asserted so an empty collection can never
+     * pass again. */
     let mut cc = Cma::new(16);
     for i in 0..10 {
         let mut v = vec![0.0; 16];
@@ -157,7 +163,24 @@ fn decay_eval_death_ledger_records_retain_prunes_and_survives_reload() {
         cc.records[id as usize].age_seconds = 90000;
     }
     cc.consolidate();
+    assert_eq!(
+        cc.deaths.len(),
+        10,
+        "consolidate() must ledge every row it tombstones (R-26b)"
+    );
     assert!(cc.deaths.iter().all(|d| d.reason == "consolidated"));
+    assert!(
+        cc.deaths.iter().all(|d| d.text.contains("quokka")),
+        "the ledger carries the dead row's text, not the summary's"
+    );
+    /* …and a later retain() must not bury the same death twice. */
+    let before = cc.deaths.len();
+    cc.retain();
+    assert_eq!(
+        cc.deaths.len(),
+        before,
+        "a consolidated row is ledged once, at the tombstone — not again at the prune"
+    );
 }
 
 #[test]
@@ -172,4 +195,59 @@ fn decay_eval_ledger_never_grows_past_its_cap() {
     assert!(cma.deaths.len() <= super::cma::DEATH_LEDGER_CAP);
     /* Newest kept: the ring holds the LATEST deaths. */
     assert_eq!(cma.deaths.last().unwrap().reason, "forget");
+}
+
+/// H-08 (AUDIT-2026-10-29): the survival harness for a PIN. The decay law
+/// is unchanged — the pin's strength falls on exactly the same curve as its
+/// untouched twin (measured below) — but recall must return it every week
+/// of a month, where the twin dies at ~3 days. Both pin spellings the
+/// product writes are exercised: the Rust role (`PIN_ROLE`) and the JS
+/// `/remember` marker (`source = "pin"`).
+#[test]
+fn decay_eval_pin_survives_a_month_and_stays_recallable() {
+    for (role, source) in [(super::cma::PIN_ROLE, ""), ("user", "pin")] {
+        let mut cma = Cma::new(DIM);
+        let pinned_v = unit(7);
+        let pin = cma
+            .remember_with_source(&pinned_v, "the deploy bucket is sofuu-dist", role, 0, source)
+            as u32;
+        /* The twin nobody pinned. */
+        let twin = cma.remember(&unit(9), "an idle fact nobody pinned", "user", 0) as u32;
+
+        for week in 1..=4 {
+            cma.decay_tick(7 * 86400);
+            let s = cma.records[pin as usize].strength;
+            let t = cma.records[twin as usize].strength;
+            println!(
+                "{role}/{source} week {week}: pin {s:.6}, twin {t:.6} \
+                 (same curve: {:.6})",
+                (s - t).abs()
+            );
+            let hits = cma.recall(&pinned_v, 4);
+            let top = hits.first().map(|h| h.id);
+            assert_eq!(
+                top,
+                Some(pin),
+                "{role}/{source} week {week}: the pin must be the top hit"
+            );
+            assert_eq!(
+                hits[0].distance, 0.0,
+                "{role}/{source} week {week}: the pin comes back at distance 0"
+            );
+            assert!(
+                !hits.iter().any(|h| h.id == twin),
+                "{role}/{source} week {week}: the idle twin is (correctly) long gone"
+            );
+        }
+        assert!(
+            cma.records[pin as usize].strength < FORGET_FLOOR,
+            "{role}/{source}: the pin really did decay below the floor — recall ignores it anyway"
+        );
+        /* Retention keeps it too. */
+        cma.retain();
+        assert!(
+            cma.records.iter().any(|r| r.text == "the deploy bucket is sofuu-dist"),
+            "{role}/{source}: retain() must never prune a pin"
+        );
+    }
 }

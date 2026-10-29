@@ -133,6 +133,17 @@ fn load_or_create_key(path: &str) -> Result<String, String> {
         let key = random_hex(32);
         if let Some(parent) = std::path::Path::new(path).parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            // AUDIT-2026-10-29 (Pi 5, first-run hygiene): create_dir_all used
+            // the process umask, so `~/.sofuu/` landed 0775 — group-writable on
+            // a shared host. The key inside was correctly 0600, but the
+            // directory allowed another group member to add files the runtime
+            // would later read. Tighten the parent to 0700 (best effort: an
+            // existing directory owned by someone else must not fail the run).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            }
         }
         /* 0600 tmp sibling unique to this process — a reader never sees a
          * partial key, and concurrent creators cannot tear one file. */

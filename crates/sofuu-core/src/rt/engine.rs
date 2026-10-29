@@ -25,10 +25,14 @@
 // message names a useful file" fallbacks.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::Path;
 use std::ptr;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use crate::ffi_exports::sofuu_ts_strip_rs;
 use crate::modules::{
@@ -68,6 +72,184 @@ pub struct SofuuRuntime {
 pub struct SofuuEngine {
     rt: *mut qjs::JSRuntime,
     ctx: *mut qjs::JSContext,
+}
+
+// Two real QuickJS exports the ffi bindings do not mirror yet. Declared here
+// (rather than guessed at call sites) so the ABI stays quickjs.h's:
+//   JS_DefinePropertyGetSet — process.exitCode is an accessor, not a plain
+//   data property, so a script cannot desynchronise it from the runtime.
+//   JS_NewBigInt64 — process.hrtime.bigint() (R-16).
+unsafe extern "C" {
+    fn JS_DefinePropertyGetSet(
+        ctx: *mut qjs::JSContext,
+        this_obj: qjs::JSValueConst,
+        prop: qjs::JSAtom,
+        getter: qjs::JSValue,
+        setter: qjs::JSValue,
+        flags: c_int,
+    ) -> c_int;
+    fn JS_NewBigInt64(ctx: *mut qjs::JSContext, v: i64) -> qjs::JSValue;
+}
+
+// ── C-01: truthful process exit status ────────────────────────────
+//
+// QuickJS reports a failing MODULE evaluation by rejecting the module's own
+// promise (`js_evaluate_module` → resolving_funcs[1]) and handing that
+// promise back from JS_Eval — JS_Eval does not return JS_EXCEPTION. The
+// host rejection tracker therefore saw a top-level throw as an "unhandled
+// promise rejection" (twice: the module promise plus the async module
+// function's internal promise) and the CLI, seeing rc == 0, exited 0.
+//
+// The status below is what the CLI turns into a process status:
+//   * has_uncaught_error — a fatal error escaped the script (sync throw,
+//     unhandled rejection, microtask-queue overflow). Read once the event
+//     loop is idle: the process then exits 1 unless the script chose a code.
+//   * exit_code — `process.exitCode` (Node semantics): a script can pick the
+//     status without calling process.exit(); it wins over the default.
+//   * fatal — the substrate itself failed (heap ceiling hit while draining
+//     the microtask queue). The loop must stop instead of spinning on a
+//     queue QuickJS can no longer grow.
+//
+// Per-context, because several engines can share one process (the C API
+// does) and a fresh engine must not inherit a dead engine's status. The
+// engine is single-threaded, so a thread-local map keyed by JSContext is
+// exact.
+
+#[derive(Default, Clone, Copy, Debug)]
+pub struct RunStatus {
+    pub has_uncaught_error: bool,
+    pub exit_code: Option<i32>,
+    pub fatal: bool,
+}
+
+thread_local! {
+    static RUN_STATUS: RefCell<HashMap<usize, RunStatus>> = RefCell::new(HashMap::new());
+}
+
+fn status_key(ctx: *mut qjs::JSContext) -> usize {
+    ctx as usize
+}
+
+fn with_status<R>(ctx: *mut qjs::JSContext, f: impl FnOnce(&mut RunStatus) -> R) -> R {
+    RUN_STATUS.with(|m| f(m.borrow_mut().entry(status_key(ctx)).or_default()))
+}
+
+/// Record that a fatal error escaped the script.
+pub fn note_uncaught_error(ctx: *mut qjs::JSContext) {
+    if !ctx.is_null() {
+        with_status(ctx, |s| s.has_uncaught_error = true);
+    }
+}
+
+/// Record a substrate failure that must stop the event loop.
+pub fn note_fatal(ctx: *mut qjs::JSContext) {
+    if !ctx.is_null() {
+        with_status(ctx, |s| {
+            s.has_uncaught_error = true;
+            s.fatal = true;
+        });
+    }
+}
+
+/// `process.exitCode` setter — `None` clears it (`= undefined`, Node).
+pub fn note_exit_code(ctx: *mut qjs::JSContext, code: Option<i32>) {
+    if !ctx.is_null() {
+        with_status(ctx, |s| s.exit_code = code);
+    }
+}
+
+/// Snapshot of one engine's exit state.
+pub fn run_status(ctx: *mut qjs::JSContext) -> RunStatus {
+    if ctx.is_null() {
+        return RunStatus::default();
+    }
+    RUN_STATUS.with(|m| m.borrow().get(&status_key(ctx)).copied().unwrap_or_default())
+}
+
+/// C-pointer flavour for the CLI, which holds only the opaque engine handle.
+pub fn run_status_raw(ctx: *mut c_void) -> RunStatus {
+    run_status(ctx as *mut qjs::JSContext)
+}
+
+// ── C-03: the JavaScript heap ceiling ─────────────────────────────
+//
+// 512 MiB (the old hard limit) was low enough that a ~1M-continuation
+// microtask fan-out ran out of heap INSIDE QuickJS's promise machinery.
+// There, a failed job allocation is dropped silently (`JS_EnqueueJob`'s
+// return value is ignored in `fulfill_or_reject_promise`) and the OOM
+// itself is thrown as JS_NULL because the error object cannot be allocated
+// (`JS_ThrowError2`: "out of memory: throw JS_NULL to avoid recursing") —
+// which is exactly the bare `null` on stderr with no name/message/stack and
+// exit 0 that the audit found.
+//
+// So the ceiling now follows the machine instead of a constant: a quarter
+// of physical memory, clamped to [512 MiB, 4 GiB] so a 2 GiB target keeps
+// the old protection and a dev box lets a 1M-task fan-out complete.
+// SOFUU_JS_HEAP_MB overrides it (operators / tests).
+// Kept in u64 so the 4 GiB ceiling does not overflow usize on 32-bit
+// targets (Android armeabi-v7a) — the cast back is clamped.
+const MIN_JS_HEAP: u64 = 512 * 1024 * 1024;
+const MAX_JS_HEAP: u64 = 4 * 1024 * 1024 * 1024;
+
+static JS_HEAP_LIMIT: AtomicUsize = AtomicUsize::new(MIN_JS_HEAP as usize);
+
+/// The live QuickJS heap ceiling in bytes (reported in overflow messages).
+pub fn js_heap_limit() -> usize {
+    JS_HEAP_LIMIT.load(Ordering::Relaxed)
+}
+
+/// Physical memory in bytes, when the platform can report it.
+fn physical_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut size: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: sysctlbyname writes at most `len` bytes into `size`.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                &mut size as *mut u64 as *mut c_void,
+                &mut len,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        if rc == 0 && size > 0 {
+            return Some(size);
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: sysinfo fills the whole zeroed struct on success.
+        let mut info: libc::sysinfo = unsafe { std::mem::zeroed() };
+        // SAFETY: &mut info is a valid out-pointer.
+        if unsafe { libc::sysinfo(&mut info) } == 0 && info.totalram > 0 {
+            return Some(info.totalram as u64 * info.mem_unit as u64);
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// Resolve the heap ceiling: SOFUU_JS_HEAP_MB, else a quarter of RAM.
+fn resolve_js_heap_limit() -> usize {
+    if let Some(mb) = std::env::var_os("SOFUU_JS_HEAP_MB")
+        .and_then(|v| v.to_string_lossy().parse::<u64>().ok())
+        .filter(|mb| *mb >= 16)
+    {
+        // saturating: a hostile value must not wrap the ceiling to 0.
+        return mb.saturating_mul(1024 * 1024).min(usize::MAX as u64) as usize;
+    }
+    match physical_memory_bytes() {
+        Some(bytes) => (bytes / 4)
+            .clamp(MIN_JS_HEAP, MAX_JS_HEAP)
+            .min(usize::MAX as u64) as usize,
+        None => MIN_JS_HEAP as usize,
+    }
 }
 
 // The ESM loader's base path (a stable heap string; QuickJS stores an
@@ -184,8 +366,11 @@ unsafe fn engine_create() -> *mut SofuuEngine {
     if rt.is_null() {
         return ptr::null_mut();
     }
-    // Generous memory limit (512MB) + GC threshold (64MB) — engine.c.
-    unsafe { qjs::JS_SetMemoryLimit(rt, 512 * 1024 * 1024) };
+    // Memory limit (C-03: a quarter of RAM clamped to [512MB, 4GB], not the
+    // old flat 512MB — see the JS_HEAP_LIMIT docs) + GC threshold (64MB).
+    let heap_limit = resolve_js_heap_limit();
+    JS_HEAP_LIMIT.store(heap_limit, Ordering::Relaxed);
+    unsafe { qjs::JS_SetMemoryLimit(rt, heap_limit) };
     unsafe { qjs::JS_SetGCThreshold(rt, 64 * 1024 * 1024) };
     let ctx = unsafe { qjs::JS_NewContext(rt) };
     if ctx.is_null() {
@@ -219,6 +404,9 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
     unsafe {
         mod_console_register(ctx);
         mod_process_register(ctx);
+        // C-01: process.exitCode (accessor) — must exist before any script
+        // runs, and before anything can throw.
+        register_process_exit_code(ctx);
         mod_timer_register(ctx);
         mod_fs_register(ctx);
         mod_subprocess_register(ctx);
@@ -458,6 +646,297 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
 
     // Rust-side JS surface: sofuu.rlm host functions + shipped driver.
     unsafe { sofuu_rust_register_engine_js(ctx as *mut c_void) };
+
+    // R-16 / R-38: precision clocks (performance.now, process.hrtime[.bigint])
+    // and the runtime version on the root `sofuu` object. Last, so every
+    // module has finished building `sofuu` and nothing overwrites these.
+    unsafe { register_timing_globals(ctx) };
+    unsafe { register_version_property(ctx) };
+}
+
+// ── C-01 / C-03 error surfaces shared with promise.rs ─────────────
+
+/// Build a real RangeError (name + message) — the loud counterpart to
+/// QuickJS's bare-null OOM sentinel. Returned value is owned by the caller.
+pub(crate) unsafe fn new_range_error(ctx: *mut qjs::JSContext, msg: &str) -> qjs::JSValue {
+    let cmsg = CString::new(msg).unwrap_or_default();
+    // Prefer the real constructor, so a process.on('uncaughtException')
+    // handler sees `e instanceof RangeError` (the C-03 contract). At the heap
+    // ceiling that allocation can itself fail, so every step is checked and
+    // the plain-object fallback below builds an Error with the same name.
+    let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
+    let ctor = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"RangeError".as_ptr()) };
+    unsafe { qjs::sofuu_js_free_value(ctx, global) };
+    if unsafe { qjs::JS_IsFunction(ctx, ctor) } != 0 {
+        // SAFETY: cmsg is NUL-terminated and lives for the whole call.
+        let m = unsafe { qjs::sofuu_js_new_string(ctx, cmsg.as_ptr()) };
+        if unsafe { qjs::is_exception(m) } {
+            // Even the message string failed (out of memory): clear the
+            // pending throw, then use the fallback.
+            unsafe { qjs::sofuu_js_free_value(ctx, m) };
+            let pending = unsafe { qjs::sofuu_js_get_exception(ctx) };
+            unsafe { qjs::sofuu_js_free_value(ctx, pending) };
+        } else {
+            // SAFETY: ctor is callable; m is the single live argument and is
+            // borrowed for the duration of the call.
+            let e = unsafe {
+                qjs::JS_Call(
+                    ctx,
+                    ctor,
+                    qjs::sofuu_js_undefined(),
+                    1,
+                    &m as *const qjs::JSValueConst,
+                )
+            };
+            unsafe { qjs::sofuu_js_free_value(ctx, m) };
+            if !unsafe { qjs::is_exception(e) } {
+                unsafe { qjs::sofuu_js_free_value(ctx, ctor) };
+                return e;
+            }
+            // The constructor threw (out of memory): clear it — a pending
+            // exception would otherwise surface as the next JS result.
+            let pending = unsafe { qjs::sofuu_js_get_exception(ctx) };
+            unsafe { qjs::sofuu_js_free_value(ctx, pending) };
+        }
+    }
+    // SAFETY: ctor is owned here on every path that did not return early.
+    unsafe { qjs::sofuu_js_free_value(ctx, ctor) };
+    // Fallback: plain Error carrying name + message.
+    // SAFETY: ctx live; each value is moved into exactly one property.
+    let err = unsafe { qjs::JS_NewError(ctx) };
+    unsafe {
+        qjs::sofuu_js_set_property_str(
+            ctx,
+            err,
+            c"name".as_ptr(),
+            qjs::sofuu_js_new_string(ctx, c"RangeError".as_ptr()),
+        );
+    }
+    // SAFETY: cmsg is NUL-terminated and outlives the call.
+    unsafe {
+        qjs::sofuu_js_set_property_str(
+            ctx,
+            err,
+            c"message".as_ptr(),
+            qjs::sofuu_js_new_string(ctx, cmsg.as_ptr()),
+        );
+    }
+    err
+}
+
+/// Throw a RangeError into `ctx` (used by the process.exitCode setter).
+unsafe fn throw_range_error(ctx: *mut qjs::JSContext, msg: &str) -> qjs::JSValue {
+    // SAFETY: err is a fresh owned value; JS_Throw takes ownership of it.
+    unsafe { qjs::JS_Throw(ctx, new_range_error(ctx, msg)) }
+}
+
+unsafe extern "C" fn js_get_exit_code(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValueConst,
+    _argc: c_int,
+    _argv: *const qjs::JSValueConst,
+) -> qjs::JSValue {
+    match run_status(ctx).exit_code {
+        Some(code) => qjs::sofuu_js_new_int32(ctx, code),
+        None => qjs::sofuu_js_undefined(),
+    }
+}
+
+/// `process.exitCode = <int>` — Node semantics: an integer in 0..=255,
+/// `undefined` clears it, anything else is a RangeError (a typo'd exit code
+/// must never leave the default silently in place).
+unsafe extern "C" fn js_set_exit_code(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValueConst,
+    argc: c_int,
+    argv: *const qjs::JSValueConst,
+) -> qjs::JSValue {
+    // SAFETY: argv is valid for argc entries (checked).
+    if argc < 1 || unsafe { qjs::is_undefined(*argv) } || unsafe { qjs::is_null(*argv) } {
+        note_exit_code(ctx, None);
+        return qjs::sofuu_js_undefined();
+    }
+    let mut code: f64 = 0.0;
+    // SAFETY: *argv is a live value; JS_ToFloat64 writes code on success.
+    if unsafe { qjs::JS_ToFloat64(ctx, &mut code, *argv) } != 0 {
+        return qjs::sofuu_js_exception(); /* TypeError pending */
+    }
+    if !code.is_finite() || code.fract() != 0.0 || code < 0.0 || code > 255.0 {
+        return unsafe {
+            throw_range_error(
+                ctx,
+                &format!("process.exitCode must be an integer in 0..=255 (got {code})"),
+            )
+        };
+    }
+    note_exit_code(ctx, Some(code as i32));
+    qjs::sofuu_js_undefined()
+}
+
+/// Install `process.exitCode` as an accessor backed by this engine's status.
+unsafe fn register_process_exit_code(ctx: *mut qjs::JSContext) {
+    // SAFETY: global/process are live values owned by this frame.
+    let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
+    let process = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"process".as_ptr()) };
+    if unsafe { qjs::is_object(process) } {
+        let getter = unsafe {
+            qjs::sofuu_js_new_cfunction(ctx, js_get_exit_code, c"get exitCode".as_ptr(), 0)
+        };
+        let setter = unsafe {
+            qjs::sofuu_js_new_cfunction(ctx, js_set_exit_code, c"set exitCode".as_ptr(), 1)
+        };
+        // SAFETY: atom is created + freed here; the define call takes
+        // ownership of getter/setter (JS_DefineProperty frees on both paths).
+        unsafe {
+            let atom = qjs::JS_NewAtom(ctx, c"exitCode".as_ptr());
+            JS_DefinePropertyGetSet(
+                ctx,
+                process,
+                atom,
+                getter,
+                setter,
+                (qjs::JS_PROP_CONFIGURABLE | qjs::JS_PROP_ENUMERABLE) as c_int,
+            );
+            qjs::JS_FreeAtom(ctx, atom);
+        }
+    }
+    // SAFETY: both values are owned here.
+    unsafe {
+        qjs::sofuu_js_free_value(ctx, process);
+        qjs::sofuu_js_free_value(ctx, global);
+    }
+}
+
+// ── R-16: precision clocks ────────────────────────────────────────
+
+/// Monotonic origin for performance.now() / process.hrtime(): one Instant
+/// per process, taken on first use. Instant is monotonic and
+/// nanosecond-resolution on every target we ship.
+fn monotonic_origin() -> Instant {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    *ORIGIN.get_or_init(Instant::now)
+}
+
+/// `performance.now()` — milliseconds since the runtime started, fractional
+/// (sub-millisecond), monotonic (immune to wall-clock jumps).
+unsafe extern "C" fn js_performance_now(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValueConst,
+    _argc: c_int,
+    _argv: *const qjs::JSValueConst,
+) -> qjs::JSValue {
+    let nanos = monotonic_origin().elapsed().as_nanos() as f64;
+    qjs::sofuu_js_new_float64(ctx, nanos / 1_000_000.0)
+}
+
+unsafe extern "C" fn js_hrtime(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValueConst,
+    _argc: c_int,
+    _argv: *const qjs::JSValueConst,
+) -> qjs::JSValue {
+    // Node: [seconds, nanoseconds] integers, monotonic, arbitrary origin.
+    let d = monotonic_origin().elapsed();
+    // SAFETY: arr owned here until returned; property sets transfer values.
+    let arr = unsafe { qjs::JS_NewArray(ctx) };
+    if unsafe { qjs::is_exception(arr) } {
+        return arr;
+    }
+    let secs = qjs::sofuu_js_new_float64(ctx, d.as_secs() as f64);
+    let nanos = qjs::sofuu_js_new_float64(ctx, d.subsec_nanos() as f64);
+    let rc0 = unsafe { qjs::JS_SetPropertyUint32(ctx, arr, 0, secs) };
+    if rc0 < 0 {
+        // JS_SetPropertyUint32 already freed `secs`.
+        unsafe { qjs::sofuu_js_free_value(ctx, nanos) };
+        unsafe { qjs::sofuu_js_free_value(ctx, arr) };
+        return qjs::sofuu_js_exception();
+    }
+    let rc1 = unsafe { qjs::JS_SetPropertyUint32(ctx, arr, 1, nanos) };
+    if rc1 < 0 {
+        unsafe { qjs::sofuu_js_free_value(ctx, arr) };
+        return qjs::sofuu_js_exception();
+    }
+    arr
+}
+
+/// `process.hrtime.bigint()` — nanoseconds as a BigInt (Node).
+unsafe extern "C" fn js_hrtime_bigint(
+    ctx: *mut qjs::JSContext,
+    _this: qjs::JSValueConst,
+    _argc: c_int,
+    _argv: *const qjs::JSValueConst,
+) -> qjs::JSValue {
+    // SAFETY: real quickjs export; no allocation beyond the BigInt itself.
+    unsafe { JS_NewBigInt64(ctx, monotonic_origin().elapsed().as_nanos() as i64) }
+}
+
+/// Install globalThis.performance and process.hrtime.
+unsafe fn register_timing_globals(ctx: *mut qjs::JSContext) {
+    // SAFETY: every value is either moved into a property or freed here.
+    let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
+    let perf = unsafe { qjs::sofuu_js_new_object(ctx) };
+    unsafe {
+        qjs::sofuu_js_set_property_str(
+            ctx,
+            perf,
+            c"now".as_ptr(),
+            qjs::sofuu_js_new_cfunction(ctx, js_performance_now, c"now".as_ptr(), 0),
+        );
+        qjs::sofuu_js_set_property_str(ctx, global, c"performance".as_ptr(), perf);
+    }
+    let process = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"process".as_ptr()) };
+    if unsafe { qjs::is_object(process) } {
+        let hrtime =
+            unsafe { qjs::sofuu_js_new_cfunction(ctx, js_hrtime, c"hrtime".as_ptr(), 0) };
+        unsafe {
+            qjs::sofuu_js_set_property_str(
+                ctx,
+                hrtime,
+                c"bigint".as_ptr(),
+                qjs::sofuu_js_new_cfunction(ctx, js_hrtime_bigint, c"bigint".as_ptr(), 0),
+            );
+            qjs::sofuu_js_set_property_str(ctx, process, c"hrtime".as_ptr(), hrtime);
+        }
+    }
+    unsafe {
+        qjs::sofuu_js_free_value(ctx, process);
+        qjs::sofuu_js_free_value(ctx, global);
+    }
+}
+
+// ── R-38: sofuu.version ───────────────────────────────────────────
+
+unsafe fn register_version_property(ctx: *mut qjs::JSContext) {
+    // SAFETY: global/sofuu_obj owned by this frame; the string is moved in.
+    let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
+    let mut sofuu_obj = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr()) };
+    if !unsafe { qjs::is_object(sofuu_obj) } {
+        // No module claimed the namespace (a stripped-down build): create it,
+        // so `sofuu.version` is always readable (R-38).
+        unsafe { qjs::sofuu_js_free_value(ctx, sofuu_obj) };
+        sofuu_obj = unsafe { qjs::sofuu_js_new_object(ctx) };
+        unsafe {
+            qjs::sofuu_js_set_property_str(
+                ctx,
+                global,
+                c"sofuu".as_ptr(),
+                qjs::sofuu_js_dup_value(ctx, sofuu_obj),
+            );
+        }
+    }
+    let ver = CString::new(env!("CARGO_PKG_VERSION")).unwrap_or_default();
+    unsafe {
+        qjs::sofuu_js_set_property_str(
+            ctx,
+            sofuu_obj,
+            c"version".as_ptr(),
+            qjs::sofuu_js_new_string(ctx, ver.as_ptr()),
+        );
+    }
+    unsafe {
+        qjs::sofuu_js_free_value(ctx, sofuu_obj);
+        qjs::sofuu_js_free_value(ctx, global);
+    }
 }
 
 /// C `dirname()` — strips the final component; "." for a bare name,
@@ -721,7 +1200,7 @@ unsafe fn dump_error(ctx: *mut qjs::JSContext) {
     } else {
         unsafe { CStr::from_ptr(msg) }.to_string_lossy()
     };
-    eprintln!("\x1b[31mError:\x1b[0m {}", msg_s);
+    eprintln!("{}", paint("31", &format!("Error: {}", msg_s)));
     let stack = unsafe { qjs::sofuu_js_get_property_str(ctx, exception, c"stack".as_ptr()) };
     if !unsafe { qjs::is_undefined(stack) } && !unsafe { qjs::is_null(stack) } {
         let s = unsafe { qjs::sofuu_js_to_cstring(ctx, stack) };
@@ -740,13 +1219,83 @@ unsafe fn dump_error(ctx: *mut qjs::JSContext) {
     unsafe { qjs::sofuu_js_free_value(ctx, exception) };
 }
 
+/// Print ONE uncaught error and remember it for the process exit code.
+///
+/// Every fatal path funnels through here so a throw is never reported twice
+/// or under the wrong name. `reason` is borrowed (the caller keeps ownership).
+pub(crate) unsafe fn report_uncaught(ctx: *mut qjs::JSContext, reason: qjs::JSValueConst) {
+    // QuickJS's out-of-memory sentinel is a bare `null` — no name, no
+    // message, no stack (JS_ThrowError2 cannot allocate the Error object and
+    // throws JS_NULL "to avoid recursing"). QuickJS uses the same JS_NULL for
+    // "no exception pending", so a literal `throw null` is indistinguishable
+    // here; the substrate limit is the overwhelmingly likely cause.
+    if unsafe { crate::rt::promise::is_oom_reason(ctx, reason) } {
+        // SAFETY: ctx live; the helper reports + flags + builds the error.
+        unsafe { crate::rt::promise::report_microtask_overflow(ctx, 0) };
+        return;
+    }
+    // SAFETY: str_v/stack are live values, each freed exactly once below.
+    let str_v = unsafe { qjs::JS_ToString(ctx, reason) };
+    let msg = unsafe { qjs::sofuu_js_to_cstring(ctx, str_v) };
+    let msg_s = if msg.is_null() {
+        "(unknown error)".to_string()
+    } else {
+        let s = unsafe { CStr::from_ptr(msg) }.to_string_lossy().into_owned();
+        // SAFETY: msg came from to_cstring on this ctx.
+        unsafe { qjs::sofuu_js_free_cstring(ctx, msg) };
+        s
+    };
+    eprintln!("{}", paint("31", &format!("[sofuu] UncaughtException: {}", msg_s)));
+    let stack = unsafe { qjs::sofuu_js_get_property_str(ctx, reason, c"stack".as_ptr()) };
+    if !unsafe { qjs::is_undefined(stack) } && !unsafe { qjs::is_null(stack) } {
+        let ss = unsafe { qjs::sofuu_js_to_cstring(ctx, stack) };
+        if !ss.is_null() {
+            eprintln!("{}", unsafe { CStr::from_ptr(ss) }.to_string_lossy());
+            // SAFETY: ss came from to_cstring on this ctx.
+            unsafe { qjs::sofuu_js_free_cstring(ctx, ss) };
+        }
+    }
+    unsafe { qjs::sofuu_js_free_value(ctx, stack) };
+    unsafe { qjs::sofuu_js_free_value(ctx, str_v) };
+    note_uncaught_error(ctx);
+}
+
+/// Whether stderr may carry ANSI colour.
+///
+/// The audit diffed `sofuu run` output against `node` and could not: every
+/// diagnostic was wrapped in `\x1b[31m`, including when stderr is a pipe, a
+/// log file or a CI capture. Colour now follows the same convention as the
+/// rest of the CLI: only on a real terminal, and never when `NO_COLOR` is set
+/// (https://no-color.org) or `SOFUU_NO_COLOR` asks for it.
+pub(crate) fn stderr_wants_color() -> bool {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        if std::env::var_os("NO_COLOR").is_some() || std::env::var_os("SOFUU_NO_COLOR").is_some() {
+            return false;
+        }
+        // SAFETY: isatty(2) has no preconditions and no side effects.
+        unsafe { libc::isatty(2) == 1 }
+    })
+}
+
+/// `\x1b[<code>m<text>\x1b[0m` when colour is allowed, `text` otherwise.
+#[inline]
+pub(crate) fn paint<'a>(code: &str, text: &'a str) -> std::borrow::Cow<'a, str> {
+    if stderr_wants_color() {
+        std::borrow::Cow::Owned(format!("\x1b[{}m{}\x1b[0m", code, text))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 /// engine_eval_file — load + (TS-strip) + eval a file as a module, then
 /// drain the event loop. Returns 0 on success (1 on any error).
 unsafe fn engine_eval_file(eng: *mut SofuuEngine, path_c: *const c_char) -> c_int {
     // SAFETY: path_c is a NUL-terminated C string.
     let path = unsafe { CStr::from_ptr(path_c) }.to_string_lossy().into_owned();
     let Some((source, len)) = engine_read_file(&path) else {
-        eprintln!("\x1b[31mError:\x1b[0m Cannot open file '{}'", path);
+        eprintln!("{}", paint("31", &format!("Error: Cannot open file '{}'", path)));
         return 1;
     };
 
@@ -784,16 +1333,56 @@ unsafe fn engine_eval_file(eng: *mut SofuuEngine, path_c: *const c_char) -> c_in
     }
 
     if unsafe { qjs::is_exception(result) } {
-        unsafe { dump_error((*eng).ctx) };
-        // SAFETY: result is a live exception value.
+        // Compile/link failure, or a throw out of the module loader.
+        let exc = unsafe { qjs::JS_GetException((*eng).ctx) };
+        unsafe { report_uncaught((*eng).ctx, exc) };
+        // SAFETY: exc/result are live values.
+        unsafe { qjs::sofuu_js_free_value((*eng).ctx, exc) };
         unsafe { qjs::sofuu_js_free_value((*eng).ctx, result) };
         return 1;
+    }
+
+    // A module body that throws does NOT surface as JS_EXCEPTION: QuickJS's
+    // js_evaluate_module() rejects the module's own promise and returns that
+    // promise (quickjs.c: resolving_funcs[1]). The rejection also notified the
+    // host tracker, so the old code printed the throw as an "unhandled promise
+    // rejection" — twice (the module promise plus the async module function's
+    // internal promise) — and then reported success. A promise already
+    // REJECTED at this point is a synchronous throw: report it once, retract
+    // the tracker's deferred copies of the same reason, and stop — unless a
+    // process.on('uncaughtException') handler absorbed it, in which case Node
+    // lets the process continue to the (empty) event loop.
+    if unsafe { qjs::JS_PromiseState((*eng).ctx, result) } == qjs::JSPromiseStateEnum::Rejected {
+        let reason = unsafe { qjs::JS_PromiseResult((*eng).ctx, result) };
+        // SAFETY: reason lives in this ctx; the tracker holds dups of it.
+        unsafe { crate::rt::promise::sofuu_rt_suppress_rejections((*eng).ctx, reason) };
+        // Node gives a registered process.on('uncaughtException') handler the
+        // first shot; when it handles the throw the process continues (and
+        // exits 0), so the loop still drains.
+        let handled = unsafe { process_dispatch_uncaught((*eng).ctx, reason) } != 0;
+        if !handled {
+            unsafe { report_uncaught((*eng).ctx, reason) };
+        }
+        // SAFETY: reason/result are live values.
+        unsafe { qjs::sofuu_js_free_value((*eng).ctx, reason) };
+        unsafe { qjs::sofuu_js_free_value((*eng).ctx, result) };
+        if !handled {
+            return 1;
+        }
+        unsafe { sofuu_loop_run((*eng).ctx) };
+        return if run_status((*eng).ctx).has_uncaught_error { 1 } else { 0 };
     }
 
     // SAFETY: result is a live value.
     unsafe { qjs::sofuu_js_free_value((*eng).ctx, result) };
     // Run the libuv event loop — drains timers, I/O, and Promise chains.
     unsafe { sofuu_loop_run((*eng).ctx) };
+    // An unhandled rejection (or a microtask overflow) surfaced during the
+    // drain: the status flag is the CLI's exit-1 signal. process.exitCode, if
+    // the script set one, overrides it in main.rs.
+    if run_status((*eng).ctx).has_uncaught_error {
+        return 1;
+    }
     0
 }
 
@@ -812,32 +1401,13 @@ unsafe fn engine_eval_string(
     let result = unsafe { qjs::JS_Eval(ctx, source, src_len, name, qjs::JS_EVAL_TYPE_GLOBAL) };
 
     if unsafe { qjs::is_exception(result) } {
-        // SAFETY: exception value is live; uncaught dispatch takes it.
+        // SAFETY: exception value is live; uncaught dispatch borrows it.
         let exc = unsafe { qjs::JS_GetException(ctx) };
+        // A registered process.on('uncaughtException') handler gets the first
+        // shot and keeps the runtime alive (Node); otherwise the throw is
+        // reported once as an uncaught exception and the process exits 1.
         if unsafe { process_dispatch_uncaught(ctx, exc) } == 0 {
-            let str_v = unsafe { qjs::JS_ToString(ctx, exc) };
-            let msg = unsafe { qjs::sofuu_js_to_cstring(ctx, str_v) };
-            if msg.is_null() {
-                eprintln!("\x1b[31mError:\x1b[0m (unknown error)");
-            } else {
-                eprintln!(
-                    "\x1b[31mError:\x1b[0m {}",
-                    unsafe { CStr::from_ptr(msg) }.to_string_lossy()
-                );
-                // SAFETY: msg from to_cstring on this ctx.
-                unsafe { qjs::sofuu_js_free_cstring(ctx, msg) };
-            }
-            let stack = unsafe { qjs::sofuu_js_get_property_str(ctx, exc, c"stack".as_ptr()) };
-            if !unsafe { qjs::is_undefined(stack) } {
-                let ss = unsafe { qjs::sofuu_js_to_cstring(ctx, stack) };
-                if !ss.is_null() {
-                    eprintln!("{}", unsafe { CStr::from_ptr(ss) }.to_string_lossy());
-                    // SAFETY: ss from to_cstring on this ctx.
-                    unsafe { qjs::sofuu_js_free_cstring(ctx, ss) };
-                }
-            }
-            unsafe { qjs::sofuu_js_free_value(ctx, stack) };
-            unsafe { qjs::sofuu_js_free_value(ctx, str_v) };
+            unsafe { report_uncaught(ctx, exc) };
         }
         // SAFETY: exc/result are live values.
         unsafe { qjs::sofuu_js_free_value(ctx, exc) };
@@ -848,6 +1418,11 @@ unsafe fn engine_eval_string(
     // SAFETY: result is a live value.
     unsafe { qjs::sofuu_js_free_value(ctx, result) };
     unsafe { sofuu_loop_run(ctx) };
+    // An unhandled rejection surfaced during the drain (C-01): exit 1 unless
+    // the script picked a code via process.exitCode (main.rs decides).
+    if run_status(ctx).has_uncaught_error {
+        return 1;
+    }
     0
 }
 
@@ -858,7 +1433,10 @@ unsafe fn engine_run_jobs(eng: *mut SofuuEngine) {
         let err = unsafe { qjs::JS_ExecutePendingJob((*eng).rt, &mut ctx1) };
         if err <= 0 {
             if err < 0 {
-                unsafe { dump_error(ctx1) };
+                // A job that threw: same classification as the loop drain.
+                let exc = unsafe { qjs::JS_GetException(ctx1) };
+                unsafe { report_uncaught(ctx1, exc) };
+                unsafe { qjs::sofuu_js_free_value(ctx1, exc) };
             }
             break;
         }
@@ -890,6 +1468,11 @@ unsafe fn engine_destroy(eng: *mut SofuuEngine) {
     unsafe { qjs::JS_RunGC((*eng).rt) };
     unsafe { qjs::JS_FreeContext((*eng).ctx) };
     unsafe { qjs::JS_FreeRuntime((*eng).rt) };
+    // C-01: the status is per-context — drop this engine's entry so a later
+    // engine in the same process starts with a clean exit state.
+    RUN_STATUS.with(|m| {
+        m.borrow_mut().remove(&status_key((*eng).ctx));
+    });
     drop(unsafe { Box::from_raw(eng) });
 }
 
@@ -1084,13 +1667,13 @@ unsafe fn engine_eval_repl_inner(
             unsafe { qjs::sofuu_js_free_cstring(ctx, msg) };
             out
         };
-        let mut buf = format!("\x1b[31m{}\x1b[0m", msg_s);
+        let mut buf = paint("31", &msg_s).into_owned();
         let stack = unsafe { qjs::sofuu_js_get_property_str(ctx, exc, c"stack".as_ptr()) };
         if !unsafe { qjs::is_undefined(stack) } {
             let st = unsafe { qjs::sofuu_js_to_cstring(ctx, stack) };
             if !st.is_null() {
                 let st_s = unsafe { CStr::from_ptr(st) }.to_string_lossy();
-                buf.push_str(&format!("\n\x1b[90m{}\x1b[0m", st_s));
+                buf.push_str(&format!("\n{}", paint("90", &st_s)));
                 // SAFETY: st from to_cstring on this ctx.
                 unsafe { qjs::sofuu_js_free_cstring(ctx, st) };
             }

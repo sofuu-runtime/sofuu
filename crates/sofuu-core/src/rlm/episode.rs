@@ -113,6 +113,20 @@ fn tool_prompt(tools: &[ToolSpec], max_prompt_tools: usize) -> String {
 const NO_SNIPPET_NUDGE: &str =
     "no snippet found; reply with exactly one ```js block and nothing else";
 
+/// R-11: the kickoff USER turn for an episode that carries a developer
+/// system prompt — the protocol contract first, in ONE delimited block, then
+/// the context/question kickoff. Delimited so it is visibly an instruction
+/// block bolted onto the turn, never a rewrite of the developer's system
+/// turn (which stays byte-identical in `messages[0]`).
+fn protocol_then_kickoff(protocol: &str, kickoff: &str) -> String {
+    format!(
+        "--- episode protocol (applies to every reply in this episode) ---\n\
+         {protocol}\n\
+         --- end episode protocol ---\n\n\
+         {kickoff}"
+    )
+}
+
 /// How many consecutive no-snippet nudges before giving up with the raw
 /// reply text as the best answer available.
 const MAX_NO_SNIPPET_RETRIES: u32 = 3;
@@ -175,6 +189,34 @@ pub struct Episode {
 impl Episode {
     /// Build the sandbox, load the context, and prepare the transcript.
     pub fn new(req: RlmRequest, depth: u32) -> Result<Self, String> {
+        Self::new_with_developer_system(req, depth, None)
+    }
+
+    /// R-11 (RULES §1.2 prompt sovereignty): build an episode that carries a
+    /// DEVELOPER system prompt.
+    ///
+    /// The developer prompt is sacred: when one is supplied (non-empty after
+    /// a whitespace-only check — the bytes are never trimmed or rewritten)
+    /// it becomes `messages[0]`, a `system` message whose content is
+    /// byte-for-byte the caller's text. The RLM protocol contract then moves
+    /// into the kickoff USER message as ONE clearly delimited block
+    /// (`--- episode protocol … --- end protocol ---`) placed before the
+    /// question, so it can never displace or edit the developer text.
+    ///
+    /// Why not "append an extra system message after it"? Both wire builders
+    /// would lose that second system turn: `rt/ai.rs format_chatml` keeps only
+    /// the first system turn for local/ChatML models, and the Anthropic
+    /// builder hoists only the LEADING system message. A delimited block in
+    /// the kickoff user turn reaches the model intact on OpenAI-compatible,
+    /// Anthropic and ChatML wires alike.
+    ///
+    /// `None` (or an all-whitespace prompt) is exactly the pre-R-11 shape:
+    /// protocol owns the system turn, kickoff owns the user turn.
+    pub fn new_with_developer_system(
+        req: RlmRequest,
+        depth: u32,
+        developer_system: Option<&str>,
+    ) -> Result<Self, String> {
         // js-12 (AUDIT-2026-09-07): max_depth used to be parsed from the
         // wire but never read — the recursion knob was decorative. Every
         // episode (top-level or nested) is constructed HERE, so the budget
@@ -198,14 +240,23 @@ impl Episode {
             sandbox.context_chars(),
             req.question.trim()
         );
-        let system = format!("{}{}",
+        let protocol = format!("{}{}",
             SYSTEM_PROMPT,
             tool_prompt(&req.opts.tools, req.opts.max_tool_calls as usize));
+        let messages = match developer_system.filter(|s| !s.trim().is_empty()) {
+            /* R-11: developer prompt first, byte-for-byte; protocol after it
+             * as delimited text in the kickoff turn. */
+            Some(dev) => vec![
+                Message::system(dev),
+                Message::user(&protocol_then_kickoff(&protocol, &kickoff)),
+            ],
+            None => vec![Message::system(&protocol), Message::user(&kickoff)],
+        };
         Ok(Self {
             sandbox,
             opts: req.opts,
             depth,
-            messages: vec![Message::system(&system), Message::user(&kickoff)],
+            messages,
             llm_cache: Vec::new(),
             tool_cache: Vec::new(),
             pending: None,
@@ -602,6 +653,52 @@ mod tests {
             SYSTEM_PROMPT.len() <= 680,
             "driver prompt grew: {} chars", SYSTEM_PROMPT.len()
         );
+    }
+
+    /// R-11 (RULES §1.2 prompt sovereignty): a developer system prompt rides
+    /// the FIRST system segment byte-for-byte, and the episode protocol never
+    /// displaces or edits it — it follows as one delimited block in the
+    /// kickoff turn instead.
+    #[test]
+    fn developer_system_is_first_and_byte_exact() {
+        /* Deliberately awkward bytes: interior double spaces, a newline, a
+         * unicode glyph, a trailing space. Trimming/normalising any of them
+         * would be a prompt-sovereignty violation. */
+        let dev = "AGENT=sovereign. Reply in one line.  \n\nKeep   spacing · unicode ✓ ";
+        let mut req = request("some corpus text");
+        req.opts.tools = vec![ToolSpec {
+            name: "echo".to_string(),
+            description: "echo the argument".to_string(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }];
+        let ep = Episode::new_with_developer_system(req, 0, Some(dev)).expect("episode");
+        assert_eq!(ep.messages[0].role, "system");
+        assert_eq!(ep.messages[0].content, dev, "developer prompt must be byte-identical");
+        assert_eq!(ep.messages[1].role, "user");
+        let kick = &ep.messages[1].content;
+        assert!(kick.starts_with("--- episode protocol"), "protocol block must be delimited: {kick}");
+        assert!(kick.contains("Sofuu RLM loop"), "protocol contract must survive");
+        assert!(kick.contains("tool(name, args)"), "tool docs must survive");
+        assert!(kick.contains("Question: find the code word"), "kickoff question must survive");
+        /* The developer text is NOT copied into the kickoff turn either —
+         * exactly one authoritative system turn. */
+        assert_eq!(kick.matches("AGENT=sovereign").count(), 0);
+
+        /* No developer prompt (and a whitespace-only one) = the pre-R-11
+         * shape, byte-for-byte. */
+        let plain = Episode::new(request("some corpus text"), 0).expect("episode");
+        assert_eq!(plain.messages[0].role, "system");
+        assert_eq!(
+            plain.messages[0].content,
+            format!("{}{}", SYSTEM_PROMPT, tool_prompt(&[], 16))
+        );
+        assert_eq!(plain.messages[1].role, "user");
+        assert!(!plain.messages[1].content.contains("episode protocol"));
+
+        let blank = Episode::new_with_developer_system(request("some corpus text"), 0, Some("  \n "))
+            .expect("episode");
+        assert!(blank.messages[0].content.starts_with("Sofuu RLM loop"));
+        assert!(!blank.messages[1].content.contains("episode protocol"));
     }
 
     /// Full flow with a scripted fake model: round 1 inspects count/chunk,

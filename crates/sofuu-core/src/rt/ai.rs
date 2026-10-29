@@ -35,6 +35,12 @@ extern "C" {
     fn sofuu_dot_f32(a: *const f32, b: *const f32, n: usize) -> f32;
     fn sofuu_l2_f32(a: *const f32, b: *const f32, n: usize) -> f32;
     fn sofuu_cosine_f32(a: *const f32, b: *const f32, n: usize) -> f32;
+    /* quickjs.h:758 — a real export of the vendored 2024-01-13 engine. The
+     * typed-array class tag needs it: JS_GetTypedArrayType/JS_GetClassID do
+     * not exist in this QuickJS version (its JS_CLASS_FLOAT32_ARRAY is a
+     * private quickjs.c enum), so the class is identified by prototype
+     * identity instead — see is_float32_array() below. */
+    fn JS_GetPrototype(ctx: *mut JSContext, val: JSValueConst) -> JSValue;
 }
 
 /* ------------------------------------------------------------------ */
@@ -5634,25 +5640,170 @@ impl F32View {
     }
 }
 
+/// Drop whatever exception is pending on `ctx`, if any.
+///
 /// # Safety
-/// `val` a live JS value of `ctx`; returns a zero-copy borrowed or copied float vector view or None.
-unsafe fn extract_f32(ctx: *mut JSContext, val: JSValueConst) -> Option<F32View> {
-    let mut byte_offset: usize = 0;
-    let mut byte_length: usize = 0;
-    let buf = qjs::JS_GetTypedArrayBuffer(ctx, val, &mut byte_offset, &mut byte_length, ptr::null_mut());
-    if !qjs::is_exception(buf) {
-        let mut buf_size: usize = 0;
-        let ptr = qjs::JS_GetArrayBuffer(ctx, &mut buf_size, buf);
-        qjs::sofuu_js_free_value(ctx, buf);
-        if ptr.is_null() {
-            return None;
-        }
-        let n = byte_length / std::mem::size_of::<f32>();
-        let slice_ptr = ptr.add(byte_offset) as *const f32;
-        // Zero-copy: borrow directly from the TypedArray buffer with zero heap allocations and zero memcpy!
-        return Some(F32View::Borrowed(slice_ptr, n));
+/// `ctx` is a live JSContext. JS_GetException returns JS_NULL when nothing is
+/// pending, and freeing a non-refcounted tag is a no-op, so this is safe to
+/// call speculatively.
+unsafe fn clear_pending_exception(ctx: *mut JSContext) {
+    let e = qjs::sofuu_js_get_exception(ctx);
+    qjs::sofuu_js_free_value(ctx, e);
+}
+
+/// JavaScript-visible type name of `val`, for the H-03 error message:
+/// `constructor.name` where there is one ("Float64Array", "Uint8Array",
+/// "DataView", "Array", "Object"), else the primitive spelling.
+///
+/// # Safety
+/// `ctx` live, `val` a live value of `ctx`. Never leaves an exception pending
+/// (a throwing `constructor` getter is swallowed — we are already building a
+/// TypeError).
+unsafe fn jstype_name(ctx: *mut JSContext, val: JSValueConst) -> String {
+    if qjs::sofuu_js_is_undefined(val) != 0 {
+        return "undefined".to_string();
     }
-    qjs::sofuu_js_free_value(ctx, buf);
+    if qjs::sofuu_js_is_null(val) != 0 {
+        return "null".to_string();
+    }
+    if qjs::sofuu_js_is_string(val) != 0 {
+        return "string".to_string();
+    }
+    if qjs::sofuu_js_is_number(val) != 0 {
+        return "number".to_string();
+    }
+    if qjs::sofuu_js_is_object(val) == 0 {
+        /* boolean / bigint / symbol — no constructor to ask. */
+        return "non-object".to_string();
+    }
+    let ctor = qjs::sofuu_js_get_property_str(ctx, val, c"constructor".as_ptr());
+    if qjs::is_exception(ctor) {
+        clear_pending_exception(ctx);
+        return "Object".to_string();
+    }
+    let mut name = String::from("Object");
+    if qjs::sofuu_js_is_object(ctor) != 0 {
+        let nm = qjs::sofuu_js_get_property_str(ctx, ctor, c"name".as_ptr());
+        if qjs::is_exception(nm) {
+            clear_pending_exception(ctx);
+        } else if qjs::sofuu_js_is_string(nm) != 0 {
+            if let Some(s) = cstr_opt(ctx, nm) {
+                if !s.is_empty() {
+                    name = s;
+                }
+            }
+        }
+        qjs::sofuu_js_free_value(ctx, nm);
+    }
+    qjs::sofuu_js_free_value(ctx, ctor);
+    name
+}
+
+/// H-03 type tag. A value counts as a `Float32Array` only when it is an object
+/// whose *internal* prototype IS the intrinsic `Float32Array.prototype`.
+///
+/// Prototype identity is compared directly (no getter runs, nothing can shadow
+/// it) and rejects every other view: Float64Array / Uint8Array / Int32Array /
+/// … / DataView / ArrayBuffer / plain objects / primitives. `extract_f32`
+/// additionally requires the engine-reported element size to be 4 bytes, so a
+/// re-prototyped `Int32Array` is the only thing that could still alias (it
+/// reads its own in-bounds bytes — no OOB — and needs a deliberate
+/// `Object.setPrototypeOf` to arrange).
+///
+/// # Safety
+/// `ctx` live, `val` a live value of `ctx`. Never leaves an exception pending.
+unsafe fn is_float32_array(ctx: *mut JSContext, val: JSValueConst) -> bool {
+    if qjs::sofuu_js_is_object(val) == 0 {
+        return false; /* primitives have no typed-array class */
+    }
+    let proto = JS_GetPrototype(ctx, val); /* proxy traps can throw */
+    if qjs::is_exception(proto) {
+        clear_pending_exception(ctx);
+        return false;
+    }
+    let global = qjs::sofuu_js_get_global_object(ctx);
+    let ctor = qjs::sofuu_js_get_property_str(ctx, global, c"Float32Array".as_ptr());
+    qjs::sofuu_js_free_value(ctx, global);
+    if qjs::is_exception(ctor) {
+        clear_pending_exception(ctx);
+        qjs::sofuu_js_free_value(ctx, proto);
+        return false;
+    }
+    let f32_proto = qjs::sofuu_js_get_property_str(ctx, ctor, c"prototype".as_ptr());
+    qjs::sofuu_js_free_value(ctx, ctor);
+    let same = !qjs::is_exception(f32_proto)
+        && f32_proto.tag == proto.tag
+        && f32_proto.u.ptr == proto.u.ptr;
+    if qjs::is_exception(f32_proto) {
+        clear_pending_exception(ctx);
+    }
+    qjs::sofuu_js_free_value(ctx, f32_proto);
+    qjs::sofuu_js_free_value(ctx, proto);
+    same
+}
+
+/// R-28: was `val`'s ArrayBuffer detached? Only consulted after
+/// `JS_GetTypedArrayBuffer` already refused the view; QuickJS reports a
+/// detached typed array's `byteLength` as 0 without throwing (quickjs.c
+/// js_typed_array_get_byteLength), and a *non*-detached view would not have
+/// been refused, so 0 here means detached.
+///
+/// # Safety
+/// `ctx` live, `val` a live value of `ctx`. Never leaves an exception pending.
+unsafe fn typed_array_is_detached(ctx: *mut JSContext, val: JSValueConst) -> bool {
+    let bl = qjs::sofuu_js_get_property_str(ctx, val, c"byteLength".as_ptr());
+    if qjs::is_exception(bl) {
+        clear_pending_exception(ctx);
+        return false;
+    }
+    let mut len: f64 = f64::NAN;
+    let rc = qjs::JS_ToFloat64(ctx, &mut len, bl);
+    qjs::sofuu_js_free_value(ctx, bl);
+    rc == 0 && len == 0.0
+}
+
+/// Throw `TypeError: Expected Float32Array, got <name>` with an explicit name
+/// (used where `constructor.name` would be misleading).
+///
+/// # Safety
+/// `ctx` live.
+unsafe fn throw_expected_float32_named(ctx: *mut JSContext, name: &str) {
+    /* The name goes through %s, never through the format string, so a type
+     * name containing '%' cannot corrupt the message. */
+    let cname = CString::new(name).unwrap_or_default();
+    qjs::JS_ThrowTypeError(
+        ctx,
+        c"Expected Float32Array, got %s".as_ptr(),
+        cname.as_ptr(),
+    );
+}
+
+/// Throw `TypeError: Expected Float32Array, got <TypeName>` (H-03).
+///
+/// # Safety
+/// `ctx` live, `val` a live value of `ctx`.
+unsafe fn throw_expected_float32(ctx: *mut JSContext, val: JSValueConst) {
+    throw_expected_float32_named(ctx, &jstype_name(ctx, val));
+}
+
+/// Throw `TypeError: Cannot perform vector math on a detached ArrayBuffer`
+/// (R-28).
+///
+/// # Safety
+/// `ctx` live.
+unsafe fn throw_detached_buffer(ctx: *mut JSContext) {
+    qjs::JS_ThrowTypeError(
+        ctx,
+        c"Cannot perform vector math on a detached ArrayBuffer".as_ptr(),
+    );
+}
+
+/// Copy a plain JS `Array` of numbers into f32 lanes (the pre-existing
+/// element-by-element path; `ai.dot([1,2],[1,2])` has always gone through it).
+///
+/// # Safety
+/// `ctx` live, `val` a live Array value of `ctx`.
+unsafe fn copy_array_f32(ctx: *mut JSContext, val: JSValueConst) -> Vec<f32> {
     let len_v = qjs::sofuu_js_get_property_str(ctx, val, c"length".as_ptr());
     let mut len32: u32 = 0;
     qjs::sofuu_js_to_uint32(ctx, &mut len32, len_v);
@@ -5665,7 +5816,115 @@ unsafe fn extract_f32(ctx: *mut JSContext, val: JSValueConst) -> Option<F32View>
         qjs::sofuu_js_free_value(ctx, el);
         out[i as usize] = d as f32;
     }
-    Some(F32View::Owned(out))
+    out
+}
+
+/// Resolve one JS vector argument to f32 lanes.
+///
+/// H-03 / R-28. Accepts exactly two shapes:
+///   * `Float32Array` → zero-copy borrow of its backing store (unchanged;
+///     Float32Array.subarray() views keep the precise byte_offset window);
+///   * plain `Array` → element-by-element copy (unchanged behaviour).
+/// Everything else — Float64Array, Uint8Array, Int32Array, DataView,
+/// ArrayBuffer, SharedArrayBuffer, string, null, object — throws a real
+/// JavaScript `TypeError`, and a detached `Float32Array` throws instead of
+/// reading as an empty vector (which used to make `ai.dot` return 0).
+///
+/// Type/shape validation is O(1) and happens once per call, entirely outside
+/// the element loops: the kernels still see the same pointer + length pair and
+/// keep their branch-free SIMD fast path.
+///
+/// # Safety
+/// `val` a live JS value of `ctx`. On `Err(())` a JavaScript exception is
+/// pending and the caller must return `sofuu_js_exception()`.
+unsafe fn extract_f32(ctx: *mut JSContext, val: JSValueConst) -> Result<F32View, ()> {
+    /* (1) Plain Array — the historic copy path, kept working. */
+    if qjs::JS_IsArray(ctx, val) != 0 {
+        return Ok(F32View::Owned(copy_array_f32(ctx, val)));
+    }
+
+    /* (2) Must be a live typed array; the call also hands us the element width
+     * (4 bytes) for free — no extra lookup for the common rejection cases. */
+    let mut byte_offset: usize = 0;
+    let mut byte_length: usize = 0;
+    let mut bytes_per_element: usize = 0;
+    let buf = qjs::JS_GetTypedArrayBuffer(
+        ctx,
+        val,
+        &mut byte_offset,
+        &mut byte_length,
+        &mut bytes_per_element,
+    );
+    if qjs::is_exception(buf) {
+        /* QuickJS raised "not a TypedArray" or its own detached-buffer
+         * TypeError; drop it and re-throw one stable message per category. */
+        clear_pending_exception(ctx);
+        if is_float32_array(ctx, val) {
+            if typed_array_is_detached(ctx, val) {
+                return Err(throw_detached_buffer(ctx));
+            }
+            /* The prototype says Float32Array but the engine will not treat it
+             * as a typed array: a Proxy wrapper (JS_CLASS_PROXY) or another
+             * exotic object. It cannot be borrowed, and falling back to
+             * element-wise reads would run user code inside the vector path. */
+            return Err(throw_expected_float32_named(ctx, "Float32Array-like object"));
+        }
+        return Err(throw_expected_float32(ctx, val));
+    }
+    /* (3) 4-byte lanes, then the class tag: Int32Array/Uint32Array are also
+     * 4 bytes, so the width alone is not enough. */
+    if bytes_per_element != std::mem::size_of::<f32>() || !is_float32_array(ctx, val) {
+        qjs::sofuu_js_free_value(ctx, buf);
+        return Err(throw_expected_float32(ctx, val));
+    }
+    let mut buf_size: usize = 0;
+    let ptr = qjs::JS_GetArrayBuffer(ctx, &mut buf_size, buf);
+    qjs::sofuu_js_free_value(ctx, buf);
+    if ptr.is_null() {
+        /* JS_GetArrayBuffer only fails (and raises) for a detached buffer —
+         * R-28, e.g. detached between the two calls. */
+        clear_pending_exception(ctx);
+        /* Empty buffer on a platform whose allocator returns NULL for 0
+         * bytes: no lanes to read, so nothing to dereference. */
+        if byte_length == 0 {
+            return Ok(F32View::Borrowed(std::ptr::null(), 0));
+        }
+        return Err(throw_detached_buffer(ctx));
+    }
+    let n = byte_length / std::mem::size_of::<f32>();
+    let slice_ptr = ptr.add(byte_offset) as *const f32;
+    // Zero-copy: borrow directly from the TypedArray buffer with zero heap allocations and zero memcpy!
+    Ok(F32View::Borrowed(slice_ptr, n))
+}
+
+/// f64 dot product over the same f32 lanes — the R-27 escape hatch used when
+/// the f32 kernel saturated. Summation in f64 keeps the exact answer for
+/// magnitudes whose f32 product/sum exceeds FLT_MAX (components ≳1e19, or
+/// n·x² ≳3.4e38).
+///
+/// # Safety
+/// `a`/`b` must each point to `n` readable f32 lanes.
+unsafe fn dot_f64_wide(a: *const f32, b: *const f32, n: usize) -> f64 {
+    let mut acc: f64 = 0.0;
+    for i in 0..n {
+        acc += (*a.add(i) as f64) * (*b.add(i) as f64);
+    }
+    acc
+}
+
+/// f64 L2 distance over the same f32 lanes — same escape hatch as
+/// `dot_f64_wide`, so a squared difference that overflows f32 no longer
+/// collapses the distance to Infinity.
+///
+/// # Safety
+/// `a`/`b` must each point to `n` readable f32 lanes.
+unsafe fn l2_f64_wide(a: *const f32, b: *const f32, n: usize) -> f64 {
+    let mut acc: f64 = 0.0;
+    for i in 0..n {
+        let d = (*a.add(i) as f64) - (*b.add(i) as f64);
+        acc += d * d;
+    }
+    acc.sqrt()
 }
 
 unsafe extern "C" fn js_ai_similarity(
@@ -5677,10 +5936,15 @@ unsafe extern "C" fn js_ai_similarity(
     if argc < 2 {
         return qjs::JS_ThrowTypeError(ctx, c"similarity(a,b) requires 2 vectors".as_ptr());
     }
-    let a = extract_f32(ctx, *argv);
-    let b = extract_f32(ctx, *argv.add(1));
-    let (Some(a), Some(b)) = (a, b) else {
-        return qjs::JS_ThrowTypeError(ctx, c"vectors must be same length".as_ptr());
+    /* H-03/R-28: extract_f32 throws (TypeError) for anything that is not a
+     * Float32Array or a plain Array, and for detached views. */
+    let a = match extract_f32(ctx, *argv) {
+        Ok(v) => v,
+        Err(()) => return qjs::sofuu_js_exception(),
+    };
+    let b = match extract_f32(ctx, *argv.add(1)) {
+        Ok(v) => v,
+        Err(()) => return qjs::sofuu_js_exception(),
     };
     if a.len() != b.len() {
         return qjs::JS_ThrowTypeError(ctx, c"vectors must be same length".as_ptr());
@@ -5699,17 +5963,31 @@ unsafe extern "C" fn js_ai_dot(
     if argc < 2 {
         return qjs::JS_ThrowTypeError(ctx, c"dot(a,b) requires 2 vectors".as_ptr());
     }
-    let a = extract_f32(ctx, *argv);
-    let b = extract_f32(ctx, *argv.add(1));
-    let (Some(a), Some(b)) = (a, b) else {
-        return qjs::JS_ThrowTypeError(ctx, c"same length required".as_ptr());
+    let a = match extract_f32(ctx, *argv) {
+        Ok(v) => v,
+        Err(()) => return qjs::sofuu_js_exception(),
+    };
+    let b = match extract_f32(ctx, *argv.add(1)) {
+        Ok(v) => v,
+        Err(()) => return qjs::sofuu_js_exception(),
     };
     if a.len() != b.len() {
         return qjs::JS_ThrowTypeError(ctx, c"same length required".as_ptr());
     }
     // SAFETY: a/b live for the call; n matches their length.
     let r = sofuu_dot_f32(a.as_ptr(), b.as_ptr(), a.len());
-    qjs::sofuu_js_new_float64(ctx, r as f64)
+    /* R-27: f32 products/sums saturate to ±Inf once a lane exceeds FLT_MAX
+     * (components ≳1e19, or n·x² ≳3.4e38 — 768 lanes of 1e18 is 7.7e38).
+     * An overflowed f32 sum can never come back to a finite value
+     * (Inf ± finite = Inf, Inf − Inf = NaN), so `is_finite` is an exact
+     * overflow detector: recompute in f64 only then. Ordinary magnitudes
+     * (and NaN operands) keep the exact fast-path answer. */
+    let out = if r.is_finite() {
+        r as f64
+    } else {
+        dot_f64_wide(a.as_ptr(), b.as_ptr(), a.len())
+    };
+    qjs::sofuu_js_new_float64(ctx, out)
 }
 
 unsafe extern "C" fn js_ai_l2(
@@ -5721,17 +5999,28 @@ unsafe extern "C" fn js_ai_l2(
     if argc < 2 {
         return qjs::JS_ThrowTypeError(ctx, c"l2(a,b) requires 2 vectors".as_ptr());
     }
-    let a = extract_f32(ctx, *argv);
-    let b = extract_f32(ctx, *argv.add(1));
-    let (Some(a), Some(b)) = (a, b) else {
-        return qjs::JS_ThrowTypeError(ctx, c"same length required".as_ptr());
+    let a = match extract_f32(ctx, *argv) {
+        Ok(v) => v,
+        Err(()) => return qjs::sofuu_js_exception(),
+    };
+    let b = match extract_f32(ctx, *argv.add(1)) {
+        Ok(v) => v,
+        Err(()) => return qjs::sofuu_js_exception(),
     };
     if a.len() != b.len() {
         return qjs::JS_ThrowTypeError(ctx, c"same length required".as_ptr());
     }
     // SAFETY: a/b live for the call; n matches their length.
     let r = sofuu_l2_f32(a.as_ptr(), b.as_ptr(), a.len());
-    qjs::sofuu_js_new_float64(ctx, r as f64)
+    /* R-27 consistency: a squared difference that overflows f32 would report
+     * Infinity for a finite distance — same is_finite detector, same f64
+     * recompute, ordinary magnitudes untouched. */
+    let out = if r.is_finite() {
+        r as f64
+    } else {
+        l2_f64_wide(a.as_ptr(), b.as_ptr(), a.len())
+    };
+    qjs::sofuu_js_new_float64(ctx, out)
 }
 
 unsafe extern "C" fn js_ai_estimate_tokens(

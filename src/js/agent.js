@@ -575,6 +575,12 @@
       profile: def.profile || '',
       maxTokensOut: (def.max_tokens || def.maxTokensOut || 0) | 0,
       ctxWindow: (def.ctx_window || def.ctxWindow || 0) | 0,
+      /* R-12 (RULES §1.2): repository-context opt-in, resolved at define
+       * time. A def may request AGENTS.md injection with `agentsMd: true`;
+       * a run may also request it with `opts.agentsMd: true`. This field
+       * used to be a truthy check in the injection gate that nothing ever
+       * assigned — a def-level flag was silently ignored. */
+      agentsMd: def.agentsMd === true,
       /* P2: recall gating knobs — 0 = scale with the model's window.
        * M1: unset is `undefined`, not 0 — 0 now means "the live window
        * says inject nothing this turn" and must never arise from a
@@ -637,10 +643,12 @@
      * Off by default — it costs one LLM call; the P3.3 ledger below gives
      * the zero-token advisory for everyone else. */
     d.budget.verify = b.verify === true;
-    /* Task-gate: tool-aware & opt-in; enabled by default only for coding preset */
-    d.budget.taskGate = (typeof b.taskGate === 'boolean')
-      ? b.taskGate
-      : (d.preset === 'coding' || d.profile === 'coding');
+    /* Task-gate: tool-aware & STRICTLY opt-in (RULES §1.3). `false` is the
+     * default for every def, coding preset included; only an explicit
+     * `budget.taskGate: true` (or a run's `opts.taskGate: true`) arms it,
+     * and the loop still requires todo_write in the resolved toolset.
+     * R-13: the old coding-preset default nagged general-purpose agents. */
+    d.budget.taskGate = b.taskGate === true;
     d.budget.taskGateSteps = (b.taskGateSteps | 0) || TODO_GATE_STEPS;
     /* P4.1 structured outputs: an optional LIGHT JSON schema (required +
      * type checks, ≤2 levels of properties) the answer must satisfy —
@@ -3329,7 +3337,18 @@
        * this, it does not substitute for it. */
       if (d.provider !== 'local') {
         ctxParts.push('Current date: ' + isoDate() + '.');
-        if (d.preset === 'coding' || d.profile === 'coding' || d.agentsMd || (opts && opts.agentsMd) || d.system === CORE_PROMPT) {
+        /* R-12 / RULES §1.2: repository context is STRICTLY opt-in. The
+         * triggers are an explicit `agentsMd: true` on the def (resolved in
+         * normalizeDef), an explicit `opts.agentsMd === true` on this run,
+         * or `preset: 'coding'` (the one §1.2-sanctioned domain preset; the
+         * interactive coding CLI depends on it). Removed here: the
+         * `d.system === CORE_PROMPT` value-equality trigger — a def whose
+         * prompt merely happened to equal CORE_PROMPT got repository
+         * context injected by accident, which is exactly the implicit
+         * injection §1.2 forbids. Default (no flag, no coding preset) = no
+         * injection. */
+        if (d.agentsMd === true || (opts && opts.agentsMd === true) ||
+            d.preset === 'coding' || d.profile === 'coding') {
           var agentsMd = await readAgentsMd(d);
           if (agentsMd) ctxParts.push(agentsMd);
         }
@@ -3552,8 +3571,11 @@
               }
             }
 
-            // 2. Only for coding preset or explicit opts.agentsMd: also pin to AGENTS.md
-            if (isCoding || (opts && opts.agentsMd)) {
+            // 2. RULES §1.4: only the coding preset or an EXPLICIT
+            //    agentsMd opt-in (def or run) may pin to AGENTS.md — the
+            //    built-in tool never writes workspace markdown for a
+            //    general agent.
+            if (isCoding || d.agentsMd === true || (opts && opts.agentsMd === true)) {
               var fileRes = await pinProjectFact(fact);
               results.push('AGENTS.md: ' + fileRes);
             }
@@ -3763,6 +3785,16 @@
             var ro = { provider: d.provider, model: d.model, effort: d.effort,
                        base_url: d.baseUrl, api_key: d.apiKey, profile: d.profile, trace: true,
                        tokenLimit: tokRemain };
+            /* R-11 (RULES §1.2 prompt sovereignty): the developer's system
+             * prompt must survive the RLM route — the episode protocol used
+             * to own the system turn outright, so a routed turn silently
+             * dropped the developer's prompt. Handed over BYTE-EXACT (no
+             * identity line, no protocol concatenation) so the episode can
+             * emit it as the FIRST system segment verbatim and keep the
+             * protocol in a clearly delimited block after it. Forwarding
+             * chain: rlm.js __rlm_new `opts.system` -> js_api OptsJson ->
+             * RlmOpts.system -> Episode::new_with_developer_system. */
+            ro.system = d.system;
             var mo = (opts && opts.max_tokens) || d.maxTokensOut || 0;
             if (mo <= 0) mo = maxOutputFor(d);
             if (mo > 0) ro.max_tokens = mo;
@@ -4967,9 +4999,10 @@
         }
         /* Task-gate backstop: fires only if:
          * 1. Agent has the todo_write tool in its resolved toolset (never nag if tool is absent)
-         * 2. taskGate is enabled in budget (opt-in; defaults true only for coding preset)
-         * 3. opts.taskGate is not explicitly disabled for this run
-         * 4. Steps reach threshold without sawTodo */
+         * 2. taskGate is explicitly enabled — budget.taskGate: true at define
+         *    time or opts.taskGate: true for this run (RULES §1.3, R-13).
+         *    There is NO preset-derived default: false everywhere.
+         * 3. Steps reach threshold without sawTodo */
         var hasTodoTool = !!(toolset && toolset.exec && toolset.exec.todo_write);
         var gateThreshold = (d.budget && d.budget.taskGateSteps > 0) ? d.budget.taskGateSteps : TODO_GATE_STEPS;
         var runTaskGate = (opts && opts.taskGate !== undefined) ? !!opts.taskGate : !!(d.budget && d.budget.taskGate);

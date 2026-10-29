@@ -249,8 +249,11 @@ release-archives: linux
 dist: all linux
 	@mkdir -p dist
 	@cp $(TARGET) dist/sofuu-darwin-arm64
-	@tar -czf dist/sofuu-darwin-arm64.tar.gz -C dist sofuu-darwin-arm64
+	@stage=$$(mktemp -d); cp dist/sofuu-darwin-arm64 $$stage/; \
+	  bash scripts/pack/stage_legal.sh $$stage . >/dev/null 2>&1 || true; \
+	  tar -czf dist/sofuu-darwin-arm64.tar.gz -C $$stage .; rm -rf $$stage
 	@echo "  \033[32m✓\033[0m dist/sofuu-darwin-arm64.tar.gz"
+	@bash scripts/pack/checksums.sh
 	@ls -lh dist/*.tar.gz
 
 # ── H4: Platform packs (libsofuu for macOS, Linux, iOS, Android) ───

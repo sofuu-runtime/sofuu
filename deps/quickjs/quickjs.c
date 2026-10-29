@@ -277,6 +277,10 @@ struct JSRuntime {
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
+    /* S2/C-02: set while lre_poll_interrupts() invokes the interrupt handler
+       so the handler can distinguish a native regexp engine poll from a
+       bytecode interrupt-counter batch (see JS_GetInterruptPollSource). */
+    int interrupt_poll_source;
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -1817,6 +1821,16 @@ void JS_SetInterruptCounter(JSContext *ctx, int counter)
 {
     if (ctx)
         ctx->interrupt_counter = counter;
+}
+
+/* S2/C-02: 0 when the interrupt handler was called from a bytecode meter
+ * batch, 1 when it was called from the native regexp engine poll
+ * (lre_poll_interrupts). Embedders that meter work (the sandbox fuel meter)
+ * use this to decide whether a batch of instructions was actually
+ * executed. */
+int JS_GetInterruptPollSource(JSRuntime *rt)
+{
+    return rt ? rt->interrupt_poll_source : 0;
 }
 
 void JS_SetCanBlock(JSRuntime *rt, BOOL can_block)
@@ -43759,6 +43773,41 @@ void *lre_realloc(void *opaque, void *ptr, size_t size)
     return js_realloc_rt(ctx->rt, ptr, size);
 }
 
+/* S2/C-02: called by the regexp backtracking loop every
+ * LRE_INTERRUPT_POLL_STEPS steps (libregexp.c). Regexp evaluation is one
+ * native frame, so without this hook JS_SetInterruptHandler() (the sandbox
+ * fuel meter and wall-clock deadline) could never fire while a catastrophic
+ * pattern such as /(a+)+$/ backtracks.
+ *
+ * The steps are charged to the same interrupt counter the bytecode loop
+ * uses, so the (arbitrary, possibly expensive) user handler runs at most
+ * once per JS_INTERRUPT_COUNTER_INIT steps instead of once per regexp step.
+ * The handler is told the poll came from the engine
+ * (JS_GetInterruptPollSource() == 1) so a work meter can account for native
+ * steps without mistaking them for executed bytecode. With no handler
+ * installed - the default for every non-sandboxed runtime - this is one
+ * null check and nothing else. Returns non-zero with a pending JS exception
+ * (raised by __js_poll_interrupts) when the handler aborts. */
+int lre_poll_interrupts(void *opaque)
+{
+    JSContext *ctx = opaque;
+    JSRuntime *rt;
+    int ret;
+
+    if (!ctx)
+        return 0;
+    rt = ctx->rt;
+    if (!rt->interrupt_handler)
+        return 0;
+    ctx->interrupt_counter -= LRE_INTERRUPT_POLL_STEPS;
+    if (likely(ctx->interrupt_counter > 0))
+        return 0;
+    rt->interrupt_poll_source = 1;
+    ret = __js_poll_interrupts(ctx);
+    rt->interrupt_poll_source = 0;
+    return ret;
+}
+
 static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
@@ -43819,7 +43868,11 @@ static JSValue js_regexp_exec(JSContext *ctx, JSValueConst this_val,
                     goto fail;
             }
         } else {
-            JS_ThrowInternalError(ctx, "out of memory in regexp execution");
+            /* S2/C-02: on interrupt the exception raised by
+             * js_poll_interrupts() is already pending - keep it instead of
+             * replacing it with the OOM message. */
+            if (rc != LRE_ECODE_INTERRUPTED)
+                JS_ThrowInternalError(ctx, "out of memory in regexp execution");
             goto fail;
         }
     } else {
@@ -44015,7 +44068,9 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValueCon
                         goto fail;
                 }
             } else {
-                JS_ThrowInternalError(ctx, "out of memory in regexp execution");
+                /* S2/C-02: keep the pending interrupt exception. */
+                if (ret != LRE_ECODE_INTERRUPTED)
+                    JS_ThrowInternalError(ctx, "out of memory in regexp execution");
                 goto fail;
             }
             break;

@@ -127,6 +127,63 @@ fn surfaces() -> Value {
     Value::Object(out)
 }
 
+/// Logical cores available to this process.
+///
+/// `std::thread::available_parallelism()` returns **1** in the static-musl
+/// Linux build (its `sched_getaffinity` path fails and Rust falls back to 1),
+/// which made `capabilities()` — and therefore `doctor`, which prints this
+/// field — report a single core on a 4-core Raspberry Pi 5 while the
+/// inference engine fanned out to 4 (see `infer/qwen35.rs:58`, which documents
+/// the same defect and works around it by borrowing the C++ pool's count).
+/// A host that sized its own thread pool from `capabilities` was handed one
+/// worker on a four-core machine.
+///
+/// The pool is authoritative once initialised; otherwise use the OS view and,
+/// on Linux, fall back to counting `/sys/devices/system/cpu/cpu[0-9]+`.
+fn logical_cpus() -> usize {
+    let from_pool = crate::infer::quant::get_thread_count();
+    if from_pool > 1 {
+        return from_pool;
+    }
+    if let Ok(n) = std::thread::available_parallelism() {
+        if n.get() > 1 {
+            return n.get();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") {
+            let n = entries
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.strip_prefix("cpu")
+                        .map(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+                        .unwrap_or(false)
+                })
+                .count();
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    from_pool.max(1)
+}
+
+/// Features the *target platform* cannot provide at all, as opposed to
+/// features this build dropped. Metal exists only on Apple platforms, so a
+/// Linux or Windows build listing it under `missing` is not a degraded build —
+/// `doctor` used to count it as a failure and exited 1 on every healthy
+/// Linux install (R-25b, AUDIT-2026-10-29).
+fn platform_absent() -> Vec<&'static str> {
+    if cfg!(any(target_os = "macos", target_os = "ios")) {
+        Vec::new()
+    } else {
+        vec!["metal"]
+    }
+}
+
 /// The manifest as a JSON value.
 pub fn manifest() -> Value {
     let mut features = vec!["simd", "qtsq"];
@@ -143,11 +200,15 @@ pub fn manifest() -> Value {
             "version": env!("CARGO_PKG_VERSION"),
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
-            "threads": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+            "threads": logical_cpus(),
             "ram_mb": ram_mb(),
             "gpu": { "backend": "metal", "available": metal_available() }
         },
-        "build": { "features": features, "missing": missing },
+        "build": {
+            "features": features,
+            "missing": missing,
+            "platform_absent": platform_absent()
+        },
         "engine": {
             "formats": ["gguf", "safetensors", "pt", "npy"],
             "quant_types": ["f32", "f16", "q4_K", "q6_K", "q8_0", "q3_K_S"],

@@ -7,6 +7,42 @@
 #include "simd.h"
 #include <math.h>
 
+/* ── R-27: extreme-magnitude escape hatch ──────────────────────────────
+ * Identical to the NEON kernel's (src/simd/neon.c) so both arches answer
+ * the same way. f32 cosine accumulation overflows once |a_i| > 1.8e19
+ * (x*x > FLT_MAX) or once the sum of squares passes 3.4e38 (768 components
+ * of 1e18 = 7.7e38), after which dot/denom is Inf/Inf = NaN or a silent
+ * 0.0. An overflowed f32 sum can never return to a finite value, so a
+ * non-finite accumulator is an exact detector; only then is the whole
+ * computation redone in f64 after scaling each vector by its max |component|
+ * (cosine is scale-invariant). Ordinary magnitudes keep the branch-free
+ * accumulate loops and bit-identical results. */
+static float sofuu_cosine_scaled_f32(const float *a, const float *b, size_t n) {
+    double sa = 0.0, sb = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double x = fabs((double)a[i]);
+        double y = fabs((double)b[i]);
+        if (!isfinite(x) || !isfinite(y)) return NAN;
+        if (x > sa) sa = x;
+        if (y > sb) sb = y;
+    }
+    if (sa == 0.0 || sb == 0.0) return 0.0f;
+    double dot = 0.0, na = 0.0, nb = 0.0;
+    for (size_t i = 0; i < n; i++) {
+        double x = (double)a[i] / sa;
+        double y = (double)b[i] / sb;
+        dot += x * y;
+        na  += x * x;
+        nb  += y * y;
+    }
+    double den = sqrt(na) * sqrt(nb);
+    if (!(den > 1e-10)) return 0.0f; /* also catches den == NaN */
+    double r = dot / den;
+    if (r > 1.0) r = 1.0;
+    else if (r < -1.0) r = -1.0;
+    return (float)r;
+}
+
 #if defined(__x86_64__) && defined(__AVX2__)
 #include <immintrin.h>
 
@@ -109,6 +145,12 @@ float sofuu_cosine_f32(const float *a, const float *b, size_t n) {
         normb += b[i] * b[i];
     }
     float denom = sqrtf(norma) * sqrtf(normb);
+    /* R-27: overflow (Inf/NaN) or an underflowed-to-zero norm cannot be
+     * answered from these f32 sums — redo scaled in f64. Four compares after
+     * the loop, never inside it. */
+    if (!isfinite(dot) || !isfinite(norma) || !isfinite(normb) ||
+        !isfinite(denom) || norma == 0.0f || normb == 0.0f)
+        return sofuu_cosine_scaled_f32(a, b, n);
     if (denom < 1e-10f) return 0.0f;
     return dot / denom;
 }
@@ -138,6 +180,10 @@ float sofuu_cosine_f32(const float *a, const float *b, size_t n) {
         nb  += b[i] * b[i];
     }
     float den = sqrtf(na) * sqrtf(nb);
+    /* R-27: see sofuu_cosine_scaled_f32 — same overflow/underflow escape. */
+    if (!isfinite(dot) || !isfinite(na) || !isfinite(nb) || !isfinite(den) ||
+        na == 0.0f || nb == 0.0f)
+        return sofuu_cosine_scaled_f32(a, b, n);
     if (den < 1e-10f) return 0.0f;
     return dot / den;
 }

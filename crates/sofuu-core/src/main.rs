@@ -91,9 +91,14 @@ fn print_help() {
     println!("  sofuu infer <model.gguf> \"<prompt>\" Fast on-device CPU inference on GGUF models");
     println!("  sofuu swarm worker|leader   Distributed edge swarm cluster over LAN (layer pipelining)");
     println!("  sofuu doctor             Health check: QTSQ, brain round-trip, ctx resolution");
+    println!("  sofuu capabilities       Print the runtime capability manifest as JSON");
+    println!("  sofuu tools list         List the tools the active policy allows (--json)");
+    println!("  sofuu policy check|why   Validate a policy file / explain an allow-or-deny");
+    println!("  sofuu mcp list|test|add|remove  Manage MCP servers and inspect their tools");
     println!("  sofuu version            Print version and exit");
     println!("  sofuu licenses           Print open-source licenses");
     println!("  sofuu help               Print this help");
+    println!("  sofuu <command> --help   Show every flag a subcommand accepts");
     println!("  sofuu session list       List active sessions on this project");
     println!("  sofuu session show <id>  Show one session's full context");
     println!("  sofuu session inspect <id>  Inspect storage without payload text");
@@ -119,6 +124,276 @@ fn print_help() {
     println!("Disable with `--sync off`. Main session data uses bounded .store QTSQ segments; legacy flat .qtsq files remain readable.");
     println!("\n\x1b[90mBuilt with Rust + QuickJS + C + QTSQ | MIT License (QTSQ proprietary)\x1b[0m\n");
 }
+
+// ── R-29: per-subcommand help ─────────────────────────────────────
+//
+// `sofuu serve --help` used to START a real HTTP server on
+// 127.0.0.1:7707 and create ~/.sofuu/serve_token, because no command
+// parsed a help flag at all (only `swarm` did). A help request must be
+// pure documentation: no runtime init, no listener, no token file, no state
+// on disk. main() therefore checks wants_help() BEFORE any command arm
+// runs — in particular before SofuuRuntime::init() and cmd_serve().
+//
+// Every flag below is one the parser actually accepts; the docs are derived
+// from the parsers, not invented.
+
+/// True when argv asks the SUBCOMMAND for help.
+///
+/// Only the first argument after the command (or a leading `-` flag token)
+/// is considered, so `sofuu eval 'x --help'` still evaluates the string and
+/// `sofuu run file.js --help` passes `--help` to the script — the code/args
+/// of a command are never stolen as a help request.
+fn wants_help(args: &[String]) -> bool {
+    match args.get(2).map(String::as_str) {
+        Some("-h") | Some("--help") | Some("help") => true,
+        Some(first) if first.starts_with('-') => {
+            args[2..].iter().any(|a| a == "-h" || a == "--help")
+        }
+        _ => false,
+    }
+}
+
+/// Print help for `cmd`; returns false when the command has no help page
+/// (the caller then falls through to the normal dispatch).
+fn print_subcommand_help(cmd: &str) -> bool {
+    match cmd {
+        "serve" => print_serve_help(),
+        "infer" => print_infer_help(),
+        "dev" | "web" => print_dev_help(),
+        "chat" => print_chat_help(),
+        "run" | "eval" => print_run_help(cmd),
+        "repl" => println!(
+            "Usage: sofuu repl\n\n\
+             JavaScript REPL. Dot-commands: .help .clear .exit .version\n"
+        ),
+        "bundle" => println!(
+            "Usage: sofuu bundle <entry.js> [-o <out.js>]\n\n\
+             Bundle an ES module entry (npm resolution included) into one file.\n\
+               -o, --out <out.js>   output path (default: printed to stdout)\n"
+        ),
+        "install" => println!("Usage: sofuu install\n\nInstall the dependencies from ./package.json.\n"),
+        "add" => println!(
+            "Usage: sofuu add <package>[@version] [<package>…]\n\n\
+             Install npm packages into ./node_modules (specs are validated before\n\
+             any network or disk work).\n"
+        ),
+        "compile-bc" => println!(
+            "Usage: sofuu compile-bc <input.js> <output.bc>\n\n\
+             Compile a shipped JS driver to a QuickJS bytecode snapshot.\n"
+        ),
+        "agent" | "agents" => print_agent_help(),
+        "plugin" | "plugins" => print_plugin_help(),
+        "session" | "sessions" => print_session_help(),
+        "outputs" | "output" => print_outputs_help(),
+        "doctor" => println!(
+            "Usage: sofuu doctor [-m <model.gguf>] [--json]\n\n\
+             Health check: QTSQ codec, brain round-trip, context resolution.\n\
+               -m, --model <path>   model to probe (default: configured)\n\
+               --json               machine-readable report\n"
+        ),
+        "capabilities" => println!(
+            "Usage: sofuu capabilities\n\n\
+             Print the runtime capability manifest as JSON (features, GPU\n\
+             availability, inference backends, limits).\n"
+        ),
+        "tools" => println!(
+            "Usage: sofuu tools list [--json]\n\n\
+             List the tools the active policy allows, with schemas.\n"
+        ),
+        "policy" => println!(
+            "Usage: sofuu policy check <policy.json>\n\
+                    sofuu policy why <op> [key=value …] [--policy <file>]\n\n\
+             Validate a policy file, or explain why an operation is allowed/denied.\n"
+        ),
+        "mcp" => println!(
+            "Usage: sofuu mcp list\n\
+                    sofuu mcp test <command line | http(s)://url>\n\
+                    sofuu mcp add <name> <command> [args…]\n\
+                    sofuu mcp remove <name>\n\n\
+             Manage MCP servers and inspect the tools they expose.\n"
+        ),
+        "conformance" => println!(
+            "Usage: sofuu conformance [--suite <name>]\n\n\
+             Run the built-in conformance checks against this binary.\n"
+        ),
+        "swarm" => print_swarm_help(),
+        "version" | "licenses" | "help" => print_help(),
+        _ => return false,
+    }
+    true
+}
+
+fn print_serve_help() {
+    println!(
+        "\x1b[1mUsage:\x1b[0m sofuu serve [options]\n\n\
+         Serve the brain over HTTP (GET /health, POST /remember, GET /recall,\n\
+         POST /share) with Bearer-token auth. The server runs as a shipped JS\n\
+         driver on the normal runtime.\n\n\
+         \x1b[1mOptions:\x1b[0m\n\
+           -b, --brain <path>     brain store path (default: ~/.sofuu/brain.qtsq)\n\
+           -m, --model <path>     local GGUF model to serve\n\
+               --model-id <id>    model id advertised to clients\n\
+               --infer            enable on-server inference for /share\n\
+           -p, --port <n>         listen port 0-65535 (default: 7707)\n\
+               --host <addr>      listen address (default: 127.0.0.1)\n\
+           -t, --token <secret>   Bearer token; SOFUU_SERVE_TOKEN (env) wins and is\n\
+                                  preferred, because --token is visible in `ps`\n\
+               --policy <file>    policy file applied before the server starts\n\n\
+         \x1b[1mEnvironment:\x1b[0m\n\
+           SOFUU_SERVE_TOKEN       auth token (takes precedence over --token)\n\
+           SOFUU_HTTP_HEADERS_MS   pre-auth header deadline (default: 30000)\n\
+           SOFUU_HTTP_IDLE_MS      post-request idle deadline (default: 0 = none)\n\n\
+         Without a token, one is generated and written to ~/.sofuu/serve_token.\n\
+         \x1b[90mThis page is documentation only: `sofuu serve --help` starts no\n\
+         listener and creates no token.\x1b[0m\n"
+    );
+}
+
+fn print_dev_help() {
+    println!(
+        "\x1b[1mUsage:\x1b[0m sofuu dev [dir] [options]\n\n\
+         Start the AI-native full-stack dev server (frontend engine + SSR).\n\n\
+         \x1b[1mOptions:\x1b[0m\n\
+           -p, --port <n>       listen port (default: 3000)\n\
+           -h, --host <addr>    listen address (default: 127.0.0.1)\n\
+           -m, --model <path>   local GGUF model for the dev assistant\n"
+    );
+}
+
+fn print_chat_help() {
+    println!(
+        "\x1b[1mUsage:\x1b[0m sofuu chat [options]      (bare `sofuu` does the same)\n\n\
+         \x1b[1mOptions:\x1b[0m\n\
+           -m, --model <name>        model to chat with\n\
+           -p, --provider <name>     openai | anthropic | local\n\
+           -k, --apikey <key>        API key for this session\n\
+               --base-url <url>      override the provider endpoint\n\
+           -t, --threads <n>         inference threads (local provider)\n\
+               --effort <level>      reasoning effort / thinking budget\n\
+               --think <level>       alias of --effort\n\
+               --brain               use the on-device brain\n\
+               --sync on|off         session mesh sync (--no-sync is --sync off)\n\
+               --ctx-window, --ctx <n>     context window in tokens (0 = provider default)\n\
+               --max-output, --maxout, --max-tokens <n>   max output tokens per response\n\n\
+         Chat commands are listed in `sofuu help`.\n"
+    );
+}
+
+fn print_run_help(cmd: &str) {
+    if cmd == "run" {
+        println!(
+            "\x1b[1mUsage:\x1b[0m sofuu run <file.js|file.ts>\n\n\
+             Evaluate a file as an ES module on a fresh runtime, then drain the\n\
+             event loop (timers, I/O, promise chains).\n\n\
+             \x1b[1mExit status:\x1b[0m\n\
+               0    the script completed\n\
+               1    an uncaught exception, an unhandled promise rejection, or a\n\
+                    microtask-queue overflow\n\
+               N    whatever the script passed to process.exit(N), or set via\n\
+                    process.exitCode = N\n"
+        );
+    } else {
+        println!(
+            "\x1b[1mUsage:\x1b[0m sofuu eval \"<code>\"\n\n\
+             Evaluate a JavaScript string on a fresh runtime. Same exit-status\n\
+             rules as `sofuu run`.\n"
+        );
+    }
+}
+
+fn print_agent_help() {
+    println!(
+        "\x1b[1mUsage:\x1b[0m sofuu agent <subcommand>\n\n\
+           list                       list agent definitions (~/.sofuu/agents/*.js)\n\
+           run <name> <task…> [--json] run one agent headless\n\
+           init <name>                scaffold ~/.sofuu/agents/<name>.js\n\
+           validate <file.js>         dry-run a definition with precise errors\n\n\
+         \x1b[1mOptions:\x1b[0m\n\
+               --json             emit the result as JSON (run)\n\
+               --policy <file>    policy file applied before the agent starts\n"
+    );
+}
+
+fn print_plugin_help() {
+    println!(
+        "\x1b[1mUsage:\x1b[0m sofuu plugin <subcommand>\n\n\
+           list [--json]                        list installed plugins\n\
+           validate <file.js|file.ts>           validate syntax, exports, schema\n\
+           run <tool_name> [args_json]          execute one plugin tool\n\
+           init <name> [--category=<kind>]      scaffold a plugin\n\n\
+         \x1b[1mOptions:\x1b[0m\n\
+               --policy <file>    policy file applied before the plugin runs\n"
+    );
+}
+
+fn print_session_help() {
+    println!(
+        "\x1b[1mUsage:\x1b[0m sofuu session <subcommand>\n\n\
+           list | ls                 list sessions on this project (default)\n\
+           show | info <id>          full session context\n\
+           inspect <id>              storage view without payload text\n\
+           repair <id>               rebuild a damaged segmented manifest\n\
+           migrate <id>              migrate one legacy flat session\n\
+           storage-stats | stats <id>  segment/storage counters\n\
+           prune | clean             remove ended sessions older than 7 days\n\
+           export <id> [--out <f>]   portable session document (secrets stripped)\n\
+           import <file|->           validate + persist a session document\n"
+    );
+}
+
+fn print_outputs_help() {
+    println!(
+        "\x1b[1mUsage:\x1b[0m sofuu outputs <subcommand>\n\n\
+           list | ls [--session <id>] [--kind <k>] [--status <s>] [--limit <n>]\n\
+           show | get <output-id>\n\
+           search <text>\n\
+           context <task>\n\
+           stats | info\n\
+           rebuild-index | repair\n\
+           prune [--dry-run|--apply] [--older-than <s>] [--max-bytes <n>] [--max-count <n>]\n\n\
+         `prune` is a dry run unless --apply is given.\n"
+    );
+}
+
+fn print_infer_help() {
+    println!(
+        "\x1b[1mUsage:\x1b[0m sofuu infer <model.gguf> \"<prompt>\" [options]\n\
+                 sofuu infer <model.gguf> --score <file> [options]\n\n\
+         On-device inference over a local GGUF file. All eleven-plus flags the\n\
+         parser accepts are documented here; anything else is left to the prompt.\n\n\
+         \x1b[1mGeneration:\x1b[0m\n\
+           -n, --max-tokens <n>        tokens to generate (default: 256)\n\
+               --temp, --temperature <f>  sampling temperature (default: 0.7)\n\
+           -t, --threads <n>           worker threads (0 = auto)\n\
+               --chat                  wrap the prompt in the model's own chat template\n\
+               --trace <file>          write a per-token JSON trace\n\n\
+         \x1b[1mContext / attention:\x1b[0m\n\
+           -c, --ctx <n>               custom context length (0 = model default)\n\
+               --swa, --sliding-window <n>  sliding-window attention size (0 = model default)\n\
+               --snapkv                SnapKV attention eviction\n\
+               --dynamic-ffn           dynamic FFN width\n\
+               --lookahead             speculative lookahead decoding (default on)\n\
+               --no-lookahead          serial decoding (same as SOFUU_LOOKAHEAD=0)\n\n\
+         \x1b[1mKV cache / memory:\x1b[0m\n\
+               --kv-dtype <d>          KV cache dtype: f32 | 4 | 2 | 8 | f16k (aliases:\n\
+                                       q4/4bit, q2/2bit, q8/8bit, k16)\n\
+               --kivi                  quantized KIVI KV stream on the CPU layer loop\n\
+               --kivi-bits <n>         KIVI bit width (default: 4)\n\
+               --streaming-weights, --cache-bypass  stream weights instead of caching them\n\n\
+         \x1b[1mPlacement:\x1b[0m\n\
+               --ngl, --gpu-layers <n>  layers to place on the GPU (default: 999 = all)\n\
+               --gpu                   prefer the GPU (same as --gpu-layers 999)\n\
+               --cpu                   CPU only (same as --gpu-layers 0)\n\n\
+         \x1b[1mScoring:\x1b[0m\n\
+               --score <file>          score a file instead of generating (prompt unused;\n\
+                                       may directly follow the model path)\n\
+               --score-window <n>      scoring window size (0 = whole file)\n\n\
+         \x1b[1mEnvironment:\x1b[0m\n\
+           SOFUU_LOOKAHEAD=0           same as --no-lookahead\n\
+           SOFUU_KV_RING=<n>           KIVI ring-KV size (default: 4096, min 256)\n"
+    );
+}
+
 
 fn print_version() {
     println!("sofuu {VERSION}");
@@ -512,6 +787,51 @@ fn cmd_plugin(rt: &SofuuRuntime, args: &[String]) -> i32 {
 /// `sofuu run <file>` — run a JS/TS file.
 fn cmd_run(rt: &SofuuRuntime, path: &str) -> i32 {
     rt.eval_file(path)
+}
+
+/// True when THIS build can place layers on a GPU for `sofuu infer`.
+///
+/// The whole-layer GPU client is compiled for macOS only (Metal); every
+/// other target links the CPU engine alone, and a Mac without a usable Metal
+/// device falls back too. Used to keep `--gpu-layers` honest and to stop the
+/// banner advertising a CPU+GPU engine on a CPU-only build (audit A).
+fn infer_gpu_backend_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            /// Metal device probe (src/metal/*.m) — the same symbol
+            /// capabilities.rs reports as gpu.available.
+            fn sofuu_metal_available() -> bool;
+        }
+        // SAFETY: argument-free C getter; returns whether a usable Metal
+        // device exists.
+        unsafe { sofuu_metal_available() }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// C-01: the process status for a command that evaluated JavaScript.
+///
+/// Precedence (Node-compatible):
+///   1. `process.exitCode` — an explicit choice by the script always wins
+///      (including 0 over an error, which is how a script says "expected").
+///   2. a non-zero engine rc — compile errors, missing files, bad usage.
+///   3. `has_uncaught_error` — an uncaught synchronous throw, an unhandled
+///      promise rejection, or a microtask-queue overflow → 1.
+///   4. 0.
+fn js_exit_code(rt: &SofuuRuntime, rc: i32) -> ExitCode {
+    let st = sofuu_core::rt::engine::run_status_raw(rt.engine_ctx());
+    let code = match (st.exit_code, rc, st.has_uncaught_error) {
+        (Some(chosen), _, _) => chosen,
+        (None, rc, _) if rc != 0 => 1,
+        (None, _, true) => 1,
+        _ => 0,
+    };
+    // Same truncation the OS applies; never panic on a hostile value.
+    ExitCode::from(code.clamp(0, 255) as u8)
 }
 
 /// `sofuu repl` — JavaScript evaluation REPL (delegates to C for now).
@@ -1349,6 +1669,14 @@ fn main() -> ExitCode {
 
     let cmd = args[1].as_str();
 
+    // R-29: a per-subcommand help request is answered HERE, before dispatch —
+    // so before SofuuRuntime::init(), before any listener binds, and before
+    // cmd_serve() can create ~/.sofuu/serve_token. `sofuu serve --help` must
+    // never start a server.
+    if wants_help(&args) && print_subcommand_help(cmd) {
+        return ExitCode::SUCCESS;
+    }
+
     match cmd {
         "version" | "--version" | "-v" => {
             print_version();
@@ -1390,11 +1718,7 @@ fn main() -> ExitCode {
                 }
             };
             let rc = cmd_eval(&rt, &args[2]);
-            if rc == 0 {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
+            js_exit_code(&rt, rc)
         }
         "dev" | "web" => {
             let mut port = 3000u16;
@@ -1607,6 +1931,10 @@ fn main() -> ExitCode {
             let mut sliding_window = 0usize;
             let mut custom_ctx = 0usize;
             let mut gpu_layers = 999usize;
+            /* A (audit): did the script ask for GPU placement explicitly?
+             * Only an explicit request warns when this build has no GPU
+             * backend — the 999 default must stay silent on CPU-only hosts. */
+            let mut gpu_layers_explicit = false;
             // Lookahead speculative decoding is the OUTPUT default on the GGUF
             // batched path (Pi 5 Llama-1B Q8_0: 9.0 -> 19.7 tk/s, temp-0 outputs
             // token-identical; the engine only engages it on the GGUF backend).
@@ -1656,10 +1984,12 @@ fn main() -> ExitCode {
                 } else if (args[i] == "--gpu-layers" || args[i] == "--ngl") && i + 1 < args.len() {
                     if let Ok(v) = args[i + 1].parse::<usize>() {
                         gpu_layers = v;
+                        gpu_layers_explicit = true;
                     }
                     i += 2;
                 } else if args[i] == "--gpu" {
                     gpu_layers = 999;
+                    gpu_layers_explicit = true;
                     i += 1;
                 } else if args[i] == "--cpu" {
                     gpu_layers = 0;
@@ -1821,7 +2151,29 @@ fn main() -> ExitCode {
                 gpu_layers = 0;
             }
 
-            let engine_type = if gpu_layers > 0 { "⚡ Sofuu Neural Engine (Heterogeneous CPU+GPU)" } else { "⚡ Sofuu CPU Inference Engine" };
+            /* A (audit): the whole-layer GPU client exists only when this
+             * build links + can use it (Metal on macOS). Off that build
+             * `--gpu-layers` used to be silently inert while the banner still
+             * advertised "Heterogeneous CPU+GPU". Normalise the request to
+             * the hardware that is actually here — and say so once when the
+             * operator asked for the GPU explicitly. --cpu stays silent. */
+            let gpu_backend = infer_gpu_backend_available();
+            if gpu_layers > 0 && !gpu_backend {
+                if gpu_layers_explicit {
+                    eprintln!(
+                        "[sofuu infer] --gpu-layers {}: this build has no GPU backend \
+                         (the whole-layer client is macOS/Metal only) — decoding on the CPU. \
+                         Pass --cpu to make that explicit.",
+                        gpu_layers
+                    );
+                }
+                gpu_layers = 0;
+            }
+            let engine_type = if gpu_layers > 0 && gpu_backend {
+                "⚡ Sofuu Neural Engine (Heterogeneous CPU+GPU)"
+            } else {
+                "⚡ Sofuu CPU Inference Engine"
+            };
             eprintln!("\x1b[36m{}\x1b[0m — loading {}...", engine_type, model_path);
             let t0 = std::time::Instant::now();
             // P7 ring-KV (long-context §8): --kivi loads the CPU engine with
@@ -2126,11 +2478,7 @@ fn main() -> ExitCode {
                 }
             };
             let rc = cmd_run(&rt, &args[2]);
-            if rc == 0 {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
+            js_exit_code(&rt, rc)
         }
         "bundle" => {
             let rt = match SofuuRuntime::init() {

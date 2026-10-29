@@ -480,12 +480,15 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=AudioToolbox");
         println!("cargo:rustc-link-lib=c++");
         println!("cargo:rustc-link-lib=objc");
-        if Path::new("/opt/homebrew/lib/libopus.dylib").exists() {
-            println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
-            println!("cargo:rustc-link-lib=opus");
-        } else if Path::new("/usr/local/lib/libopus.dylib").exists() {
-            println!("cargo:rustc-link-search=native=/usr/local/lib");
-            println!("cargo:rustc-link-lib=opus");
+        // H-05 (AUDIT-2026-10-29): this used to link the build machine's
+        // Homebrew /usr/local libopus dynamically, so a user Mac without opus
+        // installed died at launch with a dyld error — the opposite of the
+        // standalone claim in README.md. Never add a dynamic link from a host
+        // library path. If a link is genuinely required (debug/test links pull
+        // the QTSQ audio objects through LTO), it is opt-in via
+        // SOFUU_LINK_OPUS=1 and must resolve to a static archive.
+        if env::var("SOFUU_LINK_OPUS").as_deref() == Ok("1") {
+            println!("cargo:rustc-link-lib=static=opus");
         }
     }
     println!("cargo:rerun-if-env-changed=SOFUU_QTSQ_DIR");
@@ -499,28 +502,42 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SOFUU_CURL_STATIC_DIR");
     println!("cargo:rerun-if-env-changed=VCPKG_INSTALLATION_ROOT");
 
-    // ── libopus (optional, dev/test links) ─────────────────────────
+    // ── libopus (opt-in, static only) ──────────────────────────────
     // The POSIX QTSQ archive's audio objects reference libopus. Release
     // links (LTO) prune those objects, but debug/test links pull them →
-    // link fails without it. Add it when pkg-config finds it — only in
-    // QTSQ builds. P2-21 (AUDIT-2026-09-01): also gate on HOST == TARGET —
-    // a HOST pkg-config result poisoned CROSS links before (the flag was
-    // emitted from the build machine's opus, wrong arch). Windows: the
-    // CMake port excludes qtsq_audio_opus.c entirely (audio falls back to
-    // the in-house spectral encoder, same as a POSIX build without
-    // libopus), so there's nothing to link — and no pkg-config.
+    // link fails without it. H-05 (AUDIT-2026-10-29): this probe used to run
+    // unconditionally and emit whatever pkg-config found — on a Homebrew Mac
+    // that is a DYNAMIC ``-lopus`` from /opt/homebrew/lib, which the shipped
+    // v0.3.0-beta binary inherited (``otool -L`` showed libopus.0.dylib), so
+    // the "standalone binary" claim failed on any Mac without opus installed.
+    // It is now opt-in via SOFUU_LINK_OPUS=1 and asks pkg-config for the
+    // STATIC archive only; the default release build links no opus at all.
+    // P2-21 (AUDIT-2026-09-01) still applies: gate on HOST == TARGET so a
+    // build-machine pkg-config result can never poison a cross link.
     let host = env::var("HOST").unwrap_or_default();
     let target = env::var("TARGET").unwrap_or_default();
-    if has_qtsq && !is_windows && host == target {
+    // H-05 follow-up: the QTSQ audio objects really are pulled in at this
+    // (non-fat-LTO) release configuration, so "link no opus at all" is not a
+    // workable default — it fails at link time on _opus_decoder_create. The
+    // dependency is therefore always resolved STATICALLY: pkg-config is asked
+    // for `--static` and every `-l` is emitted as `rustc-link-lib=static=`,
+    // so `otool -L` shows no /opt/homebrew dylib and the binary stays
+    // self-contained. Set SOFUU_NO_OPUS_AUDIO=1 to skip the probe entirely
+    // (only correct for a libqtsq built without the opus audio objects).
+    if has_qtsq
+        && !is_windows
+        && host == target
+        && env::var("SOFUU_NO_OPUS_AUDIO").as_deref() != Ok("1")
+    {
         if let Ok(out) = std::process::Command::new("pkg-config")
-            .args(["--libs", "opus"])
+            .args(["--libs", "--static", "opus"])
             .output()
         {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout);
                 for tok in s.split_whitespace() {
                     if let Some(lib) = tok.strip_prefix("-l") {
-                        println!("cargo:rustc-link-lib={}", lib);
+                        println!("cargo:rustc-link-lib=static={}", lib);
                     } else if let Some(dir) = tok.strip_prefix("-L") {
                         println!("cargo:rustc-link-search=native={}", dir);
                     }

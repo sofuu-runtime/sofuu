@@ -133,6 +133,12 @@ pub const JS_GPN_STRING_MASK: c_int = 1 << 0;
 pub const JS_GPN_SYMBOL_MASK: c_int = 1 << 1;
 pub const JS_GPN_ENUM_ONLY: c_int = 1 << 4;
 pub const JS_PROP_WRITABLE: u8 = 0x02;
+/// quickjs.h:265 — `JS_PROP_ENUMERABLE` is (1 << 2). Distinct from
+/// `JS_PROP_HAS_ENUMERABLE` (1 << 10), which only says the attribute is being
+/// SET by `JS_DefinePropertyValue`-style calls. Added for the C-01
+/// `process.exitCode` accessor (engine.rs), which needs a real enumerable
+/// data property.
+pub const JS_PROP_ENUMERABLE: u8 = 0x04;
 
 /// JSCFunctionData (JS_NewCFunctionData) — the C struct is { length, length2,
 /// magic, data[0..] } at the pointer we pass; QuickJS reads magic + data.

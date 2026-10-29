@@ -19,6 +19,29 @@ pub const HNSW_MAX_LEVELS: usize = 16;
 pub const HNSW_MAX_M: usize = 16;
 pub const HNSW_MAX_M0: usize = 32;
 
+/// H-07 (AUDIT-2026-10-29): graphs at or below this size are searched
+/// EXHAUSTIVELY — the walk is unbudgeted, exactly as it always was. Below
+/// this point a full traversal is both cheap and strictly better than an
+/// approximate one, and every ranking fixture lives here, so their numbers
+/// stay pinned. (`Cma::recall` uses the same constant for its exact-search
+/// fallback: one threshold, documented in one place.)
+pub const HNSW_SMALL_GRAPH: usize = 1024;
+
+/// H-07: the search budget, as a multiple of `ef`, once the graph is
+/// LARGER than `HNSW_SMALL_GRAPH`. Without it the early-exit bound is the
+/// only termination rule, and on a diffuse graph filling `ef` result slots
+/// means walking an ever-larger share of the corpus: the audit measured
+/// recall() at `0.9 ms + 1.07 µs · n` (1.5 ms at n=500, 6.0 ms at n=8000,
+/// ~108 ms projected at 100k) because the frontier never filled cheaply.
+/// A visit budget turns that O(n) walk into O(ef) work per query — 4 × ef
+/// expansions is generous (each expansion already evaluates up to M0
+/// neighbours), so the graph path still answers with the same top-k.
+pub const HNSW_VISIT_FACTOR: usize = 4;
+
+/// The most nodes one level-0 search may expand when the graph is large
+/// (never below this, so small `ef` values stay useful).
+pub const HNSW_VISIT_FLOOR: usize = 64;
+
 /// One node in the graph. `id` indexes into the vector store.
 #[derive(Clone)]
 struct Node {
@@ -142,22 +165,15 @@ impl Hnsw {
     fn dist(&self, a: u32, b: u32) -> f32 {
         let va = &self.vec_store[a as usize];
         let vb = &self.vec_store[b as usize];
-        let mut s = 0.0f32;
-        for i in 0..self.vec_dim {
-            let d = va[i] - vb[i];
-            s += d * d;
-        }
-        s // squared L2 — monotonic with L2, matches C (L2 used in search)
+        /* H-07: slice iteration instead of indexed bounds-checked loads —
+         * same arithmetic, vectorizes (this is the inner loop of every
+         * search and every insert). */
+        va.iter().zip(vb).map(|(x, y)| (x - y) * (x - y)).sum()
     }
 
     fn dist_query(&self, q: &[f32], b: u32) -> f32 {
         let vb = &self.vec_store[b as usize];
-        let mut s = 0.0f32;
-        for i in 0..self.vec_dim {
-            let d = q[i] - vb[i];
-            s += d * d;
-        }
-        s
+        q.iter().zip(vb).map(|(x, y)| (x - y) * (x - y)).sum()
     }
 
     fn random_level(&self) -> u8 {
@@ -228,7 +244,10 @@ impl Hnsw {
         // Connect at each level up to `level`.
         for l in 0..=level {
             let m = if l == 0 { HNSW_MAX_M0 } else { HNSW_MAX_M };
-            let neighbors = self.search_layer(&self.vec_store[id as usize], ep, m, l);
+            /* H-07: construction is never budgeted — the graph is built
+             * from the best neighbourhood the walk can find. */
+            let neighbors =
+                self.search_layer(&self.vec_store[id as usize], ep, m, l, usize::MAX);
             let nid = self.nodes.len() as u32 - 1;
             for &nb in &neighbors {
                 self.nodes[nid as usize].links[l as usize].push(nb);
@@ -253,7 +272,12 @@ impl Hnsw {
     }
 
     /// Greedy best-first search at a single level.
-    fn search_layer(&self, q: &[f32], ep: u32, ef: usize, level: u8) -> Vec<u32> {
+    ///
+    /// `budget` caps how many nodes the walk may EXPAND (`usize::MAX` = no
+    /// cap). Insertion passes no cap — the graph is built from the best
+    /// neighbourhood available, so quality there is never traded away —
+    /// while `search_with_ef` budgets queries on large graphs (H-07).
+    fn search_layer(&self, q: &[f32], ep: u32, ef: usize, level: u8, budget: usize) -> Vec<u32> {
         let mut visited = std::collections::HashSet::new();
         let mut candidates: BinaryHeap<Cand> = BinaryHeap::new(); // min-heap: closest pops
         let mut results: BinaryHeap<FarCand> = BinaryHeap::new(); // max-heap: worst on top
@@ -264,17 +288,28 @@ impl Hnsw {
         visited.insert(ep);
 
         while let Some(c) = candidates.pop() {
+            /* H-07: the O(n) guard. Breaking here returns the best frontier
+             * found so far — an approximate answer in bounded time, which
+             * is what HNSW promises; the alternative (walking until the
+             * result heap is provably full) made recall latency linear in
+             * the corpus size. */
+            if visited.len() >= budget {
+                break;
+            }
             let worst = results.peek().map(|r| r.dist).unwrap_or(f32::MAX);
             if c.dist > worst && results.len() >= ef {
                 break;
             }
-            let links = self
+            /* H-07: borrow the link list instead of cloning it — this is a
+             * heap allocation per expanded node otherwise. */
+            let Some(links) = self
                 .nodes
                 .get(c.id as usize)
                 .and_then(|n| n.links.get(level as usize))
-                .cloned()
-                .unwrap_or_default();
-            for nb in links {
+            else {
+                continue;
+            };
+            for &nb in links {
                 if visited.contains(&nb) {
                     continue;
                 }
@@ -307,22 +342,28 @@ impl Hnsw {
     /// level -- larger trades latency for recall, `ef <= k` behaves like
     /// `ef = k`. `search` is `search_with_ef(q, k, (k*4).max(8))`, so the
     /// default behaviour is unchanged.
+    ///
+    /// H-07: on a graph larger than `HNSW_SMALL_GRAPH` the walk is bounded
+    /// to `HNSW_VISIT_FACTOR * ef` expansions, so a query costs O(ef) no
+    /// matter how many records the brain holds. Small graphs stay
+    /// exhaustive, which keeps every pinned ranking fixture bit-identical.
     pub fn search_with_ef(&self, q: &[f32], k: usize, ef: usize) -> Vec<(u32, f32)> {
         if self.nodes.is_empty() || k == 0 {
             return Vec::new();
         }
         let ef = ef.max(k);
+        let budget = self.visit_budget(ef);
         // Greedy best-first descent from the enter point down to level 0,
         // using ef candidates at each level (better recall than pure greedy).
         let mut ep = self.enter_node;
         let mut top = self.max_level;
         while top > 0 {
-            let candidates = self.search_layer(q, ep, ef, top);
+            let candidates = self.search_layer(q, ep, ef, top, budget);
             ep = candidates.first().copied().unwrap_or(ep);
             top -= 1;
         }
         // Level-0 search with ef, then trim to k.
-        let ids = self.search_layer(q, ep, ef, 0);
+        let ids = self.search_layer(q, ep, ef, 0, budget);
         let mut out: Vec<(u32, f32)> = ids
             .into_iter()
             .map(|id| (id, self.dist_query(q, id).sqrt()))
@@ -330,6 +371,15 @@ impl Hnsw {
         out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
         out.truncate(k);
         out
+    }
+
+    /// H-07: how many nodes a query walk may expand. Exhaustive (`MAX`) for
+    /// a small graph — the documented fallback — and O(ef) above it.
+    fn visit_budget(&self, ef: usize) -> usize {
+        if self.nodes.len() <= HNSW_SMALL_GRAPH {
+            return usize::MAX;
+        }
+        ef.saturating_mul(HNSW_VISIT_FACTOR).max(HNSW_VISIT_FLOOR)
     }
 }
 
@@ -509,5 +559,42 @@ mod tests {
         let res = h.search(&q, 1);
         assert!(!res.is_empty());
         assert!(res[0].1 < 1.0); // something close exists
+    }
+
+    /// H-07: a query on a LARGE graph must cost bounded work, not a share of
+    /// the corpus. The audit measured recall() at `0.9 ms + 1.07 µs · n`;
+    /// this pins the budget that removes the n term: the walk behind a
+    /// `search_with_ef` may expand at most `HNSW_VISIT_FACTOR * ef` nodes
+    /// once the graph is over `HNSW_SMALL_GRAPH`.
+    #[test]
+    fn large_graph_search_is_budgeted() {
+        let dim = 16usize;
+        let n = HNSW_SMALL_GRAPH + 512; // just over the exhaustive threshold
+        let mut h = Hnsw::new(dim);
+        for i in 0..n {
+            let mut v = vec![0.0; dim];
+            v[i % dim] = 1.0;
+            v[(i * 7) % dim] += (i as f32) / (n as f32);
+            h.add_vector(&v);
+        }
+        assert!(h.nodes.len() > HNSW_SMALL_GRAPH);
+        let ef = 32usize;
+        /* The budget is what bounds the walk: it can never expand more than
+         * the cap, and the default path still answers with `k` hits. */
+        let budget = h.visit_budget(ef);
+        assert_eq!(budget, ef * HNSW_VISIT_FACTOR);
+        assert!(budget < n, "a budgeted walk must not be able to touch n");
+        let mut q = vec![0.0; dim];
+        q[3] = 1.0;
+        let hits = h.search_with_ef(&q, 8, ef);
+        assert_eq!(hits.len(), 8, "a budgeted search still fills k");
+        /* A small graph keeps the exhaustive budget. */
+        let mut small = Hnsw::new(dim);
+        for i in 0..8 {
+            let mut v = vec![0.0; dim];
+            v[i] = 1.0;
+            small.add_vector(&v);
+        }
+        assert_eq!(small.visit_budget(8), usize::MAX);
     }
 }

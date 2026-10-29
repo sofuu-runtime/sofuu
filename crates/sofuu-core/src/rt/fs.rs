@@ -197,8 +197,13 @@ unsafe extern "C" fn rf_open_cb(req_fs: *mut UvFs) {
  * bypassed it. setRoot() installs one canonical root on this runtime; every
  * fs entry point then resolves relative paths under it and refuses anything
  * that escapes (lexically, or after realpath when the target exists). No
- * root = exactly the previous behaviour, so hosts reading HOME/model paths
- * are unaffected unless they opt in. */
+ * root = the previous behaviour, so hosts reading HOME/model paths are
+ * unaffected unless they opt in.
+ *
+ * H-02(c)/R-24 (2026-10-29): the POLICY is the second, always-on layer.
+ * setRoot() is one host's private jail; `fs.write` / `fs.read` + `fs.roots`
+ * is the shared policy every surface answers to. fs_path_arg applies both, in
+ * that order, and hands the caller the canonical path the gates vetted. */
 thread_local! {
     static FS_ROOT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
@@ -207,22 +212,10 @@ fn fs_root_now() -> Option<String> {
     FS_ROOT.with(|r| r.borrow().clone())
 }
 
-/// Fold `.`/`..` lexically without touching the filesystem.
+/// Fold `.`/`..` lexically without touching the filesystem. Shared with the
+/// policy resolver so the two jail layers agree on what `..` means.
 fn lexical_clean(p: &std::path::Path) -> std::path::PathBuf {
-    use std::path::Component;
-    let mut out = std::path::PathBuf::new();
-    for c in p.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
+    crate::rt::policy::lexical_clean(p)
 }
 
 /// True when `p` is inside `root` lexically AND, when the target (or its
@@ -243,12 +236,13 @@ fn fs_contained(p: &std::path::Path, root: &str) -> bool {
     }
 }
 
-/// Resolve a JS path argument under the active root. Err carries a THROWN
-/// JS value (the caller returns it verbatim).
+/// Resolve a JS path argument under the active root and the active POLICY.
+/// Err carries a THROWN JS value (the caller returns it verbatim).
 unsafe fn fs_path_arg(
     ctx: *mut JSContext,
     v: JSValueConst,
     label: &str,
+    kind: crate::rt::policy::FsKind,
 ) -> Result<CString, JSValue> {
     let path_ptr = qjs::sofuu_js_to_cstring(ctx, v);
     if path_ptr.is_null() {
@@ -273,7 +267,18 @@ unsafe fn fs_path_arg(
             clean.to_string_lossy().into_owned()
         }
     };
-    CString::new(chosen).map_err(|_| {
+    /* H-02(c)/R-24: the policy layer. gate_fs canonicalises the target (and
+     * `fs.roots` + cwd), rejects `..` escapes and symlinks that resolve
+     * outside, and returns the vetted path — so the open/stat below can only
+     * touch the file that was judged. A denial is a typed throw naming the
+     * offending path (`E_PATH_OUTSIDE: …` / `E_PERMISSION_DENIED: …`). */
+    let gated = match crate::rt::policy::gate_fs(ctx, kind, &chosen) {
+        Ok(p) => p,
+        /* R7.3 / H-02(c): a typed throw carrying .code and .rule, not just a
+         * prefixed string — `catch (e) { e.code === 'E_PATH_OUTSIDE' }`. */
+        Err(denied) => return Err(crate::rt::policy::throw_denied(ctx, &denied)),
+    };
+    CString::new(gated.to_string_lossy().into_owned()).map_err(|_| {
         let msg = format!("{label}: path contains NUL");
         let cm = CString::new(msg).unwrap_or_default();
         qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), cm.as_ptr())
@@ -323,7 +328,7 @@ unsafe extern "C" fn js_chmod(
     if argc < 2 {
         return qjs::JS_ThrowTypeError(ctx, c"chmod: path and mode required".as_ptr());
     }
-    let path = match fs_path_arg(ctx, *argv, "chmod") { Ok(p) => p, Err(e) => return e };
+    let path = match fs_path_arg(ctx, *argv, "chmod", crate::rt::policy::FsKind::Write) { Ok(p) => p, Err(e) => return e };
     let mv = *argv.add(1);
     if qjs::sofuu_js_is_number(mv) == 0 {
         return qjs::JS_ThrowTypeError(ctx, c"chmod: mode must be a number".as_ptr());
@@ -389,7 +394,7 @@ unsafe extern "C" fn js_read_file(
     if argc < 1 {
         return qjs::JS_ThrowTypeError(ctx, c"readFile: path required".as_ptr());
     }
-    let path = match fs_path_arg(ctx, *argv, "readFile") { Ok(p) => p, Err(e) => return e };
+    let path = match fs_path_arg(ctx, *argv, "readFile", crate::rt::policy::FsKind::Read) { Ok(p) => p, Err(e) => return e };
 
     let mut out: *mut PromiseHandle = ptr::null_mut();
     let promise = sofuu_promise_new(ctx, &mut out);
@@ -435,7 +440,18 @@ unsafe extern "C" fn wf_write_cb(req_fs: *mut UvFs) {
     if result < 0 {
         sofuu_promise_reject_str((*r).promise, uv_err_str(result as c_int).as_ptr());
     } else {
-        sofuu_promise_resolve((*r).promise, qjs::sofuu_js_undefined());
+        /* Pi audit 2026-10-29 (H-02c rider): writeFile/appendFile resolved
+         * `undefined`, so a caller that used the result (the reported probe
+         * did `.slice(...)`) blew up with "cannot read property 'slice' of
+         * undefined" AFTER the write had already succeeded — a success that
+         * then looks like a crash. A write now answers with the path it wrote
+         * (the gate-vetted one), so success is a usable string and failure is
+         * always a typed rejection. Node note: this is deliberately MORE than
+         * node's fs.writeFile (which resolves undefined); nothing in this repo
+         * depended on the undefined value. */
+        let pv = qjs::sofuu_js_new_string(ctx, (*r).path.as_ptr());
+        sofuu_promise_resolve((*r).promise, pv);
+        qjs::sofuu_js_free_value(ctx, pv); /* resolve borrows; caller frees */
     }
     sofuu_flush_jobs(ctx);
     (*r).promise = ptr::null_mut();
@@ -473,7 +489,7 @@ unsafe fn write_impl(
     data_val: JSValueConst,
     flags: c_int,
 ) -> JSValue {
-    let path = match fs_path_arg(ctx, path_val, "writeFile") { Ok(p) => p, Err(e) => return e };
+    let path = match fs_path_arg(ctx, path_val, "writeFile", crate::rt::policy::FsKind::Write) { Ok(p) => p, Err(e) => return e };
 
     /* proc-5: length-preserving extraction — the C-string round trip
      * truncated content at the first NUL (writeFile('a\0b') wrote "a").
@@ -557,7 +573,7 @@ unsafe extern "C" fn js_exists(
         return qjs::sofuu_js_new_bool(ctx, 0);
     }
     /* A path outside the native root is "not present" to a probe — no throw. */
-    let path = match fs_path_arg(ctx, *argv, "exists") {
+    let path = match fs_path_arg(ctx, *argv, "exists", crate::rt::policy::FsKind::Read) {
         Ok(p) => p,
         Err(_) => return qjs::sofuu_js_new_bool(ctx, 0),
     };
@@ -583,7 +599,7 @@ unsafe extern "C" fn js_readdir(
     if argc < 1 {
         return qjs::JS_ThrowTypeError(ctx, c"readdir: path required".as_ptr());
     }
-    let path = match fs_path_arg(ctx, *argv, "readdir") { Ok(p) => p, Err(e) => return e };
+    let path = match fs_path_arg(ctx, *argv, "readdir", crate::rt::policy::FsKind::Read) { Ok(p) => p, Err(e) => return e };
     let req = fs_req_alloc();
     let r = uv::uv_fs_scandir(sofuu_loop_get(), req, path.as_ptr(), 0, None);
 
@@ -634,7 +650,7 @@ unsafe extern "C" fn js_mkdir(
     if argc < 1 {
         return qjs::JS_ThrowTypeError(ctx, c"mkdir: path required".as_ptr());
     }
-    let path = match fs_path_arg(ctx, *argv, "mkdir") { Ok(p) => p, Err(e) => return e };
+    let path = match fs_path_arg(ctx, *argv, "mkdir", crate::rt::policy::FsKind::Write) { Ok(p) => p, Err(e) => return e };
     let path_bytes = path.as_bytes();
 
     let mut recursive = 0;
@@ -715,7 +731,7 @@ unsafe extern "C" fn js_rm(
     if argc < 1 {
         return qjs::JS_ThrowTypeError(ctx, c"rm: path required".as_ptr());
     }
-    let path = match fs_path_arg(ctx, *argv, "rm") { Ok(p) => p, Err(e) => return e };
+    let path = match fs_path_arg(ctx, *argv, "rm", crate::rt::policy::FsKind::Write) { Ok(p) => p, Err(e) => return e };
     let mut out: *mut PromiseHandle = ptr::null_mut();
     let promise = sofuu_promise_new(ctx, &mut out);
 
@@ -855,7 +871,7 @@ unsafe extern "C" fn js_read_file_bytes(
     if argc < 1 {
         return qjs::JS_ThrowTypeError(ctx, c"readFileBytes: path required".as_ptr());
     }
-    let path = match fs_path_arg(ctx, *argv, "readFileBytes") { Ok(p) => p, Err(e) => return e };
+    let path = match fs_path_arg(ctx, *argv, "readFileBytes", crate::rt::policy::FsKind::Read) { Ok(p) => p, Err(e) => return e };
 
     let mut out: *mut PromiseHandle = ptr::null_mut();
     let promise = sofuu_promise_new(ctx, &mut out);
@@ -893,7 +909,7 @@ unsafe extern "C" fn js_realpath(
     if argc < 1 {
         return qjs::JS_ThrowTypeError(ctx, c"realpath: path required".as_ptr());
     }
-    let path = match fs_path_arg(ctx, *argv, "realpath") { Ok(p) => p, Err(e) => return e };
+    let path = match fs_path_arg(ctx, *argv, "realpath", crate::rt::policy::FsKind::Read) { Ok(p) => p, Err(e) => return e };
     let mut out: *mut PromiseHandle = ptr::null_mut();
     let promise = sofuu_promise_new(ctx, &mut out);
 
@@ -936,7 +952,7 @@ unsafe extern "C" fn js_is_symlink(
     if argc < 1 {
         return qjs::JS_ThrowTypeError(ctx, c"isSymlink: path required".as_ptr());
     }
-    let path = match fs_path_arg(ctx, *argv, "isSymlink") { Ok(p) => p, Err(_) => return qjs::sofuu_js_new_bool(ctx, 0) };
+    let path = match fs_path_arg(ctx, *argv, "isSymlink", crate::rt::policy::FsKind::Read) { Ok(p) => p, Err(_) => return qjs::sofuu_js_new_bool(ctx, 0) };
     let is_link = std::fs::symlink_metadata(path.to_string_lossy().as_ref())
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false);

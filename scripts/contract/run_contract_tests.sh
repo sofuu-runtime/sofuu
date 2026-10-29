@@ -20,6 +20,16 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# R-23: isolate every home-relative side effect. The runtime writes sessions,
+# storage and brain keys under SOFUU_HOME; without this the suite left real
+# `.sofuu/` directories inside the checkout and in $HOME.
+CONTRACT_TMP="$(mktemp -d "${TMPDIR:-/tmp}/sofuu-contract.XXXXXX" 2>/dev/null || echo "")"
+if [ -n "$CONTRACT_TMP" ]; then
+    export SOFUU_HOME="${SOFUU_HOME:-$CONTRACT_TMP/home}"
+    mkdir -p "$SOFUU_HOME"
+    trap 'rm -rf "$CONTRACT_TMP"' EXIT INT TERM
+fi
+GIT_BEFORE="$(cd "$ROOT" && git status --porcelain 2>/dev/null | sort)"
 CASES="$ROOT/scripts/contract/cases.tsv"
 SOFUU="${SOFUU_BIN:-$ROOT/sofuu}"
 HTTP_URL="${CONTRACT_HTTP_URL:-}"
@@ -177,7 +187,26 @@ if [ "$blocked" -gt 0 ]; then
 fi
 if [ "$pass" -eq "$total" ]; then
     echo "contract suite GREEN"
+else
+    echo "contract suite NOT green (expected in P0 — see contract/README.md)"
+fi
+
+# R-23 (AUDIT-2026-10-29): the header claimed "cases never mutate the
+# repository", but the CLI/JS cases ran with cwd=$ROOT and no isolated home, so
+# a suite run left `.sofuu/sessions/*` and `.sofuu/storage/*.qtsq` behind. The
+# home is now a throwaway directory and this assertion makes the claim
+# verifiable instead of aspirational: any tracked-file change fails the run.
+if [ -n "${GIT_BEFORE:-}" ] || [ -d "$ROOT/.git" ]; then
+    GIT_AFTER="$(cd "$ROOT" && git status --porcelain 2>/dev/null | sort)"
+    if [ "$GIT_AFTER" != "${GIT_BEFORE:-}" ]; then
+        echo "✗ the contract suite mutated the repository (R-23):"
+        printf '%s\n' "$GIT_AFTER" | sed 's/^/    /'
+        NEW_MUT=1
+    fi
+fi
+[ "${NEW_MUT:-0}" = "1" ] && exit 1
+
+if [ "$pass" -eq "$total" ]; then
     exit 0
 fi
-echo "contract suite NOT green (expected in P0 — see contract/README.md)"
 exit 1

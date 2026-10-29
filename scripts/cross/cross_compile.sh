@@ -68,7 +68,16 @@ for bin in sofuu-linux-*; do
     [ -f "$bin" ] || continue
     [ -x "$bin" ] || continue
     chmod +x "$bin"
-    tar -czf "${bin}.tar.gz" "$bin"
+    # H-06 (AUDIT-2026-10-29): v0.3.0-beta shipped the bare binary — no
+    # LICENSE, no NOTICE — which violates the redistribution terms of every
+    # permissive licence listed in NOTICE. Stage the legal set beside the
+    # binary and ship it inside every archive; SHIP-MANIFEST.txt records the
+    # source commit so an artefact maps back to a revision (R-34).
+    stage="$(mktemp -d)"
+    cp "$bin" "$stage/"
+    bash "$REPO_ROOT/scripts/pack/stage_legal.sh" "$stage" "$REPO_ROOT" >/dev/null 2>&1 || true
+    tar -czf "${bin}.tar.gz" -C "$stage" .
+    rm -rf "$stage"
     echo "   ✓ ${bin}.tar.gz ($(du -sh "${bin}.tar.gz" | cut -f1))"
 done
 

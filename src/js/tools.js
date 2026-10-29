@@ -111,6 +111,140 @@
     }
   }
 
+  /* ── H-01 (AUDIT-2026-10-29): ONE enforcement point ──────────────────
+   *
+   * Before this, policyCheck('tool.run', …) ran in exactly ONE executor (the
+   * bash tool above), so the other twelve ignored tools.deny entirely and a
+   * caller that reached an executor directly — the agent loop builds its own
+   * dispatch, host code can call TOOLS.read_file.execute(), inline/toolpack
+   * tools run in the same table — bypassed the policy the inventory
+   * (sofuu.tools.list) and the loop both reported. Tools are a policy surface
+   * (R7.6), so the check belongs to the TABLE, not to each tool's body.
+   *
+   * executeWithPolicy is now the only way in: every spec.execute is replaced
+   * at load (installPolicyWrappers, end of this file) with a wrapper that
+   * asks the SAME evaluator list() asks, through the SAME request builder, so
+   * "listed as denied" and "denied at run time" cannot diverge.
+   *
+   * Double-run, and why it is safe: agent.js evaluates the policy BEFORE
+   * approval — it must, because an `ask` verdict is what decides whether the
+   * host gets prompted. The wrapper evaluates again on the way in. That is
+   * safe by construction rather than by caching: sofuu.policy.evaluate is a
+   * PURE function of (request, policy) with no side effects, so the second
+   * answer is the first answer; and a loop-level deny never reaches dispatch,
+   * so the wrapper can only ever see allow/ask here. The loop was deliberately
+   * NOT rewritten to call the wrapper: its check also runs before approval.mode
+   * handling and lives in a file outside this change's scope.
+   *
+   * `ask` is passed THROUGH the wrapper: approval is the caller's job (the
+   * loop prompts, a host may run unattended). The wrapper never invents an
+   * approval UI and never turns `ask` into a silent allow of a DENY. */
+  var POLICY_ARG_KEYS = ['command', 'path', 'cwd', 'host', 'url', 'server'];
+  var POLICY_ARG_MAX = 8192;
+
+  /* The request shape, in ONE place so the listing and the executor cannot
+   * disagree: `tool` at the top level (what tools.deny/tools.allow match) plus
+   * the parameter projection both as `params` (the documented shape) and
+   * flattened, because the evaluator's shell/net/fs rules read the top level
+   * (`command`, `path`, `host`). Only scalars ride along, capped: serializing
+   * a write_file body into an evaluator request would cost a JSON round-trip
+   * per call and could not change the decision. */
+  function toolPolicyRequest(name, params) {
+    var req = { op: 'tool.run', tool: name };
+    if (params && typeof params === 'object') {
+      var proj = null;
+      for (var i = 0; i < POLICY_ARG_KEYS.length; i++) {
+        var k = POLICY_ARG_KEYS[i];
+        var v = params[k];
+        if (v === undefined || v === null) continue;
+        if (typeof v !== 'string' && typeof v !== 'number') continue;
+        if (proj === null) proj = {};
+        proj[k] = String(v).slice(0, POLICY_ARG_MAX);
+      }
+      if (proj !== null) {
+        req.params = proj;
+        for (var pk in proj) {
+          if (Object.prototype.hasOwnProperty.call(proj, pk)) req[pk] = proj[pk];
+        }
+      }
+    }
+    return req;
+  }
+
+  /* Returns the parsed decision, or null when there is no evaluator (a
+   * stripped runtime) — null means "no opinion", never "allow". */
+  function toolPolicyDecision(name, params) {
+    try {
+      if (typeof sofuu === 'undefined' || !sofuu.policy ||
+          typeof sofuu.policy.evaluate !== 'function') return null;
+      var raw = sofuu.policy.evaluate(toolPolicyRequest(name, params));
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) { return null; }
+  }
+
+  /* The typed denial H-01 asks for, carrying the R7.3 rule id in the message
+   * AND as properties so a driver can branch without parsing text. The shape
+   * keeps the pre-existing "denied by policy (<rule>)" substring the contract
+   * harnesses assert on (t72/t75, tests/policy_test.js). */
+  function policyDeniedError(name, d) {
+    var rule = (d && d.rule) || 'R7/default';
+    var reason = (d && d.reason) || '';
+    var err = new Error('E_POLICY_DENIED: Tool \'' + name + '\' is denied by policy (' +
+      rule + ')' + (reason ? ': ' + reason : ''));
+    err.code = 'E_POLICY_DENIED';
+    err.decision = 'deny';
+    err.rule = rule;
+    err.tool = name;
+    if (reason) err.policy_reason = reason;
+    return err;
+  }
+
+  /* H-02(a) bridge: while a policy-governed dispatch is in flight, the native
+   * layers can tell "the runtime is acting for a model/remote caller" from "a
+   * host script is doing its own plumbing" (process_spawn's gate reads this
+   * depth). It is a depth, not a boolean, because a tool may dispatch another
+   * (apply_patch → bash style); it is clamped at 0 so a stray decrement can
+   * never leave the marker stuck on. */
+  var TOOL_ACTIVE = 0;
+  function toolDispatchBegin() {
+    TOOL_ACTIVE++;
+    try { globalThis.__sofuu_tool_active = TOOL_ACTIVE; } catch (e) {}
+  }
+  function toolDispatchEnd() {
+    TOOL_ACTIVE = TOOL_ACTIVE > 0 ? TOOL_ACTIVE - 1 : 0;
+    try { globalThis.__sofuu_tool_active = TOOL_ACTIVE; } catch (e) {}
+  }
+
+  /* The single enforcement point. Works when copied off the object and called
+   * unbound (`const f = TOOLS.edit_file.execute; f(...)`), which a host is
+   * allowed to do — no `this`. */
+  function executeWithPolicy(toolName, params, ctx) {
+    var name = String(toolName == null ? '' : toolName);
+    var spec = TOOLS[name];
+    if (!spec || typeof spec.__exec !== 'function') {
+      var e = new Error('E_TOOL: unknown tool \'' + name + '\'');
+      e.code = 'E_TOOL';
+      e.tool = name;
+      throw e;
+    }
+    var d = toolPolicyDecision(name, params);
+    if (d && d.decision === 'deny') throw policyDeniedError(name, d);
+    toolDispatchBegin();
+    var out;
+    try {
+      out = spec.__exec(params, ctx);
+    } catch (err) {
+      toolDispatchEnd();
+      throw err;
+    }
+    if (out && typeof out.then === 'function') {
+      return out.then(function (v) { toolDispatchEnd(); return v; },
+                      function (err) { toolDispatchEnd(); throw err; });
+    }
+    toolDispatchEnd();
+    return out;
+  }
+
   function cwd() { try { return process.cwd() || '.'; } catch (e) { return '.'; } }
 
   /* Lexical normalization: collapses '.', '..' and duplicate separators.
@@ -893,12 +1027,24 @@
       required: ['command'],
     },
     execute: async function (a) {
-      if (process.env.SOFUU_NO_SHELL) throw new Error('bash: disabled (SOFUU_NO_SHELL is set)');
+      if (process.env.SOFUU_NO_SHELL) {
+        /* Same typed refusal the native spawn gate returns (H-02a), so the
+         * tool and sofuu.spawn cannot disagree about the operator's kill
+         * switch — and "disabled" stays in the text for the inventory
+         * harness. */
+        var eNoShell = new Error('E_PERMISSION_DENIED: Process execution disabled by policy');
+        eNoShell.code = 'E_PERMISSION_DENIED';
+        eNoShell.rule = 'R7.6/shell.enabled';
+        eNoShell.tool = 'bash';
+        throw eNoShell;
+      }
       var cmd = String((a && a.command) || '');
       if (!cmd.trim()) throw new Error('bash: command required');
-      /* S4: tool.run on bash also carries the shell checks (tools.deny,
-       * shell.enabled and shell.allow all decide this one call). */
-      policyCheck('tool.run', { tool: 'bash', command: cmd });
+      /* S4/H-01: the policy check for this call now runs in the wrapper
+       * (executeWithPolicy) that every executor sits behind, with the same
+       * request `{op:'tool.run', tool:'bash', command}`. Keeping a second
+       * copy here would evaluate the same pure decision twice per call for
+       * no extra safety — the wrapper cannot be bypassed. */
       /* P3 deny-list: a small set of unambiguously catastrophic patterns is
        * refused EVEN when the user approves — a mistyped approval on `rm -rf /`
        * should not need a post-mortem. Matched against the raw command; the
@@ -911,7 +1057,7 @@
         }
       }
       var timeout = Math.min(BASH_MAX_TIMEOUT_MS, Math.max(1000, ((a && a.timeout_ms) | 0) || BASH_DEFAULT_TIMEOUT_MS));
-      return await new Promise(function (resolve) {
+      return await new Promise(function (resolve, rejectP) {
         var out = '', errOut = '', done = false, code = -1, tid = null;
         function capAdd(s) { if (out.length < BASH_OUT_CAP) out += s.slice(0, BASH_OUT_CAP - out.length); }
         function capErr(s) { if (errOut.length < BASH_ERR_CAP) errOut += s.slice(0, BASH_ERR_CAP - errOut.length); }
@@ -942,7 +1088,19 @@
             onExit: function (c) { untrackProc(proc); code = c; finish(''); },
           }));
         } catch (e) {
-          resolve('$ ' + cmd + '\nbash: spawn failed: ' + String(e.message || e));
+          /* H-01/H-02(a): a policy refusal must not be reported as a normal
+           * shell result. The wrapper already refuses the common cases; the
+           * native spawn gate can still refuse here (shell.allow at the spawn
+           * layer, the SOFUU_NO_SHELL kill switch), and that has to surface
+           * as a tool ERROR — a model must not read a denial as `[exit 0]`. */
+          var emsg = String((e && e.message) || e);
+          if (emsg.indexOf('E_PERMISSION_DENIED') >= 0 || emsg.indexOf('denied by policy') >= 0) {
+            done = true;
+            if (tid !== null) clearTimeout(tid);
+            rejectP(e);
+            return;
+          }
+          resolve('$ ' + cmd + '\nbash: spawn failed: ' + emsg);
           return;
         }
         tid = setTimeout(function () {
@@ -1974,22 +2132,27 @@
     function push(name, source, category, spec) {
       if (filterCat && filterCat !== category && filterCat !== source) return;
       if (enabledOnly && sofuu.tools.ENABLED && sofuu.tools.ENABLED[name] === false) return;
-      var allowed = true, requiresApproval = false;
-      try {
-        if (sofuu.policy && typeof sofuu.policy.evaluate === 'function') {
-          /* tool.run on bash carries the shell checks too (deny wins). */
-          var d = JSON.parse(sofuu.policy.evaluate({ op: 'tool.run', tool: name }));
-          allowed = d.decision !== 'deny';
-          requiresApproval = d.decision === 'ask';
-        }
-      } catch (ePol) {}
+      /* H-01: the SAME request builder and evaluator the executor wrapper
+       * uses (toolPolicyDecision → toolPolicyRequest), so an inventory row and
+       * an execution cannot disagree. `conditional` marks a tool whose verdict
+       * depends on call parameters (bash + shell.allow): it is not "denied",
+       * it is "denied unless the command matches" — the per-call check in
+       * executeWithPolicy is authoritative. */
+      var d = toolPolicyDecision(name, null);
+      var allowed = !(d && d.decision === 'deny');
+      var requiresApproval = !!(d && d.decision === 'ask');
       out.push({
         name: name,
         source: source,
         category: category,
         description: String((spec && (spec.description || spec.summary)) || ''),
         schema: (spec && (spec.parameters || spec.schema)) || null,
-        policy: { allowed: allowed, requiresApproval: requiresApproval },
+        policy: {
+          allowed: allowed,
+          requiresApproval: requiresApproval,
+          rule: (d && d.rule) || '',
+          conditional: !!(d && d.conditional),
+        },
       });
     }
     var i, keys, n;
@@ -2036,4 +2199,31 @@
     }
     return n;
   };
+
+  /* ── H-01: install the one policy wrapper on EVERY executor ──────────
+   * Runs last, after every TOOLS.* definition in this file (todo_write,
+   * system_info and memory_* are added below the SOFUU_TOOLS section), so no
+   * executor can escape it. Each spec keeps its body as __exec and exposes
+   * execute = the wrapper. Idempotent: re-loading the driver (hot reload)
+   * must not stack wrappers on wrappers.
+   *
+   * sofuu.tools.execute(name, params) is the documented public entry — the
+   * remediation plan's validation uses it — and it goes through exactly the
+   * same gate as TOOLS[name].execute. */
+  (function installPolicyWrappers() {
+    var names = Object.keys(TOOLS);
+    for (var i = 0; i < names.length; i++) {
+      var n = names[i];
+      var spec = TOOLS[n];
+      if (!spec || typeof spec.execute !== 'function' || spec.__policyWrapped) continue;
+      spec.__exec = spec.execute;
+      spec.__policyWrapped = true;
+      spec.execute = (function (toolName) {
+        return function (params, ctx) { return executeWithPolicy(toolName, params, ctx); };
+      })(n);
+    }
+    sofuu.tools.execute = function (name, params, ctx) {
+      return executeWithPolicy(name, params, ctx);
+    };
+  })();
 })();

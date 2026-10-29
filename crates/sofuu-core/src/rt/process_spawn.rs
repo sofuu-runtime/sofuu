@@ -53,6 +53,34 @@ const CHILD_ENV_WINDOWS: &[&str] = &[
 
 pub(crate) const CHILD_ENV_ERR: &CStr = c"env values must be strings or null";
 
+/// The command lines `shell.allow` is judged against. Both call sites push the
+/// program as argv[0], so the first entry is what the caller would have typed
+/// (`/bin/sh -c 'echo hi'`). When that argv is a POSIX shell running
+/// `-c <payload>`, the payload is offered too: it is the command that will
+/// actually run, and without it `shell.allow: ["git *"]` would allow the bash
+/// tool's `git status` and then deny the identical spawn because the native
+/// argv spells it `/bin/sh -c git status`.
+fn policy_command_lines(argv: &[CString]) -> Vec<String> {
+    let joined = argv
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect::<Vec<String>>()
+        .join(" ");
+    let mut out = vec![joined];
+    if argv.len() >= 3 {
+        let prog = argv[0].to_string_lossy();
+        let base = prog.rsplit('/').next().unwrap_or(prog.as_ref());
+        let flag = argv[1].to_string_lossy();
+        if matches!(base, "sh" | "bash" | "zsh" | "dash" | "ksh" | "busybox")
+            && flag.starts_with('-')
+            && flag.contains('c')
+        {
+            out.push(argv[2].to_string_lossy().into_owned());
+        }
+    }
+    out
+}
+
 fn child_env_name_eq(a: &str, b: &str) -> bool {
     if cfg!(windows) {
         a.eq_ignore_ascii_case(b)
@@ -601,6 +629,21 @@ unsafe extern "C" fn js_sofuu_spawn(
     }
     qjs::sofuu_js_free_value(ctx, args_val);
 
+    /* H-02(a) (AUDIT-2026-10-29): the shell policy governs EVERY way this
+     * runtime can start a process, not just the bash tool. sofuu.spawn used
+     * to ignore it entirely, so shell.enabled:false + SOFUU_NO_SHELL=1 still
+     * ran /bin/sh while the bash tool in the same process refused. The gate
+     * reads the policy from THIS runtime's global (policy_json) — never from
+     * process-wide state — so a harness/child that installs its own policy
+     * answers with its own document. Refuse before any libuv resource is
+     * allocated: nothing is spawned and nothing leaks. */
+    let cmdlines = policy_command_lines(&req.args);
+    if let Err(denied) = crate::rt::policy::gate_process_spawn(ctx, &cmdlines) {
+        drop(req);
+        /* typed refusal with .code / .rule (R7.3) */
+        return crate::rt::policy::throw_denied(ctx, &denied);
+    }
+
     /* Callbacks: read AFTER args (C peeks JS props in the same order) */
     let _ = &mut args_val; // (args_val already freed — C frees it at the same point)
     req.on_stdout = qjs::sofuu_js_get_property_str(ctx, opts, c"onStdout".as_ptr());
@@ -1059,6 +1102,15 @@ unsafe extern "C" fn js_sofuu_exec(
             }
         }
         qjs::sofuu_js_free_value(ctx, tmo_val);
+    }
+
+    /* H-02(a): sofuu.exec is the same process primitive and answers to the
+     * same shell policy (a spawn-only gate would leave this door open). */
+    let cmdlines = policy_command_lines(&req.argv);
+    if let Err(denied) = crate::rt::policy::gate_process_spawn(ctx, &cmdlines) {
+        drop(req);
+        /* typed refusal with .code / .rule (R7.3) */
+        return crate::rt::policy::throw_denied(ctx, &denied);
     }
 
     // ── uv side ─────────────────────────────────────────────────────

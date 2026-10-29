@@ -610,9 +610,14 @@ Key gates: `cargo test --release` · `make test` · `make headless-test` (all 5 
 
 ## Open core
 
-The runtime is **fully open source (MIT)** — engine, CLI, JS/TS APIs, agents, MCP, HTTP, vector ops, memory, embeddings, SDK bindings. Use, modify, and distribute it freely, commercially or not.
+The runtime is **open source (MIT)** — engine, CLI, JS/TS APIs, agents, MCP, HTTP, vector ops, memory, embeddings, SDK bindings. Use, modify, and distribute it freely, commercially or not.
 
 Proprietary are only: the **QTSQ format specification** ([terms](LICENSES/QTSQ-FORMAT.txt) — using it *through Sofuu*, commercially or not, is free and needs no approval) and **future hosted/cloud/enterprise services** as separate offerings. Nothing is removed from the core to create them.
+
+Two scopes are narrower than the sentence above, and this list is authoritative:
+
+- The **QTSQ memory encoder** (the `qtsq` static library that backs persistent memory) is not MIT, and neither is the format spec. The runtime code that drives it, and every other subsystem, is MIT. A build without that library still compiles — minus the memory codec.
+- **Third-party components** keep their own licences, all reproduced in [NOTICE](NOTICE): QuickJS, libuv, http-parser and libcurl (MIT-style), libopus (BSD-3-Clause, macOS opt-in only), and the MPL-2.0 crates that only the optional desktop wrapper pulls in.
 
 ---
 

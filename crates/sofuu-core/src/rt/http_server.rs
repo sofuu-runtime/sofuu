@@ -61,6 +61,12 @@ struct Client {
     /* request accumulation */
     url: Vec<u8>,
     body: Vec<u8>,
+    /* R-32: the route this connection served (the url as parsed, kept after
+     * `url` is reset) plus its accept time, so a disconnect log can name
+     * WHICH route died and how long it lived. */
+    route: Vec<u8>,
+    started: std::time::Instant,
+    disconnect_logged: c_int,
     /* header accumulation (http-parser fragments names/values across reads) */
     hdr_field: Vec<u8>,
     hdr_value: Vec<u8>,
@@ -111,6 +117,9 @@ impl Client {
             },
             url: Vec::new(),
             body: Vec::new(),
+            route: Vec::new(),
+            started: std::time::Instant::now(),
+            disconnect_logged: 0,
             hdr_field: Vec::new(),
             hdr_value: Vec::new(),
             headers: Vec::new(),
@@ -170,6 +179,34 @@ unsafe extern "C" fn timer_free_cb(handle: *mut UvHandle) {
     libc::free(handle as *mut c_void);
 }
 
+/// R-32: one INFO-level line per abandoned connection. Before this, a client
+/// vanishing mid-response (or an SSE generation being cut) left nothing at
+/// all in the log — the failure was indistinguishable from the server
+/// hanging. The line carries what an operator needs: the ROUTE, the elapsed
+/// milliseconds since accept, and whether a streaming generation was still
+/// in flight (`res.closed()` true ⇒ the JS generation loop is cancelling).
+unsafe fn log_client_gone(c: *mut Client, kind: &str) {
+    if c.is_null() || (*c).disconnect_logged != 0 {
+        return; /* one line per connection, whichever path notices first */
+    }
+    (*c).disconnect_logged = 1;
+    let route = if (*c).route.is_empty() {
+        "-".to_string()
+    } else {
+        let raw = String::from_utf8_lossy(&(*c).route).into_owned();
+        /* Drop the query string: it can carry tokens (?token=…). */
+        match raw.split_once('?') {
+            Some((path, _)) => path.to_string(),
+            None => raw,
+        }
+    };
+    let elapsed_ms = (*c).started.elapsed().as_millis();
+    let generation_cancelled = (*c).streaming != 0 && (*c).finished == 0;
+    eprintln!(
+        "[sofuu/http] info: client {kind} route={route} elapsed_ms={elapsed_ms} generation_cancelled={generation_cancelled}"
+    );
+}
+
 /// net-3: (re)arm the per-connection deadline. Called on the loop thread
 /// only (accept, parser callbacks, response writes).
 unsafe fn client_arm_timer(c: *mut Client, ms: u64) {
@@ -199,6 +236,9 @@ unsafe extern "C" fn on_deadline_timeout(_t: *mut UvTimer) {
     // mirroring the tcp handle slot).
     let c = *(_t as *mut *mut Client);
     if (*c).closing == 0 {
+        /* R-32: the server gave up on this connection — log it like any
+         * other abandonment (route, elapsed, generation cut). */
+        log_client_gone(c, "deadline expired");
         (*c).closing = 1;
         uv::uv_close((*c).tcp as *mut UvHandle, Some(client_free));
     }
@@ -235,7 +275,7 @@ struct WriteReq {
     close_after: c_int, /* close the connection once this write flushes */
 }
 
-unsafe extern "C" fn on_write_done(req: *mut UvWriteReq, _status: c_int) {
+unsafe extern "C" fn on_write_done(req: *mut UvWriteReq, status: c_int) {
     // SAFETY: req->data (first field of uv_req_t) was set at queue_write;
     // libuv reserves it for the user.
     let wr = *(req as *mut *mut WriteReq);
@@ -244,6 +284,11 @@ unsafe extern "C" fn on_write_done(req: *mut UvWriteReq, _status: c_int) {
     libc::free((*wr).data as *mut c_void);
     libc::free(req as *mut c_void);
     drop(Box::from_raw(wr));
+    if status < 0 {
+        /* R-32: a failed write IS the abort surfacing (EPIPE/ECONNRESET) —
+         * log it before the close fence runs. */
+        log_client_gone(c, "write failed");
+    }
     if close_after != 0 && (*c).closing == 0 {
         /* Only ONE path may own uv_close: a racing on_read(EOF/abort)
          * would otherwise double-close the handle and double-free. */
@@ -615,6 +660,10 @@ unsafe extern "C" fn cb_message_complete(p: *mut HttpParser) -> c_int {
     let c = (*p).data as *mut Client;
     let ctx = (*(*c).srv).ctx;
 
+    /* R-32: keep the route for the disconnect log — `url` is reset at the
+     * end of this call, so a later EOF would have nothing to name. */
+    (*c).route = (*c).url.clone();
+
     (*c).req_val.set(qjs::sofuu_js_new_object(ctx));
     let method_c = CString::new(
         CStr::from_ptr(http_parser::http_method_str((*p).method())).to_bytes(),
@@ -774,6 +823,14 @@ unsafe extern "C" fn on_read(s: *mut UvStream, n: isize, b: *const uv::UvBuf) {
          * handler can observe the disconnect instead of writing into a
          * dead socket forever. */
         (*c).peer_closed = 1;
+        /* R-32: say so at info level — route, elapsed ms, and whether a
+         * streaming generation (SSE/chunked) is being cancelled. */
+        let kind = if (*c).streaming != 0 && (*c).finished == 0 {
+            "stream aborted"
+        } else {
+            "disconnected"
+        };
+        log_client_gone(c, kind);
         if (*c).closing == 0 {
             (*c).closing = 1;
             uv::uv_close(s as *mut UvHandle, Some(client_free));

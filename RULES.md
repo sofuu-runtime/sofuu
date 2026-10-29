@@ -65,7 +65,7 @@ Sofuu maintains a strict zero-liability policy regarding intellectual property, 
 - Never distribute, redistribute, or package copyrighted model weights or proprietary dataset files within git repositories, release tarballs, npm packages, or container images.
 
 ### 2.4 Prohibited Terms & Confidential Projects
-- Under **no circumstances** may confidential or prohibited project names (including `societyos`) be touched, referenced, committed, or mentioned anywhere in the repository, documentation, or commit messages.
+- Under **no circumstances** may confidential or prohibited legacy codenames be touched, referenced, committed, or mentioned anywhere in the codebase, documentation, commit messages, or release artefacts. Refer to any such project only as `[CONFIDENTIAL_PROJECT_NAME]` or "a legacy codename".
 
 ---
 

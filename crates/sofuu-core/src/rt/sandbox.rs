@@ -98,27 +98,79 @@ pub struct InterruptState {
     pub reason: InterruptReason,
 }
 
-unsafe extern "C" fn sandbox_interrupt_cb(_rt: *mut JSRuntime, opaque: *mut c_void) -> c_int {
+/* C-02 (2026-10-29): a sanitized alias for the machine-readable error codes
+ * produced by the sandbox. `run()` reports them on the result object
+ * (`code`) and `eval()` / `throwOnError: true` throw an Error carrying them,
+ * so a host can distinguish a deadline from a fuel cut without string
+ * matching the message. */
+pub fn sandbox_error_code(error_type: &str) -> &'static str {
+    match error_type {
+        "timeout" => "E_TIMEOUT",
+        "fuel" => "E_FUEL",
+        "oom" => "E_OOM",
+        "stack" => "E_STACK",
+        "closed" => "E_SANDBOX_CLOSED",
+        "syntax" => "E_SYNTAX",
+        "globals" => "E_GLOBALS",
+        _ => "E_SANDBOX",
+    }
+}
+
+/* C-02: defined in deps/quickjs/quickjs.c. Non-zero when the interrupt
+ * handler is being called from the native regexp backtracking loop instead
+ * of a bytecode meter batch. Declared here (rather than in the shared
+ * sofuu-ffi qjs module) because the sandbox is its only caller. */
+extern "C" {
+    fn JS_GetInterruptPollSource(rt: *mut JSRuntime) -> c_int;
+}
+
+/* Must match LRE_INTERRUPT_POLL_STEPS in deps/quickjs/libregexp.h: the
+ * engine charges one fuel unit per backtracking step, and a poll covers
+ * that many steps. Kept as a literal so the Rust side needs no build-time
+ * binding; the unit test below pins the two values together. */
+const REGEXP_POLL_STEPS: i64 = 4096;
+
+unsafe extern "C" fn sandbox_interrupt_cb(rt: *mut JSRuntime, opaque: *mut c_void) -> c_int {
     if opaque.is_null() {
         return 0;
     }
     let st = unsafe { &mut *(opaque as *mut InterruptState) };
+    let engine_poll = !rt.is_null() && JS_GetInterruptPollSource(rt) != 0;
 
-    // Record fuel for the batch that just completed
-    let batch = st.fuel_quanta;
-    st.fuel_consumed = st.fuel_consumed.saturating_add(batch);
-
-    // Fuel check
-    if let Some(_) = st.fuel_limit {
-        st.fuel_remaining -= batch as i64;
-        if st.fuel_remaining <= 0 {
-            st.reason = InterruptReason::FuelExhausted;
-            return 1; // abort!
+    if engine_poll {
+        /* Native regexp backtracking. It is only charged to the fuel meter
+         * when the run has no wall-clock budget: the meter counts work in
+         * bytecode-instruction units, and with a deadline configured the
+         * clock is the authoritative budget for native matching (charging
+         * 1 unit per step there would let the default 5M budget preempt any
+         * deadline, turning `timeoutMs: 100` into a fuel error). With no
+         * deadline (Rust API `timeout: None`) the meter must still bound the
+         * match, so one fuel unit per step is charged here. */
+        if st.deadline.is_none() && st.fuel_limit.is_some() {
+            st.fuel_consumed = st.fuel_consumed.saturating_add(REGEXP_POLL_STEPS as u64);
+            st.fuel_remaining -= REGEXP_POLL_STEPS;
+            if st.fuel_remaining <= 0 {
+                st.reason = InterruptReason::FuelExhausted;
+                return 1; // abort!
+            }
         }
-        if !st.ctx.is_null() {
-            let next_batch = (st.fuel_remaining as u64).min(10_000).max(1);
-            st.fuel_quanta = next_batch;
-            qjs::JS_SetInterruptCounter(st.ctx, next_batch as c_int);
+    } else {
+        // Record fuel for the batch that just completed
+        let batch = st.fuel_quanta;
+        st.fuel_consumed = st.fuel_consumed.saturating_add(batch);
+
+        // Fuel check
+        if let Some(_) = st.fuel_limit {
+            st.fuel_remaining -= batch as i64;
+            if st.fuel_remaining <= 0 {
+                st.reason = InterruptReason::FuelExhausted;
+                return 1; // abort!
+            }
+            if !st.ctx.is_null() {
+                let next_batch = (st.fuel_remaining as u64).min(10_000).max(1);
+                st.fuel_quanta = next_batch;
+                qjs::JS_SetInterruptCounter(st.ctx, next_batch as c_int);
+            }
         }
     }
 
@@ -277,7 +329,8 @@ impl SandboxSession {
                 reason: InterruptReason::None,
             }));
 
-            qjs::JS_SetInterruptHandler(rt, Some(sandbox_interrupt_cb), interrupt_state as *mut c_void);
+            /* C-02: no handler at construction — `run()` installs it for the
+             * duration of the call and `disarm_interrupts()` removes it. */
 
             let ctx = qjs::JS_NewContext(rt);
             if ctx.is_null() {
@@ -336,22 +389,72 @@ impl SandboxSession {
             c
         };
 
+        /* C-02: the deadline handler is installed for exactly the duration of
+         * this call and removed before returning, so a closed/idle session
+         * runtime never carries a stale (already expired) deadline and the
+         * non-sandbox path is untouched by construction. */
         unsafe {
-            // Re-arm interrupt state
-            let st = &mut *self.interrupt_state;
-            st.deadline = run_config.timeout.map(|d| Instant::now() + d);
-            st.fuel_limit = run_config.fuel_limit;
-            st.fuel_remaining = run_config.fuel_limit.unwrap_or(u64::MAX) as i64;
-            st.fuel_consumed = 0;
-            st.reason = InterruptReason::None;
+            self.arm_interrupts(&run_config, start);
+        }
+        let result = self.run_armed(code, &run_config, globals_json, start);
+        unsafe {
+            self.disarm_interrupts();
+        }
+        result
+    }
 
-            let initial_counter = run_config
-                .fuel_limit
-                .unwrap_or(10_000)
-                .min(10_000)
-                .max(1);
-            st.fuel_quanta = initial_counter;
-            qjs::JS_SetInterruptCounter(self.ctx, initial_counter as c_int);
+    /// Arm the wall-clock deadline and the fuel meter for one run and install
+    /// `sandbox_interrupt_cb` on `self.rt`. The runtime is private to this
+    /// session (created in `new`, freed in `destroy`), so no pre-existing
+    /// interrupt handler can be clobbered; `JS_GetInterruptHandler` does not
+    /// exist in this vendored QuickJS.
+    unsafe fn arm_interrupts(&mut self, run_config: &SandboxConfig, start: Instant) {
+        let st = &mut *self.interrupt_state;
+        st.ctx = self.ctx;
+        st.deadline = run_config.timeout.map(|d| start + d);
+        st.fuel_limit = run_config.fuel_limit;
+        st.fuel_remaining = run_config.fuel_limit.unwrap_or(u64::MAX) as i64;
+        st.fuel_consumed = 0;
+        st.reason = InterruptReason::None;
+
+        let initial_counter = run_config
+            .fuel_limit
+            .unwrap_or(10_000)
+            .min(10_000)
+            .max(1);
+        st.fuel_quanta = initial_counter;
+        qjs::JS_SetInterruptCounter(self.ctx, initial_counter as c_int);
+
+        qjs::JS_SetInterruptHandler(
+            self.rt,
+            Some(sandbox_interrupt_cb),
+            self.interrupt_state as *mut c_void,
+        );
+    }
+
+    /// Remove the handler and clear the deadline/fuel state so nothing can
+    /// interrupt (or be mis-metered by) execution that is not a sandbox run.
+    unsafe fn disarm_interrupts(&mut self) {
+        if !self.rt.is_null() {
+            qjs::JS_SetInterruptHandler(self.rt, None, std::ptr::null_mut());
+        }
+        if !self.interrupt_state.is_null() {
+            let st = &mut *self.interrupt_state;
+            st.deadline = None;
+            st.fuel_limit = None;
+            st.reason = InterruptReason::None;
+        }
+    }
+
+    fn run_armed(
+        &mut self,
+        code: &str,
+        run_config: &SandboxConfig,
+        globals_json: Option<&str>,
+        start: Instant,
+    ) -> SandboxRunResult {
+        unsafe {
+            let st = &mut *self.interrupt_state;
 
             // Reset logs
             let cst = &mut *self.context_state;
@@ -450,12 +553,18 @@ impl SandboxSession {
                         true,
                     ),
                     InterruptReason::Timeout => (
+                        /* C-02: the deadline now also fires from the regexp
+                         * backtracking loop (libregexp.c polls
+                         * lre_poll_interrupts). Name the budget and the
+                         * actual elapsed time; the E_TIMEOUT prefix is the
+                         * stable, machine-readable part. */
                         format!(
-                            "Execution terminated: timeout exceeded ({} ms limit)",
+                            "E_TIMEOUT: sandbox execution exceeded its {} ms budget after {:.2} ms (interrupted)",
                             run_config
                                 .timeout
                                 .map(|d| d.as_millis())
-                                .unwrap_or(elapsed_ms as u128)
+                                .unwrap_or(elapsed_ms as u128),
+                            elapsed_ms
                         ),
                         "timeout".to_string(),
                         true,
@@ -683,6 +792,10 @@ unsafe fn build_js_result_object(ctx: *mut JSContext, res: SandboxRunResult) -> 
     if let Some(ref etype) = res.error_type {
         let c_etype = CString::new(etype.clone()).unwrap_or_else(|_| CString::new("unknown").unwrap());
         qjs::sofuu_js_set_property_str(ctx, obj, c"errorType".as_ptr(), qjs::sofuu_js_new_string(ctx, c_etype.as_ptr()));
+
+        let code = sandbox_error_code(etype);
+        let c_code = CString::new(code).unwrap_or_else(|_| CString::new("E_SANDBOX").unwrap());
+        qjs::sofuu_js_set_property_str(ctx, obj, c"code".as_ptr(), qjs::sofuu_js_new_string(ctx, c_code.as_ptr()));
     }
 
     qjs::sofuu_js_set_property_str(
@@ -705,6 +818,47 @@ unsafe fn build_js_result_object(ctx: *mut JSContext, res: SandboxRunResult) -> 
     qjs::sofuu_js_set_property_str(ctx, obj, c"logs".as_ptr(), logs_arr);
 
     obj
+}
+
+/* C-02: raise a catchable JS error for a failed run. A deadline violation
+ * becomes `SandboxTimeoutError` with `.code === 'E_TIMEOUT'` (the message
+ * also carries the budget and the elapsed time); every other failure keeps
+ * the existing InternalError shape so only the timeout path changes. */
+unsafe fn throw_sandbox_failure(ctx: *mut JSContext, result: &SandboxRunResult) -> JSValue {
+    let err_type = result.error_type.as_deref().unwrap_or("runtime");
+    let err_msg = result
+        .error
+        .clone()
+        .unwrap_or_else(|| "Sandbox error".to_string());
+    let c_msg = CString::new(err_msg).unwrap_or_else(|_| CString::new("Sandbox error").unwrap());
+
+    if err_type != "timeout" {
+        return qjs::JS_ThrowInternalError(ctx, c_msg.as_ptr());
+    }
+
+    let err = qjs::JS_NewError(ctx);
+    if qjs::is_exception(err) {
+        return qjs::JS_ThrowInternalError(ctx, c_msg.as_ptr());
+    }
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        err,
+        c"name".as_ptr(),
+        qjs::sofuu_js_new_string(ctx, c"SandboxTimeoutError".as_ptr()),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        err,
+        c"message".as_ptr(),
+        qjs::sofuu_js_new_string(ctx, c_msg.as_ptr()),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        err,
+        c"code".as_ptr(),
+        qjs::sofuu_js_new_string(ctx, c"E_TIMEOUT".as_ptr()),
+    );
+    qjs::JS_Throw(ctx, err)
 }
 
 // ── Native JS Functions: sofuu.sandbox.run & sofuu.sandbox.eval ──
@@ -753,9 +907,7 @@ unsafe extern "C" fn js_sandbox_run(
     session.destroy();
 
     if config.throw_on_error && !result.success {
-        let err_msg = result.error.unwrap_or_else(|| "Sandbox error".to_string());
-        let c_msg = CString::new(err_msg).unwrap_or_else(|_| CString::new("Sandbox error").unwrap());
-        return qjs::JS_ThrowInternalError(ctx, c_msg.as_ptr());
+        return throw_sandbox_failure(ctx, &result);
     }
 
     build_js_result_object(ctx, result)
@@ -806,9 +958,7 @@ unsafe extern "C" fn js_sandbox_eval(
     session.destroy();
 
     if !result.success {
-        let err_msg = result.error.unwrap_or_else(|| "Sandbox evaluation failed".to_string());
-        let c_msg = CString::new(err_msg).unwrap_or_else(|_| CString::new("Sandbox evaluation failed").unwrap());
-        return qjs::JS_ThrowInternalError(ctx, c_msg.as_ptr());
+        return throw_sandbox_failure(ctx, &result);
     }
 
     if let Some(json_str) = result.result_json {
@@ -872,9 +1022,7 @@ unsafe extern "C" fn js_sandbox_instance_run(
 
     let result = session.run(&code, &run_config, globals_json.as_deref());
     if run_config.throw_on_error && !result.success {
-        let err_msg = result.error.unwrap_or_else(|| "Sandbox error".to_string());
-        let c_msg = CString::new(err_msg).unwrap_or_else(|_| CString::new("Sandbox error").unwrap());
-        return qjs::JS_ThrowInternalError(ctx, c_msg.as_ptr());
+        return throw_sandbox_failure(ctx, &result);
     }
 
     build_js_result_object(ctx, result)
@@ -923,9 +1071,7 @@ unsafe extern "C" fn js_sandbox_instance_eval(
 
     let result = session.run(&code, &run_config, globals_json.as_deref());
     if !result.success {
-        let err_msg = result.error.unwrap_or_else(|| "Sandbox evaluation failed".to_string());
-        let c_msg = CString::new(err_msg).unwrap_or_else(|_| CString::new("Sandbox evaluation failed").unwrap());
-        return qjs::JS_ThrowInternalError(ctx, c_msg.as_ptr());
+        return throw_sandbox_failure(ctx, &result);
     }
 
     if let Some(json_str) = result.result_json {
@@ -1075,6 +1221,18 @@ mod tests {
         );
     }
 
+    /* C-02: the Rust poll charge and the C poll interval must agree, or the
+     * fuel meter would under/over-charge native regexp work. */
+    #[test]
+    fn test_regexp_poll_steps_matches_quickjs() {
+        let header = include_str!("../../../../deps/quickjs/libregexp.h");
+        assert!(
+            header.contains("#define LRE_INTERRUPT_POLL_STEPS 4096"),
+            "deps/quickjs/libregexp.h poll interval changed: update REGEXP_POLL_STEPS"
+        );
+        assert_eq!(REGEXP_POLL_STEPS, 4096);
+    }
+
     #[test]
     fn test_sandbox_config_is_clamped() {
         let mut cfg = SandboxConfig::default();
@@ -1138,6 +1296,85 @@ mod tests {
         assert_eq!(res.error_type.as_deref(), Some("timeout"));
         // Promptness, not a benchmark: a busy runner can delay the poll.
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    /* C-02: catastrophic regex backtracking runs in one QuickJS native
+     * frame. Before the libregexp.c poll it ignored `timeoutMs` entirely
+     * (measured: 1.9 s for N=24, 47 s for N=28) and returned success: true.
+     * The deadline must now abort it promptly, report E_TIMEOUT, and leave
+     * the runtime usable for the next call. */
+    #[test]
+    fn test_sandbox_regex_catastrophic_backtracking_times_out() {
+        let mut session = SandboxSession::new(SandboxConfig::default()).expect("session");
+        let mut config = SandboxConfig::default();
+        config.timeout = Some(Duration::from_millis(100));
+        config.fuel_limit = Some(SANDBOX_MAX_FUEL);
+
+        let start = Instant::now();
+        let res = session.run(
+            r#"/(a+)+$/.test("a".repeat(26) + "b")"#,
+            &config,
+            None,
+        );
+        let took = start.elapsed();
+
+        assert!(!res.success, "catastrophic regex must not succeed");
+        assert!(res.interrupted, "catastrophic regex must be interrupted");
+        assert_eq!(
+            res.error_type.as_deref(),
+            Some("timeout"),
+            "expected a timeout, got {:?} ({:?})",
+            res.error_type,
+            res.error
+        );
+        let msg = res.error.clone().unwrap_or_default();
+        assert!(msg.contains("E_TIMEOUT"), "message must carry E_TIMEOUT: {msg}");
+        assert!(msg.contains("100 ms"), "message must name the budget: {msg}");
+        /* ≲150 ms is the target; keep slack for a loaded runner while still
+         * failing loudly if the poll regresses to whole-second granularity. */
+        assert!(
+            took < Duration::from_millis(400),
+            "regex timeout took {took:?} (must be ~100 ms)"
+        );
+
+        /* Determinism: an interrupted evaluation must not wedge the session. */
+        let ok = session.run(r#"/abc/.test("xabcx")"#, &SandboxConfig::default(), None);
+        assert!(ok.success, "ordinary regex after a timeout: {:?}", ok.error);
+        assert_eq!(ok.result_json.as_deref(), Some("true"));
+
+        let benign = session.run(
+            r#"/(a+)+$/.test("a".repeat(12) + "b")"#,
+            &SandboxConfig::default(),
+            None,
+        );
+        assert!(benign.success, "benign regex: {:?}", benign.error);
+        assert_eq!(benign.result_json.as_deref(), Some("false"));
+    }
+
+    /* C-02 safety net: with no wall-clock budget at all (fuel-only sandbox)
+     * regexp steps are charged to the same meter, so a catastrophic pattern
+     * still terminates through the fuel path instead of hanging. */
+    #[test]
+    fn test_sandbox_regex_fuel_only_still_bounded() {
+        let mut session = SandboxSession::new(SandboxConfig::default()).expect("session");
+        let mut config = SandboxConfig::default();
+        config.timeout = None;
+        config.fuel_limit = Some(100_000);
+
+        let start = Instant::now();
+        let res = session.run(
+            r#"/(a+)+$/.test("a".repeat(26) + "b")"#,
+            &config,
+            None,
+        );
+        assert!(!res.success, "fuel-only sandbox must not succeed");
+        assert!(res.interrupted);
+        assert_eq!(res.error_type.as_deref(), Some("fuel"), "{:?}", res.error);
+        assert!(
+            start.elapsed() < Duration::from_millis(1000),
+            "fuel-only regex took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

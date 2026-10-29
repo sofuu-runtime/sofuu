@@ -79,6 +79,22 @@ print("no" if "qtsq" in (d.get("build", {}).get("missing") or []) else "yes")' 2
         fail "doctor exits non-zero — the build's declared features are not all present"
     fi
 
+    # ── 3b. archive contents (H-06) ───────────────────────────────────────
+    # MIT requires the licence text to travel with the binary. v0.3.0-beta
+    # shipped tarballs containing the bare executable and nothing else, so the
+    # gate now fails any archive that omits LICENSE or NOTICE.
+    for tgz in "$ROOT"/dist/sofuu-*.tar.gz; do
+        [ -f "$tgz" ] || continue
+        listing=$(tar -tzf "$tgz" 2>/dev/null)
+        for want in LICENSE NOTICE; do
+            if printf '%s\n' "$listing" | grep -qE "(^|/)$want\$"; then
+                say "OK  $(basename "$tgz") contains $want"
+            else
+                fail "$(basename "$tgz") is missing $want — rebuild with scripts/pack/stage_legal.sh"
+            fi
+        done
+    done
+
     # ── 4. version parity (Cargo ↔ npm ↔ CLI) ─────────────────────────────
     cargo_v=$(grep -m1 '^version' "$ROOT/Cargo.toml" 2>/dev/null | sed 's/.*"\(.*\)".*/\1/')
     cli_v=$("$BIN" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+[^ ]*' | head -1)

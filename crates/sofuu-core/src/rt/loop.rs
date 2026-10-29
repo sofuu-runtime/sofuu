@@ -214,6 +214,62 @@ pub unsafe extern "C" fn sofuu_loop_run(ctx: *mut JSContext) {
     sofuu_loop_run_bounded(ctx, None)
 }
 
+/// R-14: continuations executed per round before libuv gets a turn.
+///
+/// The old flat 1024 — combined with `on_sleep_timer` draining the WHOLE
+/// queue from inside every 0 ms timer callback — let 5,000
+/// `scheduler.yield()` chains starve a 1 ms `setInterval` down to a few
+/// ticks per 1.5 s (audit: 7/1.5 s). A 256-job round polls timers/I/O four
+/// times as often while still amortising the poll; ordering is unchanged
+/// (jobs run FIFO and every continuation still runs before the loop may
+/// exit — the bound only decides WHEN libuv is polled, never whether a job
+/// runs).
+pub(crate) const MICROTASK_BATCH: usize = 256;
+
+/// R-14 (second half): how much microtask work ONE libuv round may spend
+/// inside native macrotask callbacks (timer / immediate / sleep).
+///
+/// `MICROTASK_BATCH` bounds each individual flush, but a round can fire
+/// thousands of callbacks: 5,000 concurrent `scheduler.yield()` chains made
+/// every 1 ms timer callback flush its own 256-job batch, i.e. 1.28 M
+/// microtask steps before libuv was polled again — measured 20 interval
+/// ticks / 1.5 s. The budget makes the per-round cost O(budget) instead of
+/// O(callbacks x batch), so timers keep firing while every continuation
+/// still runs (ordering per callback is unchanged for the first callbacks of
+/// the round; the remainder drain in the loop immediately after `uv_run`).
+pub(crate) const ROUND_MICROTASK_BUDGET: usize = 4096;
+
+static ROUND_BUDGET_LEFT: ::core::sync::atomic::AtomicUsize =
+    ::core::sync::atomic::AtomicUsize::new(ROUND_MICROTASK_BUDGET);
+
+/// Re-arm the per-round microtask budget. Called once per libuv round.
+#[inline]
+pub(crate) fn begin_round() {
+    ROUND_BUDGET_LEFT.store(ROUND_MICROTASK_BUDGET, ::core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Claim up to `max` jobs of this round's budget. Returns 0 once the round is
+/// spent — the caller then skips its flush entirely and libuv is polled.
+#[inline]
+pub(crate) fn take_round_allowance(max: usize) -> usize {
+    let mut cur = ROUND_BUDGET_LEFT.load(::core::sync::atomic::Ordering::Relaxed);
+    loop {
+        if cur == 0 {
+            return 0;
+        }
+        let take = if cur < max { cur } else { max };
+        match ROUND_BUDGET_LEFT.compare_exchange_weak(
+            cur,
+            cur - take,
+            ::core::sync::atomic::Ordering::Relaxed,
+            ::core::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return take,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 /// [`sofuu_loop_run`] with an optional wall-clock bound.
 ///
 /// The unbounded loop can never give up on its own: it exits only when libuv
@@ -239,11 +295,19 @@ pub(crate) unsafe fn sofuu_loop_run_bounded(
         return;
     }
     loop {
-        /* First: pump immediately-available JS microtasks, bounded at 1024
-         * to prevent infinite microtask chains from starving the event loop. */
-        let drained = sofuu_flush_jobs_bounded(ctx, 1024);
+        /* C-03: a heap-ceiling failure while draining means the job queue can
+         * no longer grow (QuickJS silently drops what it cannot enqueue), so
+         * the substrate must stop instead of pretending the turn completed.
+         * The error itself was already reported once by promise.rs. */
+        if crate::rt::engine::run_status(ctx).fatal {
+            break;
+        }
+        /* First: pump immediately-available JS microtasks, bounded per round
+         * (R-14) so a long promise chain cannot starve libuv's timers. */
+        let drained = sofuu_flush_jobs_bounded(ctx, MICROTASK_BATCH);
         if !drained {
             /* Starvation escape: poll libuv without blocking so timers/I/O run */
+            begin_round();
             uv::uv_run(loop_ptr(), UV_RUN_NOWAIT);
             process_dispatch_pending_signals();
             /* Continue draining pending microtasks without blocking in UV_RUN_ONCE */
@@ -251,6 +315,7 @@ pub(crate) unsafe fn sofuu_loop_run_bounded(
         }
 
         /* All microtasks drained. Run one round of libuv I/O (blocking with timeout) */
+        begin_round();
         let has_pending = uv::uv_run(loop_ptr(), UV_RUN_ONCE);
 
         /* Dispatch any SIGINT/SIGTERM that fired (process.on handlers or
@@ -258,15 +323,16 @@ pub(crate) unsafe fn sofuu_loop_run_bounded(
         process_dispatch_pending_signals();
 
         /* After libuv fires callbacks, flush JS microtasks again (bounded) */
-        let drained_after = sofuu_flush_jobs_bounded(ctx, 1024);
+        let drained_after = sofuu_flush_jobs_bounded(ctx, MICROTASK_BATCH);
         if !drained_after {
+            begin_round();
             uv::uv_run(loop_ptr(), UV_RUN_NOWAIT);
             process_dispatch_pending_signals();
         }
 
         if has_pending == 0 && uv::uv_loop_alive(loop_ptr()) == 0 {
             /* Only exit if the microtask queue is genuinely empty too */
-            if sofuu_flush_jobs_bounded(ctx, 1024) {
+            if sofuu_flush_jobs_bounded(ctx, MICROTASK_BATCH) {
                 break;
             }
         }
@@ -286,8 +352,12 @@ pub(crate) unsafe fn sofuu_loop_run_bounded(
         }
     }
 
-    /* Final flush after the loop fully drains */
-    sofuu_flush_jobs(ctx);
+    /* Final flush after the loop fully drains — skipped when the substrate
+     * failed, because the queue QuickJS could not grow is what we would be
+     * pumping (the overflow was already reported once, exit code 1). */
+    if !crate::rt::engine::run_status(ctx).fatal {
+        sofuu_flush_jobs(ctx);
+    }
 }
 
 /// One non-blocking turn of the engine loop: flush JS microtasks, poll
@@ -308,10 +378,10 @@ pub unsafe extern "C" fn sofuu_loop_tick_nb(ctx: *mut JSContext) {
     if loop_ptr().is_null() {
         return;
     }
-    sofuu_flush_jobs_bounded(ctx, 1024);
+    sofuu_flush_jobs_bounded(ctx, MICROTASK_BATCH);
     uv::uv_run(loop_ptr(), UV_RUN_NOWAIT);
     process_dispatch_pending_signals();
-    sofuu_flush_jobs_bounded(ctx, 1024);
+    sofuu_flush_jobs_bounded(ctx, MICROTASK_BATCH);
 }
 
 /// Walk callback: closes any handle that is still active.

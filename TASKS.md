@@ -1494,7 +1494,7 @@ and is replaced by four: empty-adopted, claims-records-backed-up,
 backup-chain-never-clobbers, garbage-container-backed-up.
 
 Evidence: lib 395/0 · capi 24/0 · JS suite 44/0/1 · c_embed_vec gate ·
-size 3,352,640 · live: societyos project now runs clean (no persist
+size 3,352,640 · live: [CONFIDENTIAL_PROJECT_NAME] project now runs clean (no persist
 warning, no corruption alarm) and `/usr/local/bin/sofuu doctor` says
 `healthy`.
 

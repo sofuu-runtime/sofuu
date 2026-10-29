@@ -159,3 +159,8 @@ sofuu-desktop/src-tauri/icons/StoreLogo.png
 
 # ...but the runtime contract's live status is tracked:
 !contract/PROGRESS.md
+
+# Generated licence copies for the npm package (created by `prepack` from the
+# repository root; see npm/package.json — H-06).
+npm/LICENSE
+npm/NOTICE

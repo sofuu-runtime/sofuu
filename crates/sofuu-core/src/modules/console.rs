@@ -74,6 +74,175 @@ unsafe fn js_val_to_str(ctx: *mut JSContext, val: JSValueConst) -> Option<String
     out
 }
 
+/// Render one argument with the console's existing rules (JSON for objects,
+/// String() for primitives, "<unprintable>" for Symbols).
+///
+/// # Safety
+/// `ctx` valid; `val` a live value of `ctx`.
+unsafe fn arg_render(ctx: *mut JSContext, val: JSValueConst) -> String {
+    // SAFETY: val is a live value.
+    match unsafe { js_val_to_str(ctx, val) } {
+        Some(s) => s,
+        None => "<unprintable>".to_string(),
+    }
+}
+
+/// Numeric conversion for `%d`/`%i`/`%f` that never leaves a pending
+/// exception behind (a Symbol argument throws in JS_ToFloat64; console.log
+/// must swallow that, not poison the context).
+///
+/// # Safety
+/// `ctx` valid; `val` a live value of `ctx`.
+unsafe fn arg_number(ctx: *mut JSContext, val: JSValueConst) -> f64 {
+    let mut d = 0f64;
+    // SAFETY: val is a live value; JS_ToFloat64 writes d on success.
+    if unsafe { qjs::JS_ToFloat64(ctx, &mut d, val) } != 0 {
+        // SAFETY: clears the conversion exception the failed call threw.
+        let exc = unsafe { qjs::sofuu_js_get_exception(ctx) };
+        unsafe { qjs::sofuu_js_free_value(ctx, exc) };
+        return f64::NAN;
+    }
+    d
+}
+
+/// `%j` — compact JSON, like Node's util.format. `undefined` results (a
+/// function, a symbol) print as `undefined`; a value JSON cannot serialise
+/// (a cycle, a BigInt) prints as `[Circular]`, as Node does.
+///
+/// # Safety
+/// `ctx` valid; `val` a live value of `ctx`.
+unsafe fn arg_json(ctx: *mut JSContext, val: JSValueConst) -> String {
+    // SAFETY: every value is freed exactly once below.
+    let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
+    let json = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"JSON".as_ptr()) };
+    let stringify = unsafe { qjs::sofuu_js_get_property_str(ctx, json, c"stringify".as_ptr()) };
+    let result = unsafe {
+        qjs::JS_Call(ctx, stringify, json, 1, &val as *const JSValueConst)
+    };
+    unsafe {
+        qjs::sofuu_js_free_value(ctx, stringify);
+        qjs::sofuu_js_free_value(ctx, json);
+        qjs::sofuu_js_free_value(ctx, global);
+    }
+    if unsafe { qjs::is_exception(result) } {
+        // Clear the JSON.stringify throw (cycle / BigInt) — console.log must
+        // never leave a pending exception behind.
+        let pending = unsafe { qjs::sofuu_js_get_exception(ctx) };
+        unsafe { qjs::sofuu_js_free_value(ctx, pending) };
+        unsafe { qjs::sofuu_js_free_value(ctx, result) };
+        return "[Circular]".to_string();
+    }
+    if unsafe { qjs::is_undefined(result) } {
+        unsafe { qjs::sofuu_js_free_value(ctx, result) };
+        return "undefined".to_string();
+    }
+    let s = unsafe { qjs::sofuu_js_to_cstring(ctx, result) };
+    let out = if s.is_null() {
+        "[Circular]".to_string()
+    } else {
+        // SAFETY: s is NUL-terminated and freed below.
+        let text = unsafe { CStr::from_ptr(s) }.to_string_lossy().into_owned();
+        unsafe { qjs::sofuu_js_free_cstring(ctx, s) };
+        text
+    };
+    unsafe { qjs::sofuu_js_free_value(ctx, result) };
+    out
+}
+
+/// Node-style printf substitution (R-15):
+/// `console.log('%s=%d', 'fmt', 7)` printed `%s=%d fmt 7`; it now prints
+/// `fmt=7`.
+///
+/// Supported directives: `%s` (String), `%d`/`%i` (integer), `%f` (float),
+/// `%j` (JSON), `%o`/`%O` (compact JSON), `%c` (CSS — consumes an argument and
+/// prints nothing, as in Node) and `%%` (literal `%`). A directive with no
+/// argument left is printed verbatim; an unknown directive is left as-is.
+/// Arguments consumed here are advanced in `next`; the caller appends the
+/// rest space-separated, which is what makes Node's `%s %s 'a','b','c'`
+/// print `a b c`.
+///
+/// # Safety
+/// `ctx` valid; `argv` valid for `argc` entries.
+unsafe fn format_substitute(
+    ctx: *mut JSContext,
+    fmt: &str,
+    argc: c_int,
+    argv: *const JSValueConst,
+    next: &mut c_int,
+) -> String {
+    let mut out = String::with_capacity(fmt.len());
+    let mut chars = fmt.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        let Some(&spec) = chars.peek() else {
+            out.push('%');
+            break;
+        };
+        let dir = spec.to_ascii_lowercase();
+        if dir == '%' {
+            chars.next();
+            out.push('%');
+            continue;
+        }
+        // An upper-case O is a distinct directive; it maps to the same
+        // object rendering as %o here.
+        let recognised = matches!(dir, 's' | 'd' | 'i' | 'f' | 'j' | 'o' | 'c');
+        if !recognised {
+            out.push('%');
+            continue;
+        }
+        if *next >= argc {
+            // No argument left: Node leaves the directive untouched.
+            out.push('%');
+            out.push(spec);
+            chars.next();
+            continue;
+        }
+        chars.next();
+        let arg = unsafe { *argv.add(*next as usize) };
+        *next += 1;
+        let rendered = match dir {
+            's' => unsafe { arg_render(ctx, arg) },
+            'd' | 'i' => {
+                let n = unsafe { arg_number(ctx, arg) };
+                if n.is_nan() {
+                    "NaN".to_string()
+                } else if n.is_infinite() {
+                    if n > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() }
+                } else if n.abs() < 9.0e18 {
+                    format!("{}", n.trunc() as i64)
+                } else {
+                    format!("{}", n.trunc())
+                }
+            }
+            'f' => {
+                let n = unsafe { arg_number(ctx, arg) };
+                if n.is_nan() {
+                    "NaN".to_string()
+                } else if n.is_infinite() {
+                    if n > 0.0 { "Infinity".to_string() } else { "-Infinity".to_string() }
+                } else {
+                    format!("{}", n)
+                }
+            }
+            'j' => unsafe { arg_json(ctx, arg) },
+            /* Node's %o/%O use util.inspect; this runtime has no inspect.
+             * Compact single-line JSON is the closest deterministic answer:
+             * it never truncates, never wraps, and round-trips. Documented
+             * deviation (R-15) — `%s` keeps the human-readable path. */
+            'o' => unsafe { arg_json(ctx, arg) },
+            /* %O is accepted via `dir` (lower-cased) too. */
+            'c' => String::new(),
+            _ => unreachable!(),
+        };
+        out.push_str(&rendered);
+    }
+    out
+}
+
 /// Print like console_print() in C: [prefix] arg arg arg [reset]\n to the
 /// given stream. None values become "<unprintable>". When a host log
 /// callback is installed (embedded mode), the plain line is routed there
@@ -91,14 +260,28 @@ unsafe fn console_print(
     ansi_reset: &str,
 ) {
     let mut body = String::new();
-    for i in 0..argc {
-        if i > 0 {
+    // R-15: the first argument is a format string only when it IS a string
+    // and there is another argument to substitute (Node's util.format rule).
+    if argc > 1 && unsafe { qjs::sofuu_js_is_string(*argv) } != 0 {
+        // SAFETY: argv holds argc values; every read is index-checked.
+        let fmt_s = unsafe { arg_render(ctx, *argv) };
+        let mut next: c_int = 1;
+        body.push_str(&unsafe { format_substitute(ctx, &fmt_s, argc, argv, &mut next) });
+        while next < argc {
             body.push(' ');
+            body.push_str(&unsafe { arg_render(ctx, *argv.add(next as usize)) });
+            next += 1;
         }
-        // SAFETY: argv valid for argc.
-        match js_val_to_str(ctx, *argv.add(i as usize)) {
-            Some(s) => body.push_str(&s),
-            None => body.push_str("<unprintable>"),
+    } else {
+        for i in 0..argc {
+            if i > 0 {
+                body.push(' ');
+            }
+            // SAFETY: argv valid for argc.
+            match unsafe { js_val_to_str(ctx, *argv.add(i as usize)) } {
+                Some(s) => body.push_str(&s),
+                None => body.push_str("<unprintable>"),
+            }
         }
     }
     if embed_config::log(level, &body) {

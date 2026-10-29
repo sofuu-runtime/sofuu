@@ -40,6 +40,19 @@
 
 #define LRE_FLAG_NAMED_GROUPS (1 << 7) /* named groups are present in the regexp */
 
+/* lre_exec() return codes. */
+#define LRE_ECODE_NOMATCH      0
+#define LRE_ECODE_MATCH        1
+#define LRE_ECODE_ERROR        (-1) /* out of memory */
+#define LRE_ECODE_INTERRUPTED  (-2) /* lre_poll_interrupts() aborted the match */
+
+/* Number of backtracking steps between two lre_poll_interrupts() calls.
+ * Must be kept in sync with the charge applied to the interrupt counter in
+ * quickjs.c (lre_poll_interrupts). 4096 keeps the deadline overshoot well
+ * under a millisecond on current hardware while costing one predictable
+ * branch + counter increment per match step. */
+#define LRE_INTERRUPT_POLL_STEPS 4096
+
 uint8_t *lre_compile(int *plen, char *error_msg, int error_msg_size,
                      const char *buf, size_t buf_len, int re_flags,
                      void *opaque);
@@ -56,6 +69,13 @@ LRE_BOOL lre_is_space(int c);
 /* must be provided by the user */
 LRE_BOOL lre_check_stack_overflow(void *opaque, size_t alloca_size); 
 void *lre_realloc(void *opaque, void *ptr, size_t size);
+/* Polled every LRE_INTERRUPT_POLL_STEPS backtracking steps. Must return 0 to
+ * continue matching or non-zero to abort the match (lre_exec() then returns
+ * LRE_ECODE_INTERRUPTED with the caller's cancellation state already set).
+ * Implementations must be cheap when no cancellation is armed: quickjs.c
+ * only touches the runtime interrupt counter and calls the user interrupt
+ * handler once per JS_INTERRUPT_COUNTER_INIT steps. */
+int lre_poll_interrupts(void *opaque);
 
 /* JS identifier test */
 extern uint32_t const lre_id_start_table_ascii[4];

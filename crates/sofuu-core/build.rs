@@ -46,7 +46,12 @@ fn build_stamp(repo: &Path) -> String {
     let Some(sha) = git(repo, &["rev-parse", "--short", "HEAD"]).filter(|s| !s.is_empty()) else {
         return "unknown".to_string();
     };
-    let dirty = git(repo, &["status", "--porcelain"])
+    /* A modified TRACKED file means the binary does not match the commit.
+     * Untracked files do not: this repository always carries local planning
+     * documents (AUDIT_PLAN.md, REMEDIATION_PLAN.md, …) that are deliberately
+     * not committed, and a release built beside them is still exactly the
+     * commit it claims to be. */
+    let dirty = git(repo, &["status", "--porcelain", "--untracked-files=no"])
         .map(|s| !s.is_empty())
         .unwrap_or(false);
     if dirty {

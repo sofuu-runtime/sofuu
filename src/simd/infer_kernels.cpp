@@ -9,7 +9,9 @@
 #include <cstring>
 #include <thread>
 #include <vector>
+#if !defined(_WIN32)
 #include <unistd.h>
+#endif
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
@@ -99,7 +101,17 @@ public:
         // Kept alongside the file's other getenv knobs.
         if (const char *th_env = getenv("SOFUU_NUM_THREADS")) {
             int n = atoi(th_env);
+            /* PC-WIN: <unistd.h> sysconf(_SC_NPROCESSORS_ONLN) does not exist
+             * on Windows, which broke the whole Windows cross build. The
+             * portable C++ answer is std::thread::hardware_concurrency()
+             * (already included above); keep sysconf on POSIX so the Pi and
+             * the musl builds keep the value they had. */
+#if defined(_WIN32)
+            int online = (int)std::thread::hardware_concurrency();
+#else
             int online = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+            if (online <= 0) online = 1;
             if (n > 0 && n <= online) default_threads = n;
         }
         set_thread_count(default_threads);

@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────────────────
+# .cargo/config.toml — build hygiene for artifacts built from this tree
+# ─────────────────────────────────────────────────────────────────────────
+#
+# PC-07 (AUDIT-2026-10-29): a published binary embedded the producing
+# machine's absolute paths (87 of them: `~/.cargo/registry/...`,
+# `~/.rustup/...`, `<checkout>/crates/...`) and carried no source revision.
+# rustc records the path it is *handed* into panic locations and `file!()`,
+# and cargo hands it absolute paths, so the fix is a compile-time prefix remap.
+#
+# The per-user prefixes — `$HOME` and the workspace root — cannot be written
+# here: cargo does not expand environment variables in rustflags, and
+# committing `/Users/<name>` is the very leak being fixed. They are computed
+# at invocation time by `scripts/cross/remap_flags.sh`, which the Makefile
+# (`make`, `make libsofuu`, `make dist`) and every cross script pass through
+# RUSTFLAGS. Note that a RUSTFLAGS environment variable *replaces* the list
+# below instead of adding to it, which is why the script also emits the
+# generic prefixes it finds here.
+#
+# What remains here is the machine-independent half: shared temp roots. They
+# carry no username, but their random path components are machine-specific
+# (macOS TMPDIR is /var/folders/<xx>/<rand>/T), and build scripts stage files
+# there. Keep this list in sync with scripts/cross/remap_flags.sh.
+#
+# /rustc is left alone: that is rustc's own virtual prefix for the standard
+# library, not a build-host path.
+[build]
+rustflags = [
+  "--remap-path-prefix=/private/var/folders=/tmp",
+  "--remap-path-prefix=/var/folders=/tmp",
+  "--remap-path-prefix=/private/tmp=/tmp",
+  "--remap-path-prefix=/var/tmp=/tmp",
+]

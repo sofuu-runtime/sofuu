@@ -332,6 +332,48 @@ unsafe fn install_sigaction(signum: c_int, handler: extern "C" fn(c_int)) {
 #[cfg(target_os = "windows")]
 unsafe fn install_sigaction(_signum: c_int, _handler: extern "C" fn(c_int)) {}
 
+/// CLI hard stop (RUST-side, binary only): make SIGINT end the process with
+/// the conventional 130 even when the JS thread is blocked inside a tool.
+///
+/// SIGTERM already works because nothing installs a handler for it (default
+/// disposition → killed → rc 143). SIGINT used to relay on the same, but once
+/// the loop-owned dispatch path is the only exit, a run blocked in a tool
+/// (bash/exec/fetch) never reaches process_dispatch_pending_signals() and the
+/// flag just sat there — the process hung until SIGKILL.
+///
+/// The handler stores a flag (async-signal-safe) exactly like process.on
+/// ('SIGINT') does, so the loop's dispatch still runs the JS handler or the
+/// graceful exit(130) when it CAN run; a watchdog thread force-exits 130 when
+/// the flag has stayed set, i.e. when the loop is blocked and can never
+/// dispatch it. SIGTERM is deliberately left untouched (rc 143).
+#[cfg(not(target_os = "windows"))]
+pub fn cli_install_sigint_stop() {
+    unsafe { install_sigaction(libc::SIGINT, posix_sigint_handler) };
+    std::thread::spawn(|| {
+        // 4 x 50 ms of grace: the loop path exits far sooner, so this only
+        // fires for a run that cannot dispatch (a tool holding the thread).
+        const TICK_MS: u64 = 50;
+        let mut since: Option<std::time::Instant> = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
+            if GOT_SIGINT.load(Ordering::SeqCst) != 0 {
+                let t0 = *since.get_or_insert_with(std::time::Instant::now);
+                if t0.elapsed() >= std::time::Duration::from_millis(TICK_MS * 4) {
+                    // _exit, not exit: atexit handlers would run concurrently
+                    // with the blocked JS thread. The kernel closes every fd
+                    // (listeners included), so nothing is left half-open.
+                    unsafe { libc::_exit(130) };
+                }
+            } else {
+                since = None;
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "windows")]
+pub fn cli_install_sigint_stop() {}
+
 /// Dispatch any SIGINT/SIGTERM that fired since the last check. C symbol
 /// replacement (sofuu_loop_run calls it after every UV_RUN_ONCE).
 #[no_mangle]

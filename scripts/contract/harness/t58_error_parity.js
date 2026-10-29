@@ -71,7 +71,7 @@ async function main() {
     for (let i = 0; i < 40 && !up; i++) {
         await new Promise((r) => setTimeout(r, 200));
         try {
-            const probe = await curl([base + "/health"]);
+            const probe = await curl([base + "/healthz"]);
             up = probe.code === 0 && probe.out.indexOf('"status":"ok"') >= 0;
         } catch (e) { up = false; }
     }

@@ -441,6 +441,10 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         // P3 (SPEC §5/§6): the session document — one export/import format
         // behind `sofuu.session` (T4.5) and the CLI's export/import arms.
         crate::rt::session_doc::mod_session_doc_register(ctx);
+        // sofuu.host.armDeadline(ms)/disarmDeadline(): a JS-callable interrupt
+        // deadline on THIS context, so a runaway synchronous plugin (run, chat,
+        // serve, eval) is abortable — the sandbox meter never covered it.
+        crate::rt::deadline::mod_deadline_register(ctx);
     }
     /* M2 (PLAN-MEMORY-TOKENS): a global GC bridge so JS drivers can bound
      * garbage after heavy fan-outs (agent.js runMany/mapContext) — the
@@ -1248,7 +1252,16 @@ pub(crate) unsafe fn report_uncaught(ctx: *mut qjs::JSContext, reason: qjs::JSVa
         unsafe { qjs::sofuu_js_free_cstring(ctx, msg) };
         s
     };
-    eprintln!("{}", paint("31", &format!("[sofuu] UncaughtException: {}", msg_s)));
+    /* An interrupt is UNCATCHABLE (the vendored QuickJS marks it so), which
+     * makes it the one error a plugin cannot handle itself — so the host is
+     * the only place it can be explained. classify_interrupted rewrites it
+     * into the deadline it was, and only when our handler actually fired:
+     * an unrelated InternalError that happens to contain "interrupted" is
+     * left alone. */
+    match crate::rt::deadline::classify_interrupted(&msg_s) {
+        Some(deadline_msg) => eprintln!("{}", paint("31", &format!("[sofuu] {}", deadline_msg))),
+        None => eprintln!("{}", paint("31", &format!("[sofuu] UncaughtException: {}", msg_s))),
+    }
     let stack = unsafe { qjs::sofuu_js_get_property_str(ctx, reason, c"stack".as_ptr()) };
     if !unsafe { qjs::is_undefined(stack) } && !unsafe { qjs::is_null(stack) } {
         let ss = unsafe { qjs::sofuu_js_to_cstring(ctx, stack) };

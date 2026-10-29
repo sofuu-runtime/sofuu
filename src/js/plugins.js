@@ -824,6 +824,114 @@
     };
   }
 
+  /* Shield 4 timers. One setTimeout per call costs one slot in the engine's
+   * 1024-slot timer table, so 512 calls in flight wedged the table and every
+   * later call failed with "too many timers (max 1024)". A single shared
+   * ticker now serves every in-flight call with one slot, whatever the
+   * concurrency. */
+  var WD_TICK_MS = 15;
+  var wdPending = [];
+  var wdTimer = null;
+
+  function wdPump() {
+    wdTimer = null;
+    if (wdPending.length === 0) return;
+    var now = Date.now();
+    var keep = [];
+    for (var i = 0; i < wdPending.length; i++) {
+      var e = wdPending[i];
+      if (now >= e.deadline) { try { e.fire(); } catch (eF) {} }
+      else keep.push(e);
+    }
+    wdPending = keep;
+    if (wdPending.length > 0) wdArmTicker();
+  }
+
+  function wdArmTicker() {
+    if (wdTimer !== null) return;
+    wdTimer = setTimeout(wdPump, WD_TICK_MS);
+    if (wdTimer && typeof wdTimer.unref === 'function') wdTimer.unref();
+  }
+
+  function wdAdd(entry) { wdPending.push(entry); wdArmTicker(); return entry; }
+
+  function wdDrop(entry) {
+    var i = wdPending.indexOf(entry);
+    if (i >= 0) wdPending.splice(i, 1);
+  }
+
+  /* Shield 4's hard stop. The engine can interrupt the interpreter, but only
+   * while a deadline is armed: without this, timeoutMs was enforced only if
+   * the plugin happened to await, so a synchronous loop ran forever and a
+   * synchronous 5s burn returned ok under a 300ms deadline.
+   *
+   * Exactly ONE arm is in force at a time and it is always the EARLIEST
+   * deadline among the calls in flight: the host API only knows 'arm(ms)' and
+   * 'disarm()', so leaving one arm per call would make a finished short call
+   * disarm a longer one's deadline. Every start/settle recomputes the set and
+   * re-arms the earliest. */
+  var wdArms = [];
+  var wdArmed = false;
+
+  function hostHasDeadline() {
+    return !!(sofuu.host && typeof sofuu.host.armDeadline === 'function' &&
+              typeof sofuu.host.disarmDeadline === 'function');
+  }
+
+  /* An aborted turn can leave an entry behind (nothing runs in JS after an
+   * uncatchable interrupt), so drop entries whose deadline passed long ago:
+   * a stale arm would otherwise fire against unrelated work. */
+  function hostPruneArms() {
+    var t = Date.now();
+    for (var i = wdArms.length - 1; i >= 0; i--) {
+      if (wdArms[i].at + 5000 < t) wdArms.splice(i, 1);
+    }
+  }
+
+  function hostRefreshArms() {
+    if (!hostHasDeadline()) return;
+    hostPruneArms();
+    var earliest = null;
+    for (var i = 0; i < wdArms.length; i++) {
+      if (earliest === null || wdArms[i].at < earliest) earliest = wdArms[i].at;
+    }
+    try {
+      if (wdArmed) { sofuu.host.disarmDeadline(); wdArmed = false; }
+      if (earliest !== null) {
+        sofuu.host.armDeadline(Math.max(1, earliest - Date.now()));
+        wdArmed = true;
+      }
+    } catch (eR) { wdArmed = false; }
+  }
+
+  function hostArmFor(entry, ms) {
+    if (!hostHasDeadline()) return;
+    wdArms.push({ entry: entry, at: Date.now() + ms });
+    hostRefreshArms();
+  }
+
+  function hostDisarmFor(entry) {
+    for (var i = 0; i < wdArms.length; i++) {
+      if (wdArms[i].entry === entry) { wdArms.splice(i, 1); break; }
+    }
+    hostRefreshArms();
+  }
+
+  function isInterrupt(err) {
+    return /interrupt/i.test(String((err && err.message) || err || ''));
+  }
+
+  /* Grace window after a timeout: keep an arm alive briefly so a plugin that
+   * ignores the abort signal and spins after its await is still cut off. */
+  function wdArmGrace(entry, ms) {
+    var grace = ms < 1000 ? 1000 : (ms > 5000 ? 5000 : ms);
+    for (var i = 0; i < wdArms.length; i++) {
+      if (wdArms[i].entry === entry) { wdArms[i].at = Date.now() + grace; break; }
+    }
+    hostRefreshArms();
+    wdAdd({ deadline: Date.now() + grace, fire: function () { hostDisarmFor(entry); } });
+  }
+
   /* fn(signal) may throw synchronously: that lands in the same catch as a
    * rejection, so execute()/completeVia() can never reject. */
   async function runWithWatchdog(label, timeoutMs, outerSignal, fn) {
@@ -831,7 +939,7 @@
     var ms = (typeof timeoutMs === 'number' && timeoutMs > 0) ? timeoutMs : DEFAULT_TOOL_TIMEOUT_MS;
     var ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
     var signal = ctrl ? ctrl.signal : null;
-    var timer = null;
+    var entry = null;
     var timedOut = false;
     var aborted = false;
 
@@ -849,35 +957,55 @@
     });
 
     var timeoutPromise = new Promise(function (_res, rej) {
-      timer = setTimeout(function () {
-        timedOut = true;
-        if (ctrl) { try { ctrl.abort(); } catch (eT) {} }
-        rej(makeError('E_TIMEOUT', label + ' exceeded deadline of ' + ms + 'ms'));
-      }, ms);
-      if (timer && typeof timer.unref === 'function') timer.unref();
+      entry = wdAdd({
+        deadline: Date.now() + ms,
+        fire: function () {
+          timedOut = true;
+          if (ctrl) { try { ctrl.abort(); } catch (eT) {} }
+          rej(makeError('E_TIMEOUT', label + ' exceeded deadline of ' + ms + 'ms'));
+        }
+      });
     });
     handled(timeoutPromise);
 
+    hostArmFor(entry, ms);
     var execPromise;
     try {
       execPromise = Promise.resolve(fn(signal));
     } catch (eSync) {
-      execPromise = Promise.reject(eSync);
+      /* The interpreter was interrupted at the deadline while the plugin
+       * was running synchronously: that IS the timeout, not a tool fault. */
+      if (isInterrupt(eSync)) {
+        timedOut = true;
+        execPromise = Promise.reject(makeError('E_TIMEOUT', label + ' exceeded deadline of ' + ms + 'ms (interrupted)'));
+      } else {
+        execPromise = Promise.reject(eSync);
+      }
     }
     handled(execPromise);
 
     try {
       var value = await Promise.race([execPromise, timeoutPromise, cancelPromise]);
-      clearTimeout(timer);
+      wdDrop(entry);
+      hostDisarmFor(entry);
       unlink();
       return { ok: true, value: value, durationMs: Date.now() - startTs };
     } catch (err) {
-      clearTimeout(timer);
+      wdDrop(entry);
       unlink();
       if (ctrl) { try { ctrl.abort(); } catch (eB) {} }
       var code = (err && err.code) || 'E_TOOL';
-      if (timedOut || aborted) code = 'E_TIMEOUT';
-      return { ok: false, code: code, message: String((err && err.message) || err), durationMs: Date.now() - startTs };
+      var message = String((err && err.message) || err);
+      if (timedOut || aborted || isInterrupt(err)) {
+        if (!timedOut && !aborted) message = label + ' exceeded deadline of ' + ms + 'ms (interrupted)';
+        code = 'E_TIMEOUT';
+        /* Hold the interrupt open briefly so work that ignored the abort
+         * signal cannot spin past the deadline. */
+        wdArmGrace(entry, ms);
+      } else {
+        hostDisarmFor(entry);
+      }
+      return { ok: false, code: code, message: message, durationMs: Date.now() - startTs };
     }
   }
 

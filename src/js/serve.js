@@ -758,8 +758,25 @@
         var path = String(req.url || '/').split('?')[0];
         var method = String(req.method || 'GET').toUpperCase();
 
-        /* Liveness is unauthenticated and carries no data (H2). */
+        /* Liveness. /healthz and /livez are the probe endpoints: public and
+         * data-free (no version, no uptime, no counts).
+         * /health used to be public too, so an authenticated server answered
+         * one route without the token and two shipped tests disagreed about
+         * the contract (serve_test H2 vs brain_auth_e2e). The boundary is now
+         * uniform: with a token configured, /health needs it. */
+        if (method === 'GET' && (path === '/healthz' || path === '/livez')) {
+          send(res, 200, { ok: true, status: 'ok' });
+          return;
+        }
+
         if (method === 'GET' && path === '/health') {
+          if (authMode() !== 'none') {
+            var hAuth = (req.headers && (req.headers.authorization || req.headers.Authorization)) || '';
+            if (!ctEq(hAuth, 'Bearer ' + cfg.token)) {
+              fail(res, 401, 'missing or invalid bearer token', 'authentication_error', 'invalid_api_key');
+              return;
+            }
+          }
           send(res, 200, {
             ok: true,
             status: 'ok',

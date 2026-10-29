@@ -2307,6 +2307,11 @@ fn main() -> ExitCode {
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
+    /* SIGINT must stop run/chat/agent run/serve the way SIGTERM does — exit
+     * 130, no hang — including when a tool holds the JS thread and the uv
+     * loop therefore never reaches the signal dispatch. SIGTERM keeps its
+     * default disposition (rc 143). */
+    sofuu_core::modules::process::cli_install_sigint_stop();
     let args: Vec<String> = env::args().collect();
 
     // M3: give the JS side process.argv (the ported mod_process_set_args;

@@ -2522,6 +2522,61 @@ unsafe fn stream_req_destroy(ctx: *mut JSContext, req: *mut AiStreamReq) {
     drop(Box::from_raw(req));
 }
 
+/// The message for a received 4xx/5xx on a streaming request:
+/// "HTTP <status>[ — <provider error.message | truncated body>][ hint]".
+///
+/// Shared by the two ways a stream failure is observed: a clean transfer that
+/// carried a 4xx/5xx status, and a transfer libcurl reports as an error even
+/// though the response arrived (some builds surface a connect-ish code there —
+/// "Couldn't connect to server" for a 429 that was in fact served). The status
+/// the peer sent is the truth in both cases.
+unsafe fn stream_status_error(ctx: *mut JSContext, req: *mut AiStreamReq, http_code: c_long) -> String {
+    let raw = unsafe { (*req).error_body.clone() };
+    let body_str = String::from_utf8_lossy(&raw);
+    let mut detail = String::new();
+    /* Try JSON {error:{message,code}} or {message}; fall back to the body. */
+    if !raw.is_empty() {
+        let c = CString::new(raw.clone()).unwrap_or_default();
+        let v = unsafe { qjs::JS_ParseJSON(ctx, c.as_ptr(), c.as_bytes().len(), c"<err>".as_ptr()) };
+        let mut out: Option<String> = None;
+        if unsafe { qjs::is_exception(v) } {
+            unsafe { qjs::sofuu_js_get_exception(ctx) };
+        } else {
+            let err = unsafe { qjs::sofuu_js_get_property_str(ctx, v, c"error".as_ptr()) };
+            if unsafe { qjs::is_object(err) } {
+                let m = unsafe { qjs::sofuu_js_get_property_str(ctx, err, c"message".as_ptr()) };
+                if let Some(s) = unsafe { cstr_opt(ctx, m) } {
+                    if !s.is_empty() { out = Some(s); }
+                }
+                unsafe { qjs::sofuu_js_free_value(ctx, m) };
+            }
+            if out.is_none() {
+                let m = unsafe { qjs::sofuu_js_get_property_str(ctx, v, c"message".as_ptr()) };
+                if let Some(s) = unsafe { cstr_opt(ctx, m) } {
+                    if !s.is_empty() { out = Some(s); }
+                }
+                unsafe { qjs::sofuu_js_free_value(ctx, m) };
+            }
+            unsafe { qjs::sofuu_js_free_value(ctx, err) };
+        }
+        unsafe { qjs::sofuu_js_free_value(ctx, v) };
+        if let Some(m) = out {
+            detail = m;
+        } else {
+            let t = body_str.trim();
+            if !t.is_empty() { detail = t.chars().take(400).collect(); }
+        }
+    }
+    let mut ebuf = format!("HTTP {}", http_code);
+    if !detail.is_empty() { ebuf.push_str(" — "); ebuf.push_str(&detail); }
+    if http_code == 429 {
+        ebuf.push_str(" (rate limited — retry after a moment or check your quota)");
+    } else if http_code == 502 || detail.contains("Too many open files") || detail.contains("gateway error") {
+        ebuf.push_str(" (provider gateway overloaded — retry in a moment or try a different model; not a prompt bug)");
+    }
+    ebuf
+}
+
 /// Fill the provider-neutral usage stats object handed to stream.done()
 /// (P6: cacheRead/cacheWrite included; 0 when the provider doesn't report).
 unsafe fn set_stream_stats(ctx: *mut JSContext, stats: JSValue, prompt: i32, completion: i32,
@@ -3190,7 +3245,22 @@ unsafe fn ai_check_multi() {
                     } else {
                         None
                     };
-                    let e = match (*req).stream_err.as_deref().map(|s| s.to_string()).or(timeout_msg) {
+                    /* A RECEIVED 4xx/5xx wins over curl's transport wording:
+                     * some libcurl builds report a connect-ish code
+                     * (CURLE_COULDNT_CONNECT, "Couldn't connect to server")
+                     * for a transfer whose 429 response did arrive. The status
+                     * the peer actually sent is the truth — report
+                     * "HTTP <status>" plus the (truncated) response body.
+                     * Only a genuine transport failure (no status received)
+                     * keeps the curl string. */
+                    let mut status: c_long = 0;
+                    curl::curl_easy_getinfo(easy, curl::CURLINFO_RESPONSE_CODE, &mut status as *mut c_long);
+                    let status_msg = if status >= 400 {
+                        Some(stream_status_error(ctx, req, status))
+                    } else {
+                        None
+                    };
+                    let e = match (*req).stream_err.as_deref().map(|s| s.to_string()).or(status_msg).or(timeout_msg) {
                         Some(m) => {
                             let cm = CString::new(m).unwrap_or_default();
                             qjs::sofuu_js_new_string(ctx, cm.as_ptr())
@@ -3212,42 +3282,7 @@ unsafe fn ai_check_multi() {
                      * frames regardless of status) — done wins over the
                      * status error. */
                     if (*req).done_called == 0 && qjs::JS_IsFunction(ctx, (*req).error_fn) != 0 {
-                        let raw = (*req).error_body.clone();
-                        let mut detail = String::new();
-                        // Try JSON {error:{message,code}} or {message}
-                        if !raw.is_empty() {
-                            let body_str = String::from_utf8_lossy(&raw);
-                            // Try to parse as JSON via QuickJS for richer error.message extraction (when JS context is alive).
-                            // Fallback: truncated raw body.
-                            let parsed_msg = {
-                                let c = CString::new(raw.clone()).unwrap_or_default();
-                                let v = qjs::JS_ParseJSON(ctx, c.as_ptr(), c.as_bytes().len(), c"<err>".as_ptr());
-                                let mut out: Option<String> = None;
-                                if !qjs::is_exception(v) {
-                                    let err = qjs::sofuu_js_get_property_str(ctx, v, c"error".as_ptr());
-                                    if qjs::is_object(err) {
-                                        let m = qjs::sofuu_js_get_property_str(ctx, err, c"message".as_ptr());
-                                        if let Some(s) = cstr_opt(ctx, m) { if !s.is_empty() { out = Some(s); } }
-                                        qjs::sofuu_js_free_value(ctx, m);
-                                    }
-                                    if out.is_none() {
-                                        let m = qjs::sofuu_js_get_property_str(ctx, v, c"message".as_ptr());
-                                        if let Some(s) = cstr_opt(ctx, m) { if !s.is_empty() { out = Some(s); } }
-                                        qjs::sofuu_js_free_value(ctx, m);
-                                    }
-                                    qjs::sofuu_js_free_value(ctx, err);
-                                } else { qjs::sofuu_js_get_exception(ctx); }
-                                qjs::sofuu_js_free_value(ctx, v);
-                                out.or_else(|| { let t = body_str.trim(); if t.is_empty() { None } else { Some(t.chars().take(400).collect()) } })
-                            };
-                            if let Some(m) = parsed_msg { detail = m; }
-                        }
-                        let mut ebuf = format!("HTTP {}", http_code);
-                        if !detail.is_empty() { ebuf.push_str(" — "); ebuf.push_str(&detail); }
-                        if http_code == 429 { ebuf.push_str(" (rate limited — retry after a moment or check your quota)"); }
-                        else if http_code == 502 || detail.contains("Too many open files") || detail.contains("gateway error") {
-                            ebuf.push_str(" (provider gateway overloaded — retry in a moment or try a different model; not a prompt bug)");
-                        }
+                        let ebuf = stream_status_error(ctx, req, http_code);
                         let ec = CString::new(ebuf).unwrap_or_default();
                         let e = qjs::sofuu_js_new_string(ctx, ec.as_ptr());
                         let r = qjs::JS_Call(ctx, (*req).error_fn, qjs::sofuu_js_undefined(), 1, &e);

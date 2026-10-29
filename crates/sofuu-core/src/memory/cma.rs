@@ -858,6 +858,10 @@ impl Cma {
     /// existing record (max strength, earliest created_at wins, original
     /// text/role/source kept); everything else inserts with the card's tier,
     /// role, entity and provenance. Tombstones are never imported.
+    ///
+    /// `records_json` is a JSON OBJECT `{"records":[…]}` — one record per
+    /// vector, in vector order (W6.3; a bare array does not match here and
+    /// yields the all-zero stats, which is why the JS cfunc now rejects it).
     pub fn import_records(
         &mut self,
         vecs: &[f32],

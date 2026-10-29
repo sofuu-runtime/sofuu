@@ -4144,9 +4144,11 @@ mod tests {
         );
 
         // 2. The FUNNEL (the headless C-ABI surface) sees both records
-        //    with the same read-out shape. (list returns its JSON as a
-        //    string — the same string the server writes and chat parses —
-        //    so the helper re-parses it; that IS the cross-surface shape.)
+        //    with the same read-out shape. W6.4: the flat `memory.list`
+        //    answers an ARRAY of real record objects (the JSON envelope
+        //    {total,offset,limit,records} stays the instance/server shape,
+        //    which is what the server writes and chat parses), so across
+        //    the JSON C-ABI boundary the read-out arrives as a JSON array.
         let open_args = format!(
             r#"{{"path":{},"dim":768,"embed_id":"hash-v1"}}"#,
             serde_json::to_string(&path.to_string_lossy()).unwrap()
@@ -4163,10 +4165,9 @@ mod tests {
         };
         let all = list("");
         let all_arr = all
-            .get("records")
-            .and_then(|r| r.as_array())
-            .unwrap_or_else(|| panic!("memory.list must return {{records}}, got {all}"));
-        assert_eq!(all.get("total").and_then(|t| t.as_i64()), Some(2));
+            .as_array()
+            .unwrap_or_else(|| panic!("memory.list must return an array of records, got {all}"));
+        assert_eq!(all_arr.len(), 2, "the read-out sees both records: {all}");
         let texts: Vec<&str> = all_arr
             .iter()
             .filter_map(|r| r.get("text").and_then(|t| t.as_str()))
@@ -4180,8 +4181,7 @@ mod tests {
         // 3. Tier filters are the same numbers on both surfaces.
         let tier_of = |filter: &str| -> Vec<u8> {
             let v = list(&format!(",{f}", f = filter));
-            v.get("records")
-                .and_then(|r| r.as_array())
+            v.as_array()
                 .unwrap_or_else(|| panic!("list({filter}) must return records, got {v}"))
                 .iter()
                 .map(|r| r.get("tier").and_then(|t| t.as_u64()).unwrap_or(255) as u8)

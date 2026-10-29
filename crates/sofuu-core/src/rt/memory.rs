@@ -2943,6 +2943,14 @@ mod impl_qtsq {
     /// B2.2: `cma.importRecords(vecsFloat32, recordsJson)` → JSON
     /// `{added, merged, skipped}`. `vecs` must already be in THIS store's
     /// space (the caller re-embeds when a card came from another space).
+    ///
+    /// W6.3 — the serialization contract, stated once: `recordsJson` is a JSON
+    /// OBJECT of the form `{"records":[...]}`, one record object per vector,
+    /// which is what `Cma::import_records` reads (`root["records"]`). A bare
+    /// JSON array matches nothing there and used to answer
+    /// `{added:0,merged:0,skipped:0}` — a silent no-op the flat JS bridge hit
+    /// on every call. The shape is now asserted before the import, so a
+    /// mismatch is a TypeError instead of an empty success.
     unsafe extern "C" fn js_cma_import(
         ctx: *mut JSContext,
         this_val: JSValueConst,
@@ -2970,6 +2978,17 @@ mod impl_qtsq {
         let Some(json_s) = json_s else {
             return qjs::JS_ThrowTypeError(ctx, c"Argument 2 must be a JSON string".as_ptr());
         };
+        /* W6.3: refuse the wrong envelope loudly (see the contract above). */
+        if !serde_json::from_str::<serde_json::Value>(&json_s)
+            .ok()
+            .and_then(|v| v.get("records").map(|r| r.is_array()))
+            .unwrap_or(false)
+        {
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"Argument 2 must be JSON of the form {\"records\":[...]}".as_ptr(),
+            );
+        }
         let dim = cma.vec_dim;
         let n = vec_slice.len() / dim.max(1);
         let stats = cma.cma.import_records(

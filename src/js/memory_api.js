@@ -111,6 +111,16 @@
       !(typeof Uint8Array !== 'undefined' && a instanceof Uint8Array);
   }
 
+  /* Typed refusal: a thrown Error carrying `.code`, the shape the rest of the
+   * runtime's bridges use (plugins.js / providers.js `makeError`). Used where
+   * the alternative would be a silent no-op — the native layer keeps its own
+   * defensive clamp, but a clamp that answers `true` is a lie. */
+  function refuse(ctor, code, message) {
+    var err = new ctor(message);
+    err.code = code;
+    return err;
+  }
+
   /* Dual-form dispatch: options object -> mapper(a); otherwise forward the
    * raw arguments to the current brain (instance-argument form). */
   function invoke(name, mapper) {
@@ -139,18 +149,39 @@
     var source = a.source !== undefined ? String(a.source) : undefined;
     return [String(text), role, source];
   });
-  /* B1.5: the read-out surface, same shape as the in-process API. */
-  M.list = invoke('list', function (a) {
+  /* B1.5 / W6.4: the read-out surface, same shape as the in-process API.
+   *
+   * Contract: `m.list({tier?, role?, entity?, text?, min_strength?, offset?,
+   * limit?})` returns an ARRAY of real record objects. The JSON envelope
+   * `{total, offset, limit, records}` is the native instance/C-ABI contract
+   * (`js_cma_list` still answers it in rt/memory.rs for the chat driver), and
+   * this bridge is where it becomes JS values. `offset`/`limit` are applied
+   * natively, in store insertion order, so a page is stable while the store is
+   * unchanged; `total` (the count BEFORE pagination), `offset` and `limit`
+   * ride along as non-enumerable properties so a pager can render "N of M"
+   * without a second call, while `JSON.stringify(rows)` stays the records. */
+  M.list = function (a) {
+    var inst = pick(isOpts(a) ? a : {});
     var opts = {};
-    if (a.tier !== undefined) opts.tier = a.tier | 0;
-    if (a.role !== undefined) opts.role = String(a.role);
-    if (a.entity !== undefined) opts.entity = String(a.entity);
-    if (a.text !== undefined) opts.text = String(a.text);
-    if (a.min_strength !== undefined) opts.minStrength = +a.min_strength;
-    if (a.offset !== undefined) opts.offset = a.offset | 0;
-    if (a.limit !== undefined) opts.limit = a.limit | 0;
-    return [opts];
-  });
+    if (isOpts(a)) {
+      if (a.tier !== undefined) opts.tier = a.tier | 0;
+      if (a.role !== undefined) opts.role = String(a.role);
+      if (a.entity !== undefined) opts.entity = String(a.entity);
+      if (a.text !== undefined) opts.text = String(a.text);
+      if (a.min_strength !== undefined) opts.minStrength = +a.min_strength;
+      if (a.offset !== undefined) opts.offset = a.offset | 0;
+      if (a.limit !== undefined) opts.limit = a.limit | 0;
+    }
+    var out = isOpts(a) ? inst.list(opts) : inst.list(a);
+    var env = typeof out === 'string' ? JSON.parse(out) : out;
+    var recs = (env && env.records) || [];
+    try {
+      Object.defineProperty(recs, 'total', { value: (env && env.total) | 0, enumerable: false });
+      Object.defineProperty(recs, 'offset', { value: (env && env.offset) | 0, enumerable: false });
+      Object.defineProperty(recs, 'limit', { value: (env && env.limit) | 0, enumerable: false });
+    } catch (eMeta) { /* frozen array — the records still work */ }
+    return recs;
+  };
   M.export = invoke('export', function () { return []; });
   M.recall = invoke('recall', function (a) {
     var q = a.text !== undefined ? a.text : a.query;
@@ -196,11 +227,32 @@
   M.markPositive = invoke('markPositive', function (a) {
     return [a.ids !== undefined ? a.ids : a.id];
   });
+  /* W6.2 — object parameter parsing. `{seconds}`, `{hours}` (×3600) or `{dt}`
+   * seconds; a bare number is already seconds. Validated HERE, not silently
+   * coerced: the native `decayTick` deliberately turns a negative/non-finite
+   * dt into 0 (a no-op) so a ToUint32 wrap can never erase the whole brain
+   * (P3, AUDIT-2026-09-07), but a no-op that returns `true` is a silent lie,
+   * and a missing unit used to decay a silent 1 second. Both are now typed
+   * refusals (E_DT) that leave every strength untouched. */
   M.decayTick = function (a) {
     var inst = pick(isOpts(a) ? a : {});
-    if (!isOpts(a)) return inst.decayTick.apply(inst, Array.prototype.slice.call(arguments));
-    var dt = a.dt !== undefined ? +a.dt
-      : (a.seconds !== undefined ? +a.seconds : (a.hours !== undefined ? (+a.hours * 3600) : 1));
+    var dt;
+    if (isOpts(a)) {
+      if (a.dt !== undefined) dt = +a.dt;
+      else if (a.seconds !== undefined) dt = +a.seconds;
+      else if (a.hours !== undefined) dt = +a.hours * 3600;
+      else {
+        throw refuse(TypeError, 'E_DT',
+          'memory.decayTick: pass {seconds} or {hours} (or a bare number of seconds)');
+      }
+    } else {
+      dt = +a;
+    }
+    if (!isFinite(dt) || dt < 0) {
+      throw refuse(RangeError, 'E_DT',
+        'memory.decayTick: dt must be a finite, non-negative number of seconds (got ' +
+        String(dt) + ')');
+    }
     inst.decayTick(dt);
     return true;
   };
@@ -220,10 +272,51 @@
   };
   M.consolidate = invoke('consolidate', function () { return []; });
   M.compact = invoke('compact', function () { return []; });
-  M.importRecords = invoke('importRecords', function (a) {
-    var json = typeof a.records === 'string' ? a.records : JSON.stringify(a.records || []);
-    return [f32(a.vecs || a.vec), json];
-  });
+  /* W6.3 — ONE serialization contract, stated once: the native
+   * `importRecords(vecs, recordsJson)` parses `recordsJson` as a JSON OBJECT
+   * `{"records":[...]}` (`Cma::import_records` reads `root["records"]`; a bare
+   * array matches nothing and imports zero rows — exactly the mismatch this
+   * wrapper used to send, which made every flat import a silent no-op). So
+   * every call from here sends that envelope, `records` may be an array or a
+   * JSON string in either call form, and the native reply
+   * `{"added","merged","skipped"}` is parsed back into a real object. The
+   * instance method keeps its JSON-string reply for the chat driver and the C
+   * ABI; this flat surface is the JS-shaped one. */
+  function importEnvelope(recs) {
+    var arr = recs;
+    if (typeof recs === 'string') {
+      try { arr = JSON.parse(recs); }
+      catch (eJson) {
+        throw refuse(TypeError, 'E_RECORDS', 'memory.importRecords: records is not valid JSON');
+      }
+    }
+    if (arr && !Array.isArray(arr) && typeof arr === 'object' &&
+        Array.isArray(arr.records)) {
+      arr = arr.records;
+    }
+    if (!Array.isArray(arr)) {
+      throw refuse(TypeError, 'E_RECORDS',
+        'memory.importRecords: records must be an array of record objects (or {"records":[...]})');
+    }
+    return JSON.stringify({ records: arr });
+  }
+
+  function importStats(out) {
+    var s = typeof out === 'string' ? JSON.parse(out) : out;
+    if (!s || typeof s !== 'object') {
+      throw refuse(TypeError, 'E_IMPORT', 'memory.importRecords: the engine returned no stats');
+    }
+    return { added: s.added | 0, merged: s.merged | 0, skipped: s.skipped | 0 };
+  }
+
+  M.importRecords = function (a) {
+    var inst = pick(isOpts(a) ? a : {});
+    if (!isOpts(a)) {
+      /* positional: (vecsFloat32, recordsJson) */
+      return importStats(inst.importRecords(a, importEnvelope(arguments[1])));
+    }
+    return importStats(inst.importRecords(f32(a.vecs || a.vec), importEnvelope(a.records)));
+  };
   M.kvHints = invoke('kvHints', function (a) {
     var n = a.n_hints !== undefined ? (a.n_hints | 0) : (a.n === undefined ? 5 : (a.n | 0));
     return [f32(a.vec), n];

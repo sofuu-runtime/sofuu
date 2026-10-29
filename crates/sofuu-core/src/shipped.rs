@@ -113,6 +113,19 @@ pub const PROVIDERS_JS: &str = include_str!("../../../src/js/providers.js");
 #[cfg(not(debug_assertions))]
 pub const PROVIDERS_JS: &str = "";
 pub const PROVIDERS_BC: &[u8] = include_bytes!("../../../src/js/providers.bc.gz");
+/// The observability CLI renderer — single source of truth is src/js/observability.js
+/// (OBSERVABILITY-SPEC §4: the "sofuu logs" surface). Rust collects and
+/// validates the event log (rt/events.rs, rt/observability.rs); this driver
+/// only renders it, because rendering is the part that changes and the binary
+/// is size-capped (§0). It MERGES into the sofuu.observability object the Rust
+/// seam installed - adding cli/renderRun - and leaves runs/lastCheckpoint/
+/// postmortem/crashCard untouched, so eval it AFTER those host functions exist.
+#[cfg(debug_assertions)]
+pub const OBSERVABILITY_JS: &str = include_str!("../../../src/js/observability.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const OBSERVABILITY_JS: &str = "";
+pub const OBSERVABILITY_BC: &[u8] = include_bytes!("../../../src/js/observability.bc.gz");
 
 /// Eval one shipped JS driver into the engine context. A driver failure
 /// must never take the engine down (the drivers guard their own deps) —
@@ -323,6 +336,7 @@ mod tests {
             ("chat.js", CHAT_JS),
             ("plugins.js", PLUGINS_JS),
             ("providers.js", PROVIDERS_JS),
+            ("observability.js", OBSERVABILITY_JS),
         ] {
             let bc = unsafe { compile_to_bytecode(ctx, src, name) };
             assert!(bc.is_some(), "{name}: failed to compile to bytecode");

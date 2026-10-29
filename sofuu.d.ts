@@ -8,6 +8,7 @@
  *   src/js/storage.js                     sofuu.storage (QTSQ structured store)
  *   src/js/memory_api.js                  sofuu.memory
  *   src/js/agent.js                       sofuu.ai / sofuu.tools / sofuu.policy / sofuu.mcp
+ *   src/js/observability.js               sofuu.observability.cli / renderRun
  *   crates/sofuu-core/src/rt/engine.rs    sofuu.version, sofuu.fs
  *
  * Two rules this file obeys:
@@ -51,6 +52,14 @@
  *   E_TOOL         Shield 5 - the tool itself threw
  *   E_CAPABILITY   the runtime cannot answer (missing driver or feature)
  *   E_BACKPRESSURE a queue or budget refused the work
+ *   E_RATE_LIMIT   a provider or queue throttled the caller
+ *   E_INTERNAL     an engine bug, never a user or provider mistake
+ *
+ * The last two complete the normative taxonomy in OBSERVABILITY-SPEC §0: a
+ * retryable throttle and the last-resort internal code. Codes the spec
+ * forbids (E_NETWORK_TIMEOUT, E_SERVER_ERROR, E_UNCAUGHT_THROW) are
+ * deliberately absent - network and timeout faults map to E_TIMEOUT, tool
+ * faults to E_TOOL, policy to E_DENIED, validation to E_SCHEMA.
  */
 export type SofuuErrorCode =
   | 'E_SCHEMA'
@@ -59,7 +68,9 @@ export type SofuuErrorCode =
   | 'E_CIRCUIT_OPEN'
   | 'E_TOOL'
   | 'E_CAPABILITY'
-  | 'E_BACKPRESSURE';
+  | 'E_BACKPRESSURE'
+  | 'E_RATE_LIMIT'
+  | 'E_INTERNAL';
 
 /**
  * A plugin-raised error. code is what the shield loop reads; a plain Error
@@ -1136,6 +1147,136 @@ export interface SofuuPlugins {
   _yaml?: { parse(src: string): unknown };
 }
 
+/* ================================================================== 
+ * Observability (rt/observability.rs + src/js/observability.js)
+ * ================================================================== */
+
+/**
+ * The terminal-failure policy a run uses when something throws
+ * (OBSERVABILITY-SPEC §3). "interactive" prompts [r]etry/[s]kip/[i]nspect/
+ * [h]alt on a TTY and falls back to "fail-stop" when there is none.
+ */
+export type OnErrorMode = 'auto-retry' | 'fail-stop' | 'interactive';
+
+/**
+ * One classified failure: the taxonomy code the agent loop acts on, plus the
+ * operation that produced it. classifyError never throws - an unknown throw
+ * comes back as E_INTERNAL carrying the original message.
+ */
+export interface SofuuClassifiedError {
+  /** A code from the normative taxonomy; never invented by the classifier. */
+  code: ErrorCodeLike;
+  /** True when retrying the same operation is worth another attempt. */
+  retryable?: boolean;
+  /** What failed: provider, tool:<name>, memory, ... */
+  op?: string;
+  message: string;
+  /** The classified value, when it was not already an Error. */
+  cause?: unknown;
+}
+
+/**
+ * The agent driver's error-policy surface (src/js/agent.js).
+ *
+ * Advisory: run() already accepts opts.onError, and the two helpers below
+ * ship with the agent driver's observability refresh (OBSERVABILITY-SPEC §3)
+ * - until then they are absent, which is why they are declared optional.
+ */
+export interface SofuuAgent {
+  classifyError?(err: unknown): SofuuClassifiedError;
+  /** The mode a run defaults to: interactive on a TTY, auto-retry otherwise. */
+  onErrorMode?(opts?: { tty?: boolean }): OnErrorMode;
+  [extension: string]: unknown;
+}
+
+/** One row of sofuu.observability.runs(). */
+export interface ObservabilityRun {
+  run_id: string;
+  /** .sofuu/logs/agent-<run_id>.jsonl, or a session's events.ndjson. */
+  path: string;
+  /** agent = a headless agent run, session = a chat session. */
+  kind: 'agent' | 'session' | (string & {});
+  bytes: number;
+  /** Epoch seconds or milliseconds, whichever the host reports. */
+  mtime: number;
+  steps: number;
+  /** OBSERVABILITY-SPEC §5: OK | HALTED | RETRYING | RUNNING. */
+  status: string;
+}
+
+/** The rehydration unit a resume seeds the loop from (OBSERVABILITY-SPEC §3). */
+export interface AgentCheckpoint {
+  step: number;
+  messages: unknown[];
+  task: string;
+  model?: string;
+  provider?: string;
+  tokens?: number;
+  last_tool?: string;
+}
+
+/** sofuu.observability.lastCheckpoint(...), parsed. */
+export interface LastCheckpointResult {
+  ok: boolean;
+  found: boolean;
+  step?: number;
+  seq?: number;
+  ts?: string;
+  checkpoint?: AgentCheckpoint;
+}
+
+/** The post-mortem card sofuu.observability.postmortem writes. */
+export interface CrashCard {
+  crash_id: string;
+  run_id: string;
+  timestamp: string;
+  failed_step?: number;
+  error: { code?: string; message?: string; details?: unknown; stack?: string };
+  context_snapshot?: {
+    model?: string;
+    provider?: string;
+    context_tokens?: number;
+    last_user_message?: string;
+    last_tool?: string;
+  };
+  recovery_hint?: string;
+  trace_path?: string;
+}
+
+/**
+ * The observability surface.
+ *
+ * The four host functions (runs / lastCheckpoint / postmortem / crashCard)
+ * take ONE JSON string and answer with JSON TEXT, the convention
+ * sofuu.events.append and sofuu.policy.evaluate already use - parse the
+ * answer, or go through the renderer. cli/renderRun are the shipped JS
+ * renderer (src/js/observability.js); both are pure formatting, so neither
+ * writes or validates anything.
+ */
+export interface SofuuObservability {
+  /** { ok, runs: ObservabilityRun[] } as JSON text. Args: { project?, path? }. */
+  runs(args?: string | Record<string, unknown>): string;
+  /** { ok, found, step, seq, ts, checkpoint } as JSON text. */
+  lastCheckpoint(args?: string | Record<string, unknown>): string;
+  /** Writes .sofuu/crashes/<crash_id>.json: { ok, crash_id, path, card }. */
+  postmortem(args?: string | Record<string, unknown>): string;
+  /** The newest crash card as JSON text: { ok, card }. */
+  crashCard(args?: string | Record<string, unknown>): string;
+  /**
+   * The `sofuu logs` renderer. argv[0] is the subcommand: list |
+   * show <run_id> | follow [run_id] | last-error. Resolves to the process
+   * exit code (0 ok, 1 the named run is missing or unreadable, 2 usage).
+   * Prints through the host console and never throws.
+   */
+  cli(argv: string[]): Promise<number>;
+  /**
+   * One run rendered as a fixed-width trace (clock, kind, step, payload
+   * summary, duration). Accepts envelope objects or raw JSONL text.
+   */
+  renderRun(events: unknown[] | string): string;
+  readonly VERSION?: string;
+}
+
 /**
  * The Sofuu runtime as a plugin sees it. Only namespaces the drivers actually
  * install are listed; anything else is undefined at runtime.
@@ -1152,6 +1293,10 @@ export interface SofuuRuntime {
   policy?: SofuuPolicy;
   /** The QTSQ structured store (src/js/storage.js). */
   storage?: SofuuStorage;
+  /** The agent runtime (src/js/agent.js) and its error policy. */
+  agent?: SofuuAgent;
+  /** Run logs, checkpoints and crash cards (src/js/observability.js). */
+  observability?: SofuuObservability;
   /** Runtime semver, e.g. 0.3.0-beta. */
   version: string;
 }

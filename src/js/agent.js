@@ -190,6 +190,360 @@
   function isTransientProviderError(msg) {
     return STREAM_TRANSIENT_RE.test(String(msg == null ? '' : msg));
   }
+  /* ── Observability seam + error policy (OBSERVABILITY-SPEC §0/§3) ─────
+   * ONE emission point for the run's JSONL trace and ONE error-policy
+   * engine. Both are best-effort by contract: a logging failure must never
+   * break a run (the logRun discipline at the bottom of this file), and
+   * every host binding is feature-detected — a driver has to work on any
+   * host, including one with no sofuu.events at all.
+   *
+   * The envelope is chat.js's, byte for byte (chat.js:1292): ONE writer
+   * (rt/events.rs) owns validation, redaction and fsync, so this file never
+   * invents a second format. `path` + `durable` are the run-log additions
+   * from SPEC §2; a stale host that ignores them still lands the same
+   * events in the session log instead of dropping them. */
+  var OBS_MODES = { 'auto-retry': 1, 'fail-stop': 1, 'interactive': 1 };
+  /* SPEC §3: five CONSECUTIVE classified errors trip the circuit. */
+  var OBS_CIRCUIT_ERRORS = 5;
+  /* SPEC §3: one checkpoint must stay a log line, not a transcript dump. */
+  var OBS_CHECKPOINT_CAP = 32768;
+  /* The closed taxonomy (SPEC §0) — the ONLY codes a driver may emit.
+   * Never add E_NETWORK_TIMEOUT / E_SERVER_ERROR / E_UNCAUGHT_THROW here. */
+  var ERROR_CODES = { E_SCHEMA: 1, E_TIMEOUT: 1, E_RATE_LIMIT: 1, E_DENIED: 1,
+                      E_CIRCUIT_OPEN: 1, E_TOOL: 1, E_CAPABILITY: 1,
+                      E_BACKPRESSURE: 1, E_INTERNAL: 1 };
+  var RETRYABLE_CODES = { E_TIMEOUT: 1, E_RATE_LIMIT: 1, E_BACKPRESSURE: 1 };
+  /* Message-shape classifiers. The ORDER in classifyError is what keeps a
+   * schema/policy refusal from being retried as a generic E_TOOL: a bad
+   * tool call arrives as "tool error: invalid arguments at ...", i.e. it
+   * carries both shapes. */
+  var OBS_POLICY_RE = /(denied by policy|denied by user|blocked by permissions policy|blocked by service|approve:\S+ but the host)/i;
+  var OBS_SCHEMA_RE = /(invalid arguments at|schema|not parseable as json|invalid json)/i;
+  var OBS_TOOL_RE = /^tool error\b/i;
+  /* Per-run emission state: the seq counter (see obsEmit), the turn number
+   * the envelope's turn_id folds from, and the consecutive classified-error
+   * counter the circuit breaker reads. Keyed by runId so a resume
+   * re-entering the same log keeps ONE sequence. */
+  var OBS_RUNS = {};
+  function obsState(runId) {
+    var k = String(runId == null ? '' : runId);
+    var s = OBS_RUNS[k];
+    if (!s) {
+      /* seq must be STRICTLY increasing inside one log file (R6.3), and a
+       * resumed run re-enters the same agent-<id>.jsonl from a NEW process,
+       * where an in-memory 1..N counter would be rejected as a regression on
+       * every append. Anchor the sequence to the wall clock instead: ms*1000
+       * leaves room for 1000 events in one millisecond. */
+      s = OBS_RUNS[k] = { seq: 0, base: Date.now() * 1000, turn: 0, errors: 0, halted: false, warned: false };
+    }
+    return s;
+  }
+  function obsProject() {
+    return String(env('SOFUU_PROJECT') || '.');
+  }
+  /* The one capability probe: no binding = no logging, silently. */
+  function obsEnabled() {
+    try {
+      return !!(typeof sofuu !== 'undefined' && sofuu.events &&
+                typeof sofuu.events.append === 'function');
+    } catch (e) { return false; }
+  }
+  /* SPEC §1: <project>/.sofuu/logs/agent-<run_id>.jsonl, with opts.logDir
+   * as the override. The run id is sanitised because the Rust writer
+   * rejects ids carrying '/' or '..' (and this one also names a file). */
+  function obsRunId(runId) {
+    var id = String(runId == null ? 'run' : runId).replace(/[^A-Za-z0-9_.-]/g, '_');
+    return id || 'run';
+  }
+  function obsRunPath(opts, runId) {
+    /* SPEC §1 puts the trace INSIDE the project: `sofuu logs` scans
+     * <project>/.sofuu/logs, and an operator debugging a checkout expects the
+     * trace in that checkout. sofuuDir() is the HOME config root — correct for
+     * the usage ledger (logRun), wrong for a per-run trace, because it would
+     * hide the run from both the CLI and the project it belongs to. */
+    var dir = (opts && opts.logDir) ? String(opts.logDir) : (obsProject() + '/.sofuu/logs');
+    return dir.replace(/\/+$/, '') + '/agent-' + obsRunId(runId) + '.jsonl';
+  }
+  /* Emit ONE event. Never throws, never returns a promise the caller must
+   * await: observability is a probe on the run, not a step in it. */
+  function obsEmit(runId, path, kind, step, payload, durable) {
+    try {
+      if (!obsEnabled()) return false;
+      var sid = obsRunId(runId);
+      var st = obsState(runId);
+      if (kind === 'turn_start') st.turn = (st.turn | 0) + 1;
+      st.seq = (st.seq | 0) + 1;
+      var body = {};
+      if (step !== undefined && step !== null) body.step = step;
+      if (payload && typeof payload === 'object') {
+        for (var k in payload) {
+          if (Object.prototype.hasOwnProperty.call(payload, k) && payload[k] !== undefined) {
+            body[k] = payload[k];
+          }
+        }
+      }
+      sofuu.events.append(JSON.stringify({
+        project: obsProject(),
+        sid: sid,
+        path: String(path || obsRunPath(null, runId)),
+        durable: durable === true,
+        events: [{
+          kind: kind, schema_version: 1, sid: sid,
+          turn_id: sid + '-t' + (st.turn | 0),
+          seq: st.base + st.seq,
+          ts: new Date().toISOString(),
+          surface: 'js',
+          payload: body,
+        }],
+      }));
+      return true;
+    } catch (e) { return false; }
+  }
+  /* Plain-ASCII hints: the post-mortem box is read by a human under
+   * pressure, so it says what to DO, in one line, with no guesswork. */
+  var OBS_RECOVERY_HINTS = {
+    E_SCHEMA: 'Check the tool call or response schema, fix the shape, then resume from the last checkpoint.',
+    E_TIMEOUT: 'The provider or tool did not answer in time. Raise the timeout or its budget and resume.',
+    E_RATE_LIMIT: 'The provider is rate limiting this key. Wait, then resume from the last checkpoint.',
+    E_DENIED: 'A policy or approval denied the step. Grant access explicitly, then resume.',
+    E_CIRCUIT_OPEN: 'Five consecutive failures tripped the circuit. Fix the failing step before resuming.',
+    E_TOOL: 'A tool failed deterministically. Fix its inputs or the tool, then resume.',
+    E_CAPABILITY: 'The selected model or host lacks this capability. Pick another model, then resume.',
+    E_BACKPRESSURE: 'A bounded queue was full. Retry with less concurrency.',
+    E_INTERNAL: 'Unexpected internal failure. Check the event log for the last completed step.',
+  };
+  /* SPEC §2: the crash card. Absent binding = no card, never an error. */
+  function obsPostmortem(runId, step, err, ctx, tracePath) {
+    try {
+      if (typeof sofuu === 'undefined' || !sofuu.observability ||
+          typeof sofuu.observability.postmortem !== 'function') return null;
+      var e = err || {};
+      var code = String(e.code || 'E_INTERNAL');
+      if (!ERROR_CODES[code]) code = 'E_INTERNAL';
+      var c = ctx || {};
+      var args = {
+        project: obsProject(),
+        run_id: obsRunId(runId),
+        step: (typeof step === 'number' && step >= 0) ? step : 0,
+        error: { code: code, message: clip(String(e.message || e), 2000) },
+        context: {
+          model: String(c.model || ''),
+          provider: String(c.provider || ''),
+          context_tokens: Number(c.context_tokens) || 0,
+          last_user_message: clip(String(c.last_user_message || ''), 500),
+          last_tool: String(c.last_tool || ''),
+        },
+        recovery_hint: String(c.recovery_hint || OBS_RECOVERY_HINTS[code] || OBS_RECOVERY_HINTS.E_INTERNAL),
+      };
+      if (e.stack) args.error.stack = clip(String(e.stack), 2000);
+      if (tracePath) args.trace_path = String(tracePath);
+      var raw = null;
+      /* The Rust seam takes a JSON string on the events surface and an
+       * object on the policy surface; accept whichever this host has. */
+      try { raw = sofuu.observability.postmortem(JSON.stringify(args)); }
+      catch (eStr) { raw = sofuu.observability.postmortem(args); }
+      if (!raw) return null;
+      return (typeof raw === 'string') ? JSON.parse(raw) : raw;
+    } catch (eOut) { return null; }
+  }
+  /* SPEC §0 mapping, in priority order. Note what is deliberately absent:
+   * no 5xx -> E_RATE_LIMIT guess (a server error is not a rate limit) and
+   * no invented codes — an unrecognised shape lands on E_INTERNAL last. */
+  function classifyError(e) {
+    var msg = String((e && (e.message || e.text)) || (e == null ? '' : e));
+    var given = (e && typeof e === 'object' && e.code && ERROR_CODES[String(e.code)])
+      ? String(e.code) : '';
+    var retryable = (e && typeof e === 'object' && e.retryable === true);
+    if (given === 'E_DENIED' || OBS_POLICY_RE.test(msg)) return { code: 'E_DENIED', retryable: false };
+    if (given === 'E_SCHEMA' || OBS_SCHEMA_RE.test(msg)) return { code: 'E_SCHEMA', retryable: false };
+    var toolFault = given === 'E_TOOL' || OBS_TOOL_RE.test(msg) ||
+                    !!(e && typeof e === 'object' && e.toolFault === true);
+    /* isTransientProviderError is the ONE transport classifier this file
+     * already owns (streamWithRetry rides it): a transport failure is a
+     * timing failure, hence E_TIMEOUT and retryable. A TOOL fault that
+     * carries a transport cause keeps its tool code but stays retryable,
+     * which is exactly the class the auto-retry ladder exists for. */
+    var transient = isTransientProviderError(msg);
+    if (toolFault) return { code: 'E_TOOL', retryable: transient || retryable };
+    if (given) return { code: given, retryable: RETRYABLE_CODES[given] === 1 || retryable };
+    if (transient) return { code: 'E_TIMEOUT', retryable: true };
+    return { code: 'E_INTERNAL', retryable: retryable };
+  }
+  function obsNoteError(runId) {
+    var st = obsState(runId);
+    st.errors = (st.errors | 0) + 1;
+    return st.errors;
+  }
+  function obsNoteSuccess(runId) {
+    obsState(runId).errors = 0;
+  }
+  /* Exactly one TERMINAL event per run (SPEC §3/§5): run_complete on a
+   * clean exit, halt on any stop — the status vocabulary derives HALTED from
+   * the LAST terminal event, so a second one would rewrite history. The
+   * paths that log their own halt get here last, not first, hence the guard. */
+  function obsTerminal(runId, path, step, stopped, tokens, answerChars) {
+    try {
+      var st = obsState(runId);
+      if (st.halted) return false;
+      st.halted = true;
+      var tk = tokens || {};
+      if (stopped) {
+        obsEmit(runId, path, 'halt', step,
+                { ok: false, reason: String(stopped), steps: step, tokens: tk }, true);
+      } else {
+        obsEmit(runId, path, 'run_complete', step,
+                { ok: true, steps: step, answer_chars: answerChars | 0, tokens: tk }, true);
+      }
+      return true;
+    } catch (e) { return false; }
+  }
+  /* A stop the POLICY decided (circuit, fail-stop, interactive halt): halt
+   * plus the crash card, because those stops are the ones a human resumes. */
+  function obsHalt(runId, path, step, reason, code, message, ctx) {
+    try {
+      var st = obsState(runId);
+      if (st.halted) return false;
+      st.halted = true;
+      obsEmit(runId, path, 'halt', step,
+              { ok: false, reason: String(reason || ''), code: String(code || ''),
+                steps: step, message: clip(String(message || ''), 500) }, true);
+      obsPostmortem(runId, step, { code: code, message: message }, ctx, path);
+      return true;
+    } catch (e) { return false; }
+  }
+  /* A run that THREW: fatal_error THEN halt (SPEC §3 puts fatal_error before
+   * halt on the fatal path), then the crash card. */
+  function obsFatal(runId, path, step, err, ctx) {
+    try {
+      var st = obsState(runId);
+      if (st.halted) return false;
+      st.halted = true;
+      var cls = classifyError(err);
+      var msg = clip(String((err && err.message) || err || ''), 500);
+      obsEmit(runId, path, 'fatal_error', step,
+              { code: cls.code, op: String((ctx && ctx.op) || 'run'),
+                retryable: cls.retryable, message: msg }, true);
+      obsEmit(runId, path, 'halt', step,
+              { ok: false, reason: cls.code, code: cls.code, steps: step, message: msg }, true);
+      obsPostmortem(runId, step,
+                    { code: cls.code, message: msg, stack: (err && err.stack) || '' },
+                    ctx || {}, path);
+      return true;
+    } catch (e) { return false; }
+  }
+  /* A TTY is only half the question (interactive also needs a channel),
+   * but it is the half the default policy keys on (SPEC §3). */
+  function obsTty() {
+    try {
+      var p = (typeof process !== 'undefined') ? process : null;
+      if (p && p.stdout && p.stdout.isTTY) return true;
+      if (p && p.stdin && p.stdin.isTTY) return true;
+    } catch (e) {}
+    return false;
+  }
+  /* Resolve the error policy: opts.onError, then SOFUU_ON_ERROR, then the
+   * TTY default. An UNKNOWN value is REFUSED — a typo must never silently
+   * mean some other policy (same fail-closed stance as setPermissions). */
+  function onErrorMode(opts) {
+    var raw = '';
+    try {
+      if (opts && opts.onError !== undefined && opts.onError !== null) raw = String(opts.onError);
+    } catch (e) {}
+    if (!raw) raw = String(env('SOFUU_ON_ERROR') || '');
+    var mode = raw || (obsTty() ? 'interactive' : 'auto-retry');
+    if (!OBS_MODES[mode]) {
+      var err = new Error('unknown onError mode: ' + raw +
+        ' (expected one of auto-retry, fail-stop, interactive)');
+      err.code = 'E_SCHEMA';
+      throw err;
+    }
+    return mode;
+  }
+  /* Interactive answers arrive on the ONE ask channel this file already
+   * owns (opts.onErrorPrompt, else the approval callback, else the
+   * approveInteractive parking lot) — a host that can render a y/n card can
+   * render this one. No channel or no TTY = null, and the caller falls back
+   * to fail-stop plus the warning SPEC §3 requires. */
+  function obsAskChannel(opts) {
+    if (opts && typeof opts.onErrorPrompt === 'function') return 'onErrorPrompt';
+    if (opts && typeof opts.onApproval === 'function') return 'onApproval';
+    if (opts && opts.approveInteractive === true) return 'approveInteractive';
+    return '';
+  }
+  function obsChoiceFrom(raw) {
+    var v = raw;
+    if (v && typeof v === 'object') {
+      if (v.allow === true) return 'retry';
+      if (v.allow === false) return 'halt';
+      v = (v.choice !== undefined) ? v.choice : v.decision;
+    }
+    var s = String(v == null ? '' : v).toLowerCase();
+    if (s === 'r' || s === 'retry' || s === 'allow') return 'retry';
+    if (s === 's' || s === 'skip') return 'skip';
+    if (s === 'i' || s === 'inspect') return 'inspect';
+    if (s === 'h' || s === 'halt' || s === 'deny') return 'halt';
+    return '';
+  }
+  /* SPEC §3: the checkpoint payload IS the rehydration unit, so the
+   * messages ride the log — size-capped, oldest dropped first, because a
+   * resume needs the recent tail and the task itself is on run_start. */
+  function obsCapMessages(msgs, cap) {
+    var out = [];
+    if (!Array.isArray(msgs)) return out;
+    var limit = (cap > 0) ? cap : OBS_CHECKPOINT_CAP;
+    var total = 0;
+    for (var i = msgs.length - 1; i >= 0; i--) {
+      var m = msgs[i];
+      if (!m) continue;
+      var copy = { role: m.role };
+      if (m.content !== undefined && m.content !== null) copy.content = m.content;
+      if (m.tool_calls) copy.tool_calls = m.tool_calls;
+      if (m.tool_call_id) copy.tool_call_id = m.tool_call_id;
+      var n = 0;
+      try { n = JSON.stringify(copy).length; } catch (eS) { n = 0; }
+      if (n <= 0) continue;
+      if (total + n > limit) {
+        /* A single oversized message still rehydrates the run better than
+         * nothing, so the FIRST kept message is clipped to fit instead. */
+        if (out.length === 0 && typeof copy.content === 'string') {
+          copy.content = clip(copy.content, limit);
+          out.unshift(copy);
+          total = limit;
+        }
+        break;
+      }
+      out.unshift(copy);
+      total += n;
+    }
+    return out;
+  }
+  function obsBytes(v) {
+    try { return JSON.stringify(v == null ? {} : v).length; } catch (e) { return 0; }
+  }
+  function obsMsgsChars(msgs) {
+    var n = 0;
+    if (!Array.isArray(msgs)) return 0;
+    for (var i = 0; i < msgs.length; i++) {
+      var m = msgs[i];
+      if (!m) continue;
+      n += String(m.content == null ? '' : m.content).length;
+      if (m.tool_calls) n += obsBytes(m.tool_calls);
+    }
+    return n;
+  }
+  /* A tool "fault" is what the tool returned as a refusal/error, not a
+   * throw (execOneTool catches its own throws and returns them as text).
+   * The untrusted-output header is stripped first: every successful result
+   * carries it, so a prefix test without stripping would never match. */
+  function obsToolFault(text) {
+    var s = String(text == null ? '' : text);
+    if (s.indexOf('[untrusted tool output') === 0) {
+      var nl = s.indexOf('\n');
+      s = (nl >= 0) ? s.slice(nl + 1) : '';
+    }
+    if (OBS_TOOL_RE.test(s) || /^(blocked by |denied by )/i.test(s)) return s;
+    return null;
+  }
   /* Tool results are the largest uncontrolled token source — cap each one
    * before it enters any message (head+tail kept, middle elided with a
    * recovery hint; per-def override budget.maxToolResultChars). The cap
@@ -2375,6 +2729,11 @@
   function run(target, task, opts) {
     opts = opts || {};
     var d = resolveDef(target);
+    /* SPEC §3: resolve the error policy BEFORE the run registers itself
+     * (ACTIVE/SIGNALS/run counter) — an unknown mode is REFUSED here, so a
+     * typo can never leave a half-open run behind or silently mean some
+     * other policy. */
+    var errorMode = onErrorMode(opts);
     var parentCtx = (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.getStore === 'function')
       ? sofuu.context.getStore()
       : null;
@@ -2467,6 +2826,21 @@
 
     async function runCore() {
     var traceStorage = resolveStorage(opts);
+    /* ── Observability wiring (OBSERVABILITY-SPEC §3) ─────────────────
+     * The policy mode (validated in run()), this run's log path, and the
+     * per-run emission state every hook below shares. None of this can
+     * throw: obsEmit/obsPostmortem swallow everything by contract. */
+    var obsMode = errorMode;
+    var obsPath = obsRunPath(opts, runId);
+    var obsLastTool = '';
+    /* The context snapshot a crash card carries (SPEC §2): what the run was
+     * doing when it died, in the same vocabulary the card documents. */
+    function obsCtx() {
+      return { model: String(d.model || ''), provider: String(d.provider || ''),
+               context_tokens: own.promptTokens + own.completionTokens,
+               last_user_message: String(task == null ? '' : task),
+               last_tool: String(obsLastTool || '') };
+    }
     /* Live per-tool histogram for the breach report — (2026-10-15) the
      * report used to re-scan the trace for kind:'tool' entries, but
      * TRACE_CAP demotion deletes old payloads, so a long run's report read
@@ -2569,7 +2943,9 @@
       }
       return false;
     }
-    var steps = (typeof opts.resumeSteps === 'number') ? opts.resumeSteps : 0;
+    var steps = (typeof opts.resumeSteps === 'number') ? opts.resumeSteps
+      : (opts.resumeFrom && typeof opts.resumeFrom === 'object' &&
+         typeof opts.resumeFrom.step === 'number') ? opts.resumeFrom.step : 0;
     /* Cumulative across auto-continue windows — `steps` resets on a
      * renewal, so this is what "how long did this actually run" means. */
     var stepsTotal = steps;
@@ -2591,6 +2967,53 @@
     var loopMsgs = Array.isArray(opts.resumeTranscript)
       ? opts.resumeTranscript.slice()
       : (Array.isArray(opts.resumeMessages) ? opts.resumeMessages.slice() : []);
+    /* ── SPEC §3 resumeFrom ──────────────────────────────────────────
+     * {step, messages, task, model, provider, tokens} is the checkpoint
+     * payload coming back in, and it IS the rehydration unit: the loop
+     * picks up at step+1 with the transcript it already had instead of
+     * starting fresh. A.resume(runId) — the QTSQ trace path — is untouched
+     * and still synthesizes resumeTranscript/resumeSteps itself; it never
+     * sets resumeFrom. */
+    var obsResumeFrom = (opts.resumeFrom && typeof opts.resumeFrom === 'object') ? opts.resumeFrom : null;
+    if (obsResumeFrom) {
+      if (Array.isArray(obsResumeFrom.messages) && obsResumeFrom.messages.length) {
+        loopMsgs = obsResumeFrom.messages.slice();
+      }
+      if (obsResumeFrom.task !== undefined && obsResumeFrom.task !== null &&
+          String(obsResumeFrom.task).trim()) {
+        task = String(obsResumeFrom.task);
+      }
+      /* The checkpoint IS the run's configuration. A def rarely names a model,
+       * and a fresh process has no /model selection, so without this every
+       * resume died on "No model configured" before reaching the loop. Copy
+       * rather than assign: resolveDef hands back the LIVE registry object for
+       * string targets, and writing its model would leak into later runs. */
+      if (obsResumeFrom.model && !opts.model && !d.model) {
+        d = Object.assign({}, d, { model: String(obsResumeFrom.model) });
+      }
+      if (obsResumeFrom.provider && !opts.provider && !d.provider) {
+        d = Object.assign({}, d, { provider: String(obsResumeFrom.provider) });
+      }
+      /* Token continuity: a resumed window must not look FREE to the
+       * maxTokens guard, or the budget reports a run that never ran. */
+      var rfTok = obsResumeFrom.tokens;
+      if (typeof rfTok === 'number' && rfTok > 0) {
+        own.promptTokens += rfTok;
+        tree.promptTokens += rfTok;
+      } else if (rfTok && typeof rfTok === 'object') {
+        var rfP = Number(rfTok.prompt) || 0, rfC = Number(rfTok.completion) || 0;
+        own.promptTokens += rfP; own.completionTokens += rfC;
+        tree.promptTokens += rfP; tree.completionTokens += rfC;
+      }
+      /* model/provider only when the DEF has none: an explicit def or
+       * opts model is the caller's decision and must win over the log. */
+      if (obsResumeFrom.model && !d.model) {
+        d = Object.assign({}, d, { model: String(obsResumeFrom.model) });
+      }
+      if (obsResumeFrom.provider && !d.provider) {
+        d = Object.assign({}, d, { provider: String(obsResumeFrom.provider) });
+      }
+    }
     function turnTranscript() {
       return loopMsgs.filter(function (m) {
         if (m.role === 'assistant' && m.tool_calls) return true;
@@ -2856,6 +3279,35 @@
         data: (respSchema && validated) ? validatedData : undefined,
       };
       emit('answer', { answer: clip(answer, 200), stopped: stopped });
+      /* SPEC §3: exactly one terminal event per run, durable — a budget
+       * stop logs halt (the status vocabulary says HALTED), a clean exit
+       * logs run_complete. A stop that already logged its own halt (the
+       * circuit, fail-stop, an interactive halt) is left alone. */
+      /* SPEC §Component 4: a turn that answered WITHOUT entering the tool
+       * loop still has to leave a resume point — that is the most common run
+       * shape, and without this `sofuu resume` has nothing to rehydrate for
+       * it. When the tool loop already checkpointed, the same payload is
+       * re-emitted and the newest wins (lastCheckpoint scans in reverse). */
+      if (!stopped) {
+        var obsSeedMsgs = (typeof loopMsgs !== 'undefined' && loopMsgs && loopMsgs.length)
+          ? obsCapMessages(loopMsgs, OBS_CHECKPOINT_CAP)
+          : [{ role: 'user', content: clip(String(task == null ? '' : task), 8000) },
+             { role: 'assistant', content: clip(String(answer || ''), 8000) }];
+        obsEmit(runId, obsPath, 'checkpoint', stepsTotal, {
+          messages: obsSeedMsgs,
+          task: clip(String(task == null ? '' : task), 2000),
+          /* The EFFECTIVE model, not just the def's. A headless caller passes
+           * opts.model, so recording only d.model checkpoints an empty model
+           * and resume can never find one (observed: "No model configured"). */
+          model: String(opts.model || d.model || ''),
+          provider: String(opts.provider || d.provider || ''),
+          tokens: { prompt: own.promptTokens, completion: own.completionTokens },
+          last_tool: '',
+        }, true);
+      }
+      obsTerminal(runId, obsPath, stepsTotal, stopped,
+                  { prompt: own.promptTokens, completion: own.completionTokens },
+                  String(answer || '').length);
       if (res.evidence && (res.evidence.backed > 0 || res.evidence.unbacked > 0)) {
         emit('evidence', { backed: res.evidence.backed, unbacked: res.evidence.unbacked,
                            samples: res.evidence.samples });
@@ -2907,6 +3359,18 @@
       }
     } catch (eStartHook) {}
     emit('start', { agentName: d.name, task: task, fullTask: task, depth: depth, chain: chain.slice() });
+    /* SPEC §3: the run's first log event. budget rides along so a reader
+     * can tell a run that finished from one its guardrail cut short, and
+     * on_error so the policy in force is never a guess. */
+    obsEmit(runId, obsPath, 'run_start', stepsTotal, {
+      agent: String(d.name || ''),
+      task: clip(String(task == null ? '' : task), 400),
+      model: String(d.model || ''),
+      provider: String(d.provider || ''),
+      budget: d.budget,
+      resumed: obsResumeFrom ? true : false,
+      on_error: obsMode,
+    }, false);
     /* PLAN-ML-GATES §8: open this run's trajectory in the working set.
      * Sub-agents run under their own runId, so trajectories stay separate. */
     if (mlEnabled(d)) {
@@ -3324,6 +3788,13 @@
                                   result: 'provider error (' + clip(msg, 100) + ') — retrying in ' +
                                           (delays[attempt] / 1000) + 's' +
                                           ' (attempt ' + (attempt + 1) + '/' + delays.length + ')' });
+            /* SPEC §3 retry event: the provider ladder is the retry path
+             * most runs actually hit, so it logs the same shape the tool
+             * ladder does — one classifier, one vocabulary. The delays
+             * here are the ladder's own (fixed, not jittered). */
+            obsEmit(runId, obsPath, 'retry', stepsTotal,
+                    { attempt: attempt + 1, delay_ms: delays[attempt],
+                      code: classifyError(msg).code, op: 'provider' }, false);
             await new Promise(function (r) { setTimeout(r, delays[attempt]); });
             attempt++;
             if (state.cancelled) throw new Error('cancelled');
@@ -3912,7 +4383,7 @@
             });
             if (rlmTools.length) {
               ro.tools = rlmTools;
-              ro.execTool = function (name, args) { return execOneTool(name, args, 'rlm_' + runId); };
+              ro.execTool = function (name, args) { return execToolWithPolicy(name, args, 'rlm_' + runId); };
             }
             /* Cancel must also stop the episode between rounds (the
              * driver checks __rlm_aborted at every action). */
@@ -4502,6 +4973,166 @@
         return cappedR.text;
       }
 
+      /* ── Error-policy gate for tool calls (SPEC §0/§3) ───────────────
+       * execOneTool still does the work; this wraps it so the loop is NOT
+       * restructured: tool_call -> (retry|error_policy)* -> tool_result,
+       * plus the mode's decision and the consecutive-error circuit. A
+       * DETERMINISTIC fault is still reflected to the model exactly as
+       * today — classifying it changed only what the log and the policy
+       * know, never what the model sees. */
+      async function execToolWithPolicy(name, args, callId) {
+        var toolStart = Date.now();
+        /* Local copy: parallel read-only batches run several of these at
+         * once, so a shared name would let a sibling rewrite this call's
+         * op field mid-flight. obsLastTool stays the checkpoint's "last". */
+        var tn = String(name || '');
+        obsLastTool = tn;
+        obsEmit(runId, obsPath, 'tool_call', stepsTotal,
+                { id: String(callId || ''), name: tn, args_bytes: obsBytes(args) }, false);
+        var attempt = 0;
+        var text = '';
+        for (;;) {
+          var threw = null;
+          try {
+            text = await execOneTool(name, args, callId);
+          } catch (eTool) {
+            /* execOneTool catches its own throws; belt and braces so no
+             * policy path can ever leak an exception into the loop. */
+            threw = eTool;
+            text = 'tool error: ' + String((eTool && eTool.message) || eTool);
+          }
+          var fault = threw ? null : obsToolFault(text);
+          if (!fault && !threw) { obsNoteSuccess(runId); break; }
+          var cls = classifyError(threw || fault || text);
+          var consecutive = obsNoteError(runId);
+          var why = String(fault || (threw && threw.message) || text || '');
+          emit('error_policy', { mode: obsMode, code: cls.code, op: tn,
+                                 attempt: attempt, retryable: cls.retryable,
+                                 consecutive: consecutive, message: clip(why, 160) });
+          /* Circuit (SPEC §3, auto-retry only): five consecutive classified
+           * errors mean the run is not making progress, and the ladder would
+           * only spend the wall budget proving it. */
+          if (obsMode === 'auto-retry' && consecutive >= OBS_CIRCUIT_ERRORS) {
+            obsEmit(runId, obsPath, 'error', stepsTotal,
+                    { code: 'E_CIRCUIT_OPEN', op: tn, retryable: false,
+                      message: OBS_CIRCUIT_ERRORS + ' consecutive classified errors - circuit open' }, true);
+            obsHalt(runId, obsPath, stepsTotal, 'circuit_open', 'E_CIRCUIT_OPEN', why, obsCtx());
+            stopped = stopped || 'circuit_open';
+            break;
+          }
+          if (obsMode === 'fail-stop') {
+            obsEmit(runId, obsPath, 'fatal_error', stepsTotal,
+                    { code: cls.code, op: tn, retryable: false, message: clip(why, 500) }, true);
+            obsHalt(runId, obsPath, stepsTotal, 'fail-stop', cls.code, why, obsCtx());
+            stopped = stopped || 'fail_stop';
+            break;
+          }
+          if (obsMode === 'interactive') {
+            var choice = await obsAskError(cls, why, tn);
+            if (choice === 'skip') {
+              emit('error_policy', { mode: obsMode, code: cls.code, op: tn, choice: 'skip' });
+              break; /* the fault text still reaches the model: no dead end */
+            }
+            if (choice !== 'retry') {
+              obsEmit(runId, obsPath, 'fatal_error', stepsTotal,
+                      { code: cls.code, op: tn, retryable: false, message: clip(why, 500) }, true);
+              obsHalt(runId, obsPath, stepsTotal, 'halted', cls.code, why, obsCtx());
+              stopped = stopped || 'halted';
+              break;
+            }
+          } else if (!cls.retryable) {
+            break; /* deterministic fault: reflected to the model, never retried */
+          }
+          var ladder = retryDelays();
+          if (attempt >= ladder.length) break;
+          /* Full jitter (SPEC §3): a ladder without jitter makes a rate
+           * limited fleet retry in lock-step. Interactive [r]etry already
+           * waited on a human, so it re-runs immediately. */
+          var delay = (obsMode === 'interactive') ? 0 : Math.floor(Math.random() * ladder[attempt]);
+          attempt++;
+          if (Date.now() - started + delay > d.budget.maxWallMs) {
+            emit('error_policy', { mode: obsMode, code: cls.code, op: tn,
+                                   attempt: attempt, wall: true,
+                                   message: 'retry refused: it would pass the wall budget' });
+            break;
+          }
+          obsEmit(runId, obsPath, 'retry', stepsTotal,
+                  { attempt: attempt, delay_ms: delay, code: cls.code, op: tn }, false);
+          if (state.cancelled) break;
+          if (delay > 0) await new Promise(function (rD) { setTimeout(rD, delay); });
+          if (state.cancelled) break;
+        }
+        var toolMs = Date.now() - toolStart;
+        obsEmit(runId, obsPath, 'tool_result', stepsTotal,
+                { id: String(callId || ''), name: tn,
+                  ok: !obsToolFault(text),
+                  bytes: String(text == null ? '' : text).length,
+                  ms: toolMs }, false);
+        return text;
+      }
+
+      /* SPEC §3 interactive mode. Reuses the ONE ask channel this file
+       * already owns (opts.onErrorPrompt, else the approval callback, else
+       * the approveInteractive parking lot) — a host that can render a y/n
+       * card can render this one. NO TTY or NO channel falls back to
+       * fail-stop and logs the warning the spec requires: an interactive
+       * policy that cannot ask must never guess. [e]dit is out of scope v1. */
+      async function obsAskError(cls, message, opName) {
+        var channel = obsAskChannel(opts);
+        if (!channel || !obsTty()) {
+          obsWarnInteractive(channel ? 'no tty' : 'no prompt channel');
+          return 'halt';
+        }
+        var info = { id: 'oe-' + runId + '-' + (++APPROVAL_SEQ), code: cls.code,
+                     op: String(opName || ''), retryable: cls.retryable,
+                     message: clip(String(message || ''), 600),
+                     choices: ['r', 's', 'i', 'h'] };
+        var inspects = 0;
+        for (;;) {
+          var raw = null;
+          var waitMs = opts.toolTimeoutMs || d.toolTimeoutMs;
+          try {
+            if (channel === 'onErrorPrompt') {
+              raw = await withTimeout(withCancelGuard(state, Promise.resolve(opts.onErrorPrompt(info))),
+                                      waitMs, 'onError prompt timed out');
+            } else if (channel === 'onApproval') {
+              raw = await withTimeout(withCancelGuard(state, Promise.resolve(opts.onApproval('on_error', info, info.id))),
+                                      waitMs, 'onError prompt timed out');
+            } else {
+              raw = await withTimeout(withCancelGuard(state, new Promise(function (resA) {
+                AGENT_PENDING_APPROVALS[info.id] = { resolve: resA, tool: 'on_error' };
+              })), waitMs, 'onError prompt timed out');
+            }
+          } catch (eAsk) {
+            raw = null; /* timeout, cancel and rejection all mean CANNOT ASK */
+          } finally {
+            delete AGENT_PENDING_APPROVALS[info.id];
+          }
+          var choice = obsChoiceFrom(raw);
+          if (choice === 'inspect') {
+            inspects++;
+            emit('error_policy', { mode: 'interactive', code: cls.code, op: String(opName || ''),
+                                   inspect: true, attempt: inspects,
+                                   message: clip(String(message || ''), 800) });
+            if (inspects >= 3) return 'halt';
+            continue;
+          }
+          if (!choice) return 'halt'; /* an unmappable answer must not guess */
+          emit('error_policy', { mode: 'interactive', code: cls.code, op: String(opName || ''),
+                                 choice: choice });
+          return choice;
+        }
+      }
+      function obsWarnInteractive(why) {
+        var st = obsState(runId);
+        if (st.warned) return; /* one warning per run, not one per fault */
+        st.warned = true;
+        var msg = 'onError=interactive unavailable (' + why + ') - falling back to fail-stop';
+        obsEmit(runId, obsPath, 'warning', stepsTotal,
+                { mode: 'interactive', reason: why, message: msg }, false);
+        emit('warn', { message: msg });
+      }
+
       async function execDelegate(args) {
         var childName = String((args && args.agent) || '');
         if (d.agents.indexOf(childName) < 0) {
@@ -4831,6 +5462,12 @@
           delete so.cacheAnchorCount; /* never mark a rewritten prefix */
         }
         if (!own.llmCalls) turnSections = reqSections(so.messages, so.tools, toolset.mcpNames);
+        /* SPEC §3: one turn_start per dispatched prompt, before the
+         * request leaves, so a run that dies inside the provider call
+         * still shows that a turn was open. */
+        obsEmit(runId, obsPath, 'turn_start', stepsTotal,
+                { round: own.llmCalls + 1, tools: tools.length,
+                  prompt_chars: obsMsgsChars(so.messages) }, false);
         var sres;
         try {
           sres = await streamWithRetry(so,
@@ -4916,6 +5553,12 @@
           cacheReadTokens: su.cacheReadTokens || 0, cacheWriteTokens: su.cacheWriteTokens || 0 },
           sections: (turnSections && own.llmCalls === 1) ? turnSections : undefined });
         var stcs = mergeStreamToolCalls(st.toolCalls || []);
+        /* SPEC §3: model_complete carries the finish reason and the
+         * tokens the loop already has in hand. */
+        obsEmit(runId, obsPath, 'model_complete', stepsTotal,
+                { round: own.llmCalls, finish_reason: String(su.finishReason || ''),
+                  tokens: { prompt: su.promptTokens || 0, completion: su.completionTokens || 0 },
+                  tool_calls: stcs.length }, false);
         /* P1.4 escalation: the model called a still-slim tool — promote it
          * to a full schema (sticky for the run), re-bill this attempt's
          * tokens + call, and re-stream with the expanded wire. Capped at
@@ -5096,7 +5739,7 @@
                   if (pIdx >= cchunk.items.length) return;
                   var pItem = cchunk.items[pIdx];
                   try {
-                    var pRes = await execOneTool(pItem.name, pItem.args, pItem.cid);
+                    var pRes = await execToolWithPolicy(pItem.name, pItem.args, pItem.cid);
                     parResults[pIdx] = { id: pItem.cid, name: pItem.name, args: pItem.args, result: String(pRes == null ? '' : pRes) };
                   } catch (e) {
                     parResults[pIdx] = { id: pItem.cid, name: pItem.name, args: pItem.args,
@@ -5119,7 +5762,7 @@
             for (var si = 0; si < cchunk.items.length; si++) {
               if (state.cancelled) { stopped = stopped || 'cancelled'; break; }
               var sItem = cchunk.items[si];
-              var stRes = await execOneTool(sItem.name, sItem.args, sItem.cid);
+              var stRes = await execToolWithPolicy(sItem.name, sItem.args, sItem.cid);
               loopMsgs.push({ role: 'assistant', content: null,
                               tool_calls: [{ id: sItem.cid, type: 'function',
                                              function: { name: sItem.name, arguments: JSON.stringify(sItem.args) } }] });
@@ -5128,6 +5771,22 @@
             if (state.cancelled) { stopped = stopped || 'cancelled'; break; }
           }
         }
+        /* SPEC §3 checkpoint — after a COMPLETED step, i.e. every tool
+         * pair of this round is in the transcript. This payload IS the
+         * rehydration unit opts.resumeFrom consumes, so the messages are
+         * the loop's real ones (size-capped, oldest dropped first) and
+         * the tokens are live. Durable: this is the resume point. */
+        obsEmit(runId, obsPath, 'checkpoint', stepsTotal, {
+          messages: obsCapMessages(loopMsgs, OBS_CHECKPOINT_CAP),
+          task: clip(String(task == null ? '' : task), 2000),
+          /* The EFFECTIVE model, not just the def's. A headless caller passes
+           * opts.model, so recording only d.model checkpoints an empty model
+           * and resume can never find one (observed: "No model configured"). */
+          model: String(opts.model || d.model || ''),
+          provider: String(opts.provider || d.provider || ''),
+          tokens: { prompt: own.promptTokens, completion: own.completionTokens },
+          last_tool: String(obsLastTool || ''),
+        }, true);
         /* Freshness gate boundary flush (§5/§16): stale verdicts queued
          * during this step's tool calls become ONE ephemeral user notice
          * before the next generation — advise only, data path untouched. */
@@ -5375,6 +6034,10 @@
         /* alloc gate Layer 1 — error learning (same as the tool loop):
          * a limit 400 teaches the real limit, retry once per kind. */
         if (!state.allocRetriedKinds) state.allocRetriedKinds = {};
+        /* SPEC §3: the plain (no-tools) turn logs the same pair. */
+        obsEmit(runId, obsPath, 'turn_start', stepsTotal,
+                { round: own.llmCalls + 1, tools: 0,
+                  prompt_chars: obsMsgsChars(msgs), plain: true }, false);
         var sres;
         for (;;) {
           try { sres = await streamWithRetry(o, onThink, onDelta); break; }
@@ -5413,6 +6076,10 @@
           promptTokens: u.promptTokens || 0, completionTokens: u.completionTokens || 0,
           cacheReadTokens: u.cacheReadTokens || 0, cacheWriteTokens: u.cacheWriteTokens || 0 },
           sections: faSections || undefined });
+        obsEmit(runId, obsPath, 'model_complete', stepsTotal,
+                { round: own.llmCalls, finish_reason: String(u.finishReason || ''),
+                  tokens: { prompt: u.promptTokens || 0, completion: u.completionTokens || 0 },
+                  tool_calls: 0, plain: true }, false);
         var text = parts.join('').trim() || (state.cancelled ? '(cancelled)' : '(no response)');
         if (state.cancelled) stopped = stopped || 'cancelled';
         /* Same empty-stream recovery as the tool loop (see there): react to
@@ -5520,6 +6187,19 @@
         } catch (e) {}
       }
     } catch (e) {
+      /* SPEC §3 fatal path: fatal_error -> halt -> crash card, then the
+       * existing cleanup untouched. A thrown run must never leave the log
+       * without a terminal event; a CANCEL is a stop, not a failure, so it
+       * gets the plain halt instead of a crash card. */
+      try {
+        if (state.cancelled) {
+          obsTerminal(runId, obsPath, (typeof stepsTotal === 'number' ? stepsTotal : 0),
+                      'cancelled',
+                      { prompt: own.promptTokens, completion: own.completionTokens }, 0);
+        } else {
+          obsFatal(runId, obsPath, (typeof stepsTotal === 'number' ? stepsTotal : 0), e, obsCtx());
+        }
+      } catch (eObs) {}
       try { if (sofuu.tools && sofuu.tools.endRunScope) sofuu.tools.endRunScope(String(runId)); } catch (eSc) {}
       delete ACTIVE[runId];
       delete SIGNALS[cancelId];
@@ -6011,6 +6691,13 @@
   /* Retry-policy classifier (see STREAM_TRANSIENT_RE) — exposed for tests
    * and consumers that need the same transient/permanent distinction. */
   A.isTransientProviderError = isTransientProviderError;
+  /* Observability + error policy (OBSERVABILITY-SPEC §0/§3): the ONE
+   * classifier the policy engine runs, the resolved policy mode (throws on
+   * an unknown value so a typo cannot silently mean another policy), and
+   * the run-log path a CLI or a test can compute without starting a run. */
+  A.classifyError = classifyError;
+  A.onErrorMode = onErrorMode;
+  A.obsRunPath = obsRunPath;
   /* (A.memoryBackend export removed — AUDIT-2026-09-07 P3: zero consumers;
    * the backend a brain opens is resolved internally at run()/brainFor.) */
   /* The ONE brain handle for a def — the same BRAINS-cached entry a run()

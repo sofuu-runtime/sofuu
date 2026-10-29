@@ -341,6 +341,27 @@ Full guide: [docs/PLUGINS.md](docs/PLUGINS.md) · runnable examples:
 
 ---
 
+## 24/7 Agent Observability & Crash Recovery
+
+Sofuu includes an append-only JSONL trace substrate designed for reliable, long-running autonomous agents:
+
+* **Append-Only Tracing** — Every turn and step appends to `.sofuu/logs/agent-<run_id>.jsonl` with total-order sequence numbers (`seq`), timestamps, and step counters.
+* **Secret Redaction** — Sensitive API keys, tokens, and passwords are automatically scrubbed at the write choke point before touching disk.
+* **Fsync Durability** — Checkpoint events barrier through kernel `fsync()`. Tested against `SIGKILL` with zero data loss.
+* **Post-Mortem Cards** — Unhandled crashes generate diagnostic cards in `.sofuu/crashes/<crash_id>.json` capturing the failed step, tool inputs, stack traces, and suggested fixes.
+* **Checkpointed Resume** — Transparently restart execution from the last valid checkpoint with `sofuu resume <run_id>`.
+
+```bash
+sofuu logs                     # List past agent runs with derived status
+sofuu logs show <run_id>       # Render colored, step-by-step transcript
+sofuu logs --last-error        # View post-mortem card for the most recent failure
+sofuu resume <run_id>          # Resume an interrupted or halted run from its last checkpoint
+```
+
+Full guide: [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) · specification: [docs/OBSERVABILITY-SPEC.md](docs/OBSERVABILITY-SPEC.md).
+
+---
+
 ## CLI Reference
 
 ```bash
@@ -355,6 +376,10 @@ sofuu bundle <entry.js> [-o <out.js>]  # Bundle into one file
 sofuu install / add <package>          # npm packages
 sofuu agent list             # List agent definitions (~/.sofuu/agents/*.js)
 sofuu agent run <name> "task" [--json] # Run one agent headless
+sofuu plugin list|validate|test|init   # Manage and test 5-shield plugins
+sofuu logs [--last-error]    # Inspect runs and crash post-mortem cards
+sofuu logs show <run_id>     # Step-by-step trace transcript
+sofuu resume <run_id>        # Resume execution from last checkpoint
 sofuu serve --brain <path>   # OpenAI-compatible HTTP server (--model, --model-id, --host, --port)
 sofuu doctor                 # Health check: QTSQ link, brain round-trip, ctx
 sofuu version / help

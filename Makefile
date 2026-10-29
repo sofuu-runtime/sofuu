@@ -37,6 +37,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # ──────────────────────────────────────────────────────────────────
 
 .PHONY: all clean install test protocol-test serve-test c-only size-check bc-check cargo-build \
+	observability-stress \
         deps scoreboard scoreboard-check \
         libsofuu zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
@@ -134,15 +135,22 @@ dist-dryrun: libsofuu
 #   plugin-stress  — the adversarial suite: the 5 shields, concurrency,
 #                    providers, mirror writes, service hooks, OpenAPI/YAML.
 plugin-check: $(TARGET)
-	@$(TARGET) run scripts/stress/plugin_types_check.js
-	@for f in plugins/*.ts; do $(TARGET) plugin validate "$$f" >/dev/null || exit 1; done; \
+	@./$(TARGET) run scripts/stress/plugin_types_check.js
+	@for f in plugins/*.ts; do ./$(TARGET) plugin validate "$$f" >/dev/null || exit 1; done; \
 	echo "  ✓ cookbook plugins validate"
 
 plugin-stress: $(TARGET)
-	@$(TARGET) run scripts/stress/plugin_stress.js
+	@./$(TARGET) run scripts/stress/plugin_stress.js
 
 plugin-stress-fast: $(TARGET)
-	@$(TARGET) run scripts/stress/plugin_stress.js --fast
+	@./$(TARGET) run scripts/stress/plugin_stress.js --fast
+
+# OBSERVABILITY_PLAN: the trace substrate is the recovery path for 24/7 runs,
+# so it gets the same adversarial treatment as the plugin layer — plus the
+# CLI round-trip (logs / last-error / resume) that an operator actually types.
+observability-stress: $(TARGET)
+	@./$(TARGET) run scripts/stress/observability_stress.js
+	@bash scripts/stress/observability_e2e.sh
 
 # ── Size cap check (CI: fails if binary exceeds 5MB) ────────────
 size-check: $(TARGET)

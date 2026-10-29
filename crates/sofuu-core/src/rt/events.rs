@@ -11,9 +11,14 @@
 //   sofuu.events.schema()                       the §7.2 definition
 //   sofuu.events.validate(event)                {ok, errors[]}
 //   sofuu.events.redact(event)                  secret-bearing fields stripped
-//   sofuu.events.append({project, sid, events}) validate + redact + ndjson
-//   sofuu.events.read({project, sid})           parse + validate the log
+//   sofuu.events.append({project, sid, events, path, durable})
+//                                               validate + redact + ndjson
+//   sofuu.events.read({project, sid, path})     parse + validate the log
 //   sofuu.events.reconstruct({project, sid})    fold events into turn records
+//
+// The 24/7 agent plan writes its run logs (`<project>/.sofuu/logs/`) through
+// this same append and reads them back in `rt/observability.rs`: one format,
+// one validator, only the directory differs (OBSERVABILITY-SPEC §1/§2).
 //
 // Phase P2 (R6.1/R6.2/R6.6). This module only reads and appends; it changes
 // no engine behavior.
@@ -36,11 +41,16 @@ pub const KINDS: [&str; 10] = [
 /// Kinds the shipped drivers additionally emit, recognized with envelope-only
 /// validation (identity fields required, no payload rules). The required ten
 /// are a subset; a driver may not invent kinds outside this registry.
-pub const KNOWN_KINDS: [&str; 23] = [
+pub const KNOWN_KINDS: [&str; 36] = [
     "start", "plan", "think", "answer", "answer_delta", "llm", "delegate", "recall",
     "consolidated", "stored", "learned", "evidence", "schema", "verify", "warn", "mlgate",
     "allocgate", "compact", "done", "approval_request", "approval_resolved",
     "prompt", "tools",
+    // OBSERVABILITY plan §Component 1: the agent run vocabulary. Envelope-only
+    // validation — the payloads belong to the driver, the envelope is ours.
+    "run_start", "turn_start", "tool_call", "model_complete", "memory_recall",
+    "memory_store", "checkpoint", "warning", "fatal_error", "retry", "halt",
+    "run_complete", "stream_chunk",
 ];
 
 pub const SURFACES: [&str; 6] = ["js", "cli", "http", "cabi", "swift", "kotlin"];
@@ -219,27 +229,167 @@ pub(crate) fn log_path(project: &str, sid: &str) -> PathBuf {
     sessions_dir(project, sid).join("events.ndjson")
 }
 
-fn last_seq(path: &PathBuf) -> u64 {
-    let Ok(f) = std::fs::File::open(path) else {
+/// Advisory lock held for one append batch. A run log can have two writers at
+/// once (a parent agent and the subagent it spawned, or two headless runs
+/// sharing a run id); without this the read-tail-then-append sequence races and
+/// both writers mint the same seq. Mirrors the output-archive lock so the tree
+/// keeps one locking idiom (see output_archive::with_archive_lock).
+struct LogLock(#[allow(dead_code)] std::fs::File);
+
+impl LogLock {
+    fn acquire(file: &std::fs::File) -> Result<LogLock, String> {
+        let handle = file.try_clone().map_err(|e| format!("lock clone: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: the duplicated descriptor stays open for as long as the guard lives.
+            if unsafe { libc::flock(handle.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err("cannot lock the event log".into());
+            }
+        }
+        #[cfg(windows)]
+        {
+            if handle.lock().is_err() {
+                return Err("cannot lock the event log".into());
+            }
+        }
+        Ok(LogLock(handle))
+    }
+}
+
+impl Drop for LogLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: same open file description that took the lock.
+            let _ = unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
+        #[cfg(windows)]
+        {
+            let _ = self.0.unlock();
+        }
+    }
+}
+
+/// Last seq already on disk, read under the batch lock. Scans the tail first:
+/// a 24/7 run log grows to megabytes, and re-reading all of it on every append
+/// turns the loop quadratic. Falls back to a full scan only when the tail holds
+/// no parseable seq (huge lines, or a log shorter than the window).
+fn last_seq_locked(file: &mut std::fs::File) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL: u64 = 64 * 1024;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len == 0 {
         return 0;
+    }
+    let start = len.saturating_sub(TAIL);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return 0;
+    }
+    let mut buf = String::new();
+    if file.read_to_string(&mut buf).is_err() {
+        return 0;
+    }
+    // A tail window that starts mid-file begins mid-line; drop that fragment.
+    let text = if start > 0 {
+        match buf.find('\n') {
+            Some(i) => &buf[i + 1..],
+            None => "",
+        }
+    } else {
+        buf.as_str()
     };
-    let reader = std::io::BufReader::new(f);
     let mut last = 0u64;
-    for line in reader.lines().map_while(Result::ok) {
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
+    for line in text.lines() {
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
             if let Some(s) = v.get("seq").and_then(Value::as_u64) {
                 last = s;
             }
         }
     }
+    if last == 0 && start > 0 {
+        return file
+            .seek(SeekFrom::Start(0))
+            .ok()
+            .and_then(|_| {
+                let mut all = String::new();
+                file.read_to_string(&mut all).ok().map(|_| all)
+            })
+            .map(|all| {
+                all.lines()
+                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                    .filter_map(|v| v.get("seq").and_then(Value::as_u64))
+                    .last()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+    }
     last
 }
 
-/// Validate + redact + append events to the session's events.ndjson.
+/// Kinds whose batch forces `sync_all` even without `durable`: these are the
+/// events that move the resume point (checkpoint) or end the run, which is
+/// exactly the window the plan's crash-resilience guarantee covers
+/// (OBSERVABILITY-SPEC §2).
+fn forces_sync(kind: &str) -> bool {
+    matches!(
+        kind,
+        "checkpoint" | "halt" | "fatal_error" | "run_complete" | "stop"
+    )
+}
+
+/// `run_id` is the plan spelling of the identity `sid` already carries (§0),
+/// so it is folded in before validation rather than refused: a plan-shaped
+/// event then validates exactly as written.
+fn normalise_run_id(ev: &mut Value) {
+    let Some(obj) = ev.as_object_mut() else {
+        return;
+    };
+    if obj.get("sid").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+        return;
+    }
+    let Some(run_id) = obj.get("run_id").and_then(Value::as_str) else {
+        return;
+    };
+    if !run_id.is_empty() {
+        obj.insert("sid".into(), json!(run_id));
+    }
+}
+
+/// Where a batch (or a read) lands: an explicit `path` wins — relative paths
+/// resolve against `project`, so a driver can pass
+/// `.sofuu/logs/agent-<run_id>.jsonl` unchanged — and the session directory
+/// owns the file otherwise.
+fn log_target(project: &str, sid: &str, args: &Value) -> Result<PathBuf, Value> {
+    let raw = match args.get("path") {
+        None => return Ok(log_path(project, sid)),
+        Some(v) if v.is_null() => return Ok(log_path(project, sid)),
+        Some(v) => v.as_str().unwrap_or(""),
+    };
+    // `..` would walk out of the project tree: these logs are project-local
+    // artifacts, never a general-purpose file writer.
+    if raw.is_empty() || raw.contains("..") {
+        return Err(json!({"ok": false, "code": "E_SCHEMA", "message": "invalid path"}));
+    }
+    let p = PathBuf::from(raw);
+    Ok(if p.is_absolute() { p } else { PathBuf::from(project).join(p) })
+}
+
+/// Validate + redact + append events to a log file: the session's
+/// events.ndjson, or the explicit `path` the agent runs write to.
 /// Assigns `seq` when absent; rejects regressions (R6.3: total order).
+///
+/// `durable` forces `sync_all` after the batch; the checkpoint-class kinds
+/// force it regardless, because the resume point is the one line that must
+/// survive a power loss (OBSERVABILITY plan §Component 1).
 pub fn append(args: &Value) -> Value {
     let project = args.get("project").and_then(Value::as_str).unwrap_or(".");
-    let Some(sid) = args.get("sid").and_then(Value::as_str) else {
+    let sid = args
+        .get("sid")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("run_id").and_then(Value::as_str));
+    let Some(sid) = sid else {
         return json!({"ok": false, "code": "E_SCHEMA", "message": "sid is required"});
     };
     if sid.contains('/') || sid.contains("..") || sid.is_empty() {
@@ -258,23 +408,41 @@ pub fn append(args: &Value) -> Value {
             "message": format!("event batch exceeds the {} event bound", max_events)});
     }
 
-    let dir = sessions_dir(project, sid);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return json!({"ok": false, "code": "E_INTERNAL", "message": "cannot create the session directory"});
+    let path = match log_target(project, sid, args) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() && std::fs::create_dir_all(parent).is_err() {
+            return json!({"ok": false, "code": "E_INTERNAL", "message": "cannot create the log directory"});
+        }
     }
-    let path = log_path(project, sid);
-    let mut seq = last_seq(&path);
-    let mut written = 0usize;
-    let mut errors: Vec<Value> = Vec::new();
-
-    let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    // read+append: the tail scan below needs to read, and O_APPEND still
+    // guarantees every write lands at EOF regardless of the read cursor.
+    let mut file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .open(&path)
+    {
         Ok(f) => f,
         Err(e) => {
             return json!({"ok": false, "code": "E_INTERNAL", "message": format!("open: {e}")})
         }
     };
+    // Held until this function returns: it makes "read the last seq, then
+    // append this batch" atomic against another process doing the same.
+    let _lock = match LogLock::acquire(&file) {
+        Ok(l) => l,
+        Err(e) => return json!({"ok": false, "code": "E_INTERNAL", "message": e}),
+    };
+    let mut seq = last_seq_locked(&mut file);
+    let mut written = 0usize;
+    let mut errors: Vec<Value> = Vec::new();
+    let mut sync_wanted = args.get("durable").and_then(Value::as_bool).unwrap_or(false);
     for ev in events {
         let mut ev = redact(ev);
+        normalise_run_id(&mut ev);
         // Auto-assign seq when the caller did not; reject regressions.
         if ev.get("seq").and_then(Value::as_u64).is_none() {
             seq += 1;
@@ -294,12 +462,33 @@ pub fn append(args: &Value) -> Value {
             errors.push(json!({"seq": ev.get("seq"), "errors": errs}));
             continue;
         }
-        if let Ok(line) = serde_json::to_string(&ev) {
-            if file.write_all(line.as_bytes()).is_ok()
-                && file.write_all(b"\n").is_ok()
-            {
+        if let Ok(mut line) = serde_json::to_string(&ev) {
+            // ONE write syscall for the whole line. Body-then-newline is two
+            // syscalls, and O_APPEND only makes a single write atomic: a
+            // concurrent appender slipping between them glues two JSON objects
+            // onto one line and both records are lost (stress case A11).
+            line.push('\n');
+            if file.write_all(line.as_bytes()).is_ok() {
                 written += 1;
+                // Only a line that actually landed moves the resume point.
+                if forces_sync(ev.get("kind").and_then(Value::as_str).unwrap_or("")) {
+                    sync_wanted = true;
+                }
             }
+        }
+    }
+    // Flush unconditionally: `File` is unbuffered today, so this costs nothing
+    // now and keeps "the batch left the process" a property of the writer if
+    // the handle ever becomes buffered.
+    let _ = file.flush();
+    let mut synced = false;
+    if sync_wanted {
+        if file.sync_all().is_ok() {
+            synced = true;
+        } else {
+            // A failed fsync means the batch is NOT durable; say so instead of
+            // reporting `ok`.
+            errors.push(json!({"error": "sync_all failed"}));
         }
     }
     json!({
@@ -308,16 +497,25 @@ pub fn append(args: &Value) -> Value {
         "written": written,
         "seq_end": seq,
         "errors": errors,
+        "synced": synced,
     })
 }
 
-/// Read + validate a session's event log.
+/// Read + validate a session's event log, or the explicit `path` a run log
+/// lives at (same resolution rules as `append`).
 pub fn read(args: &Value) -> Value {
     let project = args.get("project").and_then(Value::as_str).unwrap_or(".");
-    let Some(sid) = args.get("sid").and_then(Value::as_str) else {
+    let sid = args
+        .get("sid")
+        .and_then(Value::as_str)
+        .or_else(|| args.get("run_id").and_then(Value::as_str));
+    let Some(sid) = sid else {
         return json!({"ok": false, "code": "E_SCHEMA", "message": "sid is required"});
     };
-    let path = log_path(project, sid);
+    let path = match log_target(project, sid, args) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     let Ok(f) = std::fs::File::open(&path) else {
         return json!({"ok": true, "events": [], "count": 0, "path": path.display().to_string()});
     };
@@ -515,7 +713,7 @@ pub fn schema() -> Value {
         "schema_version": SCHEMA_VERSION,
         "envelope_fields": ENVELOPE_FIELDS,
         "required_kinds": KINDS,
-        "known_kinds": KNOWN_KINDS,
+        "known_kinds": &KNOWN_KINDS[..],
         "surfaces": SURFACES,
         "stop_reasons": STOP_REASONS,
         "required_payload": payload,

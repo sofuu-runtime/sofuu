@@ -430,6 +430,9 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         // P2 (SPEC §7/§3): the event envelope + the async contract, so every
         // driver and host can validate events and speak one error shape.
         crate::rt::events::mod_events_register(ctx);
+        // OBSERVABILITY (contract §2): runs/lastCheckpoint/postmortem/crashCard
+        // over the same envelope, for `sofuu logs` and `sofuu resume`.
+        crate::rt::observability::mod_observability_register(ctx);
         crate::rt::async_contract::mod_async_contract_register(ctx);
         // Hosted-auth primitive: RS256 JWT verification against a JWKS
         // (OIDC/JWT providers). Registered after `sofuu` exists, before the

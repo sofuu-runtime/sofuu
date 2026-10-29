@@ -4,6 +4,67 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## 24/7 Agent Observability, Tracing & Recovery — 2026-10-29
+
+Implementation of `OBSERVABILITY_PLAN.md`: a durable per-run trace, a declared
+failure policy, crash post-mortems, and checkpointed resume.
+
+- **One envelope, one writer** — agent runs append the §7.2 envelope to
+  `.sofuu/logs/agent-<run_id>.jsonl`; chat keeps
+  `.sofuu/sessions/<sid>/events.ndjson`. Same validator, same secret
+  redactor, same `rt/events.rs` append path — only the directory differs.
+  `run_id` is accepted as an alias for `sid`, so a plan-shaped event
+  validates exactly as written. Thirteen kinds join the registry
+  (`run_start`, `turn_start`, `tool_call`, `model_complete`,
+  `memory_recall`, `memory_store`, `checkpoint`, `warning`,
+  `fatal_error`, `retry`, `halt`, `run_complete`, `stream_chunk`).
+- **Durability** — every batch is flushed, and a batch carrying a
+  `checkpoint`, `halt`, `fatal_error`, `run_complete` or `stop` is
+  `fsync`ed and reports `synced: true`. A `kill -9` loses nothing already
+  written; a power loss loses only events after the last checkpoint.
+- **Concurrent writers are safe** — found by the stress suite (case A11). The
+  writer issued two `write_all` calls (body, then newline) and `O_APPEND`
+  only makes a *single* write atomic, so a second process could land between
+  them and glue two records onto one line — 19 of 200 appends were lost while
+  every writer reported success. Writes are now one syscall per line, and a
+  per-batch `flock` makes read-tail-then-append atomic, so `seq` stays unique
+  across processes. `last_seq` reads a 64 KB tail instead of the whole log,
+  which removes a quadratic re-read from every append.
+- **Error policy** — `--on-error=auto-retry|fail-stop|interactive` (also
+  `SOFUU_ON_ERROR`), defaulting to `interactive` on a TTY and `auto-retry`
+  otherwise; an unknown mode is refused rather than silently meaning the
+  default. `auto-retry` reuses the existing stream ladder with full jitter and
+  now also covers tool faults; five consecutive classified errors trip the
+  circuit (`E_CIRCUIT_OPEN`); `interactive` degrades to `fail-stop` with a
+  `warning` event when there is no TTY. `[e]dit` in `$EDITOR` is out of scope
+  for v1 and documented as such.
+- **Post-mortems** — `.sofuu/crashes/<crash_id>.json` carries the plan's card
+  shape (failed step, error code and message, stack, context snapshot,
+  recovery hint, trace path); `sofuu logs --last-error` renders it.
+- **Checkpoint and resume** — a checkpoint is written after every completed
+  turn, including turns that never entered the tool loop (otherwise resume has
+  nothing to rehydrate for the most common run shape), and it is capped so a
+  long run checkpoints its recent window. `sofuu resume <run_id> [--step=N]
+  [--force]` rehydrates the newest *valid* checkpoint — skipping a torn tail
+  line — reloads `~/.sofuu/agents`, adopts the checkpoint's model and
+  provider, and continues from the next step. A completed run is refused
+  without `--force`.
+- **CLI** — `sofuu logs`, `logs show <id>`, `logs --follow`,
+  `logs --last-error`, `sofuu resume`. Rendering lives in
+  `src/js/observability.js` and ships as compressed bytecode; `main.rs` stays
+  a thin shim, which is what keeps the feature inside the size cap.
+- **Typings** — `sofuu.d.ts` declares `sofuu.observability.*`,
+  `sofuu.agent.classifyError` and the `OnErrorMode` union. The plan's proposed
+  codes `E_NETWORK_TIMEOUT`, `E_SERVER_ERROR` and `E_UNCAUGHT_THROW` are
+  deliberately absent: they are mapped onto the normative taxonomy
+  (`E_TIMEOUT`, `E_TOOL`, `E_SCHEMA`, `E_DENIED`) so cross-surface error
+  parity (R5.1) still holds.
+- **Gates** — `make observability-stress` runs 13 adversarial cases
+  (`scripts/stress/observability_stress.js`: redaction, seq total order,
+  backpressure, `kill -9` durability, four concurrent writers, torn lines,
+  crash cards) plus a 7-case CLI e2e (`tests/observability_e2e.sh`).
+  Conformance stays 51 PASS / 0 FAIL / 1 BLOCKED.
+
 ## Universal Plugin & Extensibility System — 2026-10-29
 
 Implementation of PLUGIN_PLAN.md: five plugin categories behind one runtime,

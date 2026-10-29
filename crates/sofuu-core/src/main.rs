@@ -82,6 +82,14 @@ fn print_help() {
     println!("  sofuu agent list         List agent definitions (~/.sofuu/agents/*.js)");
     println!("  sofuu agent run <name> \"task\"  Run one agent headless");
     println!("  sofuu agent run <name> \"task\" --json   …with a JSON result");
+    /* OBSERVABILITY-SPEC §4: the observation surface sits next to the agent
+     * commands because that is what it observes. Descriptions start at the
+     * same column as every other line in this block. */
+    println!("  sofuu logs               List recent runs: id, start, steps, status");
+    println!("  sofuu logs show <id>     Render one run's event trace");
+    println!("  sofuu logs --follow      Stream a run's log live (Ctrl-C exits)");
+    println!("  sofuu logs --last-error  Post-mortem box for the newest crash");
+    println!("  sofuu resume <id>        Resume an interrupted agent run from its checkpoint");
     println!("  sofuu plugin list        List plugins in ./plugins/ and ~/.sofuu/plugins/");
     println!("  sofuu plugin validate <f> Validate plugin syntax, export, and schema");
     println!("  sofuu plugin run <tool>  Execute a plugin tool with 5-shield safety");
@@ -190,6 +198,8 @@ fn print_subcommand_help(cmd: &str) -> bool {
              Compile a shipped JS driver to a QuickJS bytecode snapshot.\n"
         ),
         "agent" | "agents" => print_agent_help(),
+        "logs" => print_logs_help(),
+        "resume" => print_resume_help(),
         "plugin" | "plugins" => print_plugin_help(),
         "session" | "sessions" => print_session_help(),
         "outputs" | "output" => print_outputs_help(),
@@ -283,7 +293,12 @@ fn print_chat_help() {
                --brain               use the on-device brain\n\
                --sync on|off         session mesh sync (--no-sync is --sync off)\n\
                --ctx-window, --ctx <n>     context window in tokens (0 = provider default)\n\
-               --max-output, --maxout, --max-tokens <n>   max output tokens per response\n\n\
+               --max-output, --maxout, --max-tokens <n>   max output tokens per response\n\
+               --on-error=<mode>     auto-retry | fail-stop | interactive;\n\
+                                     sets SOFUU_ON_ERROR for this session\n\n\
+         \x1b[1mEnvironment:\x1b[0m\n\
+           SOFUU_ON_ERROR         terminal-failure policy, same three values;\n\
+                                  --on-error exports it for the session it starts\n\n\
          Chat commands are listed in `sofuu help`.\n"
     );
 }
@@ -327,7 +342,50 @@ fn print_agent_help() {
            validate <file.js>         dry-run a definition with precise errors\n\n\
          \x1b[1mOptions:\x1b[0m\n\
                --json             emit the result as JSON (run)\n\
+               --on-error=<mode>  auto-retry | fail-stop | interactive (run)\n\
                --policy <file>    policy file applied before the agent starts\n"
+    );
+}
+
+/// OBSERVABILITY-SPEC §4. Every flag below is one cmd_logs accepts; a bare
+/// run id is shorthand for show.
+fn print_logs_help() {
+    println!(
+        "\x1b[1mUsage:\x1b[0m sofuu logs [subcommand]\n\n\
+           list | ls                 recent runs (default): id, start, steps, status\n\
+           show <run_id>             rendered event trace for one run\n\
+           follow [run_id]           stream a run's log (Ctrl-C exits)\n\
+           last-error [run_id]       post-mortem box for the newest crash\n\n\
+         \x1b[1mOptions:\x1b[0m\n\
+           -f, --follow              same as follow\n\
+               --last-error          same as last-error\n\n\
+         Agent runs log to .sofuu/logs/agent-<run_id>.jsonl, chat sessions to\n\
+         .sofuu/sessions/<sid>/events.ndjson, crash cards to .sofuu/crashes/.\n\
+         Rendering lives in the shipped driver src/js/observability.js.\n"
+    );
+}
+
+/// OBSERVABILITY-SPEC §4. --force and --step=N are the two knobs a resume
+/// needs; --agent exists because a log that lost its run_start event cannot
+/// name the definition to re-enter.
+fn print_resume_help() {
+    println!(
+        "\x1b[1mUsage:\x1b[0m sofuu resume <run_id> [options]\n\n\
+         Continue an interrupted agent run from its last checkpoint: the loop\n\
+         re-enters at the checkpoint's step with the same messages, task, model\n\
+         and provider, so a crash costs one turn instead of the whole run.\n\n\
+         \x1b[1mOptions:\x1b[0m\n\
+               --step=<n>         resume from the checkpoint recorded at step n\n\
+                                  (default: the newest checkpoint)\n\
+               --force            resume a run whose log already ended in\n\
+                                  run_complete; without it a finished run is\n\
+                                  refused, because replaying it may spend tokens\n\
+                                  on an answer that already exists\n\
+               --agent=<name>     which definition to re-enter (default: the\n\
+                                  run_start event's name)\n\
+               --on-error=<mode>  auto-retry | fail-stop | interactive\n\
+               --json             emit the result as JSON\n\
+               --policy <file>    policy file applied before the run resumes\n"
     );
 }
 
@@ -533,6 +591,60 @@ fn take_policy_arg(args: &[String]) -> (Option<String>, Vec<String>) {
     (path, out)
 }
 
+/// `--on-error=<mode>` / `--on-error <mode>` - pull a run's terminal-failure
+/// policy out of an argument list before the command's own parser sees it
+/// (OBSERVABILITY-SPEC §3). Shaped exactly like take_policy_arg, so the
+/// pre-parsers in front of the runtime can be read as one family.
+fn take_on_error_arg(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut mode: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--on-error" {
+            if i + 1 < args.len() {
+                mode = Some(args[i + 1].clone());
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else if let Some(rest) = args[i].strip_prefix("--on-error=") {
+            mode = Some(rest.to_string());
+            i += 1;
+        } else {
+            out.push(args[i].clone());
+            i += 1;
+        }
+    }
+    (mode, out)
+}
+
+/// The three modes the agent driver accepts (SPEC §3). A typo fails the
+/// command here instead of silently running with the default policy - the
+/// one thing worse than no policy is thinking you set one.
+fn parse_on_error_mode(mode: &str) -> Result<&'static str, String> {
+    match mode {
+        "auto-retry" => Ok("auto-retry"),
+        "fail-stop" => Ok("fail-stop"),
+        "interactive" => Ok("interactive"),
+        other => Err(format!(
+            "--on-error '{other}': want auto-retry, fail-stop, or interactive"
+        )),
+    }
+}
+
+/// `sofuu chat --on-error=<mode>`: the chat turn engine is the Rust UI in
+/// chat.rs, whose ChatConfig has no error-policy field, so the flag cannot
+/// ride through as an option the way `sofuu agent run`'s does. Its contract is the
+/// ENVIRONMENT instead: SOFUU_ON_ERROR is exported for this process before
+/// the chat config is loaded, which is the one channel a chat-side reader can
+/// consume without a signature change (and the same variable an operator or a
+/// wrapper script can set without the flag at all).
+fn apply_on_error_env(mode: &str) -> Result<(), String> {
+    let canonical = parse_on_error_mode(mode)?;
+    std::env::set_var("SOFUU_ON_ERROR", canonical);
+    Ok(())
+}
+
 /// Load a policy JSON file and install it. Fail closed: an unreadable,
 /// non-JSON or rejected policy aborts the command instead of running with
 /// defaults.
@@ -557,7 +669,10 @@ pub(crate) fn apply_policy_file(rt: &SofuuRuntime, path: &str) -> Result<(), Str
 /// the headless agent surface (PLAN-AGENTS A8.2). Everything runs in the
 /// engine's shipped agent runtime (src/js/agent.js); this is just CLI
 /// sugar: load ~/.sofuu/agents/*.js, then list or one-shot run.
-fn cmd_agent(rt: &SofuuRuntime, args: &[String]) -> i32 {
+/// `on_error` is the run's terminal-failure policy (OBSERVABILITY-SPEC
+/// §3), pre-parsed by the dispatcher so a typo fails before the engine
+/// starts; None leaves the driver's own TTY-aware default in place.
+fn cmd_agent(rt: &SofuuRuntime, args: &[String], on_error: Option<&str>) -> i32 {
     if args.len() < 3 {
         eprintln!("\x1b[1mUsage:\x1b[0m");
         eprintln!("  sofuu agent list");
@@ -726,6 +841,16 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String]) -> i32 {
             }
             let name_js = serde_json::to_string(&name).unwrap_or_else(|_| "\"\"".into());
             let task_js = serde_json::to_string(&task).unwrap_or_else(|_| "\"\"".into());
+            /* §3: the policy rides through opts.onError. The key is only
+             * sent when the operator named a mode, because the driver owns
+             * the default (interactive on a TTY, auto-retry otherwise). */
+            let on_error_js = match on_error {
+                Some(mode) => format!(
+                    "onError: {},",
+                    serde_json::to_string(mode).unwrap_or_else(|_| "\"auto-retry\"".into())
+                ),
+                None => String::new(),
+            };
             let on_step = if json {
                 // Keep stdout pure JSON; progress lines go to stderr.
                 r#"onStep: function (e) {
@@ -774,6 +899,7 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String]) -> i32 {
   }}
   try {{
     const r = await sofuu.agent.run({name_js}, {task_js}, {{
+      {on_error_js}
       {on_step}
     }});
     if (r && r.answer && String(r.answer).trim()) {{
@@ -800,7 +926,343 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String]) -> i32 {
         }
     }
 }
+/// `sofuu logs [list | show <run_id> | --follow [run_id] | --last-error]`
+/// - the observability surface (OBSERVABILITY-SPEC §4). A thin eval shim
+/// exactly like cmd_agent: this fn turns the CLI's flags into the argv array
+/// the shipped renderer (src/js/observability.js) takes, the renderer
+/// prints, and its return value is the exit code (0 ok, 1 the named run is
+/// missing or unreadable, 2 usage). All of the formatting lives in JS so a
+/// column change never touches the size-capped binary (§0).
+fn cmd_logs(rt: &SofuuRuntime, args: &[String]) -> i32 {
+    let mut sub: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut follow = false;
+    let mut last_error = false;
+    for a in &args[2..] {
+        match a.as_str() {
+            "--follow" | "-f" => follow = true,
+            "--last-error" | "--last" => last_error = true,
+            "-h" | "--help" => {
+                print_logs_help();
+                return 0;
+            }
+            s if sub.is_none() && matches!(s, "list" | "ls" | "show" | "follow" | "last-error") => {
+                sub = Some(s.to_string());
+            }
+            s if s.starts_with('-') => {
+                eprintln!("\x1b[31mError:\x1b[0m logs: unknown flag '{s}'");
+                print_logs_help();
+                return 2;
+            }
+            s => rest.push(s.to_string()),
+        }
+    }
+    /* --follow / --last-error are FLAGS on the CLI (§4) and subcommands in
+     * argv[0] for the renderer; a bare run id is shorthand for show. */
+    let mut argv: Vec<String> = Vec::new();
+    if last_error {
+        argv.push("last-error".to_string());
+    } else if follow {
+        argv.push("follow".to_string());
+    } else if let Some(s) = sub.as_deref() {
+        argv.push(if s == "ls" { "list".to_string() } else { s.to_string() });
+    } else if !rest.is_empty() {
+        argv.push("show".to_string());
+    } else {
+        argv.push("list".to_string());
+    }
+    argv.extend(rest);
+    let argv_js = serde_json::to_string(&argv).unwrap_or_else(|_| "[]".into());
+    let code = format!(
+        r#"(async function () {{
+  if (!sofuu.observability || typeof sofuu.observability.cli !== 'function') {{
+    console.error('logs: the observability driver is not loaded in this build');
+    process.exit(1);
+  }}
+  /* argv[0] is the subcommand (list | show | follow | last-error); the shim
+   * above only turned flags into it. The renderer owns the printing and its
+   * return value is this command's exit code. */
+  const rc = await sofuu.observability.cli({argv_js});
+  if (typeof rc === 'number' && rc !== 0) process.exit(rc);
+}})().catch(function (e) {{ console.error(String((e && e.message) || e)); process.exit(1); }});"#
+    );
+    rt.eval_string(&code, "<logs>")
+}
 
+/// `sofuu resume <run_id> [--step=N] [--force] [--agent=<name>]`
+/// - continue an interrupted agent run from its checkpoint
+/// (OBSERVABILITY-SPEC §3/§4). The checkpoint IS the rehydration unit: the
+/// loop re-enters at its step with the same messages, task, model and
+/// provider, so a crash costs one turn instead of a whole run.
+///
+/// --force resumes a run whose log already ended in run_complete (without it
+/// a finished run is refused, because replaying it may spend tokens on an
+/// answer that already exists). --step=N picks the checkpoint recorded at
+/// step N instead of the newest one: the newest is what a crash needs, an
+/// older one is what an investigation needs.
+fn cmd_resume(rt: &SofuuRuntime, args: &[String]) -> i32 {
+    let mut run_id: Option<String> = None;
+    let mut step: Option<u64> = None;
+    let mut force = false;
+    let mut agent: Option<String> = None;
+    let mut on_error: Option<String> = None;
+    let mut json = false;
+    let mut i = 2;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--force" {
+            force = true;
+            i += 1;
+        } else if a == "--json" {
+            json = true;
+            i += 1;
+        } else if a == "--step" {
+            match args.get(i + 1).and_then(|v| v.parse::<u64>().ok()) {
+                Some(n) => {
+                    step = Some(n);
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m --step wants a step number");
+                    return 2;
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--step=") {
+            match v.parse::<u64>() {
+                Ok(n) => {
+                    step = Some(n);
+                    i += 1;
+                }
+                Err(_) => {
+                    eprintln!("\x1b[31mError:\x1b[0m --step wants a step number (got '{v}')");
+                    return 2;
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--agent=") {
+            agent = Some(v.to_string());
+            i += 1;
+        } else if a == "--on-error" {
+            match args.get(i + 1) {
+                Some(v) => {
+                    on_error = Some(v.clone());
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m --on-error wants a mode");
+                    return 2;
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--on-error=") {
+            on_error = Some(v.to_string());
+            i += 1;
+        } else if !a.starts_with('-') && run_id.is_none() {
+            run_id = Some(a.to_string());
+            i += 1;
+        } else {
+            eprintln!("\x1b[31mError:\x1b[0m resume: unexpected argument '{a}'");
+            print_resume_help();
+            return 2;
+        }
+    }
+    let Some(run_id) = run_id else {
+        eprintln!("\x1b[31mError:\x1b[0m 'sofuu resume' requires a <run_id> (sofuu logs lists them)");
+        return 2;
+    };
+    if let Some(mode) = on_error.as_deref() {
+        if let Err(e) = parse_on_error_mode(mode) {
+            eprintln!("\x1b[31mError:\x1b[0m {e}");
+            return 2;
+        }
+    }
+    let run_id_js = serde_json::to_string(&run_id).unwrap_or_else(|_| "\"\"".into());
+    let step_js = step.map(|n| n.to_string()).unwrap_or_else(|| "null".to_string());
+    let force_js = if force { "true" } else { "false" };
+    let agent_js = match agent {
+        Some(name) => serde_json::to_string(&name).unwrap_or_else(|_| "null".into()),
+        None => "null".to_string(),
+    };
+    let on_error_js = match on_error {
+        Some(mode) => serde_json::to_string(&mode).unwrap_or_else(|_| "null".into()),
+        None => "null".to_string(),
+    };
+    let json_js = if json { "true" } else { "false" };
+    let code = format!(
+        r#"(async function () {{
+  const runId = {run_id_js};
+  const wantStep = {step_js};
+  const force = {force_js};
+  const agentFlag = {agent_js};
+  const onError = {on_error_js};
+  const asJson = {json_js};
+
+  /* Host functions take ONE JSON string and answer with one JSON string (the
+   * sofuu.events.append convention); a missing one collapses to null so every
+   * step below can fall back to reading the log itself. */
+  function host(fn, args) {{
+    try {{
+      if (!sofuu.observability || typeof sofuu.observability[fn] !== 'function') return null;
+      const raw = sofuu.observability[fn](JSON.stringify(args || {{}}));
+      if (typeof raw === 'string') return raw.trim() ? JSON.parse(raw) : null;
+      return raw && typeof raw === 'object' ? raw : null;
+    }} catch (e) {{ return null; }}
+  }}
+  function payload(ev) {{
+    return (ev && ev.payload && typeof ev.payload === 'object') ? ev.payload : (ev || {{}});
+  }}
+  async function exists(p) {{
+    try {{ return !!(await sofuu.fs.exists(p)); }} catch (e) {{ return false; }}
+  }}
+  /* The lister knows about the driver's logDir override; the two SPEC §1 paths
+   * are the fallback, so resume works even before the Rust surface lands. */
+  async function locate() {{
+    const res = host('runs', {{ project: '.' }});
+    const rows = (res && res.runs) || [];
+    for (const r of rows) {{
+      if (String(r.run_id) === runId && r.path) {{
+        return {{ path: String(r.path), status: String(r.status || '') }};
+      }}
+    }}
+    const cands = ['.sofuu/logs/agent-' + runId + '.jsonl',
+                   '.sofuu/sessions/' + runId + '/events.ndjson'];
+    for (const c of cands) if (await exists(c)) return {{ path: c, status: '' }};
+    return null;
+  }}
+  async function readEvents(path) {{
+    const text = String(await sofuu.fs.readFile(path, 'utf8'));
+    const out = [];
+    for (const line of text.split('\n')) {{
+      const s = line.trim();
+      if (!s) continue;
+      try {{ const v = JSON.parse(s); if (v && typeof v === 'object') out.push(v); }} catch (e) {{}}
+    }}
+    return out;
+  }}
+
+  const loc = await locate();
+  if (!loc) {{
+    console.error('resume: no log for run ' + runId + ' (looked in .sofuu/logs and .sofuu/sessions)');
+    process.exit(1);
+  }}
+  let events;
+  try {{ events = await readEvents(loc.path); }}
+  catch (e) {{
+    console.error('resume: cannot read ' + loc.path + ': ' + String((e && e.message) || e));
+    process.exit(1);
+  }}
+
+  /* A run that already reached run_complete is refused without --force:
+   * replaying a completed turn can spend tokens on an answer that exists. A
+   * halted run is the case this command exists for, so it is never gated. */
+  let terminal = '';
+  for (let i = events.length - 1; i >= 0; i--) {{
+    const k = String((events[i] && events[i].kind) || '');
+    if (k === 'run_complete' || k === 'halt' || k === 'fatal_error') {{ terminal = k; break; }}
+  }}
+  const status = String(loc.status || (terminal === 'run_complete' ? 'OK' : (terminal ? 'HALTED' : ''))).toUpperCase();
+  if (status === 'OK' && !force) {{
+    console.error('resume: run ' + runId + ' already completed (status OK); pass --force to resume it anyway');
+    process.exit(1);
+  }}
+
+  /* The newest checkpoint is what a crash needs (lastCheckpoint scans the log
+   * in reverse, SPEC §2); --step=N asks for a specific one instead. */
+  let cp = null;
+  if (wantStep === null) {{
+    const lc = host('lastCheckpoint', {{ project: '.', run_id: runId }});
+    if (lc && lc.ok && lc.found && lc.checkpoint && typeof lc.checkpoint === 'object') {{
+      cp = lc.checkpoint;
+    }} else {{
+      console.error('resume: sofuu.observability.lastCheckpoint is unavailable in this build; scanning the log directly');
+    }}
+  }}
+  if (!cp) {{
+    const want = wantStep === null ? null : Number(wantStep);
+    for (let i = events.length - 1; i >= 0; i--) {{
+      if (String((events[i] && events[i].kind) || '') !== 'checkpoint') continue;
+      const p = payload(events[i]);
+      if (want === null || Number(p.step) === want) {{ cp = p; break; }}
+    }}
+  }}
+  if (!cp) {{
+    console.error(wantStep === null
+      ? 'resume: run ' + runId + ' has no checkpoint (' + loc.path + '); a run writes one per completed turn'
+      : 'resume: run ' + runId + ' has no checkpoint at step ' + String(wantStep) + ' (' + loc.path + ')');
+    process.exit(1);
+  }}
+
+  /* Which agent: the checkpoint payload carries no name by contract, so the
+   * run_start event names it and --agent= covers a log that lost one. */
+  let name = agentFlag ? String(agentFlag) : '';
+  if (!name) name = String(cp.agent || cp.name || '');
+  if (!name) {{
+    for (let i = 0; i < events.length; i++) {{
+      if (String((events[i] && events[i].kind) || '') !== 'run_start') continue;
+      const p = payload(events[i]);
+      name = String(p.agent || p.name || p.agentName || '');
+      if (name) break;
+    }}
+  }}
+  if (!name) {{
+    console.error('resume: cannot tell which agent run ' + runId + ' belongs to (no run_start event); pass --agent=<name>');
+    process.exit(1);
+  }}
+  /* Definitions live in ~/.sofuu/agents — the dir 'sofuu agent run' loads.
+   * Resume is a NEW process, so it starts with none defined and every name
+   * would read as "unknown agent"; load the dir first, then fail with the
+   * directory named instead of the bare lookup error. */
+  try {{ await sofuu.agent.loadDir(); }} catch (e) {{}}
+  try {{
+    const known = sofuu.agent.list().map(function (a) {{ return a.name; }});
+    if (known.length && known.indexOf(name) < 0) {{
+      console.error('resume: agent "' + name + '" is not defined (loaded: ' + known.join(', ') +
+                    '); put it in ~/.sofuu/agents/<name>.js');
+      process.exit(1);
+    }}
+  }} catch (e) {{}}
+  const task = (cp.task === undefined || cp.task === null) ? '' : String(cp.task);
+  if (!task) {{
+    console.error('resume: the checkpoint carries no task, so there is nothing to resume (step ' + String(cp.step) + ')');
+    process.exit(1);
+  }}
+
+  const cpStep = (cp.step === undefined || cp.step === null) ? null : cp.step;
+  const opts = {{ resumeFrom: cp }};
+  if (onError) opts.onError = onError;
+  if (!asJson) {{
+    /* Name-only progress on stderr, exactly like 'sofuu agent run': tool
+     * arguments can carry secrets and stderr is scrollback that gets pasted
+     * into issues. */
+    opts.onStep = function (e) {{
+      if (e.kind === 'tool') console.error('  > tool ' + (e.payload && e.payload.name) + '()');
+      else if (e.kind === 'delegate') console.error('  > agent ' + (e.payload && e.payload.agent) + '()');
+    }};
+  }}
+  console.error('resume: ' + name + ' from step ' + String(cpStep === null ? '?' : cpStep) +
+                ' (' + loc.path + ')' + (onError ? ', on-error ' + onError : ''));
+
+  let r;
+  try {{ r = await sofuu.agent.run(name, task, opts); }}
+  catch (e) {{
+    console.error('resume: ' + String((e && e.message) || e));
+    process.exit(1);
+  }}
+  if (asJson) {{
+    console.log(JSON.stringify({{
+      answer: r.answer, steps: r.steps, stopped: r.stopped, usage: r.usage,
+      resumedFrom: cpStep, runId: r.runId || runId
+    }}, null, 2));
+  }} else {{
+    const u = r.usage || {{}};
+    console.log('');
+    console.log(r.answer);
+    console.log(' resumed from step ' + String(cpStep === null ? '?' : cpStep) + ' · ' + r.steps + ' steps · ' +
+                (u.llmCalls || 0) + ' llm calls · ' + (u.toolCalls || 0) + ' tool calls' +
+                (r.stopped ? ' · stopped: ' + r.stopped : ''));
+  }}
+}})().catch(function (e) {{ console.error(String((e && e.message) || e)); process.exit(1); }});"#
+    );
+    rt.eval_string(&code, "<resume>")
+}
 /// `sofuu plugin list` / `validate` / `run` / `test` / `init` —
 /// the extensibility standard CLI surface (PLAN-PLUGIN-AND-EXTENSIBILITY-STANDARD).
 fn cmd_plugin(rt: &SofuuRuntime, args: &[String]) -> i32 {
@@ -1155,6 +1617,20 @@ fn run_chat(args: &[String]) -> ExitCode {
 }
 
 fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
+    /* OBSERVABILITY-SPEC §4: --on-error is accepted here as an ENVIRONMENT
+     * switch (apply_on_error_env), so it is exported BEFORE ChatConfig::load
+     * reads config: every reader in the chat path then sees one value, and
+     * a pre-set SOFUU_ON_ERROR stays the operator's choice when the flag is
+     * absent. A bad mode fails here, not mid-turn. */
+    if let Some(rest) = args.get(2..) {
+        let (mode, _) = take_on_error_arg(rest);
+        if let Some(mode) = mode {
+            if let Err(e) = apply_on_error_env(&mode) {
+                eprintln!("\x1b[31mError:\x1b[0m {e}");
+                return 1;
+            }
+        }
+    }
     let mut cfg = chat::ChatConfig::load();
     // CLI overrides: -m/--model, -p/--provider, --effort/--think, --brain,
     // --sync on|off, -k/--apikey, --base-url, --ctx-window, --max-output.
@@ -1377,6 +1853,11 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
                     return 1;
                 }
             },
+            /* Already exported by the prescan at the top of this fn; consume
+             * the flag and its value so neither is read as a positional or
+             * swallowed as another flag's value. */
+            "--on-error" => i += 2,
+            _ if a.starts_with("--on-error=") => i += 1,
             _ => i += 1,
         }
     }
@@ -2755,6 +3236,20 @@ fn main() -> ExitCode {
         }
         "agent" | "agents" => {
             let (policy, clean) = take_policy_arg(&args);
+            /* §4: --on-error belongs to `agent run`. Strip and validate it
+             * here, i.e. before the runtime starts, so a typo costs nothing
+             * and never reaches the driver as an unknown mode. */
+            let (on_error, clean) = take_on_error_arg(&clean);
+            let on_error = match on_error.as_deref() {
+                Some(mode) => match parse_on_error_mode(mode) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        eprintln!("\x1b[31mError:\x1b[0m {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                None => None,
+            };
             let rt = match SofuuRuntime::init() {
                 Some(rt) => rt,
                 None => {
@@ -2768,12 +3263,46 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             }
-            let rc = cmd_agent(&rt, &clean);
+            let rc = cmd_agent(&rt, &clean, on_error);
             if rc == 0 {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
             }
+        }
+        /* OBSERVABILITY-SPEC §4: the observation surface. Rendering (and the
+         * exit code) come from the shipped driver; the runtime is still
+         * initialised because sofuu.observability lives on the engine. */
+        "logs" => {
+            let rt = match SofuuRuntime::init() {
+                Some(rt) => rt,
+                None => {
+                    eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rc = cmd_logs(&rt, &args);
+            js_exit_code(&rt, rc)
+        }
+        /* §4: resume takes --policy like the agent commands next to it,
+         * because it re-enters the same loop under the same policy. */
+        "resume" => {
+            let (policy, clean) = take_policy_arg(&args);
+            let rt = match SofuuRuntime::init() {
+                Some(rt) => rt,
+                None => {
+                    eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Some(p) = policy {
+                if let Err(e) = apply_policy_file(&rt, &p) {
+                    eprintln!("\x1b[31mError:\x1b[0m {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let rc = cmd_resume(&rt, &clean);
+            js_exit_code(&rt, rc)
         }
         "plugin" | "plugins" => {
             let (policy, clean) = take_policy_arg(&args);

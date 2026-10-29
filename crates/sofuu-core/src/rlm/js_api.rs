@@ -579,6 +579,18 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
             Some(crate::shipped::PROVIDERS_BC),
             "<providers-driver>",
         );
+        // OBSERVABILITY-SPEC §4: the "sofuu logs" renderer. Last of the
+        // shipped drivers, and pure JS over the sofuu.observability host
+        // functions rt/observability.rs registers with the builtins - it
+        // merges cli/renderRun into that object and never replaces it, so a
+        // build without the backend still defines the command (which then
+        // prints "no runs yet" instead of throwing).
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::OBSERVABILITY_JS,
+            Some(crate::shipped::OBSERVABILITY_BC),
+            "<observability-driver>",
+        );
     }
 }
 

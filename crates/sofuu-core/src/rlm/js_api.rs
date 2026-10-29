@@ -568,6 +568,17 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
             Some(crate::shipped::PLUGINS_BC),
             "<plugins-driver>",
         );
+        // PLUGIN_PLAN Phase 2: the first-party inference provider adapters
+        // (ollama, llamacpp, openai, lmstudio, vllm). Eval'd immediately after
+        // the plugin driver because they register INTO sofuu.plugins.PROVIDERS
+        // and publish the sofuu.providers.list/get/health namespace; without
+        // sofuu.plugins the driver defines nothing and returns.
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::PROVIDERS_JS,
+            Some(crate::shipped::PROVIDERS_BC),
+            "<providers-driver>",
+        );
     }
 }
 

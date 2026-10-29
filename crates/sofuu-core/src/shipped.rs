@@ -106,6 +106,13 @@ pub const PLUGINS_JS: &str = include_str!("../../../src/js/plugins.js");
 #[cfg(not(debug_assertions))]
 pub const PLUGINS_JS: &str = "";
 pub const PLUGINS_BC: &[u8] = include_bytes!("../../../src/js/plugins.bc.gz");
+/// The first-party inference provider adapters — single source of truth is src/js/providers.js.
+#[cfg(debug_assertions)]
+pub const PROVIDERS_JS: &str = include_str!("../../../src/js/providers.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const PROVIDERS_JS: &str = "";
+pub const PROVIDERS_BC: &[u8] = include_bytes!("../../../src/js/providers.bc.gz");
 
 /// Eval one shipped JS driver into the engine context. A driver failure
 /// must never take the engine down (the drivers guard their own deps) —
@@ -297,6 +304,10 @@ mod tests {
         assert!(CHAT_JS.contains("sofuu.chat"));
         assert!(CHAT_JS.contains("chat.submit"));
         assert!(CHAT_JS.contains("chat.init"));
+        // the native provider adapters register into sofuu.plugins + expose
+        // sofuu.providers (PLUGIN_PLAN Phase 2)
+        assert!(PROVIDERS_JS.contains("sofuu.providers"));
+        assert!(PROVIDERS_JS.contains("sofuu.plugins"));
         let rt = unsafe { qjs::JS_NewRuntime() };
         assert!(!rt.is_null());
         let ctx = unsafe { qjs::JS_NewContext(rt) };
@@ -311,6 +322,7 @@ mod tests {
             ("storage.js", STORAGE_JS),
             ("chat.js", CHAT_JS),
             ("plugins.js", PLUGINS_JS),
+            ("providers.js", PROVIDERS_JS),
         ] {
             let bc = unsafe { compile_to_bytecode(ctx, src, name) };
             assert!(bc.is_some(), "{name}: failed to compile to bytecode");

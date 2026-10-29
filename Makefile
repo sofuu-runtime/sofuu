@@ -123,6 +123,27 @@ scoreboard-check:
 dist-dryrun: libsofuu
 	@bash scripts/dist-dryrun.sh
 
+# ─── Universal plugin & extensibility system (PLUGIN_PLAN.md) ──────
+# The 5-shield plugin runtime ships INSIDE the binary (src/js/plugins.js ->
+# plugins.bc.gz plus the provider adapters driver), so these targets exercise
+# the shipped engine, not a JS test double.
+#
+#   plugin-check   — the SDK typings cannot drift from the runtime: every
+#                    documented export must exist (sofuu.d.ts parity), and
+#                    the cookbook plugins must strip+load.
+#   plugin-stress  — the adversarial suite: the 5 shields, concurrency,
+#                    providers, mirror writes, service hooks, OpenAPI/YAML.
+plugin-check: $(TARGET)
+	@$(TARGET) run scripts/stress/plugin_types_check.js
+	@for f in plugins/*.ts; do $(TARGET) plugin validate "$$f" >/dev/null || exit 1; done; \
+	echo "  ✓ cookbook plugins validate"
+
+plugin-stress: $(TARGET)
+	@$(TARGET) run scripts/stress/plugin_stress.js
+
+plugin-stress-fast: $(TARGET)
+	@$(TARGET) run scripts/stress/plugin_stress.js --fast
+
 # ── Size cap check (CI: fails if binary exceeds 5MB) ────────────
 size-check: $(TARGET)
 	@SIZE=$$(stat -f%z $(TARGET) 2>/dev/null || stat -c%s $(TARGET) 2>/dev/null); \

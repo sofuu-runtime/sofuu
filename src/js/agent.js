@@ -2888,12 +2888,25 @@
       return res;
     }
 
-    emit('start', { agentName: d.name, task: task, fullTask: task, depth: depth, chain: chain.slice() });
+    /* PLAN-PLUGIN Category 4 (lifecycle services): onTurnStart runs BEFORE
+     * the start event so a prompt rewrite (PII redaction, instruction
+     * injection, locale shaping) is what the trace, the ledger and the
+     * provider all see. The hook is awaited under a ceiling: a service that
+     * hangs must cost 1.5 s, never the whole turn. A throwing service is
+     * fail-open (the original prompt stands) — rewriting is advice, not a
+     * security boundary; onToolCall is where blocking belongs. */
     try {
       if (typeof sofuu !== 'undefined' && sofuu.plugins && typeof sofuu.plugins.emitTurnStart === 'function') {
-        sofuu.plugins.emitTurnStart({ turnId: runId, prompt: task, agent: d.name, depth: depth });
+        var startEv = await withTimeout(
+          Promise.resolve(sofuu.plugins.emitTurnStart({ turnId: runId, prompt: task, agent: d.name, depth: depth })),
+          1500, 'service onTurnStart timed out');
+        if (startEv && typeof startEv.prompt === 'string' && startEv.prompt !== task) {
+          task = startEv.prompt;
+          emit('prompt_rewritten', { turnId: runId, by: 'service' });
+        }
       }
     } catch (eStartHook) {}
+    emit('start', { agentName: d.name, task: task, fullTask: task, depth: depth, chain: chain.slice() });
     /* PLAN-ML-GATES §8: open this run's trajectory in the working set.
      * Sub-agents run under their own runId, so trajectories stay separate. */
     if (mlEnabled(d)) {
@@ -3167,6 +3180,98 @@
       }
       return more;
     }
+    /* ── PLAN-PLUGIN Category 2: plugin inference providers ──────────────
+     * A defineProvider adapter wins ONLY for a name the compiled Rust wires
+     * do not own (openai/anthropic/local keep their native path: they stream
+     * incrementally, while a JS adapter replays a buffered body). Resolution
+     * is defensive in every direction — a missing driver, a broken registry
+     * or a spec without complete()/stream() all fall back to native, so an
+     * agent run can never fail because a plugin provider is half-loaded. */
+    var NATIVE_PROVIDER_NAMES = { openai: 1, anthropic: 1, local: 1 };
+    function pluginProviderFor(ro) {
+      if (!ro || !ro.provider) return null;
+      var nm = String(ro.provider);
+      if (NATIVE_PROVIDER_NAMES[nm]) return null;
+      if (!sofuu.plugins || typeof sofuu.plugins.resolveProvider !== 'function') return null;
+      var pp = null;
+      try { pp = sofuu.plugins.resolveProvider(nm); } catch (eRs) { return null; }
+      if (!pp || typeof pp !== 'object') return null;
+      if (typeof pp.stream !== 'function' && typeof pp.complete !== 'function') return null;
+      return pp;
+    }
+    /* Adapts a callback-driven provider to the async-iterable shape the
+     * loop already consumes ({think}/{text} chunks + .abort()), so the
+     * retry ladder, budget accounting and cancel path stay byte-identical
+     * to the native stream. */
+    function pluginStreamFor(pp, ro) {
+      var queue = [];
+      var waiters = [];
+      var done = false;
+      var failed = null;
+      var aborted = false;
+      function push(item) {
+        if (item === null) { /* end-of-stream signal */
+          if (waiters.length) {
+            var w0 = waiters.shift();
+            if (failed) w0.reject(failed);
+            else w0.resolve({ value: undefined, done: true });
+          }
+          return;
+        }
+        if (waiters.length) { waiters.shift().resolve({ value: item, done: false }); }
+        else queue.push(item);
+      }
+      var req = {
+        messages: (ro.system ? [{ role: 'system', content: String(ro.system) }] : [])
+          .concat(Array.isArray(ro.messages) ? ro.messages : []),
+        model: ro.model || '',
+        tools: ro.tools || undefined,
+        maxTokens: ro.max_tokens || undefined,
+        stream: true
+      };
+      var ctx = {
+        model: ro.model || '',
+        apiKey: ro.api_key || '',
+        baseUrl: ro.base_url || '',
+        env: (typeof process !== 'undefined' && process.env) || {}
+      };
+      Promise.resolve().then(function () {
+        if (typeof pp.stream === 'function') {
+          return pp.stream(req, ctx, function (ev) {
+            if (!ev || aborted) return;
+            if (ev.type === 'delta' && typeof ev.text === 'string' && ev.text) push({ text: ev.text });
+            else if (ev.type === 'think' && typeof ev.text === 'string' && ev.text) push({ think: ev.text });
+          });
+        }
+        return Promise.resolve(pp.complete(req, ctx)).then(function (r) {
+          var t = (r && typeof r.text === 'string') ? r.text : '';
+          if (t) push({ text: t });
+          return r;
+        });
+      }).then(function () {
+        done = true; push(null);
+      }, function (ePv) {
+        failed = (ePv && ePv.message) ? ePv : new Error(String(ePv || 'plugin provider failed'));
+        done = true; push(null);
+      });
+      return {
+        abort: function () { aborted = true; },
+        [Symbol.asyncIterator]: function () {
+          return {
+            next: function () {
+              if (aborted) return Promise.resolve({ value: undefined, done: true });
+              if (queue.length) return Promise.resolve({ value: queue.shift(), done: false });
+              if (done) {
+                return failed ? Promise.reject(failed)
+                              : Promise.resolve({ value: undefined, done: true });
+              }
+              return new Promise(function (resolve, reject) { waiters.push({ resolve: resolve, reject: reject }); });
+            }
+          };
+        }
+      };
+    }
+
     async function streamWithRetry(ro, onThink, onText) {
       var attempt = 0;
       var continued = 0;
@@ -3178,7 +3283,8 @@
          * overlap-deduped at return (a re-streaming model often repeats
          * the tail; the UI must never see it twice). */
         var isCont = continued > 0;
-        var st = sofuu.ai.stream(ro);
+        var stPp = pluginProviderFor(ro);
+        var st = stPp ? pluginStreamFor(stPp, ro) : sofuu.ai.stream(ro);
         state.aborts.push(function () { try { st.abort(); } catch (e) {} });
         var parts = [];
         var thinkParts = [];
@@ -3888,6 +3994,29 @@
         }
         toolHist[name] = (toolHist[name] || 0) + 1;
         emit('tool', { name: name, args: clip(JSON.stringify(args || {}), 200) });
+        /* PLAN-PLUGIN Category 4: service interceptor. A service may mutate
+         * the args object in place (secret redaction on a command line) or
+         * throw to block the call. A block is a refusal the MODEL can see
+         * and react to — the run continues, exactly like a policy deny —
+         * and it is fail-CLOSED: a service that hangs past the ceiling also
+         * blocks, because an interceptor that silently stops intercepting
+         * is worse than a slow one. */
+        if (sofuu.plugins && typeof sofuu.plugins.emitToolCall === 'function') {
+          try {
+            await withTimeout(
+              Promise.resolve(sofuu.plugins.emitToolCall({ tool: name, args: args || {},
+                                                           agent: d.name, turnId: runId })),
+              1500, 'service onToolCall timed out');
+          } catch (eHook) {
+            var hookCode = (eHook && eHook.code) || 'E_DENIED';
+            var hookMsg = 'blocked by service (' + hookCode + '): ' +
+                          String((eHook && eHook.message) || eHook || 'denied');
+            emit('tool_result', { name: name, blocked: 'service', ok: false, source: toolSource,
+                                  error_code: hookCode, result: clip(hookMsg, 200),
+                                  duration_ms: Date.now() - toolStartedAt });
+            return hookMsg;
+          }
+        }
         /* T3 (2026-10-23): validate against the declared schema BEFORE any
          * side effect. A bad call gets a path-precise E_SCHEMA result and
          * the tool never runs (no partial writes, no spawned shell). */
@@ -4316,6 +4445,17 @@
           } catch (eT) {}
         }
         emit('tool_result', trPayload);
+        /* PLAN-PLUGIN Category 4: observers see the settled result (trace,
+         * cost, audit). Fire-and-forget by contract: a throwing or slow
+         * observer must never change the outcome the model already has. */
+        if (sofuu.plugins && typeof sofuu.plugins.emitToolResult === 'function') {
+          try {
+            var trHook = sofuu.plugins.emitToolResult({
+              tool: name, args: args, result: trPayload, ok: toolOk,
+              durationMs: Date.now() - toolStartedAt, agent: d.name, turnId: runId });
+            if (trHook && typeof trHook.then === 'function') trHook.then(null, function () {});
+          } catch (eTrHook) {}
+        }
         /* Supervisor checkpoint 2 — AFTER the result returns: account the
          * outcome in the working set (trajectory + write tracking for the
          * re-read rule), then report a confidence-banded outcome label for

@@ -54,6 +54,9 @@ enum Provider {
     Anthropic = 1,
     Local = 2,  /* in-process inference (GGUF / SafeTensors / .pt / .npz) */
     Custom = 3, /* user-defined endpoint; wire format comes from `profile` */
+    /* A keyless, OpenAI-compatible llama.cpp / llama-server host. Appended at
+     * the END so the existing repr values (persisted in config) never shift. */
+    LlamaCpp = 4,
 }
 
 fn parse_provider(name: Option<&str>) -> Provider {
@@ -63,6 +66,10 @@ fn parse_provider(name: Option<&str>) -> Provider {
         /* Legacy configs may still say "ollama" — treat it as local. */
         Some("ollama") => Provider::Local,
         Some("local") => Provider::Local,
+        /* llama.cpp's HTTP server speaks the OpenAI wire over HTTP (never the
+         * in-process path), so it is its own provider rather than Custom:
+         * Custom demands an explicit base_url and defaults to OpenAI's host. */
+        Some("llamacpp") | Some("llama.cpp") | Some("llama-server") => Provider::LlamaCpp,
         Some(_) => Provider::Custom, /* any other name = custom provider */
     }
 }
@@ -77,6 +84,9 @@ fn provider_env_key(p: Provider) -> Option<&'static str> {
     match p {
         Provider::Anthropic => Some("ANTHROPIC_API_KEY"),
         Provider::Local => None,
+        /* llama-server takes no auth: returning None keeps a stray
+         * OPENAI_API_KEY out of an Authorization header sent to localhost. */
+        Provider::LlamaCpp => None,
         _ => Some("OPENAI_API_KEY"),
     }
 }
@@ -88,6 +98,7 @@ fn provider_embed_key_name(p: Provider) -> Option<&'static str> {
     match p {
         Provider::Anthropic => Some("anthropic"),
         Provider::Local => None,
+        Provider::LlamaCpp => None,
         _ => Some("openai"),
     }
 }
@@ -105,6 +116,25 @@ fn provider_api_url(p: Provider, _model: Option<&str>) -> String {
     match p {
         Provider::Anthropic => "https://api.anthropic.com/v1/messages".to_string(),
         Provider::Local => "http://localhost:11434/api/chat".to_string(),
+        /* llama.cpp / llama-server is OpenAI-compatible at /v1/chat/completions.
+         * LLAMA_CPP_HOST overrides the host (kept verbatim so an operator can
+         * point at a remote box or a reverse proxy); the OpenAI wire is used
+         * everywhere below. */
+        Provider::LlamaCpp => std::env::var("LLAMA_CPP_HOST")
+            .ok()
+            .map(|h| {
+                let base = h.trim().trim_end_matches('/').to_string();
+                if base.is_empty() {
+                    "http://localhost:8080/v1/chat/completions".to_string()
+                } else if base.ends_with("/v1/chat/completions") {
+                    base
+                } else if base.ends_with("/v1") {
+                    format!("{base}/chat/completions")
+                } else {
+                    format!("{base}/v1/chat/completions")
+                }
+            })
+            .unwrap_or_else(|| "http://localhost:8080/v1/chat/completions".to_string()),
         _ => "https://api.openai.com/v1/chat/completions".to_string(),
     }
 }
@@ -828,6 +858,8 @@ fn build_request_body(cfg: &AiRequestConfig) -> String {
         Provider::Anthropic => build_anthropic_body_v2(cfg),
         Provider::Local => build_ollama_body_v2(cfg),
         Provider::OpenAi => build_openai_body_v2(cfg),
+        /* llama.cpp's HTTP server accepts the OpenAI chat body verbatim. */
+        Provider::LlamaCpp => build_openai_body_v2(cfg),
         _ => build_openai_body_v2(cfg),
     }
 }
@@ -851,6 +883,8 @@ fn build_openai_embed_body(cfg: &AiEmbedConfig) -> String {
 fn build_embed_body(cfg: &AiEmbedConfig) -> String {
     match cfg.provider {
         Provider::Local => build_openai_embed_body(cfg),
+        /* llama.cpp serves /v1/embeddings with the OpenAI body shape too. */
+        Provider::LlamaCpp => build_openai_embed_body(cfg),
         _ => build_openai_embed_body(cfg),
     }
 }
@@ -4382,12 +4416,16 @@ unsafe extern "C" fn js_ai_complete(
         return qjs::JS_ThrowTypeError(ctx, NO_MODEL_MSG.as_ptr());
     }
 
+    /* An explicit llama.cpp provider is an HTTP server, so its model string
+     * must never route the call back to in-process inference — llama-server is
+     * commonly configured with the very .gguf path a local call would use. */
     let is_local = cfg.provider == Provider::Local || eff == Provider::Local
-        || cfg.model.as_deref().map_or(false, |m| {
-            let clean = crate::infer::clean_model_path(m);
-            clean.extension().map_or(false, |e| e == "gguf")
-                || m.trim_matches(|c| c == '\'' || c == '"').ends_with(".gguf")
-        });
+        || (eff != Provider::LlamaCpp
+            && cfg.model.as_deref().map_or(false, |m| {
+                let clean = crate::infer::clean_model_path(m);
+                clean.extension().map_or(false, |e| e == "gguf")
+                    || m.trim_matches(|c| c == '\'' || c == '"').ends_with(".gguf")
+            }));
     if is_local {
         return js_run_local_complete(ctx, &cfg);
     }
@@ -4640,7 +4678,8 @@ unsafe extern "C" fn js_ai_stream(
 
     let is_local = cfg.provider == Provider::Local
         || eff == Provider::Local
-        || cfg.model.as_deref().map_or(false, looks_like_local_model);
+        || (eff != Provider::LlamaCpp
+            && cfg.model.as_deref().map_or(false, looks_like_local_model));
     if is_local {
         let factory_c = CString::new(STREAM_FACTORY).unwrap();
         let factory = qjs::JS_Eval(
@@ -5027,6 +5066,15 @@ unsafe extern "C" fn js_ai_embed(
      * the Track-B reject; the reject is gone, the early return replaces it.) */
     let mut url: String = if cfg.provider == Provider::OpenAi {
         "https://api.openai.com/v1/embeddings".to_string()
+    } else if cfg.provider == Provider::LlamaCpp {
+        /* llama.cpp serves /v1/embeddings next to /v1/chat/completions
+         * (--embeddings). Without this the embed body would be posted to the
+         * chat endpoint, because provider_api_url only knows the chat URL. */
+        format!(
+            "{}/embeddings",
+            provider_api_url(cfg.provider, cfg.model.as_deref())
+                .trim_end_matches("/chat/completions")
+        )
     } else {
         provider_api_url(cfg.provider, cfg.model.as_deref())
     };

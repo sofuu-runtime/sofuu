@@ -180,7 +180,7 @@
   function cfg() { return S.cfg || loadConfig(); }
 
   /* Known built-in providers (mirrors chat.rs usableConfig). */
-  var KNOWN_PROVIDERS = ['openai', 'anthropic', 'local'];
+  var KNOWN_PROVIDERS = ['openai', 'anthropic', 'local', 'ollama', 'llamacpp', 'lmstudio', 'vllm'];
   function usableConfig() {
     var c = cfg();
     if (!c.provider || !c.model) return false;

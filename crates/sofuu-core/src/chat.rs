@@ -574,7 +574,13 @@ impl ChatConfig {
 
 // ── Slash commands ──────────────────────────────────────────────
 
-const VALID_PROVIDERS: [&str; 3] = ["openai", "anthropic", "local"];
+/// Wire profiles the TUI accepts by name. "ollama" and "llamacpp" are the
+/// local inference engines (PLUGIN_PLAN Phase 2): ollama speaks its own
+/// /api/chat wire (rt/ai.rs maps it to the local provider), llamacpp is an
+/// OpenAI-compatible llama-server reached through --base-url.
+const VALID_PROVIDERS: [&str; 7] = [
+    "openai", "anthropic", "local", "ollama", "llamacpp", "lmstudio", "vllm",
+];
 const VALID_EFFORTS: [&str; 4] = ["low", "medium", "high", "max"];
 
 /// Hard ceiling on a user-configured context window: 4Mi tokens.
@@ -620,7 +626,9 @@ const MAX_OUTPUT_TOKENS: i64 = 384_000;
 fn default_ctx_window(provider: &str) -> i64 {
     match provider {
         "openai" | "anthropic" => 128_000,
-        "local" => 32_768,
+        /* Local engines serve a modest window by default; the registry still
+         * wins whenever it knows the real model. */
+        "local" | "ollama" | "llamacpp" => 32_768,
         _ => 32_768,
     }
 }
@@ -5821,7 +5829,10 @@ const DRIVER: &str = r#"
      * Models detected as thinking-incapable at runtime (no_think_models)
      * also never get an effort parameter. */
     let noThink = (c.no_think_models || []).indexOf(c.model) >= 0 || (c.effort === 'off') || (resolveCaps().thinking === 'none');
-    const isLocal = c.provider === 'local';
+    /* Local inference engines (ollama, llama.cpp) get the same lean shape as
+     * the in-process local provider: no coding preset, no tool defs, a short
+     * system prompt, so a CPU-bound model is not buried in prompt tokens. */
+    const isLocal = c.provider === 'local' || c.provider === 'ollama' || c.provider === 'llamacpp';
     const def = {
       name: 'chat',
       preset: isLocal ? undefined : 'coding',

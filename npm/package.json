@@ -27,18 +27,20 @@
   "license": "MIT",
   "author": "Haruhito <hello@sofuu.xyz>",
   "type": "commonjs",
+  "types": "sofuu.d.ts",
   "bin": {
     "sofuu": "bin/sofuu.js"
   },
   "files": [
     "bin/sofuu.js",
     "install.js",
+    "sofuu.d.ts",
     "README.md",
     "LICENSE",
     "NOTICE"
   ],
   "scripts": {
-    "prepack": "node -e \"const f=require('fs'),p=require('path');for(const n of ['LICENSE','NOTICE'])f.copyFileSync(p.join(__dirname,'..',n),p.join(__dirname,n))\"",
+    "prepack": "node -e \"const f=require('fs'),p=require('path');for(const n of ['LICENSE','NOTICE','sofuu.d.ts'])f.copyFileSync(p.join(__dirname,'..',n),p.join(__dirname,n))\"",
     "postinstall": "node install.js",
     "test": "node install.js --verify-only"
   },

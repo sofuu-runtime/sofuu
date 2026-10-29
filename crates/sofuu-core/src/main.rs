@@ -85,6 +85,7 @@ fn print_help() {
     println!("  sofuu plugin list        List plugins in ./plugins/ and ~/.sofuu/plugins/");
     println!("  sofuu plugin validate <f> Validate plugin syntax, export, and schema");
     println!("  sofuu plugin run <tool>  Execute a plugin tool with 5-shield safety");
+    println!("  sofuu plugin test <tool> Alias of plugin run; executes one tool in isolation");
     println!("  sofuu plugin init <name> Scaffold a plugin (--category=tool|service|...)");
     println!("  sofuu dev [dir]          Start AI-native full-stack dev server (--port, --host, --model)");
     println!("  sofuu serve --brain <path>   Serve the brain over HTTP (--port, --host, --token)");
@@ -272,9 +273,10 @@ fn print_chat_help() {
         "\x1b[1mUsage:\x1b[0m sofuu chat [options]      (bare `sofuu` does the same)\n\n\
          \x1b[1mOptions:\x1b[0m\n\
            -m, --model <name>        model to chat with\n\
-           -p, --provider <name>     openai | anthropic | local\n\
+           -p, --provider <name>     openai | anthropic | local | ollama | llamacpp\n\
            -k, --apikey <key>        API key for this session\n\
                --base-url <url>      override the provider endpoint\n\
+                                     (llamacpp defaults to http://127.0.0.1:8080/v1)\n\
            -t, --threads <n>         inference threads (local provider)\n\
                --effort <level>      reasoning effort / thinking budget\n\
                --think <level>       alias of --effort\n\
@@ -335,6 +337,7 @@ fn print_plugin_help() {
            list [--json]                        list installed plugins\n\
            validate <file.js|file.ts>           validate syntax, exports, schema\n\
            run <tool_name> [args_json]          execute one plugin tool\n\
+           test <tool_name> [args_json]         alias of run, isolated execution\n\
            init <name> [--category=<kind>]      scaffold a plugin\n\n\
          \x1b[1mOptions:\x1b[0m\n\
                --policy <file>    policy file applied before the plugin runs\n"
@@ -798,7 +801,7 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String]) -> i32 {
     }
 }
 
-/// `sofuu plugin list` / `validate` / `run` / `init` —
+/// `sofuu plugin list` / `validate` / `run` / `test` / `init` —
 /// the extensibility standard CLI surface (PLAN-PLUGIN-AND-EXTENSIBILITY-STANDARD).
 fn cmd_plugin(rt: &SofuuRuntime, args: &[String]) -> i32 {
     if args.len() < 3 {
@@ -806,7 +809,8 @@ fn cmd_plugin(rt: &SofuuRuntime, args: &[String]) -> i32 {
         eprintln!("  sofuu plugin list [--json]");
         eprintln!("  sofuu plugin validate <file.js|file.ts>");
         eprintln!("  sofuu plugin run <tool_name> [args_json]");
-        eprintln!("  sofuu plugin init <name> [--category=tool|service|provider|store]");
+        eprintln!("  sofuu plugin test <tool_name> [args_json]   (alias of run)");
+        eprintln!("  sofuu plugin init <name> [--category=tool|provider|store|vectorstore|service|openapi]");
         return 1;
     }
     match args[2].as_str() {
@@ -829,23 +833,29 @@ fn cmd_plugin(rt: &SofuuRuntime, args: &[String]) -> i32 {
             let code = format!("sofuu.plugins.cliValidate({fjs})");
             rt.eval_string(&code, "<plugin-validate>")
         }
-        "run" => {
+        // "test" is an alias of "run" (PLUGIN_PLAN DX table). It prefers the
+        // isolated driver entry point so the two can diverge later, and falls
+        // back to cliRun when the loaded bytecode predates cliTest — an alias
+        // must never become a hard dependency on a bytecode refresh.
+        "run" | "test" => {
             if args.len() < 4 {
-                eprintln!("\x1b[31mError:\x1b[0m 'sofuu plugin run' requires a tool name");
-                eprintln!("Usage: sofuu plugin run <tool_name> [args_json]");
+                eprintln!("\x1b[31mError:\x1b[0m 'sofuu plugin {}' requires a tool name", args[2]);
+                eprintln!("Usage: sofuu plugin <run|test> <tool_name> [args_json]");
                 return 1;
             }
             let tool_name = &args[3];
             let raw_args = if args.len() >= 5 { args[4..].join(" ") } else { "{}".to_string() };
             let tool_js = serde_json::to_string(tool_name).unwrap_or_else(|_| "\"\"".into());
             let args_js = serde_json::to_string(&raw_args).unwrap_or_else(|_| "\"{}\"".into());
-            let code = format!("sofuu.plugins.cliRun({tool_js}, {args_js})");
+            let code = format!(
+                "(typeof sofuu!=='undefined'&&sofuu.plugins&&typeof sofuu.plugins.cliTest==='function')?sofuu.plugins.cliTest({tool_js},{args_js}):sofuu.plugins.cliRun({tool_js},{args_js})"
+            );
             rt.eval_string(&code, "<plugin-run>")
         }
         "init" => {
             if args.len() < 4 {
                 eprintln!("\x1b[31mError:\x1b[0m 'sofuu plugin init' requires a plugin name");
-                eprintln!("Usage: sofuu plugin init <name> [--category=tool|service|provider|store]");
+                eprintln!("Usage: sofuu plugin init <name> [--category=tool|provider|store|vectorstore|service|openapi]");
                 return 1;
             }
             let name = &args[3];
@@ -861,7 +871,9 @@ fn cmd_plugin(rt: &SofuuRuntime, args: &[String]) -> i32 {
             rt.eval_string(&code, "<plugin-init>")
         }
         other => {
-            eprintln!("\x1b[31mError:\x1b[0m unknown plugin subcommand '{other}' (list | validate | run | init)");
+            eprintln!(
+                "\x1b[31mError:\x1b[0m unknown plugin subcommand '{other}' (list | validate | run | test | init)"
+            );
             1
         }
     }
@@ -1118,6 +1130,30 @@ fn value_arg(args: &[String], i: usize) -> Option<String> {
 }
 
 /// `sofuu chat` — interactive chat UI (Rust, Phase 1).
+/// Shared body of `sofuu chat ...` and of a bare `sofuu --provider ...`.
+fn run_chat(args: &[String]) -> ExitCode {
+    let (policy, clean) = take_policy_arg(args);
+    let rt = match SofuuRuntime::init() {
+        Some(rt) => rt,
+        None => {
+            eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(p) = policy {
+        if let Err(e) = apply_policy_file(&rt, &p) {
+            eprintln!("\x1b[31mError:\x1b[0m {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let rc = cmd_chat(&rt, &clean);
+    if rc == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
     let mut cfg = chat::ChatConfig::load();
     // CLI overrides: -m/--model, -p/--provider, --effort/--think, --brain,
@@ -1179,8 +1215,24 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
                  * the configured provider names; custom base_url implies
                  * openai-compat, which the profile "openai" covers. */
                 Some(p) => match p.as_str() {
-                    "openai" | "anthropic" | "local" => {
+                    /* Local inference engines are first-class names (PLUGIN_PLAN
+                     * Phase 2). "ollama" needs no endpoint: rt/ai.rs already
+                     * maps it to the local provider and its
+                     * http://localhost:11434/api/chat default. "llamacpp" is an
+                     * OpenAI-compatible llama-server, so it needs one. */
+                    "openai" | "anthropic" | "local" | "ollama" => {
                         cfg.provider = p;
+                        i += 2;
+                    }
+                    "llamacpp" => {
+                        cfg.provider = p;
+                        /* Without a default, a bare -p llamacpp would fall
+                         * through to the cloud OpenAI endpoint. Only fill it in
+                         * when no --base-url appears anywhere on the command
+                         * line, since the flag may come after -p. */
+                        if cfg.base_url.is_empty() && !args.iter().any(|a| a == "--base-url") {
+                            cfg.base_url = "http://127.0.0.1:8080/v1".to_string();
+                        }
                         i += 2;
                     }
                     _ => {
@@ -1193,7 +1245,7 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
                             i += 2;
                         } else {
                             eprintln!(
-                                "\x1b[31mError:\x1b[0m unknown provider '{p}' (known: openai, anthropic, local)."
+                                "\x1b[31mError:\x1b[0m unknown provider '{p}' (known: openai, anthropic, local, ollama, llamacpp)."
                             );
                             eprintln!("  Add it in the TUI (/provider) or use --base-url for a custom endpoint.");
                             return 1;
@@ -2659,27 +2711,20 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         }
-        "chat" => {
-            let (policy, clean) = take_policy_arg(&args);
-            let rt = match SofuuRuntime::init() {
-                Some(rt) => rt,
-                None => {
-                    eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
-                    return ExitCode::FAILURE;
-                }
-            };
-            if let Some(p) = policy {
-                if let Err(e) = apply_policy_file(&rt, &p) {
-                    eprintln!("\x1b[31mError:\x1b[0m {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-            let rc = cmd_chat(&rt, &clean);
-            if rc == 0 {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
+        "chat" => run_chat(&args),
+        /* PLAN §4 Phase 2 spells provider selection as
+         * `sofuu --provider ollama --model llama3.2` — a bare CLI whose first
+         * token is a flag is a chat invocation, not an unknown command.
+         * --help/-h/--version still fall through to their own handlers. */
+        flag if flag.starts_with('-')
+            && flag != "-h"
+            && flag != "--help"
+            && flag != "-V"
+            && flag != "--version" =>
+        {
+            let mut chat_args: Vec<String> = args.clone();
+            chat_args.insert(1, "chat".to_string());
+            run_chat(&chat_args)
         }
         "conformance" => {
             let rt = match SofuuRuntime::init() {

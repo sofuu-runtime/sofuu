@@ -4,6 +4,64 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Universal Plugin & Extensibility System — 2026-10-29
+
+Implementation of PLUGIN_PLAN.md: five plugin categories behind one runtime,
+one safety model, one error taxonomy.
+
+- **Five categories** — action tools (`defineTool`), inference providers
+  (`defineProvider`), storage and vector stores (`defineStorage` /
+  `defineVectorStore`), lifecycle services (`defineService`, including an
+  `onToolCall` interceptor) and description-driven plugins (`useOpenAPI` for
+  OpenAPI 3.x/Swagger 2.0, `ingestMcp` for MCP servers). All of them are
+  reachable as `import { ... } from 'sofuu'`.
+- **Five shields** — schema validation (input and output), policy and SSRF
+  network jailing plus a jailed `ctx.fs`, a CLOSED/OPEN/HALF_OPEN circuit
+  breaker with single-trial admission, a watchdog with abort signal, and a
+  panic guard. A policy denial no longer trips the breaker, so a blocked
+  target keeps reporting `E_DENIED` instead of decaying into
+  `E_CIRCUIT_OPEN`. Two codes join the taxonomy: `E_CAPABILITY` and
+  `E_BACKPRESSURE`.
+- **Engine modularised** — `src/js/plugins.js` is now eleven modules (schema,
+  security, breaker, watchdog, registry, provider, store, service, openapi,
+  discovery, cli) with every 0.2.0 public name preserved.
+- **Native provider adapters** — new `src/js/providers.js` ships `ollama`
+  (`/api/chat` NDJSON, tool calls, usage), `llamacpp` (OpenAI wire, keyless,
+  GBNF `grammar`), `openai` (Bearer key required) and the `lmstudio` /
+  `vllm` local aliases, all through one shared wire parser. `completeVia` /
+  `streamVia` apply the provider's own breaker and watchdog;
+  `sofuu.providers.list()` reports capability, and adapter streaming is
+  explicitly `streaming: 'buffered'`. Rust gains a first-class
+  `Provider::LlamaCpp` (no `OPENAI_API_KEY` leakage to a local server, no
+  `.gguf` hijack of an explicit llama.cpp call) and `-p ollama|llamacpp`
+  works end to end.
+- **SDK typings** — `sofuu.d.ts` declares the whole surface (tools,
+  providers, storage/vector, services, hooks, CLI helpers, the micro-Zod
+  shape) and type-checks clean under `tsc --strict`. Shipped in the npm
+  package.
+- **TypeScript plugins without a compiler** — a scanner-based stripper
+  handles imports/exports, interfaces, type aliases, enums, generics,
+  parameter/return annotations, optional parameters, parameter properties and
+  class fields. It is construct-aware rather than regex-based: an object
+  literal `{ units: defaultUnits }` is no longer eaten, and a regex literal
+  containing quotes no longer desynchronises the scanner. Unsupported
+  constructs are left intact so they fail loudly instead of silently.
+- **CLI and discovery** — `sofuu plugin list|validate|run|test|init`,
+  `sofuu.json` manifests, `./plugins` plus `~/.sofuu/plugins`, `init`
+  templates for all six categories, and a per-file discovery report that
+  isolates a broken plugin instead of aborting startup.
+- **Dual-write mirror** — `attachVectorStore` / `attachStorage` mirror QTSQ
+  writes into an external store behind a bounded, batched, back-off queue; the
+  local write stays synchronous and `mirrorStats()`/`flushMirror()` expose
+  the queue.
+- **Agent seam** — `onTurnStart` may rewrite the prompt, `onToolCall` may
+  veto or mutate a call, and every hook is isolated and time-boxed.
+- **Cookbook and docs** — four runnable plugins in `plugins/` (`fetch_web`,
+  `sqlite_query`, `ollama_provider`, `token_logger`), a user guide in
+  `docs/PLUGINS.md`, a README section, and two gates: `make plugin-check`
+  (runtime/typings parity plus cookbook strip proof) and `make
+  plugin-stress` (25 adversarial cases across all five categories).
+
 ## 0.3.0-beta — 2026-10-28 (in development)
 
 Mandatory QTSQ core integration, runtime conformance program completion, and general-purpose AI runtime architectural alignment:

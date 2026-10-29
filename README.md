@@ -276,6 +276,71 @@ Pi 5 receipts: 2026-10-26 battery, current main, 4× Cortex-A76 with NEON+dotpro
 
 ---
 
+## Plugins & Extensibility
+
+Sofuu is extensible from JavaScript or TypeScript with no build step: drop a
+file in `./plugins/` (or list it in `sofuu.json`) and it is discovered,
+validated and registered at startup. Every extension crosses the same
+**five shields**, so an untrusted plugin cannot take the process down.
+
+| Category | Factory | What it registers |
+| --- | --- | --- |
+| Action | `defineTool` | an LLM-callable tool (zod or JSON Schema input/output) |
+| Inference | `defineProvider` | a model backend (ollama, llama.cpp, OpenAI wire, custom) |
+| Storage | `defineStorage` / `defineVectorStore` | a key/value store or a vector index (dual-write mirror of QTSQ) |
+| Lifecycle | `defineService` | background service with `onStart`, `onTurnStart`, `onToolCall`, `onToolResult`, `onTurnEnd`, `onStop` |
+| Description | `useOpenAPI` / `ingestMcp` | zero-code bridging of a REST API or an MCP server's tools |
+
+The five shields, and the error each one raises:
+
+1. **Schema** — input validated before the callable runs, output before the result is returned (`E_SCHEMA`).
+2. **Policy & network jailing** — `permissions.net` allowlist plus a private-IP/SSRF egress guard and a jailed `ctx.fs` (`E_DENIED`).
+3. **Circuit breaker** — CLOSED / OPEN / HALF_OPEN, one trial admitted under a concurrent burst (`E_CIRCUIT_OPEN`). A policy denial never trips it.
+4. **Watchdog** — every call carries a hardware-timer deadline with an abort signal (`E_TIMEOUT`).
+5. **Panic guard** — a throw, a rejected promise, a circular return or a BigInt result becomes a typed tool result; the host process keeps running (`E_TOOL`, `E_CAPABILITY`, `E_BACKPRESSURE`).
+
+```bash
+sofuu plugin init weather --category=tool   # scaffold ./plugins/weather.ts
+sofuu plugin validate plugins/weather.ts    # parse + register + report
+sofuu plugin test weather '{"city":"Guwahati"}'   # invoke once, print the envelope
+sofuu plugin list                           # every registered plugin + circuit state
+```
+
+```ts
+import { defineTool, z } from 'sofuu';
+
+export default defineTool({
+  name: 'weather',
+  description: 'Current temperature for a city',
+  schema: z.object({ city: z.string() }),
+  timeoutMs: 5000,
+  async run({ city }, ctx) {
+    const res = await ctx.fetch('https://wttr.in/' + encodeURIComponent(city) + '?format=j1');
+    if (!res.ok) throw new Error('weather upstream ' + res.status); // -> E_TOOL
+    return { city, tempC: (await res.json()).current_condition[0].temp_C };
+  },
+});
+```
+
+TypeScript is accepted directly: the runtime strips annotations, interfaces,
+type aliases, enums and generics textually before evaluating the file, so a
+plugin never needs `tsc` at install time. Editor support is real `tsc`
+though — `sofuu.d.ts` ships with the package and type-checks under
+`--strict`.
+
+Built-in provider adapters are plugin providers too: `ollama` and `llamacpp`
+talk to a local server, `lmstudio` and `vllm` alias the OpenAI wire on their
+default local ports, and `openai` requires a key. Select one with
+`sofuu chat -p ollama` or `sofuu config provider ollama`. Their streaming is
+delivered as a **buffered replay** (the whole body is read, then the deltas are
+emitted in order) — incremental token delivery stays on the Rust native path,
+which the CLI uses whenever the provider is one of the built-in engines.
+
+Full guide: [docs/PLUGINS.md](docs/PLUGINS.md) · runnable examples:
+[plugins/README.md](plugins/README.md) · typings: [sofuu.d.ts](sofuu.d.ts).
+
+---
+
 ## CLI Reference
 
 ```bash

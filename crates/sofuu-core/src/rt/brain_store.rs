@@ -754,6 +754,20 @@ unsafe fn pack_segment(
     crcs: Option<&[u32]>,
     flags: u32,
 ) -> Result<(), c_int> {
+    let (flat, dims, meta_json) = segment_image(dim, recs, crcs, flags)?;
+    write_segment_image(path, &flat, &dims, &meta_json, flags)
+}
+
+/// The three things a segment is made of: the flat tensor, its shape, and the
+/// metadata document. Split out of `pack_segment` so `write_segment` can hold
+/// the exact bytes it wrote and verify a read-back against THEM, instead of
+/// decoding the file back into records to compare.
+fn segment_image(
+    dim: usize,
+    recs: &[SegRecord],
+    crcs: Option<&[u32]>,
+    flags: u32,
+) -> Result<(Vec<f32>, Vec<u32>, String), c_int> {
     let mut flat: Vec<f32> = Vec::with_capacity(recs.len() * dim);
     let mut metas: Vec<serde_json::Value> = Vec::with_capacity(recs.len());
     for r in recs {
@@ -767,7 +781,7 @@ unsafe fn pack_segment(
         }
         metas.push(m);
     }
-    let dims: [u32; 2] = [recs.len() as u32, dim as u32];
+    let dims: Vec<u32> = vec![recs.len() as u32, dim as u32];
     let mut root = serde_json::Map::new();
     root.insert("dim".into(), serde_json::json!(dim));
     root.insert("records".into(), serde_json::Value::Array(metas));
@@ -793,6 +807,16 @@ unsafe fn pack_segment(
         return Err(qtsq::QTSQ_ERR_FORMAT);
     }
     let meta_json = serde_json::Value::Object(root).to_string();
+    Ok((flat, dims, meta_json))
+}
+
+unsafe fn write_segment_image(
+    path: &str,
+    flat: &[f32],
+    dims: &[u32],
+    meta_json: &str,
+    flags: u32,
+) -> Result<(), c_int> {
     /* A re-pack in place (the two-phase write below) must not inherit a
      * longer previous image: the trailer records the exact length. */
     let _ = std::fs::remove_file(path);
@@ -801,12 +825,12 @@ unsafe fn pack_segment(
         &[
             Stream::Tensor {
                 name: SEGMENT_TENSOR_STREAM,
-                data: &flat,
-                dims: &dims,
+                data: flat,
+                dims,
             },
             Stream::Json {
                 name: SEGMENT_META_STREAM,
-                body: &meta_json,
+                body: meta_json,
             },
         ],
     )?;
@@ -845,18 +869,72 @@ pub unsafe fn write_segment(
         .iter()
         .map(|r| record_crc(r.id, &r.meta, &r.vec))
         .collect();
-    pack_segment(path, dim, recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC)?;
-    /* Learn what a reader will actually decode. */
-    let decoded = open_segment_raw(path)?.recs;
-    if records_bit_identical(recs, &decoded) {
+    let (flat, dims, meta_json) = segment_image(dim, recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC)?;
+    write_segment_image(path, &flat, &dims, &meta_json, SEG_FLAG_PER_RECORD_CRC)?;
+
+    /* Learn what a reader will actually decode — but compare the STREAMS, not
+     * decoded records. This used to re-open the file, decompress both streams,
+     * parse the metadata back into `Value`s and rebuild every record just to
+     * ask one question ("did the tensor survive the codec?"). Measured at
+     * 22.8 ms of a 34.4 ms flush for a 128-record segment, against ~1 ms of
+     * actual container writing. Reading the two streams and memcmp-ing them
+     * answers the same question without a single JSON parse. */
+    let Some((decoded_flat, decoded_meta)) = read_back_streams(path) else {
+        /* Cannot even read our own output: fall through to the strict path so
+         * the failure is reported by the code that knows how to report it. */
+        let decoded = open_segment_raw(path)?.recs;
+        let crcs: Vec<u32> = decoded
+            .iter()
+            .map(|r| record_crc(r.id, &r.meta, &r.vec))
+            .collect();
+        return pack_segment(path, dim, recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC);
+    };
+    let meta_exact = decoded_meta.as_bytes() == meta_json.as_bytes();
+    let tensor_exact = decoded_flat.len() == flat.len()
+        && decoded_flat
+            .iter()
+            .zip(flat.iter())
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+    if tensor_exact && meta_exact {
         /* The codec was exact: phase 1's CRCs already describe it. */
         return Ok(());
     }
-    let crcs: Vec<u32> = decoded
+    if !meta_exact {
+        /* Metadata is JSON: it must round-trip byte for byte. If it did not,
+         * the container is misbehaving — keep the strict record-level check
+         * (and its diagnostics) rather than guessing. */
+        let decoded = open_segment_raw(path)?.recs;
+        let crcs: Vec<u32> = decoded
+            .iter()
+            .map(|r| record_crc(r.id, &r.meta, &r.vec))
+            .collect();
+        return pack_segment(path, dim, recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC);
+    }
+    /* The tensor transform biased some components. Re-derive the CRCs from
+     * what a reader will hash — the DECODED vectors — and repack. The tensor
+     * we hand it is byte-identical to phase 1's, so the file a reader decodes
+     * is exactly `decoded_flat`, which is what these CRCs describe. */
+    let crcs: Vec<u32> = recs
         .iter()
-        .map(|r| record_crc(r.id, &r.meta, &r.vec))
+        .enumerate()
+        .map(|(i, r)| {
+            let lo = i * dim;
+            record_crc(r.id, &r.meta, &decoded_flat[lo..lo + dim])
+        })
         .collect();
-    pack_segment(path, dim, recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC)
+    let (flat, dims, meta_json) = segment_image(dim, recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC)?;
+    write_segment_image(path, &flat, &dims, &meta_json, SEG_FLAG_PER_RECORD_CRC)
+}
+
+/// Re-open a segment the writer just staged and return its two streams
+/// decoded, WITHOUT parsing the metadata into records.
+unsafe fn read_back_streams(path: &str) -> Option<(Vec<f32>, String)> {
+    let (container, _legacy) = container_open_ex(path).ok()?;
+    let tensor = read_tensor_stream(container, SEGMENT_TENSOR_STREAM);
+    let meta = read_json_stream(container, SEGMENT_META_STREAM);
+    container_free(container);
+    let (flat, _dims) = tensor?;
+    Some((flat, meta?))
 }
 
 /// True when two record slices are the same records bit for bit: same

@@ -84,6 +84,36 @@ jobs:
         # costs ~1s (376 tests in 2.8s locally).
         run: cargo test --release -- --test-threads=1
 
+      - name: Phase exit gates (QTSQ_UPGRADE_PLAN.md)
+        # The plan's Phase 1/2 exit gates were never measured, so they were
+        # claims rather than facts. This step measures them at CI size and
+        # prints PASS/FAIL per gate.
+        #
+        # continue-on-error is DELIBERATE and temporary: the first full
+        # measurement (100k records, release, 2026-10-30) showed
+        #   lazy open call   27.4 ms   PASS  (the eager open was > 1 s)
+        #   usable access   170.04 s   FAIL  (materialising 391 segments)
+        #   flush P99       302.0 ms   FAIL  (limit 50 ms)
+        #   10k texts->10k  10000/10000 PASS
+        # so gating on it today would paint every PR red for a real,
+        # already-recorded defect. Flip this to blocking once the load and
+        # flush paths are fast enough; the harness exits non-zero when a gate
+        # fails, so the flip is a one-line delete.
+        continue-on-error: true
+        run: |
+          cargo run --release -p sofuu-core --example brain_gates -- \
+            --n 20000 --dim 64 --texts 2000 --flushes 60 --dirty 128
+
+      - name: W4.5 recall harness (ground truth vs brute force)
+        # The plan names scripts/stress/recall_eval.rs; examples/recall_eval.rs
+        # is a Cargo shim that include!s it, so there is one implementation.
+        # The threshold is only claimed on the CLUSTERED fixture, because
+        # 98.5% recall@10 is not achievable on uniform-random high-dim data
+        # at ef=64 — the harness prints both rather than hiding that.
+        run: |
+          cargo run --release -p sofuu-core --example recall_eval -- \
+            --n 2000 --dim 128 --ef 64
+
       - name: Size cap
         run: make size-check
 

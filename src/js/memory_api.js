@@ -51,17 +51,39 @@
   M.open = function (a, dim, spaceId) {
     // Object form {"path","dim","embed_id"|"space"} and the in-process
     // positional form (path, dim, spaceId) both work.
-    var path, d, sid;
+    var path, d, sid, opts;
     if (a && typeof a === 'object') {
       path = a.path;
       d = a.dim;
       sid = a.embed_id !== undefined ? a.embed_id : a.space;
+      /* W2.2 / W3.3: open modes. `readonly` takes a SHARED lock and writes
+       * nothing at all (no repair, no backup, no lock file); `verifyFull`
+       * keeps the paranoid open that reads and digests every segment
+       * instead of deferring the load to first row access. */
+      opts = {
+        readonly: !!a.readonly,
+        verify_full: !!(a.verifyFull || a.verify_full)
+      };
     } else {
       path = a;
       d = dim;
-      sid = spaceId;
+      /* M.open(path, dim, spaceId) and M.open(path, dim, {readonly, verifyFull})
+       * are both natural calls, so the third positional argument is accepted
+       * as either a space id or the open-modes object. */
+      if (spaceId && typeof spaceId === 'object') {
+        sid = spaceId.embed_id !== undefined ? spaceId.embed_id : spaceId.space;
+        opts = {
+          readonly: !!spaceId.readonly,
+          verify_full: !!(spaceId.verifyFull || spaceId.verify_full)
+        };
+      } else {
+        sid = spaceId;
+        opts = { readonly: false, verify_full: false };
+      }
     }
-    var inst = (sid === undefined || sid === null) ? realOpen(path, d) : realOpen(path, d, sid);
+    var inst = (sid === undefined || sid === null)
+      ? realOpen(path, d, undefined, opts)
+      : realOpen(path, d, sid, opts);
     var id = live.indexOf(inst);
     if (id < 0) {
       var emptyIdx = live.indexOf(null);

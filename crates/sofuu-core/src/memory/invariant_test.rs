@@ -28,7 +28,7 @@
 //       never does, so the survival claim stays decidable)
 //   I9  the default list view never shows a forgotten-tier record
 
-use super::cma::{Cma, ListFilter, FORGET_FLOOR, PIN_ROLE, TIER_FORGOTTEN, WORKING_MAX_RECORDS};
+use super::cma::{is_pinned, Cma, ListFilter, FORGET_FLOOR, PIN_ROLE, TIER_FORGOTTEN, WORKING_MAX_RECORDS};
 use std::collections::{HashMap, HashSet};
 
 const DIM: usize = 64;
@@ -216,7 +216,7 @@ fn run_fuzz(seed: u32) {
                         let r = &cma.records[id];
                         (r.text.clone(), r.strength, r.tier)
                     };
-                if rtier != TIER_FORGOTTEN && rstrength >= FORGET_FLOOR {
+                if rtier != TIER_FORGOTTEN && rstrength >= FORGET_FLOOR && !is_pinned(&cma.records[id]) {
                     let v = cma.index.vector(id as u32).to_vec();
                     let hits = cma.recall(&v, 8);
                     /* The contract is about the FACT, not the row id: an

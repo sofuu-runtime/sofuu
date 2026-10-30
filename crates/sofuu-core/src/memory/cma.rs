@@ -149,6 +149,75 @@ pub fn is_pinned(rec: &Record) -> bool {
 /// `strength` is capped at 1.0 everywhere else, so this is the ceiling.
 pub const PIN_RANK_STRENGTH: f32 = 1.0;
 
+/* ── W5.4: the pin floor is an INVARIANT, not just a ranking hint ─────
+ *
+ * H-08 floored a pin's *ranking* term (`PIN_RANK_STRENGTH`) and exempted
+ * it from recall's floor and retain()'s prune — but the stored strength
+ * still followed the ordinary curve all the way down (≈1e-9 after a
+ * month). Anything that reads the stored number instead of the ranking
+ * term therefore still saw a pin as "about to die": a brain card, an
+ * eviction pass, a UI "weakest facts" list, a reader porting the file.
+ * A pin must not merely *rank* as fresh; it must not decay under the
+ * floor at all. `PIN_FLOOR` is that floor: on every tick a live pinned
+ * row is clamped up to it, and pinning a weak row raises it immediately.
+ */
+pub const PIN_FLOOR: f32 = 0.2;
+
+/* ── W5.3: the decay POLICY ───────────────────────────────────────────
+ *
+ * One hardcoded law used to serve every brain: `strength *= exp(-dt /
+ * half_life)`. W5.3 makes the policy explicit and persistable — the
+ * store keeps the `(tag, seconds)` pair `decay_params()` returns and
+ * re-applies it with `set_decay_params()`. Exactly three tags exist;
+ * the setter rejects everything else:
+ *
+ *   DECAY_TAG_NONE         strength never moves (a tick only ages rows).
+ *   DECAY_TAG_EXPONENTIAL  strength *= 0.5^(dt / seconds) — `seconds` is
+ *                          a HALF-LIFE: a 100 s half-life leaves 0.5 after
+ *                          100 s and 0.25 after 200 s. `seconds == 0.0` is
+ *                          the legacy sentinel meaning "use each record's
+ *                          own `half_life`", which is the pre-W5.3 curve
+ *                          and the DEFAULT, so an old brain file ticks
+ *                          exactly as it always did.
+ *   DECAY_TAG_TTL          nothing decays; a row strictly older than
+ *                          `seconds` (measured from `created_at`) leaves
+ *                          the live set at tick time.
+ *
+ * Every tag still enforces the W5.4 pin floor and never ages a
+ * tombstone.
+ */
+pub const DECAY_TAG_NONE: u8 = 0;
+pub const DECAY_TAG_EXPONENTIAL: u8 = 1;
+pub const DECAY_TAG_TTL: u8 = 2;
+
+/// W5.3: the DeathLedger reason a TTL expiry records. It reuses the same
+/// tombstone → `retain()` accounting as `forget()` ("forget") and
+/// consolidation ("consolidated"); the reason is what tells the three
+/// apart once the row is physically gone.
+pub const TTL_DEATH_REASON: &str = "ttl";
+
+/// W5.4: the pin invariant in one place — a LIVE pinned row never carries
+/// less than `PIN_FLOOR`. Called on every tick (whatever the policy) and
+/// by `pin()` so the raise is immediate. A tombstone is left alone: a
+/// forgotten row is dead, and no decay rule should dress it back up.
+fn clamp_to_pin_floor(rec: &mut Record) {
+    if rec.tier != TIER_FORGOTTEN && is_pinned(rec) && rec.strength < PIN_FLOOR {
+        rec.strength = PIN_FLOOR;
+    }
+}
+
+/// W5.3 TTL: `true` when the row is STRICTLY older than `seconds` by its
+/// `created_at`. `created_at == 0` means "unknown" (a brain file written
+/// before the field existed) and never expires — an unknown age is not
+/// evidence of death. A `created_at` in the future (clock skew) reads as
+/// age 0 through `saturating_sub`, not as a huge age.
+fn ttl_expired(rec: &Record, now: u32, seconds: f64) -> bool {
+    if rec.created_at == 0 {
+        return false;
+    }
+    (now.saturating_sub(rec.created_at) as f64) > seconds
+}
+
 /// H-07: the vector near-duplicate gate's search width. Identical strings
 /// never reach it — `Cma::text_index` answers those in O(1) — so this is
 /// the *near*-duplicate path only. The audit's "ef=128 duplicate gate"
@@ -532,6 +601,15 @@ pub struct Cma {
     /// for. Bulk ingestion can turn it off (SOFUU_BRAIN_DUP_GATE=0) and
     /// lose nothing but paraphrase folding.
     pub dup_gate: bool,
+    /// W5.3: the decay policy tag in force — always one of the
+    /// `DECAY_TAG_*` constants (the only writer is `set_decay_params`,
+    /// which rejects every other value, so an unknown tag cannot exist
+    /// inside a live store).
+    decay_tag: u8,
+    /// W5.3: the policy's seconds parameter — the half-life for
+    /// DECAY_TAG_EXPONENTIAL (`0.0` = the per-record legacy curve) and the
+    /// TTL for DECAY_TAG_TTL (`0.0` = unused, DECAY_TAG_NONE).
+    decay_seconds: f64,
 }
 
 /// Above this many dirty ids, tracking per-record stops paying — the next
@@ -608,6 +686,12 @@ impl Cma {
                     !(v == "0" || v == "false" || v == "off" || v == "no")
                 })
                 .unwrap_or(true),
+            /* W5.3: the shipped default is the historical law — the
+             * per-record e-folding curve. An old brain file that predates
+             * the policy field hydrates into exactly this, and a new brain
+             * ticks the same way until `set_decay_params` says otherwise. */
+            decay_tag: DECAY_TAG_EXPONENTIAL,
+            decay_seconds: 0.0,
         }
     }
 
@@ -616,6 +700,52 @@ impl Cma {
     /// check that costs one graph search per insert.
     pub fn set_dup_gate(&mut self, on: bool) {
         self.dup_gate = on;
+    }
+
+    /// W5.3: the decay policy this brain ticks with, as the `(tag, seconds)`
+    /// pair the store persists. A fresh brain answers
+    /// `(DECAY_TAG_EXPONENTIAL, 0.0)` — the historical per-record curve
+    /// (see `DECAY_TAG_EXPONENTIAL` for the `0.0` sentinel).
+    pub fn decay_params(&self) -> (u8, f64) {
+        (self.decay_tag, self.decay_seconds)
+    }
+
+    /// W5.3: install a decay policy. Returns `false` — and leaves the
+    /// current policy untouched — for an unknown tag, for a non-finite or
+    /// negative `seconds`, and for a TTL that is not strictly positive.
+    /// `DECAY_TAG_NONE` ignores `seconds` (normalised to `0.0`).
+    ///
+    /// `DECAY_TAG_EXPONENTIAL` accepts `seconds == 0.0`: that is the
+    /// documented "use each record's own `half_life`" sentinel, i.e. the
+    /// default, so persisting `decay_params()` and re-applying it after a
+    /// hydrate is a lossless round trip in every mode (including the
+    /// default one).
+    pub fn set_decay_params(&mut self, tag: u8, seconds: f64) -> bool {
+        if !seconds.is_finite() || seconds < 0.0 {
+            return false;
+        }
+        match tag {
+            DECAY_TAG_NONE => {
+                self.decay_tag = DECAY_TAG_NONE;
+                self.decay_seconds = 0.0;
+                true
+            }
+            DECAY_TAG_EXPONENTIAL => {
+                /* 0.0 = the per-record curve; > 0.0 = a global half-life. */
+                self.decay_tag = DECAY_TAG_EXPONENTIAL;
+                self.decay_seconds = seconds;
+                true
+            }
+            DECAY_TAG_TTL => {
+                if seconds <= 0.0 {
+                    return false;
+                }
+                self.decay_tag = DECAY_TAG_TTL;
+                self.decay_seconds = seconds;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// H-07: re-derive the exact-text index from `records`. Cheap (O(n) hash
@@ -1840,21 +1970,85 @@ impl Cma {
         out
     }
 
-    /// Ebbinghaus decay: strength *= exp(-dt / half_life).
+    /// W5.3/W5.4: one decay tick under the policy installed by
+    /// `set_decay_params`.
+    ///
+    /// The law per tag:
+    ///   · `DECAY_TAG_NONE`        — strength does not move at all; the
+    ///     tick only ages the row.
+    ///   · `DECAY_TAG_EXPONENTIAL` — `strength *= 0.5^(dt / seconds)`,
+    ///     a HALF-life law: at a 100 s half-life, 100 s leaves 0.5 and
+    ///     200 s leaves 0.25 (two half-lives). NOTE the arithmetic: the
+    ///     0.3679 (= 1/e) figure is the ONE E-FOLD point, which this law
+    ///     reaches at ln2 · seconds ≈ 69.3 s of a 100 s half-life — it is
+    ///     NOT the 200 s value. With `seconds == 0.0` (the default) the
+    ///     per-record curve of every pre-W5.3 brain applies instead:
+    ///     `strength *= exp(-dt / half_life)`.
+    ///   · `DECAY_TAG_TTL`         — nothing decays; a row strictly older
+    ///     than `seconds` by `created_at` leaves the live set at tick
+    ///     time. It leaves it the way every other death leaves it — a
+    ///     tombstone (`TIER_FORGOTTEN` + its why), which `retain()` then
+    ///     physically prunes and ledgers. No second removal path, and no
+    ///     renumbering mid-tick (ids stay valid until the caller's next
+    ///     turn boundary).
+    ///
+    /// W5.4 is unconditional on every tick, whatever the policy: a live
+    /// pinned row is clamped UP to `PIN_FLOOR` and is never expired or
+    /// tombstoned by decay.
     pub fn decay_tick(&mut self, dt_seconds: u32) {
-        for rec in self.records.iter_mut() {
+        let (tag, seconds) = (self.decay_tag, self.decay_seconds);
+        /* TTL measures wall age, so read the clock once for the whole
+         * pass: a record cannot expire because the loop straddled a
+         * second boundary. */
+        let now = now_secs();
+        let mut expired: Vec<u32> = Vec::new();
+        for idx in 0..self.records.len() {
+            let rec = &mut self.records[idx];
             if rec.tier == TIER_FORGOTTEN {
                 continue;
             }
             rec.age_seconds = rec.age_seconds.saturating_add(dt_seconds);
-            // ml-3 (AUDIT-2026-09-07) belt: half_life 0 would make the factor
-            // exp(-inf) = 0 — an instant permanent erase. hydrate normalizes
-            // the file value; decay stays multiplicative-neutral, not fatal.
-            if rec.half_life == 0 {
-                continue;
+            match tag {
+                DECAY_TAG_NONE => {}
+                DECAY_TAG_TTL => {
+                    if !is_pinned(rec) && ttl_expired(rec, now, seconds) {
+                        /* Positional, like every id in this store. */
+                        expired.push(idx as u32);
+                    }
+                }
+                /* EXPONENTIAL — the only value `set_decay_params` stores
+                 * besides the two above, so the wildcard is exhaustive by
+                 * construction. */
+                _ => {
+                    if seconds > 0.0 {
+                        rec.strength *= 0.5f32.powf(dt_seconds as f32 / seconds as f32);
+                    } else if rec.half_life == 0 {
+                        /* ml-3 (AUDIT-2026-09-07) belt: half_life 0 would
+                         * make the factor exp(-inf) = 0 — an instant
+                         * permanent erase. hydrate normalizes the file
+                         * value; decay stays multiplicative-neutral, not
+                         * fatal. */
+                    } else {
+                        rec.strength *= (-(dt_seconds as f32) / rec.half_life as f32).exp();
+                    }
+                }
             }
-            let f = (-(dt_seconds as f32) / rec.half_life as f32).exp();
-            rec.strength *= f;
+            /* W5.4: the pin floor. Under every policy, on every tick. */
+            clamp_to_pin_floor(rec);
+        }
+        /* TTL expiries leave the live set through the SAME accounting
+         * `forget`/`consolidate` use — tombstone + why — so the ring
+         * (and any reader) can tell a TTL death from a user forget. */
+        for id in expired {
+            if let Some(rec) = self.records.get_mut(id as usize) {
+                rec.tier = TIER_FORGOTTEN;
+                rec.death_reason = Some(TTL_DEATH_REASON.to_string());
+                let gone = rec.text.clone();
+                if !gone.is_empty() && self.text_index.get(&gone) == Some(&id) {
+                    self.text_index.remove(&gone);
+                }
+                self.mark_dirty(id);
+            }
         }
     }
 
@@ -1908,6 +2102,57 @@ impl Cma {
             false
         }
     }
+
+    /// W5.4: pin an existing live row so decay can never demote it. The
+    /// marker written is the same one the JS `/remember` path writes
+    /// (`source = "pin"`), which `is_pinned` already recognises and which
+    /// `RecordJson` already persists — no schema change, and the pin
+    /// survives a flush/hydrate round trip. A row below `PIN_FLOOR` is
+    /// raised to it IMMEDIATELY (not at the next tick). Returns `false`
+    /// for an id that names no record or a tombstone.
+    pub fn pin(&mut self, id: u32) -> bool {
+        if id as usize >= self.records.len() || self.records[id as usize].tier == TIER_FORGOTTEN {
+            return false;
+        }
+        {
+            let rec = &mut self.records[id as usize];
+            if rec.source != "pin" {
+                rec.source = "pin".to_string();
+            }
+            clamp_to_pin_floor(rec);
+        }
+        self.mark_dirty(id);
+        true
+    }
+
+    /// W5.4: release a pin — every spelling `is_pinned` accepts is cleared
+    /// (role `user_pin`/`pin` → `user`, `source = "pin"` → empty, a
+    /// `entity_type = "pin"` marker → `None`), so the row decays on the
+    /// ordinary curve again from wherever the floor left it. Returns
+    /// `false` when the id names no record or the row was not pinned.
+    pub fn unpin(&mut self, id: u32) -> bool {
+        if id as usize >= self.records.len() {
+            return false;
+        }
+        {
+            let rec = &mut self.records[id as usize];
+            if !is_pinned(rec) {
+                return false;
+            }
+            if rec.role == PIN_ROLE || rec.role == "pin" {
+                rec.role = "user".to_string();
+            }
+            if rec.source == "pin" {
+                rec.source.clear();
+            }
+            if rec.entity_type.as_deref() == Some("pin") {
+                rec.entity_type = None;
+            }
+        }
+        self.mark_dirty(id);
+        true
+    }
+
 
     /// M2: record a physical death in the ledger (retain paths; the record
     /// itself is about to vanish, so the ring is the only witness). Newest
@@ -3032,9 +3277,19 @@ mod tests {
             cma.remember(&unit(6, 8), "an unrelated entity", "user", 0);
             /* 30 days of e-folding decay at the 1-day default. */
             cma.decay_tick(30 * 86400);
+            /* W5.4 UPDATED THIS ASSERTION. It used to demand the pin sink
+             * BELOW FORGET_FLOOR ("the pin must really be below the floor")
+             * because that was the H-08 failure mode: a pin decayed to ~1e-9
+             * and only the ranking floor + recall exemption kept it alive.
+             * The pin floor makes that state unreachable — the tick holds a
+             * live pin AT PIN_FLOOR — so the honest assertion is that the
+             * floor held. The below-floor recall exemption is still
+             * exercised below, by lowering the stored strength by hand: a
+             * brain file written BEFORE the floor can carry such a pin, and
+             * hydrate does not re-clamp it. */
             assert!(
-                cma.records[pin as usize].strength < FORGET_FLOOR,
-                "{role}/{source}: the pin must really be below the floor (strength {})",
+                (cma.records[pin as usize].strength - PIN_FLOOR).abs() < 1e-6,
+                "{role}/{source}: a live pin must be held at PIN_FLOOR, got {}",
                 cma.records[pin as usize].strength
             );
 
@@ -3048,6 +3303,18 @@ mod tests {
                 hits[0].distance < 0.01,
                 "{role}/{source}: the pin must come back at distance ~0, got {}",
                 hits[0].distance
+            );
+
+            /* A brain file written BEFORE the pin floor can hand us a pin
+             * far below it — hydrate copies the stored strength verbatim
+             * and nothing re-clamps on read. The recall exemption, not the
+             * floor, is what has to save that row, so prove it here. */
+            cma.records[pin as usize].strength = 1e-9;
+            let weak_hit = cma.recall(&pin_v, 5);
+            assert_eq!(
+                weak_hit.first().map(|h| h.id),
+                Some(pin),
+                "{role}/{source}: a below-floor pin must still be recallable"
             );
 
             /* …and it survives the retention sweep and a reload. */
@@ -3072,10 +3339,10 @@ mod tests {
     }
 
     /// The pin's RANK is floored, not its lifecycle: decay still moves the
-    /// stored strength (the documented e-folding law is untouched), but the
-    /// ordering term can never fall under a fresh row's — a zero-strength
-    /// pin beside a live row would otherwise score 0 and lose its own
-    /// neighbourhood.
+    /// stored strength (W5.4 only stops it at `PIN_FLOOR`, which is a long
+    /// way under a fresh row), but the ordering term can never fall under a
+    /// fresh row's — a floor-level pin beside a live row would otherwise
+    /// score under it and lose its own neighbourhood.
     #[test]
     fn pin_ranking_strength_is_floored_at_one() {
         let mut cma = Cma::new(4);
@@ -3085,11 +3352,11 @@ mod tests {
         let other = cma.remember(&other_v, "fresh unrelated fact", "user", 0) as u32;
         cma.decay_tick(90 * 86400);
         /* The unrelated row is refreshed to model a live record; the pin
-         * keeps the strength 90 idle days left it with. */
+         * keeps the strength 90 idle days left it with — PIN_FLOOR. */
         cma.records[other as usize].strength = 1.0;
         assert!(
-            cma.records[pin as usize].strength < PIN_RANK_STRENGTH,
-            "the stored strength still decayed — only the ranking term is floored"
+            (cma.records[pin as usize].strength - PIN_FLOOR).abs() < 1e-6,
+            "the stored strength sits at the pin floor — only the ranking term is 1.0"
         );
 
         let query = [1.0f32, 0.2, 0.0, 0.0];
@@ -3696,6 +3963,413 @@ mod tests {
         );
         let _ = now;
     }
+
+    /* ── W5.3: the decay POLICY (none | exponential | ttl) ───────────── */
+
+    /// (a) NONE: strength never moves, however much simulated time passes.
+    /// The tick still RUNS — age advances — so this cannot pass on a tick
+    /// that silently does nothing, and age-driven machinery keeps working.
+    #[test]
+    fn decay_policy_none_never_touches_strength() {
+        let mut cma = Cma::new(4);
+        let id = cma.remember(&unit(0, 4), "undecaying fact", "user", 0) as u32;
+        assert!(cma.set_decay_params(DECAY_TAG_NONE, 0.0));
+        assert_eq!(cma.decay_params(), (DECAY_TAG_NONE, 0.0));
+
+        for _ in 0..10 {
+            cma.decay_tick(86_400);
+        }
+        assert_eq!(
+            cma.records[id as usize].strength, 1.0,
+            "NONE: ten days of ticks must not move strength at all"
+        );
+        assert_eq!(
+            cma.records[id as usize].age_seconds, 864_000,
+            "NONE: the tick still ages the row — strength is what does not move"
+        );
+        assert_eq!(cma.records[id as usize].tier, TIER_EPISODIC);
+    }
+
+    /// (b) EXPONENTIAL with a 100 s half-life. THE LAW IS
+    /// `strength *= 0.5^(elapsed_secs / seconds)` — `seconds` is a
+    /// HALF-life, so 100 s leaves 0.5 and 200 s leaves 0.25.
+    ///
+    /// The 0.3679 figure in the brief is 1/e, i.e. the ONE E-FOLD point of
+    /// this same curve, reached at ln2 · seconds ≈ 69.3 s of a 100 s
+    /// half-life — NOT at 200 s. It is asserted here through the identity
+    /// 0.5^(1.4427) = 1/e (1000 s half-life, 1443 s tick) so the
+    /// distinction is pinned by arithmetic, not prose.
+    #[test]
+    fn decay_policy_exponential_is_a_half_life_law() {
+        let mut cma = Cma::new(4);
+        let id = cma.remember(&unit(0, 4), "half-life fact", "user", 0) as u32;
+        assert!(cma.set_decay_params(DECAY_TAG_EXPONENTIAL, 100.0));
+        assert_eq!(cma.decay_params(), (DECAY_TAG_EXPONENTIAL, 100.0));
+
+        cma.decay_tick(100);
+        assert!(
+            (cma.records[id as usize].strength - 0.5).abs() < 1e-6,
+            "one 100 s half-life must halve, got {}",
+            cma.records[id as usize].strength
+        );
+        cma.decay_tick(100);
+        assert!(
+            (cma.records[id as usize].strength - 0.25).abs() < 1e-6,
+            "200 s is TWO half-lives: 0.25, got {}",
+            cma.records[id as usize].strength
+        );
+
+        /* The same 200 s in ONE tick lands in the same place. */
+        let mut one = Cma::new(4);
+        let oid = one.remember(&unit(0, 4), "half-life fact", "user", 0) as u32;
+        assert!(one.set_decay_params(DECAY_TAG_EXPONENTIAL, 100.0));
+        one.decay_tick(200);
+        assert!(
+            (one.records[oid as usize].strength - 0.25).abs() < 1e-6,
+            "0.5^(200/100) = 0.25 in a single tick too, got {}",
+            one.records[oid as usize].strength
+        );
+
+        /* 0.5^(1.4427) = 1/e = 0.367879…: the e-fold lies at ln2
+         * half-lives (1443 s of a 1000 s half-life), which is also why
+         * "0.3679 after 2 half-lives" is the wrong number. */
+        let mut efold = Cma::new(4);
+        let eid = efold.remember(&unit(0, 4), "efold", "user", 0) as u32;
+        assert!(efold.set_decay_params(DECAY_TAG_EXPONENTIAL, 1000.0));
+        efold.decay_tick(1443);
+        let s = efold.records[eid as usize].strength;
+        assert!(
+            (s - 0.367_879_4).abs() < 1e-3,
+            "one e-fold is 0.3679 at ln2 half-lives, got {s}"
+        );
+        let mut two = Cma::new(4);
+        let tid = two.remember(&unit(0, 4), "two half-lives", "user", 0) as u32;
+        assert!(two.set_decay_params(DECAY_TAG_EXPONENTIAL, 1000.0));
+        two.decay_tick(2000);
+        let t = two.records[tid as usize].strength;
+        assert!((t - 0.25).abs() < 1e-6, "two half-lives is 0.25, got {t}");
+        assert!(
+            (t - s).abs() > 0.1,
+            "the e-fold (0.368) and two half-lives (0.25) are different points on the curve"
+        );
+    }
+
+    /// (c) TTL: a row STRICTLY older than `seconds` (by `created_at`)
+    /// leaves the live set at tick time; a younger one is untouched and
+    /// does not decay. `created_at == 0` (unknown — a legacy file) never
+    /// expires.
+    #[test]
+    fn decay_policy_ttl_expires_by_created_at() {
+        let mut cma = Cma::new(4);
+        let old = cma.remember(&unit(0, 4), "sixty second old", "user", 0) as usize;
+        let young = cma.remember(&unit(1, 4), "ten second old", "user", 0) as usize;
+        let unknown = cma.remember(&unit(2, 4), "unknown age", "user", 0) as usize;
+        let now = now_secs();
+        cma.records[old].created_at = now.saturating_sub(60);
+        cma.records[young].created_at = now.saturating_sub(10);
+        cma.records[unknown].created_at = 0;
+        assert!(cma.set_decay_params(DECAY_TAG_TTL, 50.0));
+
+        cma.decay_tick(1);
+
+        assert_eq!(cma.records[old].tier, TIER_FORGOTTEN, "60 s old > 50 s TTL");
+        assert_eq!(
+            cma.records[old].death_reason.as_deref(),
+            Some(TTL_DEATH_REASON),
+            "the tick stamps WHY the row died"
+        );
+        assert_ne!(cma.records[young].tier, TIER_FORGOTTEN, "10 s old < 50 s TTL");
+        assert_eq!(cma.records[young].strength, 1.0, "TTL is not a strength decay");
+        assert_ne!(
+            cma.records[unknown].tier, TIER_FORGOTTEN,
+            "created_at 0 = unknown age, never expires"
+        );
+
+        /* It left the LIVE set at tick time — recall cannot return it. */
+        assert!(
+            !cma.recall(&unit(0, 4), 5).iter().any(|h| h.id == old as u32),
+            "an expired row must not be recallable"
+        );
+        /* …and it leaves through the EXISTING accounting: retain() prunes
+         * the tombstone and the ledger records why (same path as forget /
+         * consolidate). */
+        assert_eq!(cma.retain(), 1, "the expired row is the one retain drops");
+        assert_eq!(
+            cma.deaths.last().map(|d| d.reason.as_str()),
+            Some(TTL_DEATH_REASON),
+            "the death ledger carries the TTL reason"
+        );
+        assert_eq!(cma.len(), 2);
+        assert_eq!(
+            cma.records.iter().filter(|r| r.age_seconds == 1).count(),
+            2,
+            "the survivors were ticked (age 1) — the TTL pass ran"
+        );
+    }
+
+    /// (d) an unknown tag is rejected, and so is an impossible parameter,
+    /// with the installed policy left UNTOUCHED — a store that re-persists
+    /// `decay_params()` after a rejected call must not end up with a
+    /// half-installed policy.
+    #[test]
+    fn decay_policy_rejects_unknown_and_impossible_params() {
+        let mut cma = Cma::new(4);
+        assert_eq!(
+            cma.decay_params(),
+            (DECAY_TAG_EXPONENTIAL, 0.0),
+            "the shipped default is the historical per-record curve"
+        );
+
+        for bogus in [3u8, 7, 42, u8::MAX] {
+            assert!(!cma.set_decay_params(bogus, 60.0), "tag {bogus} is not a policy");
+        }
+        assert_eq!(
+            cma.decay_params(),
+            (DECAY_TAG_EXPONENTIAL, 0.0),
+            "rejections must change nothing"
+        );
+
+        /* TTL needs a strictly positive, finite time-to-live. */
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                !cma.set_decay_params(DECAY_TAG_TTL, bad),
+                "TTL {bad} must be refused"
+            );
+        }
+        /* EXPONENTIAL's half-life is non-negative and finite. */
+        assert!(!cma.set_decay_params(DECAY_TAG_EXPONENTIAL, -5.0));
+        assert!(!cma.set_decay_params(DECAY_TAG_EXPONENTIAL, f64::NAN));
+        assert_eq!(cma.decay_params(), (DECAY_TAG_EXPONENTIAL, 0.0));
+
+        /* Every accepted pair is read back verbatim (what the store
+         * persists, and what a hydrate re-applies). */
+        assert!(cma.set_decay_params(DECAY_TAG_TTL, 50.5));
+        assert_eq!(cma.decay_params(), (DECAY_TAG_TTL, 50.5));
+        assert!(cma.set_decay_params(DECAY_TAG_NONE, 99.0));
+        assert_eq!(cma.decay_params(), (DECAY_TAG_NONE, 0.0), "NONE has no seconds");
+        assert!(
+            cma.set_decay_params(DECAY_TAG_EXPONENTIAL, 0.0),
+            "0.0 is the legacy per-record sentinel, not an error"
+        );
+        assert_eq!(cma.decay_params(), (DECAY_TAG_EXPONENTIAL, 0.0));
+    }
+
+    /// (e) THE DEFAULT IS THE OLD BEHAVIOUR: `Cma::new` ships
+    /// `(DECAY_TAG_EXPONENTIAL, 0.0)`, where `0.0` means "use each record's
+    /// own `half_life`" — byte-for-byte the pre-W5.3 tick
+    /// `strength *= exp(-dt / half_life)`, including the zero-half_life
+    /// guard and the reinforced/entity curves. Every row is checked
+    /// against the closed form, not against another implementation of it.
+    #[test]
+    fn default_decay_policy_reproduces_the_historical_curve() {
+        let mut cma = Cma::new(4);
+        let epi = cma.remember(&unit(0, 4), "a turn fact", "user", 0) as u32;
+        let ent = cma.remember_entity(&unit(1, 4), "Barnaby is a dog", "Barnaby", "pet") as u32;
+        let grown = cma.remember(&unit(2, 4), "a reinforced fact", "user", 0) as u32;
+        cma.mark_positive(&[grown]); // doubles the half-life, as recall does
+        let zero = cma.remember(&unit(3, 4), "hostile zero half-life", "user", 0) as u32;
+        cma.records[zero as usize].half_life = 0;
+        cma.records[epi as usize].strength = 0.8; // a partly-decayed row
+        assert_eq!(
+            cma.decay_params(),
+            (DECAY_TAG_EXPONENTIAL, 0.0),
+            "the shipped default must BE the historical per-record curve"
+        );
+
+        let before: Vec<(u32, f32, u32)> = cma
+            .records
+            .iter()
+            .map(|r| (r.half_life, r.strength, r.age_seconds))
+            .collect();
+        let dt = 3600u32;
+        cma.decay_tick(dt);
+        for (i, (hl, s0, age0)) in before.iter().enumerate() {
+            let r = &cma.records[i];
+            assert_eq!(r.age_seconds, age0 + dt, "row {i}: age advances either way");
+            let want = if *hl == 0 {
+                *s0 // ml-3 belt: a zero half-life row keeps its strength
+            } else {
+                s0 * (-(dt as f32) / *hl as f32).exp()
+            };
+            assert!(
+                (r.strength - want).abs() < 1e-6,
+                "row {i} (half_life {hl}): default tick must equal exp(-dt/half_life); want {want}, got {}",
+                r.strength
+            );
+        }
+        assert!(
+            cma.records[ent as usize].strength > 0.999,
+            "an entity's 1-year half-life barely moves in an hour"
+        );
+        assert!(
+            cma.records[grown as usize].half_life > 86400,
+            "fixture premise: mark_positive grew the half-life"
+        );
+
+        /* The persisted pair round-trips: after another policy, restoring
+         * the DEFAULT (what re-applying a manifest does) re-arms exactly
+         * the same law. */
+        let snap: Vec<f32> = cma.records.iter().map(|r| r.strength).collect();
+        assert!(cma.set_decay_params(DECAY_TAG_NONE, 0.0));
+        cma.decay_tick(86_400);
+        assert_eq!(
+            cma.records[epi as usize].strength, snap[epi as usize],
+            "NONE froze the row"
+        );
+        assert!(cma.set_decay_params(DECAY_TAG_EXPONENTIAL, 0.0));
+        assert_eq!(cma.decay_params(), (DECAY_TAG_EXPONENTIAL, 0.0));
+        cma.decay_tick(86_400);
+        let hl = cma.records[epi as usize].half_life;
+        let want = snap[epi as usize] * (-(86_400f32) / hl as f32).exp();
+        assert!(
+            (cma.records[epi as usize].strength - want).abs() < 1e-6,
+            "restoring the default re-arms the historical law"
+        );
+    }
+
+    /* ── W5.4: the pin floor is an invariant ─────────────────────────── */
+
+    /// (a) pinning raises a weak row to exactly `PIN_FLOOR` immediately,
+    /// and every tick holds it there.
+    #[test]
+    fn pin_floor_raises_a_weak_row_and_holds_it() {
+        let mut cma = Cma::new(4);
+        let id = cma.remember(&unit(0, 4), "weak pin candidate", "user", 0) as u32;
+        cma.records[id as usize].strength = 0.13;
+        assert!(!cma.pin(9_999), "no such record");
+        assert!(cma.pin(id), "pinning a live row must succeed");
+        assert_eq!(
+            cma.records[id as usize].strength, PIN_FLOOR,
+            "a pin raises a 0.13 row to the floor ON THE SPOT"
+        );
+        assert!(is_pinned(&cma.records[id as usize]));
+
+        for i in 0..10 {
+            cma.decay_tick(3600);
+            assert_eq!(
+                cma.records[id as usize].strength, PIN_FLOOR,
+                "tick {i}: a pinned row must sit exactly on the floor"
+            );
+            assert_eq!(cma.records[id as usize].tier, TIER_EPISODIC, "tick {i}");
+        }
+        assert_eq!(cma.retain(), 0, "nothing to prune: the pin is live at the floor");
+        assert_eq!(cma.len(), 1);
+    }
+
+    /// (b) a pinned row is never dropped or demoted — not after 100 ticks
+    /// of decay, and not under a GLOBAL policy (TTL) that would expire the
+    /// whole store.
+    #[test]
+    fn pinned_row_is_never_dropped_or_expired() {
+        let mut cma = Cma::new(4);
+        let pin = cma.remember(&unit(0, 4), "pinned anchor", "user", 0) as u32;
+        assert!(cma.pin(pin));
+        for i in 0..100 {
+            cma.decay_tick(86_400);
+            assert!(
+                cma.records[pin as usize].strength >= PIN_FLOOR - 1e-6,
+                "tick {i}: pin strength fell under the floor: {}",
+                cma.records[pin as usize].strength
+            );
+            assert_eq!(
+                cma.records[pin as usize].tier, TIER_EPISODIC,
+                "tick {i}: a pin is never demoted"
+            );
+        }
+        assert_eq!(cma.retain(), 0, "retain has nothing to drop: the row is pinned");
+
+        /* The global config: TTL 1 s with every row far older than that. */
+        cma.records[pin as usize].created_at = now_secs().saturating_sub(3_600);
+        assert!(cma.set_decay_params(DECAY_TAG_TTL, 1.0));
+        cma.decay_tick(1);
+        assert_ne!(
+            cma.records[pin as usize].tier, TIER_FORGOTTEN,
+            "a TTL broad enough to expire the store must not take a pin"
+        );
+        assert!(
+            cma.records[pin as usize].death_reason.is_none(),
+            "no death reason is stamped on a pin"
+        );
+        assert_eq!(cma.retain(), 0);
+        assert_eq!(cma.len(), 1);
+        let hits = cma.recall(&unit(0, 4), 3);
+        assert_eq!(hits.first().map(|h| h.id), Some(pin), "the pin still recalls");
+    }
+
+    /// (c) THE CONTROL: an unpinned row in the same brain does decay away.
+    /// Without it, (a)/(b) could pass on a tick that does nothing at all.
+    #[test]
+    fn unpinned_row_in_the_same_brain_decays_away() {
+        let mut cma = Cma::new(4);
+        let pin = cma.remember(&unit(0, 4), "pinned anchor", "user", 0) as u32;
+        let loose = cma.remember(&unit(1, 4), "idle unpinned twin", "user", 0) as u32;
+        assert!(cma.pin(pin));
+        for _ in 0..100 {
+            cma.decay_tick(86_400);
+        }
+        assert!(
+            cma.records[loose as usize].strength < FORGET_FLOOR,
+            "the unpinned twin must decay below the forget floor, got {}",
+            cma.records[loose as usize].strength
+        );
+        assert_eq!(
+            cma.records[loose as usize].tier, TIER_EPISODIC,
+            "decay does not tombstone — retain does"
+        );
+        assert_eq!(cma.retain(), 1, "retain drops the decayed twin and nothing else");
+        assert_eq!(cma.len(), 1);
+        assert!(
+            cma.records.iter().any(|r| r.text == "pinned anchor"),
+            "the pin outlived the control"
+        );
+        assert_eq!(cma.deaths.last().map(|d| d.reason.as_str()), Some("decay"));
+    }
+
+    /// (d) unpinning restores the ordinary curve: the row decays again from
+    /// the floor it was held at, and retain() prunes it once it is under
+    /// the forget floor.
+    #[test]
+    fn unpin_restores_normal_decay() {
+        let mut cma = Cma::new(4);
+        let id = cma.remember(&unit(0, 4), "released fact", "user", 0) as u32;
+        cma.records[id as usize].strength = 0.13;
+        assert!(cma.pin(id));
+        cma.decay_tick(86_400);
+        assert_eq!(cma.records[id as usize].strength, PIN_FLOOR);
+
+        assert!(cma.unpin(id), "unpin must accept a pinned row");
+        assert!(
+            !is_pinned(&cma.records[id as usize]),
+            "every pin spelling was cleared"
+        );
+        assert!(!cma.unpin(id), "unpinning twice reports 'not pinned'");
+
+        /* One day at the 1-day default: 0.2 · e⁻¹ ≈ 0.0736 — under the
+         * floor it was held at, still above the forget floor. */
+        cma.decay_tick(86_400);
+        let s = cma.records[id as usize].strength;
+        assert!(s < PIN_FLOOR, "the released row decays again, got {s}");
+        assert!(
+            (s - PIN_FLOOR * (-1.0f32).exp()).abs() < 1e-5,
+            "the ordinary curve resumes from the floor, got {s}"
+        );
+        cma.decay_tick(3 * 86_400);
+        assert!(cma.records[id as usize].strength < FORGET_FLOOR);
+        assert_eq!(cma.retain(), 1, "an unpinned weak row is pruned like any other");
+        assert_eq!(cma.len(), 0);
+
+        /* A row pinned by ROLE is unpinned too — the floor must not leak
+         * through a marker spelling. */
+        let by_role = cma.remember(&unit(2, 4), "role-pinned fact", PIN_ROLE, 0) as u32;
+        assert!(is_pinned(&cma.records[by_role as usize]));
+        assert!(cma.unpin(by_role));
+        assert!(!is_pinned(&cma.records[by_role as usize]));
+        assert_eq!(cma.records[by_role as usize].role, "user");
+        /* A tombstone is not pinnable. */
+        cma.forget(by_role);
+        assert!(!cma.pin(by_role), "a forgotten row cannot be pinned");
+    }
+
 }
 
 #[cfg(test)]

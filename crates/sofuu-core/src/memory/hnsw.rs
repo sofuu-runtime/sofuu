@@ -247,7 +247,15 @@ impl Hnsw {
     }
 
     /// Push a new vector; returns its index (used as node id).
+    ///
+    /// W3.1: only a hydrated index can be extended — inserting into a
+    /// topology-only one would build links from coordinates that are not
+    /// there, so it panics with the remedy instead.
     pub fn add_vector(&mut self, v: &[f32]) -> u32 {
+        assert!(
+            self.is_hydrated(),
+            "Hnsw::add_vector on a topology-only snapshot: call hydrate_vectors() first"
+        );
         debug_assert_eq!(v.len(), self.vec_dim);
         self.vec_store.push(v.to_vec());
         let id = (self.vec_store.len() - 1) as u32;
@@ -257,8 +265,19 @@ impl Hnsw {
 
     /// The number of stored vectors (tombstones included — use `live_len`
     /// for the recallable count).
+    ///
+    /// W3.1: a graph restored from a snapshot has its nodes before its
+    /// coordinates (`hydrate_vectors` attaches those), and the record count
+    /// is a property of the nodes — so this reports the larger of the two.
+    /// They are equal in every hydrated index.
     pub fn len(&self) -> usize {
-        self.vec_store.len()
+        self.vec_store.len().max(self.nodes.len())
+    }
+
+    /// W3.1: true when the coordinates are attached — false only between
+    /// `load_from` and `hydrate_vectors` (`load_with_vectors` does both).
+    pub fn is_hydrated(&self) -> bool {
+        self.vec_store.len() == self.nodes.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -306,7 +325,10 @@ impl Hnsw {
     /// The HNSW store IS the single vector store — Cma.vectors was folded
     /// into it (AUDIT-2026-09-07 ml-5).
     pub fn vector(&self, id: u32) -> &[f32] {
-        &self.vec_store[id as usize]
+        self.vec_store
+            .get(id as usize)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// The level-0 out-links of `id` (empty for an out-of-range id). Read
@@ -330,12 +352,22 @@ impl Hnsw {
     /// makes — but searches see the new coordinates immediately.
     pub fn set_vector(&mut self, id: u32, v: &[f32]) {
         debug_assert_eq!(v.len(), self.vec_dim);
-        self.vec_store[id as usize].copy_from_slice(v);
+        if let Some(dst) = self.vec_store.get_mut(id as usize) {
+            if dst.len() == v.len() {
+                dst.copy_from_slice(v);
+            }
+        }
     }
 
     fn dist(&self, a: u32, b: u32) -> f32 {
-        let va = &self.vec_store[a as usize];
-        let vb = &self.vec_store[b as usize];
+        let (Some(va), Some(vb)) = (
+            self.vec_store.get(a as usize),
+            self.vec_store.get(b as usize),
+        ) else {
+            /* W3.1: a topology-only graph has no coordinates; an unreachable
+             * distance keeps every ordering total instead of panicking. */
+            return f32::MAX;
+        };
         /* H-07: slice iteration instead of indexed bounds-checked loads —
          * same arithmetic, vectorizes (this is the inner loop of every
          * search and every insert). */
@@ -343,7 +375,9 @@ impl Hnsw {
     }
 
     fn dist_query(&self, q: &[f32], b: u32) -> f32 {
-        let vb = &self.vec_store[b as usize];
+        let Some(vb) = self.vec_store.get(b as usize) else {
+            return f32::MAX;
+        };
         q.iter().zip(vb).map(|(x, y)| (x - y) * (x - y)).sum()
     }
 
@@ -750,6 +784,11 @@ impl Hnsw {
         if self.nodes.is_empty() || k == 0 || self.live_len() == 0 {
             return Vec::new();
         }
+        /* W3.1: without coordinates there is nothing to rank — a
+         * topology-only snapshot answers nothing until it is hydrated. */
+        if !self.is_hydrated() {
+            return Vec::new();
+        }
         let ef = ef.max(k);
         let budget = self.visit_budget(ef);
         // Greedy best-first descent from the enter point down to level 0,
@@ -808,9 +847,609 @@ impl Hnsw {
     }
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * W3.1: the persisted graph snapshot
+ *
+ * Every open used to rebuild this index from the store's records:
+ * `add_vector` per record, with an `efConstruction`-wide walk each — the
+ * dominant cost of opening a large brain. The topology is now saved as a
+ * self-describing, versioned snapshot beside the manifest
+ * (`graph-<generation>.bin`, see `rt::brain_store::graph_path`) and
+ * mapped back in, which is O(bytes) instead of O(n · ef · M).
+ *
+ * What is saved is deliberately ONLY the topology: levels, neighbour
+ * lists, the enter point, tombstones, the W4.6 reachability state and the
+ * selection policy. The VECTORS are not duplicated — they are already in
+ * the store's segments, and a copy would roughly double the on-disk
+ * footprint (`hydrate_vectors` fills them from the records on load).
+ *
+ * The format is little-endian, and every field is checked before it is
+ * trusted: magic, version, dimension, record count, the M/M0/ef parameters
+ * this build was compiled with, per-node level and degree bounds, the
+ * enter point, and a SHA-256 over the whole payload. A snapshot that
+ * disagrees with the store — different dim, different count, different
+ * parameters, or a failed digest — is REJECTED (`SnapshotError`), and the
+ * caller rebuilds from records instead of trusting it.
+ * ══════════════════════════════════════════════════════════════════════ */
+
+/// `SFUHNSW\x01` — catches "this is not a graph snapshot" before any
+/// length field is interpreted.
+pub const HNSW_SNAPSHOT_MAGIC: &[u8; 8] = b"SFUHNSW\x01";
+/// Bump on any layout change: an older build must refuse a newer file (and
+/// rebuild) rather than misparse it.
+pub const HNSW_SNAPSHOT_VERSION: u32 = 1;
+/// Trailing digest width (SHA-256).
+pub const HNSW_SNAPSHOT_DIGEST: usize = 32;
+
+/// Why a graph snapshot was refused. Every variant means "rebuild from the
+/// records" — never "the brain cannot be opened".
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// The file could not be read or written.
+    Io(String),
+    /// The magic did not match: not a snapshot at all.
+    NotASnapshot,
+    /// A snapshot written by a newer format version.
+    UnsupportedVersion(u32),
+    /// The bytes are damaged: truncated, out of range, or a digest
+    /// mismatch.
+    Corrupt(&'static str),
+    /// A well-formed snapshot of a DIFFERENT graph (dimension, record
+    /// count, or index parameters disagree with the store).
+    Mismatch(String),
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotError::Io(e) => write!(f, "graph snapshot io: {e}"),
+            SnapshotError::NotASnapshot => write!(f, "not a graph snapshot"),
+            SnapshotError::UnsupportedVersion(v) => {
+                write!(f, "graph snapshot version {v} is newer than this build")
+            }
+            SnapshotError::Corrupt(w) => write!(f, "graph snapshot corrupt: {w}"),
+            SnapshotError::Mismatch(w) => write!(f, "graph snapshot does not match the store: {w}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+impl From<std::io::Error> for SnapshotError {
+    fn from(e: std::io::Error) -> Self {
+        SnapshotError::Io(e.to_string())
+    }
+}
+
+/// A read-only view of the snapshot file.
+///
+/// The store is small enough that either path is cheap, but the point of
+/// the snapshot is a fast open, so the normal path is `mmap` (libc is
+/// already a dependency of this crate — no new crate is pulled in): the
+/// page cache is walked in place and the topology is decoded straight out
+/// of the mapping. When `mmap` is unavailable (a filesystem that refuses
+/// it, or a non-unix target) `open` falls back to `std::fs::read`, which
+/// costs one copy of the same bytes and behaves identically.
+struct SnapshotBytes {
+    ptr: *mut libc::c_void,
+    len: usize,
+    /// `Some` on the fallback path (and on non-unix targets), meaning the
+    /// bytes are owned rather than mapped.
+    owned: Option<Vec<u8>>,
+}
+
+impl SnapshotBytes {
+    #[cfg(unix)]
+    fn open(path: &str) -> Result<Self, SnapshotError> {
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::File::open(path).map_err(SnapshotError::from)?;
+        let len = file.metadata().map_err(SnapshotError::from)?.len();
+        if len == 0 {
+            return Err(SnapshotError::NotASnapshot);
+        }
+        if len > usize::MAX as u64 {
+            return Err(SnapshotError::Corrupt("snapshot too large to map"));
+        }
+        let len = len as usize;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            /* Fallback: no mapping on this filesystem. */
+            let data = std::fs::read(path).map_err(SnapshotError::from)?;
+            let len = data.len();
+            return Ok(SnapshotBytes {
+                ptr: std::ptr::null_mut(),
+                len,
+                owned: Some(data),
+            });
+        }
+        Ok(SnapshotBytes {
+            ptr,
+            len,
+            owned: None,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn open(path: &str) -> Result<Self, SnapshotError> {
+        let data = std::fs::read(path).map_err(SnapshotError::from)?;
+        let len = data.len();
+        if len == 0 {
+            return Err(SnapshotError::NotASnapshot);
+        }
+        Ok(SnapshotBytes {
+            ptr: std::ptr::null_mut(),
+            len,
+            owned: Some(data),
+        })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match &self.owned {
+            Some(v) => v.as_slice(),
+            /* SAFETY: the mapping is PROT_READ, `len` bytes, and outlives
+             * the borrow; nothing else writes the file through us. */
+            None => unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) },
+        }
+    }
+}
+
+impl Drop for SnapshotBytes {
+    fn drop(&mut self) {
+        if self.owned.is_none() && !self.ptr.is_null() {
+            unsafe {
+                libc::munmap(self.ptr, self.len);
+            }
+        }
+    }
+}
+
+/// Bounds-checked little-endian reader over the mapped bytes.
+struct SnapReader<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl<'a> SnapReader<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        SnapReader { b, at: 0 }
+    }
+    fn need(&mut self, n: usize) -> Result<&'a [u8], SnapshotError> {
+        let end = self
+            .at
+            .checked_add(n)
+            .ok_or(SnapshotError::Corrupt("length overflow"))?;
+        if end > self.b.len() {
+            return Err(SnapshotError::Corrupt("truncated"));
+        }
+        let s = &self.b[self.at..end];
+        self.at = end;
+        Ok(s)
+    }
+    fn u8(&mut self) -> Result<u8, SnapshotError> {
+        Ok(self.need(1)?[0])
+    }
+    fn u32(&mut self) -> Result<u32, SnapshotError> {
+        let s = self.need(4)?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+    fn u64(&mut self) -> Result<u64, SnapshotError> {
+        let s = self.need(8)?;
+        Ok(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+    /// How many bytes are left — the budget every count is checked against.
+    fn remaining(&self) -> usize {
+        self.b.len().saturating_sub(self.at)
+    }
+}
+
+/// SHA-256 over the snapshot image (the store's own hash, no new crate).
+fn snapshot_digest(data: &[u8]) -> [u8; 32] {
+    let mut h = crate::rt::wal::Sha256::new();
+    h.update(data);
+    h.finalize()
+}
+
+fn push_u32(out: &mut Vec<u8>, v: u32) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn push_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+impl Hnsw {
+    /// The constructor parameters a snapshot is only valid under. They are
+    /// compile-time constants of this build, so a snapshot written by a
+    /// build with different ones must be rebuilt, not trusted.
+    fn snapshot_params() -> [u32; 3] {
+        [
+            HNSW_MAX_M as u32,
+            HNSW_MAX_M0 as u32,
+            HNSW_EF_CONSTRUCTION as u32,
+        ]
+    }
+
+    fn policy_code(&self) -> u32 {
+        match self.policy {
+            SelectPolicy::Heuristic => 0,
+            SelectPolicy::Nearest => 1,
+            SelectPolicy::LegacyRandom => 2,
+        }
+    }
+
+    fn policy_from_code(c: u32) -> Result<SelectPolicy, SnapshotError> {
+        match c {
+            0 => Ok(SelectPolicy::Heuristic),
+            1 => Ok(SelectPolicy::Nearest),
+            2 => Ok(SelectPolicy::LegacyRandom),
+            _ => Err(SnapshotError::Corrupt("unknown selection policy")),
+        }
+    }
+
+    /// The snapshot image: header, every node's level and neighbour lists,
+    /// tombstones, reachability state, and the trailing digest.
+    fn snapshot_bytes(&self) -> Result<Vec<u8>, SnapshotError> {
+        for (i, n) in self.nodes.iter().enumerate() {
+            if n.id as usize != i {
+                return Err(SnapshotError::Mismatch(format!(
+                    "node id {} is not its slot {i}",
+                    n.id
+                )));
+            }
+        }
+        let count = self.nodes.len();
+        /* Header + a level byte and at most M0 links per node (the real
+         * degree is usually lower; this is only a size hint). */
+        let mut out: Vec<u8> = Vec::with_capacity(48 + count * (5 + 4 * HNSW_MAX_M0));
+        out.extend_from_slice(HNSW_SNAPSHOT_MAGIC);
+        push_u32(&mut out, HNSW_SNAPSHOT_VERSION);
+        push_u32(&mut out, self.vec_dim as u32);
+        push_u64(&mut out, count as u64);
+        let [m, m0, ef] = Self::snapshot_params();
+        push_u32(&mut out, m);
+        push_u32(&mut out, m0);
+        push_u32(&mut out, ef);
+        push_u32(&mut out, self.policy_code());
+        push_u32(&mut out, self.enter_node);
+        push_u32(&mut out, self.max_level as u32);
+        for n in &self.nodes {
+            out.push(n.level);
+            for l in 0..=n.level as usize {
+                let links = n.links.get(l).map(|v| v.as_slice()).unwrap_or(&[]);
+                push_u32(&mut out, links.len() as u32);
+                for &id in links {
+                    push_u32(&mut out, id);
+                }
+            }
+        }
+        /* Tombstones, packed (bit i of byte i/8). */
+        let mut bits = vec![0u8; count.div_ceil(8)];
+        for (i, d) in self.deleted.iter().enumerate() {
+            if *d {
+                if let Some(b) = bits.get_mut(i / 8) {
+                    *b |= 1 << (i % 8);
+                }
+            }
+        }
+        out.extend_from_slice(&bits);
+        for i in 0..count {
+            push_u32(&mut out, self.l0_in(i as u32));
+        }
+        push_u32(&mut out, self.orphans.len() as u32);
+        for &id in &self.orphans {
+            push_u32(&mut out, id);
+        }
+        let digest = snapshot_digest(&out);
+        out.extend_from_slice(&digest);
+        Ok(out)
+    }
+
+    /// Parse and fully validate a snapshot image.
+    ///
+    /// `expect_dim`/`expect_count` are the shape of the store this snapshot
+    /// is being loaded for (the records it must describe). Anything that
+    /// disagrees is a `Mismatch` — the caller rebuilds.
+    fn parse_snapshot(
+        bytes: &[u8],
+        expect_dim: Option<usize>,
+        expect_count: Option<usize>,
+    ) -> Result<Hnsw, SnapshotError> {
+        if bytes.len() < HNSW_SNAPSHOT_MAGIC.len() + 4 + HNSW_SNAPSHOT_DIGEST {
+            return Err(SnapshotError::NotASnapshot);
+        }
+        if &bytes[..HNSW_SNAPSHOT_MAGIC.len()] != HNSW_SNAPSHOT_MAGIC {
+            return Err(SnapshotError::NotASnapshot);
+        }
+        /* Digest FIRST: nothing inside a file whose checksum is wrong is
+         * worth interpreting (and a torn write usually fails here). */
+        let body_end = bytes.len() - HNSW_SNAPSHOT_DIGEST;
+        let want = &bytes[body_end..];
+        let got = snapshot_digest(&bytes[..body_end]);
+        if want != got {
+            return Err(SnapshotError::Corrupt("digest mismatch"));
+        }
+        let mut r = SnapReader::new(&bytes[..body_end]);
+        r.need(HNSW_SNAPSHOT_MAGIC.len())?;
+        let version = r.u32()?;
+        if version != HNSW_SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnsupportedVersion(version));
+        }
+        let dim = r.u32()? as usize;
+        let count = r.u64()?;
+        if count > usize::MAX as u64 {
+            return Err(SnapshotError::Corrupt("record count overflows"));
+        }
+        let count = count as usize;
+        let m = r.u32()?;
+        let m0 = r.u32()?;
+        let ef = r.u32()?;
+        if [m, m0, ef] != Self::snapshot_params() {
+            return Err(SnapshotError::Mismatch(format!(
+                "index parameters differ (snapshot M={m} M0={m0} ef={ef}, this build M={} M0={} ef={})",
+                HNSW_MAX_M,
+                HNSW_MAX_M0,
+                HNSW_EF_CONSTRUCTION
+            )));
+        }
+        let policy = Self::policy_from_code(r.u32()?)?;
+        let enter_node = r.u32()?;
+        let max_level = r.u32()? as u8;
+        if let Some(d) = expect_dim {
+            if d != dim {
+                return Err(SnapshotError::Mismatch(format!(
+                    "dimension {dim} != store dimension {d}"
+                )));
+            }
+        }
+        if let Some(c) = expect_count {
+            if c != count {
+                return Err(SnapshotError::Mismatch(format!(
+                    "record count {count} != store record count {c}"
+                )));
+            }
+        }
+        if max_level as usize >= HNSW_MAX_LEVELS {
+            return Err(SnapshotError::Corrupt("max level out of range"));
+        }
+        if count == 0 {
+            if enter_node != 0 {
+                return Err(SnapshotError::Corrupt("enter point on an empty graph"));
+            }
+            let mut graph = Hnsw::new_with_policy(dim, policy);
+            graph.max_level = 0;
+            return Ok(graph);
+        }
+        if enter_node as usize >= count {
+            return Err(SnapshotError::Corrupt("enter point out of range"));
+        }
+        /* Every node costs at least 5 bytes (level + link count), so a
+         * count larger than the remaining bytes is a lie — refuse before
+         * reserving anything for it. */
+        if count > r.remaining() / 5 {
+            return Err(SnapshotError::Corrupt("record count exceeds the image"));
+        }
+        let mut nodes: Vec<Node> = Vec::with_capacity(count);
+        for id in 0..count {
+            let level = r.u8()?;
+            if level as usize >= HNSW_MAX_LEVELS {
+                return Err(SnapshotError::Corrupt("node level out of range"));
+            }
+            let mut links: Vec<Vec<u32>> = Vec::with_capacity(level as usize + 1);
+            for l in 0..=level as usize {
+                let n = r.u32()? as usize;
+                let cap = if l == 0 { HNSW_MAX_M0 } else { HNSW_MAX_M };
+                if n > cap {
+                    return Err(SnapshotError::Corrupt("node degree out of range"));
+                }
+                if n > r.remaining() / 4 {
+                    return Err(SnapshotError::Corrupt("neighbour count exceeds the image"));
+                }
+                let mut list = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let nb = r.u32()?;
+                    if nb as usize >= count {
+                        return Err(SnapshotError::Corrupt("neighbour out of range"));
+                    }
+                    list.push(nb);
+                }
+                links.push(list);
+            }
+            nodes.push(Node { id: id as u32, level, links });
+        }
+        if nodes[enter_node as usize].level != max_level {
+            return Err(SnapshotError::Corrupt("enter point is not at the top level"));
+        }
+        let bits = r.need(count.div_ceil(8))?;
+        let mut deleted = Vec::with_capacity(count);
+        for i in 0..count {
+            deleted.push(bits[i / 8] & (1 << (i % 8)) != 0);
+        }
+        if count > r.remaining() / 4 {
+            return Err(SnapshotError::Corrupt("in-degree table exceeds the image"));
+        }
+        let mut in_l0 = Vec::with_capacity(count);
+        for _ in 0..count {
+            in_l0.push(r.u32()?);
+        }
+        let n_orphans = r.u32()? as usize;
+        if n_orphans > count || n_orphans > r.remaining() / 4 {
+            return Err(SnapshotError::Corrupt("orphan list out of range"));
+        }
+        let mut orphans = Vec::with_capacity(n_orphans);
+        for _ in 0..n_orphans {
+            let id = r.u32()?;
+            if id as usize >= count {
+                return Err(SnapshotError::Corrupt("orphan out of range"));
+            }
+            orphans.push(id);
+        }
+        if r.remaining() != 0 {
+            return Err(SnapshotError::Corrupt("trailing bytes before the digest"));
+        }
+        Ok(Hnsw {
+            /* Hydrated separately: the coordinates live in the store. */
+            vec_store: Vec::new(),
+            vec_dim: dim,
+            nodes,
+            enter_node,
+            max_level,
+            deleted,
+            policy,
+            in_l0,
+            orphans,
+        })
+    }
+
+    /// Persist this graph's topology to `path`.
+    ///
+    /// Published the way every other store file is: stage to `<path>.tmp`,
+    /// fsync it, rename it into place, fsync the directory — so a crash
+    /// leaves either the old snapshot or the new one, never a torn one
+    /// beside a committed manifest.
+    pub fn save_to(&self, path: &str) -> Result<(), SnapshotError> {
+        let bytes = self.snapshot_bytes()?;
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let tmp = format!("{path}.tmp");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&bytes)?;
+            f.sync_all()?;
+        }
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(SnapshotError::Io(format!("could not publish {path}")));
+        }
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            if let Ok(d) = std::fs::File::open(parent) {
+                let _ = d.sync_all();
+            }
+        }
+        Ok(())
+    }
+
+    /// Load a snapshot's TOPOLOGY (mmap'd, digest-checked, parameter- and
+    /// shape-checked).
+    ///
+    /// The returned index holds no coordinates — they are the store's
+    /// records — so it answers no queries until `hydrate_vectors` fills
+    /// them (`search` returns empty meanwhile rather than scoring against
+    /// missing data). `load_with_vectors` does both in one call, which is
+    /// what the store's open path uses.
+    pub fn load_from(path: &str) -> Result<Hnsw, SnapshotError> {
+        let map = SnapshotBytes::open(path)?;
+        Self::parse_snapshot(map.bytes(), None, None)
+    }
+
+    /// Load a snapshot for a store whose records are `vectors` (in record
+    /// id order) and hydrate it in one step.
+    ///
+    /// A snapshot that disagrees with those records in dimension or count —
+    /// or fails its digest, or was written with other index parameters — is
+    /// rejected with `SnapshotError`, and the caller rebuilds from the
+    /// records instead of trusting it.
+    pub fn load_with_vectors(
+        path: &str,
+        vectors: Vec<Vec<f32>>,
+    ) -> Result<Hnsw, SnapshotError> {
+        let expect_dim = vectors.first().map(|v| v.len());
+        let expect_count = Some(vectors.len());
+        let map = SnapshotBytes::open(path)?;
+        let mut graph = Self::parse_snapshot(map.bytes(), expect_dim, expect_count)?;
+        graph.hydrate_vectors(vectors)?;
+        Ok(graph)
+    }
+
+    /// Attach the store's coordinates to a topology-loaded graph.
+    ///
+    /// This does NOT touch a single link: the graph and the vectors are the
+    /// same pair the writer saved, so the loaded index answers exactly the
+    /// queries the rebuilt one does (see the golden-recall test).
+    pub fn hydrate_vectors(&mut self, vectors: Vec<Vec<f32>>) -> Result<(), SnapshotError> {
+        if vectors.len() != self.nodes.len() {
+            return Err(SnapshotError::Mismatch(format!(
+                "{} vectors for {} nodes",
+                vectors.len(),
+                self.nodes.len()
+            )));
+        }
+        if let Some(bad) = vectors.iter().position(|v| v.len() != self.vec_dim) {
+            return Err(SnapshotError::Mismatch(format!(
+                "vector {bad} has dimension {} (snapshot is {})",
+                vectors[bad].len(),
+                self.vec_dim
+            )));
+        }
+        self.vec_store = vectors;
+        Ok(())
+    }
+
+    /// Cheap "is this snapshot usable for a store of this shape?" check:
+    /// header, parameters, digest, dimension and record count — without
+    /// decoding the topology or touching any coordinates. Lets a caller
+    /// decide to rebuild BEFORE it assembles the record vectors.
+    pub fn verify_snapshot(
+        path: &str,
+        dim: usize,
+        count: usize,
+    ) -> Result<(), SnapshotError> {
+        let map = SnapshotBytes::open(path)?;
+        let bytes = map.bytes();
+        if bytes.len() < HNSW_SNAPSHOT_MAGIC.len() + 4 + HNSW_SNAPSHOT_DIGEST {
+            return Err(SnapshotError::NotASnapshot);
+        }
+        if &bytes[..HNSW_SNAPSHOT_MAGIC.len()] != HNSW_SNAPSHOT_MAGIC {
+            return Err(SnapshotError::NotASnapshot);
+        }
+        let body_end = bytes.len() - HNSW_SNAPSHOT_DIGEST;
+        if bytes[body_end..] != snapshot_digest(&bytes[..body_end]) {
+            return Err(SnapshotError::Corrupt("digest mismatch"));
+        }
+        let mut r = SnapReader::new(&bytes[..body_end]);
+        r.need(HNSW_SNAPSHOT_MAGIC.len())?;
+        let version = r.u32()?;
+        if version != HNSW_SNAPSHOT_VERSION {
+            return Err(SnapshotError::UnsupportedVersion(version));
+        }
+        let snap_dim = r.u32()? as usize;
+        let snap_count = r.u64()? as usize;
+        let params = [r.u32()?, r.u32()?, r.u32()?];
+        if params != Self::snapshot_params() {
+            return Err(SnapshotError::Mismatch(
+                "index parameters differ from this build".into(),
+            ));
+        }
+        if snap_dim != dim {
+            return Err(SnapshotError::Mismatch(format!(
+                "dimension {snap_dim} != store dimension {dim}"
+            )));
+        }
+        if snap_count != count {
+            return Err(SnapshotError::Mismatch(format!(
+                "record count {snap_count} != store record count {count}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 /// Simple deterministic PRNG for tests + level assignment.
-fn rand_u32() -> u32 {
-    // xorshift — deterministic, no external dep.
+fn rand_u32() -> u32 {    // xorshift — deterministic, no external dep.
     use std::cell::Cell;
     thread_local! {
         static STATE: Cell<u32> = Cell::new(0x9e3779b9);
@@ -1694,4 +2333,241 @@ mod tests {
         }
         assert_eq!(small.visit_budget(8), usize::MAX);
     }
+
+    /* ══════════════════════════════════════════════════════════════
+     * W3.1: persisted graph snapshots
+     * ══════════════════════════════════════════════════════════════ */
+
+    /// A private directory for the snapshot files these tests write.
+    fn snapdir(tag: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!(
+            "sofuu-hnsw-snap-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// (a) THE GOLDEN COMPARISON: the graph loaded from the snapshot answers
+    /// every query exactly as the graph that was saved — same ids, same
+    /// order, same distances — and both agree with the rebuilt index.
+    #[test]
+    fn w3_1_snapshot_round_trip_answers_identically() {
+        let dim = 32usize;
+        let (vecs, queries) = clustered_fixture(11, 800, dim, 8, 0.15, 24);
+        let built = build(&vecs, dim, SelectPolicy::Heuristic);
+        let path = snapdir("golden");
+        let file = path.join("graph-000001.bin").to_string_lossy().to_string();
+        built.save_to(&file).expect("save");
+
+        let loaded =
+            Hnsw::load_with_vectors(&file, vecs.clone()).expect("a valid snapshot must load");
+        assert_eq!(loaded.len(), built.len());
+        assert_eq!(loaded.vec_dim, built.vec_dim);
+        assert_eq!(loaded.max_level, built.max_level);
+        assert_eq!(loaded.enter_node, built.enter_node);
+        assert_eq!(loaded.policy(), built.policy());
+        for id in 0..built.len() as u32 {
+            assert_eq!(
+                loaded.neighbors_l0(id),
+                built.neighbors_l0(id),
+                "level-0 links of node {id} must survive the round trip"
+            );
+        }
+
+        let mut compared = 0usize;
+        for q in &queries {
+            for k in [1usize, 5, 10] {
+                for ef in [16usize, 64] {
+                    let want = built.search_with_ef(q, k, ef);
+                    let got = loaded.search_with_ef(q, k, ef);
+                    assert_eq!(
+                        got, want,
+                        "snapshot answer differs from the saved graph (k={k}, ef={ef})"
+                    );
+                    compared += 1;
+                }
+            }
+            /* And it is the SAME index the records rebuild to: identical
+             * geometry, identical links, identical answers. */
+            assert_eq!(
+                loaded.search(q, 5),
+                built.search(q, 5),
+                "loaded graph must match the rebuilt one exactly"
+            );
+        }
+        assert!(compared > 0);
+        /* Recall is unchanged too (not just self-consistency). */
+        let (r_built, r_loaded) = (
+            recall_at(&built, &vecs, &queries, 10, 64),
+            recall_at(&loaded, &vecs, &queries, 10, 64),
+        );
+        assert_eq!(
+            r_built, r_loaded,
+            "recall must not move across a snapshot round trip"
+        );
+        println!("W3.1 golden: {compared} (query,k,ef) comparisons identical; recall@10 {r_loaded:.4}");
+    }
+
+    /// (b) A damaged snapshot is REJECTED — and the caller rebuilds from the
+    /// records, which still answers (the brain opens; only the cache is
+    /// lost). Covers a bit flip, a truncation, a header/dimension lie and a
+    /// snapshot from a store of another size.
+    #[test]
+    fn w3_1_a_corrupt_snapshot_is_rejected_and_the_graph_is_rebuilt() {
+        let dim = 16usize;
+        let (vecs, queries) = clustered_fixture(23, 300, dim, 6, 0.2, 8);
+        let built = build(&vecs, dim, SelectPolicy::Heuristic);
+        let dir = snapdir("corrupt");
+        let good = dir.join("graph-000001.bin").to_string_lossy().to_string();
+        built.save_to(&good).expect("save");
+        let pristine = std::fs::read(&good).unwrap();
+
+        // 1. one flipped byte in the topology body.
+        let mut flipped = pristine.clone();
+        let at = pristine.len() / 2;
+        flipped[at] ^= 0b0001_0000;
+        let f = dir.join("flip.bin").to_string_lossy().to_string();
+        std::fs::write(&f, &flipped).unwrap();
+        assert_eq!(
+            Hnsw::load_with_vectors(&f, vecs.clone()).err(),
+            Some(SnapshotError::Corrupt("digest mismatch")),
+            "a flipped byte must be refused, not decoded"
+        );
+
+        // 2. a truncated file (a crash mid-write).
+        let t = dir.join("trunc.bin").to_string_lossy().to_string();
+        std::fs::write(&t, &pristine[..pristine.len() - 40]).unwrap();
+        assert!(matches!(
+            Hnsw::load_with_vectors(&t, vecs.clone()),
+            Err(SnapshotError::Corrupt(_))
+        ));
+
+        // 3. not a snapshot at all.
+        let n = dir.join("junk.bin").to_string_lossy().to_string();
+        std::fs::write(&n, b"this is not a graph snapshot").unwrap();
+        assert_eq!(
+            Hnsw::load_with_vectors(&n, vecs.clone()).err(),
+            Some(SnapshotError::NotASnapshot)
+        );
+
+        // 4. a snapshot of a DIFFERENT store: one more record than the store
+        //    has (a stale graph after a flush).
+        assert!(matches!(
+            Hnsw::load_with_vectors(&good, vecs[..vecs.len() - 1].to_vec()),
+            Err(SnapshotError::Mismatch(_))
+        ));
+        //    …or vectors of the wrong dimension.
+        let mut wrong_dim: Vec<Vec<f32>> = vecs.clone();
+        wrong_dim[0] = vec![0.0; dim + 1];
+        assert!(matches!(
+            Hnsw::load_with_vectors(&good, wrong_dim),
+            Err(SnapshotError::Mismatch(_))
+        ));
+        //    …the cheap pre-check agrees without decoding anything.
+        assert!(Hnsw::verify_snapshot(&good, dim, vecs.len()).is_ok());
+        assert!(matches!(
+            Hnsw::verify_snapshot(&good, dim, vecs.len() + 1),
+            Err(SnapshotError::Mismatch(_))
+        ));
+
+        // THE REBUILD: every rejection above funnels into the same fallback
+        // the open path takes — rebuild from the records — and the rebuilt
+        // index answers the queries the saved one answered.
+        let rebuilt = build(&vecs, dim, SelectPolicy::Heuristic);
+        for q in &queries {
+            assert_eq!(rebuilt.search(q, 5), built.search(q, 5));
+        }
+        println!(
+            "W3.1 corrupt: 4 rejections (digest/truncation/magic/mismatch); rebuild from {} records answers identically",
+            vecs.len()
+        );
+    }
+
+    /// (c) Opening a large store from the snapshot is measurably cheaper
+    /// than rebuilding the index from its records.
+    ///
+    /// "Open time" here is exactly the work the store does on open: decode
+    /// every record's vector, then either `add_vector` each one (rebuild) or
+    /// map the snapshot and attach the vectors (load). Both timings are
+    /// printed.
+    #[test]
+    fn w3_1_a_snapshot_opens_faster_than_a_rebuild() {
+        let dim = 64usize;
+        let n = 20_000usize;
+        let (vecs, queries) = uniform_fixture(31, n, dim, 4);
+
+        let t_rebuild = std::time::Instant::now();
+        let built = build(&vecs, dim, SelectPolicy::Heuristic);
+        let rebuild = t_rebuild.elapsed();
+
+        let dir = snapdir("open");
+        let file = dir.join("graph-000001.bin").to_string_lossy().to_string();
+        built.save_to(&file).expect("save");
+        let graph_bytes = std::fs::metadata(&file).unwrap().len();
+
+        let t_load = std::time::Instant::now();
+        let loaded = Hnsw::load_with_vectors(&file, vecs.clone()).expect("load");
+        let load = t_load.elapsed();
+
+        println!(
+            "W3.1 open: rebuild from {n} records x dim {dim} = {rebuild:?}; snapshot ({graph_bytes} bytes) mmap load = {load:?}; speedup = {:.1}x",
+            rebuild.as_secs_f64() / load.as_secs_f64().max(1e-9)
+        );
+        /* The snapshot must be decisively cheaper — not marginally. */
+        assert!(
+            load * 5 < rebuild,
+            "a snapshot open ({load:?}) must be at least 5x cheaper than a rebuild ({rebuild:?})"
+        );
+        /* …and identical in what it answers. */
+        for q in &queries {
+            assert_eq!(loaded.search(q, 5), built.search(q, 5));
+        }
+        /* The topology must stay small in ABSOLUTE terms, per record.
+         *
+         * It is tempting to compare it with the vector payload, but that
+         * ratio depends on dim: level 0 holds at most M0 neighbour ids of
+         * 4 bytes, i.e. 32*4 = 128 B per record, while dim=64 vectors are
+         * only 256 B — so "under half the vectors" is unachievable at low
+         * dim by construction, not a regression. The real invariant is
+         * that the snapshot is O(M0) per record and does not scale with
+         * dim: M0*4 bytes of links + a small per-record header. */
+        let per_record_bound = (n as u64) * (32u64 * 4 + 48);
+        assert!(
+            graph_bytes <= per_record_bound,
+            "the snapshot ({graph_bytes} B, {:.1} B/record) must stay within M0*4+48 = 176 B/record ({per_record_bound} B)",
+            graph_bytes as f64 / n as f64
+        );
+    }
+
+    /// The topology-only loader is usable for inspection, refuses to answer
+    /// queries it cannot compute, and can be hydrated later.
+    #[test]
+    fn w3_1_topology_only_load_answers_nothing_until_hydrated() {
+        let dim = 12usize;
+        let (vecs, queries) = clustered_fixture(5, 120, dim, 4, 0.2, 4);
+        let built = build(&vecs, dim, SelectPolicy::Heuristic);
+        let dir = snapdir("topo");
+        let file = dir.join("graph-000007.bin").to_string_lossy().to_string();
+        built.save_to(&file).expect("save");
+
+        let mut topo = Hnsw::load_from(&file).expect("topology load");
+        assert_eq!(topo.len(), vecs.len(), "the node count is known");
+        assert!(!topo.is_hydrated());
+        assert!(topo.search(&queries[0], 5).is_empty(), "no coordinates, no answers");
+        assert!(topo.vector(0).is_empty());
+
+        topo.hydrate_vectors(vecs.clone()).expect("hydrate");
+        assert!(topo.is_hydrated());
+        for q in &queries {
+            assert_eq!(topo.search(q, 5), built.search(q, 5));
+        }
+    }
+
 }

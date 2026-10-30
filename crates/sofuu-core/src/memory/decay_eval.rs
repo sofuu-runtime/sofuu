@@ -239,9 +239,20 @@ fn decay_eval_pin_survives_a_month_and_stays_recallable() {
                 "{role}/{source} week {week}: the idle twin is (correctly) long gone"
             );
         }
+        /* W5.4 moved this contract: a live pin is no longer allowed to sink
+         * below the floor, it is HELD at it. The property this test exists
+         * for is unchanged — a pinned row stays recallable after a month of
+         * decay — but the mechanism is now the floor rather than the
+         * strength filter's exemption. */
+        /* PIN_FLOOR is a MINIMUM, not a fixed point: a pin that has not yet
+         * decayed down to it legitimately sits above it (0.22 in this
+         * fixture). The invariant is "never below", which is what makes the
+         * row survive the strength filter indefinitely. */
+        let pinned_strength = cma.records[pin as usize].strength;
         assert!(
-            cma.records[pin as usize].strength < FORGET_FLOOR,
-            "{role}/{source}: the pin really did decay below the floor — recall ignores it anyway"
+            pinned_strength >= super::cma::PIN_FLOOR - 1e-6,
+            "{role}/{source}: a live pin must never fall below PIN_FLOOR ({}), got {pinned_strength}",
+            super::cma::PIN_FLOOR
         );
         /* Retention keeps it too. */
         cma.retain();

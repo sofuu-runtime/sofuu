@@ -826,7 +826,20 @@ flowchart TD
         end
     end
 
-    subgraph P2["Phase 2: Hardening & Compiler (Active Sprint)"]
+    subgraph P2["Phase 2: Hardening, Compatibility & Compiler (Active Sprint)"]
+        subgraph P2_Compat["Node & Web Standards Compatibility (Shipped)"]
+            B1["WHATWG Web Standards (TextEncoder, URL, atob, Headers, Request, Response)"]
+            B2["Web Crypto API (crypto.randomUUID v4, getRandomValues, SHA-256)"]
+            B3["Node.js Core Globals (Buffer, EventEmitter, process.nextTick, versions)"]
+            B4["Virtual Module Loader (node:path, fs, crypto, events, stream, os, util)"]
+            B5["Native Synchronous FS Primitives (readFileSync, writeFileSync, existsSync)"]
+            B6["Official Compatibility Matrix & TS Template (COMPAT.md)"]
+        end
+        subgraph P2_Frontend["Native Frontend & Full-Stack Engine (Experimental)"]
+            E1["Streaming JSX/TSX Transpiler"]
+            E2["Dev Server & Livereload (sofuu dev)"]
+            E3["Static Asset Serving & SSR Bridge"]
+        end
         subgraph P2_Compiler["Standalone Compiler (sofuu compile)"]
             C1["AOT Bytecode Serializer (rt/bytecode.rs)"]
             C2["32-Byte Binary Trailer (SOFUU_BIN_V1)"]
@@ -870,8 +883,8 @@ flowchart TD
     end
 
     subgraph P4["Phase 4: Ecosystem & Edge Standards (Future Vision)"]
-        W1["WinterCG Standards (fetch, Request, Response, Streams)"]
-        W2["Cloudflare Workers & Vercel Edge Drop-In Mode"]
+        W1["Extended WinterCG & Cloudflare Workers Drop-In Mode"]
+        W2["Vercel Edge & Cloudflare Edge Adaptors"]
         W3["Multi-Arch Cross-Compilation (--target linux-x86_64/arm64)"]
         W4["Embeddable Mobile SDKs (libsofuu Swift & Kotlin)"]
         W5["Encrypted Peer-to-Peer Remote Cloud Mesh Relay"]

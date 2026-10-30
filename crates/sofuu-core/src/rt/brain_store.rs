@@ -71,6 +71,25 @@ pub const ERR_NOT_CONTAINER: c_int = -1001;
 /// floor under the plan's "flush P99 < 50 ms" and "open < 1 s" gates; the fix
 /// is a key-derivation cache or a derived-key entry point in the vault.
 pub const QTSQ_LEVEL_FULL: c_int = 0;
+/// 1 = fast, 2 = store (no compression). See qtc_level_opts in the C codec.
+pub const QTSQ_LEVEL_FAST: c_int = 1;
+pub const QTSQ_LEVEL_STORE: c_int = 2;
+
+/// Compression level for a stream of `len` bytes.
+///
+/// The codec runs at ~4.5 MB/s at FULL: a 32 KB segment tensor costs 7 ms of
+/// CPU to save ~17 KB of writes, which cost 0.02 ms. For anything a flush
+/// writes, compressing is a catastrophic trade — and at STORE the codec is the
+/// IDENTITY, which also means the two-phase write (and its probe) has nothing
+/// left to correct. Large payloads still compress: there the saved megabytes
+/// are worth the seconds.
+fn stream_level(len: usize) -> c_int {
+    if len <= 1 << 20 {
+        QTSQ_LEVEL_STORE
+    } else {
+        QTSQ_LEVEL_FULL
+    }
+}
 
 pub const MANIFEST_STREAM: &str = "manifest";
 pub const SEGMENT_META_STREAM: &str = "meta";
@@ -490,6 +509,7 @@ pub unsafe fn container_write(path: &str, streams: &[Stream]) -> Result<(), c_in
                 r = qtsq::QTSQ_ERR_ALLOC;
                 break;
             }
+            let ti = std::time::Instant::now();
             let init = qtsq::qtsq_init(sub);
             if init != qtsq::QTSQ_OK {
                 qtsq::qtsq_ctx_free(sub);
@@ -497,6 +517,8 @@ pub unsafe fn container_write(path: &str, streams: &[Stream]) -> Result<(), c_in
                 break;
             }
             (*sub).set_codec(qtsq::QTSQ_CODEC_QTC);
+            let t_init = ti.elapsed().as_secs_f64() * 1000.0;
+            let tc = std::time::Instant::now();
             let (rc, name) = match s {
                 Stream::Tensor { name, data, dims } => {
                     if data.is_empty() {
@@ -511,7 +533,7 @@ pub unsafe fn container_write(path: &str, streams: &[Stream]) -> Result<(), c_in
                             data.len(),
                             dims.as_ptr(),
                             dims.len() as u8,
-                            QTSQ_LEVEL_FULL,
+                            stream_level(data.len() * 4),
                         ),
                         *name,
                     )
@@ -529,6 +551,10 @@ pub unsafe fn container_write(path: &str, streams: &[Stream]) -> Result<(), c_in
                     )
                 }
             };
+            if std::env::var_os("SOFUU_PROFILE").is_some() {
+                let kind = match s { Stream::Tensor { .. } => "tensor", Stream::Json { .. } => "json" };
+                eprintln!("[cw] init={t_init:.2} compress[{kind}]={:.2}", tc.elapsed().as_secs_f64() * 1000.0);
+            }
             if rc == qtsq::QTSQ_OK {
                 let cname = CString::new(name).unwrap_or_default();
                 r = qtsq::qtsq_container_add_stream(container, sub, cname.as_ptr());
@@ -855,6 +881,11 @@ unsafe fn write_segment_image(
 /// one 64 KB write, so the real segment is packed exactly once.
 unsafe fn probe_decoded_tensor(dim: usize, n: usize, flat: &[f32]) -> Option<Vec<f32>> {
     if flat.len() != n * dim || dim == 0 || n == 0 {
+        return None;
+    }
+    /* A stored tensor is the identity: there is nothing for a probe to learn,
+     * and the caller's own vectors are already what a reader will decode. */
+    if stream_level(flat.len() * 4) == QTSQ_LEVEL_STORE {
         return None;
     }
     let path = std::env::temp_dir().join(format!(

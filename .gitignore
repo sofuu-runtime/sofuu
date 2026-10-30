@@ -164,3 +164,12 @@ sofuu-desktop/src-tauri/icons/StoreLogo.png
 # repository root; see npm/package.json — H-06).
 npm/LICENSE
 npm/NOTICE
+
+# Local-only project notes: kept on this machine, deliberately not published.
+# (Untracked 2026-10-30; the files stay in the working tree.)
+/AGENTS.md
+/TASKS.md
+/RELEASE-0.2.0-PREP.md
+/SOFUU-ANDROID-0.2.0-UPDATE.md
+/SOFUU-CRYPTO-JWT.md
+/PLUGIN_SYSTEM_REPORT.pdf

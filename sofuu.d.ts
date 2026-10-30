@@ -21,7 +21,9 @@
  *
  * The declarations reference the host fetch/AbortController globals (Response,
  * RequestInit, AbortSignal). Sofuu provides all three at runtime, so include a
- * DOM or Node type library in the consuming project.
+ * DOM or Node type library in the consuming project. `Response.body` is a
+ * WHATWG `ReadableStream<Uint8Array>` (getReader / pipeThrough / tee / async
+ * iteration), so the DOM library's types describe it correctly.
  *
  * Usage:
  *   import { defineTool, z } from 'sofuu';

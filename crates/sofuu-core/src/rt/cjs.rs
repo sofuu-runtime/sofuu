@@ -182,20 +182,74 @@ unsafe extern "C" fn js_require(
         qjs::sofuu_js_free_value(ctx, nmods);
     }
 
+    /* PLAN-MODERN-NPM pillar C: a Node built-in this runtime deliberately
+     * does not provide gets an explanation instead of "Cannot find module".
+     * Checked AFTER the shim catalog, so a module that is (or later becomes)
+     * provided is never shadowed by the diagnostic. */
+    let bare = spec_clean.split('/').next().unwrap_or(spec_clean);
+    if let Some(hint) = crate::rt::diagnostics::unsupported_node_api(bare) {
+        let msg = crate::rt::diagnostics::unsupported_api_message(bare, hint);
+        qjs::sofuu_js_free_cstring(ctx, spec_ptr);
+        return crate::rt::diagnostics::throw_with_code(
+            ctx,
+            c"ReferenceError",
+            &msg,
+            crate::rt::diagnostics::E_NODE_API,
+        );
+    }
+
     let Ok(cwd) = std::env::current_dir() else {
         qjs::sofuu_js_free_cstring(ctx, spec_ptr);
         return qjs::JS_ThrowReferenceError(ctx, c"Cannot determine cwd".as_ptr());
     };
 
-    let resolved = crate::npm::npm_resolve(&cwd, &spec).map(|p| p.to_string_lossy().into_owned());
+    /* require() evaluates the CommonJS condition order (`require` first), so
+     * a dual-published package gives us its CJS build, not a .mjs file. */
+    let resolved = crate::npm::npm_resolve_cjs(&cwd, &spec).map(|p| p.to_string_lossy().into_owned());
 
     let Some(resolved) = resolved else {
-        let msg = format!("Cannot find module '{}'", spec);
+        let mut msg = format!("Cannot find module '{}'", spec);
+        if let Some(why) = crate::npm::explain_module_not_found(&cwd, &spec) {
+            msg = crate::rt::diagnostics::resolution_message(&spec, &why);
+        }
+        if let Some(hint) = crate::rt::diagnostics::native_package_hint(bare) {
+            msg.push_str(&format!("\n  → Recommendation: {hint}."));
+        }
         qjs::sofuu_js_free_cstring(ctx, spec_ptr);
-        let mc = CString::new(msg).unwrap_or_default();
-        return qjs::JS_ThrowReferenceError(ctx, mc.as_ptr());
+        return crate::rt::diagnostics::throw_with_code(
+            ctx,
+            c"ReferenceError",
+            &msg,
+            crate::rt::diagnostics::E_RESOLVE,
+        );
     };
     qjs::sofuu_js_free_cstring(ctx, spec_ptr);
+
+    /* PLAN-MODERN-NPM pillar C: a resolved .node entry point is a compiled
+     * addon, not JavaScript. Refuse it before reading a Mach-O/ELF file as
+     * source (which used to surface as a syntax error). */
+    if resolved.ends_with(".node") {
+        let pkg = crate::rt::diagnostics::package_of_path(&resolved).unwrap_or_else(|| spec.clone());
+        let msg = crate::rt::diagnostics::native_addon_message(&pkg, &resolved);
+        return crate::rt::diagnostics::throw_with_code(
+            ctx,
+            c"ReferenceError",
+            &msg,
+            crate::rt::diagnostics::E_NATIVE_ADDON,
+        );
+    }
+
+    /* require() of an ES module: say so, instead of wrapping `export` in a
+     * CommonJS function and reporting a syntax error at the wrong layer. */
+    if resolved.ends_with(".mjs") {
+        let msg = crate::rt::diagnostics::require_esm_message(&spec, &resolved);
+        return crate::rt::diagnostics::throw_with_code(
+            ctx,
+            c"TypeError",
+            &msg,
+            crate::rt::diagnostics::E_REQUIRE_ESM,
+        );
+    }
 
     let Some(source) = read_file(&resolved) else {
         return qjs::JS_ThrowReferenceError(

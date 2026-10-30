@@ -155,6 +155,12 @@ jobs:
       - name: Policy DX gate (25 checks)
         run: make policy-dx
 
+      # PLAN-MODERN-NPM: conditional exports, WHATWG streams behind fetch()
+      # and the actionable import diagnostics, proven end to end against a
+      # real chunked server.
+      - name: Modern npm + web streams gate (28 checks)
+        run: make modern-npm
+
       # R7.P4: the SBOM is a release artifact; generating it on every push
       # catches a `cargo metadata` regression before the tag does.
       - name: SBOM generates (CycloneDX 1.5)

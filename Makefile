@@ -37,7 +37,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # ──────────────────────────────────────────────────────────────────
 
 .PHONY: all clean install test protocol-test serve-test c-only size-check bc-check cargo-build sandbox-stress \
-	observability-stress asan fuzz-simd policy-dx sbom sign-dist \
+	observability-stress asan fuzz-simd policy-dx modern-npm sbom sign-dist \
         deps scoreboard scoreboard-check \
         libsofuu libsofuu-linux-x86_64 zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
@@ -188,6 +188,14 @@ fuzz-simd:
 # the three guard flags enforced at the real gates.
 policy-dx: $(TARGET)
 	@bash scripts/stress/policy_dx_e2e.sh ./$(TARGET)
+
+# ── PLAN-MODERN-NPM: npm compatibility + web streams ────────────
+# Conditional "exports" (subpaths, wildcards, import vs require), WHATWG
+# streams behind fetch(), and the actionable failure diagnostics. The probe
+# runs against a real chunked SSE server, so streaming is proven by arrival
+# time rather than by a resolved promise.
+modern-npm: $(TARGET)
+	@bash scripts/stress/modern_npm_e2e.sh ./$(TARGET)
 
 # ── R7.P4: distribution integrity ───────────────────────────────
 # sbom      — CycloneDX 1.5 SBOM from `cargo metadata` (stdlib Python only,

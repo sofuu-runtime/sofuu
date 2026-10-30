@@ -47,6 +47,7 @@ Sofuu runs **identically across surfaces**: as an embeddable mobile SDK (`libsof
 - **Long-context Q&A** — `sofuu.rlm.query` answers over contexts far larger than any model window via a sandboxed reader loop
 - **Context-economy gates** — `sofuu.ml` freshness/supervisor/compaction/relevance models (~8k params each) advise the loop to cut token waste; hard off via `/ml off` or `SOFUU_NO_ML=1`
 - **MCP + HTTP + web** — `sofuu.mcp.connect/serve`, `sofuu.http.createServer`, keyless `sofuu.web.search/open`
+- **Modern npm + Web Streams** — conditional `package.json#exports` (subpaths, `./*` wildcards, `import`/`require` conditions), and `Response.body` as a real `ReadableStream` (`getReader`, `pipeThrough(new TextDecoderStream())`, `for await`), so official AI SDK streaming loops run unmodified; unsupported packages fail with a coded, actionable diagnostic instead of a cryptic error
 - **Embeddable** — `libsofuu` C ABI with Swift/Kotlin wrappers; QuickJS has no JIT, so iOS App Store policy is satisfied by design
 
 ---

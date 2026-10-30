@@ -37,6 +37,7 @@ pub mod model_caps_discovered; // caps harvested from endpoint model listings (p
 pub mod memory; // M9: sofuu.memory/kv/agent (mod_memory.c + mod_kv.c + mod_agent.c + qtsq_adapter.c)
 pub mod zerocopy; // Phase 3: Zero-Copy TypedArray & Native Memory Bridge
 pub mod view_guard; // R7.P2: the validated JS-view → native-pointer window (bounds/alignment/dim)
+pub mod diagnostics; // PLAN-MODERN-NPM: actionable failures (native addons, absent Node APIs, resolution)
 pub mod async_context; // Phase 4: Native AsyncLocalStorage & Agent Context Propagation
 pub mod sandbox; // Phase 5: Deterministic Agent Sandboxing & Fuel Meters
 pub mod policy; // S4 (R7): one policy evaluator for tools/shell/fs/net/MCP

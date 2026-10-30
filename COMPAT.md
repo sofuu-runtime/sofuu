@@ -15,7 +15,12 @@ Sofuu implements the WHATWG and W3C standard interfaces used by modern SDKs and 
 | `fetch()` | **Full** | Native HTTP/1.1 and HTTP/2 client backed by native connection pooling; supports streaming bodies and SSE. |
 | `Headers` | **Full** | Case-insensitive header maps, iteration (`entries`, `keys`, `values`), and `append`/`set`/`get`/`delete`. |
 | `Request` | **Full** | WHATWG Request object supporting `.json()`, `.text()`, headers, and method parsing. |
-| `Response` | **Full** | Supports `.json()`, `.text()`, `.arrayBuffer()`, and static `Response.json(data, init)`. |
+| `Response` | **Full** | `.json()`, `.text()`, `.arrayBuffer()`, static `Response.json(data, init)`, and a stable `.body` that is a real `ReadableStream`. |
+| `ReadableStream` | **Full** | `getReader()` (`read`, `releaseLock`, `cancel`), `locked`, `cancel`, `pipeTo`, `pipeThrough`, `tee`, `Symbol.asyncIterator`. Chunks are `Uint8Array`. |
+| `WritableStream` | **Full (core)** | `getWriter()` (`write`, `close`, `abort`, `ready`, `closed`), serialised writes with backpressure signalled through `ready`. |
+| `TransformStream` | **Full (core)** | `readable` / `writable` pair with `transform`, `flush`, `start`, and a controller (`enqueue`, `error`, `terminate`). |
+| `TextDecoderStream` | **Full** | Incremental UTF-8 decoding that keeps split multi-byte characters intact across chunk boundaries. |
+| `TextEncoderStream` | **Full** | String chunks to UTF-8 byte chunks. |
 | `URL` | **Full** | Complete WHATWG URL parser supporting `protocol`, `hostname`, `port`, `pathname`, `search`, `hash`, `origin`, and credentials. |
 | `URLSearchParams` | **Full** | Bi-directional synchronization with `url.search` and `url.href`; supports `get`, `getAll`, `has`, `set`, `append`, `delete`, and iterators. |
 | `TextEncoder` | **Full** | Spec-compliant UTF-8 encoder (`encode()` $\to$ `Uint8Array`, `encodeInto()`). |
@@ -51,8 +56,29 @@ Sofuu intercepts both CommonJS (`require('...')`) and ES Module (`import ... fro
 | `async_hooks` / `node:async_hooks` | **Full** | `AsyncLocalStorage` backed by Sofuu's native context propagation engine (`sofuu.context`). |
 | `process` / `node:process` | **Full** | `process.nextTick()`, `process.env`, `process.cwd()`, `process.versions` (`node`, `sofuu`, `quickjs`), `process.platform`, `process.arch`, `process.exit()`, `process.argv`. |
 | `http` / `https` | **Partial** | Client requests routed through native HTTP engine; edge server functions available via `sofuu serve` and `sofuu.http.createServer()`. |
-| `child_process` | **Sandboxed** | Replaced by `sofuu.exec` / `sofuu.subprocess` with deterministic permission controls and timeout caps. |
+| `child_process` | **Intentional gap** | Not provided. `require('child_process')` throws `ERR_SOFUU_UNSUPPORTED_NODE_API` and points at `sofuu.spawn` / `sofuu.exec` (deterministic permission controls and timeout caps). |
+| `worker_threads` / `cluster` | **Intentional gap** | `ERR_SOFUU_UNSUPPORTED_NODE_API`. Sofuu runs one address space: use `scheduler.yield()`, `sofuu.swarm`, or an agent mesh. |
+| `v8` / `inspector` | **Intentional gap** | `ERR_SOFUU_UNSUPPORTED_NODE_API` — there is no V8 inside a zero-JIT engine. |
 | `net` / `tls` | **Intentional Gap** | Direct raw TCP socket manipulation is restricted in favor of `sofuu.http`, `fetch`, and WebSockets for security containment. |
+
+### Package resolution (`node_modules`)
+
+Resolution follows the Node.js / WinterCG subpath contract:
+
+- `package.json#exports` is honoured for the root (`"."`) and for subpaths, with
+  exact keys, `./*` wildcard patterns (longest prefix wins), string, array and
+  nested-condition targets.
+- Condition order is `import` → `module` → `default` → `node` for `import` /
+  `import()`, and `require` → `module` → `default` → `node` → `import` for
+  `require()` — so a dual-published package gives each loader its own build.
+- Without `exports`, the legacy chain is `module` → `main` → `index.js` /
+  `index.mjs`, and a deep import (`pkg/lib/x.js`) still resolves.
+- An `exports` target may not escape its own package (`..`, absolute paths and
+  URLs are refused).
+- Failures are diagnosed rather than guessed: a missing package says
+  `run \`sofuu add <pkg>\``, a missing subpath lists the published ones, a
+  `.node` entry point explains the zero-JIT limit, and `require()` of an ES
+  module returns `ERR_SOFUU_REQUIRE_ESM`.
 
 ---
 

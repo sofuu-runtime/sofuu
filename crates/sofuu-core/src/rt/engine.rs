@@ -1124,6 +1124,26 @@ pub unsafe extern "C" fn sofuu_module_loader(
         }
         return unsafe { qjs::sofuu_js_value_get_ptr(func) };
     }
+
+    /* PLAN-MODERN-NPM pillar C: a Node built-in this runtime deliberately
+     * does not provide. Checked after the builtin table, so a provided
+     * module is never shadowed by the diagnostic. */
+    if let Some(hint) = crate::rt::diagnostics::unsupported_node_api(norm_name) {
+        let msg = crate::rt::diagnostics::unsupported_api_message(norm_name, hint);
+        /* The loader signals failure by leaving an exception pending and
+         * returning a null module pointer — the JSValue from JS_Throw is not
+         * the return channel here. */
+        unsafe {
+            crate::rt::diagnostics::throw_with_code(
+                ctx,
+                c"ReferenceError",
+                &msg,
+                crate::rt::diagnostics::E_NODE_API,
+            );
+        }
+        return ptr::null_mut();
+    }
+
     // SAFETY: opaque is our g_loader_base CString or NULL.
     let base: String = if opaque.is_null() {
         "./".to_string()
@@ -1134,15 +1154,41 @@ pub unsafe extern "C" fn sofuu_module_loader(
     };
 
     let path = resolve_module_path(&base, &name);
+
+    /* A resolved .node entry point is a compiled addon, not JavaScript —
+     * refuse it before compiling a Mach-O/ELF file as a module. */
+    if path.ends_with(".node") {
+        let pkg = crate::rt::diagnostics::package_of_path(&path).unwrap_or_else(|| name.clone());
+        let msg = crate::rt::diagnostics::native_addon_message(&pkg, &path);
+        unsafe {
+            crate::rt::diagnostics::throw_with_code(
+                ctx,
+                c"ReferenceError",
+                &msg,
+                crate::rt::diagnostics::E_NATIVE_ADDON,
+            );
+        }
+        return ptr::null_mut();
+    }
+
     let Some((source, mut len)) = engine_read_file(&path) else {
-        // JS_ThrowReferenceError(ctx, "Cannot find module '%s' (resolved: '%s')", ...)
-        let msg = CString::new(format!(
-            "Cannot find module '{}' (resolved: '{}')",
-            name, path
-        ))
-        .unwrap_or_default();
-        // SAFETY: msg is a NUL-terminated format string with matching args.
-        unsafe { qjs::JS_ThrowReferenceError(ctx, c"%s".as_ptr(), msg.as_ptr()) };
+        let mut msg = format!("Cannot find module '{}' (resolved: '{}')", name, path);
+        let from = Path::new(&base).parent().unwrap_or_else(|| Path::new("."));
+        if let Some(why) = crate::npm::explain_module_not_found(from, &name) {
+            msg = crate::rt::diagnostics::resolution_message(&name, &why);
+        }
+        if let Some(hint) = crate::rt::diagnostics::native_package_hint(norm_name) {
+            msg.push_str(&format!("\n  → Recommendation: {hint}."));
+        }
+        // SAFETY: ctx live; the message is a Rust &str.
+        unsafe {
+            crate::rt::diagnostics::throw_with_code(
+                ctx,
+                c"ReferenceError",
+                &msg,
+                crate::rt::diagnostics::E_RESOLVE,
+            );
+        }
         return ptr::null_mut();
     };
 

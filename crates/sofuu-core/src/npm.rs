@@ -109,50 +109,300 @@ fn read_file_str(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// Try to resolve a module inside a specific `node_modules/<name>` dir.
-pub fn resolve_in_pkg_dir(pkg_dir: &Path) -> Option<PathBuf> {
-    // 1. package.json "main" field.
-    let pkg_json_path = pkg_dir.join("package.json");
-    if let Some(json) = read_file_str(&pkg_json_path) {
-        if let Some(main_val) = json_get_str(&json, "main") {
-            let mrel = main_val.strip_prefix("./").unwrap_or(&main_val);
-            let main_path = pkg_dir.join(mrel);
-            if main_path.is_file() {
-                return main_path.canonicalize().ok();
+/// Parse `package.json`. `None` when the file is missing or not an object —
+/// the caller then falls back to the legacy fields, which is exactly what a
+/// malformed manifest deserves.
+fn read_package_json(pkg_dir: &Path) -> Option<serde_json::Value> {
+    let text = read_file_str(&pkg_dir.join("package.json"))?;
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) if v.is_object() => Some(v),
+        _ => None,
+    }
+}
+
+// ── §2a Conditional "exports" (PLAN-MODERN-NPM, pillar A) ───────
+
+/// The condition keys an ES module import evaluates, in precedence order.
+///
+/// `import` first because an ESM import is the primary path; `module` is the
+/// bundler convention a large share of modern packages publish; then
+/// `default`, which is Node's own fallback. `node` is last on purpose: it
+/// selects Node-specific builds that usually reach for native APIs we do not
+/// have, so it is a fallback rather than a primary match.
+const EXPORT_CONDITIONS_ESM: [&str; 4] = ["import", "module", "default", "node"];
+
+/// The same list for `require()`. The only difference is the leading
+/// `require` condition: a package that publishes separate ESM and CJS builds
+/// must give `require()` the CJS one, or a `.mjs` file is loaded as
+/// CommonJS (which is exactly the "unsupported keyword: export" failure this
+/// list exists to prevent).
+const EXPORT_CONDITIONS_CJS: [&str; 5] = ["require", "module", "default", "node", "import"];
+
+/// Split a bare specifier into `(package name, exports subpath)`.
+///
+/// `"pkg"` → `("pkg", ".")`, `"pkg/sub/x.js"` → `("pkg", "./sub/x.js")`,
+/// `"@scope/pkg/sub"` → `("@scope/pkg", "./sub")`.
+///
+/// `None` for relative/absolute/builtin-style specifiers: those are not
+/// package specifiers and the legacy walk below keeps handling them exactly
+/// as before.
+pub fn split_package_spec(spec: &str) -> Option<(String, String)> {
+    if spec.is_empty() || spec.starts_with('.') || spec.starts_with('/') || spec.starts_with('#') {
+        return None;
+    }
+    if spec.starts_with('@') {
+        let mut parts = spec.splitn(3, '/');
+        let scope = parts.next()?;
+        let name = parts.next()?;
+        if scope.len() < 2 || name.is_empty() {
+            return None;
+        }
+        let pkg = format!("{scope}/{name}");
+        return Some(match parts.next() {
+            Some(tail) if !tail.is_empty() => (pkg, format!("./{tail}")),
+            _ => (pkg, ".".to_string()),
+        });
+    }
+    match spec.split_once('/') {
+        Some((name, tail)) if !name.is_empty() && !tail.is_empty() => {
+            Some((name.to_string(), format!("./{tail}")))
+        }
+        _ => Some((spec.to_string(), ".".to_string())),
+    }
+}
+
+/// Resolve `subpath` ("." or "./x") inside a package directory.
+///
+/// Order: `exports` first (the modern contract), then for "." the legacy
+/// `module` → `main` → `index.js`/`index.mjs` chain, and for a subpath a
+/// literal deep import. Being permissive on the deep-import fallback is
+/// deliberate: Node refuses it when `exports` exists, but failing an import
+/// is a worse outcome for an agent runtime than reading a file the package
+/// already ships. Traversal is still refused.
+pub fn resolve_in_pkg(pkg_dir: &Path, subpath: &str) -> Option<PathBuf> {
+    resolve_in_pkg_with(pkg_dir, subpath, &EXPORT_CONDITIONS_ESM)
+}
+
+/// `resolve_in_pkg` with an explicit condition order (ESM vs CJS).
+pub fn resolve_in_pkg_with(
+    pkg_dir: &Path,
+    subpath: &str,
+    conditions: &[&str],
+) -> Option<PathBuf> {
+    let manifest = read_package_json(pkg_dir);
+    if let Some(v) = &manifest {
+        if let Some(exports) = v.get("exports") {
+            if let Some(p) = resolve_exports_value(pkg_dir, exports, subpath, conditions, 0) {
+                return Some(p);
             }
-            let with_js = PathBuf::from(format!("{}.js", main_path.to_string_lossy()));
-            if with_js.is_file() {
-                return with_js.canonicalize().ok();
+        }
+        if subpath == "." {
+            for key in ["module", "main"] {
+                if let Some(rel) = v.get(key).and_then(|x| x.as_str()) {
+                    if let Some(p) = package_relative_path(pkg_dir, rel) {
+                        return Some(p);
+                    }
+                }
             }
         }
     }
-    // 2. index.js
-    let idx = pkg_dir.join("index.js");
-    if idx.is_file() {
-        return idx.canonicalize().ok();
+    if subpath == "." {
+        let idx = pkg_dir.join("index.js");
+        if idx.is_file() {
+            return idx.canonicalize().ok();
+        }
+        let idxm = pkg_dir.join("index.mjs");
+        if idxm.is_file() {
+            return idxm.canonicalize().ok();
+        }
+        None
+    } else {
+        package_relative_path(pkg_dir, subpath)
     }
-    // 3. index.mjs
-    let idxm = pkg_dir.join("index.mjs");
-    if idxm.is_file() {
-        return idxm.canonicalize().ok();
+}
+
+/// Try to resolve a module inside a specific `node_modules/<name>` dir.
+pub fn resolve_in_pkg_dir(pkg_dir: &Path) -> Option<PathBuf> {
+    resolve_in_pkg(pkg_dir, ".")
+}
+
+/// One exports target, resolved to a real file.
+///
+/// Handles every shape the specification allows: a string, an array of
+/// alternatives, a conditions object (evaluated in `EXPORT_CONDITIONS`
+/// order), and a subpath map with exact or single-`*` wildcard keys.
+///
+/// Existence is checked at every string leaf, not once at the end: an array
+/// or condition chain must be able to skip a target that points at a file
+/// the package did not ship, exactly like Node does. `depth` bounds the
+/// recursion so a hostile manifest cannot spin.
+fn resolve_exports_value(
+    pkg_dir: &Path,
+    v: &serde_json::Value,
+    subpath: &str,
+    conditions: &[&str],
+    depth: u8,
+) -> Option<PathBuf> {
+    if depth > 8 {
+        return None;
+    }
+    match v {
+        serde_json::Value::String(s) => {
+            if subpath == "." {
+                package_relative_path(pkg_dir, s)
+            } else {
+                None
+            }
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|x| resolve_exports_value(pkg_dir, x, subpath, conditions, depth + 1)),
+        serde_json::Value::Object(map) => {
+            let is_subpath_map = !map.is_empty() && map.keys().all(|k| k.starts_with('.'));
+            if !is_subpath_map {
+                /* A conditions object is only meaningful for the root. */
+                return if subpath == "." {
+                    resolve_condition_object(pkg_dir, map, None, conditions, depth + 1)
+                } else {
+                    None
+                };
+            }
+            if let Some(target) = map.get(subpath) {
+                return resolve_export_target(pkg_dir, target, None, conditions, depth + 1);
+            }
+            /* Wildcard: the LONGEST matching prefix wins (spec). */
+            let mut best: Option<(usize, &serde_json::Value, String)> = None;
+            for (key, target) in map {
+                let Some(star) = key.find('*') else { continue };
+                let prefix = &key[..star];
+                let suffix = &key[star + 1..];
+                if !subpath.starts_with(prefix) || !subpath.ends_with(suffix) {
+                    continue;
+                }
+                if subpath.len() < prefix.len() + suffix.len() {
+                    continue;
+                }
+                let matched = &subpath[prefix.len()..subpath.len() - suffix.len()];
+                if best.as_ref().map_or(true, |b| prefix.len() > b.0) {
+                    best = Some((prefix.len(), target, matched.to_string()));
+                }
+            }
+            best.and_then(|(_, target, matched)| {
+                resolve_export_target(pkg_dir, target, Some(&matched), conditions, depth + 1)
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A target value inside `exports`: string (with `*` substitution), array of
+/// alternatives, or a nested conditions object.
+fn resolve_export_target(
+    pkg_dir: &Path,
+    v: &serde_json::Value,
+    star: Option<&str>,
+    conditions: &[&str],
+    depth: u8,
+) -> Option<PathBuf> {
+    if depth > 8 {
+        return None;
+    }
+    match v {
+        serde_json::Value::String(s) => {
+            let target = match star {
+                Some(m) => s.replace('*', m),
+                None => s.clone(),
+            };
+            package_relative_path(pkg_dir, &target)
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .find_map(|x| resolve_export_target(pkg_dir, x, star, conditions, depth + 1)),
+        serde_json::Value::Object(map) => {
+            resolve_condition_object(pkg_dir, map, star, conditions, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_condition_object(
+    pkg_dir: &Path,
+    map: &serde_json::Map<String, serde_json::Value>,
+    star: Option<&str>,
+    conditions: &[&str],
+    depth: u8,
+) -> Option<PathBuf> {
+    for cond in conditions {
+        if let Some(target) = map.get(*cond) {
+            if let Some(r) = resolve_export_target(pkg_dir, target, star, conditions, depth) {
+                return Some(r);
+            }
+        }
+    }
+    None
+}
+
+/// Turn a package-relative target into an existing file.
+///
+/// Rejects absolute paths and any `..` component (a package must not point a
+/// resolution outside itself), then accepts the literal path or one of the
+/// usual script extensions. `exports` targets are exact by specification, but
+/// extensionless targets are common enough in the wild that refusing them
+/// would cost real packages; the file must still exist either way.
+fn package_relative_path(pkg_dir: &Path, rel: &str) -> Option<PathBuf> {
+    let rel = rel.strip_prefix("./").unwrap_or(rel);
+    if rel.is_empty() {
+        return None;
+    }
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute()
+        || rel_path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    let base = pkg_dir.join(rel_path);
+    let mut candidates = vec![base.clone()];
+    for ext in ["js", "mjs", "cjs", "ts"] {
+        candidates.push(PathBuf::from(format!("{}.{ext}", base.to_string_lossy())));
+    }
+    candidates.push(base.join("index.js"));
+    candidates.push(base.join("index.mjs"));
+    for c in candidates {
+        if c.is_file() {
+            /* canonicalize for the loader (and stack traces); confinement is
+             * lexical, so a pnpm/link farm whose real path lives outside the
+             * package dir keeps working. */
+            return Some(c.canonicalize().unwrap_or(c));
+        }
     }
     None
 }
 
 /// Node.js-style module resolution: walk up from `start_dir` looking for
-/// `node_modules/<name>`.
+/// `node_modules/<name>`, honouring `exports` / `module` / `main`.
 pub fn npm_resolve(start_dir: &Path, module_name: &str) -> Option<PathBuf> {
+    let spec = split_package_spec(module_name);
     let mut dir = start_dir.to_path_buf();
     loop {
         let nm = dir.join("node_modules");
         if nm.is_dir() {
-            let pkg_dir = nm.join(module_name);
-            if pkg_dir.is_dir() {
-                if let Some(r) = resolve_in_pkg_dir(&pkg_dir) {
-                    return Some(r);
+            if let Some((pkg, subpath)) = &spec {
+                let pkg_dir = nm.join(pkg);
+                if pkg_dir.is_dir() {
+                    if let Some(r) = resolve_in_pkg(&pkg_dir, subpath) {
+                        return Some(r);
+                    }
                 }
             }
-            // Direct file: node_modules/<name>.js
+            /* Direct file: node_modules/<name>.js (a full specifier, e.g.
+             * "foo/lib/x.js", or a plain "foo.js" package). */
             let direct = nm.join(format!("{module_name}.js"));
             if direct.is_file() {
                 return direct.canonicalize().ok();
@@ -166,6 +416,92 @@ pub fn npm_resolve(start_dir: &Path, module_name: &str) -> Option<PathBuf> {
         dir = parent.to_path_buf();
     }
     None
+}
+
+/// `npm_resolve` with CommonJS conditions (`require` first).
+pub fn npm_resolve_cjs(start_dir: &Path, module_name: &str) -> Option<PathBuf> {
+    let spec = split_package_spec(module_name);
+    let mut dir = start_dir.to_path_buf();
+    loop {
+        let nm = dir.join("node_modules");
+        if nm.is_dir() {
+            if let Some((pkg, subpath)) = &spec {
+                let pkg_dir = nm.join(pkg);
+                if pkg_dir.is_dir() {
+                    if let Some(r) = resolve_in_pkg_with(&pkg_dir, subpath, &EXPORT_CONDITIONS_CJS)
+                    {
+                        return Some(r);
+                    }
+                }
+            }
+            let direct = nm.join(format!("{module_name}.js"));
+            if direct.is_file() {
+                return direct.canonicalize().ok();
+            }
+        }
+        let parent = dir.parent()?;
+        if parent == dir {
+            break;
+        }
+        dir = parent.to_path_buf();
+    }
+    None
+}
+
+/// Why `module_name` did not resolve, in one sentence a developer can act on
+/// (PLAN-MODERN-NPM pillar C, third row). `None` for non-package specifiers.
+///
+/// Only called on the failure path, so the extra walk costs nothing in the
+/// common case.
+pub fn explain_module_not_found(start_dir: &Path, module_name: &str) -> Option<String> {
+    let (pkg, subpath) = split_package_spec(module_name)?;
+    let mut dir = start_dir.to_path_buf();
+    loop {
+        let nm = dir.join("node_modules");
+        if nm.is_dir() {
+            let pkg_dir = nm.join(&pkg);
+            if pkg_dir.is_dir() {
+                let manifest = read_package_json(&pkg_dir);
+                let name = manifest
+                    .as_ref()
+                    .and_then(|v| v.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&pkg);
+                let label = match manifest
+                    .as_ref()
+                    .and_then(|v| v.get("version"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some(ver) => format!("{name}@{ver}"),
+                    None => name.to_string(),
+                };
+                if subpath != "." {
+                    let exported: Vec<&str> = manifest
+                        .as_ref()
+                        .and_then(|v| v.get("exports"))
+                        .and_then(|v| v.as_object())
+                        .map(|m| m.keys().map(|k| k.as_str()).take(8).collect())
+                        .unwrap_or_default();
+                    let hint = if exported.is_empty() {
+                        " (the package publishes no 'exports' map)".to_string()
+                    } else {
+                        format!(" — published subpaths: {}", exported.join(", "))
+                    };
+                    return Some(format!("package '{label}' does not provide '{subpath}'{hint}"));
+                }
+                return Some(format!(
+                    "package '{label}' has no resolvable entry point (no matching 'exports', \
+                     'module', 'main' or index.js)"
+                ));
+            }
+        }
+        let Some(parent) = dir.parent() else { break };
+        if parent == dir {
+            break;
+        }
+        dir = parent.to_path_buf();
+    }
+    Some(format!("package '{pkg}' is not installed (run `sofuu add {pkg}`)"))
 }
 
 // ── §3 SHA-1 (tarball integrity) ────────────────────────────────
@@ -470,6 +806,244 @@ mod tests {
         assert!(r.ends_with("lib/entry.js"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── PLAN-MODERN-NPM pillar A: conditional exports ──────────────
+
+    /// Build a temp project: `pkg_json` at node_modules/<pkg>/package.json,
+    /// plus each (rel, body) file under the same package.
+    fn exports_fixture(tag: &str, pkg: &str, pkg_json: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("sofuu-npm-exp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dir = root.join("node_modules").join(pkg);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("package.json"), pkg_json).unwrap();
+        for (rel, body) in files {
+            let p = dir.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, body).unwrap();
+        }
+        root
+    }
+
+    fn resolved(root: &Path, spec: &str) -> Option<String> {
+        npm_resolve(root, spec).map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+    }
+
+    #[test]
+    fn exports_exact_subpath_wins_over_main() {
+        let root = exports_fixture(
+            "exact",
+            "pkg",
+            r#"{"main":"legacy.js","exports":{".":"./dist/index.js","./feature":"./dist/feature.mjs"}}"#,
+            &[("legacy.js", "1"), ("dist/index.js", "2"), ("dist/feature.mjs", "3")],
+        );
+        assert_eq!(resolved(&root, "pkg").as_deref(), Some("index.js"));
+        assert_eq!(resolved(&root, "pkg/feature").as_deref(), Some("feature.mjs"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exports_wildcard_substitutes_the_matched_segment() {
+        let root = exports_fixture(
+            "wild",
+            "pkg",
+            r#"{"exports":{"./locales/*":"./dist/locales/*.js"}}"#,
+            &[("dist/locales/fr.js", "1"), ("dist/locales/de/extra.js", "2")],
+        );
+        assert_eq!(resolved(&root, "pkg/locales/fr").as_deref(), Some("fr.js"));
+        /* The `*` may span slashes, per spec. */
+        assert_eq!(resolved(&root, "pkg/locales/de/extra").as_deref(), Some("extra.js"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exports_conditions_prefer_import_then_module_then_default_then_node() {
+        let root = exports_fixture(
+            "cond",
+            "pkg",
+            r#"{"exports":{".":{"node":"./n.js","default":"./d.js","module":"./m.js","import":"./i.js"}}}"#,
+            &[("n.js", "1"), ("d.js", "2"), ("m.js", "3"), ("i.js", "4")],
+        );
+        assert_eq!(resolved(&root, "pkg").as_deref(), Some("i.js"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        /* Without "import" the bundler key wins next. */
+        let root = exports_fixture(
+            "cond2",
+            "pkg",
+            r#"{"exports":{".":{"node":"./n.js","default":"./d.js","module":"./m.js"}}}"#,
+            &[("n.js", "1"), ("d.js", "2"), ("m.js", "3")],
+        );
+        assert_eq!(resolved(&root, "pkg").as_deref(), Some("m.js"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        /* ...then "default", and "node" only when nothing else matches. */
+        let root = exports_fixture(
+            "cond3",
+            "pkg",
+            r#"{"exports":{".":{"node":"./n.js","default":"./d.js"}}}"#,
+            &[("n.js", "1"), ("d.js", "2")],
+        );
+        assert_eq!(resolved(&root, "pkg").as_deref(), Some("d.js"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root = exports_fixture(
+            "cond4",
+            "pkg",
+            r#"{"exports":{".":{"node":"./n.js"}}}"#,
+            &[("n.js", "1")],
+        );
+        assert_eq!(resolved(&root, "pkg").as_deref(), Some("n.js"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exports_condition_value_can_be_an_array_or_nested() {
+        /* The first existing alternative wins. */
+        let root = exports_fixture(
+            "arr",
+            "pkg",
+            r#"{"exports":{".":{"import":["./missing.js","./real.js"],"default":"./d.js"}}}"#,
+            &[("real.js", "1"), ("d.js", "2")],
+        );
+        assert_eq!(resolved(&root, "pkg").as_deref(), Some("real.js"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        /* Nested conditions: import → (module → default). */
+        let root = exports_fixture(
+            "nested",
+            "pkg",
+            r#"{"exports":{".":{"import":{"module":"./m.js","default":"./i.js"},"default":"./d.js"}}}"#,
+            &[("m.js", "1"), ("i.js", "2"), ("d.js", "3")],
+        );
+        assert_eq!(resolved(&root, "pkg").as_deref(), Some("m.js"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exports_string_form_maps_only_the_root() {
+        let root = exports_fixture(
+            "str",
+            "pkg",
+            r#"{"exports":"./entry.mjs"}"#,
+            &[("entry.mjs", "1"), ("extra.js", "2")],
+        );
+        assert_eq!(resolved(&root, "pkg").as_deref(), Some("entry.mjs"));
+        /* "./extra" is not exported; the deep-import fallback still finds
+         * the file the package ships. */
+        assert_eq!(resolved(&root, "pkg/extra").as_deref(), Some("extra.js"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn exports_target_cannot_escape_the_package() {
+        let root = exports_fixture(
+            "escape",
+            "pkg",
+            r#"{"exports":{"./evil":"../outside.js"}}"#,
+            &[],
+        );
+        /* Create the file the target would reach, so only the guard can
+         * stop it. */
+        std::fs::write(root.join("node_modules/outside.js"), "x").unwrap();
+        assert_eq!(npm_resolve(&root, "pkg/evil"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_module_beats_main_and_index_remains_the_floor() {
+        let root = exports_fixture(
+            "legacy",
+            "pkg",
+            r#"{"main":"cjs.js","module":"esm.mjs"}"#,
+            &[("cjs.js", "1"), ("esm.mjs", "2"), ("index.js", "3")],
+        );
+        assert_eq!(resolved(&root, "pkg").as_deref(), Some("esm.mjs"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        let root = exports_fixture("floor", "pkg", r#"{"name":"pkg"}"#, &[("index.js", "1")]);
+        assert_eq!(resolved(&root, "pkg").as_deref(), Some("index.js"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn require_conditions_pick_the_cjs_build() {
+        let root = exports_fixture(
+            "cjscond",
+            "dual",
+            r#"{"exports":{".":{"require":"./dist/index.cjs","import":"./dist/index.mjs"}}}"#,
+            &[("dist/index.cjs", "1"), ("dist/index.mjs", "2")],
+        );
+        /* ESM import takes the .mjs build... */
+        assert_eq!(resolved(&root, "dual").as_deref(), Some("index.mjs"));
+        /* ...and require() takes the .cjs one. */
+        let cjs = npm_resolve_cjs(&root, "dual").map(|p| p.file_name().unwrap().to_string_lossy().into_owned());
+        assert_eq!(cjs.as_deref(), Some("index.cjs"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scoped_package_subpath_resolves() {
+        let root = exports_fixture(
+            "scoped",
+            "@scope/pkg",
+            r#"{"exports":{".":{"import":"./index.mjs"},"./util":"./src/util.js"}}"#,
+            &[("index.mjs", "1"), ("src/util.js", "2")],
+        );
+        assert_eq!(resolved(&root, "@scope/pkg").as_deref(), Some("index.mjs"));
+        assert_eq!(resolved(&root, "@scope/pkg/util").as_deref(), Some("util.js"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn specifier_split_matches_the_spec() {
+        assert_eq!(
+            split_package_spec("pkg"),
+            Some(("pkg".to_string(), ".".to_string()))
+        );
+        assert_eq!(
+            split_package_spec("pkg/a/b"),
+            Some(("pkg".to_string(), "./a/b".to_string()))
+        );
+        assert_eq!(
+            split_package_spec("@s/p"),
+            Some(("@s/p".to_string(), ".".to_string()))
+        );
+        assert_eq!(
+            split_package_spec("@s/p/sub"),
+            Some(("@s/p".to_string(), "./sub".to_string()))
+        );
+        assert_eq!(split_package_spec("./rel.js"), None);
+        assert_eq!(split_package_spec("/abs.js"), None);
+        assert_eq!(split_package_spec("#internal"), None);
+    }
+
+    #[test]
+    fn module_not_found_explanations_name_the_real_reason() {
+        let root = exports_fixture(
+            "explain",
+            "pkg",
+            r#"{"name":"pkg","version":"2.1.0","exports":{".":"./index.js","./feature":"./f.js"}}"#,
+            &[("index.js", "1"), ("f.js", "2")],
+        );
+        let missing_sub = explain_module_not_found(&root, "pkg/nope").unwrap();
+        assert!(missing_sub.contains("pkg@2.1.0"), "{missing_sub}");
+        assert!(missing_sub.contains("./nope"), "{missing_sub}");
+        assert!(missing_sub.contains("./feature"), "{missing_sub}");
+
+        let not_installed = explain_module_not_found(&root, "ghost").unwrap();
+        assert!(not_installed.contains("not installed"), "{not_installed}");
+
+        /* A package dir with no entry point at all. */
+        let bare = exports_fixture("bare", "pkg", r#"{"name":"bare-pkg"}"#, &[]);
+        let no_entry = explain_module_not_found(&bare, "pkg").unwrap();
+        assert!(no_entry.contains("no resolvable entry point"), "{no_entry}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&bare);
     }
 
     #[test]

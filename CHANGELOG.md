@@ -4,6 +4,41 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Modern npm resolution, WHATWG streams, and import diagnostics — 2026-10-30
+
+Three friction points that made modern AI SDKs fail on Sofuu, closed:
+
+**Conditional `exports` (`crates/sofuu-core/src/npm.rs`).** The resolver now
+reads `package.json#exports` before `module`/`main`: exact subpaths, `./*`
+wildcards (longest prefix wins), string/array/nested-condition targets, and a
+condition order that differs per loader — `import` → `module` → `default` →
+`node` for ESM, `require` → `module` → `default` → `node` → `import` for
+`require()`. That last list is the fix for dual-published packages, which used
+to hand `require()` an `.mjs` file. Legacy `module`/`main`/`index.js` and deep
+imports still resolve; escape targets (`..`, absolute) are refused.
+
+**Web streams (`src/js/compat.js` + `rt/http_client.rs`).** `ReadableStream`,
+`WritableStream`, `TransformStream`, `TextDecoderStream` and
+`TextEncoderStream` are implemented in plain JS (no dependency, no new native
+code), and `Response.body` is now a stable `ReadableStream` backed by the same
+curl write-callback chunks the runtime already delivered — `getReader()`,
+`pipeThrough(new TextDecoderStream())`, `for await`, `tee()` and `locked` all
+work, so official SDK streaming loops run unmodified. The previous async
+iterator remains the fallback when no `ReadableStream` is installed.
+
+**Diagnostics (`rt/diagnostics.rs`).** A `.node` addon (direct, as a package
+`main`, or imported from ESM), an absent Node built-in (`child_process`, `v8`,
+`worker_threads`, `cluster`, `inspector`), `require()` of an ES module, and a
+package that resolves to nothing now throw coded errors
+(`ERR_SOFUU_NATIVE_ADDON`, `ERR_SOFUU_UNSUPPORTED_NODE_API`,
+`ERR_SOFUU_REQUIRE_ESM`, `ERR_SOFUU_RESOLUTION`) whose second line says what
+to use instead — including a small table of native packages with pure-JS or
+in-runtime alternatives.
+
+`make modern-npm` runs 28 acceptance checks against a real chunked
+SSE server (chunk arrival time proves streaming, not a resolved promise).
+`COMPAT.md` records the new surface, including what is deliberately absent.
+
 ## R7 security firewall: honest threat model, hardened FFI, policy DX, supply chain — 2026-10-30
 
 The R7 evaluator already existed; this pass makes it *verifiable* and closes

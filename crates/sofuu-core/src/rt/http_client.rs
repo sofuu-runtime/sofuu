@@ -711,7 +711,32 @@ const BODY_ITER_FACTORY: &str = "(function() { \
     }; \
   })";
 
-/// Response.body — the async iterator object.
+/// Response.body as a WHATWG ReadableStream (PLAN-MODERN-NPM pillar B).
+///
+/// The chunks still come from the native curl write callbacks through
+/// `__fetch_stream_next` / `__fetch_stream_wait`; this factory only wraps
+/// them in the standard interface the official SDKs call
+/// (`getReader()`, `pipeThrough(new TextDecoderStream())`, `for await`).
+/// `r` is the ResponseData handle, captured by the closure so the stream
+/// keeps working after the Response object is collected.
+const BODY_STREAM_FACTORY: &str = "(function(r) { \
+    return new globalThis.ReadableStream({ \
+      pull: function(c) { \
+        var res = globalThis.__fetch_stream_next(r); \
+        if (res) { \
+          if (res.done) { c.close(); return; } \
+          c.enqueue(res.value); \
+          return; \
+        } \
+        return globalThis.__fetch_stream_wait(r).then(function(x) { \
+          if (x.done) c.close(); else c.enqueue(x.value); \
+        }); \
+      } \
+    }); \
+  })";
+
+/// Response.body — a ReadableStream when the runtime has one, else the
+/// async iterator the engine shipped before web streams existed.
 unsafe extern "C" fn response_body_getter(
     ctx: *mut JSContext,
     this_val: JSValueConst,
@@ -722,40 +747,80 @@ unsafe extern "C" fn response_body_getter(
     if r.is_null() {
         return qjs::JS_ThrowTypeError(ctx, c"Invalid Response".as_ptr());
     }
-    /* P3 (AUDIT-2026-09-07): the factory is compiled once at boot and
-     * cached as a global — re-evaluating the same source on every body
-     * access was pure waste. Fall back to an inline eval if the boot-time
-     * global is missing. */
+    /* The getter is stable: repeated `response.body` returns the SAME
+     * stream (spec), so a reader cannot silently fork the byte stream. */
+    let cached = qjs::sofuu_js_get_property_str(ctx, this_val, c"__bodyStream".as_ptr());
+    if !qjs::is_undefined(cached) && !qjs::is_null(cached) {
+        return cached;
+    }
+    qjs::sofuu_js_free_value(ctx, cached);
+
     let global = qjs::sofuu_js_get_global_object(ctx);
-    let mut factory =
-        qjs::sofuu_js_get_property_str(ctx, global, c"__fetch_body_iter_factory".as_ptr());
+    let rs = qjs::sofuu_js_get_property_str(ctx, global, c"ReadableStream".as_ptr());
+    let has_streams = qjs::JS_IsFunction(ctx, rs) != 0;
+    qjs::sofuu_js_free_value(ctx, rs);
+
+    /* P3 (AUDIT-2026-09-07): both factories are compiled once at boot and
+     * cached as globals — re-evaluating the source on every body access was
+     * pure waste. Fall back to an inline eval if the global is missing. */
+    let (factory_name, factory_src, with_arg): (&std::ffi::CStr, &str, bool) = if has_streams {
+        (
+            c"__fetch_body_stream_factory",
+            BODY_STREAM_FACTORY,
+            true,
+        )
+    } else {
+        (c"__fetch_body_iter_factory", BODY_ITER_FACTORY, false)
+    };
+    let mut factory = qjs::sofuu_js_get_property_str(ctx, global, factory_name.as_ptr());
     qjs::sofuu_js_free_value(ctx, global);
     let mut owned = false;
     if qjs::is_undefined(factory) || qjs::is_null(factory) {
         qjs::sofuu_js_free_value(ctx, factory);
         owned = true;
-        let factory_c = CString::new(BODY_ITER_FACTORY).unwrap();
+        let factory_c = CString::new(factory_src).unwrap();
         factory = qjs::JS_Eval(
             ctx,
             factory_c.as_ptr(),
             factory_c.as_bytes().len(),
-            c"<body-iter>".as_ptr(),
+            c"<body-stream>".as_ptr(),
             qjs::JS_EVAL_TYPE_GLOBAL,
         );
     }
     if qjs::is_exception(factory) {
         return qjs::sofuu_js_exception();
     }
-    let iter = qjs::JS_Call(ctx, factory, qjs::sofuu_js_undefined(), 0, ptr::null());
+    let body = if with_arg {
+        let arg = qjs::sofuu_js_new_int64(ctx, r as i64);
+        let v = qjs::JS_Call(ctx, factory, qjs::sofuu_js_undefined(), 1, &arg);
+        qjs::sofuu_js_free_value(ctx, arg);
+        v
+    } else {
+        let v = qjs::JS_Call(ctx, factory, qjs::sofuu_js_undefined(), 0, ptr::null());
+        if !qjs::is_exception(v) {
+            /* The iterator shape reads __resp off itself. */
+            qjs::sofuu_js_set_property_str(
+                ctx,
+                v,
+                c"__resp".as_ptr(),
+                qjs::sofuu_js_new_int64(ctx, r as i64),
+            );
+        }
+        v
+    };
     if owned {
         qjs::sofuu_js_free_value(ctx, factory);
     }
-    if qjs::is_exception(iter) {
+    if qjs::is_exception(body) {
         return qjs::sofuu_js_exception();
     }
-    /* Store the response pointer on the iterator for the bridges. */
-    qjs::sofuu_js_set_property_str(ctx, iter, c"__resp".as_ptr(), qjs::sofuu_js_new_int64(ctx, r as i64));
-    iter
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        this_val,
+        c"__bodyStream".as_ptr(),
+        qjs::sofuu_js_dup_value(ctx, body),
+    );
+    body
 }
 
 /// Validate that `p` is a live ResponseData pointer from the RESPONSES list
@@ -2385,6 +2450,27 @@ pub unsafe extern "C" fn mod_http_client_register(ctx: *mut JSContext) {
             c"__fetch_body_iter_factory".as_ptr(),
             factory,
         );
+    }
+    /* R7 follow-up (PLAN-MODERN-NPM pillar B): the ReadableStream factory is
+     * compiled at the same point — one eval for the whole process. It is only
+     * used when the runtime has ReadableStream (compat.js loads it). */
+    let stream_src = CString::new(BODY_STREAM_FACTORY).unwrap();
+    let stream_factory = qjs::JS_Eval(
+        ctx,
+        stream_src.as_ptr(),
+        stream_src.as_bytes().len(),
+        c"<body-stream>".as_ptr(),
+        qjs::JS_EVAL_TYPE_GLOBAL,
+    );
+    if !qjs::is_exception(stream_factory) {
+        qjs::sofuu_js_set_property_str(
+            ctx,
+            global2,
+            c"__fetch_body_stream_factory".as_ptr(),
+            stream_factory,
+        );
+    } else {
+        qjs::sofuu_js_free_value(ctx, stream_factory);
     }
     qjs::sofuu_js_free_value(ctx, global2);
 }

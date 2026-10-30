@@ -96,7 +96,7 @@ fn print_help() {
     println!("  sofuu plugin run <tool>  Execute a plugin tool with 5-shield safety");
     println!("  sofuu plugin test <tool> Alias of plugin run; executes one tool in isolation");
     println!("  sofuu plugin init <name> Scaffold a plugin (--category=tool|service|...)");
-    println!("  sofuu dev [dir]          Start AI-native full-stack dev server (--port, --host, --model)");
+    println!("  sofuu dev [dir]          Start AI-native full-stack dev server (experimental) (--port, --host, --model)");
     println!("  sofuu serve --brain <path>   Serve the brain over HTTP (--port, --host, --token)");
     /* W7 (QTSQ_UPGRADE_PLAN): the storage engine shipped with no CLI. These
      * sit beside `serve` because they operate on the same file, and
@@ -294,7 +294,7 @@ fn print_serve_help() {
 fn print_dev_help() {
     println!(
         "\x1b[1mUsage:\x1b[0m sofuu dev [dir] [options]\n\n\
-         Start the AI-native full-stack dev server (frontend engine + SSR).\n\n\
+         Start the AI-native full-stack dev server (frontend engine + SSR) (experimental).\n\n\
          \x1b[1mOptions:\x1b[0m\n\
            -p, --port <n>       listen port (default: 3000)\n\
            -h, --host <addr>    listen address (default: 127.0.0.1)\n\

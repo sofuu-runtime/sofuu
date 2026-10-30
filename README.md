@@ -451,9 +451,9 @@ sofuu version / help
 
 ---
 
-## Native Frontend & Full-Stack Engine (`sofuu dev`)
+## Native Frontend & Full-Stack Engine (`sofuu dev`) — experimental
 
-Sofuu embeds a streaming JSX/TSX transpiler, file-based router, and React-compatible reactive micro-runtime directly into the native binary. Develop full-stack reactive web applications with zero npm dependencies and zero background daemons.
+Sofuu embeds an experimental streaming JSX/TSX transpiler, file-based router, and React-compatible reactive micro-runtime directly into the native binary. Develop full-stack reactive web applications with zero npm dependencies and zero background daemons.
 
 ```bash
 sofuu dev [dir] --port 3000 --host 127.0.0.1

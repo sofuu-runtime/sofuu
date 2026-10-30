@@ -42,6 +42,9 @@ compile_commands.json
 findings.md
 progress.md
 task_plan.md
+/ENTERPRISE_HARDENING_PLAN.md
+/SOFUU_MASTER_BLUEPRINT.md
+/STANDALONE_COMPILER_PLAN.md
 
 # ── Research archive (not part of this repo) ─────
 black-hole-disk/

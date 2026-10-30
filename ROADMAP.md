@@ -50,7 +50,7 @@
 ## 🟡 2. In Progress (Active Sprint — Weeks 1–2)
 
 ### 🎯 The "Killer Wedge": Standalone Agent Compiler (`sofuu compile`)
-*See detailed specification in [`STANDALONE_COMPILER_PLAN.md`](STANDALONE_COMPILER_PLAN.md).*
+*See detailed specification in [`docs/STANDALONE_COMPILER_PLAN.md`](docs/STANDALONE_COMPILER_PLAN.md).*
 - [ ] **Trailer Format Implementation**: 32-byte `SOFUU_BIN_V1\0` binary trailer with CRC32 verification.
 - [ ] **Fast-Path Boot Detection**: Instant `<0.5ms` payload deserialization bypassing standard CLI parsing.
 - [ ] **AOT Bytecode Bundler**: Bundling TypeScript + QuickJS bytecode into single executable.
@@ -58,7 +58,7 @@
 - [ ] **Embedded Memory Support**: Packaging `.qtsq` cognitive vector databases directly into the binary (`--embed-brain`).
 
 ### 🛡️ Zero-Crash Hardening & Concurrency Fuzzing
-*See detailed specification in [`ENTERPRISE_HARDENING_PLAN.md`](ENTERPRISE_HARDENING_PLAN.md).*
+*See detailed specification in [`docs/ENTERPRISE_HARDENING_PLAN.md`](docs/ENTERPRISE_HARDENING_PLAN.md).*
 - [ ] **Promise Rejection Trap**: Unhandled rejection sink terminating with exit code 1 instead of Rust panics.
 - [ ] **Handle Lifecycle Auditing**: Guaranteeing `uv_loop_alive() == 0` when work drains to eliminate hanging processes.
 - [ ] **10,000-Concurrency Stress Harness**: High-concurrency test verifying 0 leaks under macOS `leaks` and Linux ASan.

@@ -3673,6 +3673,29 @@
       var done = false;
       var failed = null;
       var aborted = false;
+      /* The loop reads st.usage and st.toolCalls AFTER the iterator finishes
+       * (token accounting, tool dispatch). A JS adapter reports both on its
+       * 'done' event and in the resolved value, so they are collected here and
+       * exposed on the handle: without this a plugin provider answered with
+       * 0/0 tokens and its tool calls were silently dropped, i.e. an ollama
+       * turn could never actually call a tool. */
+      var usageOut = { promptTokens: 0, completionTokens: 0, cacheReadTokens: 0,
+                       cacheWriteTokens: 0, finishReason: '' };
+      var toolCallsOut = [];
+      function pickNum(o, camel, snake) {
+        var v = (o[camel] !== undefined) ? o[camel] : o[snake];
+        return (typeof v === 'number' && isFinite(v)) ? v : 0;
+      }
+      function absorbUsage(u, tc, fr) {
+        if (u && typeof u === 'object') {
+          usageOut.promptTokens = pickNum(u, 'promptTokens', 'prompt_tokens') || usageOut.promptTokens;
+          usageOut.completionTokens = pickNum(u, 'completionTokens', 'completion_tokens') || usageOut.completionTokens;
+          usageOut.cacheReadTokens = pickNum(u, 'cacheReadTokens', 'cache_read_tokens') || usageOut.cacheReadTokens;
+          usageOut.cacheWriteTokens = pickNum(u, 'cacheWriteTokens', 'cache_write_tokens') || usageOut.cacheWriteTokens;
+        }
+        if (typeof fr === 'string' && fr) usageOut.finishReason = fr;
+        if (Array.isArray(tc) && tc.length) toolCallsOut = tc;
+      }
       function push(item) {
         if (item === null) { /* end-of-stream signal */
           if (waiters.length) {
@@ -3701,15 +3724,21 @@
       };
       Promise.resolve().then(function () {
         if (typeof pp.stream === 'function') {
-          return pp.stream(req, ctx, function (ev) {
+          return Promise.resolve(pp.stream(req, ctx, function (ev) {
             if (!ev || aborted) return;
             if (ev.type === 'delta' && typeof ev.text === 'string' && ev.text) push({ text: ev.text });
             else if (ev.type === 'think' && typeof ev.text === 'string' && ev.text) push({ think: ev.text });
+            else if (ev.type === 'done') absorbUsage(ev.usage, ev.toolCalls, ev.finishReason);
+          })).then(function (rStream) {
+            if (rStream && typeof rStream === 'object') {
+              absorbUsage(rStream.usage, rStream.toolCalls, rStream.finishReason);
+            }
           });
         }
         return Promise.resolve(pp.complete(req, ctx)).then(function (r) {
           var t = (r && typeof r.text === 'string') ? r.text : '';
           if (t) push({ text: t });
+          if (r && typeof r === 'object') absorbUsage(r.usage, r.toolCalls, r.finishReason);
           return r;
         });
       }).then(function () {
@@ -3719,6 +3748,8 @@
         done = true; push(null);
       });
       return {
+        get usage() { return usageOut; },
+        get toolCalls() { return toolCallsOut; },
         abort: function () { aborted = true; },
         [Symbol.asyncIterator]: function () {
           return {

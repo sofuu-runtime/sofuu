@@ -188,9 +188,41 @@
     throw makeError('E_SCHEMA', label + ' is neither a micro-Zod schema nor a JSON-Schema object (expected {type:...} or {properties:...})');
   }
 
+  /* A microZod node is an object that carries its builder methods (describe,
+   * optional, default, int, safeParse …) as own properties, and returning it
+   * verbatim used to leak functions into the "JSON schema": JSON.stringify()
+   * then dropped the declared default (and every other function), so a model
+   * never saw the default the author wrote, and `sofuu plugin list --json`
+   * printed a schema whose `default` was a function. Emit a clean, JSON-safe
+   * node instead — the live object keeps its methods for validation. */
+  function zodNodeToJSON(node) {
+    if (!node || typeof node !== 'object') return { type: 'string' };
+    var out = {};
+    if (node.type) out.type = node.type;
+    if (Array.isArray(node.enum)) out.enum = node.enum.slice();
+    if (node.description) out.description = node.description;
+    if (node.minimum !== undefined && typeof node.minimum !== 'function') out.minimum = node.minimum;
+    if (node.maximum !== undefined && typeof node.maximum !== 'function') out.maximum = node.maximum;
+    if (node._default !== undefined) out.default = node._default;
+    else if (node.default !== undefined && typeof node.default !== 'function') out.default = node.default;
+    if (node.items) out.items = zodNodeToJSON(node.items);
+    if (node.properties && typeof node.properties === 'object') {
+      out.properties = {};
+      for (var k in node.properties) {
+        if (Object.prototype.hasOwnProperty.call(node.properties, k)) {
+          out.properties[k] = zodNodeToJSON(node.properties[k]);
+        }
+      }
+    }
+    if (Array.isArray(node.required) && node.required.length) out.required = node.required.slice();
+    if (!out.type) out.type = 'object';
+    if (out.type === 'object' && !out.properties) out.properties = {};
+    return out;
+  }
+
   function zodToJSONSchema(zObj) {
     if (!zObj || typeof zObj !== 'object') return { type: 'object', properties: {} };
-    if (zObj._isJSONSchema) return zObj;
+    if (zObj._isJSONSchema) return zodNodeToJSON(zObj);
     if (zObj.type && typeof zObj.type === 'string') return zObj;
 
     if (zObj._def) {
@@ -505,6 +537,11 @@
   function isPrivateHost(host) {
     if (!host) return true;
     var h = String(host).toLowerCase().trim().replace(/^\[|\]$/g, '');
+    /* A fully-qualified name ends with a dot: 'localhost.' and '127.0.0.1.'
+     * are the same hosts to the resolver, and the trailing empty label used
+     * to push the dotted-quad split to five parts, skipping the IPv4 range
+     * test entirely — a one-character Shield 2 bypass. */
+    while (h.length > 1 && h.charAt(h.length - 1) === '.') h = h.slice(0, -1);
     if (!h || h === 'localhost' || h === '0.0.0.0' || h === '::' || h === '::1') return true;
     if (h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.internal')) return true;
     if (h === 'metadata.google.internal' || h.indexOf('169.254.') === 0) return true;
@@ -1419,22 +1456,37 @@
       var m = messages[i] || {};
       clean.push({ role: String(m.role || 'user'), content: (m.content === undefined || m.content === null) ? '' : m.content });
     }
-    return {
+    /* PLAN §2 Cat 2 documents complete({messages, model, stream, tools}) — so
+     * the normalised request carries every field an adapter may branch on,
+     * including the llama.cpp GBNF grammar and OpenAI response_format, which
+     * used to exist only on the direct-adapter path. */
+    var out = {
       messages: clean,
       model: req.model || spec.model || '',
       tools: req.tools || undefined,
       temperature: (typeof req.temperature === 'number') ? req.temperature : undefined,
       maxTokens: (typeof req.maxTokens === 'number') ? req.maxTokens : undefined
     };
+    /* complete() is never a streaming call, but the field is documented, so
+     * an adapter that branches on it sees a real boolean instead of undefined. */
+    out.stream = (req.stream !== undefined) ? !!req.stream : false;
+    if (req.grammar !== undefined) out.grammar = req.grammar;
+    if (req.response_format !== undefined) out.response_format = req.response_format;
+    if (req.responseFormat !== undefined && out.response_format === undefined) out.response_format = req.responseFormat;
+    return out;
   }
 
   function buildProviderCtx(spec, customCtx, signal) {
     var ctx = customCtx || {};
     var env = envOf();
+    /* A per-call override wins over the adapter's own endpoint/credential:
+     * without this, ctx.baseUrl and ctx.apiKey were silently discarded and
+     * only process.env could authenticate through completeVia. */
     return {
       name: spec.name,
-      baseUrl: spec.baseUrl || '',
-      model: spec.model || '',
+      baseUrl: (typeof ctx.baseUrl === 'string' && ctx.baseUrl) ? ctx.baseUrl : (spec.baseUrl || ''),
+      apiKey: (typeof ctx.apiKey === 'string' && ctx.apiKey) ? ctx.apiKey : (ctx.api_key || ''),
+      model: (typeof ctx.model === 'string' && ctx.model) ? ctx.model : (spec.model || ''),
       fetch: createProviderFetch(spec.name, spec, signal) || g.fetch,
       signal: signal,
       abortSignal: signal,
@@ -1490,9 +1542,14 @@
     var ct = u ? firstDefined(u.completionTokens, u.completion_tokens, u.output_tokens) : undefined;
     if (pt === undefined && raw && typeof raw === 'object') pt = raw.prompt_eval_count;
     if (ct === undefined && raw && typeof raw === 'object') ct = raw.eval_count;
+    var tt = u ? firstDefined(u.totalTokens, u.total_tokens) : undefined;
+    if (typeof tt !== 'number') {
+      tt = (typeof pt === 'number' ? pt : 0) + (typeof ct === 'number' ? ct : 0);
+    }
     return {
       promptTokens: (typeof pt === 'number') ? pt : 0,
-      completionTokens: (typeof ct === 'number') ? ct : 0
+      completionTokens: (typeof ct === 'number') ? ct : 0,
+      totalTokens: tt
     };
   }
 
@@ -2591,6 +2648,39 @@
     return -1;
   }
 
+  /* Remove generic type ARGUMENTS at a call site — the plan's own signature is
+   * defineTool<TSchema, TOutput>({...}), and 'new Map<string, number>()' is
+   * ordinary plugin code. A regex cannot do it (the arguments nest:
+   * z.infer<any>), so scan for a balanced <...> that is immediately followed
+   * by '(' and drop only that span. Comparisons are left alone. */
+  function stripGenericCallArgs(src) {
+    var out = '';
+    var i = 0;
+    while (i < src.length) {
+      var ch = src.charAt(i);
+      if (ch === '<' && i > 0 && /[\w$]/.test(src.charAt(i - 1))) {
+        var depth = 0;
+        var j = i;
+        var closed = false;
+        for (; j < src.length; j++) {
+          var c = src.charAt(j);
+          if (c === '<') { depth++; }
+          else if (c === '>') {
+            /* '=>' is an arrow, not the end of a type argument list. */
+            if (src.charAt(j - 1) === '=') continue;
+            depth--;
+            if (depth === 0) { closed = true; break; }
+          }
+          else if (c === ';' || c === '\n') break;
+        }
+        if (closed && /^[ \t]*\(/.test(src.slice(j + 1))) { i = j + 1; continue; }
+      }
+      out += ch;
+      i++;
+    }
+    return out;
+  }
+
   function stripTs(src) {
     if (!src || typeof src !== 'string') return '';
     var s = String(src);
@@ -2609,6 +2699,13 @@
     s = s.replace(/\b(function\s+[A-Za-z_$][\w$]*)\s*<[^<>()\n]*>(?=\s*\()/g, '$1');
     /* generic ARROW functions: const f = <T>(x: T) => x */
     s = s.replace(/([=(,:]\s*)<[^<>\n()]+>(?=\s*\()/g, '$1');
+    /* 1d. generic type ARGUMENTS at a call site: the plan's own signature is
+     *     defineTool<TSchema, TOutput>({...}), and 'new Map<string, number>()'
+     *     is ordinary plugin code. Left in place, the runtime sees
+     *     'defineTool < TSchema' as a comparison and dies with
+     *     "'string' is not defined". Only an identifier immediately followed
+     *     by <...> and then ( is rewritten, so comparisons are untouched. */
+    s = stripGenericCallArgs(s);
 
     /* 2. interface { ... } blocks — brace matched, so a '}' inside a
      *    string or a method signature cannot end it early. */
@@ -3014,7 +3111,14 @@
     if (isTs) execSrc = stripTs(execSrc);
     return execSrc;
   }
-  function adoptDefaultExport(lastExp) {
+  async function adoptDefaultExport(lastExp) {
+    /* A plugin may export a FACTORY — the `plugin init --category=openapi`
+     * starter does exactly that, and a factory that returns useOpenAPI(...)
+     * used to be reported as "loaded but registered nothing". Call it. */
+    if (typeof lastExp === 'function') lastExp = await lastExp();
+    /* useOpenAPI() registers its tools itself and returns them as an array;
+     * the registry diff already saw them, so there is nothing to adopt. */
+    if (Array.isArray(lastExp)) return null;
     if (!lastExp || typeof lastExp !== 'object') return null;
     /* A spec that already carries a category came back from its factory, i.e.
      * it registered itself (export default defineTool(...) evaluates the
@@ -3100,7 +3204,7 @@
         var execSrc = pluginExecSource(src, /\.ts$/.test(fname));
         g.__sofuu_last_export = undefined;
         (0, eval)(execSrc);
-        var adopted = adoptDefaultExport(g.__sofuu_last_export);
+        var adopted = await adoptDefaultExport(g.__sofuu_last_export);
         var added = registryDiff(before);
         if (!added.length && adopted) added.push(String(adopted.category || 'plugin') + ':' + String(adopted.name || fname));
         tagOrigin(added, fpath);
@@ -3292,7 +3396,7 @@
       var before = registrySnapshot();
       g.__sofuu_last_export = undefined;
       (0, eval)(execSrc);
-      var adopted2 = adoptDefaultExport(g.__sofuu_last_export);
+      var adopted2 = await adoptDefaultExport(g.__sofuu_last_export);
       var found = registryDiff(before);
       if (!found.length && adopted2) found.push(String(adopted2.category || 'plugin') + ':' + String(adopted2.name || file));
       tagOrigin(found, file);
@@ -3469,12 +3573,32 @@
       ].join('\n');
     },
     openapi: function (name) {
+      /* Self-contained on purpose: the spec is an inline document, so the
+       * scaffold validates and produces a callable tool the moment it is
+       * written. Swap SPEC for a URL, a local path, or your own document. */
       return [
         '// plugins/' + name + '.ts -- bridge a REST API from its OpenAPI document.',
+        '// Replace SPEC with your own OpenAPI 3.0/3.1 (or Swagger 2.0) document:',
+        '// a URL, a local path, or an inline object.',
         "import { useOpenAPI } from 'sofuu';",
         '',
-        'export default async function register(spec, opts) {',
-        "  return useOpenAPI(spec, { namespace: " + JSON.stringify(name) + ", baseUrl: opts && opts.baseUrl });",
+        'const SPEC = {',
+        "  openapi: '3.0.3',",
+        '  info: { title: ' + JSON.stringify(name) + ", version: '1.0.0' },",
+        "  servers: [{ url: 'http://127.0.0.1:8080' }],",
+        '  paths: {',
+        "    '/ping': {",
+        '      get: {',
+        "        operationId: 'ping',",
+        "        summary: 'Health probe',",
+        "        responses: { '200': { description: 'ok' } }",
+        '      }',
+        '    }',
+        '  }',
+        '};',
+        '',
+        'export default async function register() {',
+        "  return useOpenAPI(SPEC, { namespace: " + JSON.stringify(name) + ' });',
         '}',
         ''
       ].join('\n');

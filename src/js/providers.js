@@ -473,6 +473,10 @@
       state.text += whole.text;
       await emit(onEvent, { type: 'delta', text: whole.text });
     }
+    if (whole.thinking) {
+      state.thinking = (state.thinking || '') + whole.thinking;
+      await emit(onEvent, { type: 'think', text: whole.thinking });
+    }
     if (whole.toolCalls && whole.toolCalls.length) state.toolCalls = whole.toolCalls;
     state.usage = whole.usage;
     state.finishReason = whole.finishReason;
@@ -488,7 +492,8 @@
       finishReason: state.finishReason
     });
     return {
-      text: state.text,
+      text: state.text || (state.thinking || ''),
+      thinking: state.thinking || '',
       toolCalls: toolCalls,
       usage: usage,
       finishReason: state.finishReason,
@@ -680,8 +685,16 @@
     var choices = (json && json.choices) || [];
     var choice = choices[0] || {};
     var msg = choice.message || {};
+    /* Reasoning models (Qwen3, DeepSeek-R1, …) put the chain of thought in
+     * reasoning_content and leave content EMPTY when they hit a token or
+     * reasoning budget; observed live against llama-server, where the answer
+     * arrived only as reasoning_content and the adapter returned "". Expose
+     * it as thinking, and fall back to it so a turn is never silently blank. */
+    var reasoning = asString(msg.reasoning_content) || asString(msg.reasoning);
+    var content = asString(msg.content);
     return {
-      text: asString(msg.content),
+      text: content || reasoning,
+      thinking: reasoning,
       toolCalls: normaliseToolCalls(msg.tool_calls),
       usage: makeUsage(json && json.usage),
       finishReason: choice.finish_reason ? asString(choice.finish_reason) : null,
@@ -713,6 +726,14 @@
       if (typeof delta.content === 'string' && delta.content.length) {
         state.text += delta.content;
         await emit(onEvent, { type: 'delta', text: delta.content });
+      }
+      /* Reasoning deltas: same rule as the non-streaming body. */
+      var thinkDelta = (typeof delta.reasoning_content === 'string' && delta.reasoning_content)
+        ? delta.reasoning_content
+        : ((typeof delta.reasoning === 'string' && delta.reasoning) ? delta.reasoning : '');
+      if (thinkDelta) {
+        state.thinking = (state.thinking || '') + thinkDelta;
+        await emit(onEvent, { type: 'think', text: thinkDelta });
       }
       if (delta.tool_calls) accumulateDeltas(state, delta.tool_calls);
       if (choice.finish_reason) state.finishReason = asString(choice.finish_reason);
@@ -765,7 +786,10 @@
   }
 
   async function openAiHealth(adapter, ctx) {
-    var key = resolveKey(adapter, ctx);
+    /* Fail CLOSED: a keyed adapter must not send an unauthenticated probe and
+     * report the resulting 401 as a transport error (E_TOOL) — a missing key
+     * is a configuration problem (E_DENIED), same as the chat path. */
+    var key = requireKey(adapter, ctx);
     return probe(adapter.name, ctx, joinUrl(baseUrlOf(adapter, ctx), '/models'), authHeaders(key),
       function (json) {
         var list = (json && json.data) || [];
@@ -774,7 +798,7 @@
   }
 
   async function openAiListModels(adapter, ctx) {
-    var key = resolveKey(adapter, ctx);
+    var key = requireKey(adapter, ctx);
     var json = await getJson(adapter.name, ctx, joinUrl(baseUrlOf(adapter, ctx), '/models'),
                              authHeaders(key));
     var data = (json && json.data) || [];
@@ -880,8 +904,13 @@
       throw makeError('E_TOOL', name + ': ' + json.error, { adapter: name });
     }
     var msg = (json && json.message) || {};
+    /* DeepSeek-R1 style models served by Ollama stream the chain of thought
+     * in message.thinking and may leave content empty. */
+    var thinking = asString(msg.thinking);
+    var content = asString(msg.content);
     return {
-      text: asString(msg.content),
+      text: content || thinking,
+      thinking: thinking,
       toolCalls: normaliseToolCalls(msg.tool_calls),
       usage: makeUsage(json),
       finishReason: (json && json.done_reason) ? asString(json.done_reason) : null,
@@ -903,6 +932,10 @@
     if (typeof msg.content === 'string' && msg.content.length) {
       state.text += msg.content;
       await emit(onEvent, { type: 'delta', text: msg.content });
+    }
+    if (typeof msg.thinking === 'string' && msg.thinking.length) {
+      state.thinking = (state.thinking || '') + msg.thinking;
+      await emit(onEvent, { type: 'think', text: msg.thinking });
     }
     if (msg.tool_calls && msg.tool_calls.length) state.toolCalls = normaliseToolCalls(msg.tool_calls);
     mergeUsage(state.usage, json);

@@ -278,6 +278,25 @@ function startDeadline(ms: number, tool: string, target: string): Deadline {
   };
 }
 
+// -- operator escape hatch -------------------------------------------------
+//
+// By default the tool declares no network permissions, so Shield 2 refuses
+// loopback and private hosts — an SSRF guard the MODEL cannot talk its way
+// past, because it is not an argument. Local development still needs
+// http://127.0.0.1, so the OPERATOR (not the model) can widen the allowlist
+// from the environment:
+//
+//     SOFUU_FETCH_WEB_ALLOW=127.0.0.1,localhost sofuu plugin test fetch_web …
+//
+// An allowlist is authoritative and exact, so it also keeps refusing
+// host-name tricks such as a trailing dot.
+const ALLOW_ENV = (typeof process !== 'undefined' && process.env) ? process.env.SOFUU_FETCH_WEB_ALLOW : '';
+const ALLOW_HOSTS = String(ALLOW_ENV || '')
+  .split(',')
+  .map(function (s) { return s.trim(); })
+  .filter(function (s) { return s.length > 0; });
+const NET_PERMISSIONS = ALLOW_HOSTS.length > 0 ? { net: ALLOW_HOSTS } : undefined;
+
 // -- the tool -------------------------------------------------------------
 
 export default defineTool({
@@ -286,6 +305,7 @@ export default defineTool({
   timeoutMs: HARD_TIMEOUT_MS,
   name: 'fetch_web',
   description: 'Fetch an http(s) URL and return clean text (5 s deadline, 1 MB cap)',
+  permissions: NET_PERMISSIONS,
   schema: z.object({
     url: z.string().describe('Absolute http(s) URL to fetch'),
     maxBytes: z.number().int().positive().optional().describe('Body cap in bytes (default and maximum 1048576)'),

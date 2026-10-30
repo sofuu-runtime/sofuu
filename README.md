@@ -917,9 +917,31 @@ flowchart TD
         W5["Encrypted Peer-to-Peer Remote Cloud Mesh Relay"]
     end
 
+    subgraph P5["Phase 5: Physical Computing, Robotics & Ambient AI (Horizon)"]
+        subgraph P5_Robotics["Robotics & Drones"]
+            D1["Zero-Copy Sensor Stream (V4L2 / AVFoundation Camera)"]
+            D2["Perception-Action Loop & Spatial Memory in QTSQ"]
+            D3["ROS2 & micro-ROS Zero-Copy Topic Bridge"]
+            D4["Drone VLA Inference & Emergency Flight Watchdog"]
+        end
+        subgraph P5_Wearables["Smart Watches & AR Glasses"]
+            W6["Sub-25MB RSS Profile for Micro-Wearables"]
+            W7["Deep-Sleep Event Loop Wake-on-Interrupt"]
+            W8["Offline Sovereign Health Intelligence (HIPAA/GDPR)"]
+            W9["AR Glasses Optical-Flow Vision Gating & Audio HUD"]
+        end
+        subgraph P5_IoT["Industrial Edge IoT & Safety"]
+            I1["Serial, CAN-bus, Modbus & I2C/SPI Protocols"]
+            I2["Autonomous Predictive Anomaly Detection"]
+            I3["R7 Hardware Safety Firewall (Actuator Velocity/Torque Gates)"]
+            I4["Autonomous Microsecond Hardware Relay Protection"]
+        end
+    end
+
     P1 --> P2
     P2 --> P3
     P3 --> P4
+    P4 --> P5
 ```
 
 ---

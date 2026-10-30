@@ -509,7 +509,6 @@ pub unsafe fn container_write(path: &str, streams: &[Stream]) -> Result<(), c_in
                 r = qtsq::QTSQ_ERR_ALLOC;
                 break;
             }
-            let ti = std::time::Instant::now();
             let init = qtsq::qtsq_init(sub);
             if init != qtsq::QTSQ_OK {
                 qtsq::qtsq_ctx_free(sub);
@@ -517,8 +516,6 @@ pub unsafe fn container_write(path: &str, streams: &[Stream]) -> Result<(), c_in
                 break;
             }
             (*sub).set_codec(qtsq::QTSQ_CODEC_QTC);
-            let t_init = ti.elapsed().as_secs_f64() * 1000.0;
-            let tc = std::time::Instant::now();
             let (rc, name) = match s {
                 Stream::Tensor { name, data, dims } => {
                     if data.is_empty() {
@@ -551,10 +548,6 @@ pub unsafe fn container_write(path: &str, streams: &[Stream]) -> Result<(), c_in
                     )
                 }
             };
-            if std::env::var_os("SOFUU_PROFILE").is_some() {
-                let kind = match s { Stream::Tensor { .. } => "tensor", Stream::Json { .. } => "json" };
-                eprintln!("[cw] init={t_init:.2} compress[{kind}]={:.2}", tc.elapsed().as_secs_f64() * 1000.0);
-            }
             if rc == qtsq::QTSQ_OK {
                 let cname = CString::new(name).unwrap_or_default();
                 r = qtsq::qtsq_container_add_stream(container, sub, cname.as_ptr());
@@ -963,12 +956,8 @@ pub unsafe fn write_segment(
             .map(|r| record_crc(r.id, &r.meta, &r.vec))
             .collect(),
     };
-    let w0 = std::time::Instant::now();
     let (flat, dims, meta_json) = segment_image(dim, recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC)?;
-    let t_img = w0.elapsed().as_secs_f64() * 1000.0;
-    let w1 = std::time::Instant::now();
     write_segment_image(path, &flat, &dims, &meta_json, SEG_FLAG_PER_RECORD_CRC)?;
-    let t_wr = w1.elapsed().as_secs_f64() * 1000.0;
 
     /* Learn what a reader will actually decode — but compare the STREAMS, not
      * decoded records. This used to re-open the file, decompress both streams,
@@ -1000,10 +989,6 @@ pub unsafe fn write_segment(
         p.len() == decoded_flat.len()
             && p.iter().zip(decoded_flat.iter()).all(|(a, b)| a.to_bits() == b.to_bits())
     });
-    if std::env::var_os("SOFUU_PROFILE").is_some() {
-        eprintln!("[ws] img={t_img:.1} write={t_wr:.1} exact={} predicted={predicted}",
-                  tensor_exact && meta_exact);
-    }
     if proto_done(tensor_exact, predicted, meta_exact) {
         /* The codec was exact: phase 1's CRCs already describe it. */
         return Ok(());

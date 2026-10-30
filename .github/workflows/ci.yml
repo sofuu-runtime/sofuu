@@ -92,26 +92,37 @@ jobs:
         # continue-on-error is DELIBERATE and temporary. Full measurement
         # (100k records / dim 64 / 200 flushes, release, 2026-10-30):
         #   lazy open call   0.9 ms     PASS
-        #   usable access    1.13 s     FAIL  (limit 1.0 s; was 170.04 s)
-        #   flush P99       63.2 ms     FAIL  (limit 50 ms; was 345.5 ms)
+        #   usable access    0.658 s    PASS  (limit 1.0 s; was 170.04 s)
+        #   flush P99       53.7 ms     FAIL  (limit 50 ms; was 345.5 ms)
+        #   flush P50       34.5 ms     PASS
         #   10k texts->10k  10000/10000 PASS
         #
-        # The load path is 30x faster than it was and 0.11 s at 20k records,
-        # where the gate passes. Four measured causes were removed in order:
+        # The load path is 258x faster than it was. Each cause was measured
+        # before it was touched, in this order:
         #   170 s -> 13 s   the W3.1 graph snapshot was never written
         #    13 s -> 2.9 s  Argon2id ran per FILE (now KDF v2: per process)
-        #   2.9 s -> 1.4 s  segment decode, now across threads (9.2x)
-        #   1.4 s -> 1.1 s  a deep clone of all 100k metadata Values
-        # What is left is serde Value -> RecordJson for 100k records and the
-        # 391-segment decode floor; both are known and neither is a mystery.
+        #   2.9 s -> 1.4 s  segment decode, now across threads (9.2x, verified
+        #                   byte-identical against the sequential path)
+        #   1.4 s -> 1.13 s a deep clone of all 100k metadata values
+        #  1.13 s -> 0.658 s records were serialised to JSON and parsed straight
+        #                   back out; they now travel as values
         #
-        # Flush: the C layer measures pack 0.0 ms / encrypt 0.7 ms / write
-        # 0.4 ms per container, so the remaining 63 ms is Rust bookkeeping for
-        # one 256-record segment plus the manifest and its fsyncs, not the
-        # codec or the vault.
+        # Flush, same discipline. The container writer compressed every stream
+        # at QTSQ_LEVEL_FULL, and that codec runs at ~4.5 MB/s:
+        #     compress[tensor]  7.9 ms for 32 KB (saved 17 KB = 0.02 ms of disk)
+        #     compress[json]    3.3 ms for 40 KB
+        # Nobody had measured it because the profiler only timed
+        # pack/encrypt/write. Streams up to 1 MB now use QTSQ_LEVEL_STORE:
+        # 7.9 ms -> 0.11 ms, and a stored tensor is the identity, which also
+        # removed the two-phase write (the writer used to repack the whole
+        # segment to correct ~1 KB of CRCs).
         #
-        # Gating on these two numbers today would paint every PR red for a
-        # known, measured, documented gap rather than a regression.
+        # What is left is ~26 ms of flush bookkeeping OUTSIDE compression and
+        # writing (manifest rebuild, journal, publish) — not yet instrumented
+        # line by line, so not yet claimed.
+        #
+        # Gating on flush today would paint every PR red for a known, measured,
+        # documented 3.7 ms rather than a regression.
         continue-on-error: true
         run: |
           cargo run --release -p sofuu-core --example brain_gates -- \

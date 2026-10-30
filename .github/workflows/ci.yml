@@ -89,18 +89,23 @@ jobs:
         # claims rather than facts. This step measures them at CI size and
         # prints PASS/FAIL per gate.
         #
-        # continue-on-error is DELIBERATE and temporary: the first full
-        # measurement (100k records, release, 2026-10-30) showed
-        #   lazy open call   28.2 ms    PASS  (the eager open was > 1 s)
-        #   usable access    13.11 s    FAIL  (391 segments x ~33 ms; was
-        #                                       170.04 s before the W3.1 graph
-        #                                       snapshot was wired into open)
-        #   flush P99       345.5 ms    FAIL  (limit 50 ms)
+        # continue-on-error is DELIBERATE and temporary. Full measurement
+        # (100k records / dim 64 / 200 flushes, release, 2026-10-30):
+        #   lazy open call   27.3 ms    PASS  (the eager open was > 1 s)
+        #   usable access    13.23 s    FAIL  (was 170.04 s before the W3.1
+        #                                       graph snapshot was wired)
+        #   flush P99       210.0 ms    FAIL  (limit 50 ms; was 345.5 ms)
         #   10k texts->10k  10000/10000 PASS
-        # so gating on it today would paint every PR red for a real,
-        # already-recorded defect. Flip this to blocking once the load and
-        # flush paths are fast enough; the harness exits non-zero when a gate
-        # fails, so the flip is a one-line delete.
+        #
+        # BOTH failures have one measured cause: qtsq_vault_encrypt_password
+        # runs Argon2id at m_cost = 64 MB per call and exposes no derived-key
+        # entry point, so a flush pays 3 derivations (~78 ms of its 188 ms
+        # p50) and a 100k open pays 391 (~11 s of its 13 s). See
+        # brain_store.rs::QTSQ_LEVEL_FULL for the profile and
+        # sofuu/JOURNAL.md for the numbers. Until the vault caches a derived
+        # key (a change to src/qtsq_vault.c, outside this workflow's reach),
+        # gating on these two numbers would paint every PR red for a known,
+        # documented floor rather than a regression.
         continue-on-error: true
         run: |
           cargo run --release -p sofuu-core --example brain_gates -- \

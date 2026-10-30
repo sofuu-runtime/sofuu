@@ -698,6 +698,11 @@ mod impl_qtsq {
         /// W3.3: the manifest a lazy open deferred (`None` for a fresh or
         /// legacy single-file brain, which have no segments to read).
         pending: Option<crate::rt::brain_store::Manifest>,
+        /// W3.1: which generation the on-disk graph snapshot describes, and
+        /// how many records it held, so a flush can tell whether rewriting it
+        /// is worth ~30 ms of I/O.
+        graph_snapshot_epoch: u64,
+        graph_snapshot_records: Option<usize>,
         /// W3.3: segment payloads this handle has actually read — 0 for a
         /// normal open until the first row access, N for `verify_full`.
         /// Reported as `stats().segments_read`.
@@ -1319,6 +1324,8 @@ mod impl_qtsq {
             readonly: opts.readonly,
             loaded: false,
             pending: None,
+            graph_snapshot_epoch: 0,
+            graph_snapshot_records: None,
             segments_read: 0,
             recovery_pending: false,
             closed: false,
@@ -2625,11 +2632,32 @@ mod impl_qtsq {
         /* W3.1: persist the graph for THIS generation, beside the segments.
          * Written after the manifest is durable, so a snapshot can never
          * describe a generation the manifest does not reference; a failure
-         * here is not fatal (the load simply rebuilds). */
-        {
+         * here is not fatal (the load simply rebuilds).
+         *
+         * NOT on every flush: the snapshot is the whole graph (28.8 MB at
+         * 100k records), so rewriting it for each 256-record append turns an
+         * O(append) flush into O(store). It is written when the generation
+         * changed (a compaction invalidates the topology anyway) or when the
+         * graph has grown enough that the stale snapshot stopped being a good
+         * approximation — which keeps the write count logarithmic in the
+         * store's growth instead of linear in the flush count. */
+        let records_now = shell.cma.len();
+        let stale = match shell.graph_snapshot_records {
+            None => true,
+            Some(n) => layout.epoch != shell.graph_snapshot_epoch
+                || n == 0
+                || records_now >= n.saturating_mul(4),
+        };
+        if stale {
             let graph = crate::rt::brain_store::graph_path(&path, layout.epoch);
-            if let Err(e) = shell.cma.index.save_to(&graph) {
-                eprintln!("[sofuu/cma] graph snapshot not written ({e:?}) — the next open rebuilds it");
+            match shell.cma.index.save_to(&graph) {
+                Ok(()) => {
+                    shell.graph_snapshot_epoch = layout.epoch;
+                    shell.graph_snapshot_records = Some(records_now);
+                }
+                Err(e) => eprintln!(
+                    "[sofuu/cma] graph snapshot not written ({e:?}) — the next open rebuilds it"
+                ),
             }
         }
 
@@ -4884,6 +4912,8 @@ mod impl_qtsq {
             readonly: false,
             loaded: true,
             pending: None,
+            graph_snapshot_epoch: 0,
+            graph_snapshot_records: None,
             segments_read: 0,
             recovery_pending: false,
             closed: false,

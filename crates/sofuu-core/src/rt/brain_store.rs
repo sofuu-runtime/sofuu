@@ -60,6 +60,16 @@ pub const LEGACY_PASSWORD: &str = crate::rt::brain_key::LEGACY_PASSWORD;
 pub const ERR_NOT_CONTAINER: c_int = -1001;
 
 /// Codec tensor-compression level: 0 = full contest (see rt/memory.rs).
+///
+/// COST, measured (SOFUU_PROFILE=1, 256x64 segment): compress ≈ 2.5 ms,
+/// pack 0.0 ms, write 0.5 ms — and **encrypt ≈ 26 ms**. `encrypt` is
+/// `qtsq_vault_encrypt_password`, which runs Argon2id at m_cost = 64 MB on
+/// EVERY call, and the store has no derived-key API to share that work.
+/// A flush touches three containers (read manifest, write segment, write
+/// manifest) = ~78 ms of key derivation before anything else happens, and a
+/// 100k-record open reads 391 of them = ~11 s. That, not the codec, is the
+/// floor under the plan's "flush P99 < 50 ms" and "open < 1 s" gates; the fix
+/// is a key-derivation cache or a derived-key entry point in the vault.
 pub const QTSQ_LEVEL_FULL: c_int = 0;
 
 pub const MANIFEST_STREAM: &str = "manifest";
@@ -532,15 +542,28 @@ pub unsafe fn container_write(path: &str, streams: &[Stream]) -> Result<(), c_in
             }
         }
     }
+    let prof = std::env::var_os("SOFUU_PROFILE").is_some();
+    let mut t = std::time::Instant::now();
     if r == qtsq::QTSQ_OK {
         r = qtsq::qtsq_container_pack(container);
+    }
+    if prof {
+        eprintln!("[prof] pack {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        t = std::time::Instant::now();
     }
     if r == qtsq::QTSQ_OK {
         r = encrypt(container);
     }
+    if prof {
+        eprintln!("[prof] encrypt {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        t = std::time::Instant::now();
+    }
     if r == qtsq::QTSQ_OK {
         let cpath = CString::new(path).unwrap_or_default();
         r = qtsq::qtsq_write(container, cpath.as_ptr());
+    }
+    if prof {
+        eprintln!("[prof] write {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
     }
     qtsq::qtsq_free(container);
     qtsq::qtsq_ctx_free(container);
@@ -2012,3 +2035,4 @@ mod tests {
     }
 
 }
+

@@ -790,41 +790,96 @@ Built by **Haruhito** — early-stage, bootstrapped, open-core, in active develo
 
 ```mermaid
 flowchart TD
-    subgraph Shipped["Phase 1: Core Foundation (Shipped)"]
-        S1["QuickJS + libuv Event Loop (Boot <4ms)"]
-        S2["QTSQ Vector Memory (SIMD Cosine Recall)"]
-        S3["Autonomous Agent Engine (Prompt Sovereignty)"]
-        S4["Native Model Context Protocol (stdio + SSE)"]
-        S5["Sandbox v2 (Filesystem Jail + Network Policy)"]
-        S6["Session Mesh (Terminal Task Synchronization)"]
-        S7["Zero-Dependency Bundler + TypeScript Stripper"]
+    subgraph P1["Phase 1: Core Foundation (Shipped)"]
+        subgraph P1_Substrate["Runtime Substrate"]
+            S1["QuickJS ES2023 JIT-Free Engine"]
+            S2["libuv Async Event Loop"]
+            S3["Cooperative Scheduler (scheduler.yield)"]
+            S4["Microtask Starvation Protection"]
+            S5["Lexical TS Stripper (ts.rs)"]
+            S6["ESM Bundler & Tree-Shaker (bundler.rs)"]
+            S7["Strict Binary Cap (<= 5.5 MB Release)"]
+        end
+        subgraph P1_Memory["Cognitive Vector Memory (CMA v2)"]
+            M1["Encrypted .qtsq Container Files"]
+            M2["Zero-Byte 768-dim Offline Embeddings"]
+            M3["ARM NEON & x86 AVX2 SIMD Kernels"]
+            M4["Sub-2ms Top-K Cosine & L2 Search"]
+            M5["Cross-Session /remember & /recall"]
+            M6["Cryptographic Portable Brain Cards"]
+        end
+        subgraph P1_Security["Security & Tooling (Sandbox v2)"]
+            X1["CWD Lexical Filesystem Jail"]
+            X2["Credential Redaction (.ssh, .aws, .env)"]
+            X3["Domain Network Allowlisting"]
+            X4["Catastrophic Shell Deny-List"]
+            X5["Deterministic Instruction Fuel Metering"]
+            X6["Native MCP Client & Server (stdio + SSE)"]
+            X7["Jailed Coding Tools (read, edit, grep, glob)"]
+        end
+        subgraph P1_Agent["Agent & Mesh Layer"]
+            G1["Multi-Step Reasoning Loop"]
+            G2["Prompt Sovereignty (Zero Injected Prompts)"]
+            G3["Token & Step Hard Budgets"]
+            G4["Multi-Terminal Session Mesh (/work, /done)"]
+            G5["Structured JSONL Observability & WAL"]
+        end
     end
 
-    subgraph Active["Phase 2: Hardening & Compiler (Active Sprint)"]
-        A1["Standalone Binary Compiler (sofuu compile)"]
-        A2["32-Byte Binary Trailer & Fast-Path Boot"]
-        A3["Promise Trap & Concurrency Fuzzing (10k Ops)"]
-        A4["Global sofuu.z Schema Engine & Tool Builder"]
-        A5["Memory Allocation Guardrails & Handle Audit"]
+    subgraph P2["Phase 2: Hardening & Compiler (Active Sprint)"]
+        subgraph P2_Compiler["Standalone Compiler (sofuu compile)"]
+            C1["AOT Bytecode Serializer (rt/bytecode.rs)"]
+            C2["32-Byte Binary Trailer (SOFUU_BIN_V1)"]
+            C3["Sub-0.5ms Fast-Path Boot Detector"]
+            C4["Embedded QTSQ Brain Packager (--embed-brain)"]
+            C5["macOS Ad-Hoc Signing (codesign -s -)"]
+            C6["Linux ELF Trailer Integrity & Perms (0755)"]
+        end
+        subgraph P2_Fuzzing["Zero-Crash Hardening & Fuzzing"]
+            F1["Global Promise Unhandled Rejection Sink"]
+            F2["Graceful Exit Code 1 (No Rust Panics)"]
+            F3["libuv Handle Leak Auditor (uv_loop_alive == 0)"]
+            F4["10,000 Concurrent Async Timers Harness"]
+            F5["1,000 Rapid File I/O Concurrency Test"]
+            F6["500 Parallel SIMD Vector Query Test"]
+            F7["Heap Allocation Guardrails (Catchable RangeError)"]
+        end
+        subgraph P2_DX["Schema & Tool Calling DX"]
+            Z1["Promote microZod to Global (sofuu.z)"]
+            Z2["Declarative Builder (sofuu.tools.define)"]
+            Z3["Auto-Generated OpenAI & Anthropic Specs"]
+            Z4["Auto-Generated MCP Tool Schemas"]
+            Z5["Self-Correcting LLM Validation Error Prompts"]
+            Z6["TypeScript Declarations (types/sofuu.d.ts)"]
+        end
     end
 
-    subgraph Enterprise["Phase 3: Production Engine & Blueprints (Planned)"]
-        E1["llama.cpp Dynamic Plugin (Metal + CUDA Acceleration)"]
-        E2["In-Process Enterprise RAG Architecture"]
-        E3["Autonomous Sandboxed Code Reviewer"]
-        E4["Collaborative Swarm Workflows"]
+    subgraph P3["Phase 3: Production Engine & Enterprise Blueprints (Planned)"]
+        subgraph P3_Llama["Turnkey Local LLM Plugin"]
+            L1["Dynamic C-ABI Provider Bridge"]
+            L2["Apple Silicon Metal Matrix Multiplication"]
+            L3["Linux CUDA & Vulkan Tensor Execution"]
+            L4["Full Quantization Support (Q4_K_M, Q8_0, IQ3)"]
+            L5["1-Command CLI Installer (sofuu plugin add llamacpp)"]
+        end
+        subgraph P3_Recipes["Enterprise Production Recipes"]
+            R1["In-Process RAG Pipeline (Chunking + Cited Recall)"]
+            R2["Autonomous DevOps Reviewer (Diff + SARIF Reports)"]
+            R3["Collaborative Swarm Mesh (Multi-Agent Task Sync)"]
+        end
     end
 
-    subgraph Expansion["Phase 4: Ecosystem & Edge (Future Vision)"]
-        F1["WinterCG Standards (Request, Response, Streams)"]
-        F2["Edge Serverless & Worker Compatibility"]
-        F3["Cross-Platform Compilation Targets"]
-        F4["Embeddable Mobile SDKs (Swift + Kotlin)"]
+    subgraph P4["Phase 4: Ecosystem & Edge Standards (Future Vision)"]
+        W1["WinterCG Standards (fetch, Request, Response, Streams)"]
+        W2["Cloudflare Workers & Vercel Edge Drop-In Mode"]
+        W3["Multi-Arch Cross-Compilation (--target linux-x86_64/arm64)"]
+        W4["Embeddable Mobile SDKs (libsofuu Swift & Kotlin)"]
+        W5["Encrypted Peer-to-Peer Remote Cloud Mesh Relay"]
     end
 
-    Shipped --> Active
-    Active --> Enterprise
-    Enterprise --> Expansion
+    P1 --> P2
+    P2 --> P3
+    P3 --> P4
 ```
 
 ---

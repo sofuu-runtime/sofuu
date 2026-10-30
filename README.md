@@ -786,6 +786,31 @@ Built by **Haruhito** — early-stage, bootstrapped, open-core, in active develo
 
 ---
 
+## Roadmap
+
+Sofuu's active development status and upcoming milestones toward category monopolization:
+
+```mermaid
+flowchart LR
+    A["v0.1-v0.3 Shipped (QuickJS, QTSQ, MCP, Sandbox)"] --> B["v0.3.5 Active (sofuu compile, Fuzzing, Zod)"]
+    B --> C["v0.4 Enterprise (llama.cpp Plugin, Recipes)"]
+    C --> D["v1.0 Monopoly (WinterCG Edge, Cross-Compile)"]
+```
+
+| Milestone | Capability | Status |
+| :--- | :--- | :--- |
+| **Runtime Substrate** | QuickJS + libuv event loop (<4ms boot), TypeScript, Bundler | 🟢 **Shipped** |
+| **Cognitive Memory** | In-process encrypted QTSQ containers + hardware SIMD search | 🟢 **Shipped** |
+| **Agent Core & Security** | Sandbox v2 (5-Shields), native MCP, Session Mesh, Observability | 🟢 **Shipped** |
+| **Standalone Compiler** | `sofuu compile` (single 5.2 MB self-contained executable) | 🟡 **In Progress** |
+| **Zero-Crash Hardening** | 10k-concurrency fuzzing, promise unhandled rejection trap | 🟡 **In Progress** |
+| **Tool Calling DX** | Global `sofuu.z` / `microZod` declarative schemas & types | 🟡 **In Progress** |
+| **Production Local LLMs** | `sofuu-plugin-llamacpp` Metal / CUDA GGUF hardware acceleration | 🔵 **Planned** |
+
+👉 **Full living roadmap & task tracker:** See [**`ROADMAP.md`**](ROADMAP.md).
+
+---
+
 ## Star History
 
 <p align="center">

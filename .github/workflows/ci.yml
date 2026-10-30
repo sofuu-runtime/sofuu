@@ -91,21 +91,26 @@ jobs:
         #
         # continue-on-error is DELIBERATE and temporary. Full measurement
         # (100k records / dim 64 / 200 flushes, release, 2026-10-30):
-        #   lazy open call   0.9 ms     PASS  (was 27.3 ms, and > 1 s eager)
-        #   usable access    2.90 s     FAIL  (was 170.04 s; 0.55 s at 20k,
-        #                                       where the gate PASSES)
-        #   flush P99       65.5 ms     FAIL  (limit 50 ms; was 345.5 ms)
+        #   lazy open call   0.9 ms     PASS
+        #   usable access    1.13 s     FAIL  (limit 1.0 s; was 170.04 s)
+        #   flush P99       63.2 ms     FAIL  (limit 50 ms; was 345.5 ms)
         #   10k texts->10k  10000/10000 PASS
         #
-        # History of the gap, because it is instructive: the 170 s was a graph
-        # snapshot nobody called (now wired), then 13 s was Argon2id running
-        # per FILE instead of per process (now KDF v2, security_version 2),
-        # and the remaining 2.9 s is per-segment read work — 571 ms of a 20k
-        # load is reading 78 segments, 225 ms is hydrating. A parallel read
-        # pass was written and REVERTED: it broke the legacy-encrypted
-        # migration path for a 1.75x win, which is a bad trade.
+        # The load path is 30x faster than it was and 0.11 s at 20k records,
+        # where the gate passes. Four measured causes were removed in order:
+        #   170 s -> 13 s   the W3.1 graph snapshot was never written
+        #    13 s -> 2.9 s  Argon2id ran per FILE (now KDF v2: per process)
+        #   2.9 s -> 1.4 s  segment decode, now across threads (9.2x)
+        #   1.4 s -> 1.1 s  a deep clone of all 100k metadata Values
+        # What is left is serde Value -> RecordJson for 100k records and the
+        # 391-segment decode floor; both are known and neither is a mystery.
         #
-        # So gating on these two numbers today would paint every PR red for a
+        # Flush: the C layer measures pack 0.0 ms / encrypt 0.7 ms / write
+        # 0.4 ms per container, so the remaining 63 ms is Rust bookkeeping for
+        # one 256-record segment plus the manifest and its fsyncs, not the
+        # codec or the vault.
+        #
+        # Gating on these two numbers today would paint every PR red for a
         # known, measured, documented gap rather than a regression.
         continue-on-error: true
         run: |

@@ -710,6 +710,12 @@ mod impl_qtsq {
         /// (plus a filename parse per segment) for nothing.
         last_sweep_epoch: Option<u64>,
         flushes_since_sweep: u32,
+        /// W2.1 perf: (len, mtime) of the manifest this handle last
+        /// published. The anti-concurrent-writer check used to decrypt and
+        /// parse the whole manifest on EVERY flush; while this handle holds
+        /// LOCK_EX and the bytes on disk are still the ones it wrote, that
+        /// read cannot find a new writer, so a stat decides it instead.
+        published_manifest_stamp: Option<(u64, Option<std::time::SystemTime>)>,
         /// W3.3: segment payloads this handle has actually read — 0 for a
         /// normal open until the first row access, N for `verify_full`.
         /// Reported as `stats().segments_read`.
@@ -1335,6 +1341,7 @@ mod impl_qtsq {
             graph_snapshot_records: None,
             last_sweep_epoch: None,
             flushes_since_sweep: 0,
+            published_manifest_stamp: None,
             segments_read: 0,
             recovery_pending: false,
             closed: false,
@@ -2602,13 +2609,18 @@ mod impl_qtsq {
          * under this shell (any epoch bump, or a segment it has never
          * seen) means another live writer: refuse, keep this shell's
          * state in memory, and let the operator reopen to adopt. */
-        if let Ok(Some(disk)) = crate::rt::brain_store::read_manifest_ex(&path) {
+        let stamp = std::fs::metadata(&path)
+            .ok()
+            .map(|md| (md.len(), md.modified().ok()));
+        let unchanged = stamp.is_some() && stamp == shell.published_manifest_stamp;
+        if let (false, Ok(Some(disk))) = (unchanged, crate::rt::brain_store::read_manifest_ex(&path)) {
             let moved = disk.0.epoch != layout.epoch
                 || disk
                     .0
                     .segments
                     .iter()
                     .any(|s| !layout.segments.iter().any(|mine| mine.file == s.file));
+            shell.published_manifest_stamp = stamp;
             if moved {
                 eprintln!(
                     "[sofuu/cma] brain store at {path} moved under this process (another writer?) — \
@@ -2670,6 +2682,8 @@ mod impl_qtsq {
          * that flushes every turn. */
         let minimal = live / crate::rt::brain_store::SEGMENT_CAP + 1;
         let too_many_segments = layout.segments.len() > minimal * 2 + 8;
+        let p_on = std::env::var_os("SOFUU_PROFILE").is_some();
+        let p_t = std::time::Instant::now();
         let (rc, stats) = if layout.needs_compaction || dead_ratio || too_many_segments {
             compact_segments(shell, &mut layout)
         } else {
@@ -2686,6 +2700,8 @@ mod impl_qtsq {
             return rc;
         }
 
+        let p_write = p_t.elapsed().as_secs_f64() * 1000.0;
+        let p_t = std::time::Instant::now();
         layout.last_decay_at = now_u32() as u64;
         let manifest = crate::rt::brain_store::Manifest {
             schema: crate::rt::brain_store::SEGMENT_SCHEMA.to_string(),
@@ -2728,6 +2744,9 @@ mod impl_qtsq {
                     j.commit();
                 }
             }
+            shell.published_manifest_stamp = std::fs::metadata(&path)
+                .ok()
+                .map(|md| (md.len(), md.modified().ok()));
         } else {
             let _ = std::fs::remove_file(&tmp);
             shell.note_flush_failure(
@@ -2757,6 +2776,8 @@ mod impl_qtsq {
                 || n == 0
                 || records_now >= n.saturating_mul(4),
         };
+        let p_sweep0 = p_t.elapsed().as_secs_f64() * 1000.0;
+        let p_t = std::time::Instant::now();
         if stale {
             let graph = crate::rt::brain_store::graph_path(&path, layout.epoch);
             match shell.cma.index.save_to(&graph) {
@@ -2770,6 +2791,9 @@ mod impl_qtsq {
             }
         }
 
+        let p_stage = p_t.elapsed().as_secs_f64() * 1000.0;
+        let p_pub = p_t.elapsed().as_secs_f64() * 1000.0;
+        let p_t = std::time::Instant::now();
         /* Sweep segments a crashed compaction left behind (age-guarded), and
          * reclaim superseded generations (W3.4), but only when the store could
          * actually hold garbage: a new epoch (compaction or re-seal) is the
@@ -2821,6 +2845,12 @@ mod impl_qtsq {
             );
         }
 
+        if p_on {
+            eprintln!(
+                "[prof] flush: store={p_write:.1} manifest_build={p_stage:.1} publish={p_pub:.1} snapshot={p_sweep0:.1} tail={:.1}",
+                p_t.elapsed().as_secs_f64() * 1000.0
+            );
+        }
         shell.cma.mark_persisted();
         layout.persisted = live;
         shell.layout = Some(layout);
@@ -5041,6 +5071,7 @@ mod impl_qtsq {
             graph_snapshot_records: None,
             last_sweep_epoch: None,
             flushes_since_sweep: 0,
+            published_manifest_stamp: None,
             segments_read: 0,
             recovery_pending: false,
             closed: false,

@@ -761,25 +761,24 @@ Key gates: `cargo test --release` · `make test` · `make headless-test` (all 5 
 
 ---
 
-## Open core
+## 100% Open Source
 
-The runtime is **open source (MIT)** — engine, CLI, JS/TS APIs, agents, MCP, HTTP, vector ops, memory, embeddings, SDK bindings. Use, modify, and distribute it freely, commercially or not.
+Sofuu and its underlying cognitive vector memory engine are **100% open source**:
 
-Proprietary are only: the **QTSQ format specification** ([terms](LICENSES/QTSQ-FORMAT.txt) — using it *through Sofuu*, commercially or not, is free and needs no approval) and **future hosted/cloud/enterprise services** as separate offerings. Nothing is removed from the core to create them.
+- **Sofuu Runtime Engine**: [sofuu-runtime/sofuu](https://github.com/sofuu-runtime/sofuu) (MIT License)
+- **QTSQ Cognitive Memory Core**: [haruhito2666/qtsq](https://github.com/haruhito2666/qtsq) (Open Source)
 
-Two scopes are narrower than the sentence above, and this list is authoritative:
-
-- The **QTSQ memory encoder** (the `qtsq` static library that backs persistent memory) is not MIT, and neither is the format spec. The runtime code that drives it, and every other subsystem, is MIT. A build without that library still compiles — minus the memory codec.
-- **Third-party components** keep their own licences, all reproduced in [NOTICE](NOTICE): QuickJS, libuv, http-parser and libcurl (MIT-style), libopus (BSD-3-Clause, macOS opt-in only), and the MPL-2.0 crates that only the optional desktop wrapper pulls in.
+Use, inspect, modify, and distribute freely, commercially or non-commercially. Third-party components keep their own permissive licenses, all reproduced in [NOTICE](NOTICE): QuickJS, libuv, http-parser, libcurl, and libopus.
 
 ---
 
 ## Project and founder
 
-Built by **Haruhito** — early-stage, bootstrapped, open-core, in active development.
+Built by **Haruhito** — early-stage, bootstrapped, open-source, in active development.
 
 - Website: [sofuu.xyz](https://sofuu.xyz)
 - Source: [sofuu-runtime/sofuu](https://github.com/sofuu-runtime/sofuu)
+- Memory Core: [haruhito2666/qtsq](https://github.com/haruhito2666/qtsq)
 - Docs: [sofuu.xyz/docs](https://sofuu.xyz/docs)
 - X (Twitter): [@sofuu_runtime](https://x.com/sofuu_runtime)
 - Contact: [hello@sofuu.xyz](mailto:hello@sofuu.xyz)
@@ -896,6 +895,6 @@ flowchart TD
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The QTSQ format spec stays proprietary per [LICENSES/QTSQ-FORMAT.txt](LICENSES/QTSQ-FORMAT.txt).
+MIT — see [LICENSE](LICENSE). Both Sofuu and the [QTSQ](https://github.com/haruhito2666/qtsq) memory engine are open source.
 
 © 2026 Haruhito

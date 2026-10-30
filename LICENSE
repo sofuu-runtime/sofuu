@@ -21,25 +21,14 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ------------------------------------------------------------------------------
-Open-core note:
-Sofuu follows an open-core model. The MIT License above covers the entire
-Sofuu execution runtime codebase: the engine, CLI, JavaScript/TypeScript
-APIs, agents, MCP client/server, HTTP, vector operations, the local-memory
-subsystem's runtime code, embeddings, and core developer tooling.
-
-It DOES NOT cover the design, mathematics, or specification of the QTSQ
-tensor format, nor any future hosted, cloud, enterprise, or managed
-offerings. Those remain proprietary — see `LICENSES/QTSQ-FORMAT.txt` for
-the QTSQ format terms. Note: that license grants free use of the Format
-through Sofuu itself (personal and commercial, no fees); what stays
-restricted is forking the spec and independent competing implementations.
-The `qtsq` codec library itself is likewise proprietary; builds that cannot
-find it compile without the persistent-memory subsystem.
-The full boundary is stated in the "Open core" section of `README.md`.
+Open Source Architecture:
+Sofuu and its companion on-device cognitive vector memory engine (QTSQ) are
+100% open source:
+- Sofuu Runtime: https://github.com/sofuu-runtime/sofuu (MIT)
+- QTSQ Engine:   https://github.com/haruhito2666/qtsq (Open Source)
 
 Third-party components:
-Sofuu links or bundles QuickJS, libuv, http-parser, libcurl, libopus and a
-large set of Rust crates, each under its own licence. Their copyright notices
-and licence texts are reproduced in `NOTICE` — and, from v0.3.1 onward, that
-file travels inside every release archive next to the binary. `NOTICE` is
-part of the distribution and must not be removed.
+Sofuu links or bundles QuickJS, libuv, http-parser, libcurl, libopus and
+supporting Rust crates, each under its own permissive licence. Their copyright
+notices and licence texts are reproduced in `NOTICE`. `NOTICE` travels inside
+every release archive next to the binary and must not be removed.

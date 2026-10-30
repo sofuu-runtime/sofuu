@@ -840,6 +840,53 @@ unsafe fn write_segment_image(
     Ok(())
 }
 
+/// Learn the exact tensor bits a reader will decode, WITHOUT writing the
+/// segment.
+///
+/// The container's tensor transform is not the identity (a 0.0 comes back as
+/// 2^-62, and a wide dynamic range biases small components), so the per-record
+/// CRCs must cover the DECODED vectors. Learning that used to require writing
+/// the whole segment and decoding it back, and because the CRCs live inside
+/// the metadata document the writer then had to rebuild and repack all 150 KB
+/// to change ~1 KB of numbers — two full encodes and two container writes per
+/// flush, measured at 56 ms against ~4 ms of actual work.
+///
+/// Probing a tensor-only container answers the same question for the price of
+/// one 64 KB write, so the real segment is packed exactly once.
+unsafe fn probe_decoded_tensor(dim: usize, n: usize, flat: &[f32]) -> Option<Vec<f32>> {
+    if flat.len() != n * dim || dim == 0 || n == 0 {
+        return None;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "sofuu-probe-{}-{:?}.tmp",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let path_s = path.to_string_lossy().to_string();
+    let _ = std::fs::remove_file(&path);
+    let dims: [u32; 2] = [n as u32, dim as u32];
+    let wrote = container_write(
+        &path_s,
+        &[Stream::Tensor {
+            name: SEGMENT_TENSOR_STREAM,
+            data: flat,
+            dims: &dims,
+        }],
+    )
+    .is_ok();
+    let decoded = if wrote {
+        container_open_ex(&path_s).ok().and_then(|(container, _legacy)| {
+            let got = read_tensor_stream(container, SEGMENT_TENSOR_STREAM);
+            container_free(container);
+            got.map(|(vals, _dims)| vals)
+        })
+    } else {
+        None
+    };
+    let _ = std::fs::remove_file(&path);
+    decoded.filter(|d| d.len() == flat.len())
+}
+
 /// Write one segment: tensor of the records' vectors + their metadata.
 ///
 /// W3.5: new segments carry a per-record CRC over id + metadata + vector,
@@ -865,12 +912,32 @@ pub unsafe fn write_segment(
     dim: usize,
     recs: &[SegRecord],
 ) -> Result<(), c_int> {
-    let crcs: Vec<u32> = recs
-        .iter()
-        .map(|r| record_crc(r.id, &r.meta, &r.vec))
-        .collect();
+    /* Ask the codec what a reader will decode BEFORE writing the segment, so
+     * the CRCs are right the first time. This is the difference between one
+     * encode and two. If the probe fails we fall back to the CRCs of the input
+     * vectors; the read-back below still catches that case and repacks. */
+    let probe = probe_decoded_tensor(
+        dim,
+        recs.len(),
+        &recs.iter().flat_map(|r| r.vec.iter().copied()).collect::<Vec<f32>>(),
+    );
+    let crcs: Vec<u32> = match probe.as_deref() {
+        Some(decoded) => recs
+            .iter()
+            .enumerate()
+            .map(|(i, r)| record_crc(r.id, &r.meta, &decoded[i * dim..(i + 1) * dim]))
+            .collect(),
+        None => recs
+            .iter()
+            .map(|r| record_crc(r.id, &r.meta, &r.vec))
+            .collect(),
+    };
+    let w0 = std::time::Instant::now();
     let (flat, dims, meta_json) = segment_image(dim, recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC)?;
+    let t_img = w0.elapsed().as_secs_f64() * 1000.0;
+    let w1 = std::time::Instant::now();
     write_segment_image(path, &flat, &dims, &meta_json, SEG_FLAG_PER_RECORD_CRC)?;
+    let t_wr = w1.elapsed().as_secs_f64() * 1000.0;
 
     /* Learn what a reader will actually decode — but compare the STREAMS, not
      * decoded records. This used to re-open the file, decompress both streams,
@@ -895,7 +962,18 @@ pub unsafe fn write_segment(
             .iter()
             .zip(flat.iter())
             .all(|(a, b)| a.to_bits() == b.to_bits());
-    if tensor_exact && meta_exact {
+    /* Did the pre-write probe predict exactly what came back? If so the CRCs
+     * already describe the decoded vectors and there is nothing to repack:
+     * that is the whole point of probing before writing. */
+    let predicted = probe.as_deref().map_or(false, |p| {
+        p.len() == decoded_flat.len()
+            && p.iter().zip(decoded_flat.iter()).all(|(a, b)| a.to_bits() == b.to_bits())
+    });
+    if std::env::var_os("SOFUU_PROFILE").is_some() {
+        eprintln!("[ws] img={t_img:.1} write={t_wr:.1} exact={} predicted={predicted}",
+                  tensor_exact && meta_exact);
+    }
+    if proto_done(tensor_exact, predicted, meta_exact) {
         /* The codec was exact: phase 1's CRCs already describe it. */
         return Ok(());
     }
@@ -928,6 +1006,12 @@ pub unsafe fn write_segment(
 
 /// Re-open a segment the writer just staged and return its two streams
 /// decoded, WITHOUT parsing the metadata into records.
+/// The codec was exact, or the probe already predicted the decode: either way
+/// the CRCs written are the ones a reader will compute, so no repack is needed.
+fn proto_done(tensor_exact: bool, predicted: bool, meta_exact: bool) -> bool {
+    meta_exact && (tensor_exact || predicted)
+}
+
 unsafe fn read_back_streams(path: &str) -> Option<(Vec<f32>, String)> {
     let (container, _legacy) = container_open_ex(path).ok()?;
     let tensor = read_tensor_stream(container, SEGMENT_TENSOR_STREAM);

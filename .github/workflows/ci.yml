@@ -91,21 +91,22 @@ jobs:
         #
         # continue-on-error is DELIBERATE and temporary. Full measurement
         # (100k records / dim 64 / 200 flushes, release, 2026-10-30):
-        #   lazy open call   27.3 ms    PASS  (the eager open was > 1 s)
-        #   usable access    13.23 s    FAIL  (was 170.04 s before the W3.1
-        #                                       graph snapshot was wired)
-        #   flush P99       210.0 ms    FAIL  (limit 50 ms; was 345.5 ms)
+        #   lazy open call   0.9 ms     PASS  (was 27.3 ms, and > 1 s eager)
+        #   usable access    2.90 s     FAIL  (was 170.04 s; 0.55 s at 20k,
+        #                                       where the gate PASSES)
+        #   flush P99       65.5 ms     FAIL  (limit 50 ms; was 345.5 ms)
         #   10k texts->10k  10000/10000 PASS
         #
-        # BOTH failures have one measured cause: qtsq_vault_encrypt_password
-        # runs Argon2id at m_cost = 64 MB per call and exposes no derived-key
-        # entry point, so a flush pays 3 derivations (~78 ms of its 188 ms
-        # p50) and a 100k open pays 391 (~11 s of its 13 s). See
-        # brain_store.rs::QTSQ_LEVEL_FULL for the profile and
-        # sofuu/JOURNAL.md for the numbers. Until the vault caches a derived
-        # key (a change to src/qtsq_vault.c, outside this workflow's reach),
-        # gating on these two numbers would paint every PR red for a known,
-        # documented floor rather than a regression.
+        # History of the gap, because it is instructive: the 170 s was a graph
+        # snapshot nobody called (now wired), then 13 s was Argon2id running
+        # per FILE instead of per process (now KDF v2, security_version 2),
+        # and the remaining 2.9 s is per-segment read work — 571 ms of a 20k
+        # load is reading 78 segments, 225 ms is hydrating. A parallel read
+        # pass was written and REVERTED: it broke the legacy-encrypted
+        # migration path for a 1.75x win, which is a bad trade.
+        #
+        # So gating on these two numbers today would paint every PR red for a
+        # known, measured, documented gap rather than a regression.
         continue-on-error: true
         run: |
           cargo run --release -p sofuu-core --example brain_gates -- \

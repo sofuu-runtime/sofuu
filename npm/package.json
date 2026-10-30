@@ -1,7 +1,7 @@
 {
   "name": "sofuu",
   "version": "0.3.0-beta",
-  "description": "Sofuu \u2014 an early-stage, bootstrapped, open-core AI-native JavaScript/TypeScript runtime with offline embeddings, agents, MCP, and local memory.",
+  "description": "Sofuu \u2014 a general-purpose runtime for AI, built to run anywhere from servers to smart devices.",
   "keywords": [
     "ai",
     "agent",

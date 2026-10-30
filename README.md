@@ -2,7 +2,7 @@
 
 # ⚡ Sofuu (素風)
 
-> *The AI-Specific General-Purpose Runtime — a fast, private JavaScript/TypeScript execution environment with in-process CPU/GPU inference (experimental), multi-format (GGUF + SafeTensors), autonomous agents, and cognitive vector memory (CMA) in a single <= 5.5 MB binary (5.2 MB stripped release with bundled QTSQ cognitive memory). Zero daemons, zero external deps.*
+> *Sofuu is a general-purpose runtime for AI — built to run anywhere from servers to smart devices. A compact, sovereign systems engine (Rust/C core, QuickJS/libuv) combining in-process CPU/GPU inference (experimental), multi-format models (GGUF + SafeTensors), autonomous agent loops, encrypted cognitive vector memory (QTSQ), and native MCP in a single <= 5.5 MB binary (5.2 MB stripped release with bundled QTSQ cognitive memory). Zero daemons, zero external dependencies.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0--beta-orange.svg)](https://github.com/sofuu-runtime/sofuu/releases)
@@ -19,11 +19,11 @@
 
 ## What is Sofuu?
 
-Sofuu is **the AI-specific general-purpose JavaScript/TypeScript runtime** — the unified execution environment for the AI era.
+Sofuu is **a general-purpose runtime for AI — built to run anywhere from servers to smart devices**.
 
-Sofuu is **not just a terminal coding agent or a local model runner**; the terminal assistant (`sofuu chat`) is merely one first-party demonstration application running on the engine. Sofuu is the foundational operating substrate built to collapse the fragmented AI stack (Python/Node + LangChain + Chroma + Ollama + FastAPI) into a single in-process runtime.
+Sofuu is **not just a terminal coding agent or a desktop model runner**; the terminal assistant (`sofuu chat`) is merely one first-party demonstration application running on the engine. Sofuu is the foundational systems substrate engineered to collapse the fragmented AI stack (Python/Node + LangChain + Chroma + Ollama + FastAPI) into a single in-process, self-contained runtime.
 
-Everything AI workloads need is built directly into the single native binary — no npm packages, no Python environments, and no background daemons required:
+While TypeScript and JavaScript serve as the ergonomic high-level orchestration surface, the engine itself is an ultra-lean systems core (Rust + C) with a clean C ABI. Everything AI applications require is built directly into the single native binary — no npm packages, no Python environments, and no background daemons required:
 - **In-process local LLM inference** (**experimental** — built-in engine is early stage; for production use llama.cpp or another backend via the plugin system) (GGUF, SafeTensors, PyTorch, NumPy on Metal / NEON / AVX2) and cloud streaming
 - **Autonomous agent loops** with native tools, prompt sovereignty, and sandboxed execution
 - **Continuous Memory Architecture (CMA v2)** — on-device encrypted vector brain in `.qtsq` containers (bundled on macOS and Linux)
@@ -31,13 +31,18 @@ Everything AI workloads need is built directly into the single native binary —
 - **Unified R7 Security Policy** — deterministic firewall for tools, shell, filesystem, network, and MCP
 - **Async HTTP server & SIMD vector mathematics**
 
-Sofuu runs **identically across surfaces**: as an embeddable mobile SDK (`libsofuu` for iOS/Android), an edge agent on a Raspberry Pi, an API microservice in the cloud, or an interactive terminal workspace on your laptop.
+### Where Sofuu Runs
+Sofuu is built from first principles with a hard **$\le 5.5\text{ MB}$ binary cap**, **sub-4ms cold boot**, and **zero-JIT execution** (making it 100% compliant with strict platform policies like the iOS App Store and RTOS environments). This enables it to run identically across diverse hardware form factors:
+- **Cloud & Edge Servers:** Headless microservices, streaming LLM proxies, and containerized autonomous agents with microsecond warm-up.
+- **Developer Workstations:** High-throughput local agent workspaces, standalone compiled CLI tools (`sofuu compile`), and zero-config desktop tools.
+- **Mobile Devices (iOS & Android):** Shipped as an embeddable C ABI library (`libsofuu`) with Swift and Kotlin bindings.
+- **Smart Devices, Wearables & Physical Computing:** Drones, robotics, smart watches, AR glasses, and edge IoT gateways — where tight RAM budgets ($<30\text{ MB}$), offline on-device tensor evaluation, local encrypted memory, and deterministic hardware-safety boundaries allow building ambient intelligence without relying on constant cloud roundtrips or bloated OS runtimes.
 
 ---
 
 ## Features
 
-- **JS/TS runtime** — QuickJS (ES2023) + libuv event loop with cooperative scheduler (W3C `scheduler.yield()`, microtask starvation protection), AOT bytecode snapshotting, zero-copy TypedArray SIMD memory bridge, native `AsyncLocalStorage` context propagation, deterministic instruction-metered sandboxing, ~3.8 ms startup on modern workstations (38 ms on Raspberry Pi 5, see [BENCHMARKS.md](BENCHMARKS.md)), TypeScript runs with no compiler step, and `sofuu bundle` ships one self-contained file
+- **Universal runtime with TS/JS orchestration** — QuickJS (ES2023) + libuv event loop with cooperative scheduler (W3C `scheduler.yield()`, microtask starvation protection), AOT bytecode snapshotting, zero-copy TypedArray SIMD memory bridge, native `AsyncLocalStorage` context propagation, deterministic instruction-metered sandboxing, ~3.8 ms startup on modern workstations (38 ms on Raspberry Pi 5, see [BENCHMARKS.md](BENCHMARKS.md)), TypeScript runs with no compiler step, and `sofuu bundle` ships one self-contained file
 - **Local edge inference** (**experimental** — built-in engine; production use: llama.cpp or another backend via plugin) — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), up to ~195 tok/s prefill and ~69 tok/s decode on this battery's hardware, in-place KV cache compaction & sliding-window attention past context limits
 - **Cloud LLM streaming** — `sofuu.ai.stream` / `complete` over OpenAI, Anthropic, or any OpenAI-compatible endpoint (BYO key); per-model context/effort registry, no default model
 - **Agents + workflows** — `sofuu.agent.define/run`, modular domain toolpacks (`coding`, `web`, `memory`, `system`), prompt sovereignty, tool-aware task-gate, budgets, cancel, trace rendering; generalized session documents (`chat`, `agent`, `workflow`, `pipeline`) with state container

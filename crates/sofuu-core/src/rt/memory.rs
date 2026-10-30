@@ -293,6 +293,10 @@ mod impl_qtsq {
         n: usize,
         dim: usize,
         meta: Option<String>,
+        /// Records already parsed, for the segmented loader: handing these to
+        /// hydrate skips the write-to-text/parse-back round trip (470 ms +
+        /// 135 ms of a 100k open). `None` means "parse `meta` instead".
+        record_values: Option<Vec<serde_json::Value>>,
         found_memories: bool, /* the "memories" stream was present */
         /// B4: the LEGACY fixed password opened this file — the next write
         /// re-encrypts it under the machine key (backup kept first).
@@ -420,6 +424,7 @@ mod impl_qtsq {
             n,
             dim,
             meta,
+            record_values: None,
             found_memories,
             legacy_encryption,
         })
@@ -2126,10 +2131,12 @@ mod impl_qtsq {
                 scan.dropped_versions
             );
         }
+        /* The records are NOT serialised into this document: they are already
+         * parsed values and hydrate takes them directly. Only the two fields
+         * that live beside them stay. */
         let meta_json = serde_json::json!({
             "schema": "sofuu-cma@2",
             "embedding": m.embedding,
-            "records": metas,
         })
         .to_string();
         let layout = BrainLayout {
@@ -2168,6 +2175,7 @@ mod impl_qtsq {
                 n,
                 dim: 0, /* filled by the caller from the manifest */
                 meta: Some(meta_json),
+                record_values: Some(metas),
                 found_memories: n > 0,
                 legacy_encryption: scan.any_legacy,
             },
@@ -2221,10 +2229,15 @@ mod impl_qtsq {
                     crate::memory::hnsw::Hnsw::load_with_vectors(&gp, per_record).ok()
                 }
             };
-            if !shell
-                .cma
-                .hydrate_with_snapshot(&brain.vecs, brain.n, brain.dim, meta, snapshot)
-            {
+            let hydrated = match brain.record_values {
+                Some(values) => shell
+                    .cma
+                    .hydrate_from_values(&brain.vecs, brain.n, brain.dim, values, snapshot),
+                None => shell
+                    .cma
+                    .hydrate_with_snapshot(&brain.vecs, brain.n, brain.dim, meta, snapshot),
+            };
+            if !hydrated {
                 eprintln!("[sofuu/cma] brain file metadata unreadable — refusing the load");
                 return Err(qtsq::QTSQ_ERR_FORMAT);
             }

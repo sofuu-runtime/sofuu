@@ -1012,13 +1012,6 @@ impl Cma {
         meta_json: &str,
         snapshot: Option<crate::memory::hnsw::Hnsw>,
     ) -> bool {
-        if dim != self.vec_dim || vecs.len() != n * dim {
-            return false;
-        }
-        // The brain-file metadata is {"records":[...]} — the same shape the
-        // C cma_flush wrote (M2: plus an optional top-level "deaths").
-        let prof = std::env::var_os("SOFUU_PROFILE").is_some();
-        let mut t = std::time::Instant::now();
         /* One parse, straight into the typed document.
          *
          * This used to build a serde_json::Value and then CLONE the records
@@ -1031,10 +1024,48 @@ impl Cma {
             Ok(v) => v,
             Err(_) => return false,
         };
-        let t_parse = t.elapsed().as_secs_f64() * 1000.0;
-        t = std::time::Instant::now();
-        let records: Vec<RecordJson> = doc.records;
-        let deaths: Vec<DeathEntry> = doc.deaths;
+        self.hydrate_records(vecs, n, dim, doc.records, doc.deaths, snapshot)
+    }
+
+    /// Hydrate from records that are ALREADY parsed values.
+    ///
+    /// The segmented loader holds every record's metadata as a value; handing
+    /// it over directly skips the write-to-text/parse-back round trip it used
+    /// to perform (serialise 100k records into the meta document, then parse
+    /// them straight out again — measured 470 ms + 135 ms of a 100k open).
+    pub fn hydrate_from_values(
+        &mut self,
+        vecs: &[f32],
+        n: usize,
+        dim: usize,
+        values: Vec<serde_json::Value>,
+        snapshot: Option<crate::memory::hnsw::Hnsw>,
+    ) -> bool {
+        let mut records: Vec<RecordJson> = Vec::with_capacity(values.len());
+        for v in values {
+            match serde_json::from_value::<RecordJson>(v) {
+                Ok(r) => records.push(r),
+                Err(_) => return false,
+            }
+        }
+        self.hydrate_records(vecs, n, dim, records, Vec::new(), snapshot)
+    }
+
+    fn hydrate_records(
+        &mut self,
+        vecs: &[f32],
+        n: usize,
+        dim: usize,
+        records: Vec<RecordJson>,
+        deaths: Vec<DeathEntry>,
+        snapshot: Option<crate::memory::hnsw::Hnsw>,
+    ) -> bool {
+        if dim != self.vec_dim || vecs.len() != n * dim {
+            return false;
+        }
+        let prof = std::env::var_os("SOFUU_PROFILE").is_some();
+        let mut t = std::time::Instant::now();
+        let t_parse = 0.0f64;
         /* W3.1: with a valid snapshot the index comes from the file; only the
          * record table needs building. */
         let adopt = snapshot.filter(|snap| snap.len() == n);

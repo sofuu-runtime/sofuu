@@ -283,7 +283,8 @@ fn print_chat_help() {
         "\x1b[1mUsage:\x1b[0m sofuu chat [options]      (bare `sofuu` does the same)\n\n\
          \x1b[1mOptions:\x1b[0m\n\
            -m, --model <name>        model to chat with\n\
-           -p, --provider <name>     openai | anthropic | local | ollama | llamacpp\n\
+           -p, --provider <name>     openai | anthropic | local | ollama | llamacpp |
+                                     lmstudio | vllm\n\
            -k, --apikey <key>        API key for this session\n\
                --base-url <url>      override the provider endpoint\n\
                                      (llamacpp defaults to http://127.0.0.1:8080/v1)\n\
@@ -1696,7 +1697,12 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
                      * maps it to the local provider and its
                      * http://localhost:11434/api/chat default. "llamacpp" is an
                      * OpenAI-compatible llama-server, so it needs one. */
-                    "openai" | "anthropic" | "local" | "ollama" => {
+                    /* lmstudio and vllm ship as adapters (src/js/providers.js)
+                     * and chat.js already advertises them, so the flag must
+                     * accept them too. Both are OpenAI-compatible with their
+                     * own local default ports, supplied by the adapter — no
+                     * base_url fill-in needed here. */
+                    "openai" | "anthropic" | "local" | "ollama" | "lmstudio" | "vllm" => {
                         cfg.provider = p;
                         i += 2;
                     }
@@ -1721,7 +1727,7 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
                             i += 2;
                         } else {
                             eprintln!(
-                                "\x1b[31mError:\x1b[0m unknown provider '{p}' (known: openai, anthropic, local, ollama, llamacpp)."
+                                "\x1b[31mError:\x1b[0m unknown provider '{p}' (known: openai, anthropic, local, ollama, llamacpp, lmstudio, vllm)."
                             );
                             eprintln!("  Add it in the TUI (/provider) or use --base-url for a custom endpoint.");
                             return 1;

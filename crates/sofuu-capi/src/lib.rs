@@ -763,6 +763,23 @@ unsafe fn sofuu_rt_call_impl(
     let js = format!(
         r#"var __capi_r=null;(async function(){{
   function markUnknown(m){{var e=new TypeError(m);e.__sofuuUnknown=true;return e}}
+  /* W1.7 (AUDIT-2026-10-29): a thrown error's own `.code` survives the C-ABI
+   * boundary. The envelope used to hardcode `js_exception`, which destroyed
+   * every code the JS/native layer really produced (E_DT, E_RECORDS,
+   * E_IMPORT, E_TYPE, E_NONFINITE, E_DIM, E_LOCKED, E_CORRUPT, E_ENOSPC) —
+   * a host could not tell a bad vector from a locked store. `js_exception`
+   * now means exactly "the method threw and carried no code". */
+  function errCode(e){{
+    if(e&&e.__sofuuUnknown)return "unknown_method";
+    var c=e?e.code:undefined;
+    if(typeof c==="string"&&c)return c;
+    if(typeof c==="number"&&isFinite(c))return String(c);
+    return "js_exception";
+  }}
+  function errMessage(e){{
+    if(e&&e.message!==undefined&&e.message!==null)return String(e.message);
+    try{{return String(e)}}catch(e2){{return "error"}}
+  }}
   try {{
     var p={method_json}.split("."),o=sofuu;
     for(var i=0;i<p.length;i++){{if(o==null)throw markUnknown("sofuu."+p.slice(0,i+1).join(".")+" is not available");o=o[p[i]]}}
@@ -771,7 +788,7 @@ unsafe fn sofuu_rt_call_impl(
     {call_expr}
     __capi_r={{ok:true,result:r}}
   }}catch(e){{
-    __capi_r={{ok:false,error:{{code:(e&&e.__sofuuUnknown)?"unknown_method":"js_exception",message:e.message||String(e)}}}}
+    __capi_r={{ok:false,error:{{code:errCode(e),message:errMessage(e)}}}}
   }}
 }})()"#,
         method_json = serde_json::to_string(method_str).unwrap_or_default(),
@@ -2462,18 +2479,101 @@ mod tests {
         assert!(!rt.is_null());
 
         // memory.count with a handle that was never opened:
-        //  - QTSQ build  → the method exists and throws inside → js_exception
-        //  - QTSQ-free   → the stub exists and throws E_CAPABILITY → js_exception
+        //  - QTSQ build  → the method exists and throws a typed E_TYPE
+        //  - QTSQ-free   → the stub exists and throws (no code) → js_exception
+        // Either way it must NOT be unknown_method; W1.7 additionally made the
+        // stale-handle refusal machine-readable on a QTSQ build.
         let code = call_err(rt, "memory.count", r#"{"handle":99}"#);
+        assert_ne!(
+            code, "unknown_method",
+            "a method that exists but throws must not be reported as absent"
+        );
+        let expected = if sofuu_core::HAS_QTSQ { "E_TYPE" } else { "js_exception" };
         assert_eq!(
-            code, "js_exception",
-            "a method that exists but throws must report js_exception — \
-             unknown_method would wrongly claim the method is absent"
+            code, expected,
+            "a stale handle is a typed refusal (E_TYPE) on a QTSQ build, and \
+             the codeless fallback elsewhere"
         );
 
         unsafe { sofuu_rt_free(rt) };
     }
 
+
+    /// W1.7 (AUDIT-2026-10-29): a thrown error's own `.code` survives the
+    /// C-ABI boundary, and `.message` rides along with it.
+    ///
+    /// The envelope used to hardcode `code: "js_exception"`, which destroyed
+    /// every code the JS/native layer really produced (E_DT, E_RECORDS,
+    /// E_IMPORT, and now E_TYPE / E_NONFINITE / E_DIM / E_LOCKED / E_CORRUPT /
+    /// E_ENOSPC) — a host could not tell a bad vector from a locked store.
+    /// `js_exception` now means exactly "threw, with no code".
+    #[test]
+    fn a_coded_error_keeps_its_code_across_the_c_abi() {
+        let _g = lock();
+        let rt = unsafe { sofuu_rt_new(ptr::null()) };
+        assert!(!rt.is_null());
+
+        let setup = CString::new(
+            r#"
+            sofuu.__capi_coded_probe = function () {
+              var e = new TypeError('probe: a Float64Array is not a vector');
+              e.code = 'E_TYPE';
+              throw e;
+            };
+            sofuu.__capi_bare_probe = function () { throw new TypeError('no code here'); };
+            sofuu.__capi_numeric_code_probe = function () {
+              var e = new Error('numeric'); e.code = 42; throw e;
+            };
+            "#,
+        )
+        .unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) };
+        assert_eq!(rc, 0);
+        unsafe { sofuu_free(out as *mut c_void) };
+
+        assert_eq!(
+            call_err(rt, "__capi_coded_probe", "null"),
+            "E_TYPE",
+            "a coded throw must keep its code instead of js_exception"
+        );
+        /* The envelope itself (call() would assert ok:true). */
+        let envelope = {
+            let m = CString::new("__capi_coded_probe").unwrap();
+            let a = CString::new("null").unwrap();
+            let mut out: *mut c_char = ptr::null_mut();
+            let _ = unsafe { sofuu_rt_call(rt, m.as_ptr(), a.as_ptr(), &mut out) };
+            assert!(!out.is_null(), "envelope must not be NULL");
+            let json = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+            unsafe { sofuu_free(out as *mut c_void) };
+            serde_json::from_str::<JsonValue>(&json)
+                .unwrap_or_else(|e| panic!("envelope is not JSON ({e}): {json}"))
+        };
+        assert_eq!(
+            envelope.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()),
+            Some("probe: a Float64Array is not a vector"),
+            "the coded error's message must survive too: {envelope}"
+        );
+        assert_eq!(
+            call_err(rt, "__capi_bare_probe", "null"),
+            "js_exception",
+            "a throw WITHOUT a code still reports the generic js_exception"
+        );
+        assert_eq!(
+            call_err(rt, "__capi_numeric_code_probe", "null"),
+            "42",
+            "a numeric code is preserved as its string form"
+        );
+        /* And the REAL surface: a refusal produced by memory_api.js itself
+         * (a bad handle is E_TYPE) — it used to arrive as `js_exception`. */
+        assert_eq!(
+            call_err(rt, "memory.decayTick", "[{\"seconds\":-5}]"),
+            "E_TYPE",
+            "a memory_api.js refusal must keep its code across the C-ABI"
+        );
+
+        unsafe { sofuu_rt_free(rt) };
+    }
 
     #[test]
     fn call_bad_args_json_returns_error() {
@@ -4311,13 +4411,19 @@ mod tests {
         // error must surface as a normal error envelope, not a crash. The
         // method resolves in every build (P1 typed-refusal stubs on a
         // QTSQ-free one), and the facade answers before the engine stub is
-        // reached, so the code is js_exception in both.
+        // reached. W1.7 made that facade refusal machine-readable (E_TYPE) on
+        // a QTSQ build; elsewhere it stays the codeless fallback.
         let code = call_err(
             rt,
             "memory.count",
             r#"{"handle":99}"#,
         );
-        assert_eq!(code, "js_exception", "expected a clean error envelope");
+        assert_ne!(code, "unknown_method", "expected a clean error envelope");
+        assert_eq!(
+            code,
+            if sofuu_core::HAS_QTSQ { "E_TYPE" } else { "js_exception" },
+            "expected a clean, CODED error envelope"
+        );
         unsafe { sofuu_rt_free(rt) };
     }
 

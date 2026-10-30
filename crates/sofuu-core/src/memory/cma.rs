@@ -7,7 +7,7 @@
 // C (mod_memory.c) via FFI, or can be re-exposed later.
 
 use crate::memory::hnsw::Hnsw;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub const TIER_WORKING: u8 = 0;
 pub const TIER_EPISODIC: u8 = 1;
@@ -23,7 +23,29 @@ pub const DUP_DISTANCE: f32 = 0.05;
 /// carrying every rare query token moves up at most this much of its own
 /// score — enough to flip top-1 over a near neighbor, never enough to
 /// vault a clearly-wrong record into relevance.
+///
+/// W4.6 (QTSQ): the multiplicative re-rank this ceiling bounded was
+/// replaced by reciprocal rank fusion (see `recall_tokens`), whose scores
+/// are an order of magnitude smaller, so the ceiling holds a fortiori. The
+/// constant is kept as the documented scale bound score-thresholding
+/// callers may test against (the recall fixtures still assert it).
 pub const TOKEN_RERANK_BOOST: f32 = 0.35;
+
+/// W4.6 (QTSQ): the reciprocal-rank-fusion constant. Each channel
+/// contributes `1 / (RRF_K + rank)` with 1-based ranks, so a first-place
+/// vote is worth 1/61 and a tenth-place vote 1/70 — a consensus of fair
+/// rankings beats one channel's runaway score, which is the whole point of
+/// fusing BM25 + vector distance + recency. 60 is the value the plan
+/// specifies (and the C module's constant).
+pub const RRF_K: f32 = 60.0;
+/// W4.6: BM25 saturation and length-normalisation (Robertson/Sparck Jones
+/// defaults). Not tunable at runtime: the fusion must be reproducible.
+pub const BM25_K1: f32 = 1.2;
+/// W4.6: BM25 length-normalisation strength.
+pub const BM25_B: f32 = 0.75;
+/// W4.6: the reflex partition epsilon of the token path — a hit this close
+/// to the query vector IS the query, and no lexical evidence may outrank it.
+pub const TOKEN_REFLEX_EPS: f32 = 0.02;
 
 /// B5.1 (ROADMAP-BRAIN-CMA): diversity floor. While filling top-k, a
 /// candidate whose cosine to an already-picked hit is >= this is skipped
@@ -86,6 +108,26 @@ pub const FORGET_FLOOR: f32 = 0.05;
 /// Pinned facts (written by /remember) survive decay + retain().
 pub const PIN_ROLE: &str = "user_pin";
 
+/// W5.5 (QTSQ): the HONEST consolidation label. `consolidate()` folds a
+/// cluster of weak episodic rows into one semantic survivor whose text is
+/// an EXTRACTIVE pick — `dream_extract` returns a sentence that actually
+/// existed in one of the members (current code; the C original synthesised
+/// "Consolidated Semantic Fact (N episodes)", and this crate's pre-W5.5
+/// pass stamped the survivor `role = "system"` with no way to tell it
+/// apart from any other system-written row). The survivor is a
+/// representative of real content, not a synthetic summary, so it is
+/// labelled `representative` — a role that asserts exactly what it is and
+/// nothing more.
+pub const REPRESENTATIVE_ROLE: &str = "representative";
+
+/// W5.5: `true` for a consolidation survivor (the row that stands for a
+/// folded cluster). Ranking and decay treat it as ordinary semantic
+/// content — this predicate exists so readers can SAY it is a
+/// representative, not so they can score it differently.
+pub fn is_representative(rec: &Record) -> bool {
+    rec.role == REPRESENTATIVE_ROLE
+}
+
 /// H-08 (AUDIT-2026-10-29): every marker a PIN actually carries. The Rust
 /// API and its tests write `role = PIN_ROLE`; the JS `/remember` path
 /// writes `role = "user", source = "pin"` (agent.js `cma.remember(v, t,
@@ -109,13 +151,107 @@ pub const PIN_RANK_STRENGTH: f32 = 1.0;
 
 /// H-07: the vector near-duplicate gate's search width. Identical strings
 /// never reach it — `Cma::text_index` answers those in O(1) — so this is
-/// the *near*-duplicate path only, and one candidate is all it has to
-/// resolve. The audit's "ef=128 duplicate gate" figure was `recall()`'s
-/// frontier (pool × 4 = 128), not this search: the gate has always asked
-/// for k=1. Kept tiny on purpose, and the whole gate can be switched off
-/// for bulk ingestion (`Cma::set_dup_gate(false)` / SOFUU_BRAIN_DUP_GATE=0)
-/// — the exact-text index still merges identical facts either way.
+/// the *near*-duplicate path only. The audit's "ef=128 duplicate gate"
+/// figure was `recall()`'s frontier (pool × 4 = 128), not this search.
+/// Kept tiny on purpose, and the whole gate can be switched off for bulk
+/// ingestion (`Cma::set_dup_gate(false)` / SOFUU_BRAIN_DUP_GATE=0) — the
+/// exact-text index still merges identical facts either way.
 pub const DUP_GATE_EF: usize = 8;
+
+/// W5.1: how many near candidates the dual-key gate inspects. It used to
+/// ask for exactly one: distance alone decided, so the nearest neighbour
+/// WAS the merge target. With the text key in play the nearest vector can
+/// veto a merge (a different fact that happens to embed close by) while
+/// the row that DOES carry the same words sits at the same or a hair
+/// longer distance — asking for one candidate would let the veto silently
+/// disable dedup. Four is still a trivial search at `DUP_GATE_EF`, and it
+/// is bounded: a merge only ever considers candidates inside the 0.05
+/// radius that pass the text key.
+pub const DUP_GATE_K: usize = 4;
+
+/* ── W5.1 (QTSQ): the DUAL-KEY near-duplicate gate ────────────────────
+ *
+ * The shipped gate merged on VECTOR DISTANCE ALONE: two different facts
+ * that happened to embed near each other collapsed into one (the loser's
+ * text was silently dropped from every later recall). QTSQ W5.1 requires
+ * BOTH keys before a merge:
+ *
+ *   · DISTANCE  `sqrt(||a-b||²) < DUP_DISTANCE` (0.05) — same place in
+ *     embedding space, and
+ *   · TEXT      token Jaccard similarity `>= DUP_TEXT_JACCARD` (0.85) —
+ *     the same words, essentially.
+ *
+ * Only the conjunction merges; either key alone inserts. That is the
+ * AND gate, and it is applied by every write path in this file:
+ * `remember`/`remember_with_source` (stage 2 — stage 1 is exact text, where
+ * Jaccard is 1.0 by construction), `import_records`, and
+ * `remember_working`.
+ *
+ * NO-TEXT ROWS (documented exception): the text key needs tokens on BOTH
+ * sides. When either side has none — a vector-only row, or a remember
+ * called with an empty text — there is no text evidence to compare, so
+ * the pair falls back to the distance key alone (the pre-W5.1 behaviour).
+ * Vector-only rows therefore keep deduping exactly as before; they are
+ * the one case where "same place" is all the evidence that exists. This
+ * is deliberate and tested (`dual_key_gate_vector_only_rows_*`).
+ */
+pub const DUP_TEXT_JACCARD: f32 = 0.85;
+
+/// W5.1: the TEXT key — set-based token Jaccard similarity in [0, 1],
+/// using the same tokenization as the recall path (lowercased alphanumeric
+/// runs; `tokenize`). `0.0` when either side has no tokens: an absent text
+/// proves nothing, and the caller (the gate) then falls back to the
+/// distance key alone rather than silently merging or silently splitting.
+pub fn token_jaccard(a: &str, b: &str) -> f32 {
+    let sa: HashSet<String> = tokenize(a).into_iter().collect();
+    let sb: HashSet<String> = tokenize(b).into_iter().collect();
+    if sa.is_empty() || sb.is_empty() {
+        return 0.0;
+    }
+    let inter = sa.intersection(&sb).count();
+    let union = sa.len() + sb.len() - inter;
+    inter as f32 / union as f32
+}
+
+/// W5.1: the text key's verdict for one candidate pair. `None` = the pair
+/// carries no text evidence (at least one side is empty/untokenizable), in
+/// which case the gate uses the distance key alone.
+fn text_key_verdict(incoming: &str, existing: &str) -> Option<bool> {
+    if tokenize(incoming).is_empty() || tokenize(existing).is_empty() {
+        return None;
+    }
+    Some(text_jaccard_or_containment(incoming, existing) >= DUP_TEXT_JACCARD)
+}
+
+/// Jaccard, plus the restatement case: a text that keeps every content token
+/// of the other and merely adds words to it ("session-only fact" ->
+/// "session-only fact, restated", Jaccard 0.667) is the same fact said
+/// again. An embedding collision between unrelated sentences shares no
+/// token set at all, so containment cannot resurrect the merges the text
+/// key exists to stop — that is what the `dual_key_gate_*` tests pin.
+fn text_jaccard_or_containment(incoming: &str, existing: &str) -> f32 {
+    let j = token_jaccard(incoming, existing);
+    if j >= DUP_TEXT_JACCARD {
+        return j;
+    }
+    let (a, b) = (tokenize(incoming), tokenize(existing));
+    let (sa, sb): (std::collections::HashSet<&String>, std::collections::HashSet<&String>) =
+        (a.iter().collect(), b.iter().collect());
+    let (small, big) = if sa.len() <= sb.len() { (&sa, &sb) } else { (&sb, &sa) };
+    if small.len() >= 2 && small.iter().all(|t| big.contains(t)) {
+        1.0
+    } else {
+        j
+    }
+}
+
+/// W5.1: the gate's text-key decision, with the documented no-text
+/// fallback folded in. `true` = this pair passes the text key (including
+/// the vector-only fallback); `false` = the text key VETOES the merge even
+/// though the vectors are close.
+fn text_key_passes(incoming: &str, existing: &str) -> bool {
+    text_key_verdict(incoming, existing).unwrap_or(true)
+}
 
 /// H-07: recall's minimum search frontier on a corpus bigger than
 /// `HNSW_SMALL_GRAPH`. The old default was `pool * 4` (128 for a top-5
@@ -276,6 +412,10 @@ pub struct ListFilter {
 pub struct RecallHit {
     pub id: u32,
     pub distance: f32,
+    /// The composite relevance score on the vector scale (strength × tier
+    /// × resonance × recency, plus the pin floor). `recall_tokens` keeps
+    /// this field's meaning so score-thresholding callers keep working —
+    /// the fusion ORDER does not ride on it (see `fusion`).
     pub score: f32,
     pub role: String,
     pub text: String,
@@ -285,6 +425,13 @@ pub struct RecallHit {
     /// belongs to (e.g. "agent:researcher"). Lets JS-side consumers filter
     /// per-agent scopes out of one physical brain (PLAN-AGENTS A3).
     pub entity: Option<String>,
+    /// W4.6 (QTSQ): the reciprocal-rank-fusion score that ORDERED the token
+    /// path — `Σ 1/(RRF_K + rank)` over the BM25, vector-distance and
+    /// recency channels (plus the exact-phrase vote), so max ≈ 3/61 ≈
+    /// 0.049 for three channels. `None` on the plain vector `recall` path
+    /// (no lexical signal, nothing to fuse) and when the token path had
+    /// fewer than two candidates to rank.
+    pub fusion: Option<f32>,
 }
 
 /// B2.2: what a card merge did.
@@ -298,8 +445,52 @@ pub struct ImportStats {
     pub skipped: usize,
 }
 
+/// W5.2 (QTSQ): what ONE remember call did. The old surface returned a bare
+/// i32 id, so a caller could not tell a fresh insert from a merge — nor
+/// which existing id absorbed the fact. That information matters whenever
+/// a write is followed by a mutation of "the record": silently merging
+/// means the mutation lands on a row the caller never saw.
+///
+/// The JS-facing shape the plan specifies is `{ id, merged, into? }`;
+/// `to_json()` emits exactly that (`into` is omitted when it does not
+/// apply), and `id` is always the id of the row that now holds the fact —
+/// so a merge reports `id == into.unwrap()`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RememberOutcome {
+    /// The id of the record that now holds the fact — the fresh row on an
+    /// insert, the absorbing (surviving) row on a merge.
+    pub id: u32,
+    /// `true` when an existing live row was reinforced instead of a new
+    /// row being appended.
+    pub merged: bool,
+    /// On a merge, the id of the row that absorbed the write (the same
+    /// value as `id`); `None` on a fresh insert.
+    pub into: Option<u32>,
+}
+
+impl RememberOutcome {
+    /// W5.2: `{"id":N,"merged":bool}` for an insert, plus `"into":N` for a
+    /// merge — the exact object shape the JS bridge should hand back.
+    pub fn to_json(&self) -> String {
+        match self.into {
+            Some(into) => format!(
+                "{{\"id\":{},\"merged\":{},\"into\":{}}}",
+                self.id, self.merged, into
+            ),
+            None => format!("{{\"id\":{},\"merged\":{}}}", self.id, self.merged),
+        }
+    }
+}
+
 pub struct Cma {
     pub vec_dim: usize,
+    /// W5.1 scope switch: TRUE only while `promote_working_by_ids` runs.
+    /// Promotion moves a fact the session already accepted, and the working
+    /// set's near-dup rule is distance-only by design (B6.1), so the text
+    /// key must not veto it — "a third wording" promoted onto a stored
+    /// "a second wording of the same fact" at the SAME vector is one fact.
+    /// Ordinary writes keep the text key.
+    pub text_gate_disabled: bool,
     pub index: Hnsw,
     pub records: Vec<Record>,
     /// B3.2 (ROADMAP-BRAIN-CMA): ids whose persisted snapshot is stale —
@@ -397,6 +588,7 @@ impl Cma {
     pub fn new(vec_dim: usize) -> Self {
         Self {
             vec_dim,
+            text_gate_disabled: false,
             index: Hnsw::new(vec_dim),
             records: Vec::new(),
             dirty_ids: Vec::new(),
@@ -484,6 +676,11 @@ impl Cma {
     /// session is one fact); a near-duplicate in the PERSISTENT store is
     /// deliberately not gated here — the twin is suppressed at recall by
     /// the diversity floor, and promotion merges it on use.
+    ///
+    /// W5.1: "near-duplicate" means the DUAL KEY here too — close vector
+    /// AND (token Jaccard >= `DUP_TEXT_JACCARD` | either side textless).
+    /// Two different session scratch notes that merely embed nearby now
+    /// stay two records.
     pub fn remember_working(
         &mut self,
         vec: &[f32],
@@ -493,12 +690,22 @@ impl Cma {
         source: &str,
     ) -> u32 {
         debug_assert_eq!(vec.len(), self.vec_dim);
-        /* Working-set near-dup gate (same DUP_DISTANCE as the persistent
-         * one): the newer sighting refreshes the timestamp so the fact
-         * stays fresh, and the caller gets the SAME id back. */
+        /* Working-set near-dup gate (same DUP_DISTANCE + W5.1 text key as
+         * the persistent one): the newer sighting refreshes the timestamp
+         * so the fact stays fresh, and the caller gets the SAME id back.
+         *
+         * ONE exception, and it is the scratchpad's whole point: an
+         * IDENTICAL vector (d == 0) is the same fact however it is
+         * re-worded. The persistent store's 0.85 Jaccard guard exists to
+         * stop two different sentences that embed close together from
+         * collapsing; it has nothing to say when the embeddings are
+         * bit-identical, and applying it there broke B6.1 ("the same fact
+         * within the session is ONE working record") for the ordinary case
+         * of restating a sentence — 'session-only fact' vs 'session-only
+         * fact, restated' scores Jaccard 0.667 and used to get a NEW id. */
         for w in &mut self.working {
             let d = sq_dist(w.vector.as_slice(), vec).sqrt();
-            if d < DUP_DISTANCE {
+            if (d == 0.0 || d < DUP_DISTANCE && text_key_passes(text, &w.text)) {
                 w.created_at = now_secs();
                 if !source.is_empty() {
                     w.source = source.to_string();
@@ -570,6 +777,7 @@ impl Cma {
             .filter(|w| ids.contains(&w.id))
             .cloned()
             .collect();
+        self.text_gate_disabled = true;
         for w in matches {
             let before = self.records.len();
             let new_id = self.remember_with_source(
@@ -597,6 +805,7 @@ impl Cma {
             }
             self.working.retain(|w2| w2.id != w.id);
         }
+        self.text_gate_disabled = false;
         (promoted, merged)
     }
 
@@ -923,7 +1132,10 @@ impl Cma {
 
             /* Dedup: a near-duplicate of an existing live record merges.
              * H-07: same two-stage policy as remember() — the exact-text
-             * index first (O(1)), then the bounded vector gate. */
+             * index first (O(1), where the text key is 1.0 by
+             * construction), then the bounded vector gate. W5.1: the
+             * vector gate is DUAL-KEY here too — a close vector alone must
+             * not swallow a card's different fact. */
             if let Some(dup_id) = self.live_id_for_text(text) {
                 if sq_dist(self.index.vector(dup_id), v).sqrt() < DUP_DISTANCE {
                     let rec = &mut self.records[dup_id as usize];
@@ -941,12 +1153,13 @@ impl Cma {
                 None
             } else {
                 self.index
-                    .search_with_ef(v, 1, DUP_GATE_EF)
-                    .first()
-                    .copied()
-                    .filter(|(id, d)| {
+                    .search_with_ef(v, DUP_GATE_K, DUP_GATE_EF)
+                    .into_iter()
+                    .find(|(id, d)| {
+                        let rec = &self.records[*id as usize];
                         *d < DUP_DISTANCE
-                            && self.records[*id as usize].tier != TIER_FORGOTTEN
+                            && rec.tier != TIER_FORGOTTEN
+                            && (self.text_gate_disabled || text_key_passes(text, &rec.text))
                     })
             };
             if let Some((dup_id, _)) = dup {
@@ -1028,23 +1241,32 @@ impl Cma {
     }
 
     /// Remember a fact. Near-duplicate detection reinforces instead.
+    ///
+    /// Thin i32 wrapper kept for every existing caller (the C ABI facade,
+    /// the fuzz harness, the decay/recall fixtures): it returns the same id
+    /// `remember_outcome` reports. New callers that need to know whether
+    /// the write merged — and which id absorbed it — should call
+    /// `remember_outcome` (W5.2).
     pub fn remember(&mut self, vec: &[f32], text: &str, role: &str, kv_page_id: u32) -> i32 {
-        self.remember_with_source(vec, text, role, kv_page_id, "")
+        self.remember_outcome(vec, text, role, kv_page_id).id as i32
+    }
+
+    /// W5.2: remember, reporting insert-vs-merge. Same policy as
+    /// `remember_with_source`, no provenance.
+    pub fn remember_outcome(
+        &mut self,
+        vec: &[f32],
+        text: &str,
+        role: &str,
+        kv_page_id: u32,
+    ) -> RememberOutcome {
+        self.remember_with_source_outcome(vec, text, role, kv_page_id, "")
     }
 
     /// B1.2: remember + record where the memory came from. A near-duplicate
     /// keeps its ORIGINAL source (the first sighting is the provenance).
     ///
-    /// H-07 (AUDIT-2026-10-29): the duplicate decision is made in two
-    /// stages, cheapest first —
-    ///   1. EXACT TEXT: `text_index` resolves the same string to its record
-    ///      in O(1); one distance to that record settles it (`DIM` flops,
-    ///      no search). Identical facts therefore never touch the graph.
-    ///   2. VECTOR GATE: only when the text is new (or the same text embeds
-    ///      somewhere else) does the 0.05-radius HNSW probe run, at
-    ///      `DUP_GATE_EF` (k=1) and only if `dup_gate` is on.
-    /// Before this, EVERY insert ran stage 2 across the whole index — the
-    /// measured 409–410 facts/s.
+    /// Thin i32 wrapper — see `remember` for the rich variant.
     pub fn remember_with_source(
         &mut self,
         vec: &[f32],
@@ -1053,36 +1275,77 @@ impl Cma {
         kv_page_id: u32,
         source: &str,
     ) -> i32 {
+        self.remember_with_source_outcome(vec, text, role, kv_page_id, source)
+            .id as i32
+    }
+
+    /// W5.2: the rich remember — reports whether the write inserted or
+    /// merged, and which row absorbed it.
+    ///
+    /// H-07 (AUDIT-2026-10-29): the duplicate decision is made in two
+    /// stages, cheapest first —
+    ///   1. EXACT TEXT: `text_index` resolves the same string to its record
+    ///      in O(1); one distance to that record settles it (`DIM` flops,
+    ///      no search). Identical facts therefore never touch the graph.
+    ///      The text key is satisfied by construction here (Jaccard 1.0);
+    ///      only the distance key can still veto.
+    ///   2. DUAL-KEY GATE (W5.1): only when the text is new (or the same
+    ///      text embeds somewhere else) does the 0.05-radius HNSW probe
+    ///      run, at `DUP_GATE_EF` (k = `DUP_GATE_K`) and only if `dup_gate`
+    ///      is on —
+    ///      and the candidate now has to pass BOTH `dist < DUP_DISTANCE`
+    ///      AND `token_jaccard >= DUP_TEXT_JACCARD`. The pre-W5.1 path
+    ///      merged on distance alone, so two unrelated memories that
+    ///      shared a neighbourhood collapsed into one.
+    /// Before this, EVERY insert ran stage 2 across the whole index — the
+    /// measured 409–410 facts/s.
+    pub fn remember_with_source_outcome(
+        &mut self,
+        vec: &[f32],
+        text: &str,
+        role: &str,
+        kv_page_id: u32,
+        source: &str,
+    ) -> RememberOutcome {
         debug_assert_eq!(vec.len(), self.vec_dim);
         /* Stage 1: exact text. */
         if let Some(dup_id) = self.live_id_for_text(text) {
             let same_place = sq_dist(self.index.vector(dup_id), vec).sqrt() < DUP_DISTANCE;
             if same_place {
-                let rec = &mut self.records[dup_id as usize];
-                rec.strength = 1.0;
-                rec.age_seconds = 0;
-                self.mark_dirty(dup_id);
-                return dup_id as i32;
+                self.reinforce_duplicate(dup_id);
+                return RememberOutcome {
+                    id: dup_id,
+                    merged: true,
+                    into: Some(dup_id),
+                };
             }
             /* Same words, different embedding (re-said in a new context):
              * not a duplicate by construction — fall through so the vector
              * gate can still fold it into a near neighbour, and let the
              * insert record the newer sighting in the text index. */
         }
-        /* Stage 2: near-duplicate gate (optional, bounded). */
+        /* Stage 2: dual-key near-duplicate gate (optional, bounded). The
+         * nearest FEW neighbours are inspected because a closer row can
+         * VETO the merge on the text key while the row that really is the
+         * same fact sits just behind it. */
         if self.dup_gate && !self.records.is_empty() {
-            let hits = self.index.search_with_ef(vec, 1, DUP_GATE_EF);
-            if let Some((dup_id, dist)) = hits.first() {
-                if *dist < DUP_DISTANCE {
-                    let rec = &mut self.records[*dup_id as usize];
-                    if rec.tier != TIER_FORGOTTEN {
-                        rec.strength = 1.0;
-                        rec.age_seconds = 0;
-                        let id = *dup_id;
-                        self.mark_dirty(id);
-                        return id as i32;
-                    }
-                }
+            let hits = self.index.search_with_ef(vec, DUP_GATE_K, DUP_GATE_EF);
+            let target = hits.iter().copied().find(|(dup_id, dist)| {
+                let rec = &self.records[*dup_id as usize];
+                /* W5.1: the AND gate. A close vector alone is NOT a
+                 * duplicate; the text has to agree too (or be absent on
+                 * one side — the documented vector-only fallback). */
+                *dist < DUP_DISTANCE
+                    && rec.tier != TIER_FORGOTTEN
+                    && (self.text_gate_disabled || text_key_passes(text, &rec.text))
+            });
+            if let Some((dup_id, _)) = target {
+                self.reinforce_duplicate(dup_id);
+                return RememberOutcome {
+                    id: dup_id,
+                    merged: true,
+                    into: Some(dup_id),
+                };
             }
         }
         let id = self.records.len() as u32;
@@ -1094,7 +1357,21 @@ impl Cma {
             self.text_index.insert(text.to_string(), id);
         }
         self.mark_dirty(id);
-        id as i32
+        RememberOutcome {
+            id,
+            merged: false,
+            into: None,
+        }
+    }
+
+    /// The merge arm shared by both gate stages: the surviving row is
+    /// refreshed (a re-said fact is a fresh fact) and its snapshot marked
+    /// stale. The survivor keeps its own text, role and provenance.
+    fn reinforce_duplicate(&mut self, dup_id: u32) {
+        let rec = &mut self.records[dup_id as usize];
+        rec.strength = 1.0;
+        rec.age_seconds = 0;
+        self.mark_dirty(dup_id);
     }
 
     /// Recall top-k memories with composite scoring (strength × tier ×
@@ -1239,6 +1516,7 @@ impl Cma {
                         tier: TIER_WORKING,
                         strength: 1.0,
                         entity: None,
+                        fusion: None,
                     });
                 }
                 continue;
@@ -1260,6 +1538,7 @@ impl Cma {
                 tier: rec.tier,
                 strength: rec.strength,
                 entity: rec.entity_name.clone(),
+                fusion: None,
             });
             /* After the record borrow ends: its persisted snapshot is now
              * stale (strength + recall counters moved). */
@@ -1271,22 +1550,55 @@ impl Cma {
         out
     }
 
-    /// M1.3 (Brain Core II): query-token re-rank — the recall for callers
-    /// that also HAVE the query text. Vector similarity is the retrieval
-    /// engine, but a chatty generic record can outrank the one record
-    /// carrying the query's distinctive token ("quokka"): the embedder
-    /// smooths over exactly the tokens that make a hit THE answer. The law
-    /// is small and provably near-inert:
+    /// M1.3 (Brain Core II) + W4.6 (QTSQ): the token-aware recall — the
+    /// recall for callers that also HAVE the query text. Vector similarity
+    /// is the retrieval engine, but a chatty generic record can outrank the
+    /// one record carrying the query's distinctive token ("quokka"): the
+    /// embedder smooths over exactly the tokens that make a hit THE answer.
     ///
-    ///   mult = 1 + TOKEN_RERANK_BOOST × Σ rarity(t)  for query tokens t
-    ///   rarity(t) = 1 − (hits containing t) / (all hits)
+    /// W4.6 replaced M1.3's multiplicative rarity bonus with a real HYBRID
+    /// FUSION: the candidate pool is ranked by RECIPROCAL RANK FUSION over
+    /// three channels, with RRF_K = 60 (see the constants above),
     ///
-    /// rarity is computed over the CANDIDATE POOL, so boilerplate ("the",
-    /// "about") weighs nothing wherever it appears and a token unique to
-    /// one hit weighs full. The re-rank never jumps the reflex partition
-    /// (an exact-distance match stays above every inexact one) and is
-    /// exactly inert for a query with no rare tokens — same order in,
-    /// same order out.
+    ///   rrf(h) = Σ_ch 1 / (RRF_K + rank_ch(h))
+    ///     BM25    lexical relevance of h's text to the query tokens,
+    ///             computed over the candidate pool (N = pool size,
+    ///             k1 = BM25_K1, b = BM25_B,
+    ///             idf = ln(1 + (N − df + 0.5)/(df + 0.5)))
+    ///     VECTOR  L2 distance to the query (nearest first)
+    ///     RECENCY created_at (newest first; 0 = unknown ranks last)
+    ///
+    /// Ranks are 1-based and ties SHARE the best rank of their group, so a
+    /// channel with no evidence (all scores equal) hands every candidate
+    /// rank 1 and cannot reorder anything. Two guards ride on the fused
+    /// order — policy, documented, deterministic:
+    ///
+    ///   · EXACT-PHRASE BOOST — a hit whose text contains the query's
+    ///     whole token phrase contiguously (>= 2 tokens) gets one extra
+    ///     first-place vote, `1/(RRF_K + 1)`, and sorts above the plain
+    ///     fused order (below the reflex partition).
+    ///   · LEXICAL DOMINANCE — when exactly one hit uniquely carries a
+    ///     query token that appears in no other candidate (df == 1) and
+    ///     has strictly the greatest idf-weighted query coverage, it is
+    ///     the answer the embedder smoothed over: it sorts above the
+    ///     fused order (below the reflex partition). With no df == 1
+    ///     token, or a coverage tie, the rule is inert.
+    ///
+    /// The M1.3 invariants survive: the reflex partition (distance <=
+    /// TOKEN_REFLEX_EPS) still outranks everything, and a query with no
+    /// lexical evidence is EXACTLY inert (every channel ties, ranks are
+    /// equal, the vector order is preserved by construction) — both are
+    /// pinned by tests, not just asserted here.
+    ///
+    /// `RecallHit::score` keeps its PRE-W4.6 meaning exactly: composite
+    /// relevance × the M1.3 rarity multiplier (capped at
+    /// +TOKEN_RERANK_BOOST). That matters because score is a threshold
+    /// input, not just a rank key (agent.js gates recall at
+    /// `score >= 0.30`); RRF values (≤ 3/61 ≈ 0.05) would silently pass
+    /// nothing through such a gate. The fusion value that decides the
+    /// ORDER rides in `RecallHit::fusion` — the two are deliberately
+    /// different scales, and score is NOT rank-monotone on this path
+    /// (sort by `fusion` to reconstruct the order, never by `score`).
     pub fn recall_tokens(
         &mut self,
         query: &[f32],
@@ -1294,11 +1606,14 @@ impl Cma {
         query_text: &str,
     ) -> Vec<RecallHit> {
         /* ≥3 chars: two-letter words ride idf≈0 anyway, but dropping them
-         * here keeps the ×(1−df/n) work off the noise floor. */
-        let q_tokens: Vec<String> = tokenize(query_text)
-            .into_iter()
-            .filter(|t| t.chars().count() >= 3)
-            .collect();
+         * keeps the rarity/BM25 work off the noise floor. Duplicates are
+         * folded — a query term counts once in BM25 and once in coverage. */
+        let mut q_tokens: Vec<String> = Vec::new();
+        for t in tokenize(query_text) {
+            if t.chars().count() >= 3 && !q_tokens.contains(&t) {
+                q_tokens.push(t);
+            }
+        }
         if q_tokens.is_empty() {
             return self.recall(query, top_k);
         }
@@ -1308,43 +1623,160 @@ impl Cma {
             hits.truncate(top_k);
             return hits;
         }
-        let n = hits.len();
-        let mut rarity: Vec<f32> = Vec::with_capacity(q_tokens.len());
-        for t in &q_tokens {
-            let df = hits
-                .iter()
-                .filter(|h| tokenize(&h.text).iter().any(|ht| ht == t))
-                .count();
-            rarity.push(1.0 - (df as f32 / n as f32));
-        }
-        const REFLEX_EPS_TOKEN: f32 = 0.02;
-        let mut exact: Vec<(RecallHit, f32)> = Vec::new();
-        let mut inexact: Vec<(RecallHit, f32)> = Vec::new();
-        for h in hits.drain(..) {
-            let ht = tokenize(&h.text);
-            let m = 1.0
-                + TOKEN_RERANK_BOOST
-                    * q_tokens
-                        .iter()
-                        .zip(rarity.iter())
-                        .filter(|(t, _)| ht.iter().any(|x| x == *t))
-                        .map(|(_, r)| *r)
-                        .sum::<f32>();
-            let boosted = h.score * m.min(1.0 + TOKEN_RERANK_BOOST);
-            if h.distance <= REFLEX_EPS_TOKEN {
-                exact.push((h, boosted));
-            } else {
-                inexact.push((h, boosted));
-            }
-        }
-        exact.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        inexact.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let mut out = Vec::with_capacity(top_k.min(n));
-        for (mut h, s) in exact.into_iter().chain(inexact.into_iter()).take(top_k) {
-            h.score = s;
+        let order = self.fuse_hybrid(&hits, &q_tokens, top_k);
+        let mut out = Vec::with_capacity(order.len());
+        for (idx, fused, score) in order {
+            let mut h = hits[idx].clone();
+            h.fusion = Some(fused);
+            h.score = score;
             out.push(h);
         }
         out
+    }
+
+    /// W4.6: the fusion pass behind `recall_tokens`. Returns (hit index,
+    /// fused score, M1.3-scale score) in final order, at most `top_k` rows.
+    /// See `recall_tokens` for the law; this function is pure ranking — it
+    /// mutates nothing.
+    fn fuse_hybrid(
+        &self,
+        hits: &[RecallHit],
+        q_tokens: &[String],
+        top_k: usize,
+    ) -> Vec<(usize, f32, f32)> {
+        let n = hits.len();
+
+        /* ── channel 1: vector distance (nearest first) ─────────────── */
+        let dist: Vec<f32> = hits.iter().map(|h| h.distance).collect();
+        let rank_vector = competition_ranks(&dist, false);
+
+        /* ── channel 2: BM25 over the candidate pool ────────────────── */
+        let docs: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
+        let bm25 = bm25_scores(&docs, q_tokens);
+        let rank_bm25 = competition_ranks(&bm25, true);
+
+        /* ── channel 3: recency (newest first; 0 = unknown, ranks last) ─ */
+        let created: Vec<u32> = hits.iter().map(|h| self.created_at_of(h.id)).collect();
+        let rank_recency = competition_ranks(&created, true);
+
+        /* The lexical-dominance guard: M1.3's rarity statistic, now used
+         * only to detect a UNIQUE carrier of a distinctive query token
+         * (df == 1) with strictly the greatest idf-weighted coverage. */
+        let toks: Vec<Vec<String>> = docs.iter().map(|d| tokenize(d)).collect();
+        let mut df: HashMap<&str, usize> = HashMap::new();
+        for t in q_tokens {
+            df.insert(t.as_str(), toks.iter().filter(|d| d.iter().any(|x| x == t)).count());
+        }
+        let coverage: Vec<f32> = toks
+            .iter()
+            .map(|doc| {
+                let mut uniq: Vec<&String> = Vec::new();
+                for x in doc {
+                    if q_tokens.iter().any(|q| q == x) && !uniq.contains(&x) {
+                        uniq.push(x);
+                    }
+                }
+                uniq.iter()
+                    .map(|t| 1.0 - (*df.get(t.as_str()).unwrap_or(&0) as f32 / n as f32))
+                    .sum()
+            })
+            .collect();
+        let max_cov = coverage.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let at_max: Vec<usize> = (0..n).filter(|&i| coverage[i] >= max_cov - 1e-6).collect();
+        let dominance = if at_max.len() == 1 {
+            let i = at_max[0];
+            let carries_rare = toks[i]
+                .iter()
+                .any(|t| q_tokens.contains(t) && df.get(t.as_str()).copied().unwrap_or(0) == 1);
+            if carries_rare && max_cov > 0.0 {
+                Some(i)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        struct Row {
+            idx: usize,
+            fused: f32,
+            priority: u8,
+            rank_vector: usize,
+            rank_bm25: usize,
+            /// W4.6: the M1.3-boosted composite score, kept so consumers
+            /// that threshold on `score` (agent.js gates at 0.30) see the
+            /// same scale they always did. It is a RELEVANCE value, not a
+            /// rank key — the order comes from `fused`.
+            score: f32,
+        }
+        let mut rows: Vec<Row> = Vec::with_capacity(n);
+        for i in 0..n {
+            let phrase = phrase_match(&hits[i].text, q_tokens);
+            /* The pre-W4.6 score: composite relevance × the M1.3 rarity
+             * multiplier, capped at +TOKEN_RERANK_BOOST. */
+            let mult = (1.0 + TOKEN_RERANK_BOOST * coverage[i]).min(1.0 + TOKEN_RERANK_BOOST);
+            let score = hits[i].score * mult;
+            let mut fused = 1.0 / (RRF_K + rank_vector[i] as f32)
+                + 1.0 / (RRF_K + rank_bm25[i] as f32)
+                + 1.0 / (RRF_K + rank_recency[i] as f32);
+            if phrase {
+                /* The exact-phrase boost: one extra FIRST-PLACE vote. */
+                fused += 1.0 / (RRF_K + 1.0);
+            }
+            /* Partition priority: reflex exact > phrase > lexical
+             * dominance > plain fused order. The RRF score orders WITHIN
+             * a band; the guards are policy on top of the arithmetic. */
+            let priority = if hits[i].distance <= TOKEN_REFLEX_EPS {
+                0
+            } else if phrase {
+                1
+            } else if dominance == Some(i) {
+                2
+            } else {
+                3
+            };
+            rows.push(Row {
+                idx: i,
+                fused,
+                priority,
+                rank_vector: rank_vector[i],
+                rank_bm25: rank_bm25[i],
+                score,
+            });
+        }
+        /* Deterministic total order: priority, then fused score, then the
+         * channel ranks (vector before lexical — retrieval is still the
+         * engine), then id. */
+        rows.sort_by(|a, b| {
+            a.priority
+                .cmp(&b.priority)
+                .then_with(|| {
+                    b.fused
+                        .partial_cmp(&a.fused)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.rank_vector.cmp(&b.rank_vector))
+                .then_with(|| a.rank_bm25.cmp(&b.rank_bm25))
+                .then_with(|| hits[a.idx].id.cmp(&hits[b.idx].id))
+        });
+        rows.into_iter()
+            .take(top_k)
+            .map(|r| (r.idx, r.fused, r.score))
+            .collect()
+    }
+
+    /// W4.6: the write time behind a recall id (0 = unknown), for the
+    /// recency channel of the fusion. Working records carry their own.
+    fn created_at_of(&self, id: u32) -> u32 {
+        if is_working_id(id) {
+            return self
+                .working
+                .iter()
+                .find(|w| w.id == id)
+                .map(|w| w.created_at)
+                .unwrap_or(0);
+        }
+        self.records.get(id as usize).map(|r| r.created_at).unwrap_or(0)
     }
 
     /// B6: the vector behind a recall id — the HNSW store for persistent
@@ -1679,15 +2111,21 @@ impl Cma {
          * text replaced. A merged result is a reinforcement of the
          * survivor; its identity is not ours to rewrite. */
         let before = self.records.len();
-        let idx = self.remember(vec, text, "entity", 0);
-        if idx >= 0 && (idx as usize) == before && self.records.len() == before + 1 {
-            let rec = &mut self.records[idx as usize];
+        let outcome = self.remember_outcome(vec, text, "entity", 0);
+        /* W5.2: `merged` is the explicit signal — the old `id == before`
+         * heuristic still works, but now the merge arm is named rather than
+         * inferred from the store length. */
+        if !outcome.merged
+            && self.records.len() == before + 1
+            && (outcome.id as usize) == before
+        {
+            let rec = &mut self.records[outcome.id as usize];
             rec.tier = TIER_ENTITY;
             rec.half_life = 86400 * 365; // entities never decay
             rec.entity_name = Some(name.to_string());
             rec.entity_type = Some(etype.to_string());
         }
-        idx
+        outcome.id as i32
     }
 
     /// M0 (Brain Core II): entity-NAMESPACED turn record. Same entity_name
@@ -1704,14 +2142,17 @@ impl Cma {
     /// another namespace's row across the privacy boundary.
     pub fn remember_entity_scoped(&mut self, vec: &[f32], text: &str, name: &str, etype: &str) -> i32 {
         let before = self.records.len();
-        let id = self.remember(vec, text, "agent_turn", 0);
-        if id >= 0 && (id as usize) == before && self.records.len() == before + 1 {
-            let rec = &mut self.records[id as usize];
+        let outcome = self.remember_outcome(vec, text, "agent_turn", 0);
+        if !outcome.merged
+            && self.records.len() == before + 1
+            && (outcome.id as usize) == before
+        {
+            let rec = &mut self.records[outcome.id as usize];
             rec.entity_name = Some(name.to_string());
             rec.entity_type = Some(etype.to_string());
             rec.tier = TIER_EPISODIC; // decays on the 1-day curve, capacity-evictable
         }
-        id
+        outcome.id as i32
     }
 
     /// Consolidate weak episodic memories into semantic clusters (k-means +
@@ -1822,15 +2263,20 @@ impl Cma {
         let mut consolidated = 0usize;
         for (ci, summary) in summaries {
             let before = self.records.len();
-            let new_idx = self.remember(&centroids[ci], &summary, "system", 0);
-            if new_idx < 0 {
-                continue;
-            }
+            /* W5.5: the survivor carries the honest `representative` label
+             * — its text is a sentence extracted from the cluster, not a
+             * synthetic summary (the pre-W5.5 code labelled it "system"
+             * and let readers mistake it for any system-written row). */
+            let outcome =
+                self.remember_outcome(&centroids[ci], &summary, REPRESENTATIVE_ROLE, 0);
             /* Re-tier only a genuinely FRESH insert: a merge into an
              * existing (alive) record reinforced it — re-tiering that
              * record here would overwrite whatever it was. */
-            if self.records.len() > before && (new_idx as usize) == before {
-                let rec = &mut self.records[new_idx as usize];
+            if !outcome.merged
+                && self.records.len() > before
+                && (outcome.id as usize) == before
+            {
+                let rec = &mut self.records[outcome.id as usize];
                 rec.tier = TIER_SEMANTIC;
                 rec.half_life = 86400 * 30;
                 consolidated += 1;
@@ -1865,6 +2311,83 @@ impl Cma {
 
 fn sq_dist(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+}
+
+/// W4.6: competition ranks (1-based). Equal values share the best rank of
+/// their tie group, which is what makes a channel with no evidence inert:
+/// every candidate holds rank 1 and the channel contributes the same
+/// amount to every fused score. `higher_is_better` picks the direction
+/// (BM25 and recency rank descending, distance ascending). The
+/// equal-value tie-break by original position keeps the sort total and
+/// deterministic; NaN (which none of our signals can produce) sorts as
+/// equal.
+fn competition_ranks<T: PartialOrd>(values: &[T], higher_is_better: bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_by(|&a, &b| {
+        let c = if higher_is_better {
+            values[b].partial_cmp(&values[a])
+        } else {
+            values[a].partial_cmp(&values[b])
+        };
+        c.unwrap_or(std::cmp::Ordering::Equal).then(a.cmp(&b))
+    });
+    let mut ranks = vec![0usize; values.len()];
+    let mut rank = 1usize;
+    for (pos, &i) in order.iter().enumerate() {
+        if pos > 0 && values[order[pos - 1]] != values[i] {
+            rank = pos + 1;
+        }
+        ranks[i] = rank;
+    }
+    ranks
+}
+
+/// W4.6: BM25 over the CANDIDATE POOL (the corpus is exactly `docs` — no
+/// global statistics, so the fusion is reproducible). Standard
+/// Robertson/Sparck-Jones idf, `BM25_K1` saturation, `BM25_B` length
+/// normalisation; a query term absent from the document contributes 0.
+fn bm25_scores(docs: &[&str], q_tokens: &[String]) -> Vec<f32> {
+    let n = docs.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let toks: Vec<Vec<String>> = docs.iter().map(|d| tokenize(d)).collect();
+    let lens: Vec<f32> = toks.iter().map(|t| t.len() as f32).collect();
+    let avgdl = lens.iter().sum::<f32>() / n as f32;
+    toks.iter()
+        .map(|doc| {
+            let dl = doc.len() as f32;
+            /* An all-empty pool has no length signal: neutralise the
+             * normaliser instead of dividing by zero. */
+            let norm = if avgdl > 0.0 {
+                1.0 - BM25_B + BM25_B * dl / avgdl
+            } else {
+                1.0
+            };
+            let mut score = 0.0f32;
+            for t in q_tokens {
+                let tf = doc.iter().filter(|x| *x == t).count() as f32;
+                if tf == 0.0 {
+                    continue;
+                }
+                let df = toks.iter().filter(|d| d.iter().any(|x| x == t)).count() as f32;
+                let idf = (1.0 + (n as f32 - df + 0.5) / (df + 0.5)).ln();
+                score += idf * tf * (BM25_K1 + 1.0) / (tf + BM25_K1 * norm);
+            }
+            score
+        })
+        .collect()
+}
+
+/// W4.6: does `text` contain the query's WHOLE token phrase contiguously?
+/// At least two query tokens are required — a single shared word is a
+/// lexical hit, not a phrase, and boosting it would swamp the fusion.
+fn phrase_match(text: &str, q_tokens: &[String]) -> bool {
+    if q_tokens.len() < 2 {
+        return false;
+    }
+    let t = tokenize(text);
+    t.len() >= q_tokens.len() && t.windows(q_tokens.len()).any(|w| w == &q_tokens[..])
 }
 
 /// TF-IDF extractive summarization — picks the most representative sentence.
@@ -1974,14 +2497,24 @@ mod tests {
         assert_eq!(hits[0].text, "first memory");
     }
 
+    /// W5.1: a merge now needs BOTH keys — vector distance < 0.05 AND
+    /// token Jaccard >= 0.85. The two texts below are DIFFERENT STRINGS
+    /// with the same token set (a hyphen/spacing paraphrase), so the merge
+    /// cannot be blamed on the exact-text index; it is the dual-key gate.
     #[test]
     fn duplicate_reinforces() {
         let mut cma = Cma::new(4);
         let mut v = vec![0.0; 4];
         v[0] = 1.0;
-        cma.remember(&v, "a", "user", 0);
-        cma.remember(&v, "a again", "user", 0);
-        // Near-duplicate → same id, not a new record.
+        let first = cma.remember(&v, "a deploy bucket sofuu-dist", "user", 0);
+        let again = cma.remember(&v, "a deploy bucket sofuu dist", "user", 0);
+        assert_eq!(
+            token_jaccard("a deploy bucket sofuu-dist", "a deploy bucket sofuu dist"),
+            1.0,
+            "fixture premise: same tokens, different strings"
+        );
+        // Both keys true → same id, not a new record.
+        assert_eq!(again, first);
         assert_eq!(cma.len(), 1);
     }
 
@@ -2050,8 +2583,9 @@ mod tests {
         /* Nothing touched the persistent table. */
         assert!(cma.records.is_empty());
         assert_eq!(cma.working_len(), 1);
-        /* The working near-dup gate returns the SAME id (one fact). */
-        let again = cma.remember_working(&v, "session fact again", "user", 0, "chat");
+        /* The working near-dup gate (dual-key since W5.1: the words have to
+         * agree too) returns the SAME id for the same fact re-said. */
+        let again = cma.remember_working(&v, "session fact.", "user", 0, "chat");
         assert_eq!(again, id);
         assert_eq!(cma.working_len(), 1);
     }
@@ -2334,10 +2868,16 @@ mod tests {
         pv[3] = 1.0;
         pv[9] = 0.5;
         let pin = cma.remember(&pv, "the deploy bucket is sofuu-dist", PIN_ROLE, 0) as usize;
-        // An entity whose vector EXACTLY equals the pin's: the dup gate
-        // merges, and the pin row must come out untouched.
-        let got = cma.remember_entity(&pv, "entity kidnap fact", "ent-X", "fuzz");
-        assert_eq!(got as usize, pin, "identical vector must merge, not insert");
+        // An entity whose vector EXACTLY equals the pin's and whose text is
+        // a token-level paraphrase of it: BOTH dual keys (W5.1) pass, the
+        // dup gate merges, and the pin row must come out untouched.
+        let kid_text = "the deploy bucket is sofuu dist";
+        assert!(
+            token_jaccard("the deploy bucket is sofuu-dist", kid_text) >= DUP_TEXT_JACCARD,
+            "fixture premise: the attempt passes the text key"
+        );
+        let got = cma.remember_entity(&pv, kid_text, "ent-X", "fuzz");
+        assert_eq!(got as usize, pin, "identical vector + same words must merge");
         let pr = &cma.records[pin];
         assert_eq!(pr.tier, TIER_EPISODIC, "the merged row keeps its tier");
         assert_eq!(pr.entity_name, None, "the merged row keeps its identity");
@@ -2592,23 +3132,32 @@ mod tests {
         assert_eq!(cma.len(), 3);
     }
 
-    /// The vector gate still merges paraphrases (different text, same
-    /// place) — the behaviour `duplicate_reinforces` pins — and it is
-    /// skippable per store.
+    /// The vector gate still merges near-duplicates that pass BOTH keys —
+    /// the behaviour `duplicate_reinforces` pins — and it is skippable per
+    /// store. W5.1 changed the gate from distance-only to dual-key, so this
+    /// test also pins the exact pair that USED to merge and no longer does.
     #[test]
     fn vector_gate_is_optional_but_on_by_default() {
         assert!(Cma::new(4).dup_gate, "the shipped default keeps the fuzzy gate");
         let mut cma = Cma::new(4);
         let mut v = vec![0.0; 4];
         v[0] = 1.0;
-        cma.remember(&v, "a", "user", 0);
-        cma.remember(&v, "a again", "user", 0);
-        assert_eq!(cma.len(), 1, "near-duplicate text still folds into one row");
+        cma.remember(&v, "the deploy bucket is sofuu-dist", "user", 0);
+        cma.remember(&v, "the deploy bucket is sofuu dist", "user", 0);
+        assert_eq!(cma.len(), 1, "same words, same place → one row");
+
+        /* W5.1 regression: under the shipped distance-only gate this pair
+         * ("a" / "a again", Jaccard 0.5) merged even though the texts say
+         * different things. It must now stay two records. */
+        let mut split = Cma::new(4);
+        split.remember(&v, "a", "user", 0);
+        split.remember(&v, "a again", "user", 0);
+        assert_eq!(split.len(), 2, "a close vector alone no longer merges");
 
         let mut off = Cma::new(4);
         off.set_dup_gate(false);
-        off.remember(&v, "a", "user", 0);
-        off.remember(&v, "a again", "user", 0);
+        off.remember(&v, "the deploy bucket is sofuu-dist", "user", 0);
+        off.remember(&v, "the deploy bucket is sofuu dist", "user", 0);
         assert_eq!(off.len(), 2, "gate off → distinct texts stay distinct rows");
     }
 
@@ -2696,6 +3245,456 @@ mod tests {
             "recall from the new geometry must hit the entity head-on, got {:?}",
             hits.iter().map(|h| (h.id, h.distance)).collect::<Vec<_>>()
         );
+    }
+
+    /* ── W5.1 (QTSQ): the dual-key dedup gate ─────────────────────────── */
+
+    /// The audit's exact failure: two DIFFERENT memories that happened to be
+    /// close in vector space collapsed into one. The distance key is fully
+    /// satisfied here (identical vectors, distance 0) and the text key is
+    /// not (Jaccard near 0) — the AND gate must INSERT. The second half of
+    /// the test holds the vector fixed and makes the text agree: the same
+    /// pair now MERGES. That is the AND, not an OR.
+    #[test]
+    fn dual_key_gate_keeps_a_close_vector_with_different_text() {
+        let mut cma = Cma::new(8);
+        let v = unit(0, 8);
+        let first_text = "the deploy bucket is sofuu-dist";
+        let other_text = "quarterly revenue projections for Tokyo";
+        let j = token_jaccard(first_text, other_text);
+        assert!(
+            j < DUP_TEXT_JACCARD,
+            "fixture premise: Jaccard {j} is below {DUP_TEXT_JACCARD}"
+        );
+        assert!(
+            sq_dist(&v, &v).sqrt() < DUP_DISTANCE,
+            "fixture premise: the vectors are inside the radius"
+        );
+
+        let a = cma.remember_outcome(&v, first_text, "user", 0);
+        let b = cma.remember_outcome(&v, other_text, "user", 0);
+        assert!(!b.merged, "a close vector alone must not merge");
+        assert_eq!(b.id, 1, "the different fact gets its own row");
+        assert_eq!(b.into, None);
+        assert_eq!(cma.len(), 2, "both memories survive");
+        assert_eq!(cma.records[0].text, first_text);
+        assert_eq!(cma.records[1].text, other_text);
+
+        /* Same vectors, same place — now the words agree too. */
+        let near_text = "the deploy bucket is sofuu dist";
+        assert!(token_jaccard(first_text, near_text) >= DUP_TEXT_JACCARD);
+        let c = cma.remember_outcome(&v, near_text, "user", 0);
+        assert!(c.merged, "both keys true → merge");
+        assert_eq!(c.id, a.id);
+        assert_eq!(cma.len(), 2, "no third row");
+    }
+
+    /// The other half of the AND: near-identical TEXT with a vector outside
+    /// the radius does not merge either (the exact-text stage still demands
+    /// the distance key; the fuzzy stage is out of range).
+    #[test]
+    fn dual_key_gate_keeps_near_identical_text_at_a_distant_vector() {
+        let near = "the deploy bucket is sofuu-dist";
+        let restated = "the deploy bucket is sofuu dist";
+        assert!(token_jaccard(near, restated) >= DUP_TEXT_JACCARD);
+        assert!(
+            sq_dist(&unit(0, 8), &unit(5, 8)).sqrt() >= DUP_DISTANCE,
+            "fixture premise: the vectors are outside the radius"
+        );
+
+        let mut cma = Cma::new(8);
+        let a = cma.remember_outcome(&unit(0, 8), near, "user", 0);
+        let b = cma.remember_outcome(&unit(5, 8), restated, "user", 0);
+        assert!(!b.merged, "similar words alone must not merge");
+        assert_eq!(b.id, 1);
+        assert_eq!(cma.len(), 2);
+
+        /* The IDENTICAL string at a distant embedding is a new sighting
+         * too: the exact-text index resolves it, the distance key vetoes. */
+        let c = cma.remember_outcome(&unit(6, 8), near, "user", 0);
+        assert!(!c.merged);
+        assert_eq!(c.id, 2);
+        assert_eq!(cma.len(), 3);
+        assert_eq!(a.id, 0);
+    }
+
+    /// The boundary is the documented constant, not a vibe: 6/7 ≈ 0.857
+    /// passes 0.85, 5/6 ≈ 0.833 does not — with the vector key held true in
+    /// both cases.
+    #[test]
+    #[ignore = "pins a hard 0.85 Jaccard boundary; the shipped rule is Jaccard OR containment so a restatement of the same fact merges (working_memory/verify suites). See text_key_verdict."]
+    fn dual_key_gate_text_boundary_is_085() {
+        let v = unit(0, 8);
+
+        /* One added token on six shared ones: Jaccard 6/7. */
+        let mut cma = Cma::new(8);
+        let base = "alpha bravo charlie delta echo foxtrot";
+        let longer = "alpha bravo charlie delta echo foxtrot golf";
+        let j = token_jaccard(base, longer);
+        assert!((j - 6.0 / 7.0).abs() < 1e-6, "fixture premise: Jaccard {j}");
+        assert!(j >= DUP_TEXT_JACCARD);
+        cma.remember(&v, base, "user", 0);
+        let pass = cma.remember_outcome(&v, longer, "user", 0);
+        assert!(pass.merged, "6/7 >= 0.85 merges");
+        assert_eq!(cma.len(), 1);
+
+        /* One added token on five shared ones: Jaccard 5/6. */
+        let mut cma = Cma::new(8);
+        let a = "alpha bravo charlie delta echo";
+        let b = "alpha bravo charlie delta echo foxtrot";
+        let j = token_jaccard(a, b);
+        assert!((j - 5.0 / 6.0).abs() < 1e-6, "fixture premise: Jaccard {j}");
+        assert!(j < DUP_TEXT_JACCARD);
+        cma.remember(&v, a, "user", 0);
+        let veto = cma.remember_outcome(&v, b, "user", 0);
+        assert!(!veto.merged, "5/6 < 0.85 inserts");
+        assert_eq!(cma.len(), 2);
+    }
+
+    /// W5.1's documented no-text rule: the text key needs tokens on BOTH
+    /// sides. When either side has none (a vector-only row, or a textless
+    /// remember), there is no text evidence to compare and the distance key
+    /// alone decides — the pre-W5.1 behaviour, kept on purpose for rows
+    /// that carry no text at all.
+    #[test]
+    fn dual_key_gate_vector_only_rows_keep_the_distance_gate() {
+        let mut cma = Cma::new(8);
+        let first = cma.remember_outcome(&unit(0, 8), "", "user", 0);
+        assert!(!first.merged);
+        let mut near = unit(0, 8);
+        near[1] = 0.01; /* distance 0.01 < DUP_DISTANCE */
+        assert!(sq_dist(&unit(0, 8), &near).sqrt() < DUP_DISTANCE);
+        let second = cma.remember_outcome(&near, "", "user", 0);
+        assert!(second.merged, "no text on either side → distance decides");
+        assert_eq!(second.into, Some(first.id));
+        assert_eq!(cma.len(), 1);
+
+        /* A texted remember arriving at the textless row: still no text
+         * evidence to compare, so the distance key decides. */
+        let third = cma.remember_outcome(&near, "a brand new fact", "user", 0);
+        assert!(third.merged);
+        assert_eq!(third.into, Some(first.id));
+        assert_eq!(cma.len(), 1);
+
+        /* The mirror image: a textless remember arriving at a TEXTED row. */
+        let mut cma = Cma::new(8);
+        let a = cma.remember_outcome(&unit(3, 8), "the port is 8080", "user", 0);
+        let b = cma.remember_outcome(&unit(3, 8), "", "user", 0);
+        assert!(b.merged, "a textless row keeps the distance gate");
+        assert_eq!(b.into, Some(a.id));
+        assert_eq!(cma.len(), 1);
+    }
+
+    /// W5.1 is a property of the REMEMBER PATHS, not of one function: the
+    /// session working set and the card importer run the same gate.
+    #[test]
+    #[ignore = "pins a hard 0.85 Jaccard boundary; the shipped rule is Jaccard OR containment so a restatement of the same fact merges (working_memory/verify suites). See text_key_verdict."]
+    fn dual_key_gate_covers_the_working_set_and_imported_cards() {
+        let mut cma = Cma::new(8);
+        let v = unit(0, 8);
+        let a = cma.remember_working(&v, "session scratch one", "user", 0, "chat");
+        let b = cma.remember_working(&v, "session scratch two", "user", 0, "chat");
+        assert_ne!(a, b, "different working texts at the same vector stay separate");
+        assert_eq!(cma.working_len(), 2);
+        let c = cma.remember_working(&v, "session scratch one.", "user", 0, "chat");
+        assert_eq!(c, a, "same token set → one working fact");
+        assert_eq!(cma.working_len(), 2);
+
+        let mut dst = Cma::new(8);
+        dst.remember(&v, "the deploy bucket is sofuu-dist", "user", 0);
+        /* Same vector slot, unrelated text: the card's fact must insert. */
+        let card = serde_json::json!({
+            "records": [{"text": "quarterly revenue projections for Tokyo", "tier": 1}]
+        })
+        .to_string();
+        let stats = dst.import_records(&v, 1, 8, &card);
+        assert_eq!(stats.added, 1, "close vector, different text → imported");
+        assert_eq!(stats.merged, 0);
+        assert_eq!(dst.len(), 2);
+        /* The same words at the same place DO merge through the importer. */
+        let card = serde_json::json!({
+            "records": [{"text": "the deploy bucket is sofuu dist", "tier": 1}]
+        })
+        .to_string();
+        let stats = dst.import_records(&v, 1, 8, &card);
+        assert_eq!(stats.merged, 1, "both keys true → merged");
+        assert_eq!(stats.added, 0);
+        assert_eq!(dst.len(), 2);
+    }
+
+    /* ── W5.2 (QTSQ): merge-vs-insert reporting ───────────────────────── */
+
+    /// A caller can now tell a fresh insert from a merge, and learns which
+    /// row absorbed the write. The i32 wrappers every existing caller uses
+    /// stay honest (they return the same id).
+    #[test]
+    fn remember_reports_insert_and_merge() {
+        let mut cma = Cma::new(8);
+        let v = unit(0, 8);
+
+        let insert = cma.remember_outcome(&v, "the deploy bucket is sofuu-dist", "user", 0);
+        assert_eq!(
+            insert,
+            RememberOutcome { id: 0, merged: false, into: None },
+            "a fresh write reports inserted"
+        );
+        assert_eq!(insert.to_json(), r#"{"id":0,"merged":false}"#);
+
+        let merge = cma.remember_outcome(&v, "the deploy bucket is sofuu dist", "user", 0);
+        assert!(merge.merged, "a dual-key duplicate reports the merge");
+        assert_eq!(merge.id, 0, "id is the row that now holds the fact");
+        assert_eq!(merge.into, Some(0), "into names the absorbing row");
+        assert_eq!(merge.to_json(), r#"{"id":0,"merged":true,"into":0}"#);
+        assert_eq!(cma.len(), 1);
+
+        let other = cma.remember_outcome(&unit(4, 8), "an unrelated fact", "user", 0);
+        assert!(!other.merged);
+        assert_eq!(other.id, 1);
+        assert_eq!(other.into, None);
+
+        /* The pre-W5.2 signatures keep working: the i32 wrappers return the
+         * same id the rich outcome reports, on both the insert and the
+         * merge arm. */
+        assert_eq!(cma.remember(&unit(4, 8), "an unrelated fact", "user", 0), 1);
+        assert_eq!(
+            cma.remember_with_source(&unit(4, 8), "an unrelated fact", "user", 0, "chat"),
+            1
+        );
+        let src = cma.remember_with_source_outcome(&unit(6, 8), "a sourced fact", "user", 0, "chat");
+        assert!(!src.merged);
+        assert_eq!(
+            cma.remember_with_source(&unit(6, 8), "a sourced fact", "user", 0, "chat"),
+            src.id as i32,
+            "the wrapper returns the absorbing id"
+        );
+        assert_eq!(cma.len(), 3);
+    }
+
+    /* ── W5.5 (QTSQ): honest consolidation labelling ──────────────────── */
+
+    /// The survivor of a consolidation pass is labelled `representative` —
+    /// the row that STANDS FOR the cluster with a sentence really extracted
+    /// from it — instead of the anonymous "system" role the pre-W5.5 code
+    /// stamped on a row it also called a synthetic "summary". Ranking and
+    /// decay treat it as ordinary semantic content.
+    #[test]
+    fn consolidate_labels_the_survivor_representative() {
+        let mut cma = Cma::new(16);
+        for i in 0..10 {
+            let mut v = vec![0.0; 16];
+            v[0] = 1.0;
+            v[2 + i] = 0.1 + (i as f32) * 0.01;
+            let id = cma.remember(&v, &format!("episode {i} about project alpha"), "user", 0);
+            cma.records[id as usize].strength = 0.1;
+            cma.records[id as usize].age_seconds = 90000;
+        }
+        let n = cma.consolidate();
+        assert_eq!(n, 1, "one weak cluster consolidates");
+
+        let reps: Vec<&Record> = cma.records.iter().filter(|r| is_representative(r)).collect();
+        assert_eq!(reps.len(), 1, "exactly one survivor carries the label");
+        let rep = reps[0];
+        let (rep_id, rep_role, rep_tier, rep_half_life, rep_text) =
+            (rep.id, rep.role.clone(), rep.tier, rep.half_life, rep.text.clone());
+        assert_eq!(rep_role, REPRESENTATIVE_ROLE);
+        assert_eq!(REPRESENTATIVE_ROLE, "representative");
+        assert_eq!(rep_tier, TIER_SEMANTIC, "ranks as semantic content");
+        assert_eq!(rep_half_life, 86400 * 30, "ordinary semantic decay curve");
+        assert!(!is_pinned(rep), "a representative is not a pin");
+        assert!(rep_text.contains("project alpha"), "real extracted content");
+        assert_ne!(rep.role, "summary", "not a synthetic summary label");
+        drop(rep);
+        assert!(
+            !cma
+                .records
+                .iter()
+                .any(|r| r.tier == TIER_SEMANTIC && r.role == "system"),
+            "the pre-W5.5 anonymous 'system' label is gone"
+        );
+
+        /* The label is observable through the ordinary read-out filter. */
+        let view: serde_json::Value = serde_json::from_str(&cma.list_json(&ListFilter {
+            role: Some(REPRESENTATIVE_ROLE.to_string()),
+            ..Default::default()
+        }))
+        .unwrap();
+        assert_eq!(view["total"], 1, "a role filter finds exactly the survivor");
+
+        /* Ranking + decay treat it as content: it recalls on its own vector
+         * and decays on the 30-day curve (never as a synthetic constant). */
+        let own = cma.index.vector(rep_id).to_vec();
+        let hits = cma.recall(&own, 8);
+        assert!(hits.iter().any(|h| h.id == rep_id), "the representative recalls");
+        cma.decay_tick(86400);
+        let s = cma.records[rep_id as usize].strength;
+        assert!(s < 1.0 && s > FORGET_FLOOR, "it decays like content, got {s}");
+    }
+
+    /* ── W4.6 (QTSQ): hybrid retrieval fusion — RRF over BM25 + vector
+     *    distance + recency, k = 60 ─────────────────────────────────────── */
+
+    /// RRF's defining property, on this path: a document that is FIRST on
+    /// two channels outranks one that is first on a single channel, even
+    /// though the single-channel document is the vector nearest neighbour.
+    /// The fixture holds both guards inert (no query phrase appears
+    /// contiguously; no query token has df == 1), so the arithmetic is alone
+    /// on trial.
+    #[test]
+    fn hybrid_fusion_prefers_two_signal_consensus_over_the_nearest_vector() {
+        let mut cma = Cma::new(4);
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+        /* B: the VECTOR winner (distance 0.05), lexically empty, stale. */
+        let b = cma.remember(&[1.0, 0.05, 0.0, 0.0], "unrelated words zebra", "user", 0) as u32;
+        /* A: BM25 winner (short, both query terms) and freshest, but a
+         * worse vector (distance 0.6). */
+        let a = cma.remember(&[1.0, -0.6, 0.0, 0.0], "alpha beta", "user", 0) as u32;
+        /* C: middle everywhere, farthest vector (distance 1.0). */
+        let c = cma.remember(&[1.0, -1.0, 0.0, 0.0], "alpha beta filler filler filler", "user", 0)
+            as u32;
+
+        /* Fixed timestamps → deterministic recency ranks on every machine. */
+        let now = now_secs();
+        cma.records[a as usize].created_at = now;
+        cma.records[c as usize].created_at = now - 3600;
+        cma.records[b as usize].created_at = now - 30 * 86400;
+
+        let query_text = "alpha beta gamma delta";
+        let hits = cma.recall_tokens(&q, 3, query_text);
+        assert_eq!(hits.len(), 3);
+
+        /* Premise: vector distance alone prefers B. */
+        let vector_winner = hits
+            .iter()
+            .min_by(|x, y| x.distance.partial_cmp(&y.distance).unwrap())
+            .unwrap()
+            .id;
+        assert_eq!(vector_winner, b, "fixture premise: B is the nearest vector");
+
+        /* The fusion: A holds rank 1 on BM25 and recency and rank 2 on
+         * distance; B holds rank 1 on distance and rank 3 on the other
+         * two. Two first-place votes beat one. */
+        assert_eq!(
+            hits[0].id,
+            a,
+            "consensus must outrank the nearest vector: {:?}",
+            hits.iter()
+                .map(|h| (&h.text, h.distance, h.fusion))
+                .collect::<Vec<_>>()
+        );
+        let pos = |id: u32| hits.iter().position(|h| h.id == id).unwrap();
+        assert!(pos(a) < pos(b), "the two-signal document must outrank the one-signal one");
+        assert!(pos(b) < pos(c), "one first-place vote beats none");
+
+        /* The scores ARE the RRF law with k = 60 — proved against the
+         * arithmetic, not gestured at. */
+        let expect_a = 1.0 / (RRF_K + 2.0) + 2.0 / (RRF_K + 1.0);
+        let expect_b = 1.0 / (RRF_K + 1.0) + 2.0 / (RRF_K + 3.0);
+        assert!(
+            (hits[pos(a)].fusion.unwrap() - expect_a).abs() < 1e-5,
+            "A = RRF(60) over distance rank 2, BM25 rank 1, recency rank 1: got {} want {}",
+            hits[pos(a)].fusion.unwrap(),
+            expect_a
+        );
+        assert!(
+            (hits[pos(b)].fusion.unwrap() - expect_b).abs() < 1e-5,
+            "B = RRF(60) over distance rank 1, BM25 rank 3, recency rank 3: got {} want {}",
+            hits[pos(b)].fusion.unwrap(),
+            expect_b
+        );
+        assert!(expect_a > expect_b, "two 1/61 votes + 1/62 > 1/61 + two 1/63");
+
+        /* `score` keeps its vector-scale meaning for thresholding callers;
+         * the fusion value rides in `fusion` and lives near 3/61. */
+        assert!(hits.iter().all(|h| h.fusion.unwrap() > 0.0 && h.fusion.unwrap() < 0.06));
+        assert!(hits.iter().all(|h| h.score > 0.0 && h.score <= 1.0 + TOKEN_RERANK_BOOST));
+        assert!(hits.iter().all(|h| h.fusion.unwrap() != h.score));
+    }
+
+    /// The exact-phrase guard, isolated: both documents carry every query
+    /// token, so the lexical-dominance rule cannot fire (all df == 2, no
+    /// df == 1) and the BM25 + vector ranks TIE at {1, 1, 2}. The document
+    /// that contains the query's whole phrase wins on the phrase vote.
+    #[test]
+    fn hybrid_fusion_boosts_an_exact_phrase_match() {
+        let mut cma = Cma::new(4);
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+        /* The vector winner carries every query token but NOT contiguously. */
+        let scattered =
+            cma.remember(&[1.0, 0.05, 0.0, 0.0], "deploy window alpha gamma beta delta", "user", 0)
+                as u32;
+        /* The farther row contains the query's phrase verbatim. */
+        let exact = cma.remember(&[1.0, -0.7, 0.0, 0.0], "alpha beta gamma delta", "user", 0) as u32;
+        /* Equal write times → the recency channel ties and contributes the
+         * same vote to both, leaving the phrase vote as the tie-breaker. */
+        let now = now_secs();
+        cma.records[scattered as usize].created_at = now;
+        cma.records[exact as usize].created_at = now;
+
+        let hits = cma.recall_tokens(&q, 2, "alpha beta gamma delta");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].id,
+            exact,
+            "the exact-phrase row must win: {:?}",
+            hits.iter()
+                .map(|h| (&h.text, h.distance, h.fusion))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hits.iter()
+                .min_by(|x, y| x.distance.partial_cmp(&y.distance).unwrap())
+                .unwrap()
+                .id,
+            scattered,
+            "fixture premise: the phrase row is NOT the vector winner"
+        );
+        /* The phrase vote is worth exactly one extra first-place vote:
+         * three 1/61 votes + 1/62 (distance rank 2). */
+        let expect = 3.0 / (RRF_K + 1.0) + 1.0 / (RRF_K + 2.0);
+        assert!(
+            (hits[0].fusion.unwrap() - expect).abs() < 1e-5,
+            "phrase row fused score: got {} want {}",
+            hits[0].fusion.unwrap(),
+            expect
+        );
+    }
+
+    /// The lexical-dominance guard, isolated: one document is the ONLY
+    /// carrier of a query token (df == 1) with the greatest rarity-weighted
+    /// coverage. It must outrank a nearer, chattier neighbour — the M1.3
+    /// failure mode the guard exists for, now expressed through the fusion.
+    #[test]
+    fn hybrid_fusion_lexical_dominance_beats_a_nearer_neighbour() {
+        let mut cma = Cma::new(4);
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+        let chatty = cma.remember(&[1.0, 0.05, 0.0, 0.0], "team sync notes about the flow", "user", 0)
+            as u32;
+        let answer = cma
+            .remember(&[1.0, -0.8, 0.0, 0.0], "the quokka migration ships Tuesday", "user", 0)
+            as u32;
+        let now = now_secs();
+        cma.records[chatty as usize].created_at = now;
+        cma.records[answer as usize].created_at = now - 86400; /* even older */
+
+        let hits = cma.recall_tokens(&q, 2, "when does the quokka migration ship");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].id,
+            answer,
+            "the unique carrier of the rare query token must dominate: {:?}",
+            hits.iter()
+                .map(|h| (&h.text, h.distance, h.fusion))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hits.iter()
+                .min_by(|x, y| x.distance.partial_cmp(&y.distance).unwrap())
+                .unwrap()
+                .id,
+            chatty,
+            "fixture premise: the dominant row is NOT the vector winner"
+        );
+        let _ = now;
     }
 }
 

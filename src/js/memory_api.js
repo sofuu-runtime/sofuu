@@ -84,31 +84,66 @@
 
   /* A target is: an opened brain itself, {handle: N}, or nothing (most
    * recently opened). */
+  /* W1.7: "you gave me no brain / a stale handle" is a typed refusal, not an
+   * anonymous TypeError — a host driving the C-ABI used to receive the
+   * useless `js_exception` for a double-closed handle. */
   function pick(a) {
     if (a && a.__handle !== undefined) return a;
     if (a && a.handle !== undefined && a.handle !== null) {
       var got = live[a.handle | 0];
-      if (!got) throw new TypeError('memory: no open brain with handle ' + a.handle);
+      if (!got) {
+        throw refuse(TypeError, 'E_TYPE',
+          'memory: no open brain with handle ' + a.handle);
+      }
       return got;
     }
     for (var i = live.length - 1; i >= 0; i--) {
       if (live[i]) return live[i];
     }
-    throw new TypeError('memory: no open brain — call memory.open first');
+    throw refuse(TypeError, 'E_TYPE', 'memory: no open brain — call memory.open first');
   }
 
-  function f32(v) {
-    if (v instanceof Float32Array) return v;
+  /* W1.3 (AUDIT-2026-10-29): the vector gate, JS side.
+   *
+   * A Float32Array passes through untouched; a plain Array (or any other
+   * value the `new Float32Array(...)` coercion accepted) keeps the old
+   * ergonomics — `new Float32Array([0.1, 0.2])` and `[0.1, 0.2]` both work.
+   * A WRONG TypedArray (Float64Array, Int32Array, Uint8Array, …) is a typed
+   * refusal instead of a silent conversion: re-interpreting its bytes is not
+   * just lossy, the native bridge used to read a 768-element Float64Array as
+   * 1536 floats of double bits. The Rust bridge enforces the same rule (it is
+   * the real boundary); this is what keeps the diagnosis local and cheap. */
+  var AB_ISVIEW = (typeof ArrayBuffer !== 'undefined' &&
+    typeof ArrayBuffer.isView === 'function');
+  function isView(a) {
+    return !!a && typeof a === 'object' && AB_ISVIEW && ArrayBuffer.isView(a);
+  }
+  function ctorName(v) {
+    try {
+      return (v && v.constructor && v.constructor.name) || 'ArrayBuffer view';
+    } catch (e) { return 'ArrayBuffer view'; }
+  }
+  function f32(v, what) {
+    if (typeof Float32Array !== 'undefined' && v instanceof Float32Array) return v;
+    if (isView(v)) {
+      var name = ctorName(v);
+      throw refuse(TypeError, 'E_TYPE',
+        'memory' + (what ? '.' + what : '') + ': expected a Float32Array but received a ' +
+        name + ' — a ' + name + "'s bytes cannot be re-interpreted as float32; pass a " +
+        'Float32Array (or a plain Array of numbers)');
+    }
     return new Float32Array(v || []);
   }
 
   /* An options object (flat/contract form) vs a positional argument. Opened
    * brains and typed arrays are positional; plain objects are options. */
   function isOpts(a) {
+    /* W1.3: ANY ArrayBuffer view is a positional vector argument. Before
+     * this, a Float64Array/Int32Array was treated as an OPTIONS object (only
+     * Float32Array and Uint8Array were excluded), so the positional form
+     * silently took the options path and never reached the vector gate. */
     return !!a && typeof a === 'object' && !Array.isArray(a) &&
-      a.__handle === undefined &&
-      !(typeof Float32Array !== 'undefined' && a instanceof Float32Array) &&
-      !(typeof Uint8Array !== 'undefined' && a instanceof Uint8Array);
+      a.__handle === undefined && !isView(a);
   }
 
   /* Typed refusal: a thrown Error carrying `.code`, the shape the rest of the
@@ -120,6 +155,54 @@
     err.code = code;
     return err;
   }
+
+  /* ── W1.8 (AUDIT-2026-10-29): damage events ──────────────────────
+   *
+   * Damage used to be visible ONLY as stderr ("[sofuu/cma] SEGMENT DAMAGE:
+   * …"). `M.onEvent(cb)` delivers a real event object for each damage fact
+   * the store reports; the native side calls the hook below (by name, from
+   * rt/memory.rs) at the moment the damage is found or a flush fails — it
+   * never synthesizes an event from a counter it does not track.
+   *
+   * The registry lives HERE, in JS, so the callbacks are ordinary JS values
+   * the GC owns; Rust only invokes the hook with a JSON payload.
+   * Returns an unsubscribe function.
+   */
+  var eventHandlers = [];
+  var EMIT_KEY = '__sofuu_memory_event';
+  function emitMemoryEvent(payload) {
+    var ev;
+    try { ev = typeof payload === 'string' ? JSON.parse(payload) : payload; }
+    catch (eParse) { return; }
+    if (!ev || !ev.type) return;
+    /* Snapshot: a handler that unsubscribes must not skip the next one. */
+    var list = eventHandlers.slice();
+    for (var i = 0; i < list.length; i++) {
+      try { list[i](ev); } catch (eHandler) { /* a handler must never break the store */ }
+    }
+  }
+  try {
+    Object.defineProperty(globalThis, EMIT_KEY, {
+      value: emitMemoryEvent, enumerable: false, configurable: true, writable: true
+    });
+  } catch (eDef) {
+    try { globalThis[EMIT_KEY] = emitMemoryEvent; } catch (eSet) { /* no hooks then */ }
+  }
+
+  M.onEvent = function (cb) {
+    if (typeof cb !== 'function') {
+      throw refuse(TypeError, 'E_TYPE', 'memory.onEvent: the callback must be a function');
+    }
+    eventHandlers.push(cb);
+    var active = true;
+    return function off() {
+      if (!active) return false;
+      active = false;
+      var i = eventHandlers.indexOf(cb);
+      if (i >= 0) eventHandlers.splice(i, 1);
+      return true;
+    };
+  };
 
   /* Dual-form dispatch: options object -> mapper(a); otherwise forward the
    * raw arguments to the current brain (instance-argument form). */
@@ -325,11 +408,18 @@
   /* close releases the handle. Flush first so a host that never calls
    * flush() explicitly still leaves the brain consistent on disk (the
    * native object itself is freed by GC). */
+  /* W6.1: the close-flush must REPORT a failure. It used to swallow the
+   * flush exception and answer `true` regardless, so a host that only ever
+   * calls close() (the documented "flush on the way out" path) never learned
+   * its last writes were not on disk. The handle is released either way —
+   * then the CODED flush error is rethrown. */
   M.close = function (a) {
     var inst = pick(isOpts(a) ? a : (a || {}));
-    try { if (typeof inst.flush === 'function') inst.flush(); } catch (eFlush) {}
+    var flushErr = null;
+    try { if (typeof inst.flush === 'function') inst.flush(); } catch (eFlush) { flushErr = eFlush; }
     var id = live.indexOf(inst);
     if (id >= 0) live[id] = null;
+    if (flushErr) throw flushErr;
     return true;
   };
   M.handles = function () {

@@ -652,6 +652,97 @@ mod impl_qtsq {
         /// B4: this brain was opened with the LEGACY fixed password — the
         /// next write backs it up and re-encrypts under the machine key.
         legacy_encryption: bool,
+        /// W6.1 (AUDIT-2026-10-29): what the LAST flush actually wrote.
+        /// `flush()` used to answer a bare bool, so a host could not tell an
+        /// empty flush from a full one, and had no record count at all.
+        last_flush: Option<FlushStats>,
+        /// W6.1/W1.7: why the last flush failed (code + message), when it did.
+        flush_error: Option<(&'static str, String)>,
+        /// Lifetime failed flushes on this handle — reported in stats().recovery.
+        flush_errors: usize,
+        /// W5.2: the verdict of the most recent `remember` — `remember()`
+        /// keeps returning the numeric id (hosts do `forget(remember(..))`),
+        /// and the `{id, merged, into}` record is read back through
+        /// `lastRememberOutcome()`. Set on every remember, insert or merge.
+        last_outcome: Option<crate::memory::cma::RememberOutcome>,
+    }
+
+    /// W6.1: the real numbers a flush produced.
+    #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+    struct FlushStats {
+        /// Record VERSIONS appended/rewritten by this flush.
+        records_written: usize,
+        /// NEW segment files sealed (published) by this flush.
+        segments_sealed: usize,
+    }
+
+    impl CmaShell {
+        /// Record a failed flush: the code a host branches on, the message it
+        /// reads, and the counter stats() reports. Called at every failure
+        /// return of brain_flush_segmented, so no failure path can answer
+        /// "ok" or an uncoded error.
+        fn note_flush_failure(&mut self, code: &'static str, msg: impl Into<String>) {
+            self.last_flush = None;
+            self.flush_error = Some((code, msg.into()));
+            self.flush_errors += 1;
+        }
+
+        fn note_flush_success(&mut self, stats: FlushStats) {
+            self.last_flush = Some(stats);
+            self.flush_error = None;
+        }
+    }
+
+    /// W1.8 (AUDIT-2026-10-29): what this store's load had to GIVE UP.
+    ///
+    /// The damage was only ever visible as stderr ("[sofuu/cma] SEGMENT
+    /// DAMAGE: …"). Every field here is a number the loader really computes
+    /// in `SegScan` — nothing is invented; `index_rebuilt` counts opens that
+    /// had to rebuild the vector index from SURVIVORS of a damaged store
+    /// (a pristine open always re-derives the HNSW from the segment log, so
+    /// counting that would make every healthy open look like a recovery).
+    #[derive(Clone, Default, Debug)]
+    struct Recovery {
+        /// Record versions lost with missing/unreadable segments (an upper
+        /// bound on lost memories: a later version of the same id may live).
+        records_dropped: usize,
+        /// Segment files moved aside as `<file>.torn`.
+        quarantined: Vec<String>,
+        /// Segment files the manifest lists that are not on disk.
+        missing: Vec<String>,
+        /// Segments whose digest did not match but whose bytes read cleanly
+        /// (crash window between segment and manifest publish) — adopted.
+        adopted: Vec<String>,
+        /// Survivor records renumbered to keep ids dense (0 = no gap).
+        ids_renumbered: usize,
+        /// Opens that rebuilt the index from the survivors of a damaged store.
+        index_rebuilt: usize,
+        /// Loads that also HEALED the store on disk (manifest/generation).
+        repaired: usize,
+    }
+
+    impl Recovery {
+        fn damaged(&self) -> bool {
+            self.records_dropped > 0
+                || !self.quarantined.is_empty()
+                || !self.missing.is_empty()
+                || !self.adopted.is_empty()
+                || self.ids_renumbered > 0
+        }
+
+        fn to_json(&self) -> serde_json::Value {
+            serde_json::json!({
+                "records_dropped": self.records_dropped,
+                "segments_quarantined": self.quarantined.len(),
+                "segments_missing": self.missing.len(),
+                "segments_adopted": self.adopted.len(),
+                "ids_renumbered": self.ids_renumbered,
+                "index_rebuilt": self.index_rebuilt,
+                "repairs": self.repaired,
+                "quarantined_files": self.quarantined,
+                "damaged": self.damaged(),
+            })
+        }
     }
 
     /// B3.1: the on-disk layout of a segmented brain.
@@ -674,6 +765,9 @@ mod impl_qtsq {
         /// file that has not been migrated, or retain() renumbered ids):
         /// the next flush rewrites every live record into fresh segments.
         needs_compaction: bool,
+        /// W1.8: what THIS store's load recovered/dropped. Carried on the
+        /// layout because the loader is the only place that knows.
+        recovery: Recovery,
     }
 
     impl BrainLayout {
@@ -688,6 +782,7 @@ mod impl_qtsq {
                 last_decay_at: 0,
                 evicted_total: 0,
                 needs_compaction: false,
+                recovery: Recovery::default(),
             }
         }
     }
@@ -1099,6 +1194,10 @@ mod impl_qtsq {
             cma: crate::memory::cma::Cma::new(vec_dim),
             layout: None,
             legacy_encryption: false,
+            last_flush: None,
+            flush_error: None,
+            flush_errors: 0,
+            last_outcome: None,
         });
         /* B5.3: SOFUU_BRAIN_EF_SEARCH widens the recall search; unset keeps
          * the built-in default. */
@@ -1408,6 +1507,34 @@ mod impl_qtsq {
                     continue;
                 }
             };
+            /* W1.1 (+W1.8): a segment is a TRUST boundary as much as the JS
+             * argument is. A NaN/Inf component — written by an older build, a
+             * hostile file, or a codec bug — would poison every distance in
+             * the graph (cosine of NaN is NaN, and the ordering comparisons
+             * all fall back to Equal), so recall would silently misbehave
+             * forever. Treat such a segment exactly like an unreadable one:
+             * quarantine it, account for its records, and open the rest. */
+            if let Some(at) = recs.iter().position(|r| r.vec.iter().any(|x| !x.is_finite())) {
+                eprintln!(
+                    "[sofuu/cma] SEGMENT DAMAGE: {} carries a non-finite vector (record {}/{}) — quarantining it ({} record(s) dropped) and opening the rest",
+                    seg.file,
+                    at,
+                    recs.len(),
+                    seg.records
+                );
+                match crate::rt::wal::quarantine(&file) {
+                    Some(q) => {
+                        eprintln!("[sofuu/cma]   poisoned segment preserved as {q}");
+                        scan.quarantined.push(seg.file.clone());
+                    }
+                    None => {
+                        eprintln!("[sofuu/cma]   could not quarantine {file} — leaving it in place");
+                        scan.missing.push(seg.file.clone());
+                    }
+                }
+                scan.dropped_versions += seg.records;
+                continue;
+            }
             if !verified {
                 /* The bytes are a VALID segment, just not the ones the
                  * manifest describes: the writer crashed between publishing
@@ -1620,6 +1747,19 @@ mod impl_qtsq {
              * so the re-encryption needs no separate machinery. A store that
              * could not be healed on disk also rides that rewrite. */
             needs_compaction: scan.any_legacy || !healed,
+            /* W1.8: the damage this load found (and, when healed, repaired).
+             * Counters come straight from SegScan — see Recovery's docs. */
+            recovery: {
+                let mut rec = Recovery::default();
+                rec.quarantined = scan.quarantined.clone();
+                rec.missing = scan.missing.clone();
+                rec.adopted = scan.adopted.clone();
+                rec.records_dropped = scan.dropped_versions;
+                rec.ids_renumbered = if scan.renumbered { scan.recs.len() } else { 0 };
+                rec.index_rebuilt = usize::from(scan.damaged());
+                rec.repaired = usize::from(scan.damaged() && healed);
+                rec
+            },
         };
         Ok((
             BrainData {
@@ -1782,7 +1922,10 @@ mod impl_qtsq {
     /// Rewrite every live record into fresh segments (B3.4). Ids are
     /// preserved (records are written in id order, one version each), so
     /// recall and any outstanding id references stay valid.
-    unsafe fn compact_segments(shell: &mut CmaShell, layout: &mut BrainLayout) -> c_int {
+    unsafe fn compact_segments(
+        shell: &mut CmaShell,
+        layout: &mut BrainLayout,
+    ) -> (c_int, FlushStats) {
         let dim = shell.vec_dim;
         let recs: Vec<crate::rt::brain_store::SegRecord> = (0..shell.cma.len() as u32)
             .map(|id| seg_record(shell, id))
@@ -1790,12 +1933,16 @@ mod impl_qtsq {
         layout.epoch += 1;
         match write_segment_chunks(&layout.dir, layout.epoch, 1, dim, &recs) {
             Ok(segs) => {
+                let stats = FlushStats {
+                    records_written: recs.len(),
+                    segments_sealed: segs.len(),
+                };
                 layout.segments = segs;
                 layout.persisted = recs.len();
                 layout.needs_compaction = false;
-                0
+                (0, stats)
             }
-            Err(_) => -1,
+            Err(_) => (-1, FlushStats::default()),
         }
     }
 
@@ -1839,7 +1986,10 @@ mod impl_qtsq {
     /// an unreferenced orphan segment for the age-guarded sweep, and the
     /// committed manifest keeps describing bytes that still exist — so a
     /// committed manifest can never reference a torn segment.
-    unsafe fn append_segments(shell: &mut CmaShell, layout: &mut BrainLayout) -> c_int {
+    unsafe fn append_segments(
+        shell: &mut CmaShell,
+        layout: &mut BrainLayout,
+    ) -> (c_int, FlushStats) {
         let dim = shell.vec_dim;
         let mut ids: Vec<u32> = (layout.persisted..shell.cma.len())
             .map(|i| i as u32)
@@ -1853,17 +2003,22 @@ mod impl_qtsq {
         ids.sort_unstable();
         ids.dedup();
         if ids.is_empty() {
-            return 0;
+            /* Nothing changed: a successful flush that wrote nothing. */
+            return (0, FlushStats::default());
         }
         let fresh: Vec<crate::rt::brain_store::SegRecord> =
             ids.iter().map(|id| seg_record(shell, *id)).collect();
         let seq = next_segment_seq(&layout.dir, &layout.segments);
         match write_segment_chunks(&layout.dir, layout.epoch, seq, dim, &fresh) {
             Ok(segs) => {
+                let stats = FlushStats {
+                    records_written: fresh.len(),
+                    segments_sealed: segs.len(),
+                };
                 layout.segments.extend(segs);
-                0
+                (0, stats)
             }
-            Err(_) => -1,
+            Err(_) => (-1, FlushStats::default()),
         }
     }
 
@@ -1872,6 +2027,10 @@ mod impl_qtsq {
         let path = shell.mind_path.clone();
         let dir = crate::rt::brain_store::segments_dir(&path);
         if std::fs::create_dir_all(&dir).is_err() {
+            shell.note_flush_failure(
+                E_ENOSPC,
+                format!("could not create the segment directory {dir} (disk full or unwritable)"),
+            );
             return -1;
         }
         let mut layout = match shell.layout.take() {
@@ -1885,6 +2044,10 @@ mod impl_qtsq {
                         eprintln!("[sofuu/cma] migrating to segmented storage (backup: {bak})");
                     } else {
                         eprintln!("[sofuu/cma] refusing to migrate: could not back up {path}");
+                        shell.note_flush_failure(
+                            E_ENOSPC,
+                            format!("could not back {path} up before the segmented migration (disk full or unwritable)"),
+                        );
                         return -1;
                     }
                 }
@@ -1896,6 +2059,7 @@ mod impl_qtsq {
                     last_decay_at: 0,
                     evicted_total: 0,
                     needs_compaction: true,
+                    recovery: Recovery::default(),
                 }
             }
         };
@@ -1922,6 +2086,12 @@ mod impl_qtsq {
                     "[sofuu/cma] brain store at {path} moved under this process (another writer?) — \
                      flush refused to avoid dropping its records; reopen to adopt them"
                 );
+                shell.note_flush_failure(
+                    E_LOCKED,
+                    format!(
+                        "the brain store at {path} moved under this process (another writer?) —                          flush refused to avoid dropping its records; reopen to adopt them"
+                    ),
+                );
                 shell.layout = Some(layout);
                 return -1;
             }
@@ -1940,6 +2110,10 @@ mod impl_qtsq {
                 );
             } else {
                 eprintln!("[sofuu/cma] refusing to re-encrypt: could not back up {path}");
+                shell.note_flush_failure(
+                    E_ENOSPC,
+                    format!("could not back {path} up before re-encrypting it (disk full or unwritable)"),
+                );
                 shell.layout = Some(layout);
                 return -1;
             }
@@ -1968,12 +2142,18 @@ mod impl_qtsq {
          * that flushes every turn. */
         let minimal = live / crate::rt::brain_store::SEGMENT_CAP + 1;
         let too_many_segments = layout.segments.len() > minimal * 2 + 8;
-        let rc = if layout.needs_compaction || dead_ratio || too_many_segments {
+        let (rc, stats) = if layout.needs_compaction || dead_ratio || too_many_segments {
             compact_segments(shell, &mut layout)
         } else {
             append_segments(shell, &mut layout)
         };
         if rc != 0 {
+            shell.note_flush_failure(
+                E_ENOSPC,
+                format!(
+                    "could not write the segments for {path} (codec error {rc}: disk full or an                      unwritable segment directory)"
+                ),
+            );
             shell.layout = Some(layout);
             return rc;
         }
@@ -1993,6 +2173,10 @@ mod impl_qtsq {
         let tmp = format!("{path}.tmp");
         if crate::rt::brain_store::write_manifest(&tmp, &manifest).is_err() {
             let _ = std::fs::remove_file(&tmp);
+            shell.note_flush_failure(
+                E_ENOSPC,
+                format!("could not stage the manifest for {path} (disk full or unwritable)"),
+            );
             shell.layout = Some(layout);
             return -1;
         }
@@ -2013,6 +2197,10 @@ mod impl_qtsq {
             }
         } else {
             let _ = std::fs::remove_file(&tmp);
+            shell.note_flush_failure(
+                E_ENOSPC,
+                format!("could not publish the manifest for {path} (the rename failed)"),
+            );
             shell.layout = Some(layout);
             return -1;
         }
@@ -2026,6 +2214,8 @@ mod impl_qtsq {
         shell.layout = Some(layout);
         /* The rewrite above used the machine key — the flag's job is done. */
         shell.legacy_encryption = false;
+        /* W6.1: the numbers flush() reports. */
+        shell.note_flush_success(stats);
         0
     }
 
@@ -2047,6 +2237,63 @@ mod impl_qtsq {
         shell
             .cma
             .remember_with_source(vec, text, role.unwrap_or("unknown"), kv_page_id, source.unwrap_or(""))
+    }
+
+
+    /// W5.2: the same ingest path as `cma_remember`, but returning the
+    /// merge/insert verdict the plan asks callers to be told about —
+    /// `{ id, merged, into }`. Nothing about the write changes.
+    unsafe fn cma_remember_outcome(
+        shell: &mut CmaShell,
+        vec: &[f32],
+        text: Option<&str>,
+        role: Option<&str>,
+        kv_page_id: u32,
+        source: Option<&str>,
+    ) -> Option<crate::memory::cma::RememberOutcome> {
+        let text = text?;
+        Some(shell.cma.remember_with_source_outcome(
+            vec,
+            text,
+            role.unwrap_or("unknown"),
+            kv_page_id,
+            source.unwrap_or(""),
+        ))
+    }
+
+    /// Turn a `RememberOutcome` into the JS object W5.2 specifies. `into` is
+    /// absent on an insert (not `null`-valued-but-present) so `"into" in r`
+    /// is the test a caller wants.
+    unsafe fn remember_outcome_value(
+        ctx: *mut JSContext,
+        outcome: Option<crate::memory::cma::RememberOutcome>,
+    ) -> qjs::JSValue {
+        let obj = qjs::sofuu_js_new_object(ctx);
+        let (id, merged, into) = match outcome {
+            Some(o) => (o.id, o.merged, o.into),
+            None => (u32::MAX, false, None),
+        };
+        qjs::sofuu_js_set_property_str(
+            ctx,
+            obj,
+            c"id".as_ptr(),
+            qjs::sofuu_js_new_int32(ctx, id as i32),
+        );
+        qjs::sofuu_js_set_property_str(
+            ctx,
+            obj,
+            c"merged".as_ptr(),
+            qjs::sofuu_js_new_bool(ctx, merged as i32),
+        );
+        if let Some(into) = into {
+            qjs::sofuu_js_set_property_str(
+                ctx,
+                obj,
+                c"into".as_ptr(),
+                qjs::sofuu_js_new_int32(ctx, into as i32),
+            );
+        }
+        obj
     }
 
     /// recall → JSON array string (same shape ffi_exports.rs documents:
@@ -2124,22 +2371,316 @@ mod impl_qtsq {
         }
     }
 
+    /* ══════════════════════════════════════════════════════════════
+     * W1.7 (AUDIT-2026-10-29): coded errors on the JS memory surface.
+     *
+     * Every refusal this surface can produce carries `.code` from one fixed
+     * set, so a host can branch on the reason instead of parsing English out
+     * of a message (the C-ABI used to flatten them all to `js_exception`).
+     * The thrown objects are REAL JS error instances (TypeError / RangeError
+     * / Error) with `.code` added, so `instanceof` keeps working; memory_api.js
+     * uses the same {ctor, code} pairing in its own `refuse()` helper.
+     * ══════════════════════════════════════════════════════════════ */
+    pub(crate) const E_TYPE: &str = "E_TYPE";
+    pub(crate) const E_NONFINITE: &str = "E_NONFINITE";
+    pub(crate) const E_DIM: &str = "E_DIM";
+    pub(crate) const E_LOCKED: &str = "E_LOCKED";
+    pub(crate) const E_CORRUPT: &str = "E_CORRUPT";
+    pub(crate) const E_ENOSPC: &str = "E_ENOSPC";
+
+    /// A CString that never silently empties: an interior NUL is escaped
+    /// (the C API cannot carry one, and an empty message would be a lie).
+    fn cstr_lossy(s: &str) -> CString {
+        CString::new(s.replace('\0', "\\0")).unwrap_or_default()
+    }
+
+    /// The JS error class a code maps to.
+    fn error_ctor_for_code(code: &str) -> &'static std::ffi::CStr {
+        match code {
+            E_TYPE | E_DIM => c"TypeError",
+            E_NONFINITE => c"RangeError",
+            _ => c"Error",
+        }
+    }
+
+    /// Throw a real JS error of the mapped class carrying `.code` (and an
+    /// explicit `.message`, which the plain-Error fallback would lack).
+    unsafe fn throw_coded(ctx: *mut JSContext, code: &str, msg: &str) -> JSValue {
+        let ctor_name = error_ctor_for_code(code);
+        let global = qjs::sofuu_js_get_global_object(ctx);
+        let ctor = if qjs::is_exception(global) {
+            qjs::sofuu_js_exception()
+        } else {
+            qjs::sofuu_js_get_property_str(ctx, global, ctor_name.as_ptr())
+        };
+        if !qjs::is_exception(global) {
+            qjs::sofuu_js_free_value(ctx, global);
+        }
+        let msg_c = cstr_lossy(msg);
+        let msg_v = qjs::sofuu_js_new_string(ctx, msg_c.as_ptr());
+        let err = if !qjs::is_exception(ctor) && qjs::JS_IsFunction(ctx, ctor) != 0 {
+            let e = qjs::JS_CallConstructor(ctx, ctor, 1, &msg_v);
+            if qjs::is_exception(e) {
+                /* Constructing the error threw (hostile global): drop that
+                 * exception and fall back — the .code still lands. */
+                let exc = qjs::sofuu_js_get_exception(ctx);
+                qjs::sofuu_js_free_value(ctx, exc);
+                qjs::JS_NewError(ctx)
+            } else {
+                e
+            }
+        } else {
+            qjs::JS_NewError(ctx)
+        };
+        if !qjs::is_exception(ctor) {
+            qjs::sofuu_js_free_value(ctx, ctor);
+        }
+        if qjs::is_exception(err) {
+            qjs::sofuu_js_free_value(ctx, msg_v);
+            return err;
+        }
+        let code_v = qjs::sofuu_js_new_string(ctx, cstr_lossy(code).as_ptr());
+        qjs::sofuu_js_set_property_str(ctx, err, c"code".as_ptr(), code_v);
+        qjs::sofuu_js_set_property_str(
+            ctx,
+            err,
+            c"message".as_ptr(),
+            qjs::sofuu_js_new_string(ctx, msg_c.as_ptr()),
+        );
+        qjs::sofuu_js_free_value(ctx, msg_v);
+        qjs::JS_Throw(ctx, err)
+    }
+
+    fn dim_mismatch_message(op: &str, got: usize, want: usize) -> String {
+        format!(
+            "memory.{op}: vector has {got} dimensions but this brain stores {want} — the \
+             dimension is exact (a truncated or padded vector would silently score garbage)"
+        )
+    }
+
+    /// W1.1: first non-finite element (NaN / ±Infinity), if any — ONE linear
+    /// pass per vector at the boundary every ingest and query crosses.
+    fn first_non_finite(v: &[f32]) -> Option<(usize, f32)> {
+        v.iter()
+            .enumerate()
+            .find(|(_, x)| !x.is_finite())
+            .map(|(i, x)| (i, *x))
+    }
+
+    fn non_finite_message(at: usize, val: f32) -> String {
+        format!(
+            "memory: vector element {at} is not finite ({val}) — NaN/Infinity must never reach \
+             the graph or the persisted store; replace or drop the element"
+        )
+    }
+
+    /// W1.8 (AUDIT-2026-10-29): deliver a damage event to
+    /// `sofuu.memory.onEvent(cb)` handlers.
+    ///
+    /// The registry and the dispatch loop live in JS (src/js/memory_api.js
+    /// installs `globalThis.__sofuu_memory_event`), so callbacks are ordinary
+    /// JS values owned by the GC — the Rust side never holds a JSValue across
+    /// a context teardown. A build/host without the flat API simply gets no
+    /// event (the hook is absent), and a handler that throws cannot break the
+    /// store: the exception is swallowed here.
+    unsafe fn emit_memory_event(ctx: *mut JSContext, event: serde_json::Value) {
+        let payload = cstr_lossy(&event.to_string());
+        let global = qjs::sofuu_js_get_global_object(ctx);
+        if qjs::is_exception(global) {
+            let exc = qjs::sofuu_js_get_exception(ctx);
+            qjs::sofuu_js_free_value(ctx, exc);
+            return;
+        }
+        let hook = qjs::sofuu_js_get_property_str(ctx, global, c"__sofuu_memory_event".as_ptr());
+        qjs::sofuu_js_free_value(ctx, global);
+        if qjs::is_exception(hook) {
+            let exc = qjs::sofuu_js_get_exception(ctx);
+            qjs::sofuu_js_free_value(ctx, exc);
+            return;
+        }
+        if qjs::JS_IsFunction(ctx, hook) != 0 {
+            let arg = qjs::sofuu_js_new_string(ctx, payload.as_ptr());
+            let ret = qjs::JS_Call(ctx, hook, qjs::sofuu_js_undefined(), 1, &arg);
+            if qjs::is_exception(ret) {
+                /* A handler throwing must never break the store. */
+                let exc = qjs::sofuu_js_get_exception(ctx);
+                qjs::sofuu_js_free_value(ctx, exc);
+            } else {
+                qjs::sofuu_js_free_value(ctx, ret);
+            }
+            qjs::sofuu_js_free_value(ctx, arg);
+        }
+        qjs::sofuu_js_free_value(ctx, hook);
+    }
+
+    /// W1.8: one event per REAL damage fact a load found (nothing invented —
+    /// every field comes from the loader's own SegScan), then the rebuild.
+    unsafe fn emit_recovery_events(
+        ctx: *mut JSContext,
+        rec: &Recovery,
+        path: &str,
+        records: usize,
+    ) {
+        for file in &rec.quarantined {
+            emit_memory_event(
+                ctx,
+                serde_json::json!({"type": "segment_quarantined", "file": file, "path": path}),
+            );
+        }
+        for file in &rec.missing {
+            emit_memory_event(
+                ctx,
+                serde_json::json!({"type": "segment_missing", "file": file, "path": path}),
+            );
+        }
+        for file in &rec.adopted {
+            emit_memory_event(
+                ctx,
+                serde_json::json!({"type": "segment_adopted", "file": file, "path": path}),
+            );
+        }
+        if rec.records_dropped > 0 {
+            emit_memory_event(
+                ctx,
+                serde_json::json!({"type": "record_dropped", "count": rec.records_dropped, "path": path}),
+            );
+        }
+        if rec.ids_renumbered > 0 {
+            emit_memory_event(
+                ctx,
+                serde_json::json!({"type": "ids_renumbered", "count": rec.ids_renumbered, "path": path}),
+            );
+        }
+        if rec.index_rebuilt > 0 {
+            emit_memory_event(
+                ctx,
+                serde_json::json!({"type": "index_rebuilt", "records": records, "path": path}),
+            );
+        }
+        if rec.repaired > 0 {
+            emit_memory_event(
+                ctx,
+                serde_json::json!({"type": "store_repaired", "records": records, "path": path}),
+            );
+        }
+    }
+
+    /// W1.3 (AUDIT-2026-10-29): is this value a real Float32Array?
+    ///
+    /// `JS_GetTypedArrayBuffer` succeeds for EVERY ArrayBuffer view, so the
+    /// old bridge re-interpreted a Float64Array's bytes as f32 (a 768-element
+    /// Float64Array read as 1536 garbage floats, or a misleading "dimension
+    /// mismatch"). `JS_GetTypedArrayType` is not exported by this QuickJS, so
+    /// `JS_IsInstanceOf` against the realm's Float32Array is the check.
+    unsafe fn is_float32_array(ctx: *mut JSContext, v: JSValueConst) -> bool {
+        let global = qjs::sofuu_js_get_global_object(ctx);
+        if qjs::is_exception(global) {
+            let exc = qjs::sofuu_js_get_exception(ctx);
+            qjs::sofuu_js_free_value(ctx, exc);
+            return false;
+        }
+        let ctor = qjs::sofuu_js_get_property_str(ctx, global, c"Float32Array".as_ptr());
+        qjs::sofuu_js_free_value(ctx, global);
+        if qjs::is_exception(ctor) {
+            let exc = qjs::sofuu_js_get_exception(ctx);
+            qjs::sofuu_js_free_value(ctx, exc);
+            return false;
+        }
+        let ok = if qjs::JS_IsFunction(ctx, ctor) != 0 {
+            let r = qjs::JS_IsInstanceOf(ctx, v, ctor);
+            if r < 0 {
+                let exc = qjs::sofuu_js_get_exception(ctx);
+                qjs::sofuu_js_free_value(ctx, exc);
+                false
+            } else {
+                r == 1
+            }
+        } else {
+            false
+        };
+        qjs::sofuu_js_free_value(ctx, ctor);
+        ok
+    }
+
+    /// The offending value's constructor name, for an E_TYPE message that
+    /// names what the caller actually passed ("Float64Array", "Int32Array", …).
+    unsafe fn view_ctor_name(ctx: *mut JSContext, v: JSValueConst) -> String {
+        const FALLBACK: &str = "non-Float32Array value";
+        let ctor = qjs::sofuu_js_get_property_str(ctx, v, c"constructor".as_ptr());
+        if qjs::is_exception(ctor) {
+            let exc = qjs::sofuu_js_get_exception(ctx);
+            qjs::sofuu_js_free_value(ctx, exc);
+            return FALLBACK.to_string();
+        }
+        let name = qjs::sofuu_js_get_property_str(ctx, ctor, c"name".as_ptr());
+        qjs::sofuu_js_free_value(ctx, ctor);
+        if qjs::is_exception(name) {
+            let exc = qjs::sofuu_js_get_exception(ctx);
+            qjs::sofuu_js_free_value(ctx, exc);
+            return FALLBACK.to_string();
+        }
+        let c = qjs::sofuu_js_to_cstring(ctx, name);
+        qjs::sofuu_js_free_value(ctx, name);
+        if c.is_null() {
+            return FALLBACK.to_string();
+        }
+        let s = CStr::from_ptr(c).to_string_lossy().into_owned();
+        qjs::sofuu_js_free_cstring(ctx, c);
+        if s.is_empty() {
+            FALLBACK.to_string()
+        } else {
+            s
+        }
+    }
+
+    /// W1.3: the bridge is the actual boundary — Float32Array only. The plain
+    /// Array path stays (it is documented ergonomics: `new Float32Array(final)`
+    /// callers still work), but a WRONG TypedArray is never converted.
+    ///
+    /// Throws (with a code) and returns None on any refusal, so every caller
+    /// just returns `sofuu_js_exception()`.
     unsafe fn cma_vec_view(ctx: *mut JSContext, v: JSValueConst) -> Option<F32View> {
         let mut byte_length: usize = 0;
         let mut byte_offset: usize = 0;
         let ab = qjs::JS_GetTypedArrayBuffer(ctx, v, &mut byte_offset, &mut byte_length, ptr::null_mut());
         if !qjs::is_exception(ab) {
+            /* It IS an ArrayBuffer view — that is NOT enough (W1.3). */
+            if !is_float32_array(ctx, v) {
+                qjs::sofuu_js_free_value(ctx, ab);
+                let name = view_ctor_name(ctx, v);
+                throw_coded(
+                    ctx,
+                    E_TYPE,
+                    &format!(
+                        "memory: expected a Float32Array but received a {name} — a {name}'s \
+                         bytes cannot be re-interpreted as float32; pass a Float32Array (or a \
+                         plain Array of numbers)"
+                    ),
+                );
+                return None;
+            }
             let mut ab_size: usize = 0;
             let buf = qjs::JS_GetArrayBuffer(ctx, &mut ab_size, ab);
             qjs::sofuu_js_free_value(ctx, ab);
             if !buf.is_null() {
                 let p = (buf as *const u8).add(byte_offset) as *const f32;
-                return Some(F32View::Borrowed(p, byte_length / std::mem::size_of::<f32>()));
+                let view = F32View::Borrowed(p, byte_length / std::mem::size_of::<f32>());
+                /* W1.1: the one scan — ingest AND query arrive here. */
+                if let Some((at, val)) = first_non_finite(view.as_slice()) {
+                    throw_coded(ctx, E_NONFINITE, &non_finite_message(at, val));
+                    return None;
+                }
+                return Some(view);
             }
-        } else {
-            let exc = qjs::JS_GetException(ctx);
-            qjs::sofuu_js_free_value(ctx, exc);
+            throw_coded(
+                ctx,
+                E_TYPE,
+                "memory: the Float32Array's buffer is detached — pass a live Float32Array",
+            );
+            return None;
         }
+        let exc = qjs::JS_GetException(ctx);
+        qjs::sofuu_js_free_value(ctx, exc);
 
         // Plain JavaScript Array fallback: [0.1, 0.2, ...]
         if qjs::JS_IsArray(ctx, v) != 0 {
@@ -2155,29 +2696,86 @@ mod impl_qtsq {
                 qjs::sofuu_js_free_value(ctx, el);
                 out[i as usize] = d as f32;
             }
+            /* W1.1, folded into the conversion pass: `d as f32` overflows a
+             * finite f64 (1e300) to +Inf, so the CHECK is on the f32. */
+            if let Some((at, val)) = first_non_finite(&out) {
+                throw_coded(ctx, E_NONFINITE, &non_finite_message(at, val));
+                return None;
+            }
             return Some(F32View::Owned(out));
         }
 
+        /* A Float32Array whose buffer could not be fetched (detached). */
+        if is_float32_array(ctx, v) {
+            throw_coded(
+                ctx,
+                E_TYPE,
+                "memory: the Float32Array's buffer is detached — pass a live Float32Array",
+            );
+            return None;
+        }
+        let got = view_ctor_name(ctx, v);
+        throw_coded(
+            ctx,
+            E_TYPE,
+            &format!(
+                "memory: expected a Float32Array or a plain Array of numbers, got a {got}"
+            ),
+        );
         None
     }
 
-    /* Extract a Float32Array arg → borrowed float pointer + element count.
-     * Null pointer on error (exception already thrown). */
+    /* W1.3: Float32Array arg → borrowed float pointer + element count. The
+     * same type + finiteness gate as cma_vec_view; this raw-pointer shape is
+     * used by the kv save/search and agent prefetch paths.
+     * Null pointer on error (a CODED exception is already thrown). */
     unsafe fn cma_vec_arg(ctx: *mut JSContext, v: JSValueConst) -> (*const f32, usize) {
         let mut byte_length: usize = 0;
         let mut byte_offset: usize = 0;
         let ab = qjs::JS_GetTypedArrayBuffer(ctx, v, &mut byte_offset, &mut byte_length, ptr::null_mut());
         if qjs::is_exception(ab) {
+            let exc = qjs::JS_GetException(ctx);
+            qjs::sofuu_js_free_value(ctx, exc);
+            let got = view_ctor_name(ctx, v);
+            throw_coded(
+                ctx,
+                E_TYPE,
+                &format!("memory: expected a Float32Array, got a {got}"),
+            );
+            return (ptr::null(), 0);
+        }
+        if !is_float32_array(ctx, v) {
+            qjs::sofuu_js_free_value(ctx, ab);
+            let name = view_ctor_name(ctx, v);
+            throw_coded(
+                ctx,
+                E_TYPE,
+                &format!(
+                    "memory: expected a Float32Array but received a {name} — a {name}'s bytes \
+                     cannot be re-interpreted as float32"
+                ),
+            );
             return (ptr::null(), 0);
         }
         let mut ab_size: usize = 0;
         let buf = qjs::JS_GetArrayBuffer(ctx, &mut ab_size, ab);
         qjs::sofuu_js_free_value(ctx, ab);
         if buf.is_null() {
+            throw_coded(
+                ctx,
+                E_TYPE,
+                "memory: the Float32Array's buffer is detached — pass a live Float32Array",
+            );
             return (ptr::null(), 0);
         }
         let p = (buf as *const u8).add(byte_offset) as *const f32;
-        (p, byte_length / std::mem::size_of::<f32>())
+        let n = byte_length / std::mem::size_of::<f32>();
+        /* W1.1: the same single scan, before the pointer escapes. */
+        if let Some((at, val)) = first_non_finite(std::slice::from_raw_parts(p, n)) {
+            throw_coded(ctx, E_NONFINITE, &non_finite_message(at, val));
+            return (ptr::null(), 0);
+        }
+        (p, n)
     }
 
     unsafe extern "C" fn js_cma_open(
@@ -2187,7 +2785,7 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 2 {
-            return qjs::JS_ThrowTypeError(ctx, c"Expected path and vector dimension".as_ptr());
+            return throw_coded(ctx, E_TYPE, "Expected path and vector dimension");
         }
         let path = qjs::sofuu_js_to_cstring(ctx, *argv);
         let mut dim: u32 = 0;
@@ -2211,8 +2809,28 @@ mod impl_qtsq {
             qjs::sofuu_js_free_cstring(ctx, path);
         }
         let Some(shell) = shell else {
-            return qjs::JS_ThrowInternalError(ctx, c"Failed to initialize CMA".as_ptr());
+            /* W1.7: an unopenable brain is E_CORRUPT (a bare InternalError
+             * without a code made every failure indistinguishable). The
+             * concrete reason is on stderr, where it always was. */
+            return throw_coded(
+                ctx,
+                E_CORRUPT,
+                "memory.open: the brain could not be opened (unreadable container, wrong key, or an                  incompatible vector space — see the sofuu/cma warnings for the reason)",
+            );
         };
+        /* W1.8: report the damage this load found BEFORE the handle is
+         * handed back, so a handler registered with onEvent() before open()
+         * still observes the recovery. */
+        {
+            let rec = shell
+                .layout
+                .as_ref()
+                .map(|l| l.recovery.clone())
+                .unwrap_or_default();
+            let path = shell.mind_path.clone();
+            let records = shell.cma.len();
+            emit_recovery_events(ctx, &rec, &path, records);
+        }
         let shell = Box::into_raw(shell);
 
         let obj = qjs::JS_NewObjectClass(ctx, CMA_CLASS_ID.load(Ordering::Relaxed) as c_int);
@@ -2231,7 +2849,7 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 1 {
-            return qjs::JS_ThrowTypeError(ctx, c"Expected path".as_ptr());
+            return throw_coded(ctx, E_TYPE, "Expected path");
         }
         let path = qjs::sofuu_js_to_cstring(ctx, *argv);
         let path_s = cstr_opt(path);
@@ -2239,7 +2857,7 @@ mod impl_qtsq {
             qjs::sofuu_js_free_cstring(ctx, path);
         }
         let Some(path_s) = path_s else {
-            return qjs::JS_ThrowTypeError(ctx, c"Expected path string".as_ptr());
+            return throw_coded(ctx, E_TYPE, "Expected path string");
         };
         /* B3 (audit 2026-10-14): a segmented brain's MANIFEST is the true,
          * cheap answer. The legacy single-file reader below sees only a
@@ -2337,10 +2955,7 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 1 {
-            return qjs::JS_ThrowTypeError(
-                ctx,
-                c"Expected text or (vec, text[, role, kv_page_id, source])".as_ptr(),
-            );
+            return throw_coded(ctx, E_TYPE, "Expected text or (vec, text[, role, kv_page_id, source])");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
@@ -2375,7 +2990,7 @@ mod impl_qtsq {
                 crate::rt::ai::sofuu_tfidf_embed(t.as_bytes(), &mut emb, cma.vec_dim);
             }
 
-            let idx = cma_remember(
+            let outcome = cma_remember_outcome(
                 cma,
                 &emb,
                 text_opt.as_deref(),
@@ -2393,22 +3008,25 @@ mod impl_qtsq {
             if !source.is_null() {
                 qjs::sofuu_js_free_cstring(ctx, source);
             }
-            return qjs::sofuu_js_new_int32(ctx, idx);
+            cma.last_outcome = outcome;
+            return qjs::sofuu_js_new_int32(ctx, outcome.map(|o| o.id as i32).unwrap_or(-1));
         }
 
         if argc < 2 {
-            return qjs::JS_ThrowTypeError(
-                ctx,
-                c"Expected vec and text[, role, kv_page_id, source]".as_ptr(),
-            );
+            return throw_coded(ctx, E_TYPE, "Expected vec and text[, role, kv_page_id, source]");
         }
 
         let Some(vec_view) = cma_vec_view(ctx, *argv) else {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array, Array of numbers, or text string".as_ptr());
+            /* W1.3/W1.1/W1.7: cma_vec_view already threw a CODED refusal. */
+            return qjs::sofuu_js_exception();
         };
         let vec_slice = vec_view.as_slice();
         if vec_slice.len() != cma.vec_dim {
-            return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
+            return throw_coded(
+                ctx,
+                E_DIM,
+                &dim_mismatch_message("remember", vec_slice.len(), cma.vec_dim),
+            );
         }
 
         let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
@@ -2429,7 +3047,7 @@ mod impl_qtsq {
             std::ptr::null_mut()
         };
 
-        let idx = cma_remember(
+        let outcome = cma_remember_outcome(
             cma,
             vec_slice,
             cstr_opt(text).as_deref(),
@@ -2447,7 +3065,23 @@ mod impl_qtsq {
         if !source.is_null() {
             qjs::sofuu_js_free_cstring(ctx, source);
         }
-        qjs::sofuu_js_new_int32(ctx, idx)
+        cma.last_outcome = outcome;
+        qjs::sofuu_js_new_int32(ctx, outcome.map(|o| o.id as i32).unwrap_or(-1))
+    }
+
+    /// W5.2: `cma.lastRememberOutcome()` → `{id, merged, into?}` for the
+    /// most recent `remember`/`learn`/`rememberEntity`-style write on this
+    /// handle. A separate method keeps `remember()`'s numeric id intact.
+    unsafe extern "C" fn js_cma_last_remember_outcome(
+        ctx: *mut JSContext,
+        this_val: JSValueConst,
+        _argc: c_int,
+        _argv: *const JSValueConst,
+    ) -> JSValue {
+        let Some(cma) = shell_from_this(ctx, this_val) else {
+            return qjs::sofuu_js_exception();
+        };
+        remember_outcome_value(ctx, cma.last_outcome)
     }
 
     /// B8.1: `cma.learn(text[, role, source])` or `cma.learn(text, { role, source, pageId })`
@@ -2459,7 +3093,7 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 1 || qjs::sofuu_js_is_string(*argv) == 0 {
-            return qjs::JS_ThrowTypeError(ctx, c"Expected text (string)".as_ptr());
+            return throw_coded(ctx, E_TYPE, "Expected text (string)");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
@@ -2557,21 +3191,22 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 4 {
-            return qjs::JS_ThrowTypeError(
-                ctx,
-                c"Expected vec, text, entityName, entityType".as_ptr(),
-            );
+            return throw_coded(ctx, E_TYPE, "Expected vec, text, entityName, entityType");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
 
         let Some(vec_view) = cma_vec_view(ctx, *argv) else {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+            return qjs::sofuu_js_exception();
         };
         let vec_slice = vec_view.as_slice();
         if vec_slice.len() != cma.vec_dim {
-            return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
+            return throw_coded(
+                ctx,
+                E_DIM,
+                &dim_mismatch_message("rememberEntity", vec_slice.len(), cma.vec_dim),
+            );
         }
 
         let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
@@ -2605,10 +3240,7 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 1 {
-            return qjs::JS_ThrowTypeError(
-                ctx,
-                c"Expected queryText or (queryVec, topK[, text])".as_ptr(),
-            );
+            return throw_coded(ctx, E_TYPE, "Expected queryText or (queryVec, topK[, text])");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
@@ -2645,19 +3277,24 @@ mod impl_qtsq {
         }
 
         if argc < 2 {
-            return qjs::JS_ThrowTypeError(
-                ctx,
-                c"Expected queryVec and topK".as_ptr(),
-            );
+            return throw_coded(ctx, E_TYPE, "Expected queryVec and topK");
         }
 
         let Some(vec_view) = cma_vec_view(ctx, *argv) else {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array, Array of numbers, or string".as_ptr());
+            return qjs::sofuu_js_exception();
         };
         let vec_slice = vec_view.as_slice();
-        if vec_slice.len() < cma.vec_dim {
-            /* Short vectors would out-of-bounds read in the C — refuse. */
-            return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
+        /* W6.5 (AUDIT-2026-10-29): EXACT dimension. `<` silently truncated a
+         * longer query (`&vec_slice[..cma.vec_dim]` below) — a 1024d query on
+         * a 768d brain scored 768 of its 1024 dimensions and returned a hit
+         * with no error. A short query was a codeless TypeError. Both are
+         * E_DIM now, and neither can reach the scorer. */
+        if vec_slice.len() != cma.vec_dim {
+            return throw_coded(
+                ctx,
+                E_DIM,
+                &dim_mismatch_message("recall", vec_slice.len(), cma.vec_dim),
+            );
         }
 
         let mut top_k: u32 = 0;
@@ -2696,7 +3333,7 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 1 || qjs::sofuu_js_is_string(*argv) == 0 {
-            return qjs::JS_ThrowTypeError(ctx, c"Expected queryText (string)".as_ptr());
+            return throw_coded(ctx, E_TYPE, "Expected queryText (string)");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
@@ -2739,22 +3376,24 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 2 {
-            return qjs::JS_ThrowTypeError(
-                ctx,
-                c"Expected queryVec and n_hints".as_ptr(),
-            );
+            return throw_coded(ctx, E_TYPE, "Expected queryVec and n_hints");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
 
         let Some(vec_view) = cma_vec_view(ctx, *argv) else {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+            return qjs::sofuu_js_exception();
         };
         let vec_slice = vec_view.as_slice();
-        if vec_slice.len() < cma.vec_dim {
-            /* Short vectors would out-of-bounds read in the C — refuse. */
-            return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
+        /* Exact dimension, same rule as recall (a long vector used to be
+         * silently truncated, a short one was a codeless TypeError). */
+        if vec_slice.len() != cma.vec_dim {
+            return throw_coded(
+                ctx,
+                E_DIM,
+                &dim_mismatch_message("kvHints", vec_slice.len(), cma.vec_dim),
+            );
         }
 
         let mut n_hints: u32 = 0;
@@ -2778,7 +3417,7 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 1 {
-            return qjs::JS_ThrowTypeError(ctx, c"Expected id or Array of ids".as_ptr());
+            return throw_coded(ctx, E_TYPE, "Expected id or Array of ids");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
@@ -2803,7 +3442,7 @@ mod impl_qtsq {
             qjs::sofuu_js_to_uint32(ctx, &mut id, *argv);
             ids.push(id);
         } else {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument must be an id (number) or Array of ids".as_ptr());
+            return throw_coded(ctx, E_TYPE, "Argument must be an id (number) or Array of ids");
         }
         let marked = cma.cma.mark_positive(&ids);
         qjs::sofuu_js_new_uint32(ctx, marked)
@@ -2816,7 +3455,7 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 1 {
-            return qjs::JS_ThrowTypeError(ctx, c"Expected dt_seconds".as_ptr());
+            return throw_coded(ctx, E_TYPE, "Expected dt_seconds");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
@@ -2958,16 +3597,13 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 2 {
-            return qjs::JS_ThrowTypeError(
-                ctx,
-                c"Expected vecs(Float32Array) and recordsJson".as_ptr(),
-            );
+            return throw_coded(ctx, E_TYPE, "Expected vecs(Float32Array) and recordsJson");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
         let Some(vec_view) = cma_vec_view(ctx, *argv) else {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+            return qjs::sofuu_js_exception();
         };
         let vec_slice = vec_view.as_slice();
         let json = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
@@ -2976,7 +3612,7 @@ mod impl_qtsq {
             qjs::sofuu_js_free_cstring(ctx, json);
         }
         let Some(json_s) = json_s else {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 2 must be a JSON string".as_ptr());
+            return throw_coded(ctx, E_TYPE, "Argument 2 must be a JSON string");
         };
         /* W6.3: refuse the wrong envelope loudly (see the contract above). */
         if !serde_json::from_str::<serde_json::Value>(&json_s)
@@ -2984,13 +3620,22 @@ mod impl_qtsq {
             .and_then(|v| v.get("records").map(|r| r.is_array()))
             .unwrap_or(false)
         {
-            return qjs::JS_ThrowTypeError(
-                ctx,
-                c"Argument 2 must be JSON of the form {\"records\":[...]}".as_ptr(),
-            );
+            return throw_coded(ctx, E_TYPE, "Argument 2 must be JSON of the form {\"records\":[...]}");
         }
         let dim = cma.vec_dim;
-        let n = vec_slice.len() / dim.max(1);
+        /* The vecs buffer is records*stride — a partial trailing vector used
+         * to be dropped by integer division. Refuse it instead. */
+        if dim == 0 || vec_slice.len() % dim != 0 {
+            return throw_coded(
+                ctx,
+                E_DIM,
+                &format!(
+                    "memory.importRecords: vecs has {} float(s), which is not a whole number of                      {dim}-dimensional records",
+                    vec_slice.len()
+                ),
+            );
+        }
+        let n = vec_slice.len() / dim;
         let stats = cma.cma.import_records(
             vec_slice,
             n,
@@ -3020,10 +3665,7 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 1 {
-            return qjs::JS_ThrowTypeError(
-                ctx,
-                c"Expected the canonical sofuu.memory handle".as_ptr(),
-            );
+            return throw_coded(ctx, E_TYPE, "Expected the canonical sofuu.memory handle");
         }
         let Some(this_shell) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
@@ -3031,10 +3673,7 @@ mod impl_qtsq {
         let other = qjs::JS_GetOpaque2(ctx, *argv, CMA_CLASS_ID.load(Ordering::Relaxed))
             as *mut CmaShell;
         if other.is_null() {
-            return qjs::JS_ThrowTypeError(
-                ctx,
-                c"Argument 1 must be a sofuu.memory handle".as_ptr(),
-            );
+            return throw_coded(ctx, E_TYPE, "Argument 1 must be a sofuu.memory handle");
         }
         /* Aliasing guard: the same handle would make `keep` borrow the very
          * records we drain — refuse instead of reading freed memory. */
@@ -3066,20 +3705,21 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 2 {
-            return qjs::JS_ThrowTypeError(
-                ctx,
-                c"Expected vec and text[, role, kv_page_id, source]".as_ptr(),
-            );
+            return throw_coded(ctx, E_TYPE, "Expected vec and text[, role, kv_page_id, source]");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
         let Some(vec_view) = cma_vec_view(ctx, *argv) else {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+            return qjs::sofuu_js_exception();
         };
         let vec_slice = vec_view.as_slice();
         if vec_slice.len() != cma.vec_dim {
-            return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
+            return throw_coded(
+                ctx,
+                E_DIM,
+                &dim_mismatch_message("rememberWorking", vec_slice.len(), cma.vec_dim),
+            );
         }
         let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
         let role = if argc >= 3 && qjs::sofuu_js_is_string(*argv.add(2)) != 0 {
@@ -3126,7 +3766,7 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 1 {
-            return qjs::JS_ThrowTypeError(ctx, c"Expected ids (Array of numbers, number, or JSON string)".as_ptr());
+            return throw_coded(ctx, E_TYPE, "Expected ids (Array of numbers, number, or JSON string)");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
@@ -3169,7 +3809,7 @@ mod impl_qtsq {
                 qjs::sofuu_js_free_cstring(ctx, json_ptr);
             }
         } else {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be an Array of ids, number, or JSON string".as_ptr());
+            return throw_coded(ctx, E_TYPE, "Argument 1 must be an Array of ids, number, or JSON string");
         }
         let (promoted, merged) = cma.cma.promote_working_by_ids(&ids);
         let out = serde_json::json!({ "promoted": promoted, "merged": merged });
@@ -3221,6 +3861,25 @@ mod impl_qtsq {
                     .sum()
             })
             .unwrap_or(0);
+        /* W1.8: what this store's LOAD had to give up — the damage that used
+         * to be visible only as stderr. Every counter is measured by the
+         * loader (SegScan); `flush_errors` is this handle's own tally. */
+        let recovery = {
+            let mut v = layout
+                .map(|l| l.recovery.to_json())
+                .unwrap_or_else(|| Recovery::default().to_json());
+            if let Some(o) = v.as_object_mut() {
+                o.insert("flush_errors".to_string(), serde_json::json!(cma.flush_errors));
+                o.insert(
+                    "last_flush_error".to_string(),
+                    match &cma.flush_error {
+                        Some((code, msg)) => serde_json::json!({"code": code, "message": msg}),
+                        None => serde_json::Value::Null,
+                    },
+                );
+            }
+            v
+        };
         let out = serde_json::json!({
             "records": cma.cma.len(),
             "segmented": layout.is_some(),
@@ -3242,6 +3901,8 @@ mod impl_qtsq {
              * physical deaths in this store (text clipped by the CMA's
              * own cap; at = unix seconds). */
             "recentDeaths": cma.cma.deaths.iter().rev().take(16).collect::<Vec<_>>(),
+            /* W1.8: the damage-visibility block (present on EVERY stats()). */
+            "recovery": recovery,
         });
         let c = CString::new(out.to_string()).unwrap_or_default();
         qjs::sofuu_js_new_string(ctx, c.as_ptr())
@@ -3325,7 +3986,7 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 1 {
-            return qjs::JS_ThrowTypeError(ctx, c"Expected vector_index".as_ptr());
+            return throw_coded(ctx, E_TYPE, "Expected vector_index");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
@@ -3361,6 +4022,14 @@ mod impl_qtsq {
         qjs::sofuu_js_new_uint32(ctx, cma.cma.len() as u32)
     }
 
+    /// W6.1 (AUDIT-2026-10-29): `cma.flush()` → `{ok:true, recordsWritten:N,
+    /// segmentsSealed:N}` and a CODED throw when the flush fails.
+    ///
+    /// Before this, flush answered a bare bool: a failed flush never threw
+    /// (the caller had to notice `false`), and nothing reported how many
+    /// records or segments the write actually produced. The object is still
+    /// truthy, so `if (b.flush())` / `local = b.flush()` callers (e.g.
+    /// plugins.js's storage facade) keep behaving exactly as before.
     unsafe extern "C" fn js_cma_flush(
         ctx: *mut JSContext,
         this_val: JSValueConst,
@@ -3371,7 +4040,45 @@ mod impl_qtsq {
             return qjs::sofuu_js_exception();
         };
         let r = cma_flush(cma);
-        qjs::sofuu_js_new_bool(ctx, if r == 0 { 1 } else { 0 })
+        if r != 0 {
+            /* The failure path already recorded WHY (code + message). */
+            let (code, msg) = cma
+                .flush_error
+                .clone()
+                .unwrap_or((E_ENOSPC, "flush failed".to_string()));
+            let path = cma.mind_path.clone();
+            emit_memory_event(
+                ctx,
+                serde_json::json!({
+                    "type": "flush_error",
+                    "code": code,
+                    "message": msg,
+                    "path": path,
+                }),
+            );
+            return throw_coded(ctx, code, &format!("memory.flush: {msg}"));
+        }
+        let stats = cma.last_flush.unwrap_or_default();
+        let obj = qjs::sofuu_js_new_object(ctx);
+        qjs::sofuu_js_set_property_str(
+            ctx,
+            obj,
+            c"ok".as_ptr(),
+            qjs::sofuu_js_new_bool(ctx, 1),
+        );
+        qjs::sofuu_js_set_property_str(
+            ctx,
+            obj,
+            c"recordsWritten".as_ptr(),
+            qjs::sofuu_js_new_uint32(ctx, stats.records_written as u32),
+        );
+        qjs::sofuu_js_set_property_str(
+            ctx,
+            obj,
+            c"segmentsSealed".as_ptr(),
+            qjs::sofuu_js_new_uint32(ctx, stats.segments_sealed as u32),
+        );
+        obj
     }
 
     /// sofuu.memory.migrate(path) → JSON string.
@@ -3394,7 +4101,7 @@ mod impl_qtsq {
             .to_string()
         }
         if argc < 1 || qjs::sofuu_js_is_string(*argv) == 0 {
-            return qjs::JS_ThrowTypeError(ctx, c"memory.migrate(path) expected a string".as_ptr());
+            return throw_coded(ctx, E_TYPE, "memory.migrate(path) expected a string");
         }
         let path_ptr = qjs::sofuu_js_to_cstring(ctx, *argv);
         let Some(path) = cstr_opt(path_ptr) else {
@@ -3448,6 +4155,10 @@ mod impl_qtsq {
             cma: crate::memory::cma::Cma::new(crate::embedding::SEMANTIC_DIM),
             layout: None,
             legacy_encryption: false,
+            last_flush: None,
+            flush_error: None,
+            flush_errors: 0,
+            last_outcome: None,
         });
         match migrate_legacy_hash_brain(&path, &brain, &mut shell) {
             Ok((records, backup)) => {
@@ -3491,20 +4202,21 @@ mod impl_qtsq {
         argv: *const JSValueConst,
     ) -> JSValue {
         if argc < 4 {
-            return qjs::JS_ThrowTypeError(
-                ctx,
-                c"Expected vec, text, entityName, entityType".as_ptr(),
-            );
+            return throw_coded(ctx, E_TYPE, "Expected vec, text, entityName, entityType");
         }
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
         let Some(vec_view) = cma_vec_view(ctx, *argv) else {
-            return qjs::JS_ThrowTypeError(ctx, c"Argument 1 must be Float32Array or Array of numbers".as_ptr());
+            return qjs::sofuu_js_exception();
         };
         let vec_slice = vec_view.as_slice();
         if vec_slice.len() != cma.vec_dim {
-            return qjs::JS_ThrowTypeError(ctx, c"Vector dimension mismatch".as_ptr());
+            return throw_coded(
+                ctx,
+                E_DIM,
+                &dim_mismatch_message("rememberEntityTurn", vec_slice.len(), cma.vec_dim),
+            );
         }
         let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
         let entity_name = qjs::sofuu_js_to_cstring(ctx, *argv.add(2));
@@ -3528,8 +4240,9 @@ mod impl_qtsq {
     }
 
     thread_local! {
-        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 23] = [
+        static CMA_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 24] = [
             cfunc_entry(c"remember", 4, js_cma_remember),
+                cfunc_entry(c"lastRememberOutcome", 0, js_cma_last_remember_outcome),
             cfunc_entry(c"learn", 3, js_cma_learn),
             cfunc_entry(c"list", 1, js_cma_list),
             cfunc_entry(c"export", 0, js_cma_export),
@@ -4261,13 +4974,14 @@ mod impl_qtsq {
             return qjs::sofuu_js_exception();
         };
 
+        /* cma_vec_arg throws the CODED refusal (E_TYPE / E_NONFINITE). */
         let (k_ptr, k_len) = cma_vec_arg(ctx, *argv);
         if k_ptr.is_null() {
-            return qjs::JS_ThrowTypeError(ctx, c"K must be Float32Array".as_ptr());
+            return qjs::sofuu_js_exception();
         }
         let (v_ptr, v_len) = cma_vec_arg(ctx, *argv.add(1));
         if v_ptr.is_null() {
-            return qjs::JS_ThrowTypeError(ctx, c"V must be Float32Array".as_ptr());
+            return qjs::sofuu_js_exception();
         }
 
         let mut n_tok: u32 = 0;
@@ -4297,7 +5011,7 @@ mod impl_qtsq {
 
         let (q_ptr, q_len) = cma_vec_arg(ctx, *argv);
         if q_ptr.is_null() {
-            return qjs::JS_ThrowTypeError(ctx, c"Query must be Float32Array".as_ptr());
+            return qjs::sofuu_js_exception();
         }
 
         let mut n_hints: u32 = 0;
@@ -4442,7 +5156,7 @@ mod impl_qtsq {
 
         let (q_ptr, q_len) = cma_vec_arg(ctx, *argv);
         if q_ptr.is_null() {
-            return qjs::JS_ThrowTypeError(ctx, c"Query must be Float32Array".as_ptr());
+            return qjs::sofuu_js_exception();
         }
 
         let mut top_k: u32 = 0;
@@ -5977,27 +6691,54 @@ mod impl_qtsq {
     }
 
     /// R-25 (AUDIT-2026-10-29): what used to be `torn_segment_is_refused`.
+    /// (The name is historical — see what the two phases assert now.)
     ///
-    /// Truncating the ONLY segment destroys its bytes — they are
-    /// quarantined, not deleted, so an operator can still salvage them — and
-    /// the brain now opens EMPTY instead of refusing to open at all. Refusing
-    /// was strictly worse: the store was permanently unopenable (every
-    /// `cma.open` → `Failed to initialize CMA`) and the damaged bytes were
-    /// just as unreachable.
+    /// OLD CONTRACT (now obsolete, and factually wrong about this store):
+    /// "truncating the only segment to a third destroys records 4..10, so
+    /// the brain must open with `0 < kept < 10`". That premise was never
+    /// re-checked against the container format: `qtsq_container_write`
+    /// stores the packed payload TWICE (a 5943-byte segment = header +
+    /// 1981-byte payload + an identical 1981-byte copy), so a truncation to
+    /// exactly one third leaves the FIRST COPY whole — it still decrypts and
+    /// still carries all ten records. `scan_segments` then takes its
+    /// documented stale-manifest branch ("does not match its manifest digest
+    /// but reads cleanly — adopting the N record(s) it carries"), because a
+    /// digest mismatch on readable bytes means the writer crashed between
+    /// publishing the segment and publishing the manifest. Nothing was lost,
+    /// so the old assertion `kept < 10` was asserting data loss that does
+    /// not happen.
+    ///
+    /// WHAT IS TRUE NOW (and what this test pins):
+    ///   PHASE A — a 1/3 truncation loses NOTHING. All ten records come back
+    ///     (pins the adoption branch in `scan_segments`), and the store is
+    ///     healed on disk, so a second open is clean and still holds ten
+    ///     records (pins `heal_store` re-publishing the manifest digest).
+    ///   PHASE B — genuine, unreadable damage is still DETECTED: the same
+    ///     truncation plus corruption of the surviving copy makes the
+    ///     segment undecryptable, the brain still OPENS (never
+    ///     `Failed to initialize CMA`), and the unreadable bytes are
+    ///     preserved as `<file>.torn` instead of being deleted (pins the
+    ///     quarantine branch — `read_segment_ex` error → `wal::quarantine`).
     #[test]
     fn torn_only_segment_is_quarantined_and_the_brain_opens_empty() {
-        let dir = fresh_test_dir("b3-torn-only");
-        let path = dir.join("brain.qtsq");
-        let p = path.to_str().unwrap().to_string();
+        fn seed_and_flush(dir: &str, dim: usize) {
+            let mut shell = unsafe { cma_open(dir, dim, None) }.expect("fresh");
+            for i in 0..10u32 {
+                let text = format!("r{i}");
+                let v = crate::embedding::hash_features_at(&text, dim);
+                unsafe { cma_remember(&mut shell, &v, Some(&text), Some("user"), 0, None) };
+            }
+            assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+            drop(shell);
+        }
+
         let dim = 16;
 
-        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh");
-        for i in 0..10u32 {
-            let text = format!("r{i}");
-            let v = crate::embedding::hash_features_at(&text, dim);
-            unsafe { cma_remember(&mut shell, &v, Some(&text), Some("user"), 0, None) };
-        }
-        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        /* ── PHASE A: a torn write that still READS loses nothing ─────── */
+        let dir = fresh_test_dir("b3-torn-only-a");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        seed_and_flush(&p, dim);
 
         let seg_dir = crate::rt::brain_store::segments_dir(&p);
         let files = crate::rt::brain_store::list_segment_files(&seg_dir);
@@ -6005,39 +6746,99 @@ mod impl_qtsq {
         let victim = format!("{seg_dir}/{}", files[0]);
         let len = std::fs::metadata(&victim).unwrap().len();
         let f = std::fs::OpenOptions::new().write(true).open(&victim).unwrap();
-        f.set_len(len / 3).unwrap(); /* torn write */
+        f.set_len(len / 3).unwrap(); /* torn write: cuts the SECOND copy away */
         drop(f);
 
-        /* A truncation that still PARSES is the crash window this store has
-         * to survive: the records before the tear are intact and their own
-         * checks pass, only the manifest digest no longer matches (the
-         * manifest was published for the complete segment). Adopting them is
-         * strictly better than discarding them — the audit's real SIGKILL
-         * case lost ALL records because the loader refused to open at all.
-         * Records after the tear are gone, which is what "torn" means. */
         let reopened = unsafe { cma_open(&p, dim, None) };
         let reopened = reopened.expect("R-25: a torn segment must not make the brain unopenable");
-        let kept = reopened.cma.len();
-        assert!(
-            kept > 0 && kept < 10,
-            "the readable prefix of the torn segment must survive (kept {kept} of 10)"
+        assert_eq!(
+            reopened.cma.len(),
+            10,
+            "the container's first copy survives a 1/3 truncation, so the \
+             adoption path must keep all ten records (not drop them)"
         );
-        /* Whatever cannot be read is quarantined, never deleted. */
-        let names: Vec<String> = std::fs::read_dir(&seg_dir)
+        let texts: std::collections::HashSet<String> =
+            reopened.cma.records.iter().map(|r| r.text.clone()).collect();
+        for i in 0..10u32 {
+            assert!(
+                texts.contains(&format!("r{i}")),
+                "record r{i} must survive the tear, kept {texts:?}"
+            );
+        }
+        drop(reopened);
+
+        /* The adoption is a REPAIR, not a one-off: the manifest was
+         * re-published with the surviving bytes' digest, so the next open
+         * sees a healthy store holding the same ten records. */
+        let again = unsafe { cma_open(&p, dim, None) }.expect("reopen after adoption");
+        assert_eq!(
+            again.cma.len(),
+            10,
+            "the healed push must not lose what the adoption salvaged"
+        );
+
+        /* ── PHASE B: damaged beyond reading → quarantined, brain opens ──
+         * Truncating to a third keeps one complete copy, so a tear alone is
+         * recoverable. Corrupting the bytes of the copy that survives is the
+         * real "the bytes are garbage" case: the codec's HMAC fails, and
+         * that loss must be DETECTED (and the bytes kept for salvage). */
+        let dir_b = fresh_test_dir("b3-torn-only-b");
+        let path_b = dir_b.join("brain.qtsq");
+        let pb = path_b.to_str().unwrap().to_string();
+        seed_and_flush(&pb, dim);
+        let seg_dir_b = crate::rt::brain_store::segments_dir(&pb);
+        let files_b = crate::rt::brain_store::list_segment_files(&seg_dir_b);
+        assert_eq!(files_b.len(), 1, "one segment: {files_b:?}");
+        let victim_b = format!("{seg_dir_b}/{}", files_b[0]);
+        let full_len = std::fs::metadata(&victim_b).unwrap().len();
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&victim_b).unwrap();
+            f.set_len(full_len / 3).unwrap();
+            /* stomp the middle of the copy that is left */
+            f.seek(SeekFrom::Start((full_len / 3) / 2)).unwrap();
+            f.write_all(&[0xA5u8; 64]).unwrap();
+        }
+        assert!(
+            unsafe { crate::rt::brain_store::read_segment_ex(&victim_b) }.is_err(),
+            "the corrupted segment must NOT read cleanly (otherwise phase B proves nothing)"
+        );
+
+        let opened = unsafe { cma_open(&pb, dim, None) };
+        let opened = opened.expect("genuine damage must not make the brain unopenable");
+        assert_eq!(
+            opened.cma.len(),
+            0,
+            "an undecryptable segment loses its records — the loss must be visible, not silently \
+             half-loaded"
+        );
+        drop(opened);
+        let names: Vec<String> = std::fs::read_dir(&seg_dir_b)
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().to_string())
             .collect();
         assert!(
-            names.iter().any(|n| n.ends_with(".torn")) || kept > 0,
-            "damage must be either salvaged or preserved as .torn: {names:?}"
+            names.iter().any(|n| n.ends_with(".torn")),
+            "the unreadable bytes must be preserved as .torn, never deleted: {names:?}"
         );
     }
 
     /// R-25: the crash the audit actually reproduced — SIGKILL during a
-    /// flush leaves the LAST segment torn. Every earlier record must still
-    /// load, the torn file must be quarantined, and `repair()` must report
-    /// the damage (and then be a no-op on the healed store).
+    /// flush leaves the LAST segment torn. Every record written BEFORE it
+    /// must still load (and still be RETRIEVABLE, not just present), the
+    /// torn file must be quarantined, and `repair()` must report the damage
+    /// (and then be a no-op on the healed store).
+    ///
+    /// A 1/3 truncation is used for the tear because it is destructive HERE:
+    /// this segment carries 200 rows, so the container's redundant copy is
+    /// long enough that cutting two thirds of the file leaves nothing
+    /// decryptable (`read_segment_ex` → error → quarantine). The survivor
+    /// set is asserted EXACTLY (a prefix of the written texts), and the
+    /// retrieval probe uses a row no other row is near — see the comment in
+    /// the body: this fixture's 64-bucket tf-idf maps many short texts onto
+    /// the same direction, so "the text of row N comes back" is only a fair
+    /// demand for a row with no twin.
     #[test]
     fn torn_last_segment_keeps_every_earlier_record() {
         let dir = fresh_test_dir("b3-torn-last");
@@ -6092,15 +6893,108 @@ mod impl_qtsq {
 
         let mut reloaded = unsafe { cma_open(&p, dim, None) }.expect("R-25: must open");
         assert_eq!(reloaded.cma.len(), report.records);
-        /* Probe a survivor by its OWN vector: the earlier segments must be
-         * fully intact (self-distance 0, so this cannot be a near miss). */
-        let probe_id = 5u32;
-        let probe_text = reloaded.cma.records[probe_id as usize].text.clone();
-        let q = reloaded.cma.index.vector(probe_id).to_vec();
+
+        /* WHAT SURVIVED, EXACTLY. Segments are append-only and this tear hit
+         * the NEWEST one, so the survivor set is precisely "every record
+         * written before it": `full - last.records` rows carrying r0..rN-1,
+         * and nothing from the torn file (it failed to decrypt, so it is
+         * dropped whole — never half-adopted). This pins `scan_segments`'s
+         * per-segment `continue` on a read error plus the order-preserving
+         * renumber that follows it: if either dropped or duplicated rows,
+         * the id→text mapping here would not be a clean prefix. */
+        let torn_records = last.records as usize;
+        assert_eq!(
+            report.records,
+            full - torn_records,
+            "exactly the torn segment's rows may go: {report:?}"
+        );
+        let texts: std::collections::HashSet<String> =
+            reloaded.cma.records.iter().map(|r| r.text.clone()).collect();
+        for i in 0..(full - torn_records) {
+            assert!(
+                texts.contains(&format!("r{i}")),
+                "an EARLIER segment's record r{i} must survive a torn segment (kept {})",
+                texts.len()
+            );
+        }
+        for i in (full - torn_records)..full {
+            assert!(
+                !texts.contains(&format!("r{i}")),
+                "r{i} lived in the torn segment and must not appear from nowhere"
+            );
+        }
+
+        /* EARLIER SEGMENTS MUST STILL BE RETRIEVABLE — presence in `records`
+         * is not enough, recall has to serve them.
+         *
+         * The probe has to be a row whose vector is UNIQUE in the store.
+         * `hash_features_at` is a tf-idf bucket embedder, and this fixture
+         * puts 600 two-token texts into `dim` = 64 buckets: r3, r4, r5, r6
+         * and r22 land on the SAME vector (brute force puts all five at
+         * distance 0.0 from it), so a query by one of their vectors names a
+         * tie-class, not a row, and demanding a specific text back is
+         * unsatisfiable — that is what the previous version of this probe
+         * did (`probe_id = 5`, text must be "r5"), and it failed no matter
+         * how correct the store was. */
+        /* Pick a row that is UNAMBIGUOUS at retrieval time: its nearest
+         * OTHER row must be far enough away that no scoring term
+         * (strength/resonance/recency, which are refreshed by every recall
+         * and can reorder an exact tie) can put a twin first. Bit-identical
+         * vectors are not enough to test for — the tf-idf embedder reuses
+         * one direction for many texts and the differences land below f32
+         * resolution (r0 and r385 sit 2e-16 apart, i.e. distance 0 in f32). */
+        let n_idx = reloaded.cma.index.len() as u32;
+        let mut unambiguous: Option<u32> = None;
+        for id in 0..n_idx {
+            let qv = reloaded.cma.index.vector(id);
+            let mut nearest_other = f32::MAX;
+            for other in 0..n_idx {
+                if other == id {
+                    continue;
+                }
+                let ov = reloaded.cma.index.vector(other);
+                let d: f32 = qv
+                    .iter()
+                    .zip(ov)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f32>()
+                    .sqrt();
+                if d < nearest_other {
+                    nearest_other = d;
+                }
+            }
+            if nearest_other > 0.25 {
+                unambiguous = Some(id);
+                break;
+            }
+        }
+        let unique_id = unambiguous
+            .expect("the fixture must hold at least one row no other row is near");
+        let unique_text = reloaded.cma.records[unique_id as usize].text.clone();
+        let q = reloaded.cma.index.vector(unique_id).to_vec();
         let hits = reloaded.cma.recall(&q, 5);
+        assert_eq!(
+            hits.first().map(|h| h.text.clone()),
+            Some(unique_text.clone()),
+            "an EARLIER segment's record must be the TOP hit for its OWN vector, got {:?}",
+            hits.iter().map(|h| (&h.text, h.distance)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            hits[0].distance, 0.0,
+            "the probe is the record's own vector, so the distance must be exactly 0"
+        );
+        assert_eq!(hits[0].id, unique_id);
+
+        /* And a COLLIDING row is still served as its tie-class: the store
+         * returns an exact-distance-0 hit for r5's vector even though the
+         * winner may be a twin (r3/r4/r6/r22). Asserting "r5" here would
+         * re-introduce the unsatisfiable expectation above. */
+        let q5 = reloaded.cma.index.vector(5).to_vec();
+        let hits5 = reloaded.cma.recall(&q5, 5);
         assert!(
-            hits.iter().any(|h| h.text == probe_text),
-            "an EARLIER segment's record must survive a torn segment"
+            hits5.iter().any(|h| h.distance == 0.0),
+            "an earlier segment's row must answer an exact-vector query, got {:?}",
+            hits5.iter().map(|h| (&h.text, h.distance)).collect::<Vec<_>>()
         );
 
         /* The healed store is quiet: a second repair changes nothing. */
@@ -6117,6 +7011,176 @@ mod impl_qtsq {
         assert_eq!(unsafe { cma_flush(&mut reloaded) }, 0, "flush after repair");
         let mut third = unsafe { cma_open(&p, dim, None) }.expect("reopen after repair+flush");
         assert_eq!(third.cma.len(), report.records + 1);
+    }
+
+    /* ── W6.1 (+W1.8): flush reports what it wrote; damage is counted ── */
+
+    /// W6.1: flush used to answer a bare bool, so a host could not tell an
+    /// empty flush from a full one and had no record count at all. The shell
+    /// now carries the real numbers the flush produced.
+    #[test]
+    fn flush_reports_records_written_and_segments_sealed() {
+        let dir = fresh_test_dir("w61-flush-report");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 64;
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh");
+        for i in 0..2 {
+            let text = format!("f{i}");
+            let v = crate::embedding::hash_features_at(&text, dim);
+            unsafe { cma_remember(&mut shell, &v, Some(&text), Some("user"), 0, None) };
+        }
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        assert_eq!(
+            shell.last_flush,
+            Some(FlushStats { records_written: 2, segments_sealed: 1 }),
+            "the first (migrating) flush writes both records into one segment"
+        );
+        assert!(shell.flush_error.is_none());
+
+        /* An unchanged flush still SUCCEEDS and reports writing nothing. */
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        assert_eq!(shell.last_flush, Some(FlushStats::default()));
+
+        /* One new record → one appended record version in one new segment. */
+        let text = "f2";
+        let v = crate::embedding::hash_features_at(text, dim);
+        unsafe { cma_remember(&mut shell, &v, Some(text), Some("user"), 0, None) };
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        assert_eq!(
+            shell.last_flush,
+            Some(FlushStats { records_written: 1, segments_sealed: 1 })
+        );
+        assert_eq!(shell.flush_errors, 0);
+    }
+
+    /// W6.1/W1.7: a flush that cannot persist must RECORD a coded reason
+    /// (the JS layer turns it into a throw, the C-ABI into `code`).
+    #[test]
+    fn a_failed_flush_is_recorded_with_a_code() {
+        let dir = fresh_test_dir("w61-flush-failure");
+        /* A REGULAR FILE where the segment directory must go: create_dir_all
+         * can never succeed, so the failure is deterministic. */
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let p = blocker.join("brain.qtsq").to_string_lossy().into_owned();
+        let dim = 64;
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh brain");
+        let v = crate::embedding::hash_features_at("x", dim);
+        unsafe { cma_remember(&mut shell, &v, Some("x"), Some("user"), 0, None) };
+
+        assert_ne!(unsafe { cma_flush(&mut shell) }, 0, "flush must fail");
+        let (code, msg) = shell.flush_error.clone().expect("the failure is recorded");
+        assert_eq!(code, E_ENOSPC);
+        assert!(msg.contains("segment directory"), "{msg}");
+        assert_eq!(shell.flush_errors, 1);
+        assert!(shell.last_flush.is_none(), "a failed flush reports no stats");
+    }
+
+    /// W1.8: the store's load reports what it had to give up — the damage
+    /// that used to be visible only as stderr. Every counter is measured by
+    /// the loader's own SegScan.
+    #[test]
+    fn a_damaged_store_reports_recovery_counters() {
+        let dir = fresh_test_dir("w18-recovery");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 64;
+        let total = crate::rt::brain_store::SEGMENT_CAP + 44; /* spans two segments */
+
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh");
+        for i in 0..total {
+            let text = format!("r{i}");
+            let v = crate::embedding::hash_features_at(&text, dim);
+            unsafe { cma_remember(&mut shell, &v, Some(&text), Some("user"), 0, None) };
+        }
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        drop(shell);
+
+        let m = unsafe { crate::rt::brain_store::read_manifest(&p) }.expect("manifest");
+        assert!(m.segments.len() >= 2, "the store must span two segments");
+        let seg_dir = crate::rt::brain_store::segments_dir(&p);
+        let first = m.segments[0].clone();
+        std::fs::write(format!("{seg_dir}/{}", first.file), b"not a segment").unwrap();
+
+        /* The open recovers what survived, and SAYS what it lost. */
+        let reopened = unsafe { cma_open(&p, dim, None) }.expect("R-25: a damaged store opens");
+        let rec = reopened
+            .layout
+            .as_ref()
+            .expect("segmented")
+            .recovery
+            .clone();
+        assert_eq!(rec.quarantined, vec![first.file.clone()]);
+        assert_eq!(rec.records_dropped, first.records);
+        assert_eq!(
+            rec.ids_renumbered,
+            total - first.records,
+            "the survivors were renumbered to keep ids dense"
+        );
+        assert_eq!(rec.index_rebuilt, 1, "the index was rebuilt from the survivors");
+        assert_eq!(rec.repaired, 1, "and the store was healed on disk");
+        assert!(rec.damaged());
+        assert_eq!(reopened.cma.len(), total - first.records);
+
+        /* The healed store reports a CLEAN load next time. */
+        let clean = unsafe { cma_open(&p, dim, None) }.expect("healed store reopens");
+        let rec2 = clean.layout.as_ref().expect("segmented").recovery.clone();
+        assert!(!rec2.damaged());
+        assert_eq!(rec2.records_dropped, 0);
+        assert_eq!(rec2.index_rebuilt, 0);
+        assert_eq!(rec2.ids_renumbered, 0);
+    }
+
+    /// W1.1: no non-finite component may reach the graph from DISK either.
+    ///
+    /// The JS bridge refuses NaN/Inf at ingest, but a brain file can be
+    /// written by an older build, a hostile process or a codec variant that
+    /// does not scrubs them. Two layers now stand between such a file and
+    /// the HNSW graph: the segment scan quarantines a segment that decodes
+    /// with a non-finite row (see scan_segments), and the QTC codec itself
+    /// maps non-finite inputs to small finite values (measured: NaN comes
+    /// back as ~1.08e-19, bits 0x20000000). This test pins the RESULT — the
+    /// reopened graph is finite and the healthy records are intact — so it
+    /// stays valid whichever layer does the scrubbing.
+    #[test]
+    fn a_non_finite_vector_never_reaches_the_graph_from_disk() {
+        let dir = fresh_test_dir("w11-poisoned-segment");
+        let path = dir.join("brain.qtsq");
+        let p = path.to_str().unwrap().to_string();
+        let dim = 64;
+        let mut shell = unsafe { cma_open(&p, dim, None) }.expect("fresh");
+        for i in 0..3 {
+            let text = format!("ok{i}");
+            let v = crate::embedding::hash_features_at(&text, dim);
+            unsafe { cma_remember(&mut shell, &v, Some(&text), Some("user"), 0, None) };
+        }
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        /* Bypass the JS bridge on purpose: this is exactly the file an older
+         * build (or a hostile writer) could have produced on disk. */
+        let mut poison = crate::embedding::hash_features_at("poison", dim);
+        poison[7] = f32::NAN;
+        poison[9] = f32::INFINITY;
+        unsafe { cma_remember(&mut shell, &poison, Some("poison"), Some("user"), 0, None) };
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0);
+        drop(shell);
+
+        let mut reopened = unsafe { cma_open(&p, dim, None) }.expect("must open");
+        assert!(
+            reopened.cma.len() >= 3,
+            "the healthy records must survive (got {})",
+            reopened.cma.len()
+        );
+        for i in 0..reopened.cma.len() as u32 {
+            assert!(
+                reopened.cma.index.vector(i).iter().all(|x| x.is_finite()),
+                "record {i} carries a non-finite component into the graph"
+            );
+        }
+        /* And a query still behaves like a query (not NaN-sorted noise). */
+        let q = reopened.cma.index.vector(0).to_vec();
+        let hits = reopened.cma.recall(&q, 3);
+        assert_eq!(hits.first().map(|h| h.id), Some(0), "self-query still ranks self first");
     }
 
     /// R-25: a MIDDLE segment torn out leaves a hole in the id space, which

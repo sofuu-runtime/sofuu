@@ -14,6 +14,7 @@
 // pure Rust logic with no C dependency.
 
 pub mod bundler;
+pub mod brain_cmd; // W7: `sofuu brain verify|repair|stats|backup|restore|migrate`
 pub mod capabilities; // R1: the capability manifest (sofuu.capabilities)
 pub mod embedding; // compact learned semantic projector for memory recall
 pub mod embed_config; // H2: process-global embedded-mode config (is_embedded, config_root, signals)

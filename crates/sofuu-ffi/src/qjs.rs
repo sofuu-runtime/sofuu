@@ -556,6 +556,12 @@ extern "C" {
     pub fn JS_NewArray(ctx: *mut JSContext) -> JSValue;
     pub fn JS_IsArray(ctx: *mut JSContext, val: JSValueConst) -> c_int;
     pub fn JS_IsFunction(ctx: *mut JSContext, val: JSValueConst) -> c_int;
+    // quickjs.h:791 — real export. Needed by rt/memory.rs (W1.3): this
+    // QuickJS does not export JS_GetTypedArrayType, and JS_GetTypedArrayBuffer
+    // answers for EVERY view, so `instanceof Float32Array` is the only way to
+    // tell an f32 view from a Float64Array/Int32Array whose bytes must never
+    // be re-interpreted as f32.
+    pub fn JS_IsInstanceOf(ctx: *mut JSContext, val: JSValueConst, obj: JSValueConst) -> c_int;
     pub fn JS_GetPropertyUint32(
         ctx: *mut JSContext,
         this_obj: JSValueConst,

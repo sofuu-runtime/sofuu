@@ -127,8 +127,46 @@ jobs:
       # left libsofuu / headless / abi unverified on that runner. Gates that
       # protect the product come before the suite that is still being
       # stabilised on Linux.
-      - name: Run JS test suite
-        run: make test
+      #
+      # HONESTY FIX (2026-10-30): this step used to be `make test`, which is
+      # VACUOUS in CI. /tests/ is gitignored (.gitignore:143) and
+      # `git ls-files tests/` is 0, so a clean checkout has neither the corpus
+      # nor tests/run_js_tests.sh, and the Makefile target just printed
+      # "tests/ is local-only (gitignored); nothing to run" and exited 0 — a
+      # green check that proved nothing about the JS suite.
+      #
+      # Both obvious fixes were rejected. The gitignore stays (deliberate owner
+      # decision: the corpus is local-only). Hard-failing when the runner is
+      # missing would be red on every single run, because the corpus can never
+      # be in a checkout — exactly the "permanently-red job trains everyone to
+      # ignore CI" failure the matrix comment above already calls out.
+      #
+      # So this step keeps the job green but makes the skip impossible to miss:
+      # a ::warning:: annotation (surface on the run page, not buried in a log),
+      # a job-summary line, and an explicit assertion of the REASON for the
+      # skip. It fails only when the absence means the repo is actually broken:
+      # tests/ tracked in git but no tests/run_js_tests.sh, i.e. a
+      # half-committed corpus — "absent when tests are expected".
+      - name: JS test suite (local-only corpus — skips LOUDLY, never silently)
+        run: |
+          set -euo pipefail
+          tracked="$(git ls-files tests/ | wc -l | tr -d ' ')"
+          if [ -f tests/run_js_tests.sh ]; then
+            echo "JS corpus present ($tracked tracked file(s) under tests/) — running the suite."
+            make test
+          elif [ "$tracked" -ne 0 ]; then
+            echo "::error title=JS suite broken::tests/ has $tracked tracked file(s) but no tests/run_js_tests.sh — the corpus is half-committed. Refusing to report green."
+            exit 1
+          else
+            note="JS test suite NOT RUN — /tests/ is gitignored (.gitignore:143) and git tracks 0 files there, so this checkout has no runner. A green build here does NOT mean the JS corpus passed; run 'make test' locally."
+            echo "::warning title=JS suite skipped::${note}"
+            summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+            {
+              echo "### :warning: JS test suite skipped"
+              echo ""
+              echo "${note}"
+            } >> "$summary"
+          fi
 
       # ── R3: determinism gate (SPEC-RUNTIME-CONTRACT §4) ──────────
       # The receipt schema is validated on every push, then the committed

@@ -97,6 +97,15 @@ fn print_help() {
     println!("  sofuu plugin init <name> Scaffold a plugin (--category=tool|service|...)");
     println!("  sofuu dev [dir]          Start AI-native full-stack dev server (--port, --host, --model)");
     println!("  sofuu serve --brain <path>   Serve the brain over HTTP (--port, --host, --token)");
+    /* W7 (QTSQ_UPGRADE_PLAN): the storage engine shipped with no CLI. These
+     * sit beside `serve` because they operate on the same file, and
+     * `sofuu brain --help` documents every one of them. */
+    println!("  sofuu brain verify <path>    Full scrub: manifest, segments, digests (--json)");
+    println!("  sofuu brain repair <path>    Quarantine what is torn, keep what verifies");
+    println!("  sofuu brain stats <path>     Records, segments, generations, recovery counters");
+    println!("  sofuu brain backup <src> <dst>  Hardlink snapshot of the sealed segments");
+    println!("  sofuu brain restore <b> <dst>   Rebuild a brain from a backup");
+    println!("  sofuu brain migrate <path>   Convert a v1 flat brain to the segmented store");
     println!("  sofuu infer <model.gguf> \"<prompt>\" Fast on-device CPU inference on GGUF models");
     println!("  sofuu swarm worker|leader   Distributed edge swarm cluster over LAN (layer pipelining)");
     println!("  sofuu doctor             Health check: QTSQ, brain round-trip, ctx resolution");
@@ -235,6 +244,9 @@ fn print_subcommand_help(cmd: &str) -> bool {
              Run the built-in conformance checks against this binary.\n"
         ),
         "swarm" => print_swarm_help(),
+        /* W7: `sofuu brain --help` — the module owns the page so the
+         * subcommand list can never drift from the parser. */
+        "brain" => sofuu_core::brain_cmd::print_help(),
         "version" | "licenses" | "help" => print_help(),
         _ => return false,
     }
@@ -3390,6 +3402,54 @@ fn main() -> ExitCode {
             }
         }
         "swarm" => cmd_swarm(&args),
+        "brain" => {
+            /* W7: `sofuu brain …`. Only `migrate` needs the JS engine (the
+             * runtime's own open→flush conversion); verify/repair/stats/
+             * backup/restore are pure storage tooling, so the runtime is
+             * built on first use and a `--help` or a usage error never pays
+             * for it. */
+            let mut engine: Option<SofuuRuntime> = None;
+            let mut eval = |script: &str| -> Result<String, String> {
+                if engine.is_none() {
+                    engine = SofuuRuntime::init();
+                }
+                let rt = engine
+                    .as_ref()
+                    .ok_or_else(|| "runtime init failed".to_string())?;
+                let ctx = rt.engine_ctx() as *mut sofuu_ffi::qjs::JSContext;
+                if ctx.is_null() {
+                    return Err("the runtime has no engine context".to_string());
+                }
+                let rc = rt.eval_string(script, "<brain-migrate>");
+                unsafe {
+                    let global = sofuu_ffi::qjs::sofuu_js_get_global_object(ctx);
+                    let v = sofuu_ffi::qjs::sofuu_js_get_property_str(
+                        ctx,
+                        global,
+                        c"__brainReport".as_ptr(),
+                    );
+                    let cstr = sofuu_ffi::qjs::sofuu_js_to_cstring(ctx, v);
+                    let out = if cstr.is_null() {
+                        String::new()
+                    } else {
+                        std::ffi::CStr::from_ptr(cstr).to_string_lossy().into_owned()
+                    };
+                    if !cstr.is_null() {
+                        sofuu_ffi::qjs::sofuu_js_free_cstring(ctx, cstr);
+                    }
+                    sofuu_ffi::qjs::sofuu_js_free_value(ctx, v);
+                    sofuu_ffi::qjs::sofuu_js_free_value(ctx, global);
+                    if rc != 0 {
+                        return Err("the migration script threw".to_string());
+                    }
+                    if out.is_empty() {
+                        return Err("the migration script left no report".to_string());
+                    }
+                    Ok(out)
+                }
+            };
+            ExitCode::from(sofuu_core::brain_cmd::run(&args, &mut eval))
+        }
         _ => {
             eprintln!("\x1b[31mError:\x1b[0m Unknown command '{}'\nRun 'sofuu help' for usage.\x1b[0m", cmd);
             ExitCode::FAILURE

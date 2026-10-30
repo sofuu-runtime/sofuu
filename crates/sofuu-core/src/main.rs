@@ -1617,7 +1617,19 @@ fn print_compile_report(r: &sofuu_core::compiler::CompileReport) {
         if r.stripped { "stripped " } else { "unstripped " },
         if r.signed { "ad-hoc signed" } else { "unsigned" }
     );
-    println!("\x1b[90mRun with: ./{}\x1b[0m", r.output);
+    println!("\x1b[90mRun with: {}\x1b[0m", artifact_run_hint(&r.output));
+}
+
+/// How to tell the user to launch the artifact they just compiled.
+///
+/// `./name` only makes sense for a bare file name: an absolute path or one
+/// that already carries a directory component is printed as itself, so the
+/// old unconditional `./` prefix no longer produces `.//abs/path`.
+fn artifact_run_hint(path: &str) -> String {
+    match std::path::Path::new(path).parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => path.to_string(),
+        _ => format!("./{path}"),
+    }
 }
 
 /// `sofuu repl` — JavaScript evaluation REPL (delegates to C for now).
@@ -4050,5 +4062,22 @@ fn cmd_swarm(args: &[String]) -> ExitCode {
             eprintln!("\x1b[31mUnknown swarm subcommand '{}'\x1b[0m. Run 'sofuu swarm' for usage.", subcmd);
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod artifact_run_hint_tests {
+    use super::artifact_run_hint;
+
+    #[test]
+    fn paths_with_a_directory_print_as_themselves() {
+        assert_eq!(artifact_run_hint("/tmp/agent"), "/tmp/agent");
+        assert_eq!(artifact_run_hint("dist/agent"), "dist/agent");
+        assert_eq!(artifact_run_hint("./agent"), "./agent");
+    }
+
+    #[test]
+    fn a_bare_file_name_gets_the_dot_slash() {
+        assert_eq!(artifact_run_hint("agent"), "./agent");
     }
 }

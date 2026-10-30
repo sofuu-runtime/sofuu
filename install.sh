@@ -24,6 +24,14 @@ else
 fi
 BINARY="sofuu"
 
+# ── Release signature (R7.P4) ─────────────────────────────────
+# Published minisign public key for SHA256SUMS. An empty value means no key
+# has been published yet: this script then says so and installs on the
+# SHA-256 checksum alone. Set this to the base64 "RW…" key to turn signature
+# verification ON — after that, a missing signature or tool is a hard failure,
+# not a warning. NEVER paste a private key here.
+SOFUU_MINISIGN_PUBKEY=""
+
 # ── Detect platform ───────────────────────────────────────────
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
@@ -78,6 +86,50 @@ else
     exit 1
 fi
 cd -
+
+# ── Verify the signed manifest (R7.P4) ────────────────────────
+# Fail-closed once a key is published: a missing SHA256SUMS, a missing
+# signature, a missing minisign, or a bad signature all abort the install.
+# With no key published the script states that plainly instead of implying
+# a verification that did not happen.
+if [ -n "$SOFUU_MINISIGN_PUBKEY" ]; then
+    echo "→ Verifying release signature..."
+    command -v minisign > /dev/null 2>&1 || {
+        echo "✗ minisign is required to verify this release — install it (brew install minisign / apt install minisign)." >&2
+        exit 1
+    }
+    if ! curl -fsSL "${BASE_URL}/SHA256SUMS" -o "${TMP_DIR}/SHA256SUMS"; then
+        echo "✗ signed manifest SHA256SUMS is missing for this release — refusing." >&2
+        exit 1
+    fi
+    if ! curl -fsSL "${BASE_URL}/SHA256SUMS.minisig" -o "${TMP_DIR}/SHA256SUMS.minisig"; then
+        echo "✗ signature SHA256SUMS.minisig is missing for this release — refusing." >&2
+        exit 1
+    fi
+    minisign -Vm "${TMP_DIR}/SHA256SUMS" -P "$SOFUU_MINISIGN_PUBKEY" \
+        -x "${TMP_DIR}/SHA256SUMS.minisig" > /dev/null || {
+        echo "✗ Release signature does not verify — refusing to install." >&2
+        exit 1
+    }
+    SIGNED_LINE=$(grep -E "[[:space:]]\*?${ARCHIVE_NAME}\$" "${TMP_DIR}/SHA256SUMS" | head -1 || true)
+    [ -n "$SIGNED_LINE" ] || {
+        echo "✗ Signed manifest does not list ${ARCHIVE_NAME} — refusing." >&2
+        exit 1
+    }
+    SIGNED_HASH=$(printf '%s\n' "$SIGNED_LINE" | cut -d' ' -f1)
+    if command -v sha256sum > /dev/null 2>&1; then
+        ACTUAL=$(sha256sum "${TMP_DIR}/${ARCHIVE_NAME}" | cut -d' ' -f1)
+    else
+        ACTUAL=$(shasum -a 256 "${TMP_DIR}/${ARCHIVE_NAME}" | cut -d' ' -f1)
+    fi
+    if [ "$ACTUAL" != "$SIGNED_HASH" ]; then
+        echo "✗ Archive hash does not match the SIGNED manifest — refusing." >&2
+        exit 1
+    fi
+    echo "→ Release signature verified."
+else
+    echo "→ Signature: no public key published yet — SHA-256 checksum only."
+fi
 
 # ── Sanity-check archive members ──────────────────────────────
 # P3 (AUDIT-2026-09-07): extraction used to run on whatever the tarball

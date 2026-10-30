@@ -322,17 +322,21 @@ fn policy_from_args(args: &[String]) -> Result<serde_json::Value, String> {
             return serde_json::from_str(&raw).map_err(|e| format!("{path} is not valid JSON: {e}"));
         }
     }
-    Ok(serde_json::json!({}))
+    /* No explicit file: answer under the policy that is actually in force at
+     * boot (user then project layers), so `why` and the runtime cannot
+     * disagree. An invalid on-disk policy is an error, not "no policy". */
+    sofuu_core::rt::policy::layered_policy_from_disk()
 }
 
 /// `sofuu policy check <file>` — evaluate the probe set, print each rule id.
 pub fn policy(_rt: &SofuuRuntime, args: &[String]) -> i32 {
     match args.get(2).map(|s| s.as_str()).unwrap_or("") {
+        "init" => policy_init(args),
         "check" => {
             let path = match args.get(3) {
                 Some(p) if !p.starts_with("--") => p.clone(),
                 _ => {
-                    eprintln!("Usage: sofuu policy check <policy.json>");
+                    eprintln!("Usage: sofuu policy check <policy.json | script.ts> [--policy <file>]");
                     return 1;
                 }
             };
@@ -343,6 +347,14 @@ pub fn policy(_rt: &SofuuRuntime, args: &[String]) -> i32 {
                     return 1;
                 }
             };
+            /* Two modes, one command: a policy DOCUMENT is validated with the
+             * probe set (the historical behaviour, exit 0); a SCRIPT is
+             * audited against the active policy and exits non-zero when a
+             * requirement would be denied, so CI can gate on it. */
+            let is_document = path.ends_with(".json") || raw.trim_start().starts_with('{');
+            if !is_document {
+                return policy_audit(args, &path, &raw, false);
+            }
             let policy: serde_json::Value = match serde_json::from_str::<serde_json::Value>(&raw) {
                 Ok(v) if v.is_object() => v,
                 Ok(_) => {
@@ -382,6 +394,24 @@ pub fn policy(_rt: &SofuuRuntime, args: &[String]) -> i32 {
                 println!("  {:<38} {:<16} {}", label, colored, rule);
             }
             println!("\x1b[90m  {denied} of {total} probes denied\x1b[0m");
+            0
+        }
+        "dry-run" => {
+            let path = match args.get(3) {
+                Some(p) if !p.starts_with("--") => p.clone(),
+                _ => {
+                    eprintln!("Usage: sofuu policy dry-run <script.ts> [--policy <file>]");
+                    return 1;
+                }
+            };
+            let raw = match std::fs::read_to_string(&path) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("Error: cannot read {path}: {e}");
+                    return 1;
+                }
+            };
+            policy_audit(args, &path, &raw, true);
             0
         }
         "why" => {
@@ -425,8 +455,574 @@ pub fn policy(_rt: &SofuuRuntime, args: &[String]) -> i32 {
             0
         }
         _ => {
-            eprintln!("Usage: sofuu policy <check <file>|why <op> [key=value …]>");
+            eprintln!("Usage: sofuu policy <init|check|dry-run|why>");
+            eprintln!("  sofuu policy init [--profile default|strict|offline] [--force] [--global] [--print]");
+            eprintln!("  sofuu policy check <policy.json | script.ts> [--policy <file>] [--json]");
+            eprintln!("  sofuu policy dry-run <script.ts> [--policy <file>]");
+            eprintln!("  sofuu policy why <op> [key=value …] [--policy <file>]");
             1
         }
+    }
+}
+
+/* ── R7.P3: policy init / static audit / dry-run ─────────────────── */
+
+/// The destructive-command list the `default` and `offline` profiles ship.
+/// Full-command globs (rt::policy::glob_match), so they are patterns over the
+/// command STRING — a best-effort floor, not a shell parser. `shell.enabled:
+/// false` is the real switch.
+const SHELL_DENY_DEFAULT: &[&str] = &[
+    "rm -rf *",
+    "rm -fr *",
+    "rm -r /*",
+    "mkfs*",
+    "dd if=*of=/dev/*",
+    "shutdown*",
+    "reboot*",
+    "chmod -R 777 /*",
+    "git push --force*",
+    "git reset --hard*",
+];
+
+fn policy_file_path(global: bool) -> PathBuf {
+    if global {
+        let home = sofuu_core::embed_config::home_dir().unwrap_or_else(|| ".".into());
+        PathBuf::from(home).join(".sofuu").join("policy.json")
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".sofuu")
+            .join("policy.json")
+    }
+}
+
+/// The three shipped profiles. `roots` is the ABSOLUTE project directory as
+/// it is at generation time: the evaluator compares lexically, so a relative
+/// root would only match paths spelled with that same prefix. Regenerate the
+/// file if the project moves.
+fn policy_profile(name: &str) -> Option<serde_json::Value> {
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)))
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".".into());
+    let deny = serde_json::json!(SHELL_DENY_DEFAULT);
+    Some(match name {
+        "default" => serde_json::json!({
+            "_notes": [
+                "Sofuu R7 policy — project scope. Generated by `sofuu policy init`.",
+                "fs.roots confines filesystem access to this project (regenerate if it moves).",
+                "shell.deny blocks destructive command patterns; it is best-effort.",
+                "approval.mode: per-run — each driver's own gate."
+            ],
+            "fs": { "roots": [cwd] },
+            "shell": { "enabled": true, "deny": deny },
+            "approval": { "mode": "per-run" }
+        }),
+        "strict" => serde_json::json!({
+            "_notes": [
+                "Sofuu R7 policy — strict. Generated by `sofuu policy init --profile strict`.",
+                "Filesystem is read-only and confined to this project.",
+                "Shell is disabled for every surface (equivalent to SOFUU_NO_SHELL=1).",
+                "Outbound network is OFF. To permit specific hosts, replace",
+                "`net: {enabled: false}` with `net: {allow: [\"host.example\"]}`.",
+                "Every tool call asks for approval."
+            ],
+            "fs": { "roots": [cwd], "write": "off" },
+            "shell": { "enabled": false },
+            "net": { "enabled": false },
+            "approval": { "mode": "always" }
+        }),
+        "offline" => serde_json::json!({
+            "_notes": [
+                "Sofuu R7 policy — offline. Generated by `sofuu policy init --profile offline`.",
+                "Network is completely disabled (net.enabled: false).",
+                "Filesystem is confined to this project; shell keeps its destructive-command floor."
+            ],
+            "fs": { "roots": [cwd] },
+            "net": { "enabled": false },
+            "shell": { "enabled": true, "deny": deny }
+        }),
+        _ => return None,
+    })
+}
+
+/// `sofuu policy init [--profile <p>] [--force] [--global] [--print]`
+fn policy_init(args: &[String]) -> i32 {
+    let mut profile = "default";
+    let mut force = false;
+    let mut global = false;
+    let mut print_only = false;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--profile" | "-p" => match args.get(i + 1) {
+                Some(p) => {
+                    profile = p.as_str();
+                    i += 2;
+                    continue;
+                }
+                None => {
+                    eprintln!("Error: --profile needs a value (default|strict|offline)");
+                    return 1;
+                }
+            },
+            other if other.starts_with("--profile=") => {
+                profile = &other["--profile=".len()..];
+            }
+            "--force" | "-f" => force = true,
+            "--global" | "-g" => global = true,
+            "--print" => print_only = true,
+            other => {
+                eprintln!("Error: unknown argument '{other}'");
+                return 1;
+            }
+        }
+        i += 1;
+    }
+    let Some(doc) = policy_profile(profile) else {
+        eprintln!("Error: unknown profile '{profile}' (want default, strict or offline)");
+        return 1;
+    };
+    let body = match serde_json::to_string_pretty(&doc) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return 1;
+        }
+    };
+    if print_only {
+        println!("{body}");
+        return 0;
+    }
+    let path = policy_file_path(global);
+    if path.exists() && !force {
+        eprintln!(
+            "Error: {} already exists — pass --force to overwrite it",
+            path.display()
+        );
+        return 1;
+    }
+    if let Some(dir) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("Error: cannot create {}: {e}", dir.display());
+            return 1;
+        }
+    }
+    if let Err(e) = std::fs::write(&path, body.as_bytes()) {
+        eprintln!("Error: cannot write {}: {e}", path.display());
+        return 1;
+    }
+    println!("\x1b[32m✓\x1b[0m wrote {} ({profile} profile)", path.display());
+    let roots = doc
+        .get("fs")
+        .and_then(|v| v.get("roots"))
+        .and_then(|v| v.get(0))
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+    match profile {
+        "default" => {
+            println!("  fs    confined to {roots}");
+            println!("  shell destructive commands blocked (best-effort) · approvals per-run");
+        }
+        "strict" => {
+            println!("  fs    read-only, confined to {roots}");
+            println!("  shell disabled · net OFF · every tool call asks");
+        }
+        _ => {
+            println!("  fs    confined to {roots}");
+            println!("  net   OFF · shell keeps its destructive-command floor");
+        }
+    }
+    println!("\x1b[90m  inspect with `sofuu policy check {path}`\x1b[0m", path = path.display());
+    0
+}
+
+/// One capability the script asks for, already turned into an evaluator
+/// request.
+struct Finding {
+    op: &'static str,
+    target: String,
+    req: serde_json::Value,
+}
+
+/// Strip `//` and `/* */` comments while preserving strings (a URL in a
+/// comment is not a requirement; a URL in a string is).
+fn strip_comments(src: &str) -> String {
+    let b: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+    while i < b.len() {
+        let c = b[i];
+        if let Some(q) = quote {
+            out.push(c);
+            if c == '\\' && i + 1 < b.len() {
+                out.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => {
+                quote = Some(c);
+                out.push(c);
+                i += 1;
+            }
+            '/' if i + 1 < b.len() && b[i + 1] == '/' => {
+                while i < b.len() && b[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < b.len() && b[i + 1] == '*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == '*' && b[i + 1] == '/') {
+                    if b[i] == '\n' {
+                        out.push('\n');
+                    }
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            }
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The first quoted literal after `from`, if any (single, double or backtick).
+fn literal_after(src: &str, from: usize) -> Option<String> {
+    let rest = &src[from.min(src.len())..];
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] != b'"' && bytes[i] != b'\'' && bytes[i] != b'`' {
+        /* Stop at the end of the call/statement: a literal belonging to the
+         * NEXT call is not this call's argument. */
+        if matches!(bytes[i], b')' | b';' | b'\n' | b'[' | b']' | b'{' | b'}' | b'=') {
+            return None;
+        }
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let q = bytes[i];
+    let start = i + 1;
+    let mut j = start;
+    while j < bytes.len() && bytes[j] != q && bytes[j] != b'\n' {
+        j += 1;
+    }
+    (j > start).then(|| rest[start..j].to_string())
+}
+
+fn push_unique(out: &mut Vec<Finding>, seen: &mut std::collections::HashSet<String>, f: Finding) {
+    let key = format!("{}\u{0}{}", f.op, f.target);
+    if seen.insert(key) {
+        out.push(f);
+    }
+}
+
+/// The static scanner. Deliberately lexical: it reports what the SOURCE asks
+/// for (calls, literals, `process.env` reads) and lets the one evaluator
+/// answer. Dynamic targets are reported as `<dynamic>` and judged as such —
+/// the runtime still enforces them per call.
+fn scan_source(src: &str) -> Vec<Finding> {
+    let s = strip_comments(src);
+    let mut out: Vec<Finding> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    /* URLs → net.fetch. Covers fetch(), sofuu.http.request and bare literals. */
+    for scheme in ["https://", "http://"] {
+        let mut at = 0;
+        while let Some(rel) = s[at..].find(scheme) {
+            let start = at + rel;
+            let tail = &s[start + scheme.len()..];
+            let end = tail
+                .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ')' | ']' | '}' | ',' | ';'))
+                .unwrap_or(tail.len());
+            let authority = &tail[..end];
+            let host = authority.split('/').next().unwrap_or(authority);
+            if !host.is_empty() {
+                push_unique(
+                    &mut out,
+                    &mut seen,
+                    Finding {
+                        op: "net.fetch",
+                        target: host.to_string(),
+                        req: serde_json::json!({"op":"net.fetch","host":host}),
+                    },
+                );
+            }
+            at = start + scheme.len();
+        }
+    }
+    for needle in ["fetch(", "sofuu.http.request(", "http.request("] {
+        if let Some(pos) = s.find(needle) {
+            let has_host = out.iter().any(|f| f.op == "net.fetch");
+            if !has_host {
+                let host = literal_after(&s, pos + needle.len()).unwrap_or_else(|| "<dynamic>".into());
+                let host = host
+                    .trim_start_matches("https://")
+                    .trim_start_matches("http://")
+                    .split('/')
+                    .next()
+                    .unwrap_or(&host)
+                    .to_string();
+                push_unique(
+                    &mut out,
+                    &mut seen,
+                    Finding {
+                        op: "net.fetch",
+                        target: host.clone(),
+                        req: serde_json::json!({"op":"net.fetch","host":host}),
+                    },
+                );
+            }
+        }
+    }
+
+    /* Filesystem APIs → fs.read / fs.write. */
+    let read_apis = [
+        "readFile(", "readFileSync(", "readFileBytes(", "readdir(", "readdirSync(",
+        "listDir(", "exists(", "existsSync(", "stat(", "statSync(",
+    ];
+    let write_apis = [
+        "writeFile(", "writeFileSync(", "appendFile(", "appendFileSync(", "mkdir(",
+        "mkdirSync(", "rm(", "rmSync(", "unlink(", "unlinkSync(", "rename(", "renameSync(",
+        "copyFile(",
+    ];
+    for (apis, op) in [(read_apis.as_slice(), "fs.read"), (write_apis.as_slice(), "fs.write")] {
+        for api in apis {
+            let mut at = 0;
+            while let Some(rel) = s[at..].find(api) {
+                let pos = at + rel;
+                at = pos + api.len();
+                /* Only a call that names a filesystem object; JSON.parse and
+                 * friends share substrings but not the receiver. */
+                let before = &s[..pos];
+                let receiver = before.trim_end().rsplit(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.')).next().unwrap_or("");
+                if !(receiver.ends_with("fs.") || receiver.ends_with("fs") || receiver.contains("sofuu.fs")) {
+                    continue;
+                }
+                let path = literal_after(&s, at).unwrap_or_else(|| "<dynamic>".into());
+                let mut req = serde_json::json!({"op": op, "path": path});
+                if let Ok(cwd) = std::env::current_dir() {
+                    if !path.starts_with('/') && path != "<dynamic>" {
+                        req = serde_json::json!({
+                            "op": op,
+                            "path": cwd.join(&path).to_string_lossy(),
+                        });
+                    }
+                }
+                push_unique(&mut out, &mut seen, Finding { op, target: path, req });
+            }
+        }
+    }
+
+    /* Shell execution → shell.run. */
+    for needle in ["sofuu.spawn(", "sofuu.exec(", "shell.run("] {
+        let mut at = 0;
+        while let Some(rel) = s[at..].find(needle) {
+            let pos = at + rel;
+            at = pos + needle.len();
+            let cmd = literal_after(&s, at).unwrap_or_else(|| "<dynamic>".into());
+            push_unique(
+                &mut out,
+                &mut seen,
+                Finding {
+                    op: "shell.run",
+                    target: cmd.clone(),
+                    req: serde_json::json!({"op":"shell.run","command":cmd}),
+                },
+            );
+        }
+    }
+
+    /* MCP → mcp.connect. */
+    if let Some(pos) = s.find("sofuu.mcp.connect(") {
+        let server =
+            literal_after(&s, pos + "sofuu.mcp.connect(".len()).unwrap_or_else(|| "<dynamic>".into());
+        push_unique(
+            &mut out,
+            &mut seen,
+            Finding {
+                op: "mcp.connect",
+                target: server.clone(),
+                req: serde_json::json!({"op":"mcp.connect","server":server}),
+            },
+        );
+    }
+
+    /* Tools → tool.run: TOOLS.<name> and declareTool/defineTool names. */
+    let mut at = 0;
+    while let Some(rel) = s[at..].find("TOOLS.") {
+        let pos = at + rel + "TOOLS.".len();
+        let name: String = s[pos..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        at = pos;
+        if !name.is_empty() {
+            push_unique(
+                &mut out,
+                &mut seen,
+                Finding {
+                    op: "tool.run",
+                    target: name.clone(),
+                    req: serde_json::json!({"op":"tool.run","tool":name}),
+                },
+            );
+        }
+    }
+    if let Some(pos) = s.find("defineTool(") {
+        if let Some(name) = s[pos..].find("name:").and_then(|r| literal_after(&s, pos + r + 5)) {
+            push_unique(
+                &mut out,
+                &mut seen,
+                Finding {
+                    op: "tool.run",
+                    target: name.clone(),
+                    req: serde_json::json!({"op":"tool.run","tool":name}),
+                },
+            );
+        }
+    }
+
+    /* Environment reads are informational: no policy op gates them, but an
+     * env read next to a network call is the exfiltration shape an operator
+     * wants to see. */
+    let mut at = 0;
+    while let Some(rel) = s[at..].find("process.env.") {
+        let pos = at + rel + "process.env.".len();
+        let name: String = s[pos..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        at = pos;
+        if !name.is_empty() && !name.starts_with("NA") {
+            push_unique(
+                &mut out,
+                &mut seen,
+                Finding {
+                    op: "env.read",
+                    target: name.clone(),
+                    req: serde_json::json!({"op":"env.read","name":name}),
+                },
+            );
+        }
+    }
+
+    out
+}
+
+/// The audit shared by `policy check <script>` and `policy dry-run <script>`.
+fn policy_audit(args: &[String], path: &str, raw: &str, dry_run: bool) -> i32 {
+    let policy = match policy_arg(args) {
+        Some(p) => {
+            let text = match std::fs::read_to_string(&p) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("Error: cannot read {p}: {e}");
+                    return 1;
+                }
+            };
+            match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(v) if v.is_object() => v,
+                Ok(_) => {
+                    eprintln!("Error: {p} must contain a JSON object");
+                    return 1;
+                }
+                Err(e) => {
+                    eprintln!("Error: {p} is not valid JSON: {e}");
+                    return 1;
+                }
+            }
+        }
+        None => match sofuu_core::rt::policy::layered_policy_from_disk() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Error: {e}");
+                return 1;
+            }
+        },
+    };
+    let findings = scan_source(raw);
+    let want_json = args.iter().any(|a| a == "--json");
+
+    let mut rows: Vec<(String, String, String, String, String)> = Vec::new();
+    let mut denied = 0usize;
+    for f in &findings {
+        let d = sofuu_core::rt::policy::evaluate(&f.req, &policy);
+        let dec = d.get("decision").and_then(|v| v.as_str()).unwrap_or("allow").to_string();
+        let rule = d.get("rule").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let reason = d.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if dec == "deny" {
+            denied += 1;
+        }
+        rows.push((f.op.to_string(), f.target.clone(), dec, rule, reason));
+    }
+
+    if want_json {
+        let arr: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(op, target, dec, rule, reason)| {
+                serde_json::json!({"op":op,"target":target,"decision":dec,"rule":rule,"reason":reason})
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_else(|_| "[]".into()));
+        return if !dry_run && denied > 0 { 1 } else { 0 };
+    }
+
+    if dry_run {
+        for (op, target, dec, rule, reason) in &rows {
+            let tag = match dec.as_str() {
+                "deny" => "\x1b[31mDENY \x1b[0m",
+                "ask" => "\x1b[33mASK  \x1b[0m",
+                _ => "\x1b[32mALLOW\x1b[0m",
+            };
+            let suffix = if dec == "deny" {
+                format!(" — would fail closed ({reason})")
+            } else {
+                String::new()
+            };
+            println!("[POLICY DRY-RUN] {tag} {op:<12} -> {target} ({rule}){suffix}");
+        }
+        println!(
+            "\x1b[90m  {} requirement(s), {denied} would be denied. Static audit: the script was NOT executed.\x1b[0m",
+            rows.len()
+        );
+        return 0;
+    }
+
+    println!("\x1b[1msofuu policy check\x1b[0m — {path} (static audit)");
+    for (op, target, dec, rule, _reason) in &rows {
+        let colored = match dec.as_str() {
+            "deny" => "\x1b[31mdeny\x1b[0m",
+            "ask" => "\x1b[33mask\x1b[0m",
+            _ => "allow",
+        };
+        println!("  {:<12} {:<32} {:<16} {}", op, target, colored, rule);
+    }
+    let source = if policy_arg(args).is_some() {
+        policy_arg(args).unwrap_or_default()
+    } else {
+        "~/.sofuu/policy.json + .sofuu/policy.json".to_string()
+    };
+    println!(
+        "\x1b[90m  {} requirement(s) · {denied} denied · policy: {source}\x1b[0m",
+        rows.len()
+    );
+    if denied > 0 {
+        1
+    } else {
+        0
     }
 }

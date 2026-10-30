@@ -4,6 +4,53 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## R7 security firewall: honest threat model, hardened FFI, policy DX, supply chain — 2026-10-30
+
+The R7 evaluator already existed; this pass makes it *verifiable* and closes
+the gaps an independent review found.
+
+**Trust documents.** `THREAT_MODEL.md` states what R7 does and — explicitly —
+what it does not: plugins and sandbox bridges are trusted code, prompt
+injection can still cause *allowed* actions, SSRF guards are layered and
+configurable per surface, redaction is key-based, symlink TOCTOU remains.
+`SECURITY.md` gains scope, response SLAs, an honest "no PGP key published yet"
+statement and a no-bounty statement. The landing page's "preventing agent
+hallucination escapes" claim is replaced with what the evaluator actually
+guarantees, and its sandbox snippet now shows the real `sofuu.sandbox.run`
+options (the old example had invented `fs`/`net` keys).
+
+**FFI/SIMD boundary (`rt/view_guard.rs`).** One validator re-derives every
+`Float32Array` window before a pointer reaches a kernel: 4-byte alignment,
+`offset + length ≤ buffer size` with checked arithmetic, and an optional exact
+dimension. `sofuu.ai.similarity/dot/l2` (`rt/ai.rs::extract_f32`) and the
+memory/kv lane (`rt/memory.rs::cma_vec_view|arg`) now both go through it;
+zero-length views are accepted on the vector path and refused, with a coded
+error, where a bare pointer would read as "already threw". A new cargo-fuzz
+target (`fuzz_simd_bridge`) asserts the accepted window is always a subset of
+the buffer, and `.github/workflows/asan.yml` runs the boundary + policy tests
+and a fuzz smoke under AddressSanitizer on Linux nightly.
+
+**Policy DX.** `sofuu policy init [--profile default|strict|offline]` writes a
+profile (absolute project root, atomic refusal to overwrite without `--force`);
+`policy check <script>` statically audits fetch/fs/shell/env/process.env/MCP
+requirements against the active policy and exits non-zero on a denial (a
+`.json` argument still runs the historical probe table); `policy dry-run`
+prints the would-be decisions; `policy why` now answers under the layered
+on-disk policy instead of an empty one. Two evaluator keys were added:
+`shell.deny` (full-command globs, checked before `shell.allow`) and
+`net.enabled` (the `--no-net` floor). `sofuu run` and `sofuu chat` accept
+`--read-only`, `--no-net`, `--confirm-all`; `run` accepts `--policy` for the
+first time. `scripts/stress/policy_dx_e2e.sh` (25 gates) proves each flag at
+the real gate, not just in the evaluator.
+
+**Supply chain.** `scripts/sbom.py` emits a CycloneDX 1.5 SBOM from
+`cargo metadata` (stdlib only, 500+ components with licences) and
+`make sbom` writes it to `dist/`; the release workflow validates and attaches
+it. `scripts/sign_release.sh` signs `SHA256SUMS` with minisign and verifies
+its own output against the published key; `install.sh` verifies the signed
+manifest before unpacking — but only once a public key is published. Until
+then it says so out loud, and no unsigned signature file is ever emitted.
+
 ## Boot latency: HTTP initialization moved to the first request — 2026-10-30
 
 With the GPU probe gone, the largest item left in engine boot was libcurl.

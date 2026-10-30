@@ -897,12 +897,67 @@ export interface SofuuMcp {
 
 /** The policy evaluator (Shield 2 reads the deny decision). */
 export interface SofuuPolicy {
-  /** JSON string: { decision: 'allow' | 'deny', reason?: string }. */
+  /** JSON string: { decision: 'allow' | 'deny' | 'ask', rule, reason }. */
   evaluate(request: Record<string, unknown>): string;
   get?(): string;
   set?(json: string): boolean;
   load?(file: string): boolean;
   secret?(name: string): string | undefined;
+  [extension: string]: unknown;
+}
+
+/**
+ * The policy document one evaluator reads on every surface (SPEC R7).
+ * Every key is optional; an absent key means "no rule", never "deny" —
+ * except where noted. Each refusal carries the rule id it fired on.
+ *
+ * Profiles: `sofuu policy init --profile default|strict|offline`.
+ * Audit a script against the document: `sofuu policy check <script>`.
+ */
+export interface SofuuPolicyDocument {
+  tools?: {
+    /** Empty/absent = all allowed. Glob patterns accepted. R7.6/tools.allow */
+    allow?: string[];
+    /** Deny wins over allow. R7.6/tools.deny */
+    deny?: string[];
+  };
+  shell?: {
+    /** false blocks every shell interpreter on every surface. R7.6/shell.enabled */
+    enabled?: boolean;
+    /** Full-command globs; checked before allow. R7.6/shell.deny */
+    deny?: string[];
+    /** When non-empty, only matching commands run. R7.6/shell.allow */
+    allow?: string[];
+  };
+  fs?: {
+    /** Read and write are confined here (canonicalised). R7.6/fs.roots */
+    roots?: string[];
+    /** 'off' | 'any' | 'workspace' | 'allowlist'. R7.6/fs.read */
+    read?: string | string[] | boolean;
+    /** 'off' makes the tree read-only. R7.6/fs.write */
+    write?: string | string[] | boolean;
+  };
+  net?: {
+    /** false denies every outbound request (`--no-net`). R7.1/net.enabled */
+    enabled?: boolean;
+    /** Host suffix patterns; deny wins. R7.1/net.allow / R7.1/net.deny */
+    allow?: string[];
+    deny?: string[];
+  };
+  http?: {
+    /** Path prefixes refused by `sofuu serve` with 403. R7.6/http.deny */
+    deny?: string[];
+  };
+  mcp?: {
+    servers?: {
+      /** When non-empty, only these servers may connect. R7.7/mcp.allow */
+      allow?: string[];
+    };
+  };
+  approval?: {
+    /** 'always' asks for every tool call; 'never' runs unprompted. R7.4/approval.mode */
+    mode?: 'always' | 'never' | 'per-run';
+  };
   [extension: string]: unknown;
 }
 

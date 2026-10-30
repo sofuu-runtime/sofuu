@@ -137,7 +137,7 @@ fn print_help() {
     println!("\n\x1b[1mProtocol commands (run as `sofuu <command>`):\x1b[0m");
     println!("  capabilities             Print the runtime capability manifest as JSON");
     println!("  tools list               List the tools the active policy allows (--json)");
-    println!("  policy check|why         Validate a policy file / explain an allow-or-deny");
+    println!("  policy init|check|dry-run|why  Write a profile, audit a script, explain a rule");
     println!("  mcp list|test|add|remove Manage MCP servers and inspect their tools");
     println!("\n\x1b[1mChat commands (inside the chat UI):\x1b[0m");
     /* P3 (AUDIT-2026-09-07): /models was deliberately removed (unknown
@@ -240,9 +240,20 @@ fn print_subcommand_help(cmd: &str) -> bool {
              List the tools the active policy allows, with schemas.\n"
         ),
         "policy" => println!(
-            "Usage: sofuu policy check <policy.json>\n\
+            "Usage: sofuu policy init [--profile default|strict|offline] [--force] [--global] [--print]\n\
+                    sofuu policy check <policy.json | script.ts> [--policy <file>] [--json]\n\
+                    sofuu policy dry-run <script.ts> [--policy <file>]\n\
                     sofuu policy why <op> [key=value …] [--policy <file>]\n\n\
-             Validate a policy file, or explain why an operation is allowed/denied.\n"
+             init    write .sofuu/policy.json (refuses to overwrite without --force)\n\
+             check   validate a policy document, or statically audit a script's\n\
+                     fetch/fs/shell/env/MCP requirements against the active policy\n\
+             dry-run print each requirement the script implies and the would-be\n\
+                     decision (static: the script is not executed)\n\
+             why     explain one operation\n\n\
+             Guard flags accepted by `sofuu run` and `sofuu chat`:\n\
+               --read-only    fs.write off + shell disabled\n\
+               --no-net       outbound network denied\n\
+               --confirm-all  approval.mode always\n"
         ),
         "mcp" => println!(
             "Usage: sofuu mcp list\n\
@@ -680,14 +691,121 @@ pub(crate) fn apply_policy_file(rt: &SofuuRuntime, path: &str) -> Result<(), Str
     if !v.is_object() {
         return Err(format!("--policy {path}: must be a JSON object"));
     }
-    let json = serde_json::to_string(&v).map_err(|e| format!("--policy {path}: {e}"))?;
+    apply_policy_value(rt, &v, &format!("--policy {path}"))
+}
+
+/// Install an already-parsed policy document through the runtime's own
+/// `sofuu.policy.set` (one validator for file, flags and JS callers).
+pub(crate) fn apply_policy_value(
+    rt: &SofuuRuntime,
+    doc: &serde_json::Value,
+    label: &str,
+) -> Result<(), String> {
+    let json = serde_json::to_string(doc).map_err(|e| format!("{label}: {e}"))?;
     let code = format!(
         "var __p = sofuu.policy.set({json}); var __o = JSON.parse(__p); if (!__o.ok) throw new Error(__o.error || 'invalid policy');"
     );
-    if rt.eval_string(&code, "<policy-file>") != 0 {
-        return Err(format!("--policy {path}: rejected by the policy parser"));
+    if rt.eval_string(&code, "<policy>") != 0 {
+        return Err(format!("{label}: rejected by the policy parser"));
     }
     Ok(())
+}
+
+/// R7.P3 shortcut flags: `--read-only`, `--no-net`, `--confirm-all`.
+#[derive(Default, Clone, Copy)]
+struct GuardFlags {
+    read_only: bool,
+    no_net: bool,
+    confirm_all: bool,
+}
+
+impl GuardFlags {
+    fn any(self) -> bool {
+        self.read_only || self.no_net || self.confirm_all
+    }
+    /// One line for stderr, so the operator sees the guard took effect.
+    fn describe(self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        if self.read_only {
+            parts.push("read-only (no writes, no shell)");
+        }
+        if self.no_net {
+            parts.push("no-net (outbound denied)");
+        }
+        if self.confirm_all {
+            parts.push("confirm-all (every tool call asks)");
+        }
+        parts.join(" · ")
+    }
+    /// Narrow a policy document. Only ever TIGHTENS: each flag sets a key the
+    /// evaluator treats as a floor, and nothing is removed.
+    fn apply(self, doc: &mut serde_json::Value) {
+        if !doc.is_object() {
+            *doc = serde_json::json!({});
+        }
+        if self.read_only {
+            doc["fs"]["write"] = serde_json::json!("off");
+            doc["shell"]["enabled"] = serde_json::json!(false);
+        }
+        if self.no_net {
+            doc["net"]["enabled"] = serde_json::json!(false);
+        }
+        if self.confirm_all {
+            doc["approval"]["mode"] = serde_json::json!("always");
+        }
+    }
+}
+
+/// Pull the guard flags out of an argument list (long form only, no values).
+/// Deliberately exact — no `--yes`/`--offline` aliases: `--yes` already means
+/// "confirm" inside the chat `/forget` command line, and an alias that is not
+/// in `--help` is a trap for whoever scripts it.
+fn take_guard_flags(args: &[String]) -> (GuardFlags, Vec<String>) {
+    let mut g = GuardFlags::default();
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    for a in args {
+        match a.as_str() {
+            "--read-only" => g.read_only = true,
+            "--no-net" => g.no_net = true,
+            "--confirm-all" => g.confirm_all = true,
+            _ => out.push(a.clone()),
+        }
+    }
+    (g, out)
+}
+
+/// Install the effective policy for a command that accepted `--policy` and
+/// the guard flags: an explicit file (fail closed if unreadable), otherwise
+/// the layered on-disk policy — narrowed by the flags. No file and no flags
+/// leaves the runtime's own boot-time load untouched.
+pub(crate) fn install_command_policy(
+    rt: &SofuuRuntime,
+    policy_path: Option<&str>,
+    guard: GuardFlags,
+) -> Result<(), String> {
+    if policy_path.is_none() && !guard.any() {
+        return Ok(());
+    }
+    let mut doc = match policy_path {
+        Some(p) => {
+            let raw = std::fs::read_to_string(p).map_err(|e| format!("--policy {p}: {e}"))?;
+            let v: serde_json::Value = serde_json::from_str(&raw)
+                .map_err(|e| format!("--policy {p}: not valid JSON: {e}"))?;
+            if !v.is_object() {
+                return Err(format!("--policy {p}: must be a JSON object"));
+            }
+            v
+        }
+        /* Base the flags on what is already in force, so `--no-net` does not
+         * silently discard a layered fs jail. An invalid on-disk policy is an
+         * error rather than a reset to permissive defaults. */
+        None => sofuu_core::rt::policy::layered_policy_from_disk()?,
+    };
+    if guard.any() {
+        eprintln!("\x1b[90m[sofuu] policy guard: {}\x1b[0m", guard.describe());
+        guard.apply(&mut doc);
+    }
+    apply_policy_value(rt, &doc, "command policy")
 }
 
 /// `sofuu agent list` / `sofuu agent run <name> <task…> [--json]` —
@@ -1794,6 +1912,7 @@ fn value_arg(args: &[String], i: usize) -> Option<String> {
 /// Shared body of `sofuu chat ...` and of a bare `sofuu --provider ...`.
 fn run_chat(args: &[String]) -> ExitCode {
     let (policy, clean) = take_policy_arg(args);
+    let (guard, clean) = take_guard_flags(&clean);
     let rt = match SofuuRuntime::init() {
         Some(rt) => rt,
         None => {
@@ -1801,11 +1920,9 @@ fn run_chat(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Some(p) = policy {
-        if let Err(e) = apply_policy_file(&rt, &p) {
-            eprintln!("\x1b[31mError:\x1b[0m {e}");
-            return ExitCode::FAILURE;
-        }
+    if let Err(e) = install_command_policy(&rt, policy.as_deref(), guard) {
+        eprintln!("\x1b[31mError:\x1b[0m {e}");
+        return ExitCode::FAILURE;
     }
     let rc = cmd_chat(&rt, &clean);
     if rc == 0 {
@@ -3408,8 +3525,18 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "run" => {
-            if args.len() < 3 {
+            /* R7.P2/P3: --policy and the shortcut guards are honoured on the
+             * plain script runner too (they used to exist only on chat/agent),
+             * and flags are stripped BEFORE the script path is read so
+             * `sofuu run --read-only x.js` works as well as the trailing
+             * form. */
+            let (policy, clean) = take_policy_arg(&args);
+            let (guard, clean) = take_guard_flags(&clean);
+            if clean.len() < 3 {
                 eprintln!("\x1b[31mError:\x1b[0m 'sofuu run' requires a file argument");
+                eprintln!(
+                    "\x1b[90m  flags: --policy <file> --read-only --no-net --confirm-all\x1b[0m"
+                );
                 return ExitCode::FAILURE;
             }
             let rt = match SofuuRuntime::init() {
@@ -3419,7 +3546,11 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let rc = cmd_run(&rt, &args[2]);
+            if let Err(e) = install_command_policy(&rt, policy.as_deref(), guard) {
+                eprintln!("\x1b[31mError:\x1b[0m {e}");
+                return ExitCode::FAILURE;
+            }
+            let rc = cmd_run(&rt, &clean[2]);
             js_exit_code(&rt, rc)
         }
         "bundle" => {

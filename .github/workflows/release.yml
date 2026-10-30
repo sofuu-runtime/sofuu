@@ -223,9 +223,54 @@ jobs:
       - name: Build checksum manifest
         run: |
           cat dist/*.sha256 > dist/CHECKSUMS.txt
+          # The signed manifest uses one name everywhere (install.sh fetches
+          # ${BASE_URL}/SHA256SUMS + .minisig), so publish both spellings.
+          cp dist/CHECKSUMS.txt dist/SHA256SUMS
           cat dist/CHECKSUMS.txt
 
-      - name: Upload manifest
+      # R7.P4 — SBOM. `cargo metadata` ships with the runner's rustup; the
+      # script is stdlib Python, so no extra tool is installed.
+      - name: Generate CycloneDX SBOM
+        run: |
+          python3 scripts/sbom.py --out dist/sofuu-sbom.json
+          python3 -c "import json;d=json.load(open('dist/sofuu-sbom.json'));assert d['bomFormat']=='CycloneDX' and d['specVersion']=='1.5' and len(d['components'])>0;print('SBOM ok:',len(d['components']),'components')"
+
+      # R7.P4 — signature. Signing needs a minisign secret key in
+      # SOFUU_MINISIGN_SECRET_KEY_SECRET (a base64-encoded key FILE contents).
+      # When the secret is absent the release is published unsigned, with an
+      # annotation — it is NOT silently skipped, and it does not fail the
+      # release: no key has been published yet.
+      - name: Sign the manifest (minisign)
+        id: sign
+        env:
+          KEY_B64: ${{ secrets.SOFUU_MINISIGN_SECRET_KEY_SECRET }}
+          PUBKEY: ${{ vars.SOFUU_MINISIGN_PUBKEY }}
+        run: |
+          if [ -z "$KEY_B64" ]; then
+            echo "::warning::SOFUU_MINISIGN_SECRET_KEY_SECRET is unset — publishing an UNSIGNED manifest."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y minisign
+          umask 077
+          printf '%s' "$KEY_B64" | base64 -d > "$RUNNER_TEMP/sofuu.key"
+          chmod 600 "$RUNNER_TEMP/sofuu.key"
+          SOFUU_MINISIGN_SECRET_KEY="$RUNNER_TEMP/sofuu.key" \
+          SOFUU_MINISIGN_PUBKEY="$PUBKEY" \
+            sh scripts/sign_release.sh dist/SHA256SUMS
+          rm -f "$RUNNER_TEMP/sofuu.key"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload manifest and SBOM
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: dist/CHECKSUMS.txt
+          files: |
+            dist/CHECKSUMS.txt
+            dist/SHA256SUMS
+            dist/sofuu-sbom.json
+
+      - name: Upload signature
+        if: steps.sign.outputs.signed == 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: dist/SHA256SUMS.minisig

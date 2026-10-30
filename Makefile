@@ -37,7 +37,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # ──────────────────────────────────────────────────────────────────
 
 .PHONY: all clean install test protocol-test serve-test c-only size-check bc-check cargo-build sandbox-stress \
-	observability-stress \
+	observability-stress asan fuzz-simd policy-dx sbom sign-dist \
         deps scoreboard scoreboard-check \
         libsofuu libsofuu-linux-x86_64 zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
@@ -157,6 +157,50 @@ plugin-stress-fast: $(TARGET)
 observability-stress: $(TARGET)
 	@./$(TARGET) run scripts/stress/observability_stress.js
 	@bash scripts/stress/observability_e2e.sh
+
+# ── R7.P2: memory-safety gates on the JS→native boundary ─────────
+# asan      — AddressSanitizer run of the validated-view + policy unit
+#             tests. Nightly, -Zbuild-std (needs `rustup component add
+#             rust-src`), host triple. Ubuntu CI runs this in
+#             .github/workflows/asan.yml; macOS cannot inject the ASAN
+#             runtime into rustc while it loads ASAN-built proc-macro
+#             dylibs, so the target explains that instead of failing
+#             with a misleading "Interceptors are not working".
+# fuzz-simd — coverage-guided fuzzing of rt/view_guard (cargo-fuzz).
+asan:
+	@case "$$(uname -s)" in \
+	  Darwin) echo "  ⚠ ASAN on macOS needs the runtime inside rustc for proc macros;"; \
+	          echo "    run the ubuntu job: .github/workflows/asan.yml (make asan works on Linux)."; \
+	          exit 0;; \
+	esac
+	@TRIPLE=$$(rustc -vV | sed -n 's/^host: //p'); \
+	RUSTFLAGS="-Zsanitizer=address" ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 \
+	cargo +nightly test -p sofuu-core --lib -Zbuild-std --target "$$TRIPLE" -- rt::view_guard
+
+fuzz-simd:
+	@if ! cargo +nightly fuzz --version >/dev/null 2>&1; then \
+		echo "  ⚠ cargo-fuzz is not installed: cargo install cargo-fuzz"; exit 1; \
+	fi
+	@cargo +nightly fuzz run --fuzz-dir crates/fuzz fuzz_simd_bridge -- -max_len=64 -timeout=5
+
+# ── R7.P3: policy developer-experience gates ────────────────────
+# init profiles, static audit, dry-run, `why` under the layered policy, and
+# the three guard flags enforced at the real gates.
+policy-dx: $(TARGET)
+	@bash scripts/stress/policy_dx_e2e.sh ./$(TARGET)
+
+# ── R7.P4: distribution integrity ───────────────────────────────
+# sbom      — CycloneDX 1.5 SBOM from `cargo metadata` (stdlib Python only,
+#             no cargo-cyclonedx install). Attached to every GitHub release.
+# sign-dist — minisign-sign a release manifest:
+#               SOFUU_MINISIGN_SECRET_KEY=~/sofuu.key make sign-dist
+#             Writes <manifest>.minisig next to MANIFEST (default: dist/SHA256SUMS).
+# tsbom := (no external deps)
+sbom:
+	@python3 scripts/sbom.py --out dist/sofuu-sbom.json
+
+sign-dist:
+	@sh scripts/sign_release.sh "$${MANIFEST:-dist/SHA256SUMS}"
 
 # ── Size cap check (CI: fails if binary exceeds 5MB) ────────────
 size-check: $(TARGET)

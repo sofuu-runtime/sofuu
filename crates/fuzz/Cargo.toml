@@ -58,3 +58,9 @@ name = "capi_call"
 path = "fuzz_targets/capi_call.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_simd_bridge"
+path = "fuzz_targets/fuzz_simd_bridge.rs"
+test = false
+doc = false

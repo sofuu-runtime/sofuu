@@ -1,0 +1,92 @@
+name: ASAN
+
+# R7.P2 — AddressSanitizer over the JavaScript→native boundary.
+#
+# Why a separate workflow and why Linux:
+#   * The boundary under test (rt/view_guard.rs, rt/ai.rs extract_f32,
+#     rt/memory.rs cma_vec_*) is reached from Rust code that hands raw
+#     pointers to SIMD kernels. ASAN is the tool that catches an
+#     out-of-bounds read there even when the value happens not to crash.
+#   * `-Zbuild-std` instruments the standard library too, so a bad slice
+#     length inside Vec/slice helpers is caught at the source, not only at
+#     the caller. That requires the `rust-src` component.
+#   * macOS cannot load the ASAN runtime into rustc while it dlopens
+#     ASAN-instrumented proc-macro dylibs ("Interceptors are not working"),
+#     so the local `make asan` refuses darwin and points here.
+#
+# Scope note (honest): the vendored C (QuickJS, libuv, libcurl) is compiled
+# by cc-rs WITHOUT -fsanitize=undefined, so this job is ASAN for the Rust
+# side of the boundary, not UBSan coverage of the C engine. The C surfaces
+# are exercised by the fuzz targets and the JS suites instead.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: asan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  asan:
+    name: ASAN (Linux-x86_64, nightly)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libcurl4-openssl-dev python3 xz-utils
+
+      - name: Install nightly with rust-src
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup run nightly rustc --version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/asan
+          key: asan-${{ hashFiles('Cargo.lock', 'crates/**/Cargo.toml') }}
+          restore-keys: asan-
+
+      - name: ASAN — validated view window
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo +nightly test -p sofuu-core --lib \
+            -Zbuild-std --target x86_64-unknown-linux-gnu \
+            --target-dir target/asan -- rt::view_guard
+
+      - name: ASAN — policy evaluator
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+          RUST_BACKTRACE: "1"
+        run: |
+          cargo +nightly test -p sofuu-core --lib \
+            -Zbuild-std --target x86_64-unknown-linux-gnu \
+            --target-dir target/asan -- rt::policy
+
+      - name: ASAN — fuzz the boundary arithmetic (smoke, no crash expected)
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+          ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+        run: |
+          cd crates/fuzz
+          cargo +nightly build --bin fuzz_simd_bridge \
+            -Zbuild-std --target x86_64-unknown-linux-gnu \
+            --target-dir target/asan
+          ./target/asan/x86_64-unknown-linux-gnu/debug/fuzz_simd_bridge \
+            -runs=20000 -max_len=64 -print_final_stats=1

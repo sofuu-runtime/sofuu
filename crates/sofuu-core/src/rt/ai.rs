@@ -5984,10 +5984,25 @@ unsafe fn extract_f32(ctx: *mut JSContext, val: JSValueConst) -> Result<F32View,
         }
         return Err(throw_detached_buffer(ctx));
     }
-    let n = byte_length / std::mem::size_of::<f32>();
-    let slice_ptr = ptr.add(byte_offset) as *const f32;
+    /* R7.P2: re-derive the window against the buffer QuickJS just handed us.
+     * This is the one place the vector kernels' pointer comes from, so the
+     * bounds/alignment/dimension invariant is proven here and nowhere else. */
+    let window = match super::view_guard::check_f32_view(buf_size, byte_offset, byte_length, None) {
+        Ok(w) => w,
+        Err(e) => return Err(throw_view_error(ctx, e)),
+    };
+    let slice_ptr = ptr.add(window.offset) as *const f32;
     // Zero-copy: borrow directly from the TypedArray buffer with zero heap allocations and zero memcpy!
-    Ok(F32View::Borrowed(slice_ptr, n))
+    Ok(F32View::Borrowed(slice_ptr, window.count))
+}
+
+/// Turn a `view_guard` refusal into a real JavaScript `TypeError`.
+///
+/// # Safety
+/// `ctx` live.
+unsafe fn throw_view_error(ctx: *mut JSContext, e: super::view_guard::ViewError) {
+    let msg = CString::new(e.describe()).unwrap_or_default();
+    qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), msg.as_ptr());
 }
 
 /// f64 dot product over the same f32 lanes — the R-27 escape hatch used when

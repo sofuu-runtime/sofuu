@@ -206,6 +206,25 @@ pub fn evaluate(req: &serde_json::Value, policy: &serde_json::Value) -> serde_js
                 "shell execution is disabled by policy",
             );
         }
+        /* R7.6/shell.deny (R7.P3): the default profile's destructive-command
+         * list. Full-command globs; allow is consulted only after deny, so a
+         * deny cannot be re-enabled by a broader allow. Best-effort by
+         * design — a pattern matches the command STRING, not a parsed shell,
+         * which is why shell.enabled is the real switch. */
+        let deny = list_at(policy, &["shell", "deny"]);
+        if !deny.is_empty() {
+            let inventory = op == "tool.run" && command.trim().is_empty();
+            if !inventory && deny.iter().any(|p| glob_match(p, command)) {
+                return decision(
+                    "deny",
+                    "R7.6/shell.deny",
+                    &format!("command matches a shell.deny pattern: {command}"),
+                );
+            }
+            if inventory {
+                conditional = true;
+            }
+        }
         let allow = list_at(policy, &["shell", "allow"]);
         if !allow.is_empty() {
             /* `tool.run` for bash with NO command is the inventory question
@@ -262,6 +281,16 @@ pub fn evaluate(req: &serde_json::Value, policy: &serde_json::Value) -> serde_js
     }
 
     /* ── network ───────────────────────────────────────────────── */
+    /* R7.1/net.enabled (R7.P3): the `--no-net` switch and the offline
+     * profile. Checked before allow/deny so `net.allow` cannot widen it —
+     * a policy that says "no network" means no network. */
+    if op == "net.fetch" && bool_at(policy, &["net", "enabled"]) == Some(false) {
+        return decision(
+            "deny",
+            "R7.1/net.enabled",
+            "outbound network is disabled by policy",
+        );
+    }
     if op == "net.fetch" && !host.is_empty() {
         let deny = list_at(policy, &["net", "deny"]);
         if deny.iter().any(|p| host_matches(p, host)) {
@@ -365,6 +394,40 @@ fn merge_layers(layers: &[serde_json::Value]) -> serde_json::Value {
         merge(&mut out, layer);
     }
     out
+}
+
+/// The layered policy from disk — `~/.sofuu/policy.json`, then
+/// `<cwd>/.sofuu/policy.json` (project wins; deny arrays union) — WITHOUT
+/// installing it. The CLI audit needs the effective document without a live
+/// JS context; `sofuu.policy.load()` is the runtime counterpart and uses the
+/// same merge.
+///
+/// An invalid file is an ERROR, not a skipped layer: a policy the operator
+/// thinks they wrote but that silently does not apply is worse than a hard
+/// stop.
+pub fn layered_policy_from_disk() -> Result<serde_json::Value, String> {
+    let mut layers: Vec<serde_json::Value> = Vec::new();
+    let mut paths: Vec<(String, std::path::PathBuf)> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        paths.push(("user".into(), std::path::PathBuf::from(home).join(".sofuu/policy.json")));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        paths.push(("project".into(), cwd.join(".sofuu/policy.json")));
+    }
+    for (label, path) in paths {
+        if !path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("{label} policy {}: {e}", path.display()))?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("{label} policy {}: not valid JSON: {e}", path.display()))?;
+        if !v.is_object() {
+            return Err(format!("{label} policy {}: must be a JSON object", path.display()));
+        }
+        layers.push(v);
+    }
+    Ok(merge_layers(&layers))
 }
 
 /* ── JS surface ────────────────────────────────────────────────────── */
@@ -1270,6 +1333,67 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string()
+    }
+
+    /* R7.P3: shell.deny — the default profile's destructive-command list. */
+    #[test]
+    fn shell_deny_blocks_listed_commands_and_wins_over_allow() {
+        let p = serde_json::json!({
+            "shell": {
+                "deny": ["rm -rf *", "mkfs*"],
+                "allow": ["rm *", "echo *"]
+            }
+        });
+        let deny = serde_json::json!({"op":"shell.run","command":"rm -rf /"});
+        assert_eq!(eval(deny.clone(), p.clone()), "deny");
+        assert_eq!(rule(deny, p.clone()), "R7.6/shell.deny");
+        /* The same command through the bash tool is the same gate. */
+        let via_tool = serde_json::json!({"op":"tool.run","tool":"bash","command":"mkfs.ext4 /dev/sda"});
+        assert_eq!(eval(via_tool, p.clone()), "deny");
+        /* A command that only the broad allow matches still runs. */
+        let ok = serde_json::json!({"op":"shell.run","command":"echo hi"});
+        assert_eq!(eval(ok, p.clone()), "allow");
+        /* An unlisted command hits the allowlist, not the deny list. */
+        let unlisted = serde_json::json!({"op":"shell.run","command":"ls -la"});
+        assert_eq!(eval(unlisted.clone(), p.clone()), "deny");
+        assert_eq!(rule(unlisted, p), "R7.6/shell.allow");
+    }
+
+    #[test]
+    fn shell_deny_inventory_is_conditional_not_denied() {
+        let p = serde_json::json!({"shell":{"deny":["rm -rf *"]}});
+        let d = evaluate(
+            &serde_json::json!({"op":"tool.run","tool":"bash"}),
+            &p,
+        );
+        assert_eq!(d.get("decision").and_then(|v| v.as_str()), Some("allow"));
+        assert_eq!(d.get("conditional").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    /* R7.P3: net.enabled — `--no-net` and the offline profile. */
+    #[test]
+    fn net_enabled_false_denies_every_host_and_cannot_be_widened() {
+        let p = serde_json::json!({"net":{"enabled":false,"allow":["api.example.com"]}});
+        for host in ["api.example.com", "localhost", "127.0.0.1", "evil.test"] {
+            let req = serde_json::json!({"op":"net.fetch","host":host});
+            assert_eq!(eval(req.clone(), p.clone()), "deny", "host {host}");
+            assert_eq!(rule(req, p.clone()), "R7.1/net.enabled");
+        }
+        /* No host on the request is still a network question. */
+        assert_eq!(
+            eval(serde_json::json!({"op":"net.fetch"}), p.clone()),
+            "deny"
+        );
+        /* Unset / true keeps the normal allow/deny semantics. */
+        let plain = serde_json::json!({"net":{"allow":["api.example.com"]}});
+        assert_eq!(
+            eval(serde_json::json!({"op":"net.fetch","host":"api.example.com"}), plain.clone()),
+            "allow"
+        );
+        assert_eq!(
+            eval(serde_json::json!({"op":"net.fetch","host":"other.test"}), plain),
+            "deny"
+        );
     }
 
     #[test]

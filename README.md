@@ -68,6 +68,16 @@ npm install -g sofuu      # or: npx sofuu
 
 > **Platforms: Official standalone binaries available for macOS (Apple Silicon) and Linux (`x86_64` and `arm64` / Raspberry Pi 5).** Building from source works anywhere (see below).
 
+Release integrity: every archive ships a SHA-256 digest, and `install.sh`
+verifies it before unpacking (refusing to install when no checksum tool is
+present). Each release also carries a CycloneDX 1.5 SBOM
+(`sofuu-sbom.json`); regenerate it with `make sbom`. The signed manifest
+(`SHA256SUMS.minisig`) is wired through `scripts/sign_release.sh` and
+`install.sh` — verification turns on the moment a minisign public key is
+published in `install.sh`, and until then the script says plainly that it is
+installing on SHA-256 alone. See [`THREAT_MODEL.md`](THREAT_MODEL.md) for the
+full picture of what is and is not guaranteed.
+
 ---
 
 ## Quick Start
@@ -670,6 +680,9 @@ curl -s localhost:7707/v1/chat/completions \
 
 Sofuu publishes receipts, not claims:
 
+- **[Threat model](THREAT_MODEL.md)** — what R7 protects against, what it
+  cannot, and the residual risks you are accepting; **[security policy](SECURITY.md)**
+  covers reporting and response.
 - **[Contract suite](contract/CONFORMANCE.md)** — 52 clauses, currently
   42 PASS / 0 FAIL / 10 BLOCKED across the platform matrix; the same page
   carries the live capability posture and the stability index.

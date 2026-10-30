@@ -3318,8 +3318,22 @@ mod impl_qtsq {
             let buf = qjs::JS_GetArrayBuffer(ctx, &mut ab_size, ab);
             qjs::sofuu_js_free_value(ctx, ab);
             if !buf.is_null() {
-                let p = (buf as *const u8).add(byte_offset) as *const f32;
-                let view = F32View::Borrowed(p, byte_length / std::mem::size_of::<f32>());
+                /* R7.P2: the window is re-derived against the buffer before
+                 * the pointer escapes (bounds, lane alignment, overflow). */
+                let window = match crate::rt::view_guard::check_f32_view(
+                    ab_size,
+                    byte_offset,
+                    byte_length,
+                    None,
+                ) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        throw_view_refusal(ctx, e);
+                        return None;
+                    }
+                };
+                let p = (buf as *const u8).add(window.offset) as *const f32;
+                let view = F32View::Borrowed(p, window.count);
                 /* W1.1: the one scan — ingest AND query arrive here. */
                 if let Some((at, val)) = first_non_finite(view.as_slice()) {
                     throw_coded(ctx, E_NONFINITE, &non_finite_message(at, val));
@@ -3423,14 +3437,35 @@ mod impl_qtsq {
             );
             return (ptr::null(), 0);
         }
-        let p = (buf as *const u8).add(byte_offset) as *const f32;
-        let n = byte_length / std::mem::size_of::<f32>();
+        /* R7.P2: same validated window as cma_vec_view. A zero-length vector
+         * is refused HERE because this shape returns a bare pointer and its
+         * callers read null as "already threw"; there is no empty kv key or
+         * query to represent, so the honest answer is a coded error. */
+        let window = match crate::rt::view_guard::check_f32_view(ab_size, byte_offset, byte_length, None) {
+            Ok(w) => w,
+            Err(e) => {
+                throw_view_refusal(ctx, e);
+                return (ptr::null(), 0);
+            }
+        };
+        if window.count == 0 {
+            throw_coded(ctx, E_TYPE, "memory: expected a non-empty Float32Array");
+            return (ptr::null(), 0);
+        }
+        let p = (buf as *const u8).add(window.offset) as *const f32;
+        let n = window.count;
         /* W1.1: the same single scan, before the pointer escapes. */
         if let Some((at, val)) = first_non_finite(std::slice::from_raw_parts(p, n)) {
             throw_coded(ctx, E_NONFINITE, &non_finite_message(at, val));
             return (ptr::null(), 0);
         }
         (p, n)
+    }
+
+    /// R7.P2: a view_guard refusal as a coded memory error (`E_TYPE`).
+    /// Fail-closed: the caller returns the pending exception.
+    unsafe fn throw_view_refusal(ctx: *mut JSContext, e: crate::rt::view_guard::ViewError) {
+        throw_coded(ctx, E_TYPE, &format!("memory: {}", e.describe()));
     }
 
     /// W2.2/W3.3: `!!opts[name]` for an options object. Missing, null and

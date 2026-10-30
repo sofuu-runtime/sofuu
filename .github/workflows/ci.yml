@@ -138,6 +138,19 @@ jobs:
       - name: Bytecode determinism (bc-check)
         run: make bc-check
 
+      # R7.P3: the policy DX surface (init profiles, static audit, dry-run and
+      # the --read-only/--no-net/--confirm-all guards) is verified at the real
+      # gates, not only in the evaluator's unit tests.
+      - name: Policy DX gate (25 checks)
+        run: make policy-dx
+
+      # R7.P4: the SBOM is a release artifact; generating it on every push
+      # catches a `cargo metadata` regression before the tag does.
+      - name: SBOM generates (CycloneDX 1.5)
+        run: |
+          make sbom
+          python3 -c "import json;d=json.load(open('dist/sofuu-sbom.json'));assert d['specVersion']=='1.5' and len(d['components'])>0;print(len(d['components']),'components')"
+
       - name: Print binary info
         run: |
           ls -lh sofuu

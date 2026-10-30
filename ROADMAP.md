@@ -1,7 +1,7 @@
 # 🗺️ Sofuu Master Roadmap
 
 > **The Living Engineering & Product Roadmap for Sofuu.**  
-> *This document tracks our historical breakthroughs, current active sprint, and future milestones toward category monopolization and enterprise adoption.*
+> *This document tracks our historical breakthroughs, current active sprint, and future milestones toward industry-standard adoption and enterprise readiness.*
 
 ---
 
@@ -14,7 +14,7 @@
 | **v0.3 – Autonomous Agent Core** | Sandbox v2, MCP Client/Server, Session Mesh, CMA v2 | 🟢 **Completed (Shipped)** | Oct 2026 |
 | **v0.3.5 – Hardening & DX** | Zero-Crash Fuzzing, Global `sofuu.z` Schemas, `sofuu compile` | 🟡 **In Progress (Active Sprint)** | Nov 2026 |
 | **v0.4 – Enterprise & Edge** | Production llama.cpp Plugin Bridge, Enterprise Blueprints | 🔵 **Planned** | Nov/Dec 2026 |
-| **v1.0 – Monopolization** | Standalone Agent Ecosystem, WinterCG Edge Standard | 🟣 **Future Vision** | Q1 2027 |
+| **v1.0 – Ecosystem Expansion** | Standalone Agent Ecosystem, WinterCG Edge Standard | 🟣 **Future Vision** | Q1 2027 |
 
 ---
 
@@ -87,7 +87,7 @@
 
 ---
 
-## 🟣 4. Future Vision (Acquisition & Category Monopolization)
+## 🟣 4. Future Vision (Enterprise & Ecosystem Expansion)
 
 - [ ] **WinterCG Compliance**: Full compatibility with Web Standard `fetch`, `Request`, `Response`, and `ReadableStream` for instant deployment on Cloudflare Workers / Vercel Edge.
 - [ ] **Cloud Session Mesh Relay**: Optional zero-config encrypted peer-to-peer task mesh connecting remote developer teams.

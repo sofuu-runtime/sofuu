@@ -788,26 +788,44 @@ Built by **Haruhito** — early-stage, bootstrapped, open-core, in active develo
 
 ## Roadmap
 
-Sofuu's active development status and upcoming milestones toward category monopolization:
-
 ```mermaid
-flowchart LR
-    A["v0.1-v0.3 Shipped (QuickJS, QTSQ, MCP, Sandbox)"] --> B["v0.3.5 Active (sofuu compile, Fuzzing, Zod)"]
-    B --> C["v0.4 Enterprise (llama.cpp Plugin, Recipes)"]
-    C --> D["v1.0 Monopoly (WinterCG Edge, Cross-Compile)"]
+flowchart TD
+    subgraph Shipped["Phase 1: Core Foundation (Shipped)"]
+        S1["QuickJS + libuv Event Loop (Boot <4ms)"]
+        S2["QTSQ Vector Memory (SIMD Cosine Recall)"]
+        S3["Autonomous Agent Engine (Prompt Sovereignty)"]
+        S4["Native Model Context Protocol (stdio + SSE)"]
+        S5["Sandbox v2 (Filesystem Jail + Network Policy)"]
+        S6["Session Mesh (Terminal Task Synchronization)"]
+        S7["Zero-Dependency Bundler + TypeScript Stripper"]
+    end
+
+    subgraph Active["Phase 2: Hardening & Compiler (Active Sprint)"]
+        A1["Standalone Binary Compiler (sofuu compile)"]
+        A2["32-Byte Binary Trailer & Fast-Path Boot"]
+        A3["Promise Trap & Concurrency Fuzzing (10k Ops)"]
+        A4["Global sofuu.z Schema Engine & Tool Builder"]
+        A5["Memory Allocation Guardrails & Handle Audit"]
+    end
+
+    subgraph Enterprise["Phase 3: Production Engine & Blueprints (Planned)"]
+        E1["llama.cpp Dynamic Plugin (Metal + CUDA Acceleration)"]
+        E2["In-Process Enterprise RAG Architecture"]
+        E3["Autonomous Sandboxed Code Reviewer"]
+        E4["Collaborative Swarm Workflows"]
+    end
+
+    subgraph Expansion["Phase 4: Ecosystem & Edge (Future Vision)"]
+        F1["WinterCG Standards (Request, Response, Streams)"]
+        F2["Edge Serverless & Worker Compatibility"]
+        F3["Cross-Platform Compilation Targets"]
+        F4["Embeddable Mobile SDKs (Swift + Kotlin)"]
+    end
+
+    Shipped --> Active
+    Active --> Enterprise
+    Enterprise --> Expansion
 ```
-
-| Milestone | Capability | Status |
-| :--- | :--- | :--- |
-| **Runtime Substrate** | QuickJS + libuv event loop (<4ms boot), TypeScript, Bundler | 🟢 **Shipped** |
-| **Cognitive Memory** | In-process encrypted QTSQ containers + hardware SIMD search | 🟢 **Shipped** |
-| **Agent Core & Security** | Sandbox v2 (5-Shields), native MCP, Session Mesh, Observability | 🟢 **Shipped** |
-| **Standalone Compiler** | `sofuu compile` (single 5.2 MB self-contained executable) | 🟡 **In Progress** |
-| **Zero-Crash Hardening** | 10k-concurrency fuzzing, promise unhandled rejection trap | 🟡 **In Progress** |
-| **Tool Calling DX** | Global `sofuu.z` / `microZod` declarative schemas & types | 🟡 **In Progress** |
-| **Production Local LLMs** | `sofuu-plugin-llamacpp` Metal / CUDA GGUF hardware acceleration | 🔵 **Planned** |
-
-👉 **Full living roadmap & task tracker:** See [**`ROADMAP.md`**](ROADMAP.md).
 
 ---
 

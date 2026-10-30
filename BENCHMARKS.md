@@ -37,6 +37,22 @@ hyperfine --warmup 10 --runs 100 \
 
 > 📌 **Key Takeaway:** On modern developer machines and cloud servers, Sofuu boots in **under 4 ms** ($\approx 3.8\text{ ms}$). On resource-constrained edge hardware like the Raspberry Pi 5, it boots in **$\approx 38\text{ ms}$**, delivering a **3.8× to 4.8× cold-start advantage** over Node.js and Python.
 
+> ⚠️ **Provenance (2026-10-30):** the macOS row above predates the Metal
+> engine, the QTSQ memory shell and the eleven shipped JS drivers, and no
+> longer matches the current binary. Re-measured on an Apple M2 Pro / macOS
+> 15.7.3 with 50-run subprocess medians:
+>
+> | Command | Median | Note |
+> |---|---:|---|
+> | `sofuu version` (CLI only, no engine) | 5.0 ms | process + dyld floor |
+> | `sofuu eval "1+1"` | 17.1 ms | was 33.3 ms before the 2026-10-30 boot fix |
+> | `sofuu capabilities` | 26.3 ms | pays a real Metal device probe, by design |
+>
+> The gap was a boot-time `sofuu.capabilities()` call inside `memory_api.js`
+> that created a Metal device (~18–20 ms) before any user code ran; see the
+> CHANGELOG entry of 2026-10-30. The Linux and Pi 5 rows have not been
+> re-measured against the current tree and are historical until they are.
+
 ---
 
 ## 3. 🧠 Memory Footprint (Resident Set Size)

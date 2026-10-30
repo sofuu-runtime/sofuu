@@ -37,7 +37,12 @@ unsafe extern "C" {
 fn metal_available() -> bool {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
-        unsafe { sofuu_metal_available() }
+        /* One answer per process. The C probe is `MTLCreateSystemDefaultDevice`,
+         * which costs 18-20 ms on its first call (driver stack + device) and
+         * ~0.2 ms afterwards. The device cannot appear or vanish while the
+         * process runs, so caching is both faster and more honest. */
+        static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| unsafe { sofuu_metal_available() })
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
@@ -185,8 +190,15 @@ fn platform_absent() -> Vec<&'static str> {
     }
 }
 
-/// The manifest as a JSON value.
-pub fn manifest() -> Value {
+/// The `build` block of the manifest — the only part that is a pure function
+/// of this compilation, with no runtime probe behind it.
+///
+/// It is also installed as `sofuu.build` at registration so boot code can ask
+/// "what can this build do?" without building the whole manifest: `manifest()`
+/// probes the GPU (`metal_available`), and paying ~18 ms of device creation
+/// before the user's first line is exactly the cold-start bug this exists to
+/// avoid.
+pub fn build_block() -> Value {
     let mut features = vec!["simd", "qtsq"];
     let mut missing = Vec::new();
     if cfg!(any(target_os = "macos", target_os = "ios")) {
@@ -194,7 +206,19 @@ pub fn manifest() -> Value {
     } else {
         missing.push("metal");
     }
+    json!({
+        "features": features,
+        "missing": missing,
+        "platform_absent": platform_absent(),
+        // PC-07 (AUDIT-2026-10-29): a shipped binary carried no way back to
+        // its source. Stamped by build.rs (git short rev, `-dirty` when the
+        // tree differs); "unknown" only outside a checkout.
+        "revision": env!("SOFUU_BUILD")
+    })
+}
 
+/// The manifest as a JSON value.
+pub fn manifest() -> Value {
     json!({
         "schema": SCHEMA,
         "runtime": {
@@ -205,15 +229,7 @@ pub fn manifest() -> Value {
             "ram_mb": ram_mb(),
             "gpu": { "backend": "metal", "available": metal_available() }
         },
-        "build": {
-            "features": features,
-            "missing": missing,
-            "platform_absent": platform_absent(),
-            // PC-07 (AUDIT-2026-10-29): a shipped binary carried no way back
-            // to its source. Stamped by build.rs (git short rev, `-dirty` when
-            // the tree differs); "unknown" only outside a checkout.
-            "revision": env!("SOFUU_BUILD")
-        },
+        "build": build_block(),
         "engine": {
             "formats": ["gguf", "safetensors", "pt", "npy"],
             "quant_types": ["f32", "f16", "q4_K", "q6_K", "q8_0", "q3_K_S"],
@@ -280,6 +296,30 @@ pub unsafe fn mod_capabilities_register(ctx: *mut JSContext) {
         qjs::sofuu_js_new_cfunction(ctx, js_model_describe, c"describe".as_ptr(), 1),
     );
     qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"model".as_ptr(), model_obj);
+
+    /* `sofuu.build`: the manifest's build block, with no probe behind it.
+     *
+     * Boot code needs exactly this much ("can this build do X?") and must not
+     * build the whole manifest: `sofuu.capabilities()` probes the GPU, which
+     * creates a Metal device (~18 ms) before the user's first line runs. The
+     * values are `manifest().build`'s, from the same function, so the two can
+     * never disagree. */
+    let build = build_block();
+    let build_json = CString::new(build.to_string()).unwrap_or_default();
+    let build_val = qjs::JS_ParseJSON(
+        ctx,
+        build_json.as_ptr(),
+        build_json.as_bytes().len(),
+        c"<build>".as_ptr(),
+    );
+    if qjs::is_exception(build_val) {
+        let exc = qjs::JS_GetException(ctx);
+        qjs::sofuu_js_free_value(ctx, exc);
+        qjs::sofuu_js_free_value(ctx, build_val);
+    } else {
+        qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"build".as_ptr(), build_val);
+    }
+
     qjs::sofuu_js_free_value(ctx, sofuu_obj);
     qjs::sofuu_js_free_value(ctx, global);
 }
@@ -664,6 +704,15 @@ mod tests {
         assert!(m["build"]["revision"]
             .as_str()
             .is_some_and(|r| !r.is_empty()));
+    }
+
+    /// `sofuu.build` is what boot code reads instead of calling
+    /// `sofuu.capabilities()` (whose GPU probe costs a Metal device). It must
+    /// be the manifest's own build block, field for field, or the two would
+    /// silently disagree about what this build can do.
+    #[test]
+    fn the_boot_build_block_is_the_manifest_build_block() {
+        assert_eq!(build_block(), manifest()["build"]);
     }
 
     #[test]

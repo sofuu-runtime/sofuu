@@ -36,13 +36,17 @@
   if (M.__flat_memory_api) return;
 
   /* Belt and braces: the Rust caller evaluates this only in the has_qtsq
-   * build, but if the manifest is already registered and says the codec is
-   * missing, leave the typed-refusal stubs untouched. */
+   * build, but if the build facts say the codec is missing, leave the
+   * typed-refusal stubs untouched.
+   *
+   * Read `sofuu.build` — the manifest's build block, a pure function of the
+   * compilation — NOT `sofuu.capabilities()`. The full manifest probes the
+   * GPU, so asking it here created a Metal device (~18 ms) on every boot,
+   * before a single line of user code ran. */
   var capped = false;
   try {
-    var caps = JSON.parse(S.capabilities());
-    capped = ((caps.build && caps.build.missing) || []).indexOf('qtsq') >= 0;
-  } catch (eCaps) { /* manifest not registered yet — the Rust cfg gates it */ }
+    capped = !!(S.build && S.build.missing && S.build.missing.indexOf('qtsq') >= 0);
+  } catch (eBuild) { /* not registered yet — the Rust cfg gates it */ }
   if (capped) return;
 
   var live = [];

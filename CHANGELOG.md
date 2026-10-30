@@ -4,6 +4,51 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Boot latency: the GPU probe is off the start path — 2026-10-30
+
+`sofuu eval "1+1"` spent ~29 ms of its 33 ms building the engine, and ~20 of
+those milliseconds were a Metal device. The chain was
+`engine_register_builtins` → `mod_memory_register` → `eval(src/js/memory_api.js)`
+→ `sofuu.capabilities()` → `manifest_json()` → `metal_available()` →
+`MTLCreateSystemDefaultDevice()`: the flat memory API asked the whole
+capability manifest for one boolean, and the manifest asks the OS for a GPU
+device — which costs 18–20 ms the first time in a process.
+
+- **`sofuu.build`** — the manifest's `build` block (features, missing,
+  platform_absent, revision) is now registered at startup from `build_block()`,
+  a pure function of the compilation with no probe behind it. `manifest()` is
+  built from the same function and a unit test pins the two equal, so the
+  boot-time facts and the manifest cannot drift apart.
+- **`memory_api.js`** reads `sofuu.build.missing` instead of
+  `JSON.parse(sofuu.capabilities())`. The guard's intent is unchanged (do not
+  install the flat API over typed-refusal stubs on a QTSQ-free build); it just
+  no longer creates a GPU device to learn a compile-time fact.
+- **The Metal probe is cached** (`OnceLock`): a device cannot appear or vanish
+  mid-process, so a second manifest build in the same process is now free
+  instead of re-creating it.
+
+Measured on Apple M2 Pro / macOS 15.7.3 — same script in both arms, 40
+interleaved runs so both engines see the same machine load:
+
+| Command | Before | After | |
+|---|---|---|---|
+| `hello.js` (as a compiled artifact) | 34.4 ms | **17.8 ms** | 1.93× |
+| `sofuu eval "1+1"` | 33.3 ms | **17.1 ms** | 1.95× |
+| `sofuu version` (no engine) | 4.4 ms | 5.0 ms | unchanged (noise) |
+| `sofuu capabilities` | 26.8 ms | 26.3 ms | unchanged — it *should* probe the GPU |
+
+Compiled `sofuu compile` artifacts run the same boot path and inherit the win.
+
+What is left, and why it was not taken: ~4.2 ms evaluating the eleven shipped
+drivers and ~1.8 ms parsing `compat.js` from source, on top of ~2.3 ms of
+QuickJS setup and native registration. Deferring the drivers needs a lazy
+accessor for every name they install — about 30 top-level properties
+(`sofuu.agent`, `sofuu.tools`, plus `S.cfg`/`S.session`/`S.info`-style
+aliases), several colliding with native or Rust-set names such as `VERSION` —
+where one mis-installed accessor would shadow a native and break chat/serve
+silently. `compat.js` belongs to the compatibility lane; the cheap follow-up
+there is to ship it as `compat.bc.gz` like every other driver (~1.5 ms).
+
 ## Standalone Agent Compiler (`sofuu compile`) — 2026-10-30
 
 Implementation of `STANDALONE_COMPILER_PLAN.md`: an agent becomes one

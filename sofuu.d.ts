@@ -1299,8 +1299,26 @@ export interface SofuuRuntime {
   observability?: SofuuObservability;
   /** The deterministic in-process execution sandbox (rt/sandbox.rs). */
   sandbox: SofuuSandbox;
+  /**
+   * The manifest's `build` block, registered at startup: exactly
+   * `capabilities().build`, without building the whole manifest (which probes
+   * the GPU and pays a Metal device creation).
+   */
+  build: SofuuBuild;
   /** Runtime semver, e.g. 0.3.0-beta. */
   version: string;
+}
+
+/** What the running binary was compiled with — the probe-free half of the manifest. */
+export interface SofuuBuild {
+  /** Features this build carries (e.g. `simd`, `qtsq`, `metal`). */
+  features: string[];
+  /** Features this build dropped. */
+  missing: string[];
+  /** Features the target platform cannot provide at all (e.g. `metal` off Apple). */
+  platform_absent: string[];
+  /** Source revision stamped by build.rs, e.g. `8d899ef69-dirty`. */
+  revision: string;
 }
 
 /* ================================================================== 

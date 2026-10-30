@@ -101,6 +101,87 @@ unsafe extern "C" fn js_require(
     }
     let spec = CStr::from_ptr(spec_ptr).to_string_lossy().into_owned();
 
+    let spec_clean = if let Some(stripped) = spec.strip_prefix("node:") {
+        stripped
+    } else {
+        &spec
+    };
+
+    if spec_clean == "process" {
+        let global = qjs::sofuu_js_get_global_object(ctx);
+        let p = qjs::sofuu_js_get_property_str(ctx, global, c"process".as_ptr());
+        qjs::sofuu_js_free_value(ctx, global);
+        qjs::sofuu_js_free_cstring(ctx, spec_ptr);
+        return p;
+    }
+    if spec_clean == "url" {
+        let obj = qjs::sofuu_js_new_object(ctx);
+        let global = qjs::sofuu_js_get_global_object(ctx);
+        let u = qjs::sofuu_js_get_property_str(ctx, global, c"URL".as_ptr());
+        let sp = qjs::sofuu_js_get_property_str(ctx, global, c"URLSearchParams".as_ptr());
+        qjs::sofuu_js_free_value(ctx, global);
+        qjs::sofuu_js_set_property_str(ctx, obj, c"URL".as_ptr(), u);
+        qjs::sofuu_js_set_property_str(ctx, obj, c"URLSearchParams".as_ptr(), sp);
+        qjs::sofuu_js_free_cstring(ctx, spec_ptr);
+        return obj;
+    }
+    if spec_clean == "sofuu" {
+        let global = qjs::sofuu_js_get_global_object(ctx);
+        let s = qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr());
+        qjs::sofuu_js_free_value(ctx, global);
+        qjs::sofuu_js_free_cstring(ctx, spec_ptr);
+        return s;
+    }
+    if spec_clean == "zod" {
+        let global = qjs::sofuu_js_get_global_object(ctx);
+        let sofuu = qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr());
+        let plugins = qjs::sofuu_js_get_property_str(ctx, sofuu, c"plugins".as_ptr());
+        let z = qjs::sofuu_js_get_property_str(ctx, plugins, c"z".as_ptr());
+        qjs::sofuu_js_free_value(ctx, plugins);
+        qjs::sofuu_js_free_value(ctx, sofuu);
+        qjs::sofuu_js_free_value(ctx, global);
+        if !qjs::is_undefined(z) && !qjs::is_null(z) {
+            let obj = qjs::sofuu_js_new_object(ctx);
+            qjs::sofuu_js_set_property_str(ctx, obj, c"z".as_ptr(), z);
+            qjs::sofuu_js_free_cstring(ctx, spec_ptr);
+            return obj;
+        }
+        qjs::sofuu_js_free_value(ctx, z);
+    }
+    if spec_clean == "async_hooks" {
+        let obj = qjs::sofuu_js_new_object(ctx);
+        let global = qjs::sofuu_js_get_global_object(ctx);
+        let sofuu = qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr());
+        let ctx_obj = qjs::sofuu_js_get_property_str(ctx, sofuu, c"context".as_ptr());
+        let als = qjs::sofuu_js_get_property_str(ctx, ctx_obj, c"AsyncLocalStorage".as_ptr());
+        qjs::sofuu_js_free_value(ctx, ctx_obj);
+        qjs::sofuu_js_free_value(ctx, sofuu);
+        qjs::sofuu_js_free_value(ctx, global);
+        qjs::sofuu_js_set_property_str(ctx, obj, c"AsyncLocalStorage".as_ptr(), als);
+        qjs::sofuu_js_free_cstring(ctx, spec_ptr);
+        return obj;
+    }
+
+    // Check if globalThis.__sofuu_node_modules has spec_clean
+    let global = qjs::sofuu_js_get_global_object(ctx);
+    let nmods = qjs::sofuu_js_get_property_str(ctx, global, c"__sofuu_node_modules".as_ptr());
+    qjs::sofuu_js_free_value(ctx, global);
+    if !qjs::is_undefined(nmods) && !qjs::is_null(nmods) {
+        if let Ok(c_spec) = CString::new(spec_clean) {
+            let mod_val = qjs::sofuu_js_get_property_str(ctx, nmods, c_spec.as_ptr());
+            qjs::sofuu_js_free_value(ctx, nmods);
+            if !qjs::is_undefined(mod_val) && !qjs::is_null(mod_val) {
+                qjs::sofuu_js_free_cstring(ctx, spec_ptr);
+                return mod_val;
+            }
+            qjs::sofuu_js_free_value(ctx, mod_val);
+        } else {
+            qjs::sofuu_js_free_value(ctx, nmods);
+        }
+    } else {
+        qjs::sofuu_js_free_value(ctx, nmods);
+    }
+
     let Ok(cwd) = std::env::current_dir() else {
         qjs::sofuu_js_free_cstring(ctx, spec_ptr);
         return qjs::JS_ThrowReferenceError(ctx, c"Cannot determine cwd".as_ptr());

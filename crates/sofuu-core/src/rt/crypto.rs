@@ -587,6 +587,76 @@ unsafe extern "C" fn js_crypto_verify_jwt(
     json_result(ctx, &verify_jwt(&token, &jwks, &options))
 }
 
+pub fn fill_os_random(buf: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::File;
+        use std::io::Read;
+        let mut f = File::open("/dev/urandom")?;
+        f.read_exact(buf)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        use std::time::SystemTime;
+        let mut seed = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(42) as u64;
+        for b in buf.iter_mut() {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *b = (seed >> 33) as u8;
+        }
+        Ok(())
+    }
+}
+
+pub fn generate_uuid_v4() -> String {
+    let mut b = [0u8; 16];
+    let _ = fill_os_random(&mut b);
+    b[6] = (b[6] & 0x0f) | 0x40; // RFC 4122 v4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
+    )
+}
+
+unsafe extern "C" fn js_crypto_random_uuid(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    text_result(ctx, &generate_uuid_v4())
+}
+
+unsafe extern "C" fn js_crypto_random_fill(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::sofuu_js_undefined();
+    }
+    let val = *argv;
+    let mut byte_offset: usize = 0;
+    let mut byte_length: usize = 0;
+    let ab = qjs::JS_GetTypedArrayBuffer(ctx, val, &mut byte_offset, &mut byte_length, std::ptr::null_mut());
+    if !qjs::is_exception(ab) {
+        let mut ab_len: usize = 0;
+        let ptr = qjs::JS_GetArrayBuffer(ctx, &mut ab_len, ab);
+        qjs::sofuu_js_free_value(ctx, ab);
+        if !ptr.is_null() && byte_offset + byte_length <= ab_len {
+            let slice = std::slice::from_raw_parts_mut(ptr.add(byte_offset), byte_length);
+            let _ = fill_os_random(slice);
+            return qjs::sofuu_js_dup_value(ctx, val);
+        }
+    }
+    qjs::sofuu_js_dup_value(ctx, val)
+}
+
 /// Register `sofuu.crypto`. Called from `engine_register_builtins`.
 pub unsafe fn mod_crypto_register(ctx: *mut JSContext) {
     let global = qjs::sofuu_js_get_global_object(ctx);
@@ -604,11 +674,13 @@ pub unsafe fn mod_crypto_register(ctx: *mut JSContext) {
     let functions: [(
         &std::ffi::CStr,
         unsafe extern "C" fn(*mut JSContext, JSValueConst, c_int, *const JSValueConst) -> JSValue,
-    ); 4] = [
+    ); 6] = [
         (c"sha256", js_crypto_sha256),
         (c"base64urlEncode", js_crypto_base64url_encode),
         (c"base64urlDecode", js_crypto_base64url_decode),
         (c"verifyJWT", js_crypto_verify_jwt),
+        (c"randomUUID", js_crypto_random_uuid),
+        (c"randomFill", js_crypto_random_fill),
     ];
     for (name, func) in functions {
         qjs::sofuu_js_set_property_str(

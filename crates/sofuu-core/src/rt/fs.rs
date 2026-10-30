@@ -959,6 +959,234 @@ unsafe extern "C" fn js_is_symlink(
     qjs::sofuu_js_new_bool(ctx, if is_link { 1 } else { 0 })
 }
 
+unsafe extern "C" fn js_read_file_sync(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(ctx, c"readFileSync: path required".as_ptr());
+    }
+    let path = match fs_path_arg(ctx, *argv, "readFileSync", crate::rt::policy::FsKind::Read) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let path_str = path.to_string_lossy();
+    let is_utf8 = if argc > 1 {
+        let enc_ptr = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
+        if !enc_ptr.is_null() {
+            let enc = CStr::from_ptr(enc_ptr).to_string_lossy().to_lowercase();
+            qjs::sofuu_js_free_cstring(ctx, enc_ptr);
+            enc == "utf8" || enc == "utf-8"
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if is_utf8 {
+        match std::fs::read_to_string(path_str.as_ref()) {
+            Ok(content) => {
+                let Ok(c_str) = CString::new(content) else {
+                    return qjs::JS_ThrowInternalError(ctx, c"invalid utf8 in file".as_ptr());
+                };
+                qjs::sofuu_js_new_string(ctx, c_str.as_ptr())
+            }
+            Err(_) => qjs::JS_ThrowInternalError(ctx, c"readFileSync failed".as_ptr()),
+        }
+    } else {
+        match std::fs::read(path_str.as_ref()) {
+            Ok(bytes) => {
+                let ab = qjs::JS_NewArrayBufferCopy(ctx, bytes.as_ptr(), bytes.len());
+                if qjs::is_exception(ab) {
+                    return ab;
+                }
+                let global = qjs::sofuu_js_get_global_object(ctx);
+                let ctor = qjs::sofuu_js_get_property_str(ctx, global, c"Uint8Array".as_ptr());
+                qjs::sofuu_js_free_value(ctx, global);
+                let arr = qjs::JS_CallConstructor(ctx, ctor, 1, &ab);
+                qjs::sofuu_js_free_value(ctx, ab);
+                qjs::sofuu_js_free_value(ctx, ctor);
+                arr
+            }
+            Err(_) => qjs::JS_ThrowInternalError(ctx, c"readFileSync failed".as_ptr()),
+        }
+    }
+}
+
+unsafe extern "C" fn js_write_file_sync(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 2 {
+        return qjs::JS_ThrowTypeError(ctx, c"writeFileSync: path and data required".as_ptr());
+    }
+    let path = match fs_path_arg(ctx, *argv, "writeFileSync", crate::rt::policy::FsKind::Write) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let data_val = *argv.add(1);
+    let path_str = path.to_string_lossy();
+
+    let mut off: usize = 0;
+    let mut len: usize = 0;
+    let ab = qjs::JS_GetTypedArrayBuffer(ctx, data_val, &mut off, &mut len, std::ptr::null_mut());
+    if !qjs::is_exception(ab) {
+        let mut ab_len: usize = 0;
+        let ptr = qjs::JS_GetArrayBuffer(ctx, &mut ab_len, ab);
+        qjs::sofuu_js_free_value(ctx, ab);
+        if !ptr.is_null() && off + len <= ab_len {
+            let slice = std::slice::from_raw_parts(ptr.add(off), len);
+            if std::fs::write(path_str.as_ref(), slice).is_err() {
+                return qjs::JS_ThrowInternalError(ctx, c"writeFileSync failed".as_ptr());
+            }
+            return qjs::sofuu_js_undefined();
+        }
+    }
+
+    let str_ptr = qjs::sofuu_js_to_cstring(ctx, data_val);
+    if str_ptr.is_null() {
+        return qjs::JS_ThrowTypeError(ctx, c"writeFileSync: data must be string or Buffer".as_ptr());
+    }
+    let text = CStr::from_ptr(str_ptr).to_bytes();
+    let res = std::fs::write(path_str.as_ref(), text);
+    qjs::sofuu_js_free_cstring(ctx, str_ptr);
+    if res.is_err() {
+        return qjs::JS_ThrowInternalError(ctx, c"writeFileSync failed".as_ptr());
+    }
+    qjs::sofuu_js_undefined()
+}
+
+unsafe extern "C" fn js_exists_sync(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::sofuu_js_new_bool(ctx, 0);
+    }
+    let path = match fs_path_arg(ctx, *argv, "existsSync", crate::rt::policy::FsKind::Read) {
+        Ok(p) => p,
+        Err(_) => return qjs::sofuu_js_new_bool(ctx, 0),
+    };
+    let path_str = path.to_string_lossy();
+    let exists = std::path::Path::new(path_str.as_ref()).exists();
+    qjs::sofuu_js_new_bool(ctx, if exists { 1 } else { 0 })
+}
+
+unsafe extern "C" fn js_readdir_sync(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(ctx, c"readdirSync: path required".as_ptr());
+    }
+    let path = match fs_path_arg(ctx, *argv, "readdirSync", crate::rt::policy::FsKind::Read) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let path_str = path.to_string_lossy();
+    match std::fs::read_dir(path_str.as_ref()) {
+        Ok(entries) => {
+            let arr = qjs::JS_NewArray(ctx);
+            let mut idx: u32 = 0;
+            for entry in entries.flatten() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    let Ok(c_name) = CString::new(name) else { continue };
+                    let s = qjs::sofuu_js_new_string(ctx, c_name.as_ptr());
+                    qjs::JS_SetPropertyUint32(ctx, arr, idx, s);
+                    idx += 1;
+                }
+            }
+            arr
+        }
+        Err(_) => qjs::JS_ThrowInternalError(ctx, c"readdirSync failed".as_ptr()),
+    }
+}
+
+unsafe extern "C" fn js_mkdir_sync(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(ctx, c"mkdirSync: path required".as_ptr());
+    }
+    let path = match fs_path_arg(ctx, *argv, "mkdirSync", crate::rt::policy::FsKind::Write) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let path_str = path.to_string_lossy();
+    if std::fs::create_dir_all(path_str.as_ref()).is_err() {
+        return qjs::JS_ThrowInternalError(ctx, c"mkdirSync failed".as_ptr());
+    }
+    qjs::sofuu_js_undefined()
+}
+
+unsafe extern "C" fn js_unlink_sync(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(ctx, c"unlinkSync: path required".as_ptr());
+    }
+    let path = match fs_path_arg(ctx, *argv, "unlinkSync", crate::rt::policy::FsKind::Write) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let path_str = path.to_string_lossy();
+    if std::fs::remove_file(path_str.as_ref()).is_err() {
+        return qjs::JS_ThrowInternalError(ctx, c"unlinkSync failed".as_ptr());
+    }
+    qjs::sofuu_js_undefined()
+}
+
+unsafe extern "C" fn js_stat_sync(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::JS_ThrowTypeError(ctx, c"statSync: path required".as_ptr());
+    }
+    let path = match fs_path_arg(ctx, *argv, "statSync", crate::rt::policy::FsKind::Read) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let path_str = path.to_string_lossy();
+    match std::fs::metadata(path_str.as_ref()) {
+        Ok(meta) => {
+            let obj = qjs::sofuu_js_new_object(ctx);
+            let size = meta.len() as f64;
+            let is_dir = meta.is_dir();
+            let is_file = meta.is_file();
+            let mtime_ms = meta.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as f64)
+                .unwrap_or(0.0);
+            
+            qjs::sofuu_js_set_property_str(ctx, obj, c"size".as_ptr(), qjs::sofuu_js_new_float64(ctx, size));
+            qjs::sofuu_js_set_property_str(ctx, obj, c"mtimeMs".as_ptr(), qjs::sofuu_js_new_float64(ctx, mtime_ms));
+            qjs::sofuu_js_set_property_str(ctx, obj, c"is_dir".as_ptr(), qjs::sofuu_js_new_bool(ctx, if is_dir { 1 } else { 0 }));
+            qjs::sofuu_js_set_property_str(ctx, obj, c"is_file".as_ptr(), qjs::sofuu_js_new_bool(ctx, if is_file { 1 } else { 0 }));
+            obj
+        }
+        Err(_) => qjs::JS_ThrowInternalError(ctx, c"statSync failed".as_ptr()),
+    }
+}
+
 // ── Registration (C symbol replacement for mod_fs_register) ──────────
 
 /// # Safety
@@ -1056,6 +1284,48 @@ pub unsafe extern "C" fn mod_fs_register(ctx: *mut JSContext) {
         fs,
         c"root".as_ptr(),
         qjs::sofuu_js_new_cfunction(ctx, js_fs_get_root, c"root".as_ptr(), 0),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        fs,
+        c"readFileSync".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_read_file_sync, c"readFileSync".as_ptr(), 2),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        fs,
+        c"writeFileSync".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_write_file_sync, c"writeFileSync".as_ptr(), 2),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        fs,
+        c"existsSync".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_exists_sync, c"existsSync".as_ptr(), 1),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        fs,
+        c"readdirSync".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_readdir_sync, c"readdirSync".as_ptr(), 1),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        fs,
+        c"mkdirSync".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_mkdir_sync, c"mkdirSync".as_ptr(), 1),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        fs,
+        c"unlinkSync".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_unlink_sync, c"unlinkSync".as_ptr(), 1),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        fs,
+        c"statSync".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_stat_sync, c"statSync".as_ptr(), 1),
     );
 
     qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"fs".as_ptr(), fs);

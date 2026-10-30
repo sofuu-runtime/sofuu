@@ -659,6 +659,15 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
     // module has finished building `sofuu` and nothing overwrites these.
     unsafe { register_timing_globals(ctx) };
     unsafe { register_version_property(ctx) };
+
+    // Problem B: Web Standard APIs & Node.js built-ins compatibility layer
+    unsafe {
+        crate::shipped::eval_shipped(
+            ctx as *mut c_void,
+            include_str!("../../../../src/js/compat.js"),
+            "<compat>",
+        );
+    }
 }
 
 // ── C-01 / C-03 error surfaces shared with promise.rs ─────────────
@@ -1073,39 +1082,38 @@ pub unsafe extern "C" fn sofuu_module_loader(
     // SAFETY: module_name is a NUL-terminated C string.
     let name = unsafe { CStr::from_ptr(module_name) }.to_string_lossy().into_owned();
 
-    // Built-in node:async_hooks / async_hooks module support
-    if name == "node:async_hooks" || name == "async_hooks" {
-        let code = c"export const AsyncLocalStorage = (globalThis.sofuu && globalThis.sofuu.context && globalThis.sofuu.context.AsyncLocalStorage) || globalThis.AsyncLocalStorage; export default { AsyncLocalStorage };";
-        let func = unsafe {
-            qjs::JS_Eval(
-                ctx,
-                code.as_ptr(),
-                code.to_bytes().len(),
-                module_name,
-                qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_COMPILE_ONLY,
-            )
-        };
-        if unsafe { qjs::is_exception(func) } {
-            unsafe { qjs::js_std_dump_error(ctx) };
-            return ptr::null_mut();
-        }
-        return unsafe { qjs::sofuu_js_value_get_ptr(func) };
-    }
-
-    // Built-in sofuu plugin & extensibility module support
-    let builtin_code = if name == "sofuu" {
-        Some(c"const p=globalThis.sofuu?.plugins||{};export const defineTool=p.defineTool,defineProvider=p.defineProvider,defineService=p.defineService,defineVectorStore=p.defineVectorStore,defineStorage=p.defineStorage,z=p.z,sofuu=globalThis.sofuu;export default globalThis.sofuu;")
-    } else if name == "zod" {
-        Some(c"export const z=globalThis.sofuu?.plugins?.z;export default{z};")
+    // Built-in node & virtual compatibility modules
+    let norm_name = if let Some(stripped) = name.strip_prefix("node:") {
+        stripped
     } else {
-        None
+        &name
     };
+
+    let builtin_code: Option<&'static [u8]> = match norm_name {
+        "async_hooks" => Some(b"export const AsyncLocalStorage = (globalThis.sofuu && globalThis.sofuu.context && globalThis.sofuu.context.AsyncLocalStorage) || globalThis.AsyncLocalStorage; export default { AsyncLocalStorage };\0"),
+        "sofuu" => Some(b"const p=globalThis.sofuu?.plugins||{};export const defineTool=p.defineTool,defineProvider=p.defineProvider,defineService=p.defineService,defineVectorStore=p.defineVectorStore,defineStorage=p.defineStorage,z=p.z,sofuu=globalThis.sofuu;export default globalThis.sofuu;\0"),
+        "zod" => Some(b"export const z=globalThis.sofuu?.plugins?.z;export default{z};\0"),
+        "path" => Some(b"const m=globalThis.__sofuu_node_modules.path;export const join=m.join,resolve=m.resolve,normalize=m.normalize,isAbsolute=m.isAbsolute,relative=m.relative,dirname=m.dirname,basename=m.basename,extname=m.extname,parse=m.parse,format=m.format,sep=m.sep,delimiter=m.delimiter,posix=m.posix,win32=m.win32;export default m;\0"),
+        "events" => Some(b"const m=globalThis.__sofuu_node_modules.events;export const EventEmitter=m.EventEmitter,defaultMaxListeners=m.defaultMaxListeners,getEventListeners=m.getEventListeners,once=m.once;export default m;\0"),
+        "crypto" => Some(b"const m=globalThis.__sofuu_node_modules.crypto;export const randomUUID=m.randomUUID,getRandomValues=m.getRandomValues,subtle=m.subtle,randomBytes=m.randomBytes,createHash=m.createHash,createHmac=m.createHmac;export default m;\0"),
+        "buffer" => Some(b"const m=globalThis.__sofuu_node_modules.buffer;export const Buffer=m.Buffer,SlowBuffer=m.SlowBuffer,kMaxLength=m.kMaxLength;export default m;\0"),
+        "fs" => Some(b"const m=globalThis.__sofuu_node_modules.fs;export const readFileSync=m.readFileSync,writeFileSync=m.writeFileSync,existsSync=m.existsSync,readdirSync=m.readdirSync,mkdirSync=m.mkdirSync,unlinkSync=m.unlinkSync,statSync=m.statSync,promises=m.promises;export default m;\0"),
+        "os" => Some(b"const m=globalThis.__sofuu_node_modules.os;export const platform=m.platform,arch=m.arch,homedir=m.homedir,tmpdir=m.tmpdir,hostname=m.hostname,release=m.release,type=m.type,cpus=m.cpus,totalmem=m.totalmem,freemem=m.freemem,EOL=m.EOL;export default m;\0"),
+        "util" => Some(b"const m=globalThis.__sofuu_node_modules.util;export const promisify=m.promisify,inspect=m.inspect,format=m.format,types=m.types,inherits=m.inherits,TextEncoder=m.TextEncoder,TextDecoder=m.TextDecoder;export default m;\0"),
+        "stream" => Some(b"const m=globalThis.__sofuu_node_modules.stream;export const Readable=m.Readable,Writable=m.Writable,Transform=m.Transform,PassThrough=m.PassThrough,pipeline=m.pipeline,finished=m.finished;export default m;\0"),
+        "assert" => Some(b"const m=globalThis.__sofuu_node_modules.assert;export const equal=m.equal,strictEqual=m.strictEqual,deepEqual=m.deepEqual,notEqual=m.notEqual,notStrictEqual=m.notStrictEqual,ok=m.ok;export default m;\0"),
+        "url" => Some(b"export const URL=globalThis.URL,URLSearchParams=globalThis.URLSearchParams;export default{URL,URLSearchParams};\0"),
+        "http" | "https" => Some(b"const m=globalThis.__sofuu_node_modules.http;export const request=m.request,get=m.get,createServer=m.createServer,Agent=m.Agent;export default m;\0"),
+        "process" => Some(b"export default globalThis.process;\0"),
+        _ => None,
+    };
+
     if let Some(code) = builtin_code {
         let func = unsafe {
             qjs::JS_Eval(
                 ctx,
-                code.as_ptr(),
-                code.to_bytes().len(),
+                code.as_ptr() as *const c_char,
+                code.len() - 1,
                 module_name,
                 qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_COMPILE_ONLY,
             )

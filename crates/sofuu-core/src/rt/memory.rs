@@ -703,6 +703,13 @@ mod impl_qtsq {
         /// is worth ~30 ms of I/O.
         graph_snapshot_epoch: u64,
         graph_snapshot_records: Option<usize>,
+        /// W3.4 perf: the last epoch whose superseded generations were swept,
+        /// and how many flushes since the last sweep. A flush that only
+        /// appends a segment cannot create an orphan or a superseded
+        /// generation, so sweeping every flush was two full directory scans
+        /// (plus a filename parse per segment) for nothing.
+        last_sweep_epoch: Option<u64>,
+        flushes_since_sweep: u32,
         /// W3.3: segment payloads this handle has actually read — 0 for a
         /// normal open until the first row access, N for `verify_full`.
         /// Reported as `stats().segments_read`.
@@ -1326,6 +1333,8 @@ mod impl_qtsq {
             pending: None,
             graph_snapshot_epoch: 0,
             graph_snapshot_records: None,
+            last_sweep_epoch: None,
+            flushes_since_sweep: 0,
             segments_read: 0,
             recovery_pending: false,
             closed: false,
@@ -1680,6 +1689,74 @@ mod impl_qtsq {
         let mut scan = SegScan::default();
         let mut by_id: std::collections::BTreeMap<u32, crate::rt::brain_store::SegRecord> =
             std::collections::BTreeMap::new();
+        let prof = std::env::var_os("SOFUU_PROFILE").is_some();
+        let mut t_digest = 0f64;
+        let mut t_decode = 0f64;
+        let mut t_nonfinite = 0f64;
+        let mut t_byid = 0f64;
+
+        /* Parallel digest+decode pass (W3.3 perf).
+         *
+         * Segments are independent immutable files and the C container
+         * decoder is thread-safe (verified: 8 threads over 89 real segments
+         * return byte-identical results, 9.2x faster), so the sequential read
+         * was leaving every core but one idle — measured at 205 of 233 ms of
+         * scan time at 20k records, i.e. ~1.0 s of a 100k open.
+         *
+         * SAFETY VALVE: parallelism must never change a verdict. If any
+         * segment in the pass reported an error, or needed the legacy
+         * password, the pass is DISCARDED and the loop below reads
+         * sequentially exactly as it always did. A damaged or legacy store
+         * therefore takes the old path, byte for byte; only the plain
+         * all-machine-key store gets the parallel one.
+         */
+        let mut preloaded: std::collections::HashMap<
+            String,
+            (Option<String>, Result<(Vec<crate::rt::brain_store::SegRecord>, bool), c_int>),
+        > = {
+            let files: Vec<(String, String)> = m
+                .segments
+                .iter()
+                .map(|sg| (sg.file.clone(), format!("{dir}/{}", sg.file)))
+                .filter(|(_, p)| std::path::Path::new(p).is_file())
+                .collect();
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(1, 8);
+            if files.len() < 8 || threads < 2 {
+                std::collections::HashMap::new()
+            } else {
+                let chunk = files.len().div_ceil(threads).max(1);
+                let collected = std::sync::Mutex::new(Vec::with_capacity(files.len()));
+                std::thread::scope(|sc| {
+                    for part in files.chunks(chunk) {
+                        let collected = &collected;
+                        sc.spawn(move || {
+                            let mut local = Vec::with_capacity(part.len());
+                            for (name, path) in part {
+                                let digest = crate::rt::brain_store::file_digest(path);
+                                let read = crate::rt::brain_store::read_segment_ex(path);
+                                local.push((name.clone(), (digest, read)));
+                            }
+                            collected.lock().expect("segment preload").extend(local);
+                        });
+                    }
+                });
+                let map: std::collections::HashMap<_, _> =
+                    collected.into_inner().expect("segment preload").into_iter().collect();
+                let suspicious = map.values().any(|(_, r)| match r {
+                    Err(_) => true,
+                    Ok((_, legacy)) => *legacy,
+                });
+                if suspicious {
+                    std::collections::HashMap::new()
+                } else {
+                    map
+                }
+            }
+        };
+
         for seg in &m.segments {
             let file = format!("{dir}/{}", seg.file);
             if !std::path::Path::new(&file).exists() {
@@ -1695,14 +1772,26 @@ mod impl_qtsq {
              * a truncated container as a valid, silently-shortened one, so
              * without this a torn segment would read as a brain that
              * quietly lost records. */
-            let digest = crate::rt::brain_store::file_digest(&file);
+            let pre = preloaded.remove(&seg.file);
+            let t0 = std::time::Instant::now();
+            let digest = match &pre {
+                Some((d, _)) => d.clone(),
+                None => crate::rt::brain_store::file_digest(&file),
+            };
+            t_digest += t0.elapsed().as_secs_f64() * 1000.0;
             let verified =
                 seg.sha256.is_empty() || digest.as_deref() == Some(seg.sha256.as_str());
             /* W3.3: the counter a lazy open proves itself with. Counted
              * BEFORE the read so a segment that fails still counts (it was
              * touched). */
             scan.segments_read += 1;
-            let (recs, legacy) = match crate::rt::brain_store::read_segment_ex(&file) {
+            let t0 = std::time::Instant::now();
+            let decode = match pre {
+                Some((_, r)) => r,
+                None => crate::rt::brain_store::read_segment_ex(&file),
+            };
+            t_decode += t0.elapsed().as_secs_f64() * 1000.0;
+            let (recs, legacy) = match decode {
                 Ok(v) => v,
                 Err(_) => {
                     if readonly {
@@ -1756,7 +1845,10 @@ mod impl_qtsq {
              * all fall back to Equal), so recall would silently misbehave
              * forever. Treat such a segment exactly like an unreadable one:
              * quarantine it, account for its records, and open the rest. */
-            if let Some(at) = recs.iter().position(|r| r.vec.iter().any(|x| !x.is_finite())) {
+            let t0 = std::time::Instant::now();
+            let nonfinite = recs.iter().position(|r| r.vec.iter().any(|x| !x.is_finite()));
+            t_nonfinite += t0.elapsed().as_secs_f64() * 1000.0;
+            if let Some(at) = nonfinite {
                 if readonly {
                     eprintln!(
                         "[sofuu/cma] SEGMENT DAMAGE: {} carries a non-finite vector (record {}/{}) — a readonly open keeps it in place ({} record(s) unavailable to this reader)",
@@ -1814,9 +1906,16 @@ mod impl_qtsq {
                     digest.clone().unwrap_or_else(|| seg.sha256.clone())
                 },
             });
+            let t0 = std::time::Instant::now();
             for r in recs {
                 by_id.insert(r.id, r);
             }
+            t_byid += t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        if prof {
+            eprintln!(
+                "[prof] scan: digest {t_digest:.1} decode {t_decode:.1} nonfinite {t_nonfinite:.1} by_id {t_byid:.1} ms"
+            );
         }
 
         /* Ids must be dense: the HNSW store indexes vectors by position and
@@ -2661,9 +2760,23 @@ mod impl_qtsq {
             }
         }
 
-        /* Sweep segments a crashed compaction left behind (age-guarded). */
-        let keep: Vec<String> = layout.segments.iter().map(|s| s.file.clone()).collect();
-        crate::rt::brain_store::remove_orphan_segments(&dir, &keep, 600);
+        /* Sweep segments a crashed compaction left behind (age-guarded), and
+         * reclaim superseded generations (W3.4), but only when the store could
+         * actually hold garbage: a new epoch (compaction or re-seal) is the
+         * only thing that supersedes a file, and a crash leftover is caught by
+         * the periodic sweep below. Doing both sweeps on every append-only
+         * flush cost two directory scans and a parse of every segment name.
+         */
+        shell.flushes_since_sweep = shell.flushes_since_sweep.saturating_add(1);
+        let sweep = shell.last_sweep_epoch != Some(layout.epoch) || shell.flushes_since_sweep >= 64;
+        let mut keep: Vec<String> = Vec::new();
+        let mut reclaimed = 0usize;
+        if sweep {
+            shell.last_sweep_epoch = Some(layout.epoch);
+            shell.flushes_since_sweep = 0;
+            keep = layout.segments.iter().map(|s| s.file.clone()).collect();
+            crate::rt::brain_store::remove_orphan_segments(&dir, &keep, 600);
+        }
 
         /* W3.4: reclaim SUPERSEDED generations, so the store does not grow
          * with every flush. Without this, compaction and re-sealing leave
@@ -2680,16 +2793,18 @@ mod impl_qtsq {
          * readers too, so no other process can be reading an old generation
          * or publishing a new one — the guard exists for the crashed-writer
          * case, which the manifest we just published has already resolved. */
-        let mut keep_gens: Vec<u64> = Vec::with_capacity(layout.segments.len() + 1);
-        keep_gens.push(layout.epoch);
-        for st in &layout.segments {
-            if let Some(g) = crate::rt::brain_store::generation_of(&st.file) {
-                if !keep_gens.contains(&g) {
-                    keep_gens.push(g);
+        if sweep {
+            let mut keep_gens: Vec<u64> = Vec::with_capacity(layout.segments.len() + 1);
+            keep_gens.push(layout.epoch);
+            for st in &layout.segments {
+                if let Some(g) = crate::rt::brain_store::generation_of(&st.file) {
+                    if !keep_gens.contains(&g) {
+                        keep_gens.push(g);
+                    }
                 }
             }
+            reclaimed = crate::rt::brain_store::reclaim_unreferenced_now(&dir, &keep_gens, 0);
         }
-        let reclaimed = crate::rt::brain_store::reclaim_unreferenced_now(&dir, &keep_gens, 0);
         if reclaimed > 0 {
             eprintln!(
                 "[sofuu/cma] reclaimed {reclaimed} superseded store file(s) (W3.4)"
@@ -4914,6 +5029,8 @@ mod impl_qtsq {
             pending: None,
             graph_snapshot_epoch: 0,
             graph_snapshot_records: None,
+            last_sweep_epoch: None,
+            flushes_since_sweep: 0,
             segments_read: 0,
             recovery_pending: false,
             closed: false,

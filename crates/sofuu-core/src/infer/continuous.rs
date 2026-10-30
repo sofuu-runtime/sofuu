@@ -597,7 +597,7 @@ impl ContinuousBatchServer {
                     match stream.status {
                         StreamStatus::Prefilling => {
                             // CHUNKED PREFILL: one slice per iteration, so a
-                            // long prompt stops monopolising the scheduler.
+                            // long prompt stops dominating the scheduler.
                             // cur_pos doubles as "prompt tokens already in the
                             // KV cache" while Prefilling. Slice size comes from
                             // prefill_sched (SOFUU_PREFILL_LIMIT, 0 = one shot)

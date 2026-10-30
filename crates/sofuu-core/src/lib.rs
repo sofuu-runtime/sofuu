@@ -16,6 +16,7 @@
 pub mod bundler;
 pub mod brain_cmd; // W7: `sofuu brain verify|repair|stats|backup|restore|migrate`
 pub mod capabilities; // R1: the capability manifest (sofuu.capabilities)
+pub mod compiler; // `sofuu compile`: append-trailer standalone agent binaries
 pub mod embedding; // compact learned semantic projector for memory recall
 pub mod embed_config; // H2: process-global embedded-mode config (is_embedded, config_root, signals)
 pub mod ffi_exports; // C-ABI exports consumed by the remaining C core (Track D3)

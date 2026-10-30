@@ -4,6 +4,45 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Standalone Agent Compiler (`sofuu compile`) — 2026-10-30
+
+Implementation of `STANDALONE_COMPILER_PLAN.md`: an agent becomes one
+self-contained executable — the `sofuu` binary with its bundled program and,
+optionally, its brain appended behind a 32-byte trailer.
+
+- **Command** — `sofuu compile <entry.ts|js> [-o <out>] [--embed-brain
+  <file.qtsq>] [--no-strip]`. The entry is bundled (`bundler`), compiled to
+  QuickJS bytecode with a bare compile-only runtime, gzipped when that saves
+  bytes, and staged as `payload = header + entry name + bytecode + brain`.
+- **Boot** — the CLI inspects the trailer before any dispatch: a plain binary
+  pays two reads, a compiled one runs its program immediately with
+  `process.argv` forwarded and `sofuu.args` set to the words after the binary.
+  `SOFUU_PLAIN=1` opts back into CLI mode (inspect or recompile an artifact).
+- **Exit semantics** — identical to `sofuu run`: a synchronous throw, an
+  unhandled rejection and `process.exitCode` mean what they mean there, because
+  the compiled path reuses the same precedence and loop drain.
+- **Embedded brain** — a store is a manifest plus `.d/` segments, so
+  `--embed-brain` packs both (graph snapshot included) into one archive,
+  records the vector dimension at compile time, extracts the seed beside the
+  binary on first launch, and exposes
+  `sofuu.memory.embedded = {path, dim, open()}`. An existing extracted store is
+  never overwritten: the payload is a seed, not a reset.
+- **Mach-O** — appending bytes to an arm64 binary invalidates its signature and
+  fails strict validation, so the artifact is assembled as: remove signature →
+  strip any earlier payload (recompiles cannot nest; three generations are
+  byte-identical) → append → extend `__LINKEDIT` over the payload → ad-hoc
+  re-sign. The trailer therefore does not sit at EOF on macOS; boot finds it
+  just before `LC_CODE_SIGNATURE.dataoff`, tolerating codesign's 16-byte
+  alignment padding. ELF and PE keep the simple append.
+- **Verified** — hello and TypeScript/async parity with `sofuu run`; an
+  argv/exit-code matrix (0/1/7); embedded-brain recall from an unrelated cwd;
+  corrupt-payload refusal (CRC32, exit 1); size-stable recompiles; cold start
+  33.5 ms vs 33.3 ms for `sofuu run` (payload overhead below noise). 16 unit
+  tests in `compiler.rs`; conformance stays 51 PASS / 0 FAIL / 1 BLOCKED.
+- **Known gate** — `make size-check` was already red before this change
+  (5,938,720 B vs the 5,767,168 B cap; this feature adds ~18 KB). Reducing the
+  binary is a separate work item, not something this feature regressed.
+
 ## Universal Sandbox v2 — 2026-10-29
 
 Implementation of `SANDBOX_UPGRADE_PLAN.md`: the in-process execution sandbox

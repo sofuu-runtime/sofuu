@@ -50,12 +50,12 @@
 ## 🟡 2. In Progress (Active Sprint — Weeks 1–2)
 
 ### 🎯 The "Killer Wedge": Standalone Agent Compiler (`sofuu compile`)
-*See detailed specification in [`docs/STANDALONE_COMPILER_PLAN.md`](docs/STANDALONE_COMPILER_PLAN.md).*
-- [ ] **Trailer Format Implementation**: 32-byte `SOFUU_BIN_V1\0` binary trailer with CRC32 verification.
-- [ ] **Fast-Path Boot Detection**: Instant `<0.5ms` payload deserialization bypassing standard CLI parsing.
-- [ ] **AOT Bytecode Bundler**: Bundling TypeScript + QuickJS bytecode into single executable.
-- [ ] **OS Signing & Integrity**: Automated macOS ad-hoc code-signing (`codesign -s - -f`) and Linux ELF validation.
-- [ ] **Embedded Memory Support**: Packaging `.qtsq` cognitive vector databases directly into the binary (`--embed-brain`).
+*See detailed specification in [`docs/STANDALONE_COMPILER_PLAN.md`](docs/STANDALONE_COMPILER_PLAN.md). Shipped 2026-10-30 — see CHANGELOG.*
+- [x] **Trailer Format Implementation**: 32-byte `SOFUU_BIN_V1` binary trailer with CRC32 verification.
+- [x] **Fast-Path Boot Detection**: Two reads (trailer + payload) before CLI dispatch; macOS finds the trailer before `LC_CODE_SIGNATURE`.
+- [x] **AOT Bytecode Bundler**: Bundling TypeScript + QuickJS bytecode into a single executable.
+- [x] **OS Signing & Integrity**: Mach-O `__LINKEDIT` extension + automated ad-hoc signing; ELF/PE plain append.
+- [x] **Embedded Memory Support**: The whole `.qtsq` store (manifest + segments) packed into the binary (`--embed-brain`).
 
 ### 🛡️ Zero-Crash Hardening & Concurrency Fuzzing
 *See detailed specification in [`docs/ENTERPRISE_HARDENING_PLAN.md`](docs/ENTERPRISE_HARDENING_PLAN.md).*

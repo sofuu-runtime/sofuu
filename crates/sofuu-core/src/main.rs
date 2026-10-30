@@ -77,6 +77,7 @@ fn print_help() {
     println!("  sofuu eval \"<code>\"      Evaluate JS inline (prints the value; -q to silence)");
     println!("  sofuu bundle <entry.js>  Bundle to single file");
     println!("  sofuu bundle <entry.js> -o <out.js>");
+    println!("  sofuu compile <entry.ts> Compile to a standalone executable (-o, --embed-brain)");
     println!("  sofuu install            Install from package.json");
     println!("  sofuu add <pkg>          Install npm package");
     println!("  sofuu agent list         List agent definitions (~/.sofuu/agents/*.js)");
@@ -201,6 +202,17 @@ fn print_subcommand_help(cmd: &str) -> bool {
             "Usage: sofuu add <package>[@version] [<package>…]\n\n\
              Install npm packages into ./node_modules (specs are validated before\n\
              any network or disk work).\n"
+        ),
+        "compile" => println!(
+            "Usage: sofuu compile <entry.ts|js> [-o <out>] [--embed-brain <file.qtsq>] [--no-strip]\n\n\
+             Compile an agent into a standalone executable: this `sofuu` binary plus\n\
+             the entry's bundled bytecode and, optionally, a `.qtsq` brain appended\n\
+             behind a 32-byte trailer. The result runs on a machine with no Sofuu.\n\
+               -o, --output <file>      output path (default: the entry's stem)\n\
+               --embed-brain <file>     carry a brain; `sofuu.memory.embedded` opens it\n\
+               --no-strip               keep the base binary's symbols\n\n\
+             The artifact is tied to the QuickJS build that produced it, so recompile\n\
+             when upgrading `sofuu`. SOFUU_PLAIN=1 runs a compiled binary as a normal CLI.\n"
         ),
         "compile-bc" => println!(
             "Usage: sofuu compile-bc <input.js> <output.bc>\n\n\
@@ -1446,6 +1458,168 @@ fn js_exit_code(rt: &SofuuRuntime, rc: i32) -> ExitCode {
     ExitCode::from(code.clamp(0, 255) as u8)
 }
 
+/// Run a `sofuu compile` artifact's embedded program.
+///
+/// Order matters: the prelude (argv + the embedded brain handle) is installed
+/// BEFORE the program runs, because the program's first line may already read
+/// `sofuu.args` or `sofuu.memory.embedded`.
+fn run_compiled_payload(payload: &sofuu_core::compiler::EmbeddedPayload) -> ExitCode {
+    let rt = match SofuuRuntime::init() {
+        Some(rt) => rt,
+        None => {
+            eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    let brain = match sofuu_core::compiler::materialize_brain(payload) {
+        Ok(brain) => brain,
+        Err(e) => {
+            /* The artifact still runs: a program that never touches memory is
+             * unaffected, and one that does gets the open error with the path
+             * it tried. Losing the payload's seed silently would be worse. */
+            eprintln!("[sofuu] embedded brain not mounted: {e}");
+            None
+        }
+    };
+    install_compiled_prelude(&rt, brain.as_ref());
+
+    // SAFETY: engine_ctx() is this runtime's live QuickJS context.
+    let rc = unsafe {
+        sofuu_core::rt::engine::eval_compiled_and_run(
+            rt.engine_ctx() as *mut sofuu_ffi::qjs::JSContext,
+            &payload.bytecode,
+            &payload.entry,
+        )
+    };
+    js_exit_code(&rt, rc)
+}
+
+/// Install the globals a compiled artifact's program expects.
+///
+/// `sofuu.args` is the argv after the binary itself — the natural reading for
+/// `./agent "task"`. `sofuu.memory.embedded` is `{path, dim, open()}` over the
+/// brain the payload carried; `open()` needs the dimension recorded at compile
+/// time, which is exactly why the payload stores it.
+fn install_compiled_prelude(
+    rt: &SofuuRuntime,
+    brain: Option<&sofuu_core::compiler::MountedBrain>,
+) {
+    let argv: Vec<String> = env::args().skip(1).collect();
+    let argv_json = serde_json::to_string(&argv).unwrap_or_else(|_| "[]".to_string());
+    let embedded = match brain {
+        Some(b) => {
+            let path = serde_json::to_string(&b.path).unwrap_or_else(|_| "\"\"".to_string());
+            format!(
+                "try{{S.memory.embedded={{path:{path},dim:{},open:function(d){{return S.memory.open(this.path,d||this.dim);}}}};}}catch(e){{}}",
+                b.dim
+            )
+        }
+        None => String::new(),
+    };
+    let js = format!(
+        "(function(){{var S=globalThis.sofuu;if(!S)return;try{{S.args={argv_json};}}catch(e){{}}if(!S.memory)return;{embedded}}})();"
+    );
+    /* A prelude failure must not be attributed to the program: the try/catch
+     * arms keep the run status clean, and eval_string only dirties it on an
+     * escaping throw. */
+    let _ = rt.eval_string(&js, "<compiled-prelude>");
+}
+
+struct CompileArgs {
+    entry: String,
+    options: sofuu_core::compiler::CompileOptions,
+}
+
+/// `sofuu compile <entry.ts|js> [-o <out>] [--embed-brain <file.qtsq>] [--no-strip]`
+///
+/// A trailing flag that expects a value is an ERROR, not a silently ignored
+/// word: `-o` with nothing after it used to mean "write bundle.js" in
+/// `sofuu bundle`, and that class of typo must not ship a mislabelled binary.
+fn parse_compile_args(rest: &[String]) -> Result<CompileArgs, String> {
+    let mut options = sofuu_core::compiler::CompileOptions::default();
+    let mut entry: Option<String> = None;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        match a {
+            "-o" | "--output" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| "-o requires an output path".to_string())?;
+                options.output = Some(v.clone());
+                i += 2;
+            }
+            "--embed-brain" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| "--embed-brain requires a .qtsq path".to_string())?;
+                options.embed_brain = Some(v.clone());
+                i += 2;
+            }
+            "--no-strip" => {
+                options.no_strip = true;
+                i += 1;
+            }
+            _ if a.starts_with("--output=") => {
+                options.output = Some(a["--output=".len()..].to_string());
+                i += 1;
+            }
+            _ if a.starts_with("--embed-brain=") => {
+                options.embed_brain = Some(a["--embed-brain=".len()..].to_string());
+                i += 1;
+            }
+            _ if a.starts_with('-') => {
+                return Err(format!("unknown option '{a}'"));
+            }
+            _ => {
+                if entry.is_some() {
+                    return Err(format!(
+                        "unexpected argument '{a}' — sofuu compile takes one entry file"
+                    ));
+                }
+                entry = Some(a.to_string());
+                i += 1;
+            }
+        }
+    }
+    let Some(entry) = entry else {
+        return Err("'sofuu compile' requires an entry file\nUsage: sofuu compile <entry.ts|js> [-o <out>]".to_string());
+    };
+    Ok(CompileArgs { entry, options })
+}
+
+fn print_compile_report(r: &sofuu_core::compiler::CompileReport) {
+    println!("\x1b[1m⚡ sofuu compile\x1b[0m");
+    println!("  Output: \x1b[1m{}\x1b[0m", r.output);
+    match r.brain {
+        Some(brain) => println!(
+            "  Size:   {} B total ({} B base + {} B payload; bytecode {} B in, {} B stored{}; brain {} B)",
+            r.total,
+            r.base,
+            r.payload,
+            r.bytecode_raw,
+            r.bytecode_stored,
+            if r.gzipped { " gzip" } else { "" },
+            brain
+        ),
+        None => println!(
+            "  Size:   {} B total ({} B base + {} B payload; bytecode {} B in, {} B stored{})",
+            r.total,
+            r.base,
+            r.payload,
+            r.bytecode_raw,
+            r.bytecode_stored,
+            if r.gzipped { " gzip" } else { "" }
+        ),
+    }
+    println!(
+        "  Flags:  {}{}",
+        if r.stripped { "stripped " } else { "unstripped " },
+        if r.signed { "ad-hoc signed" } else { "unsigned" }
+    );
+    println!("\x1b[90mRun with: ./{}\x1b[0m", r.output);
+}
+
 /// `sofuu repl` — JavaScript evaluation REPL (delegates to C for now).
 fn cmd_repl(rt: &SofuuRuntime) -> i32 {
     // Phase 0: delegate to the C REPL via the FFI. We eval a script that
@@ -2375,6 +2549,23 @@ fn main() -> ExitCode {
         sofuu_core::modules::process::mod_process_set_args(args.len() as c_int, ptrs.as_mut_ptr());
     }
 
+    /* Standalone payload: a `sofuu compile` artifact carries its program (and
+     * optionally its brain) behind a 32-byte append trailer. Payload mode wins
+     * over every subcommand — the compiled agent owns its argv, so `./agent
+     * --help` is the agent's flag, not Sofuu's. The probe is a seek to EOF and
+     * a 32-byte read on a plain binary; `SOFUU_PLAIN=1` opts back into CLI
+     * mode when a compiled artifact has to be inspected or recompiled. */
+    match sofuu_core::compiler::detect_embedded_payload() {
+        Ok(Some(payload)) => return run_compiled_payload(&payload),
+        Ok(None) => {}
+        /* A trailer that proves a payload exists but whose bytes do not check
+         * out is fatal: falling through would run the wrong program. */
+        Err(e) => {
+            eprintln!("\x1b[31mError:\x1b[0m {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     // Bare `sofuu` → chat.
     if args.len() < 2 {
         let rt = match SofuuRuntime::init() {
@@ -2510,6 +2701,25 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
+            }
+        }
+        "compile" => {
+            let opts = match parse_compile_args(&args[2..]) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("\x1b[31mError:\x1b[0m {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match sofuu_core::compiler::compile(&opts.entry, &opts.options) {
+                Ok(r) => {
+                    print_compile_report(&r);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31mError:\x1b[0m {} — {}", e.code, e.message);
+                    ExitCode::FAILURE
+                }
             }
         }
         "compile-bc" => {

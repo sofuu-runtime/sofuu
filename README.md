@@ -436,6 +436,7 @@ sofuu repl                   # JavaScript evaluation REPL
 sofuu run <file.js|ts>       # Run a JavaScript/TypeScript file
 sofuu eval "<code>"          # Evaluate a JS expression inline
 sofuu bundle <entry.js> [-o <out.js>]  # Bundle into one file
+sofuu compile <entry.ts> [-o <out>]    # Standalone single-file binary (--embed-brain)
 sofuu install / add <package>          # npm packages
 sofuu agent list             # List agent definitions (~/.sofuu/agents/*.js)
 sofuu agent run <name> "task" [--json] # Run one agent headless

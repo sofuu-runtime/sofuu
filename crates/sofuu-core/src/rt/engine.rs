@@ -1451,6 +1451,90 @@ unsafe fn engine_eval_string(
     0
 }
 
+/// Run a compiled program the way `sofuu run` runs an entry file: read the
+/// QuickJS bytecode, build the global function, execute it, then drain the
+/// event loop. gzip-wrapped bytecode is accepted (the `.bc.gz` convention the
+/// shipped drivers already use), and the reader deliberately does NOT set
+/// `JS_READ_OBJ_ROM_DATA`: it copies, so the caller's buffer may be freed as
+/// soon as this returns even if the program left closures behind.
+///
+/// Exit-code precedence is `engine_eval_string`'s, so a compiled agent and
+/// `sofuu run agent.ts` agree on what a throw, a rejection and
+/// `process.exitCode` mean.
+///
+/// # Safety
+/// `ctx` must be a live QuickJS context on the engine thread.
+pub unsafe fn eval_compiled_and_run(
+    ctx: *mut qjs::JSContext,
+    bytecode: &[u8],
+    name: &str,
+) -> c_int {
+    if ctx.is_null() || bytecode.is_empty() {
+        eprintln!("[sofuu] {name}: no compiled program to run");
+        return 1;
+    }
+    let mut inflated = Vec::new();
+    let bc: &[u8] = if bytecode.len() >= 2 && bytecode[0] == 0x1f && bytecode[1] == 0x8b {
+        if std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(bytecode), &mut inflated)
+            .is_err()
+        {
+            eprintln!("[sofuu] {name}: the compiled program is a corrupt gzip stream");
+            return 1;
+        }
+        &inflated
+    } else {
+        bytecode
+    };
+
+    let fun = unsafe { qjs::JS_ReadObject(ctx, bc.as_ptr(), bc.len(), qjs::JS_READ_OBJ_BYTECODE) };
+    if unsafe { qjs::is_exception(fun) } {
+        let exc = unsafe { qjs::JS_GetException(ctx) };
+        unsafe { dispatch_or_report_uncaught(ctx, exc) };
+        unsafe {
+            qjs::sofuu_js_free_value(ctx, exc);
+            qjs::sofuu_js_free_value(ctx, fun);
+        }
+        return 1;
+    }
+    // JS_EvalFunction takes ownership of the function object.
+    let result = unsafe { qjs::JS_EvalFunction(ctx, fun) };
+    if unsafe { qjs::is_exception(result) } {
+        let exc = unsafe { qjs::JS_GetException(ctx) };
+        unsafe { dispatch_or_report_uncaught(ctx, exc) };
+        unsafe {
+            qjs::sofuu_js_free_value(ctx, exc);
+            qjs::sofuu_js_free_value(ctx, result);
+        }
+        return 1;
+    }
+    /* A program whose completion value is an ALREADY-rejected promise threw
+     * synchronously (the module case engine_eval_file documents): report it
+     * once and stop, unless process.on('uncaughtException') absorbed it. */
+    if unsafe { qjs::JS_PromiseState(ctx, result) } == qjs::JSPromiseStateEnum::Rejected {
+        let reason = unsafe { qjs::JS_PromiseResult(ctx, result) };
+        unsafe { crate::rt::promise::sofuu_rt_suppress_rejections(ctx, reason) };
+        let handled = unsafe { process_dispatch_uncaught(ctx, reason) } != 0;
+        if !handled {
+            unsafe { report_uncaught(ctx, reason) };
+        }
+        unsafe {
+            qjs::sofuu_js_free_value(ctx, reason);
+            qjs::sofuu_js_free_value(ctx, result);
+        }
+        if !handled {
+            return 1;
+        }
+        unsafe { sofuu_loop_run(ctx) };
+        return if run_status(ctx).has_uncaught_error { 1 } else { 0 };
+    }
+    unsafe { qjs::sofuu_js_free_value(ctx, result) };
+    unsafe { sofuu_loop_run(ctx) };
+    if run_status(ctx).has_uncaught_error {
+        return 1;
+    }
+    0
+}
+
 // ── PC-09: `sofuu eval` echoes its completion value ───────────────
 
 /// `engine_eval_string`, plus the REPL rendering of the completion value.

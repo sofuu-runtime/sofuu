@@ -6246,6 +6246,10 @@ mod impl_qtsq {
             MEMORY_FLAT_API_JS,
             "<memory-api>",
         );
+        /* PLAN-PLUGGABLE-MEMORY-ADAPTERS: the router's remote/custom
+         * backends live in src/js/memory_adapters.js and are compiled on
+         * first use — this only installs the loader, it evals nothing. */
+        crate::rt::memory_adapters::mod_memory_adapters_register(ctx);
     }
 
     /// mod_kv_register — sofuu.kv.open + the KVStore class.

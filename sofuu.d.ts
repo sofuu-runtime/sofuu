@@ -867,13 +867,133 @@ export interface MemoryHandle {
   search(query: unknown): unknown;
   count?(): number;
   close?(): void;
+  /** Backend identity: 'qtsq' for the embedded engine. */
+  readonly __adapter?: string;
   [extension: string]: unknown;
 }
 
-/** The on-device vector memory surface. */
+/* ── Pluggable memory adapters (PLAN-PLUGGABLE-MEMORY-ADAPTERS) ──────
+ *
+ * `memory.open()` also accepts a remote backend or the developer's own
+ * adapter. Those handles are asynchronous: every method returns a promise,
+ * so `await brain.remember(...)` reads the same on every backend and the
+ * native handle (synchronous) still satisfies the same `await`.
+ */
+
+/** One recalled fact. */
+export interface MemoryHit {
+  id: string | number | null;
+  text: string;
+  /** Cosine similarity clamped to [0, 1] — an exact hit is 1.0. */
+  score: number;
+  metadata?: Record<string, any>;
+  timestamp?: number | null;
+}
+
+/** What `remember` accepts (the adapter contract; the flat API also takes
+ *  the positional `(vector, text, role, page, source)` form). */
+export interface MemoryRecordInput {
+  text: string;
+  vector?: Float32Array | number[];
+  metadata?: Record<string, any>;
+  tags?: string[];
+  pinned?: boolean;
+}
+
+/** What `recall` accepts. `filter` is flat equality on metadata keys. */
+export interface MemoryQueryInput {
+  query?: string;
+  text?: string;
+  vector?: Float32Array | number[];
+  limit?: number;
+  /** In normalized score space, filtered client-side on every backend. */
+  threshold?: number;
+  filter?: Record<string, any>;
+}
+
+/** The 4-method backend contract. Optional hooks are used when present. */
+export interface MemoryAdapter {
+  readonly id: string;
+  open?(uri: string, options?: MemoryOpenOptions): void | Promise<void>;
+  remember(record: MemoryRecordInput): { id: string | number; success?: boolean } | Promise<{ id: string | number; success?: boolean }>;
+  recall(query: MemoryQueryInput): MemoryHit[] | Promise<MemoryHit[]>;
+  delete?(id: string | number): boolean | Promise<boolean>;
+  count?(): number | Promise<number>;
+  flush?(): { ok: boolean; recordsWritten: number } | Promise<{ ok: boolean; recordsWritten: number }>;
+  close?(): void | Promise<void>;
+  /** Set to a function (or any embedder option) when the adapter stores
+   *  vectors and wants the router to embed text for it. */
+  embed?: (text: string) => number[] | Float32Array | Promise<number[] | Float32Array>;
+  dimensions?: number;
+  [extension: string]: unknown;
+}
+
+export type MemoryAdapterId = 'qtsq' | 'native' | 'qdrant' | 'pinecone' | 'pgvector';
+
+/** Options for `memory.open()`. All adapter keys are optional. */
+export interface MemoryOpenOptions {
+  /** 'qtsq'/'native' keep the embedded engine; the rest pick a REST backend
+   *  or a factory `(uri, options) => MemoryAdapter`. */
+  adapter?: MemoryAdapterId | ((uri: string, options: MemoryOpenOptions) => MemoryAdapter);
+  uri?: string;
+  /** Vector width. Required by the built-in vector backends. */
+  dimensions?: number;
+  /** Inline key (harnesses). Prefer apiKeyEnv/apiKeySecret under R7. */
+  apiKey?: string;
+  /** Secret NAME, resolved through `sofuu.policy.secret()` then process.env. */
+  apiKeyEnv?: string;
+  apiKeySecret?: string;
+  /** Custom embedder; otherwise embedSpace / embedProvider / local hash. */
+  embed?: (text: string) => number[] | Float32Array | Promise<number[] | Float32Array>;
+  embedSpace?: 'hash' | 'semantic' | 'semantic-v2';
+  embedProvider?: string;
+  embedModel?: string;
+  timeoutMs?: number;
+  /* qdrant */
+  collection?: string;
+  create?: boolean;
+  distance?: 'Cosine' | 'Dot' | 'Euclid';
+  /* pinecone */
+  namespace?: string;
+  /* pgvector / PostgREST */
+  restPath?: string;
+  table?: string;
+  rpc?: string;
+  columns?: { text?: string; embedding?: string; metadata?: string; id?: string };
+  result?: { text?: string; score?: string; metadata?: string };
+  [extension: string]: unknown;
+}
+
+/** The async handle a remote/custom adapter returns. */
+export interface MemoryAdapterHandle {
+  readonly __adapter: string;
+  readonly __async: true;
+  /** The adapter's open(); rejects when the endpoint is unusable. */
+  readonly ready: Promise<void>;
+  remember(text: string, options?: MemoryRecordInput): Promise<{ id: string | number | null; success: boolean }>;
+  remember(vector: Float32Array | number[], text: string, role?: string, page?: number, source?: string): Promise<{ id: string | number | null; success: boolean }>;
+  recall(query: string, limit?: number): Promise<MemoryHit[]>;
+  recall(query: string, options?: MemoryQueryInput): Promise<MemoryHit[]>;
+  recall(query: MemoryQueryInput): Promise<MemoryHit[]>;
+  search: MemoryAdapterHandle['recall'];
+  forget(id: string | number): Promise<boolean>;
+  delete: MemoryAdapterHandle['forget'];
+  count(): Promise<number>;
+  flush(): Promise<{ ok: boolean; recordsWritten: number }>;
+  close(): Promise<boolean>;
+  [extension: string]: unknown;
+}
+
+/** The on-device vector memory surface (and the adapter router). */
 export interface SofuuMemory {
   /** Opens (or creates) a .qtsq container. */
   open(path: string, dim?: number, backend?: string): MemoryHandle | null;
+  /** Opens the developer's own backend. */
+  open(adapter: MemoryAdapter, options?: MemoryOpenOptions): MemoryAdapterHandle;
+  /** Opens a built-in REST backend (qdrant | pinecone | pgvector). */
+  open(uri: string, options: MemoryOpenOptions & { adapter: MemoryAdapterId | ((uri: string, options: MemoryOpenOptions) => MemoryAdapter) }): MemoryAdapterHandle;
+  /** Object form of either. */
+  open(options: MemoryOpenOptions & { path: string }): MemoryAdapterHandle | MemoryHandle | null;
   remember?(input: unknown): unknown;
   recall?(input: unknown): unknown;
   search?(input: unknown): unknown;

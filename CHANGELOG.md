@@ -39,6 +39,72 @@ in-runtime alternatives.
 SSE server (chunk arrival time proves streaming, not a resolved promise).
 `COMPAT.md` records the new surface, including what is deliberately absent.
 
+## Pluggable memory adapters — 2026-10-30
+
+`sofuu.memory` was hard-wired to the embedded QTSQ engine. Deployments that
+already run a vector database had to move their data into a `.qtsq` container
+(or keep a second copy), which is friction at review time and a blocker for
+serverless swarms that need one shared store. `open()` now routes to three
+handle kinds behind the *same* flat API:
+
+| Backend | Selected with | Transport |
+|---|---|---|
+| native QTSQ (default) | `memory.open(path, dim)` | in-process, unchanged |
+| custom adapter | `memory.open({remember, recall})` | whatever the developer writes |
+| `qdrant` / `pinecone` / `pgvector` | `memory.open(uri, {adapter, dimensions, …})` | `fetch` only |
+
+- **One contract.** A remote handle takes the same calls as a native brain:
+  `remember(vec, text, role, page, source)` and `remember(text, {metadata, tags})`,
+  `recall("text", 5)` and `recall({text, vector, limit, threshold, filter})`.
+  Remote methods return promises, so `await brain.remember(…)` reads the same
+  on every backend; the native methods stay synchronous.
+- **Scores are clamped cosine in [0, 1]** (an exact hit is 1.0), `threshold`
+  is applied client-side on that normalized score for every backend, and
+  `filter` is flat equality on metadata keys (payload for qdrant, metadata
+  for pinecone, the RPC `filter` argument for pgvector).
+- **Embedding is local by default** — `sofuu.ai.embedLocal` at `dimensions`
+  width (deterministic, no key). `embed: fn`, `embedSpace: 'semantic' |
+  'semantic-v2'`, or `embedProvider`/`embedModel` override it. A custom
+  adapter gets raw text unless it declares `embed`, so the router never
+  embeds behind a backend's back.
+- **No native client**: all three backends are JavaScript over `fetch`.
+  There is no `libpq`, no driver crate, and nothing new to link.
+- **R7 firewall inherited.** Every request asks `sofuu.policy.evaluate` for
+  `net.fetch` on the host first (typed `E_PERMISSION_DENIED` carrying the
+  rule id); `net.enabled:false` stops adapter traffic; a read-only policy
+  (`--read-only` narrows it to `fs.write:"off"`) refuses `remember`, `delete`
+  and `flush` with `E_PERMISSION_DENIED` unless the policy says
+  `memory.write:"on"`. Keys come from `apiKeyEnv`/`apiKeySecret` through
+  `sofuu.policy.secret()`, and no error message ever echoes a header.
+- **Typed failures**: `E_NETWORK`, `E_AUTH` (401/403), `E_NOT_FOUND`,
+  `E_HTTP`, `E_ADAPTER`, `E_ADAPTER_UNSUPPORTED`, `E_DIM`, `E_EMBED`,
+  `E_PERMISSION_DENIED`, `E_RECORD`. A dead endpoint rejects; it never
+  crashes the runtime.
+- **Boot is unchanged.** The adapter layer lives in
+  `src/js/memory_adapters.js` and is compiled on the first non-native
+  `open()` (`rt/memory_adapters.rs` installs the loader; nothing is evaluated
+  at boot). Keeping it inside `memory_api.js` cost **1.56 ms** of parse on
+  every `sofuu eval`; lazy loading measured **+0.17 ms** (inside noise) on an
+  80-run interleaved A/B against the pre-change binary.
+
+Conformance: `crates/sofuu-core/tests/memory_adapters.rs` (local-only, like
+the rest of `crates/sofuu-core/tests/` per `.gitignore`) boots the real
+runtime against an in-process fake backend that speaks all three dialects and
+runs 47 checks — round-trip and exact-hit scoring on each adapter, tag and
+metadata survival, equality filtering, flat-API routing, the custom-adapter
+contract (it must receive `{text, metadata}` and no forced vector), every
+typed failure above, the three policy gates, and a native QTSQ round-trip
+proving the default path did not change. `make bc-check` is 11/11 (both
+memory sources carry `@sofuu-source-only`; they are evaluated as source, not
+shipped as bytecode).
+
+Not in this pass: `agent.define({memory: brain})` (the plan's DX sketch) is
+not wired — the agent's memory tools still drive the on-device brain, and an
+injected async adapter would need an awaited recall inside the loop.
+pgvector counting uses `GET` + `Prefer: count=exact` + `Content-Range` rather
+than `HEAD`, because the fetch bridge drives curl through `CUSTOMREQUEST` and
+a HEAD answers CURLE_GOT_NOTHING (52).
+
 ## R7 security firewall: honest threat model, hardened FFI, policy DX, supply chain — 2026-10-30
 
 The R7 evaluator already existed; this pass makes it *verifiable* and closes

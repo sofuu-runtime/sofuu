@@ -52,7 +52,74 @@
   var live = [];
   var realOpen = M.open;
 
+  /* ── Pluggable adapter layer (PLAN-PLUGGABLE-MEMORY-ADAPTERS) ─────
+   *
+   * The adapter implementations live in src/js/memory_adapters.js and are
+   * compiled on FIRST USE by rt/memory_adapters.rs — that file is ~30 KB of
+   * source and paying for it at boot cost 1.5 ms on scripts that never touch
+   * memory. Until an adapter is opened, this router holds nothing but the
+   * two dispatch points below. */
+  var ADAPTER_SURFACE = null;
+
+  /* Installed by memory_adapters.js at the end of its evaluation. */
+  M.__installAdapters = function (surface) {
+    if (surface && typeof surface.remote === 'function' &&
+        typeof surface.custom === 'function') {
+      ADAPTER_SURFACE = surface;
+      return true;
+    }
+    return false;
+  };
+
+  /* The bridge memory_adapters.js builds against: the handle registry (so a
+   * remote handle gets the same __handle numbering as a native brain), the
+   * typed-refusal helper and the typed-array view test. Deliberately not
+   * enumerable — it is not part of the public surface. */
+  try {
+    Object.defineProperty(M, '__flat', {
+      value: { live: live, refuse: refuse, isView: isView, isOpts: isOpts },
+      enumerable: false
+    });
+  } catch (eBridge) { }
+
+  function adapterSurface() {
+    if (ADAPTER_SURFACE) return ADAPTER_SURFACE;
+    try {
+      if (typeof M.__loadAdapters === 'function') M.__loadAdapters();
+    } catch (eLoad) { /* fall through to the typed refusal */ }
+    if (!ADAPTER_SURFACE) {
+      throw refuse(Error, 'E_ADAPTER',
+        'memory adapter: adapter support is unavailable in this build');
+    }
+    return ADAPTER_SURFACE;
+  }
+
   M.open = function (a, dim, spaceId) {
+    /* ── Pluggable adapters (PLAN-PLUGGABLE-MEMORY-ADAPTERS) ──────────
+     * Recognized before the native forms, because they are strictly
+     * additive: every shape below was previously a TypeError.
+     *   memory.open(customAdapter)              → the developer's own
+     *                                             {remember, recall} object
+     *   memory.open(uri, {adapter: 'qdrant'})   → built-in REST backend
+     *   memory.open({path: uri, adapter: …})    → the same, object form
+     * `adapter: 'qtsq' | 'native'` falls through to the code below, so an
+     * explicit "use the embedded engine" reads naturally. */
+    if (a && typeof a === 'object' && typeof a.remember === 'function' &&
+        typeof a.recall === 'function') {
+      return adapterSurface().custom(a);
+    }
+    var aopts = (dim && typeof dim === 'object' && !isView(dim)) ? dim
+      : ((spaceId && typeof spaceId === 'object' && !isView(spaceId)) ? spaceId
+        : (a && typeof a === 'object' ? a : null));
+    var adapter = aopts ? aopts.adapter : undefined;
+    if (adapter !== undefined && adapter !== null && adapter !== '' &&
+        adapter !== 'qtsq' && adapter !== 'native') {
+      var uri = (a && typeof a === 'object')
+        ? (a.uri !== undefined ? a.uri : a.path)
+        : a;
+      return adapterSurface().remote(adapter, uri, aopts);
+    }
+
     // Object form {"path","dim","embed_id"|"space"} and the in-process
     // positional form (path, dim, spaceId) both work.
     var path, d, sid, opts;
@@ -101,6 +168,9 @@
     }
     try {
       Object.defineProperty(inst, '__handle', { value: id, enumerable: false });
+      /* Uniform backend identity: a native brain and a remote handle both
+       * answer __adapter, so host code can tell where a memory lives. */
+      Object.defineProperty(inst, '__adapter', { value: 'qtsq', enumerable: false });
       inst.toJSON = function () {
         return { handle: id, dim: (function () { try { return d; } catch (e) { return null; } })() };
       };
@@ -441,6 +511,18 @@
    * then the CODED flush error is rethrown. */
   M.close = function (a) {
     var inst = pick(isOpts(a) ? a : (a || {}));
+    /* A remote adapter handle is asynchronous: its flush/close return
+     * promises, and swallowing a rejection here would repeat W6.1's bug in
+     * the other direction (report success before the writes settle). The
+     * handle is released either way; the promise rejects on failure. */
+    if (inst.__async) {
+      var asyncId = live.indexOf(inst);
+      if (asyncId >= 0) live[asyncId] = null;
+      return Promise.resolve()
+        .then(function () { return typeof inst.flush === 'function' ? inst.flush() : null; })
+        .then(function () { return typeof inst.close === 'function' ? inst.close() : true; })
+        .then(function () { return true; });
+    }
     var flushErr = null;
     try { if (typeof inst.flush === 'function') inst.flush(); } catch (eFlush) { flushErr = eFlush; }
     var id = live.indexOf(inst);

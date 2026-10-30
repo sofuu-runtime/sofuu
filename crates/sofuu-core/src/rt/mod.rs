@@ -35,6 +35,7 @@ pub mod brain_key; // B4: the machine-local brain key (key file + legacy fallbac
 pub mod model_caps; // per-model capability registry (ctx/max-output/thinking)
 pub mod model_caps_discovered; // caps harvested from endpoint model listings (provider-agnostic)
 pub mod memory; // M9: sofuu.memory/kv/agent (mod_memory.c + mod_kv.c + mod_agent.c + qtsq_adapter.c)
+pub mod memory_adapters; // PLAN-PLUGGABLE-MEMORY-ADAPTERS: the lazily compiled adapter source
 pub mod zerocopy; // Phase 3: Zero-Copy TypedArray & Native Memory Bridge
 pub mod view_guard; // R7.P2: the validated JS-view → native-pointer window (bounds/alignment/dim)
 pub mod diagnostics; // PLAN-MODERN-NPM: actionable failures (native addons, absent Node APIs, resolution)

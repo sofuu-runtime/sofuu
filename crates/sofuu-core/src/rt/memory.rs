@@ -2070,7 +2070,7 @@ mod impl_qtsq {
         readonly: bool,
     ) -> Result<(BrainData, BrainLayout), c_int> {
         let dir = crate::rt::brain_store::segments_dir(path);
-        let scan = scan_segments_opts(path, m, readonly);
+        let mut scan = scan_segments_opts(path, m, readonly);
         let (segments, epoch, healed) = if scan.damaged() {
             if readonly {
                 /* Survivors only: the manifest still names the unreadable
@@ -2093,11 +2093,21 @@ mod impl_qtsq {
             );
         }
         let n = scan.recs.len();
-        let mut flat: Vec<f32> = Vec::new();
+        let renumbered_n = if scan.renumbered { n } else { 0 };
+        /* MOVE the records into the flat vector + metadata arrays instead of
+         * borrowing them and deep-cloning each `meta` Value. That clone copied
+         * 100k JSON objects — every key and every text — and was the largest
+         * single cost of a 100k open (~1.0 s of a 1.37 s load, against 191 ms
+         * for every other phase put together). `flat` is also pre-sized: it
+         * used to grow to 25 MB by repeated reallocation. Nothing here needs
+         * `scan.recs` afterwards; only its length and the renumber flag, both
+         * captured above. */
+        let dim_hint = scan.recs.first().map(|r| r.vec.len()).unwrap_or(0);
+        let mut flat: Vec<f32> = Vec::with_capacity(n.saturating_mul(dim_hint));
         let mut metas: Vec<serde_json::Value> = Vec::with_capacity(n);
-        for r in &scan.recs {
+        for r in std::mem::take(&mut scan.recs) {
             flat.extend_from_slice(&r.vec);
-            metas.push(r.meta.clone());
+            metas.push(r.meta);
         }
         if !scan.quarantined.is_empty() || !scan.missing.is_empty() || !scan.left_in_place.is_empty()
         {
@@ -2138,7 +2148,7 @@ mod impl_qtsq {
                 rec.adopted = scan.adopted.clone();
                 rec.left_in_place = scan.left_in_place.clone();
                 rec.records_dropped = scan.dropped_versions;
-                rec.ids_renumbered = if scan.renumbered { scan.recs.len() } else { 0 };
+                rec.ids_renumbered = renumbered_n;
                 rec.index_rebuilt = usize::from(scan.damaged());
                 rec.repaired = usize::from(scan.damaged() && healed);
                 rec.segments_read = scan.segments_read;

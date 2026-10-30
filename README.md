@@ -853,7 +853,7 @@ flowchart TD
             E2["Dev Server & Livereload (sofuu dev)"]
             E3["Static Asset Serving & SSR Bridge"]
         end
-        subgraph P2_Compiler["Standalone Compiler (sofuu compile)"]
+        subgraph P2_Compiler["Standalone Compiler (sofuu compile — Shipped)"]
             C1["AOT Bytecode Serializer (rt/bytecode.rs)"]
             C2["32-Byte Binary Trailer (SOFUU_BIN_V1)"]
             C3["Sub-0.5ms Fast-Path Boot Detector"]

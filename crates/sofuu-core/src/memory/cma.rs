@@ -977,6 +977,29 @@ impl Cma {
     /// metadata JSON (C's `cma_qtsq_load` output). Returns None on a
     /// malformed payload (caller falls back to a fresh store).
     pub fn hydrate(&mut self, vecs: &[f32], n: usize, dim: usize, meta_json: &str) -> bool {
+        self.hydrate_with_snapshot(vecs, n, dim, meta_json, None)
+    }
+
+    /// W3.1: `hydrate`, but with the chance to ADOPT a persisted graph
+    /// snapshot instead of rebuilding the index by inserting every vector.
+    ///
+    /// The rebuild is what made a 20k-record open take 21 s and a 100k one
+    /// 170 s: `add_vector` runs a full HNSW search per record. A snapshot of
+    /// the same generation carries the topology, so hydrating from it is
+    /// O(records) memcpy rather than O(records × log n) distance work.
+    ///
+    /// The snapshot is only used when it PROVES it belongs to this data —
+    /// same record count, same dimension — otherwise the rebuild happens as
+    /// before. A stale or corrupt snapshot must degrade to the old path, never
+    /// to a wrong answer.
+    pub fn hydrate_with_snapshot(
+        &mut self,
+        vecs: &[f32],
+        n: usize,
+        dim: usize,
+        meta_json: &str,
+        snapshot: Option<crate::memory::hnsw::Hnsw>,
+    ) -> bool {
         if dim != self.vec_dim || vecs.len() != n * dim {
             return false;
         }
@@ -991,8 +1014,14 @@ impl Cma {
                 Some(r) => r,
                 None => return false,
             };
+        /* W3.1: with a valid snapshot the index comes from the file; only the
+         * record table needs building. */
+        let adopt = snapshot.filter(|snap| snap.len() == n);
+        let rebuild_index = adopt.is_none();
         for i in 0..n {
-            self.index.add_vector(&vecs[i * dim..(i + 1) * dim]);
+            if rebuild_index {
+                self.index.add_vector(&vecs[i * dim..(i + 1) * dim]);
+            }
             let mut rec = Record::new(i as u32, "", "", 0);
             if let Some(rj) = records.get(i) {
                 rec.kv_page_id = rj.kv_page_id;
@@ -1035,6 +1064,9 @@ impl Cma {
         /* H-07: the exact-text index is derived state — re-derive it from
          * whatever the file carried (legacy files included). */
         self.rebuild_text_index();
+        if let Some(snap) = adopt {
+            self.index = snap;
+        }
         true
     }
 

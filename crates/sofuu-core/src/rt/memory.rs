@@ -2084,7 +2084,24 @@ mod impl_qtsq {
                 eprintln!("[sofuu/cma] brain file metadata unreadable — refusing the load");
                 return Err(qtsq::QTSQ_ERR_FORMAT);
             };
-            if !shell.cma.hydrate(&brain.vecs, brain.n, brain.dim, meta) {
+            /* W3.1: adopt this generation's graph snapshot when there is one.
+             * The topology is the expensive part of a load (one HNSW search
+             * per record to rebuild), so reusing it is what makes a large
+             * brain's first access cheap instead of minutes. A snapshot that
+             * does not prove it matches (count/dim are checked inside) is
+             * ignored and the index is rebuilt exactly as before. */
+            let snapshot = match crate::rt::brain_store::graph_path(&path, layout.epoch) {
+                gp => {
+                    let per_record: Vec<Vec<f32>> = (0..brain.n)
+                        .map(|i| brain.vecs[i * brain.dim..(i + 1) * brain.dim].to_vec())
+                        .collect();
+                    crate::memory::hnsw::Hnsw::load_with_vectors(&gp, per_record).ok()
+                }
+            };
+            if !shell
+                .cma
+                .hydrate_with_snapshot(&brain.vecs, brain.n, brain.dim, meta, snapshot)
+            {
                 eprintln!("[sofuu/cma] brain file metadata unreadable — refusing the load");
                 return Err(qtsq::QTSQ_ERR_FORMAT);
             }
@@ -2603,6 +2620,17 @@ mod impl_qtsq {
             );
             shell.layout = Some(layout);
             return -1;
+        }
+
+        /* W3.1: persist the graph for THIS generation, beside the segments.
+         * Written after the manifest is durable, so a snapshot can never
+         * describe a generation the manifest does not reference; a failure
+         * here is not fatal (the load simply rebuilds). */
+        {
+            let graph = crate::rt::brain_store::graph_path(&path, layout.epoch);
+            if let Err(e) = shell.cma.index.save_to(&graph) {
+                eprintln!("[sofuu/cma] graph snapshot not written ({e:?}) — the next open rebuilds it");
+            }
         }
 
         /* Sweep segments a crashed compaction left behind (age-guarded). */
@@ -6169,6 +6197,53 @@ mod impl_qtsq {
                 sh2.cma.decay_params(),
                 (crate::memory::cma::DECAY_TAG_TTL, 50.0),
                 "W5.3: a reopen with no decay config must inherit the flushed policy"
+            );
+        }
+    }
+
+    /// W3.1 (Rust surface, the WIRING not the primitive): a flush must leave
+    /// a graph snapshot beside the segments for the generation it published,
+    /// a reopen must adopt it, and a corrupt snapshot must degrade to a
+    /// correct rebuild rather than to a wrong answer. The primitive is tested
+    /// in hnsw.rs; this pins the plumbing that was missing.
+    #[test]
+    fn w3_1_a_flush_persists_the_graph_and_a_corrupt_one_falls_back_to_a_rebuild() {
+        const DIM: usize = 32;
+        let dir = fresh_test_dir("w31-wiring");
+        let p = dir.join("brain.qtsq").to_string_lossy().to_string();
+        unsafe {
+            let mut sh = cma_open(&p, DIM, None).expect("a fresh brain opens");
+            /* Distinct per record: a cyclic fixture collapses under the
+             * dedup gate (that is the gate working, not a fixture) and the
+             * count below would be measuring the merge, not the snapshot. */
+            for i in 0..40usize {
+                let v: Vec<f32> = (0..DIM).map(|d| i as f32 + d as f32 * 0.01).collect();
+                sh.cma.remember(&v, &format!("snapshot row {i}"), "user", 0);
+            }
+            assert_eq!(sh.cma.len(), 40, "40 distinct rows must survive the ingest");
+            assert_eq!(brain_flush_segmented(&mut sh), 0, "flush must succeed");
+            let epoch = sh.layout.as_ref().expect("layout").epoch;
+            let graph = crate::rt::brain_store::graph_path(&p, epoch);
+            assert!(
+                std::path::Path::new(&graph).is_file(),
+                "W3.1: a flush must persist the graph snapshot at {graph}"
+            );
+            drop(sh);
+
+            /* A good snapshot: the reopen adopts it and answers the same. */
+            let mut good = cma_open(&p, DIM, None).expect("reopen");
+            materialize(&mut good).expect("materialise");
+            assert_eq!(good.cma.len(), 40, "the snapshot-backed open keeps every record");
+
+            /* A corrupt snapshot must not be trusted: the rebuild path has to
+             * produce the same brain, never a broken one. */
+            std::fs::write(&graph, b"this is not a snapshot").expect("corrupt the snapshot");
+            let mut rebuilt = cma_open(&p, DIM, None).expect("reopen with a corrupt snapshot");
+            materialize(&mut rebuilt).expect("a corrupt snapshot must fall back, not fail");
+            assert_eq!(
+                rebuilt.cma.len(),
+                40,
+                "W3.1: a corrupt snapshot must degrade to a rebuild, not lose records"
             );
         }
     }

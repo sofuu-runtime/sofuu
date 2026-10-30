@@ -91,9 +91,11 @@ jobs:
         #
         # continue-on-error is DELIBERATE and temporary: the first full
         # measurement (100k records, release, 2026-10-30) showed
-        #   lazy open call   27.4 ms   PASS  (the eager open was > 1 s)
-        #   usable access   170.04 s   FAIL  (materialising 391 segments)
-        #   flush P99       302.0 ms   FAIL  (limit 50 ms)
+        #   lazy open call   28.2 ms    PASS  (the eager open was > 1 s)
+        #   usable access    13.11 s    FAIL  (391 segments x ~33 ms; was
+        #                                       170.04 s before the W3.1 graph
+        #                                       snapshot was wired into open)
+        #   flush P99       345.5 ms    FAIL  (limit 50 ms)
         #   10k texts->10k  10000/10000 PASS
         # so gating on it today would paint every PR red for a real,
         # already-recorded defect. Flip this to blocking once the load and

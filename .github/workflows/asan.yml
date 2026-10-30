@@ -14,6 +14,9 @@ name: ASAN
 #     ASAN-instrumented proc-macro dylibs ("Interceptors are not working"),
 #     so the local `make asan` refuses darwin and points here.
 #
+# Gated on vars.SOFUU_QTSQ_CI == '1' because the build requires a QTSQ
+# checkout (mandatory core component) that this repo does not vendor.
+#
 # Scope note (honest): the vendored C (QuickJS, libuv, libcurl) is compiled
 # by cc-rs WITHOUT -fsanitize=undefined, so this job is ASAN for the Rust
 # side of the boundary, not UBSan coverage of the C engine. The C surfaces
@@ -35,9 +38,25 @@ jobs:
     name: ASAN (Linux-x86_64, nightly)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    # QTSQ is a mandatory core component: crates/sofuu-core/build.rs panics
+    # without a built checkout (there is no "no-QTSQ" build — the flag the old
+    # CI comment mentions was never implemented). So this job runs only when
+    # the same repo variable + secret the opt-in `qtsq` job uses are present.
+    # First push (048afe0e5) failed exactly here; gating is the honest fix.
+    if: vars.SOFUU_QTSQ_CI == '1'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: QTSQ checkout (from the provided secret)
+        run: |
+          if [ -n "${{ secrets.SOFUU_QTSQ_CI_URL }}" ]; then
+            git clone "${{ secrets.SOFUU_QTSQ_CI_URL }}" /tmp/qtsq
+            echo "SOFUU_QTSQ_DIR=/tmp/qtsq" >> "$GITHUB_ENV"
+          else
+            echo "::error::SOFUU_QTSQ_CI=1 but SOFUU_QTSQ_CI_URL is unset."
+            exit 1
+          fi
 
       - name: Install build deps
         run: |

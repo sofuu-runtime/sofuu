@@ -45,12 +45,14 @@ hyperfine --warmup 10 --runs 100 \
 > | Command | Median | Note |
 > |---|---:|---|
 > | `sofuu version` (CLI only, no engine) | 5.0 ms | process + dyld floor |
-> | `sofuu eval "1+1"` | 17.1 ms | was 33.3 ms before the 2026-10-30 boot fix |
+> | `sofuu eval "1+1"` | 11.4 ms | was 33.3 ms before the two 2026-10-30 boot fixes |
 > | `sofuu capabilities` | 26.3 ms | pays a real Metal device probe, by design |
 >
-> The gap was a boot-time `sofuu.capabilities()` call inside `memory_api.js`
-> that created a Metal device (~18–20 ms) before any user code ran; see the
-> CHANGELOG entry of 2026-10-30. The Linux and Pi 5 rows have not been
+> The first fix removed a boot-time `sofuu.capabilities()` call inside
+> `memory_api.js` that created a Metal device (~18–20 ms) before any user code
+> ran; the second moved libcurl's global init (TLS trust store) and both multi
+> handles off the boot path to the first transfer (~6 ms). Both are described
+> in the CHANGELOG entries of 2026-10-30. The Linux and Pi 5 rows have not been
 > re-measured against the current tree and are historical until they are.
 
 ---

@@ -4,6 +4,52 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Boot latency: HTTP initialization moved to the first request — 2026-10-30
+
+With the GPU probe gone, the largest item left in engine boot was libcurl.
+Two modules paid for it unconditionally: `mod_http_client_register` ran
+`curl_global_init` (which loads the TLS backend and trust store, 2.7–4.6 ms
+on macOS) and built a multi handle that no script might ever use, and
+`mod_ai_register` called `ai_ensure_init()` — doing the same work a second
+time — so every `sofuu eval` and `sofuu run` carried ~6 ms of HTTP setup
+before user code ran.
+
+- **`curl::ensure_global_init()`** — a `Once`-guarded `curl_global_init`.
+  `curl_easy_init()` calls it, which covers all three users of easy handles
+  (fetch, providers, npm), and both module initializers call it too.
+- **`http_client`** creates its multi handle and timeout timer in
+  `ensure_multi()`, invoked at the top of `js_sofuu_fetch` — the only entry
+  point that starts a transfer.
+- **`ai`** — `mod_ai_register` no longer calls `ai_ensure_init()`; the four
+  request entry points (`complete`, `stream`, `embed`, audio) already did.
+- **Teardown** — `ai_abort_requests_for_ctx` used to end with an
+  unconditional `curl_multi_socket_action`, which with AI initialization
+  deferred is `NULL` and faults. It now returns early when no multi exists
+  (the abort list is empty on exactly that path). Regression test:
+  `abort_requests_without_curl_init_is_a_no_op`.
+
+Measured on Apple M2 Pro / macOS 15.7.3, same scripts in both arms,
+interleaved runs so both binaries see the same machine load:
+
+| Command | Before | After | |
+|---|---|---|---|
+| `sofuu eval "1+1"` (quiet window) | 17.3 ms | **11.4 ms** | 1.52× |
+| `sofuu eval "1+1"` (loaded window) | 20.8 ms | **14.3 ms** | 1.46× |
+| `hello.js` (as a compiled artifact) | 21.5 ms | **14.7 ms** | 1.46× |
+| `sofuu version` (no engine) | 4.9 ms | 4.9 ms | unchanged — already the floor |
+| `sofuu capabilities` | 38.2 ms | 38.9 ms | unchanged — it *should* probe the GPU |
+
+The absolute medians track machine load (two windows the same day differ by
+~3 ms); the ~6 ms delta is consistent across both. Together with the GPU
+entry below, `sofuu eval "1+1"` went from ~33 ms to ~11 ms on an idle
+machine. Verified after the change: `fetch` over TLS (200 + body), a DNS
+failure, an AI request to a dead endpoint, a compiled artifact doing
+`fetch`, and `bc-check` 11/11. The remaining boot cost is the eleven driver
+snapshots (~4.2 ms) plus native registration (~1.6 ms); deferring driver
+evaluation was evaluated and rejected — the drivers install ~30 top-level
+names that collide with native ones, so lazy loading would change what
+`sofuu.*` resolves to at boot.
+
 ## Boot latency: the GPU probe is off the start path — 2026-10-30
 
 `sofuu eval "1+1"` spent ~29 ms of its 33 ms building the engine, and ~20 of

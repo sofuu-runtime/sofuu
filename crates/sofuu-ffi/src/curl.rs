@@ -199,6 +199,22 @@ extern "C" {
     pub fn curl_mime_data(part: *mut CurlMimePart, data: *const c_char, datasize: usize) -> c_int;
 }
 
+/// Process-wide libcurl initialization, exactly once.
+///
+/// `curl_global_init` is not cheap: it loads the TLS backend and the trust
+/// store (2.7-4.6 ms measured on macOS). It used to run at engine boot, so
+/// every `sofuu eval`/`run` paid for HTTP it might never use. Every easy
+/// handle is built here, which covers all three callers (fetch, providers,
+/// npm) and makes the cost land on the first request instead.
+static GLOBAL_INIT: std::sync::Once = std::sync::Once::new();
+
+pub fn ensure_global_init() {
+    GLOBAL_INIT.call_once(|| {
+        // SAFETY: plain C call, once per process, before any easy handle.
+        unsafe { curl_global_init(CURL_GLOBAL_ALL) };
+    });
+}
+
 /// Initialize an easy handle, applying the process trust store.
 ///
 /// curl 8.6 consults `CURL_CA_BUNDLE`/`CURL_CA_PATH` only as *compile-time*
@@ -212,6 +228,7 @@ extern "C" {
 ///   SOFUU_CA_PATH=/path/to/hashed/certs   (fallback — OpenSSL hash dir)
 /// Unset on hosts whose curl already has a working default (macOS).
 pub fn curl_easy_init() -> *mut Curl {
+    ensure_global_init();
     // SAFETY: plain C call; callers already null-check the result.
     let easy = unsafe { curl_easy_init_raw() };
     if !easy.is_null() {

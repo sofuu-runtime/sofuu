@@ -1966,6 +1966,8 @@ unsafe extern "C" fn js_sofuu_fetch(
     if argc < 1 {
         return qjs::JS_ThrowTypeError(ctx, c"fetch requires a URL".as_ptr());
     }
+    // First transfer in this process: build the multi handle + timer now.
+    ensure_multi();
 
     /* P2-33 (AUDIT-2026-09-01): a streamed Response whose JS object was
      * GC'd mid-transfer parks itself in ORPHAN_RESP at DONE, with the
@@ -2277,6 +2279,28 @@ unsafe extern "C" fn js_sofuu_fetch(
     promise
 }
 
+/// Create this process's curl multi handle and its libuv timer, once.
+///
+/// Only a transfer needs them, and `fetch` is the only entry point that starts
+/// one — so this runs there. Engine boot used to pay for it (plus
+/// `curl_global_init`, which loads the TLS trust store) even when a script
+/// never touched the network.
+unsafe fn ensure_multi() {
+    if GLOBAL_INIT_DONE.with(|g| g.get()) != 0 {
+        return;
+    }
+    sofuu_ffi::curl::ensure_global_init();
+    let timer = libc::malloc(uv::sofuu_uv_timer_size()) as *mut UvTimer;
+    TIMEOUT_TIMER.with(|t| t.set(timer));
+    uv::uv_timer_init(sofuu_loop_get(), timer);
+
+    let multi = curl::curl_multi_init();
+    CURL_HANDLE.with(|c| c.set(multi));
+    curl::curl_multi_setopt(multi, CURLMOPT_SOCKETFUNCTION, handle_socket as *const c_void);
+    curl::curl_multi_setopt(multi, CURLMOPT_TIMERFUNCTION, start_timeout as *const c_void);
+    GLOBAL_INIT_DONE.with(|g| g.set(1));
+}
+
 // ── registration (C symbol replacement for mod_http_client_register) ──
 
 /// # Safety
@@ -2295,21 +2319,6 @@ pub unsafe extern "C" fn mod_http_client_register(ctx: *mut JSContext) {
         exotic: ptr::null_mut(),
     };
     qjs::JS_NewClass(qjs::JS_GetRuntime(ctx), class_id, &class_def);
-
-    let init = GLOBAL_INIT_DONE.with(|g| g.get());
-    if init == 0 {
-        curl::curl_global_init(curl::CURL_GLOBAL_ALL);
-        let timer = libc::malloc(uv::sofuu_uv_timer_size()) as *mut UvTimer;
-        TIMEOUT_TIMER.with(|t| t.set(timer));
-        uv::uv_timer_init(sofuu_loop_get(), timer);
-
-        let multi = curl::curl_multi_init();
-        CURL_HANDLE.with(|c| c.set(multi));
-        curl::curl_multi_setopt(multi, CURLMOPT_SOCKETFUNCTION, handle_socket as *const c_void);
-        curl::curl_multi_setopt(multi, CURLMOPT_TIMERFUNCTION, start_timeout as *const c_void);
-
-        GLOBAL_INIT_DONE.with(|g| g.set(1));
-    }
 
     let global = qjs::sofuu_js_get_global_object(ctx);
     let mut sofuu = qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr());
@@ -3125,6 +3134,7 @@ function go(f) {
             let _ctx_guard = CtxPtr::new(ctx);
             crate::rt::event_loop::sofuu_loop_init();
             mod_http_client_register(ctx);
+            ensure_multi();
 
             // Force curl_multi_add_handle to fail: no multi registered.
             let saved = CURL_HANDLE.with(|c| c.replace(ptr::null_mut()));

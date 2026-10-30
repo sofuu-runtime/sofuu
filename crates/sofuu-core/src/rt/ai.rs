@@ -2054,8 +2054,16 @@ pub unsafe fn ai_abort_requests_for_ctx(ctx: *mut JSContext) {
         }
         p = next;
     }
+    /* Boot never touches curl now: with no request ever issued there is no
+     * multi, no POLL_REMOVE to deliver, and curl_multi_socket_action(NULL)
+     * would fault. G_ACTIVE is empty on that path, so this early return is
+     * exactly the "nothing to tear down" case. */
+    let multi = g_multi();
+    if multi.is_null() {
+        return;
+    }
     let mut running: c_int = 0;
-    curl::curl_multi_socket_action(g_multi(), curl::CURL_SOCKET_TIMEOUT, 0, &mut running);
+    curl::curl_multi_socket_action(multi, curl::CURL_SOCKET_TIMEOUT, 0, &mut running);
 }
 
 thread_local! {
@@ -2374,7 +2382,7 @@ unsafe fn ai_ensure_init() {
     if done != 0 {
         return;
     }
-    curl::curl_global_init(curl::CURL_GLOBAL_ALL);
+    curl::ensure_global_init();
     let timer = libc::malloc(uv::sofuu_uv_timer_size()) as *mut UvTimer;
     G_TIMER.with(|t| t.set(timer));
     uv::uv_timer_init(sofuu_loop_get(), timer);
@@ -6972,7 +6980,6 @@ thread_local! {
 /// `ctx` must be the live engine context (called once at boot).
 #[no_mangle]
 pub unsafe extern "C" fn mod_ai_register(ctx: *mut JSContext) {
-    ai_ensure_init();
 
     let global = qjs::sofuu_js_get_global_object(ctx);
     let mut sofuu = qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr());
@@ -8617,4 +8624,16 @@ mod tests {
         );
     }
 
+
+    /* Boot never initializes curl now, so an engine that never issued a
+     * request tears down with no multi handle. This used to kick
+     * curl_multi_socket_action(NULL) and die with SIGSEGV — nothing else
+     * in the suite runs an engine's teardown on a fresh thread, so pin it
+     * here: the abort walk is empty, the guard must return quietly. */
+    #[test]
+    fn abort_requests_without_curl_init_is_a_no_op() {
+        // SAFETY: fresh test thread (G_ACTIVE empty, no multi); a null ctx
+        // is never dereferenced on this path.
+        unsafe { ai_abort_requests_for_ctx(ptr::null_mut()) };
+    }
 }

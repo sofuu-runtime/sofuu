@@ -1,0 +1,87 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "com.sofuu",
+    "module": "sofuu-android",
+    "version": "0.3.0",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "9.3.1"
+    }
+  },
+  "variants": [
+    {
+      "name": "releaseVariantReleaseApiPublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-api"
+      },
+      "files": [
+        {
+          "name": "sofuu-android-0.3.0.aar",
+          "url": "sofuu-android-0.3.0.aar",
+          "size": 8874883,
+          "sha512": "9a1edd7b79315f8de3c4cb3b6596d979f14c4efd353d3461e5b7c4229373eed1bbd053bec9b80eb5c71a463e716ed0a6970470c4630c4e8b5ccf30d3c6a5a06a",
+          "sha256": "4ee7dd4484ecbbd83f3af866ae4e44242a8dbf47eb856c519cde8504a3833a54",
+          "sha1": "3470ab9f097a1c640055809465acfac8f8fcf66a",
+          "md5": "3e05d8ae31aee53607cb4c54e76ed630"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseRuntimePublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "1.9.24"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "sofuu-android-0.3.0.aar",
+          "url": "sofuu-android-0.3.0.aar",
+          "size": 8874883,
+          "sha512": "9a1edd7b79315f8de3c4cb3b6596d979f14c4efd353d3461e5b7c4229373eed1bbd053bec9b80eb5c71a463e716ed0a6970470c4630c4e8b5ccf30d3c6a5a06a",
+          "sha256": "4ee7dd4484ecbbd83f3af866ae4e44242a8dbf47eb856c519cde8504a3833a54",
+          "sha1": "3470ab9f097a1c640055809465acfac8f8fcf66a",
+          "md5": "3e05d8ae31aee53607cb4c54e76ed630"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseSourcePublication",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "sofuu-android-0.3.0-sources.jar",
+          "url": "sofuu-android-0.3.0-sources.jar",
+          "size": 8876,
+          "sha512": "e48aa48d4bfec70ee3d81d907127105c5a71e31ea43861b4748053c5c978d77dec32ce0b16ba9897f3a117be9e793013c81130503562cf15d9ee8cd779f7a3e7",
+          "sha256": "6996002470ce52e8ab3ceb6b79f14573615c41863afb61cffd0c900c4dd96212",
+          "sha1": "a24630b9efa72f3bf61c0f40a4dd2c6185cb5658",
+          "md5": "12a96d14ab93705be88e242e4e3de430"
+        }
+      ]
+    }
+  ]
+}

@@ -213,6 +213,11 @@ jobs:
             || { echo "::error::NDK 26.1.10909125 missing after sdkmanager"; ls -la /usr/local/android-sdk/ || true; ls -la /usr/local/android-sdk/ndk 2>/dev/null || true; exit 1; }
           echo "ANDROID_NDK_HOME=/usr/local/android-sdk/ndk/26.1.10909125" >> $GITHUB_ENV
           echo "ANDROID_HOME=/usr/local/android-sdk" >> $GITHUB_ENV
+          # The runner preinstalls an SDK elsewhere and exports
+          # ANDROID_SDK_ROOT at it — AGP refuses to configure when the two
+          # paths disagree ("Several environment variables ... contain
+          # different paths to the SDK"). Point both at ours.
+          echo "ANDROID_SDK_ROOT=/usr/local/android-sdk" >> $GITHUB_ENV
 
       - name: Build libuv
         run: |

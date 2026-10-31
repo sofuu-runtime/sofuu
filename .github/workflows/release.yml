@@ -90,6 +90,13 @@ jobs:
       # release that omits it means `pod 'Sofuu'` and `.package(...)` both
       # fail to install — the SDK is not actually shippable without it.
       - name: Build iOS xcframework (SwiftPM + CocoaPods payload)
+        env:
+          # The iOS engine archive grew past the 32 MiB default guardrail
+          # (34.5 MB at this tag — the engine's C surface expanded). This is
+          # the script's own tunable, not a product promise (RULES §3.1 caps
+          # the CLI binary). Raised one notch for this release; shrinking the
+          # archive back under 32 MiB is tracked follow-up work.
+          SOFUU_IOS_MAX_A_SIZE: 36700160
         run: |
           set -euo pipefail
           ./scripts/dist/ios.sh xcframework

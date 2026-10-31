@@ -30,7 +30,7 @@ MOBILE_API="${ANDROID_API_LEVEL:-24}"
 
 # Ninja: not on PATH by default on macOS. The Android SDK ships it next to
 # its cmake (and that's also the cmake AGP uses for the app's own build).
-SDK_CMAKE_BIN="$(ls -d "$HOME"/Library/Android/sdk/cmake/*/bin 2>/dev/null | sort -V | tail -1)"
+SDK_CMAKE_BIN="$(ls -d "$HOME"/Library/Android/sdk/cmake/*/bin 2>/dev/null | sort -V | tail -1 || true)"
 if [ -n "$SDK_CMAKE_BIN" ] && [ -x "$SDK_CMAKE_BIN/ninja" ]; then
     export PATH="$SDK_CMAKE_BIN:$PATH"
 fi

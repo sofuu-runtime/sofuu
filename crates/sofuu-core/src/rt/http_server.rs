@@ -32,6 +32,10 @@ const MAX_REQ_HEADER_COUNT: usize = 128;
  * request side so a hostile handler can't balloon the header block. */
 const MAX_RESP_HEADERS: usize = 64;
 const MAX_RESP_HEADER_BYTES: usize = 16 * 1024;
+/* AUDIT-2026-10-31 P1-11: req.on() listeners are owned JS references held
+ * across the handler frame, so the count is bounded like every other
+ * per-connection resource in this file. */
+const MAX_REQ_LISTENERS: usize = 16;
 
 /* net-3 (AUDIT-2026-09-07): connection deadlines. Headers carry an ABSOLUTE
  * deadline from accept — deliberately NOT reset by received bytes, so
@@ -97,6 +101,20 @@ struct Client {
     /* JS objects */
     req_val: Cell<JSValue>,
     res_val: Cell<JSValue>,
+    /* AUDIT-2026-10-31 P1-11: req.on('data'|'end'|'close') listeners. The
+     * request body is already buffered when the handler runs, so the events
+     * are dispatched after the handler's SYNCHRONOUS frame (every listener it
+     * registers is in place by then) and each reference is freed as it fires.
+     * `handler_active` marks that frame; `ev_dispatching` keeps a listener
+     * that ends the response from re-entering the dispatcher. */
+    on_data: Vec<JSValue>,
+    on_end: Vec<JSValue>,
+    on_close: Vec<JSValue>,
+    ev_data_sent: c_int,
+    ev_end_sent: c_int,
+    ev_close_sent: c_int,
+    ev_dispatching: c_int,
+    handler_active: c_int,
 }
 
 /// Zeroed JSValue for the initial cells (see rt/promise.rs convention).
@@ -142,6 +160,14 @@ impl Client {
             closing: 0,
             req_val: Cell::new(zero_jsvalue()),
             res_val: Cell::new(zero_jsvalue()),
+            on_data: Vec::new(),
+            on_end: Vec::new(),
+            on_close: Vec::new(),
+            ev_data_sent: 0,
+            ev_end_sent: 0,
+            ev_close_sent: 0,
+            ev_dispatching: 0,
+            handler_active: 0,
         }
     }
 }
@@ -185,6 +211,20 @@ unsafe extern "C" fn timer_free_cb(handle: *mut UvHandle) {
     libc::free(handle as *mut c_void);
 }
 
+/// The route this connection served, shaped for a log line: the parsed url
+/// with any query string dropped (it can carry tokens, ?token=…), `-` before
+/// a url is known.
+unsafe fn route_for_log(c: *mut Client) -> String {
+    if (*c).route.is_empty() {
+        return "-".to_string();
+    }
+    let raw = String::from_utf8_lossy(&(*c).route).into_owned();
+    match raw.split_once('?') {
+        Some((path, _)) => path.to_string(),
+        None => raw,
+    }
+}
+
 /// R-32: one INFO-level line per abandoned connection. Before this, a client
 /// vanishing mid-response (or an SSE generation being cut) left nothing at
 /// all in the log — the failure was indistinguishable from the server
@@ -196,16 +236,7 @@ unsafe fn log_client_gone(c: *mut Client, kind: &str) {
         return; /* one line per connection, whichever path notices first */
     }
     (*c).disconnect_logged = 1;
-    let route = if (*c).route.is_empty() {
-        "-".to_string()
-    } else {
-        let raw = String::from_utf8_lossy(&(*c).route).into_owned();
-        /* Drop the query string: it can carry tokens (?token=…). */
-        match raw.split_once('?') {
-            Some((path, _)) => path.to_string(),
-            None => raw,
-        }
-    };
+    let route = route_for_log(c);
     let elapsed_ms = (*c).started.elapsed().as_millis();
     let generation_cancelled = (*c).streaming != 0 && (*c).finished == 0;
     eprintln!(
@@ -245,6 +276,9 @@ unsafe extern "C" fn on_deadline_timeout(_t: *mut UvTimer) {
         /* R-32: the server gave up on this connection — log it like any
          * other abandonment (route, elapsed, generation cut). */
         log_client_gone(c, "deadline expired");
+        /* AUDIT-2026-10-31 P1-11: drop req.on() references this connection
+         * will never dispatch. */
+        client_free_listeners(c);
         (*c).closing = 1;
         uv::uv_close((*c).tcp as *mut UvHandle, Some(client_free));
     }
@@ -298,6 +332,9 @@ unsafe extern "C" fn on_write_done(req: *mut UvWriteReq, status: c_int) {
     if close_after != 0 && (*c).closing == 0 {
         /* Only ONE path may own uv_close: a racing on_read(EOF/abort)
          * would otherwise double-close the handle and double-free. */
+        /* AUDIT-2026-10-31 P1-11: a response that never dispatched its
+         * listeners (failed write) releases them here. */
+        client_free_listeners(c);
         (*c).closing = 1;
         uv::uv_close((*c).tcp as *mut UvHandle, Some(client_free));
     }
@@ -545,6 +582,12 @@ unsafe extern "C" fn js_res_end(
         let term = libc::malloc(5) as *mut c_char;
         std::ptr::copy_nonoverlapping(b"0\r\n\r\n".as_ptr(), term as *mut u8, 5);
         queue_write(c, term, 5, 1);
+        /* AUDIT-2026-10-31 P1-11: the response ended — fire req.on('close').
+         * A response ended INSIDE the handler frame dispatches from
+         * cb_message_complete instead, once that frame returns. */
+        if (*c).handler_active == 0 {
+            req_dispatch_pending(c);
+        }
         return qjs::sofuu_js_undefined();
     }
 
@@ -568,6 +611,11 @@ unsafe extern "C" fn js_res_end(
     if !tmp.is_null() {
         qjs::sofuu_js_free_cstring(ctx, tmp);
     }
+    /* AUDIT-2026-10-31 P1-11: the response ended — fire req.on('close') (see
+     * the streaming path above for why the handler frame defers its own). */
+    if (*c).handler_active == 0 {
+        req_dispatch_pending(c);
+    }
     qjs::sofuu_js_undefined()
 }
 
@@ -585,6 +633,272 @@ unsafe extern "C" fn js_res_send(
         (*c).status = 200;
     }
     js_res_end(ctx, this_val, argc, argv)
+}
+
+// ── AUDIT-2026-10-31 P1-11: async-handler rejections + req.on() ─────
+
+/// One log-safe line for a JS value: ToString with newlines collapsed. A
+/// throwing `toString` must not leave a pending exception behind — it would
+/// fire on the next, unrelated JS call.
+unsafe fn value_one_line(ctx: *mut JSContext, v: JSValueConst) -> String {
+    let s = qjs::JS_ToString(ctx, v);
+    if qjs::is_exception(s) {
+        let exc = qjs::sofuu_js_get_exception(ctx);
+        qjs::sofuu_js_free_value(ctx, exc);
+        return "(unprintable)".to_string();
+    }
+    let p = qjs::sofuu_js_to_cstring(ctx, s);
+    qjs::sofuu_js_free_value(ctx, s);
+    if p.is_null() {
+        return "(unprintable)".to_string();
+    }
+    // SAFETY: p is a NUL-terminated string owned by ctx, freed below.
+    let out = CStr::from_ptr(p).to_string_lossy().replace(['\r', '\n'], " ");
+    qjs::sofuu_js_free_cstring(ctx, p);
+    out
+}
+
+/// AUDIT-2026-10-31 P1-11 (a): the rejection handler for ONE request.
+///
+/// JS_NewCFunctionData holds a strong reference to that request's response
+/// object, so the client is resolved from the response's opaque at call time.
+/// The binding is therefore per-request — a global "current response" would
+/// answer the WRONG client under concurrent connections — and it cannot
+/// outlive the client, because the res object itself holds a client reference.
+unsafe extern "C" fn js_handler_rejected(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+    _magic: c_int,
+    data: *mut JSValue,
+) -> JSValue {
+    if data.is_null() {
+        return qjs::sofuu_js_undefined();
+    }
+    let res = *data;
+    let c = qjs::JS_GetOpaque(res, RES_CLASS_ID.load(Ordering::Relaxed)) as *mut Client;
+    if c.is_null() {
+        return qjs::sofuu_js_undefined();
+    }
+    let reason = if argc >= 1 {
+        *argv
+    } else {
+        qjs::sofuu_js_undefined()
+    };
+    let msg = value_one_line(ctx, reason);
+    let route = route_for_log(c);
+    eprintln!("[sofuu/http] error: handler rejected route={route}: {msg}");
+    /* Answer the client — but only while the response is still open, and never
+     * with the error text (that is script-internal). res_end is the single
+     * path that puts response bytes on the wire and it latches `finished`, so
+     * a second rejection (or a late res.end) cannot send a second response. */
+    fail_client(ctx, c, res);
+    qjs::sofuu_js_undefined()
+}
+
+/// AUDIT-2026-10-31 P1-11: answer a handler failure with 500 — but only while
+/// the response is still open, and never with the error text (that is
+/// script-internal). Shared by the rejected-promise path and the synchronous
+/// throw path so a handler that fails either way produces the same answer
+/// instead of leaving the client to hit its own deadline.
+unsafe fn fail_client(ctx: *mut JSContext, c: *mut Client, res: JSValueConst) {
+    if (*c).finished != 0 || (*c).closing != 0 || (*c).peer_closed != 0 {
+        return;
+    }
+    if (*c).streaming != 0 {
+        /* The status line is already on the wire — all that is left is to
+         * terminate the chunk stream instead of leaving the reader hung. */
+        js_res_end(ctx, res, 0, ptr::null());
+    } else {
+        (*c).status = 500;
+        (*c).ctype.borrow_mut().clear();
+        (*c).ctype.borrow_mut().extend_from_slice(b"text/plain");
+        let body = qjs::sofuu_js_new_string(ctx, c"Internal Server Error".as_ptr());
+        js_res_end(ctx, res, 1, &body);
+        qjs::sofuu_js_free_value(ctx, body);
+    }
+}
+
+/// AUDIT-2026-10-31 P1-11 (a): a thenable returned by a handler gets a
+/// rejection handler. Pre-fix the returned promise was freed untouched, so a
+/// throw inside an `async` handler surfaced as a process-wide
+/// "[sofuu] UnhandledPromiseRejection" and the client sat until its own
+/// deadline. Attaching the handler also retracts that pending rejection (the
+/// tracker reports is_handled), so nothing is printed twice.
+unsafe fn attach_handler_rejection(ctx: *mut JSContext, c: *mut Client, ret: JSValueConst) {
+    let then_fn = qjs::sofuu_js_get_property_str(ctx, ret, c"then".as_ptr());
+    if qjs::is_exception(then_fn) {
+        /* A throwing `then` getter: nothing attachable. Consume it. */
+        qjs::js_std_dump_error(ctx);
+        return;
+    }
+    if qjs::JS_IsFunction(ctx, then_fn) == 0 {
+        qjs::sofuu_js_free_value(ctx, then_fn);
+        return; /* plain (non-thenable) return value — nothing to wait on */
+    }
+    let bound: [JSValue; 1] = [(*c).res_val.get()];
+    let handler = qjs::JS_NewCFunctionData(ctx, js_handler_rejected, 1, 0, 1, bound.as_ptr());
+    if qjs::is_exception(handler) {
+        qjs::js_std_dump_error(ctx);
+        qjs::sofuu_js_free_value(ctx, then_fn);
+        return;
+    }
+    let mut args: [JSValueConst; 2] = [qjs::sofuu_js_undefined(), handler];
+    let chained = qjs::JS_Call(ctx, then_fn, ret, 2, args.as_mut_ptr());
+    if qjs::is_exception(chained) {
+        qjs::js_std_dump_error(ctx);
+    }
+    qjs::sofuu_js_free_value(ctx, chained);
+    qjs::sofuu_js_free_value(ctx, handler);
+    qjs::sofuu_js_free_value(ctx, then_fn);
+}
+
+/// Release every listener reference an event list still owns.
+unsafe fn free_listeners(ctx: *mut JSContext, list: &mut Vec<JSValue>) {
+    for v in list.drain(..) {
+        qjs::sofuu_js_free_value(ctx, v);
+    }
+}
+
+/// AUDIT-2026-10-31 P1-11 (b): drop req.on() listeners a dying connection will
+/// never dispatch (peer gone, deadline, malformed request, failed write).
+/// Loop-thread paths only: client_release can run from the res finalizer, and
+/// freeing JSValues there (inside GC) is not allowed.
+unsafe fn client_free_listeners(c: *mut Client) {
+    if c.is_null() || (*c).srv.is_null() {
+        return;
+    }
+    if (*c).on_data.is_empty() && (*c).on_end.is_empty() && (*c).on_close.is_empty() {
+        return;
+    }
+    let ctx = (*(*c).srv).ctx;
+    if ctx.is_null() {
+        return;
+    }
+    free_listeners(ctx, &mut (*c).on_data);
+    free_listeners(ctx, &mut (*c).on_end);
+    free_listeners(ctx, &mut (*c).on_close);
+}
+
+/// AUDIT-2026-10-31 P1-11 (b): fire this connection's req.on() events —
+/// 'data' once with the buffered body, then 'end'; 'close' once the response
+/// ended. Called right after the handler's synchronous frame (so every
+/// listener the handler registers is in place) and again when the response
+/// ends. `ev_dispatching` keeps a listener that ends the response from
+/// re-entering the dispatcher.
+unsafe fn req_dispatch_pending(c: *mut Client) {
+    if (*c).ev_dispatching != 0 || (*c).srv.is_null() {
+        return;
+    }
+    let ctx = (*(*c).srv).ctx;
+    if ctx.is_null() {
+        return;
+    }
+    (*c).ev_dispatching = 1;
+    if (*c).ev_data_sent == 0 {
+        (*c).ev_data_sent = 1;
+        (*c).ev_end_sent = 1;
+        /* Node emits 'data' only when there IS a body. req.body carries the
+         * raw bytes (net-1: length-based, NUL-safe); it is undefined when the
+         * request had no body, so read it back off the live request object. */
+        let body = qjs::sofuu_js_get_property_str(ctx, (*c).req_val.get(), c"body".as_ptr());
+        let has_body = !qjs::is_undefined(body);
+        for f in std::mem::take(&mut (*c).on_data) {
+            if has_body {
+                let r = qjs::JS_Call(ctx, f, qjs::sofuu_js_undefined(), 1, &body);
+                if qjs::is_exception(r) {
+                    qjs::js_std_dump_error(ctx);
+                }
+                qjs::sofuu_js_free_value(ctx, r);
+            }
+            qjs::sofuu_js_free_value(ctx, f);
+        }
+        qjs::sofuu_js_free_value(ctx, body);
+        for f in std::mem::take(&mut (*c).on_end) {
+            let r = qjs::JS_Call(ctx, f, qjs::sofuu_js_undefined(), 0, ptr::null());
+            if qjs::is_exception(r) {
+                qjs::js_std_dump_error(ctx);
+            }
+            qjs::sofuu_js_free_value(ctx, r);
+            qjs::sofuu_js_free_value(ctx, f);
+        }
+    }
+    if (*c).ev_close_sent == 0 && (*c).finished != 0 {
+        (*c).ev_close_sent = 1;
+        for f in std::mem::take(&mut (*c).on_close) {
+            let r = qjs::JS_Call(ctx, f, qjs::sofuu_js_undefined(), 0, ptr::null());
+            if qjs::is_exception(r) {
+                qjs::js_std_dump_error(ctx);
+            }
+            qjs::sofuu_js_free_value(ctx, r);
+            qjs::sofuu_js_free_value(ctx, f);
+        }
+    }
+    (*c).ev_dispatching = 0;
+}
+
+/// AUDIT-2026-10-31 P1-11 (b): `req.on(type, fn)` — Node's echo pattern
+/// (`req.on('data', …)` / `req.on('end', …)`) used to be a TypeError here,
+/// because the request object exposed url/method/headers/body only. Minimal,
+/// over the already-buffered body: 'data' fires once with req.body, then
+/// 'end'; 'close' fires when the response ends. Returns the request
+/// (chainable), like Node. Bound to this request's response object, so the
+/// binding is per-request.
+unsafe extern "C" fn js_req_on(
+    ctx: *mut JSContext,
+    this_val: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+    _magic: c_int,
+    data: *mut JSValue,
+) -> JSValue {
+    if data.is_null() || argc < 1 {
+        return qjs::JS_ThrowTypeError(ctx, c"req.on(type, fn): two arguments required".as_ptr());
+    }
+    let c = qjs::JS_GetOpaque(*data, RES_CLASS_ID.load(Ordering::Relaxed)) as *mut Client;
+    if c.is_null() {
+        return qjs::JS_ThrowTypeError(ctx, c"req.on: the request is no longer live".as_ptr());
+    }
+    if argc < 2 || qjs::JS_IsFunction(ctx, *argv.add(1)) == 0 {
+        return qjs::JS_ThrowTypeError(ctx, c"req.on: listener must be a function".as_ptr());
+    }
+    let name_p = qjs::sofuu_js_to_cstring(ctx, *argv);
+    if name_p.is_null() {
+        return qjs::JS_ThrowTypeError(ctx, c"req.on: event name must be a string".as_ptr());
+    }
+    // SAFETY: NUL-terminated string owned by ctx, freed below.
+    let name = CStr::from_ptr(name_p).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, name_p);
+    let slot = match name.as_str() {
+        "data" => &mut (*c).on_data,
+        "end" => &mut (*c).on_end,
+        "close" => &mut (*c).on_close,
+        _ => {
+            /* Loud, not silently ignored: a typo'd event name must not look
+             * like a working subscription for the rest of the process's life. */
+            return qjs::JS_ThrowTypeError(
+                ctx,
+                c"req.on: only 'data', 'end' and 'close' are supported".as_ptr(),
+            );
+        }
+    };
+    /* 'data'/'end' fire once, as soon as the handler's synchronous frame
+     * returns (the body is already buffered). A listener registered LATER —
+     * after an `await`, say — would never be called, so say so now instead of
+     * leaving the script waiting on an event that already happened. */
+    if name != "close" && (*c).ev_data_sent != 0 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            c"req.on: 'data'/'end' already fired (the body is buffered in req.body)".as_ptr(),
+        );
+    }
+    if slot.len() >= MAX_REQ_LISTENERS {
+        return qjs::JS_ThrowRangeError(ctx, c"req.on: too many listeners".as_ptr());
+    }
+    slot.push(qjs::sofuu_js_dup_value(ctx, *argv.add(1)));
+    /* Node returns the emitter, so `req.on(...).on(...)` chains. */
+    qjs::sofuu_js_dup_value(ctx, this_val)
 }
 
 // ── http_parser callbacks ───────────────────────────────────────────
@@ -771,12 +1085,39 @@ unsafe extern "C" fn cb_message_complete(p: *mut HttpParser) -> c_int {
         qjs::sofuu_js_new_cfunction(ctx, js_res_closed, c"closed".as_ptr(), 0),
     );
 
+    /* AUDIT-2026-10-31 P1-11 (b): req.on(type, fn) for Node's echo pattern.
+     * Bound (JS_NewCFunctionData) to THIS request's response object,
+     * so the binding is per-request — never a global "current request". */
+    let bound: [JSValue; 1] = [(*c).res_val.get()];
+    let on_fn = qjs::JS_NewCFunctionData(ctx, js_req_on, 2, 0, 1, bound.as_ptr());
+    if qjs::is_exception(on_fn) {
+        qjs::js_std_dump_error(ctx);
+    } else {
+        qjs::sofuu_js_set_property_str(ctx, (*c).req_val.get(), c"on".as_ptr(), on_fn);
+    }
+
+    (*c).handler_active = 1;
     let mut args: [JSValueConst; 2] = [(*c).req_val.get(), (*c).res_val.get()];
     let ret = qjs::JS_Call(ctx, (*(*c).srv).handler, qjs::sofuu_js_undefined(), 2, args.as_mut_ptr());
+    (*c).handler_active = 0;
     if qjs::is_exception(ret) {
         qjs::js_std_dump_error(ctx);
+        /* AUDIT-2026-10-31 P1-11: a handler that throws synchronously only
+         * dumped the error and let the client time out. Same 500 as a
+         * rejected promise. */
+        fail_client(ctx, c, (*c).res_val.get());
+    } else if qjs::is_object(ret) {
+        /* AUDIT-2026-10-31 P1-11 (a): an `async` handler returns a promise.
+         * Pre-fix it was freed without a rejection handler, so a throw inside
+         * became a process-wide UnhandledPromiseRejection and this client hung
+         * until its own deadline. */
+        attach_handler_rejection(ctx, c, ret);
     }
     qjs::sofuu_js_free_value(ctx, ret);
+    /* AUDIT-2026-10-31 P1-11 (b): every listener the handler registers is in
+     * place once its synchronous frame returns — fire data → end here, while
+     * req_val (and the body it carries) is still alive. */
+    req_dispatch_pending(c);
     qjs::sofuu_js_free_value(ctx, (*c).req_val.replace(qjs::sofuu_js_undefined()));
     qjs::sofuu_js_free_value(ctx, (*c).res_val.replace(qjs::sofuu_js_undefined()));
     0
@@ -820,6 +1161,9 @@ unsafe extern "C" fn on_read(s: *mut UvStream, n: isize, b: *const uv::UvBuf) {
             /* Malformed, oversized, or half-parsed request: close instead
              * of holding the fd + buffers forever. */
             if (*c).closing == 0 {
+                /* AUDIT-2026-10-31 P1-11: malformed/oversized request — no
+                 * response will ever dispatch this connection's listeners. */
+                client_free_listeners(c);
                 (*c).closing = 1;
                 uv::uv_close(s as *mut UvHandle, Some(client_free));
             }
@@ -838,6 +1182,9 @@ unsafe extern "C" fn on_read(s: *mut UvStream, n: isize, b: *const uv::UvBuf) {
         };
         log_client_gone(c, kind);
         if (*c).closing == 0 {
+            /* AUDIT-2026-10-31 P1-11: the peer is gone — release any
+             * req.on() listener references still held for this connection. */
+            client_free_listeners(c);
             (*c).closing = 1;
             uv::uv_close(s as *mut UvHandle, Some(client_free));
         }
@@ -983,13 +1330,28 @@ unsafe extern "C" fn js_server_listen(
     if qjs::is_undefined((*srv).anchor) {
         (*srv).anchor = qjs::sofuu_js_dup_value(ctx, this_val);
     }
-    /* …but do not hold the event loop open on its own: a script that starts a
-     * server and finishes its work still exits, which is what every
-     * embedder here relies on. `serve()` (below) keeps the old referenced
-     * behaviour, and server.ref() restores Node's "the listener keeps the
-     * process alive" for callers that want it. */
+    /* Node semantics: a listening server keeps the process alive, so
+     * `createServer(h).listen(3000)` at the end of a script actually serves.
+     * (AUDIT-2026-10-31 P0: this used to uv_unref() for everyone, which made
+     * the README's headline example exit before it could accept a connection,
+     * and silently killed any server written in Sofuu JS — including this
+     * repo's own MCP HTTP fixture.)
+     *
+     * An EMBEDDED host drives the loop itself and must not be pinned by a
+     * listener it did not ask for, so it keeps the old unref'd behaviour.
+     * server.unref() is the opt-out for everyone else. */
     if (*srv).listening != 0 {
-        uv::uv_unref((*srv).tcp as *mut UvHandle);
+        /* A harness that drives servers as fixtures (start it, finish the
+         * script, expect the process to end) declares that with
+         * SOFUU_SERVERS_UNREF=1 rather than losing the Node default for
+         * everyone. */
+        let unref_only = crate::embed_config::is_embedded()
+            || std::env::var_os("SOFUU_SERVERS_UNREF").is_some();
+        if unref_only {
+            uv::uv_unref((*srv).tcp as *mut UvHandle);
+        } else {
+            uv::uv_ref((*srv).tcp as *mut UvHandle);
+        }
     }
     if qjs::JS_IsFunction(ctx, cb) != 0 {
         let ret = qjs::JS_Call(ctx, cb, qjs::sofuu_js_undefined(), 0, ptr::null());
@@ -1064,8 +1426,10 @@ unsafe extern "C" fn js_create_server(
 }
 
 /* server.ref() / server.unref(): whether the listening socket alone keeps the
- * event loop alive. listen() starts unref'd so a finished script exits; the
- * `serve` CLI calls ref() to stay up. Both return the server (chainable). */
+ * event loop alive. listen() refs by default (Node semantics) outside an
+ * embedded host, so a server keeps serving after the script's top level
+ * finishes; unref() lets a script exit while the socket stays bound. Both
+ * return the server (chainable). */
 unsafe extern "C" fn js_server_ref(
     ctx: *mut JSContext,
     this_val: JSValueConst,
@@ -1728,4 +2092,347 @@ mod tests {
             "healthy request must complete normally under short deadlines, got: {text}"
         );
     }
+    /// Connect with a bounded retry: a test's client thread must never race the
+    /// server's `listen()` (or another test holding the loop lock) into a bare
+    /// `unwrap` panic — that used to leave the pump with no event and hang the
+    /// whole run.
+    fn connect_retry(port: u16) -> TcpStream {
+        for _ in 0..600 {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port)) {
+                return s;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("server on 127.0.0.1:{port} never accepted a connection");
+    }
+
+    /// `raw_exchange` over a retrying connect (same read-to-EOF contract).
+    fn raw_exchange_retry(port: u16, req: &[u8]) -> Vec<u8> {
+        let mut s = connect_retry(port);
+        s.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+        s.write_all(req).unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match s.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        buf
+    }
+
+    /// AUDIT-2026-10-31 P1-11: drive `reqs` (concurrently) against a fresh
+    /// server and return (raw wire bytes per request, the `got` global).
+    ///
+    /// Two harness details this test class needs:
+    ///  * a WAKER thread keeps connecting on a cadence, because
+    ///    `uv_run(UV_RUN_ONCE)` blocks forever on an event-less loop (the same
+    ///    trick the deadline tests use);
+    ///  * `done` bails at a hard deadline, so a broken fix fails loudly instead
+    ///    of hanging the suite.
+    ///
+    /// The pump also asserts the run never NEWLY records an uncaught error: a
+    /// leaked rejection sets exactly that status flag (print_rejection →
+    /// note_uncaught_error), so this is the in-process proof that the handler's
+    /// rejection was handled rather than surfacing as an
+    /// UnhandledPromiseRejection. The baseline is taken on the first poll
+    /// because RUN_STATUS is keyed by the raw context pointer, which a freed
+    /// context can hand to the next test in the same process.
+    fn serve_requests(script: &str, port: u16, reqs: &[&[u8]]) -> (Vec<Vec<u8>>, String) {
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut clients = Vec::new();
+        for req in reqs {
+            let body = req.to_vec();
+            let fin = finished.clone();
+            clients.push(std::thread::spawn(move || {
+                let r = raw_exchange_retry(port, &body);
+                fin.fetch_add(1, Ordering::SeqCst);
+                r
+            }));
+        }
+        let stop_w = stop.clone();
+        let waker = std::thread::spawn(move || {
+            while !stop_w.load(Ordering::SeqCst) {
+                let _wake = TcpStream::connect(("127.0.0.1", port));
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        let started = std::time::Instant::now();
+        let fin = finished.clone();
+        let baseline: std::cell::Cell<Option<bool>> = std::cell::Cell::new(None);
+        let (tx, _rx) = mpsc::channel::<()>();
+        let mut out = String::new();
+        unsafe {
+            with_server(
+                script,
+                tx,
+                Some((2000, 2000)),
+                &|ctx| {
+                    let now = crate::rt::engine::run_status(ctx).has_uncaught_error;
+                    let base = match baseline.get() {
+                        Some(b) => b,
+                        None => {
+                            baseline.set(Some(now));
+                            now
+                        }
+                    };
+                    assert!(
+                        !(now && !base),
+                        "the handler's rejection escaped as an uncaught error \
+                         (UnhandledPromiseRejection) instead of being handled"
+                    );
+                    fin.load(Ordering::SeqCst) == reqs.len()
+                        || started.elapsed() > std::time::Duration::from_secs(12)
+                },
+                &mut out,
+            )
+            .unwrap();
+        }
+        stop.store(true, Ordering::SeqCst);
+        let mut wires = Vec::new();
+        for c in clients {
+            wires.push(c.join().unwrap());
+        }
+        waker.join().ok();
+        (wires, out)
+    }
+
+    const GET_BOOM: &[u8] = b"GET /boom HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n";
+    const POST_ECHO: &[u8] =
+        b"POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+
+    // ── P1-11 (a): async handler rejections answer 500, exactly once ────
+    // Negative control: pre-fix the handler's promise was freed without a
+    // rejection handler, so the client got NOTHING back (curl timed out after
+    // 5s) and the process printed "[sofuu] UnhandledPromiseRejection: Error: …".
+
+    #[test]
+    fn server_async_handler_rejection_answers_500_once() {
+        let port = pick_port();
+        let script = format!(
+            "const srv = createServer(async function (req, res) {{
+               throw new Error('boom-immediate');
+             }});
+             srv.listen({port}, '127.0.0.1');",
+            port = port
+        );
+        let (wires, _) = serve_requests(&script, port, &[GET_BOOM]);
+        let text = String::from_utf8_lossy(&wires[0]);
+        assert!(
+            text.contains("HTTP/1.1 500"),
+            "a rejected async handler must answer 500, got: {text:?}"
+        );
+        assert!(
+            text.contains("Internal Server Error"),
+            "the 500 must carry a body, got: {text:?}"
+        );
+        assert!(
+            !text.contains("boom-immediate"),
+            "the error text is script-internal and must not reach the client, got: {text:?}"
+        );
+        assert_eq!(
+            text.matches("HTTP/1.1 500").count(),
+            1,
+            "the rejection must produce EXACTLY one response, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn server_async_handler_rejection_after_await_answers_500() {
+        // This rejection lands a microtask AFTER the handler returns, so it also
+        // proves the returned promise (and its reaction) survives the server
+        // releasing its reference.
+        let port = pick_port();
+        let script = format!(
+            "const srv = createServer(async function (req, res) {{
+               await null;
+               throw new Error('boom-after-await');
+             }});
+             srv.listen({port}, '127.0.0.1');",
+            port = port
+        );
+        let (wires, _) = serve_requests(&script, port, &[GET_BOOM]);
+        let text = String::from_utf8_lossy(&wires[0]);
+        assert!(
+            text.contains("HTTP/1.1 500"),
+            "a rejection AFTER an await must still answer 500, got: {text:?}"
+        );
+        assert_eq!(
+            text.matches("HTTP/1.1 500").count(),
+            1,
+            "the rejection must produce EXACTLY one response, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn server_async_handler_resolve_still_answers_normally() {
+        // The rejection handler must not disturb a handler that fulfils.
+        let port = pick_port();
+        let script = format!(
+            "const srv = createServer(async function (req, res) {{
+               await null;
+               res.writeHead(200, {{ 'Content-Type': 'text/plain' }});
+               res.end('async-ok');
+             }});
+             srv.listen({port}, '127.0.0.1');",
+            port = port
+        );
+        let (wires, _) = serve_requests(
+            &script,
+            port,
+            &[b"GET /ok HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n"],
+        );
+        let text = String::from_utf8_lossy(&wires[0]);
+        assert!(
+            text.contains("HTTP/1.1 200") && text.contains("async-ok"),
+            "a fulfilled async handler must answer normally, got: {text:?}"
+        );
+        assert_eq!(
+            text.matches("HTTP/1.1 ").count(),
+            1,
+            "one response only, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn server_overlapping_rejections_answer_their_own_client() {
+        // P1-11 trap: a GLOBAL "current response" would answer the WRONG
+        // connection. Two overlapping rejecting requests must each get exactly
+        // one 500 on their own socket and never another request's response.
+        let port = pick_port();
+        let script = format!(
+            "const srv = createServer(async function (req, res) {{
+               await null; await null; await null;
+               throw new Error('boom ' + req.url);
+             }});
+             srv.listen({port}, '127.0.0.1');",
+            port = port
+        );
+        let (wires, _) = serve_requests(
+            &script,
+            port,
+            &[
+                b"GET /a HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+                b"GET /b HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n",
+            ],
+        );
+        for wire in &wires {
+            let text = String::from_utf8_lossy(wire);
+            assert!(
+                text.contains("HTTP/1.1 500"),
+                "each rejected request must get its own 500, got: {text:?}"
+            );
+            assert!(
+                !text.contains("HTTP/1.1 200"),
+                "a connection must not receive another request's response, got: {text:?}"
+            );
+            assert_eq!(
+                text.matches("HTTP/1.1 500").count(),
+                1,
+                "exactly one response per connection, got: {text:?}"
+            );
+        }
+    }
+
+    // ── P1-11 (b): req.on('data'|'end'|'close') ─────────────────────────
+    // Negative control: pre-fix the request object exposed url/method/headers/
+    // body only, so the echo pattern died with "req.on is not a function" and
+    // the client hung until its deadline.
+
+    #[test]
+    fn server_req_on_data_end_echo_round_trips() {
+        let port = pick_port();
+        let script = format!(
+            "const srv = createServer(function (req, res) {{
+               let body = '';
+               req.on('data', function (c) {{ body += c; }});
+               req.on('end', function () {{
+                 res.writeHead(200, {{ 'Content-Type': 'text/plain' }});
+                 res.end('echo:' + body);
+               }});
+             }});
+             srv.listen({port}, '127.0.0.1');",
+            port = port
+        );
+        let (wires, _) = serve_requests(&script, port, &[POST_ECHO]);
+        let text = String::from_utf8_lossy(&wires[0]);
+        assert!(
+            text.contains("HTTP/1.1 200"),
+            "the echo handler must answer 200, got: {text:?}"
+        );
+        assert!(
+            text.contains("echo:hello"),
+            "req.on('data')/'end' must deliver the request body, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn server_req_on_chains_and_close_fires_after_response() {
+        let port = pick_port();
+        let script = format!(
+            "globalThis.got = '';
+             const srv = createServer(function (req, res) {{
+               globalThis.chain =
+                 (req.on('data', function () {{}}) === req) ? '1' : '0';
+               req.on('close', function () {{
+                 globalThis.got = 'closed:' + globalThis.chain;
+               }});
+               res.writeHead(200, {{ 'Content-Type': 'text/plain' }});
+               res.end('ok');
+             }});
+             srv.listen({port}, '127.0.0.1');",
+            port = port
+        );
+        let (wires, got) = serve_requests(
+            &script,
+            port,
+            &[b"GET /chain HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n"],
+        );
+        let text = String::from_utf8_lossy(&wires[0]);
+        assert!(
+            text.contains("HTTP/1.1 200") && text.contains("ok"),
+            "the plain handler must still answer, got: {text:?}"
+        );
+        assert_eq!(
+            got, "closed:1",
+            "req.on must return the request (chainable) and 'close' must fire \
+             once the response ended"
+        );
+    }
+
+    #[test]
+    fn server_req_on_unknown_event_is_loud() {
+        // This request object is not an EventEmitter and can never emit
+        // 'error'/'timeout'/…, so subscribing to one is refused rather than
+        // silently accepted — a silent accept looks like a working subscription
+        // for the rest of the process's life.
+        let port = pick_port();
+        let script = format!(
+            "globalThis.got = '';
+             const srv = createServer(function (req, res) {{
+               globalThis.got = 'silent';
+               try {{
+                 req.on('timeout', function () {{}});
+               }} catch (e) {{
+                 globalThis.got = 'threw:' + (e instanceof TypeError);
+               }}
+               res.end('ok');
+             }});
+             srv.listen({port}, '127.0.0.1');",
+            port = port
+        );
+        let (_, got) = serve_requests(
+            &script,
+            port,
+            &[b"GET /u HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n"],
+        );
+        assert_eq!(
+            got, "threw:true",
+            "an unsupported event name must throw a TypeError, not be ignored"
+        );
+    }
+
 }

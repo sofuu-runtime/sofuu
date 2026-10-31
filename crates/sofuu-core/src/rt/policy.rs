@@ -60,6 +60,266 @@ fn list_at(v: &serde_json::Value, path: &[&str]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/* ── schema check (AUDIT-2026-10-31 P1-15) ─────────────────────────────
+ * THREAT_MODEL.md states the contract these checks implement: "Policy JSON
+ * | --policy, .sofuu/policy.json, sofuu.policy.set | schema-checked; invalid
+ * leaves the previous policy; fail closed". Only the "is it a JSON object"
+ * half existed, so a typo installed cleanly and then allowed everything it
+ * was supposed to refuse: {"net":{"denny":["x"]}} (misspelt key),
+ * {"net":{"deny":"x"}} (a string where a list belongs) and
+ * {"shell":{"enabled":"false"}} (a string that is not Some(false)) all read
+ * as "no rule". The checker below refuses those, and the caller keeps the
+ * policy it already had. */
+
+#[derive(Clone, Copy)]
+enum Ty {
+    Bool,
+    Num,
+    Str,
+    /// A list of strings. `single` also accepts one bare string, which the
+    /// filesystem resolver reads as a one-entry list (fs.roots).
+    StrList { single: bool },
+    /// fs.read / fs.write: a mode string, a boolean, or an inline allowlist.
+    /// Every spelling below reaches the ONE resolver in `fs_mode_and_roots`,
+    /// so nothing here can widen a box.
+    FsMode,
+    /// One of a fixed set; compared case-insensitively.
+    OneOf(&'static [&'static str]),
+    /// A nested section of the shape { <key>: Ty }.
+    Section(&'static [(&'static str, Ty)]),
+}
+
+const FS_MODES: &[&str] = &[
+    "", "any", "all", "on", "off", "none", "deny", "workspace", "allowlist", "allow-list",
+    "explicit", "roots",
+];
+
+const POLICY_SCHEMA: &[(&str, Ty)] = &[
+    (
+        "tools",
+        Ty::Section(&[
+            ("allow", Ty::StrList { single: false }),
+            ("deny", Ty::StrList { single: false }),
+        ]),
+    ),
+    (
+        "shell",
+        Ty::Section(&[
+            ("enabled", Ty::Bool),
+            ("allow", Ty::StrList { single: false }),
+            ("deny", Ty::StrList { single: false }),
+            ("spawn_strict", Ty::Bool),
+            ("spawnStrict", Ty::Bool),
+        ]),
+    ),
+    (
+        "fs",
+        Ty::Section(&[
+            ("write", Ty::FsMode),
+            ("read", Ty::FsMode),
+            ("roots", Ty::StrList { single: true }),
+        ]),
+    ),
+    (
+        "net",
+        Ty::Section(&[
+            ("enabled", Ty::Bool),
+            ("allow", Ty::StrList { single: false }),
+            ("deny", Ty::StrList { single: false }),
+            ("ssrf", Ty::Bool),
+            ("allow_private", Ty::Bool),
+            ("allowPrivate", Ty::Bool),
+        ]),
+    ),
+    (
+        "http",
+        Ty::Section(&[
+            ("deny", Ty::StrList { single: false }),
+            ("auth", Ty::OneOf(&["none", "bearer"])),
+        ]),
+    ),
+    (
+        "mcp",
+        Ty::Section(&[
+            ("servers", Ty::Section(&[("allow", Ty::StrList { single: false })])),
+            ("callTimeoutMs", Ty::Num),
+        ]),
+    ),
+    (
+        "approval",
+        Ty::Section(&[
+            ("mode", Ty::OneOf(&["never", "per-run", "always"])),
+            ("cache", Ty::Bool),
+        ]),
+    ),
+    (
+        "secrets",
+        Ty::Section(&[
+            ("source", Ty::OneOf(&["env", "file", "keychain", "host"])),
+            ("file", Ty::Str),
+        ]),
+    ),
+    ("memory", Ty::Section(&[("write", Ty::OneOf(&["on", "off"]))])),
+];
+
+fn describe(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "a boolean",
+        serde_json::Value::Number(_) => "a number",
+        serde_json::Value::String(_) => "a string",
+        serde_json::Value::Array(_) => "an array",
+        serde_json::Value::Object(_) => "an object",
+    }
+}
+
+fn want_text(ty: Ty) -> String {
+    match ty {
+        Ty::Bool => "a boolean".into(),
+        Ty::Num => "a number".into(),
+        Ty::Str => "a string".into(),
+        Ty::StrList { single: true } => "an array of strings (or one string)".into(),
+        Ty::StrList { single: false } => "an array of strings".into(),
+        Ty::FsMode => "off|workspace|allowlist|any, a boolean, or an array of roots".into(),
+        Ty::OneOf(vals) => format!("one of {}", vals.join("|")),
+        Ty::Section(_) => "an object".into(),
+    }
+}
+
+fn check_ty(path: &str, ty: Ty, v: &serde_json::Value, errs: &mut Vec<String>) {
+    let ok = match ty {
+        Ty::Bool => v.is_boolean(),
+        Ty::Num => v.is_number(),
+        Ty::Str => v.is_string(),
+        Ty::StrList { single } => {
+            if v.is_array() {
+                v.as_array().map(|a| a.iter().all(|x| x.is_string())).unwrap_or(false)
+            } else {
+                single && v.is_string()
+            }
+        }
+        Ty::FsMode => {
+            if v.is_array() {
+                v.as_array().map(|a| a.iter().all(|x| x.is_string())).unwrap_or(false)
+            } else if let Some(s) = v.as_str() {
+                FS_MODES.contains(&s.trim().to_ascii_lowercase().as_str())
+            } else {
+                v.is_boolean()
+            }
+        }
+        Ty::OneOf(vals) => v
+            .as_str()
+            .map(|s| vals.contains(&s.trim().to_ascii_lowercase().as_str()))
+            .unwrap_or(false),
+        Ty::Section(schema) => {
+            if let Some(obj) = v.as_object() {
+                for (k, inner) in schema {
+                    if let Some(child) = obj.get(*k) {
+                        check_ty(&format!("{path}.{k}"), *inner, child, errs);
+                    }
+                }
+                for k in obj.keys() {
+                    if !schema.iter().any(|(known, _)| known == k) {
+                        errs.push(format!(
+                            "{path}.{k}: unknown key (known: {})",
+                            schema.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+                        ));
+                    }
+                }
+                true
+            } else {
+                false
+            }
+        }
+    };
+    if !ok {
+        errs.push(format!(
+            "{path}: expected {}, got {}",
+            want_text(ty),
+            describe(v)
+        ));
+    }
+}
+
+/// Refuse a policy that is not the documented R7 shape. An unknown section or
+/// key is an error, not a no-op — that is the whole point of the check.
+fn validate_policy(v: &serde_json::Value) -> Result<(), String> {
+    let Some(obj) = v.as_object() else {
+        return Err("policy must be a JSON object".into());
+    };
+    let mut errs: Vec<String> = Vec::new();
+    for (k, ty) in POLICY_SCHEMA {
+        if let Some(child) = obj.get(*k) {
+            check_ty(k, *ty, child, &mut errs);
+        }
+    }
+    for k in obj.keys() {
+        /* A leading underscore is the file's own comment channel: the
+         * `sofuu policy init` profiles ship `_notes` so a human reading
+         * .sofuu/policy.json sees what each line is for. Nothing consumes it,
+         * so it is allowed and not checked. */
+        if k.starts_with('_') {
+            continue;
+        }
+        if !POLICY_SCHEMA.iter().any(|(known, _)| known == k) {
+            errs.push(format!(
+                "{k}: unknown policy section (known: {})",
+                POLICY_SCHEMA.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("; "))
+    }
+}
+
+/// The fs.<key> mode and the roots it is bounded by — ONE resolver, shared by
+/// the pure evaluator and `gate_fs`, so an introspection answer and an actual
+/// read/write can never disagree (AUDIT-2026-10-31 P1-6: `evaluate` honoured
+/// only the literal string "off", while the gate also read `false`, `true`,
+/// inline arrays and unknown modes).
+///
+/// `workspace` adds the process cwd to the roots (the gate confines to it), so
+/// the evaluator has to see it too.
+fn fs_mode_and_roots(policy: &serde_json::Value, key: &str) -> (String, Vec<String>) {
+    let mut roots = list_at(policy, &["fs", "roots"]);
+    /* A scalar root ("fs":{"roots":"/x"}) is a plausible spelling of the same
+     * intent; reading it as "no roots" would silently disable the box. */
+    if roots.is_empty() {
+        if let Some(single) = str_at(policy, &["fs", "roots"]) {
+            if !single.trim().is_empty() {
+                roots.push(single.trim().to_string());
+            }
+        }
+    }
+    let (mode, inline) = match get_path(policy, &["fs", key]) {
+        /* `fs.write: false` is the shortest way to write "off", and a boolean
+         * must never be read as "unset" (that would widen the policy). */
+        Some(serde_json::Value::Bool(false)) => ("off".to_string(), Vec::new()),
+        Some(serde_json::Value::Bool(true)) => ("any".to_string(), Vec::new()),
+        Some(serde_json::Value::String(s)) => (s.trim().to_ascii_lowercase(), Vec::new()),
+        Some(serde_json::Value::Array(a)) => (
+            "allowlist".to_string(),
+            a.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect::<Vec<String>>(),
+        ),
+        _ => (
+            if roots.is_empty() { "any".to_string() } else { "allowlist".to_string() },
+            Vec::new(),
+        ),
+    };
+    for r in inline {
+        if !roots.contains(&r) {
+            roots.push(r);
+        }
+    }
+    (mode, roots)
+}
+
 /// Glob match with `*` (any run, including empty) and `?` (one char).
 fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
@@ -251,11 +511,46 @@ pub fn evaluate(req: &serde_json::Value, policy: &serde_json::Value) -> serde_js
     }
 
     /* ── filesystem ────────────────────────────────────────────── */
-    if op == "fs.write" && str_at(policy, &["fs", "write"]) == Some("off") {
-        return decision("deny", "R7.6/fs.write", "filesystem writes are disabled by policy");
-    }
+    /* AUDIT-2026-10-31 P1-6: the mode comes from the SAME resolver the
+     * filesystem gate uses, so `evaluate` cannot answer "allow" for a
+     * `fs.write: false` (or an inline allowlist, or a misspelt mode) that
+     * `gate_fs` refuses. */
     if op == "fs.read" || op == "fs.write" {
-        let roots = list_at(policy, &["fs", "roots"]);
+        let key = if op == "fs.write" { "write" } else { "read" };
+        let rule = if op == "fs.write" { "R7.6/fs.write" } else { "R7.6/fs.read" };
+        let (mode, mut roots) = fs_mode_and_roots(policy, key);
+        match mode.as_str() {
+            "" | "any" | "all" | "on" => {}
+            "off" | "none" | "deny" => {
+                return decision(
+                    "deny",
+                    rule,
+                    &format!("filesystem {key}s are disabled by policy"),
+                )
+            }
+            "workspace" => {
+                /* The gate confines to fs.roots OR the process cwd. */
+                if let Ok(cwd) = std::env::current_dir() {
+                    let c = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+                    let c = c.to_string_lossy().to_string();
+                    if !roots.contains(&c) {
+                        roots.push(c);
+                    }
+                }
+            }
+            "allowlist" | "allow-list" | "explicit" | "roots" => {}
+            /* Fail closed: a typo in a security setting must never widen it
+             * (the same reading `gate_fs` takes). */
+            other => {
+                return decision(
+                    "deny",
+                    rule,
+                    &format!(
+                        "unknown fs.{key} mode '{other}' (expected off|workspace|allowlist|any)"
+                    ),
+                )
+            }
+        }
         if !roots.is_empty() {
             let inside = !path.is_empty() && roots.iter().any(|r| path_under(path, r));
             if !inside {
@@ -290,6 +585,36 @@ pub fn evaluate(req: &serde_json::Value, policy: &serde_json::Value) -> serde_js
             "R7.1/net.enabled",
             "outbound network is disabled by policy",
         );
+    }
+    /* AUDIT-2026-10-31 P1-6: the two rules below decide by host, so a
+     * net.fetch request that carries NO host used to fall through to
+     * R7/default and answer "allow". The audit's
+     * `{op:'net.fetch', target:'example.com'}` (a field the evaluator never
+     * reads) therefore reported allow while the real fetch was denied. When
+     * the policy actually has network rules, an unanswerable request is
+     * refused instead of waved through. */
+    if op == "net.fetch" && host.is_empty() && has_net_rules(policy) {
+        return decision(
+            "deny",
+            "R7.1/net.host-required",
+            "net.fetch needs a 'host' to be judged against net.allow/net.deny; \
+             the request supplied none, so it cannot be allowed",
+        );
+    }
+    /* net.ssrf / net.allow_private refuse internal targets by RESOLVED
+     * address at fetch time. The evaluator is pure, but an IP literal (or a
+     * loopback alias) needs no resolver, and that is exactly the question
+     * `{host:'169.254.169.254'}` asks. */
+    if op == "net.fetch" && !host.is_empty() && net_ssrf(policy) {
+        if let Some(ip) = parse_ip_literal(&host) {
+            if ip_is_internal(ip) {
+                return decision(
+                    "deny",
+                    "R7.1/net.ssrf",
+                    &format!("host '{host}' is an internal address and net.ssrf is on"),
+                );
+            }
+        }
     }
     if op == "net.fetch" && !host.is_empty() {
         let deny = list_at(policy, &["net", "deny"]);
@@ -425,6 +750,10 @@ pub fn layered_policy_from_disk() -> Result<serde_json::Value, String> {
         if !v.is_object() {
             return Err(format!("{label} policy {}: must be a JSON object", path.display()));
         }
+        /* AUDIT-2026-10-31 P1-15: the CLI audit reads the same files, so it
+         * has to refuse the same typos the runtime refuses. */
+        validate_policy(&v)
+            .map_err(|e| format!("{label} policy {}: {e}", path.display()))?;
         layers.push(v);
     }
     Ok(merge_layers(&layers))
@@ -505,17 +834,27 @@ unsafe extern "C" fn js_policy_set(
         return msg;
     };
     match serde_json::from_str::<serde_json::Value>(&raw) {
-        Ok(v) if v.is_object() => {
-            install_policy(ctx, &v);
-            qjs::sofuu_js_new_string(ctx, c"{\"ok\":true}".as_ptr())
-        }
+        Ok(v) if v.is_object() => match validate_policy(&v) {
+            Ok(()) => {
+                install_policy(ctx, &v);
+                qjs::sofuu_js_new_string(ctx, c"{\"ok\":true}".as_ptr())
+            }
+            /* AUDIT-2026-10-31 P1-15: a schema error is a refusal, not a
+             * no-op — the previous policy stays installed and the caller is
+             * told why (THREAT_MODEL.md: "invalid leaves the previous
+             * policy; fail closed"). */
+            Err(e) => policy_error(ctx, &e),
+        },
         Ok(_) => qjs::sofuu_js_new_string(ctx, c"{\"ok\":false,\"error\":\"policy must be a JSON object\"}".as_ptr()),
-        Err(e) => {
-            let msg = format!("{{\"ok\":false,\"error\":{}}}", serde_json::to_string(&e.to_string()).unwrap_or_else(|_| "\"invalid policy\"".into()));
-            let cs = json_str(&msg);
-            qjs::sofuu_js_new_string(ctx, cs.as_ptr())
-        }
+        Err(e) => policy_error(ctx, &e.to_string()),
     }
+}
+
+unsafe fn policy_error(ctx: *mut JSContext, msg: &str) -> JSValue {
+    let payload = serde_json::json!({ "ok": false, "error": msg });
+    let text = serde_json::to_string(&payload).unwrap_or_else(|_| "{\"ok\":false}".into());
+    let cs = json_str(&text);
+    qjs::sofuu_js_new_string(ctx, cs.as_ptr())
 }
 
 unsafe extern "C" fn js_policy_get(
@@ -694,10 +1033,16 @@ unsafe extern "C" fn js_policy_load(
         }
         match std::fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
-                Ok(v) if v.is_object() => {
-                    layers.push(v);
-                    sources.push(label);
-                }
+                Ok(v) if v.is_object() => match validate_policy(&v) {
+                    Ok(()) => {
+                        layers.push(v);
+                        sources.push(label);
+                    }
+                    /* AUDIT-2026-10-31 P1-15: a malformed file is reported
+                     * and NOTHING is installed, so a reload can never turn a
+                     * working policy into a wider one. */
+                    Err(e) => errors.push(format!("{label}: {e}")),
+                },
                 Ok(_) => errors.push(format!("{label}: policy must be a JSON object")),
                 Err(e) => errors.push(format!("{label}: {e}")),
             },
@@ -989,35 +1334,10 @@ pub(crate) unsafe fn gate_fs(
         return Ok(given);
     }
     let policy = policy_json(ctx);
-    let mut roots = list_at(&policy, &["fs", "roots"]);
-    /* A scalar root ("fs":{"roots":"/x"}) is a plausible spelling of the same
-     * intent; reading it as "no roots" would silently disable the box. */
-    if roots.is_empty() {
-        if let Some(single) = str_at(&policy, &["fs", "roots"]) {
-            if !single.trim().is_empty() {
-                roots.push(single.trim().to_string());
-            }
-        }
-    }
+    /* AUDIT-2026-10-31 P1-6: the mode/roots resolution lives in ONE helper so
+     * `sofuu.policy.evaluate` answers what this gate enforces. */
     let key = kind.key();
-    let (mode, inline_roots) = match get_path(&policy, &["fs", key]) {
-        /* `fs.write: false` is the shortest way to write "off", and a boolean
-         * must never be read as "unset" (that would widen the policy). */
-        Some(serde_json::Value::Bool(false)) => ("off".to_string(), Vec::new()),
-        Some(serde_json::Value::Bool(true)) => ("any".to_string(), Vec::new()),
-        Some(serde_json::Value::String(s)) => (s.trim().to_ascii_lowercase(), Vec::new()),
-        Some(serde_json::Value::Array(a)) => (
-            "allowlist".to_string(),
-            a.iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.to_string())
-                .collect::<Vec<String>>(),
-        ),
-        _ => (
-            if roots.is_empty() { "any".to_string() } else { "allowlist".to_string() },
-            Vec::new(),
-        ),
-    };
+    let (mode, roots) = fs_mode_and_roots(&policy, key);
 
     let confine_to_cwd = match mode.as_str() {
         "" | "any" | "all" | "on" => return Ok(given),
@@ -1042,9 +1362,6 @@ pub(crate) unsafe fn gate_fs(
         }
     };
 
-    if !inline_roots.is_empty() {
-        roots.extend(inline_roots);
-    }
     let mut allowed: Vec<PathBuf> = Vec::new();
     for r in &roots {
         if let Some(c) = canonical_nearest(Path::new(r)) {
@@ -1223,9 +1540,7 @@ pub(crate) unsafe fn net_policy(ctx: *mut JSContext) -> NetPolicy {
         return NetPolicy { ssrf: false, deny_ips: Vec::new() };
     }
     let policy = policy_json(ctx);
-    let ssrf = bool_at(&policy, &["net", "ssrf"]) == Some(true)
-        || bool_at(&policy, &["net", "allow_private"]) == Some(false)
-        || bool_at(&policy, &["net", "allowPrivate"]) == Some(false);
+    let ssrf = net_ssrf(&policy);
     let deny_ips = list_at(&policy, &["net", "deny"])
         .iter()
         .filter_map(|p| parse_ip_literal(p))
@@ -1263,6 +1578,21 @@ fn ipv4_is_internal(v4: Ipv4Addr) -> bool {
         || v4.is_broadcast()
         || (o[0] == 100 && (o[1] & 0xc0) == 64) /* 100.64/10 CGNAT */
         || (o[0] == 192 && o[1] == 0 && o[2] == 0) /* 192.0.0/24 IETF */
+}
+
+/// net.ssrf / net.allow_private (`allowPrivate`), shared by `net_policy`
+/// and the pure evaluator so the two read the same switch.
+fn net_ssrf(policy: &serde_json::Value) -> bool {
+    bool_at(policy, &["net", "ssrf"]) == Some(true)
+        || bool_at(policy, &["net", "allow_private"]) == Some(false)
+        || bool_at(policy, &["net", "allowPrivate"]) == Some(false)
+}
+
+/// Does this policy contain any rule that only a host can satisfy?
+fn has_net_rules(policy: &serde_json::Value) -> bool {
+    !list_at(policy, &["net", "deny"]).is_empty()
+        || !list_at(policy, &["net", "allow"]).is_empty()
+        || net_ssrf(policy)
 }
 
 /// Does a `net.deny` IP entry cover this resolved address? Loopback is one
@@ -1564,6 +1894,106 @@ mod tests {
         assert!(ip_denied(&deny, "::1".parse().unwrap()));
         assert!(!ip_denied(&deny, "10.0.0.1".parse().unwrap()));
         assert!(parse_ip_literal("[::1]:8080").is_some(), "normalised before parsing");
+    }
+
+    /* ── AUDIT-2026-10-31 P1-15: the schema check ────────────────── */
+
+    #[test]
+    fn schema_accepts_every_shipped_profile_shape() {
+        assert!(validate_policy(&serde_json::json!({})).is_ok());
+        assert!(validate_policy(&serde_json::json!({
+            "_notes": ["generated by sofuu policy init"],
+            "fs": { "roots": ["/work/proj"], "write": "off" },
+            "shell": { "enabled": false, "deny": ["rm -rf *"], "allow": ["git *"] },
+            "net": { "enabled": false, "allow": ["api.example.com"], "deny": ["evil.io"] },
+            "http": { "deny": ["/v1/tools"], "auth": "none" },
+            "mcp": { "servers": { "allow": ["srv1"] }, "callTimeoutMs": 80 },
+            "tools": { "allow": ["read_file"], "deny": ["bash"] },
+            "approval": { "mode": "per-run", "cache": true },
+            "secrets": { "source": "file", "file": "/tmp/secrets.json" },
+            "memory": { "write": "off" },
+        }))
+        .is_ok());
+        /* The forms the fs resolver really understands. */
+        assert!(validate_policy(&serde_json::json!({"fs":{"write":false}})).is_ok());
+        assert!(validate_policy(&serde_json::json!({"fs":{"write":["/a","/b"]}})).is_ok());
+        assert!(validate_policy(&serde_json::json!({"fs":{"roots":"/a"}})).is_ok());
+    }
+
+    #[test]
+    fn schema_refuses_typos_that_used_to_fail_open() {
+        /* A misspelt section: nothing reads it, everything stays allowed. */
+        let e = validate_policy(&serde_json::json!({"nt":{"deny":["evil.io"]}}))
+            .expect_err("unknown section must be refused");
+        assert!(e.contains("unknown policy section"), "{e}");
+        /* A misspelt key inside a real section. */
+        let e = validate_policy(&serde_json::json!({"net":{"denny":["evil.io"]}}))
+            .expect_err("unknown key must be refused");
+        assert!(e.contains("net.denny"), "{e}");
+        /* A string where a list belongs: list_at reads it as an empty list. */
+        let e = validate_policy(&serde_json::json!({"net":{"deny":"evil.io"}}))
+            .expect_err("deny must be a list");
+        assert!(e.contains("net.deny"), "{e}");
+        /* A string boolean: bool_at returns None, so the switch never fires. */
+        let e = validate_policy(&serde_json::json!({"shell":{"enabled":"false"}}))
+            .expect_err("enabled must be a boolean");
+        assert!(e.contains("shell.enabled"), "{e}");
+        /* An unknown fs mode would deny every call at the gate — refuse it at
+         * set time instead, while the operator is looking. */
+        let e = validate_policy(&serde_json::json!({"fs":{"write":"readonly"}}))
+            .expect_err("unknown fs.write mode must be refused");
+        assert!(e.contains("fs.write"), "{e}");
+        /* An unknown approval mode silently defaults to per-run. */
+        assert!(validate_policy(&serde_json::json!({"approval":{"mode":"sometimes"}})).is_err());
+        /* A non-object policy. */
+        assert!(validate_policy(&serde_json::json!(["off"])).is_err());
+    }
+
+    /* ── AUDIT-2026-10-31 P1-6: evaluate() vs the gate ───────────── */
+
+    #[test]
+    fn evaluate_reads_fs_write_the_way_the_gate_does() {
+        /* The audit's "write off" payload was the boolean form; the evaluator
+         * used to answer "allow" while gate_fs refused the write. */
+        let p = serde_json::json!({"fs":{"write":false}});
+        assert_eq!(eval(serde_json::json!({"op":"fs.write","path":"/etc/hosts"}), p.clone()), "deny");
+        assert_eq!(rule(serde_json::json!({"op":"fs.write","path":"/etc/hosts"}), p), "R7.6/fs.write");
+        /* An unknown mode fails closed on both sides. */
+        let typo = serde_json::json!({"fs":{"write":"readonly"}});
+        assert_eq!(eval(serde_json::json!({"op":"fs.write","path":"/tmp/x"}), typo.clone()), "deny");
+        assert_eq!(rule(serde_json::json!({"op":"fs.write","path":"/tmp/x"}), typo), "R7.6/fs.write");
+        /* An inline allowlist is "allowlist", not "no rule". */
+        let inline = serde_json::json!({"fs":{"write":["/work/proj"]}});
+        assert_eq!(eval(serde_json::json!({"op":"fs.write","path":"/work/proj/a"}), inline.clone()), "allow");
+        assert_eq!(eval(serde_json::json!({"op":"fs.write","path":"/etc/hosts"}), inline), "deny");
+        /* workspace confines to fs.roots and the cwd — a path under neither
+         * is denied, which is what gate_fs enforces. */
+        let ws = serde_json::json!({"fs":{"roots":["/work/proj"],"write":"workspace"}});
+        assert_eq!(eval(serde_json::json!({"op":"fs.write","path":"/etc/hosts"}), ws.clone()), "deny");
+        assert_eq!(eval(serde_json::json!({"op":"fs.write","path":"/work/proj/a"}), ws), "allow");
+    }
+
+    #[test]
+    fn evaluate_will_not_allow_a_net_fetch_it_cannot_judge() {
+        /* The audit asked {op:'net.fetch', target:'example.com'} — a field the
+         * evaluator never reads — while the policy had net.deny, and got
+         * "allow" from an API whose own fetch was denied. */
+        let p = serde_json::json!({"net":{"deny":["example.com"]}});
+        let d = evaluate(&serde_json::json!({"op":"net.fetch","target":"example.com"}), &p);
+        assert_eq!(d.get("decision").and_then(|v| v.as_str()), Some("deny"));
+        assert_eq!(d.get("rule").and_then(|v| v.as_str()), Some("R7.1/net.host-required"));
+        /* With no network rules at all there is nothing to judge, so the
+         * answer stays allow — the empty policy must keep working. */
+        assert_eq!(eval(serde_json::json!({"op":"net.fetch"}), serde_json::json!({})), "allow");
+        /* net.ssrf refuses an internal IP literal without a resolver. */
+        let ssrf = serde_json::json!({"net":{"ssrf":true}});
+        let d = evaluate(&serde_json::json!({"op":"net.fetch","host":"169.254.169.254"}), &ssrf);
+        assert_eq!(d.get("decision").and_then(|v| v.as_str()), Some("deny"));
+        assert_eq!(d.get("rule").and_then(|v| v.as_str()), Some("R7.1/net.ssrf"));
+        assert_eq!(eval(serde_json::json!({"op":"net.fetch","host":"8.8.8.8"}), ssrf), "allow");
+        /* allow_private:false is the same switch spelled the other way. */
+        let ap = serde_json::json!({"net":{"allow_private":false}});
+        assert_eq!(eval(serde_json::json!({"op":"net.fetch","host":"10.0.0.1"}), ap), "deny");
     }
 
     #[test]

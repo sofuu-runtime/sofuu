@@ -2976,9 +2976,21 @@ mod impl_qtsq {
         let arr: Vec<serde_json::Value> = hits
             .iter()
             .map(|h| {
+                /* AUDIT-2026-10-31 P1-5: score is a RANKING score — relevance
+                 * times the engagement/recency/tier boosts, so it is neither a
+                 * cosine nor bounded by 1 (an exact hit settles around 0.92 and a
+                 * boosted text-mode hit has been seen at 1.242). Callers that want
+                 * a threshold on a fixed scale get two calibrated numbers instead:
+                 * distance (the index's own metric — 0 on an exact match, sqrt(2)
+                 * between orthogonal unit vectors) and similarity = 1/(1+distance),
+                 * which is 1.0 exactly on an exact match, strictly inside (0, 1],
+                 * and monotone in the distance for any metric. Ordering callers
+                 * keep using score. */
+                let similarity = 1.0 / (1.0 + h.distance as f64);
                 serde_json::json!({
                     "id": h.id,
                     "distance": h.distance,
+                    "similarity": similarity,
                     "score": h.score,
                     "role": h.role,
                     "text": h.text,
@@ -3781,10 +3793,6 @@ mod impl_qtsq {
             return qjs::sofuu_js_new_int32(ctx, outcome.map(|o| o.id as i32).unwrap_or(-1));
         }
 
-        if argc < 2 {
-            return throw_coded(ctx, E_TYPE, "Expected vec and text[, role, kv_page_id, source]");
-        }
-
         let Some(vec_view) = cma_vec_view(ctx, *argv) else {
             /* W1.3/W1.1/W1.7: cma_vec_view already threw a CODED refusal. */
             return qjs::sofuu_js_exception();
@@ -3798,7 +3806,23 @@ mod impl_qtsq {
             );
         }
 
-        let text = qjs::sofuu_js_to_cstring(ctx, *argv.add(1));
+        /* AUDIT-2026-10-31 P2-3: the caption used to be REQUIRED, so a
+         * vector-only insert (an embedding with nothing to caption — the
+         * shape the findings call out as "not a function"/E_TYPE) was
+         * rejected by an argument-count check that never said why. The store
+         * takes an empty caption and keeps such records distinct (two
+         * different vectors stored with "" stay two rows), so a missing
+         * caption is stored as "" and recall returns the hit with text "".
+         * A null/undefined caption means the same thing; a number is still
+         * stringified the way it always was. */
+        let has_text = argc >= 2
+            && !qjs::is_undefined(*argv.add(1))
+            && !qjs::is_null(*argv.add(1));
+        let text = if has_text {
+            qjs::sofuu_js_to_cstring(ctx, *argv.add(1))
+        } else {
+            std::ptr::null_mut()
+        };
         let role = if argc >= 3 && qjs::sofuu_js_is_string(*argv.add(2)) != 0 {
             qjs::sofuu_js_to_cstring(ctx, *argv.add(2))
         } else {
@@ -3816,10 +3840,11 @@ mod impl_qtsq {
             std::ptr::null_mut()
         };
 
+        let caption = cstr_opt(text).unwrap_or_default();
         let outcome = cma_remember_outcome(
             cma,
             vec_slice,
-            cstr_opt(text).as_deref(),
+            Some(caption.as_str()),
             cstr_opt(role).as_deref(),
             page_id,
             cstr_opt(source).as_deref(),
@@ -5027,6 +5052,18 @@ mod impl_qtsq {
                 }),
             );
             return throw_coded(ctx, code, &format!("memory.close: {msg}"));
+        }
+        /* AUDIT-2026-10-31 P2-4: closing a handle makes a whole loaded brain
+         * (its vectors and HNSW node array, allocated Rust-side) unreachable,
+         * but the only collection trigger is the 64 MB JS-HEAP budget in
+         * engine.rs, which a reopen loop never approaches — so the brains piled
+         * up until something unrelated forced a sweep. The handle being closed
+         * is still referenced by the caller, so this sweep collects the
+         * PREVIOUS cycles; that is exactly what caps the live set at ~1 brain
+         * instead of N. Measured at ~0.5 MB/cycle retained before, flat after. */
+        let rt = qjs::JS_GetRuntime(ctx);
+        if !rt.is_null() {
+            qjs::JS_RunGC(rt);
         }
         qjs::sofuu_js_new_bool(ctx, 1)
     }
@@ -6240,10 +6277,27 @@ mod impl_qtsq {
          * alias of the same object — delegating to the last-opened brain or
          * `{handle}`. Compiled out on capability-gated builds by this
          * function's own cfg, so their stubs stay the surface. */
-        const MEMORY_FLAT_API_JS: &str = include_str!("../../../../src/js/memory_api.js");
+        /* AUDIT-2026-10-31 (size lever, workstream D): 24,449 B of source
+         * embedded raw was the largest remaining .rodata item on this path.
+         * Gzipped by build.rs it is 8,742 B, inflated once for the life of
+         * the process when the memory surface is registered. */
+        const MEMORY_FLAT_API_GZ: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/memory_api.js.gz"));
+        static MEMORY_FLAT_API_JS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+            crate::shipped::inflate_gz(MEMORY_FLAT_API_GZ, "src/js/memory_api.js").unwrap_or_else(
+                || {
+                    /* Loud, not silent: without this file there is no flat
+                     * sofuu.memory surface at all, so the install itself says
+                     * why instead of leaving a half-built namespace. */
+                    String::from(
+                        "throw new Error(\"sofuu.memory unavailable: embedded memory_api.js failed to inflate\");\n",
+                    )
+                },
+            )
+        });
         crate::shipped::eval_shipped(
             ctx as *mut std::ffi::c_void,
-            MEMORY_FLAT_API_JS,
+            &MEMORY_FLAT_API_JS,
             "<memory-api>",
         );
         /* PLAN-PLUGGABLE-MEMORY-ADAPTERS: the router's remote/custom

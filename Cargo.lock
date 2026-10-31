@@ -3361,6 +3361,7 @@ name = "sofuu-ffi"
 version = "0.3.0-beta"
 dependencies = [
  "cc",
+ "flate2",
  "libc",
 ]
 

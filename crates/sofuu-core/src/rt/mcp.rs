@@ -33,6 +33,9 @@ use crate::rt::promise::{
 };
 
 const MAX_PENDING: usize = 64;
+/* P2-7: how much of the child's stderr the early-exit error quotes. */
+const MCP_STDERR_CAP: usize = 1024;
+
 const MCP_READ_BUF: usize = 65536;
 const MAX_TOOLS: usize = 64;
 
@@ -91,6 +94,15 @@ struct McpClient {
 
     read_buf: [u8; MCP_READ_BUF],
     read_len: usize,
+
+    /* P2-7 (AUDIT-2026-10-31): the child's stderr, captured (first
+     * MCP_STDERR_CAP bytes) so a server that dies on startup can SAY why.
+     * Before this the child's stderr was UV_IGNORE'd — discarded — and every
+     * mistake in the launch shape surfaced as the bare "MCP server exited
+     * before initialize", which is indistinguishable from a real protocol
+     * failure. */
+    stderr_buf: [u8; MCP_STDERR_CAP],
+    stderr_len: usize,
 
     pending: [PendingCall; MAX_PENDING],
     pending_count: usize,
@@ -723,12 +735,39 @@ unsafe extern "C" fn mcp_on_read(stream: *mut UvStream, nread: isize, buf: *cons
     }
 }
 
+/// P2-7: drain the child's stderr into the client's bounded buffer. Keeps
+/// the FIRST bytes (a startup crash explains itself at the top) and drops the
+/// rest without unbounded growth: a chatty server must not cost memory.
+unsafe extern "C" fn mcp_on_stderr(
+    stream: *mut UvStream,
+    nread: isize,
+    buf: *const uv::UvBuf,
+) {
+    let client = *(stream as *mut *mut McpClient);
+    if client.is_null() || buf.is_null() {
+        return;
+    }
+    if nread > 0 {
+        let chunk = std::slice::from_raw_parts((*buf).base as *const u8, nread as usize);
+        let room = MCP_STDERR_CAP - (*client).stderr_len;
+        let take = chunk.len().min(room);
+        if take > 0 {
+            let at = (*client).stderr_len;
+            (&mut (*client).stderr_buf)[at..at + take].copy_from_slice(&chunk[..take]);
+            (*client).stderr_len += take;
+        }
+    } else if nread < 0 {
+        /* EOF (child closed stderr) or read error: nothing more to learn. */
+        uv::uv_read_stop(stream);
+    }
+}
+
 unsafe extern "C" fn mcp_on_alloc(_h: *mut UvHandle, suggested: usize, buf: *mut uv::UvBuf) {
     (*buf).base = libc::malloc(suggested) as *mut c_char;
     (*buf).len = suggested;
 }
 
-unsafe extern "C" fn mcp_on_exit(_proc: *mut UvProcess, _exit_status: i64, _term_signal: c_int) {
+unsafe extern "C" fn mcp_on_exit(_proc: *mut UvProcess, exit_status: i64, term_signal: c_int) {
     // SAFETY: process handle's data set after spawn.
     let client = *(_proc as *mut *mut McpClient);
     if client.is_null() || (*client).done != 0 {
@@ -750,12 +789,30 @@ unsafe extern "C" fn mcp_on_exit(_proc: *mut UvProcess, _exit_status: i64, _term
 
     /* Reject the connect promise if still pending */
     if !(*client).connect_promise.is_null() {
-        let err = mcp_error_value(
-            ctx,
-            MCP_ERR_TRANSPORT_LOST,
-            "MCP server exited before initialize",
-            None,
-        );
+        /* P2-7 (AUDIT-2026-10-31): say HOW the child died and quote what it
+         * printed. The bare message was the whole diagnosis budget for a
+         * wrong launch shape (`{command, args}` pointing at a CLI that needs
+         * a subcommand, a server that needs stdio but got a TTY, a missing
+         * module, ...) — indistinguishable from a real protocol failure. */
+        let mut msg = String::from("MCP server exited before initialize");
+        if term_signal != 0 {
+            msg.push_str(&format!(" (killed by signal {term_signal})"));
+        } else {
+            msg.push_str(&format!(" (exit code {exit_status})"));
+        }
+        if (*client).stderr_len > 0 {
+            let raw = String::from_utf8_lossy(&(&(*client).stderr_buf)[..(*client).stderr_len]);
+            let flat = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !flat.is_empty() {
+                let mut quoted: String = flat.chars().take(300).collect();
+                if flat.chars().count() > 300 {
+                    quoted.push('…');
+                }
+                msg.push_str(": ");
+                msg.push_str(&quoted);
+            }
+        }
+        let err = mcp_error_value(ctx, MCP_ERR_TRANSPORT_LOST, &msg, None);
         sofuu_promise_reject((*client).connect_promise, err); /* consumes err */
         (*client).connect_promise = ptr::null_mut();
     }
@@ -1211,6 +1268,8 @@ unsafe extern "C" fn js_mcp_connect(
         self_val: qjs::sofuu_js_undefined(),
         read_buf: [0u8; MCP_READ_BUF],
         read_len: 0,
+        stderr_buf: [0u8; MCP_STDERR_CAP],
+        stderr_len: 0,
         pending: [PendingCall {
             id: 0,
             promise: ptr::null_mut(),
@@ -1264,7 +1323,9 @@ unsafe extern "C" fn js_mcp_connect(
     stdio[0].data.stream = stdin_pipe as *mut c_void;
     stdio[1].flags = uv::UV_CREATE_PIPE | uv::UV_WRITABLE_PIPE;
     stdio[1].data.stream = stdout_pipe as *mut c_void;
-    stdio[2].flags = uv::UV_IGNORE;
+    /* P2-7: pipe the child stderr instead of discarding it. */
+    stdio[2].flags = uv::UV_CREATE_PIPE | uv::UV_WRITABLE_PIPE;
+    stdio[2].data.stream = stderr_pipe as *mut c_void;
 
     // P3: args derive from `cmd`, which arrived through a C string — no
     // interior NUL can reach this CString::new, so it cannot silently
@@ -1367,6 +1428,8 @@ unsafe extern "C" fn js_mcp_connect(
     *(stderr_pipe as *mut *mut McpClient) = client_ptr;
     *(timeout_timer as *mut *mut McpClient) = client_ptr;
     let _rs_rc = uv::uv_read_start(stdout_pipe as *mut UvStream, Some(mcp_on_alloc), Some(mcp_on_read));
+    /* P2-7: same allocator, separate sink (see mcp_on_stderr). */
+    let _rs_err = uv::uv_read_start(stderr_pipe as *mut UvStream, Some(mcp_on_alloc), Some(mcp_on_stderr));
 
     /* F-2: all four handles are armed per-ctx — a multi-engine teardown must
      * close them (with free_pipe_cb, which only frees storage: the client
@@ -3021,6 +3084,68 @@ mod tests {
         unsafe { qjs::JS_FreeRuntime(rt) };
     }
 
+    /// P2-7 regression (AUDIT-2026-10-31): a child that dies during startup
+    /// must say HOW it died and WHAT it printed. Before the fix the child's
+    /// stderr was UV_IGNORE'd — discarded — so every wrong launch shape
+    /// (`{command, args}` naming a CLI that needs a subcommand, a server
+    /// that wants stdio but got no args, a missing module …) surfaced as the
+    /// bare "MCP server exited before initialize", indistinguishable from a
+    /// real protocol failure.
+    #[test]
+    fn early_exit_reports_exit_code_and_child_stderr() {
+        let _loop_guard = crate::rt::test_loop_lock();
+        let rt = unsafe { qjs::JS_NewRuntime() };
+        let ctx = unsafe { qjs::JS_NewContext(rt) };
+        unsafe { crate::rt::event_loop::sofuu_loop_init() };
+        unsafe { mod_mcp_register(ctx) };
+
+        unsafe {
+            // The child writes stderr FIRST, then exits: the read callback
+            // must land before exit_cb for the assertion to be meaningful.
+            let r = eval_or_panic(
+                ctx,
+                c"<mcp-p2-7>",
+                c"globalThis.msg = '';
+                  sofuu.mcp.connect({ command: '/bin/sh',
+                                      args: ['-c', 'echo p2-7-child-stderr >&2; sleep 0.2; exit 3'] })
+                    .then(function () { globalThis.msg = 'RESOLVED'; },
+                          function (e) { globalThis.msg = String((e && e.message) || e); });",
+            );
+            qjs::sofuu_js_free_value(ctx, r);
+            crate::rt::event_loop::sofuu_loop_run_bounded(
+                ctx,
+                Some(std::time::Duration::from_secs(60)),
+            );
+
+            let global = qjs::sofuu_js_get_global_object(ctx);
+            let v = qjs::sofuu_js_get_property_str(ctx, global, c"msg".as_ptr());
+            qjs::sofuu_js_free_value(ctx, global);
+            let p = qjs::sofuu_js_to_cstring(ctx, v);
+            qjs::sofuu_js_free_value(ctx, v);
+            let msg = if p.is_null() {
+                String::new()
+            } else {
+                let out = CStr::from_ptr(p).to_string_lossy().into_owned();
+                qjs::sofuu_js_free_cstring(ctx, p);
+                out
+            };
+
+            crate::rt::event_loop::sofuu_loop_close();
+            qjs::JS_FreeContext(ctx);
+            qjs::JS_FreeRuntime(rt);
+
+            assert!(msg.starts_with("MCP server exited before initialize"), "got: {msg:?}");
+            assert!(
+                msg.contains("exit code 3"),
+                "the rejection must carry the child's exit code, got: {msg:?}"
+            );
+            assert!(
+                msg.contains("p2-7-child-stderr"),
+                "the rejection must quote the child's stderr, got: {msg:?}"
+            );
+        }
+    }
+
     /// Eval a script, panicking with the exception text on failure (the bare
     /// test runtime has no std helpers, so js_std_dump_error is silent).
     /// Returns the result value — caller frees.
@@ -3265,6 +3390,8 @@ mod tests {
                 self_val: qjs::sofuu_js_undefined(),
                 read_buf: [0u8; MCP_READ_BUF],
                 read_len: 0,
+                stderr_buf: [0u8; MCP_STDERR_CAP],
+                stderr_len: 0,
                 pending: [PendingCall { id: 0, promise: ptr::null_mut(), ctx: ptr::null_mut(), deadline: None, timeout_ms: 0 }; MAX_PENDING],
                 pending_count: 0,
                 timeout_timer: ptr::null_mut(),

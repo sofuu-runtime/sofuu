@@ -174,6 +174,26 @@
       inst.toJSON = function () {
         return { handle: id, dim: (function () { try { return d; } catch (e) { return null; } })() };
       };
+      /* AUDIT-2026-10-31 P2-4: the handle's OWN close() must release the
+       * registry slot, not just M.close(inst). `live` holds a strong
+       * reference, so `b.close()` — the method the docs and every harness
+       * use — left the handle (and the native shell with its whole loaded
+       * brain) reachable forever: after 300 open/close cycles
+       * sofuu.memory.handles() answered 300. This only fixes that reachable
+       * set; the RSS growth measured on reopen cycles persists with the slot
+       * released, so it is NOT the whole of P2-4 (see the audit note in
+       * crates/sofuu-core/src/rt/memory.rs). */
+      if (typeof inst.close === 'function') {
+        var innerClose = inst.close;
+        Object.defineProperty(inst, '__closeWrapped', { value: true, enumerable: false });
+        inst.close = function () {
+          try {
+            var slot = inst.__handle;
+            if (live[slot] === inst) live[slot] = null;
+          } catch (eSlot) { /* registry stays as it was */ }
+          return innerClose.apply(inst, arguments);
+        };
+      }
     } catch (e) { /* sealed object — the handle registry still works */ }
     return inst;
   };

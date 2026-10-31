@@ -2,7 +2,7 @@
 
 # ⚡ Sofuu (素風)
 
-> *Sofuu is a general-purpose runtime for AI — built to run anywhere from servers to smart devices. A compact, sovereign systems engine (Rust/C core, QuickJS/libuv) combining in-process CPU/GPU inference (experimental), multi-format models (GGUF + SafeTensors), autonomous agent loops, encrypted cognitive vector memory (QTSQ), and native MCP in a single <= 5.5 MB binary (5.2 MB stripped release with bundled QTSQ cognitive memory). Zero daemons, zero external dependencies.*
+> *Sofuu is a general-purpose runtime for AI — built to run anywhere from servers to smart devices. A compact, sovereign systems engine (Rust/C core, QuickJS/libuv) combining in-process CPU/GPU inference (experimental), multi-format models (GGUF + SafeTensors), autonomous agent loops, encrypted cognitive vector memory (QTSQ), and native MCP in a single <= 5.5 MiB binary (5.39 MiB on macOS arm64 with bundled QTSQ cognitive memory; the Linux builds are 5.88 MiB arm64 and 6.80 MiB x86_64 and currently exceed the cap). Zero daemons, zero external dependencies.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0--beta-orange.svg)](https://github.com/sofuu-runtime/sofuu/releases)
@@ -32,7 +32,7 @@ While TypeScript and JavaScript serve as the ergonomic high-level orchestration 
 - **Async HTTP server & SIMD vector mathematics**
 
 ### Where Sofuu Runs
-Sofuu is built from first principles with a hard **$\le 5.5\text{ MB}$ binary cap**, **sub-4ms cold boot**, and **zero-JIT execution** (making it 100% compliant with strict platform policies like the iOS App Store and RTOS environments). This enables it to run identically across diverse hardware form factors:
+Sofuu is built from first principles with a hard **$\le 5.5\text{ MiB}$ binary cap**, an **11.4 ms median cold boot** (measured to a completed `1+1` — see [BENCHMARKS.md](BENCHMARKS.md)), and **zero-JIT execution** (making it 100% compliant with strict platform policies like the iOS App Store and RTOS environments). This enables it to run identically across diverse hardware form factors:
 - **Cloud & Edge Servers:** Headless microservices, streaming LLM proxies, and containerized autonomous agents with microsecond warm-up.
 - **Developer Workstations:** High-throughput local agent workspaces, standalone compiled CLI tools (`sofuu compile`), and zero-config desktop tools.
 - **Mobile Devices (iOS & Android):** Shipped as an embeddable C ABI library (`libsofuu`) with Swift and Kotlin bindings.
@@ -42,7 +42,7 @@ Sofuu is built from first principles with a hard **$\le 5.5\text{ MB}$ binary ca
 
 ## Features
 
-- **Universal runtime with TS/JS orchestration** — QuickJS (ES2023) + libuv event loop with cooperative scheduler (W3C `scheduler.yield()`, microtask starvation protection), AOT bytecode snapshotting, zero-copy TypedArray SIMD memory bridge, native `AsyncLocalStorage` context propagation, deterministic instruction-metered sandboxing, ~3.8 ms startup on modern workstations (38 ms on Raspberry Pi 5, see [BENCHMARKS.md](BENCHMARKS.md)), TypeScript runs with no compiler step, and `sofuu bundle` ships one self-contained file
+- **Universal runtime with TS/JS orchestration** — QuickJS (ES2023) + libuv event loop with cooperative scheduler (W3C `scheduler.yield()`, microtask starvation protection), AOT bytecode snapshotting, zero-copy TypedArray SIMD memory bridge, native `AsyncLocalStorage` context propagation, deterministic instruction-metered sandboxing, an 11.4 ms startup median on an Apple M2 Pro (see [BENCHMARKS.md](BENCHMARKS.md); the older 3.8 ms row predates the Metal engine and the QTSQ shell), TypeScript runs with no compiler step, and `sofuu bundle` ships one self-contained file
 - **Local edge inference** (**experimental** — built-in engine; production use: llama.cpp or another backend via plugin) — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), up to ~195 tok/s prefill and ~69 tok/s decode on this battery's hardware, in-place KV cache compaction & sliding-window attention past context limits
 - **Cloud LLM streaming** — `sofuu.ai.stream` / `complete` over OpenAI, Anthropic, or any OpenAI-compatible endpoint (BYO key); per-model context/effort registry, no default model
 - **Agents + workflows** — `sofuu.agent.define/run`, modular domain toolpacks (`coding`, `web`, `memory`, `system`), prompt sovereignty, tool-aware task-gate, budgets, cancel, trace rendering; generalized session documents (`chat`, `agent`, `workflow`, `pipeline`) with state container
@@ -83,6 +83,56 @@ present). Each release also carries a CycloneDX 1.5 SBOM
 published in `install.sh`, and until then the script says plainly that it is
 installing on SHA-256 alone. See [`THREAT_MODEL.md`](THREAT_MODEL.md) for the
 full picture of what is and is not guaranteed.
+
+---
+
+## Release status (2026-10-31)
+
+`sofuu version` prints the build revision next to the semver, so a binary can be
+traced to the commit that produced it:
+
+```
+sofuu 0.3.0-beta
+revision 98eb89352
+quickjs 2024-01-13
+platform: macOS arm64
+```
+
+| Artifact | Size | vs. the 5.5 MiB (5,767,168 B) cap |
+| --- | --- | --- |
+| macOS arm64 — this tree, `make size-check` | 5,559,904 B (5.30 MiB) | **passes**, 202 KB headroom |
+| macOS arm64 — published archive | 5,655,808 B (5.39 MiB) | passes |
+| Linux arm64 — published archive | 6,163,520 B (5.88 MiB) | **over** |
+| Linux x86_64 — published archive | 7,130,904 B (6.80 MiB) | **over** |
+
+The cap is enforced rather than asserted: `make size-check` fails the build over
+it, and `scripts/verify-dist.sh` fails a release that ships an artifact over the
+cap, a binary with no HEAD stamp, or one built from a dirty tree.
+
+```bash
+make size-check      # host build against the cap
+sh scripts/verify-dist.sh   # release gate: stamp, tree state, every artifact
+```
+
+### Known limits
+
+- **The Linux archives are over the cap** and predate this engine; the next
+  release rebuilds and re-stamps them. macOS is already under.
+- **SwiftPM and CocoaPods coordinates do not resolve yet.** The `v0.3.0-beta`
+  tag carries a placeholder checksum and a v0.2.0 asset URL, and no xcframework
+  exists in any tag tree — so the embedding docs now say that instead of
+  pointing at an install that cannot work. A new tag with a stamped
+  `Package.swift` (`scripts/stamp-swiftpm.sh`) closes it.
+- **TypeScript is erased, never checked.** Object literals, parameter
+  properties, `enum`s, generics, `implements`/`abstract`, `as`/`satisfies`,
+  `declare`, and `export type`/`export interface` are handled; `namespace` and
+  decorators are refused with a `SyntaxError` rather than mistranslated.
+- **Deliberately absent globals:** `WeakRef`, `FinalizationRegistry`,
+  `WebAssembly`, `Intl`, `WebSocket`, `EventSource`. QuickJS has no weak
+  references, so a stand-in would be the leak the caller was avoiding.
+- **`SOFUU_REGEX_BUDGET_MS`** (default `1000`, `0` disables) bounds a single
+  regular-expression call, so a pathological pattern costs a caught error
+  instead of the loop.
 
 ---
 

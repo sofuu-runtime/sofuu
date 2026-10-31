@@ -618,18 +618,46 @@ fn cmd_repair(path: &str, json: bool) -> u8 {
             }
         }
         Err(e) => {
+            /* AUDIT-2026-10-31 P2-8: repair salvages RECORDS from a container
+             * it can open. When the container itself will not open, there is
+             * nothing to salvage and the old output stopped at "unreadable",
+             * leaving the user to guess the next step. Say plainly that this
+             * damage is beyond repair and name the paths that work. */
+            let hint = unrepairable_hint(&e);
             if json {
-                print_json(&serde_json::json!({
+                let mut payload = serde_json::json!({
                     "command": "repair",
                     "path": path,
                     "ok": false,
                     "errors": [e.message],
                     "error": e.to_json(),
-                }));
+                });
+                if let Some(h) = hint {
+                    payload["hint"] = serde_json::Value::String(h.to_string());
+                    payload["repairable"] = serde_json::Value::Bool(false);
+                }
+                print_json(&payload);
             }
             emit_error(&e);
+            if let Some(h) = hint {
+                eprintln!("  \x1b[33mhint\x1b[0m {h}");
+            }
             e.exit
         }
+    }
+}
+
+/// Why `repair` cannot help when the failure is the container and not a
+/// record. Only container-level codes qualify: record damage is exactly what
+/// repair exists for, so it gets no hint.
+fn unrepairable_hint(e: &BrainError) -> Option<&'static str> {
+    match e.code {
+        "sofuu.brain.unreadable" | "sofuu.brain.foreign" => Some(
+            "the damage is at the container level (header or key), before any record, so repair \
+             cannot salvage it in place; restore the last written copy with \
+             `sofuu brain restore <backup>`, or re-embed the source text into a new store",
+        ),
+        _ => None,
     }
 }
 

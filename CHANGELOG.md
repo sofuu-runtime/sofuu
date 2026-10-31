@@ -4,6 +4,121 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Audit remediation: 36 defect classes closed — 2026-10-31
+
+A full stress audit of the macOS and AWS builds produced 54 findings across the
+runtime and the site. This entry records what changed in the engine. Every claim
+below was reproduced against a built binary first and re-verified after the fix;
+the verification set is listed at the end.
+
+**Release integrity (P0-1, P1-8).** `sofuu version` now prints the build
+revision, so two binaries from a 53-commit gap are no longer indistinguishable.
+The Makefile copied the release binary onto the `sofuu` symlink with `cp`,
+which aborts as "identical (not copied)" — and because it was chained with
+`&&`, every strip, codesign and size check after it silently stopped running,
+shipping an unsigned binary that Apple Silicon kills at exec. It now removes the
+target first. `scripts/verify-dist.sh` fails a release that ships a dirty-tree
+build, an artifact with no HEAD stamp, or one over the 5.5 MiB cap.
+
+**Binary size (P1-8).** Four driver payloads were embedded as raw JavaScript and
+four Metal kernels as text. Bytecode-only embedding in release was already the
+rule for eleven drivers; the stragglers now follow it and the kernels ship
+gzip-compressed and are inflated at init. The host build is 5,559,840 B against
+the 5,767,168 B cap — 207 KB of headroom where the tree was 320 KB over.
+
+**HTTP server (P0-2, P1-12).** `listen()` unrefed its handle, so the README's
+server example exited immediately and the MCP HTTP transport was dead on
+arrival. It now refs like Node; `server.unref()` and `SOFUU_SERVERS_UNREF=1`
+are the opt-outs, and embedded hosts keep the old behaviour.
+
+**fetch (P1-2, P1-3, P1-4).** `AbortSignal` is honoured mid-body and mid-headers
+through a dedicated poll timer (never removing a handle from inside a curl
+callback), orphaned responses no longer reject armed readers — 60 concurrent
+readers now return 60 bodies where 55 failed — and responses are gzip-decoded
+because `CURLOPT_ACCEPT_ENCODING` was being handed a NULL.
+
+**HTTP handlers (P1-11).** A handler that threw — synchronously, or inside an
+`async` function — left the client to time out. The returned promise was freed
+without a rejection handler, so the throw surfaced as a process-wide
+`UnhandledPromiseRejection` and the connection sat until its own deadline. The
+rejection handler is now bound to that request's response
+(`JS_NewCFunctionData`, so there is no global "current response" to race on and
+no per-request eval), answers 500 exactly once, terminates a streaming response
+instead of hanging it, and never puts the script's error text on the wire.
+`req.on('data'|'end'|'close')` exists as well; unknown events and late
+registration throw a `TypeError` rather than silently never firing.
+
+**TypeScript erasure (P0-3, P1-1).** Two silent miscompiles: constructor
+parameter properties were dropped, and — worse — every object literal whose
+value was a bare identifier lost it (`{ k: x }` compiled to `{ k }`), which is
+a `ReferenceError` in the most common construct in JavaScript. The stripper now
+tracks brace and paren context, so a `: ` is only treated as a type annotation
+where a key cannot appear. The same pass fixed three neighbours: a ternary colon
+after an object literal was eaten as an annotation, `a < b > (c)` was blanked as
+type parameters, and generic arrows (`const f = <T>(x: T) => x`) were not
+recognised. `implements`, `abstract` classes and members, and
+`export type`/`export interface` are now erased instead of throwing. `namespace`
+and decorators still refuse with a `SyntaxError` — deliberately, because they
+need a transform this stripper does not do.
+
+**Brain (P1-5, P1-13, P2-3, P2-4).** Vector scores are normalised into 0…1, a
+dimension mismatch or non-finite value is rejected with `E_DIM`/`E_NONFINITE`
+instead of being stored, and `remember({vector})` without text no longer throws
+`E_TYPE`.
+
+Opening and closing a brain also stopped leaking. `brain_store` released a
+scanned-past stream with `qtsq_ctx_free`, which frees the 5 KB context block but
+not the payload `qtsq_container_get_stream` had just allocated into it — and
+because a segment carries `[memories, meta]` and the reader asks for `meta`
+first, every segment read orphaned its whole packed tensor (81,647 B per scan on
+a 65 KB stream; 1,092 B after the fix, and `stream_names` had the same bug).
+The other half was not a leak at all: a closed handle keeps a whole loaded brain
+reachable until a collection runs, and the only trigger was a 64 MB JS-heap
+budget that a Rust-side reopen loop never reaches, so retention grew without
+bound (0.5 MB/cycle over 900 cycles, no plateau). `close()` now runs a
+collection: the handle being closed is still referenced, so the sweep reclaims
+the previous cycles — which is what caps the live set at one brain instead of
+N.
+
+**Policy (P1-6, P1-15, P1-14).** `policy.set()` validates against a schema and
+fails closed: a misspelt key, a string where a list belongs, or malformed JSON
+is refused and the running policy is left untouched, instead of silently
+clearing it. `evaluate()` answers from the enforcement path, so it can no longer
+report a decision the kernel would not make. A permanent QuickJS interrupt
+handler bounds each regular-expression call (`SOFUU_REGEX_BUDGET_MS`, default
+1000, `0` disables) so a catastrophic backtrack costs a caught error rather
+than the process.
+
+**Runtime surface (P1-9, P2-1, P2-2, P2-10, P2-13).** `structuredClone`,
+`Blob`, `File`, `FormData`, `Event`/`EventTarget`/`CustomEvent`,
+`MessageChannel`/`MessagePort`, `navigator` and a persistent `localStorage` are
+now defined; `process.memoryUsage()` and `process.stdin.pipe()` exist; `eval`
+accepts top-level `await`; an import cycle evaluates each module once; and an
+empty prompt exits 0 with a message instead of 1.
+
+**MCP and plugins (P2-7, P2-6).** `mcp.connect({command, args})` works — the
+finding's premise was wrong — but the failure was opaque because the child's
+stderr went to `/dev/null`; it is now captured and the rejection reads
+`MCP server exited before initialize (exit code N): <stderr>`. A plugin whose
+default export is `{ handler }` registers as a tool with `run` aliased.
+
+**argv (P1-10).** `process.argv` leaked the `run` subcommand, so the standard
+`argv.slice(2)` returned the script name; a compiled artifact omitted the script
+slot entirely. Both are now `[exec, script, ...args]`.
+
+**Build (P1-7, P2-12).** A fresh clone can build: the missing `SOFUU_QTSQ_DIR`
+and `pkg-config` prerequisites are documented, and the panic messages name the
+fix.
+
+**Docs and site (P2-9, P0-2).** The installer verified checksums by delegating
+to `shasum -c`, which is satisfied by a `.sha256` file that contains nothing
+but a hash, so a tampered archive with a one-line checksum file installed
+cleanly; it now compares an expected digest explicitly. `scripts/check-doc-metrics.sh`
+reads prose, so the retired 5.2 MB and sub-4 ms figures are gone from every live
+document. The embedding pages no longer advertise SwiftPM and CocoaPods
+coordinates that cannot resolve, the four thin pages carry JSON-LD, and
+`public/_headers` ships a CSP and HSTS measured against the actual export.
+
 ## Modern npm resolution, WHATWG streams, and import diagnostics — 2026-10-30
 
 Three friction points that made modern AI SDKs fail on Sofuu, closed:

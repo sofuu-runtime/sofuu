@@ -1639,3 +1639,392 @@ if (typeof globalThis.ReadableStream === "undefined") {
   globalThis.TextDecoderStream = TextDecoderStream;
   globalThis.TextEncoderStream = TextEncoderStream;
 }
+
+// -- Web globals (AUDIT-2026-10-31 P1-9) ------------------------------
+// The audit found 17 web globals missing, so any library that touches one
+// died at load. Everything the engine can back honestly is installed here.
+// What cannot be honest is NOT stubbed - see the note at the end of this
+// block for each omission and why.
+(function () {
+  "use strict";
+  var g = globalThis;
+  var missing = function (name) { return typeof g[name] === "undefined"; };
+
+  // -- structuredClone ------------------------------------------------
+  // Deep copy over the structured-clone data model: plain objects/arrays,
+  // Date, RegExp, Map, Set, ArrayBuffer + every view, Error, Blob - with
+  // cycles preserved. Functions and symbols are not cloneable
+  // (DataCloneError, as the spec requires).
+  if (missing("structuredClone")) {
+    var dataCloneError = function (what) {
+      var e = new Error("structuredClone: " + what + " could not be cloned");
+      e.name = "DataCloneError";
+      return e;
+    };
+    var deepClone = function (value, seen) {
+      if (value === null || typeof value !== "object") {
+        if (typeof value === "function" || typeof value === "symbol") throw dataCloneError(typeof value);
+        return value;
+      }
+      if (seen.has(value)) return seen.get(value);
+      var out, i, keys;
+      if (Array.isArray(value)) {
+        out = new Array(value.length);
+        seen.set(value, out);
+        for (i = 0; i < value.length; i++) out[i] = deepClone(value[i], seen);
+        return out;
+      }
+      if (value instanceof Date) return new Date(value.getTime());
+      if (value instanceof RegExp) return new RegExp(value.source, value.flags);
+      if (value instanceof ArrayBuffer) return value.slice(0);
+      if (typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(value)) {
+        var copied = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+        return new value.constructor(copied);
+      }
+      if (value instanceof Map) {
+        out = new Map();
+        seen.set(value, out);
+        value.forEach(function (v, k) { out.set(deepClone(k, seen), deepClone(v, seen)); });
+        return out;
+      }
+      if (value instanceof Set) {
+        out = new Set();
+        seen.set(value, out);
+        value.forEach(function (v) { out.add(deepClone(v, seen)); });
+        return out;
+      }
+      if (value instanceof Error) {
+        try { out = new value.constructor(value.message); } catch (eCtor) { out = new Error(value.message); }
+        out.name = value.name;
+        if (value.stack) { try { out.stack = value.stack; } catch (eSt) {} }
+        return out;
+      }
+      if (!missing("Blob") && value instanceof g.Blob) return value.slice(0, value.size, value.type);
+      out = {};
+      seen.set(value, out);
+      keys = Object.keys(value);
+      for (i = 0; i < keys.length; i++) out[keys[i]] = deepClone(value[keys[i]], seen);
+      return out;
+    };
+    g.structuredClone = function structuredClone(value) { return deepClone(value, new Map()); };
+  }
+
+  // -- Event / EventTarget / CustomEvent ------------------------------
+  // Listener maps live on the instance under a non-enumerable key so
+  // Object.keys() on an EventTarget stays clean.
+  if (missing("Event")) {
+    var Event = function Event(type, init) {
+      if (!(this instanceof Event)) throw new TypeError("Event: call with new");
+      this.type = String(type);
+      this.bubbles = !!(init && init.bubbles);
+      this.cancelable = !!(init && init.cancelable);
+      this.composed = !!(init && init.composed);
+      this.defaultPrevented = false;
+      this.target = null;
+      this.currentTarget = null;
+      this.eventPhase = 0;
+      this.isTrusted = false;
+      this.timeStamp = Date.now();
+      this._stop = 0;
+    };
+    Event.prototype.preventDefault = function () { if (this.cancelable) this.defaultPrevented = true; };
+    Event.prototype.stopPropagation = function () { if (this._stop < 1) this._stop = 1; };
+    Event.prototype.stopImmediatePropagation = function () { this._stop = 2; };
+    Event.prototype.composedPath = function () { return this.target ? [this.target] : []; };
+    Event.NONE = 0;
+    Event.CAPTURING_PHASE = 1;
+    Event.AT_TARGET = 2;
+    Event.BUBBLING_PHASE = 3;
+    g.Event = Event;
+  }
+  if (missing("EventTarget")) {
+    var listenersOf = function (self) {
+      if (!Object.prototype.hasOwnProperty.call(self, "__sofuuListeners")) {
+        Object.defineProperty(self, "__sofuuListeners", { value: Object.create(null), enumerable: false, writable: true });
+      }
+      return self.__sofuuListeners;
+    };
+    var EventTarget = function EventTarget() { listenersOf(this); };
+    EventTarget.prototype.addEventListener = function (type, cb, opts) {
+      if (!cb) return;
+      var map = listenersOf(this);
+      var list = map[String(type)] || (map[String(type)] = []);
+      for (var i = 0; i < list.length; i++) { if (list[i].cb === cb) return; }
+      list.push({ cb: cb, once: !!(opts && opts.once) });
+    };
+    EventTarget.prototype.removeEventListener = function (type, cb) {
+      var list = listenersOf(this)[String(type)];
+      if (!list) return;
+      for (var i = 0; i < list.length; i++) { if (list[i].cb === cb) { list.splice(i, 1); return; } }
+    };
+    EventTarget.prototype.dispatchEvent = function (ev) {
+      if (!ev || typeof ev.type !== "string") throw new TypeError("dispatchEvent: Event required");
+      ev.target = this;
+      ev.currentTarget = this;
+      ev.eventPhase = 2;
+      var list = (listenersOf(this)[ev.type] || []).slice();
+      for (var i = 0; i < list.length && ev._stop < 2; i++) {
+        var cb = list[i].cb;
+        if (list[i].once) this.removeEventListener(ev.type, cb);
+        if (typeof cb === "function") cb.call(this, ev);
+        else if (cb && typeof cb.handleEvent === "function") cb.handleEvent(ev);
+      }
+      ev.currentTarget = null;
+      ev.eventPhase = 0;
+      return !ev.defaultPrevented;
+    };
+    g.EventTarget = EventTarget;
+  }
+  if (missing("CustomEvent")) {
+    var CustomEvent = function CustomEvent(type, init) {
+      var ev = new g.Event(type, init);
+      ev.detail = init && "detail" in init ? init.detail : null;
+      if (Object.setPrototypeOf) Object.setPrototypeOf(ev, CustomEvent.prototype);
+      return ev;
+    };
+    CustomEvent.prototype = Object.create(g.Event.prototype);
+    CustomEvent.prototype.constructor = CustomEvent;
+    g.CustomEvent = CustomEvent;
+  }
+
+  // -- Blob / File / FormData ----------------------------------------
+  var encoder = function () { return new g.TextEncoder(); };
+  var pushBytes = function (part, chunks) {
+    if (typeof part === "string") { chunks.push(encoder().encode(part)); return; }
+    if (!missing("Blob") && part instanceof g.Blob) { chunks.push(part._bytes()); return; }
+    if (part instanceof ArrayBuffer) { chunks.push(new Uint8Array(part)); return; }
+    if (typeof ArrayBuffer.isView === "function" && ArrayBuffer.isView(part)) {
+      chunks.push(new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength)));
+      return;
+    }
+    chunks.push(encoder().encode(String(part)));
+  };
+  var joinChunks = function (chunks) {
+    var total = 0, i;
+    for (i = 0; i < chunks.length; i++) total += chunks[i].length;
+    var buf = new Uint8Array(total);
+    var at = 0;
+    for (i = 0; i < chunks.length; i++) { buf.set(chunks[i], at); at += chunks[i].length; }
+    return buf;
+  };
+  if (missing("Blob")) {
+    var Blob = function Blob(parts, opts) {
+      var chunks = [], i;
+      var list = parts === undefined || parts === null ? [] : parts;
+      for (i = 0; i < list.length; i++) pushBytes(list[i], chunks);
+      this._buf = joinChunks(chunks);
+      this.type = String((opts && opts.type) || "").toLowerCase();
+    };
+    Blob.prototype._bytes = function () { return this._buf; };
+    Object.defineProperty(Blob.prototype, "size", { get: function () { return this._buf.length; } });
+    Blob.prototype.slice = function (start, end, type) {
+      var len = this._buf.length;
+      var s = start === undefined ? 0 : (start < 0 ? Math.max(len + start, 0) : Math.min(start, len));
+      var e = end === undefined ? len : (end < 0 ? Math.max(len + end, 0) : Math.min(end, len));
+      if (e < s) e = s;
+      var out = Object.create(Blob.prototype);
+      out._buf = this._buf.slice(s, e);
+      out.type = type === undefined ? "" : String(type).toLowerCase();
+      return out;
+    };
+    Blob.prototype.arrayBuffer = function () { return Promise.resolve(this._buf.slice().buffer); };
+    Blob.prototype.text = function () { return Promise.resolve(new g.TextDecoder().decode(this._buf)); };
+    Blob.prototype.bytes = function () { return Promise.resolve(this._buf.slice()); };
+    if (!missing("ReadableStream")) {
+      Blob.prototype.stream = function () {
+        var buf = this._buf;
+        return new g.ReadableStream({
+          start: function (c) { if (buf.length) c.enqueue(buf.slice()); c.close(); },
+        });
+      };
+    }
+    g.Blob = Blob;
+  }
+  if (missing("File")) {
+    var File = function File(parts, name, opts) {
+      g.Blob.call(this, parts, opts);
+      this.name = String(name);
+      this.lastModified = opts && typeof opts.lastModified === "number" ? opts.lastModified : Date.now();
+    };
+    File.prototype = Object.create(g.Blob.prototype);
+    File.prototype.constructor = File;
+    g.File = File;
+  }
+  if (missing("FormData")) {
+    var FormData = function FormData() { this._e = []; };
+    FormData.prototype.append = function (name, value) { this._e.push([String(name), value]); };
+    FormData.prototype.set = function (name, value) {
+      var n = String(name), found = false, out = [];
+      for (var i = 0; i < this._e.length; i++) {
+        if (this._e[i][0] === n) { if (!found) { out.push([n, value]); found = true; } }
+        else out.push(this._e[i]);
+      }
+      if (!found) out.push([n, value]);
+      this._e = out;
+    };
+    FormData.prototype.get = function (name) {
+      var n = String(name);
+      for (var i = 0; i < this._e.length; i++) { if (this._e[i][0] === n) return this._e[i][1]; }
+      return null;
+    };
+    FormData.prototype.getAll = function (name) {
+      var n = String(name), out = [];
+      for (var i = 0; i < this._e.length; i++) { if (this._e[i][0] === n) out.push(this._e[i][1]); }
+      return out;
+    };
+    FormData.prototype.has = function (name) {
+      var n = String(name);
+      for (var i = 0; i < this._e.length; i++) { if (this._e[i][0] === n) return true; }
+      return false;
+    };
+    FormData.prototype.delete = function (name) {
+      var n = String(name), out = [];
+      for (var i = 0; i < this._e.length; i++) { if (this._e[i][0] !== n) out.push(this._e[i]); }
+      this._e = out;
+    };
+    FormData.prototype.forEach = function (cb, thisArg) {
+      for (var i = 0; i < this._e.length; i++) cb.call(thisArg, this._e[i][1], this._e[i][0], this);
+    };
+    FormData.prototype.entries = function () { return this._e.map(function (p) { return [p[0], p[1]]; })[Symbol.iterator](); };
+    FormData.prototype.keys = function () { return this._e.map(function (p) { return p[0]; })[Symbol.iterator](); };
+    FormData.prototype.values = function () { return this._e.map(function (p) { return p[1]; })[Symbol.iterator](); };
+    if (Symbol.iterator) FormData.prototype[Symbol.iterator] = FormData.prototype.entries;
+    g.FormData = FormData;
+  }
+
+  // -- MessageChannel / MessagePort -----------------------------------
+  // The payload is passed by reference (the same-thread Node behaviour)
+  // and delivered on a microtask, which is what the web contract
+  // requires: never synchronously.
+  if (missing("MessagePort")) {
+    var soon = typeof queueMicrotask === "function"
+      ? function (fn) { queueMicrotask(fn); }
+      : function (fn) { Promise.resolve().then(fn); };
+    function makePort() {
+      var p = Object.create(MP.prototype);
+      g.EventTarget.call(p);
+      p.onmessage = null;
+      p.onmessageerror = null;
+      p._peer = null;
+      p._closed = false;
+      p.postMessage = function (data) {
+        var peer = p._peer;
+        if (!peer || peer._closed || p._closed) return;
+        var ev = new g.Event("message");
+        ev.data = data;
+        soon(function () { peer._deliver(ev); });
+      };
+      p._deliver = function (ev) {
+        if (p._closed) return;
+        if (typeof p.onmessage === "function") p.onmessage.call(p, ev);
+        p.dispatchEvent(ev);
+      };
+      p.start = function () {};
+      p.close = function () { p._closed = true; };
+      return p;
+    }
+    var MP = function MessagePort() { return makePort(); };
+    MP.prototype = Object.create(g.EventTarget.prototype);
+    MP.prototype.constructor = MP;
+    g.MessagePort = MP;
+    g.MessageChannel = function MessageChannel() {
+      var a = makePort(), b = makePort();
+      a._peer = b;
+      b._peer = a;
+      this.port1 = a;
+      this.port2 = b;
+    };
+  }
+
+  // -- navigator ------------------------------------------------------
+  if (missing("navigator")) {
+    var version = (g.process && g.process.versions && g.process.versions.sofuu) || "0.3.0";
+    var ua = "sofuu/" + version;
+    g.navigator = {
+      userAgent: ua,
+      appVersion: ua,
+      appName: "sofuu",
+      product: "Sofuu",
+      platform: (g.process && g.process.platform) || "unknown",
+      language: "en-US",
+      languages: ["en-US"],
+      hardwareConcurrency: 1,
+      onLine: true,
+    };
+  }
+
+  // -- localStorage ---------------------------------------------------
+  // Honest, synchronous and persistent: one JSON object file written
+  // through sofuu.fs SYNC primitives on every mutation. Scope is the CWD
+  // (SOFUU_LOCALSTORAGE_PATH overrides the file), NOT a web origin - the
+  // runtime has no origin concept, so this is the true analogue.
+  if (missing("localStorage") && g.sofuu && g.sofuu.fs
+      && typeof g.sofuu.fs.readFileSync === "function"
+      && typeof g.sofuu.fs.writeFileSync === "function") {
+    var lsPath = (g.process && g.process.env && g.process.env.SOFUU_LOCALSTORAGE_PATH) || ".sofuu/localStorage.json";
+    var lsSlash = lsPath.lastIndexOf("/");
+    var lsDir = lsSlash > 0 ? lsPath.slice(0, lsSlash) : "";
+    var lsData = {};
+    try {
+      var rawLs = g.sofuu.fs.readFileSync(lsPath);
+      var textLs = typeof rawLs === "string" ? rawLs : new g.TextDecoder().decode(rawLs);
+      if (textLs) lsData = JSON.parse(textLs) || {};
+    } catch (eLoad) { lsData = {}; }
+    var lsFlush = function () {
+      try {
+        if (lsDir) {
+          try { g.sofuu.fs.mkdirSync(lsDir, { recursive: true }); }
+          catch (eMk) { try { g.sofuu.fs.mkdirSync(lsDir); } catch (eMk2) {} }
+        }
+      } catch (eDir) {}
+      try { g.sofuu.fs.writeFileSync(lsPath, JSON.stringify(lsData)); } catch (eWrite) {}
+    };
+    var lsApi = {
+      getItem: function (k) {
+        k = String(k);
+        return Object.prototype.hasOwnProperty.call(lsData, k) ? String(lsData[k]) : null;
+      },
+      setItem: function (k, v) { lsData[String(k)] = String(v); lsFlush(); },
+      removeItem: function (k) { delete lsData[String(k)]; lsFlush(); },
+      clear: function () { lsData = {}; lsFlush(); },
+      key: function (i) {
+        var ks = Object.keys(lsData);
+        i = Number(i);
+        return i >= 0 && i < ks.length ? ks[i] : null;
+      },
+    };
+    Object.defineProperty(lsApi, "length", { get: function () { return Object.keys(lsData).length; } });
+    if (typeof Proxy === "function") {
+      // localStorage.foo works too, as on the web.
+      lsApi = new Proxy(lsApi, {
+        get: function (t, k) {
+          if (k in t) return t[k];
+          if (typeof k === "string" && Object.prototype.hasOwnProperty.call(lsData, k)) return String(lsData[k]);
+          return undefined;
+        },
+        set: function (t, k, v) {
+          if (typeof k === "string" && !(k in t)) { t.setItem(k, v); return true; }
+          t[k] = v;
+          return true;
+        },
+        has: function (t, k) { return (k in t) || Object.prototype.hasOwnProperty.call(lsData, k); },
+        deleteProperty: function (t, k) { t.removeItem(k); return true; },
+      });
+    }
+    g.localStorage = lsApi;
+  }
+
+  // NOT installed, deliberately - each would have to lie:
+  //   WeakRef / FinalizationRegistry - QuickJS 2024-01-13 has no weak
+  //     references. A strong-reference stand-in keeps every target alive
+  //     forever, i.e. the exact leak the caller used WeakRef to avoid.
+  //   WebAssembly - no WASM engine in the build.
+  //   Intl - no ICU data; toLocaleString falls back to the engine output.
+  //   WebSocket - needs a native RFC6455 client (runtime has TCP, not the
+  //     handshake/framing). Use fetch or the SSE surface instead.
+  //   EventSource - needs a reconnecting SSE client with last-event-id
+  //     resume; read the stream directly today:
+  //       var res = await fetch(url);
+  //       for await (var chunk of res.body) { ... }
+})();
+

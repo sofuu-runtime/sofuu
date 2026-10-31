@@ -685,6 +685,20 @@ pub unsafe fn read_tensor_stream(
 }
 
 /// Extract the stream named `want` into a fresh context (caller frees).
+///
+/// AUDIT-2026-10-31 P2-4: every stream this scan steps PAST must be released
+/// with `container_free` (payload + block), never `qtsq_ctx_free` alone.
+/// `qtsq_container_get_stream` mallocs a full copy of the stream payload
+/// into `out_ctx->singularity` (qtsq_container.c: malloc(entry.data_size)) and
+/// only `qtsq_free` releases it (qtsq_utils.c: free(ctx->singularity));
+/// `qtsq_ctx_free` is a bare free() of the 5032-byte context BLOCK.
+/// Freeing just the block orphaned the payload: reading a segment fetches
+/// "meta" FIRST, so the "memories" tensor at stream 0 was copied, skipped and
+/// leaked on every segment read — 65,612 B per read on the 600-record
+/// fixture, 8.36 MB of the 8.79 MB of unreachable heap a 40-cycle readonly
+/// reopen loop left behind. Profile:
+/// `leaks --atExit --fullStacks -- ./target/release/sofuu run <reopen loop>`
+/// attributes every leaked block to this function.
 unsafe fn find_stream(
     container: *mut qtsq::QtsqContext,
     want: &str,
@@ -712,8 +726,15 @@ unsafe fn find_stream(
             if name == want_c.as_bytes() {
                 return Some(sub);
             }
+            /* AUDIT-2026-10-31 P2-4: a stream we are NOT returning still owns
+             * the payload get_stream() copied into it - release both. */
+            container_free(sub);
+        } else {
+            /* get_stream only qtsq_init()s out_ctx on SUCCESS, and qtsq_init
+             * allocates nothing (it memsets), so a context it never filled
+             * holds no payload: the free of the block alone is complete. */
+            qtsq::qtsq_ctx_free(sub);
         }
-        qtsq::qtsq_ctx_free(sub);
     }
     None
 }
@@ -747,8 +768,13 @@ pub unsafe fn stream_names(container: *mut qtsq::QtsqContext) -> Vec<String> {
             if let Ok(s) = CStr::from_ptr(name_buf.as_ptr() as *const c_char).to_str() {
                 out.push(s.to_string());
             }
+            /* AUDIT-2026-10-31 P2-4: this loop names EVERY stream, so it used
+             * to orphan EVERY payload in the container. Same release as
+             * find_stream: container_free frees the copied payload too. */
+            container_free(sub);
+        } else {
+            qtsq::qtsq_ctx_free(sub);
         }
-        qtsq::qtsq_ctx_free(sub);
     }
     out
 }
@@ -2210,6 +2236,74 @@ mod tests {
         std::fs::write(format!("{d}/graph-000009.bin"), b"x").unwrap();
         assert_eq!(reclaim_unreferenced(&d, &[2]), 0, "fresh files are age-guarded");
         assert!(std::path::Path::new(&format!("{d}/graph-000009.bin")).exists());
+    }
+
+
+    /* ══════════════════════════════════════════════════════════════
+     * AUDIT-2026-10-31 P2-4: reading a segment must not grow the heap
+     * ══════════════════════════════════════════════════════════════ */
+
+    /// Peak resident set size of THIS process, in bytes (`ru_maxrss` is
+    /// bytes on macOS and KiB on Linux).
+    ///
+    /// Peak — not current — RSS is what a unix process can read about itself,
+    /// and it is the right instrument here: every leaked buffer raises the
+    /// high-water mark, even when the allocator would otherwise reuse the
+    /// pages for the next read.
+    fn peak_rss_bytes() -> usize {
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: getrusage writes only into the struct we own.
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
+        let raw = ru.ru_maxrss as usize;
+        if cfg!(target_os = "macos") { raw } else { raw * 1024 }
+    }
+
+    /// P2-4: `read_segment` fetches a segment's "meta" stream FIRST, so
+    /// `find_stream` copies the whole "memories" tensor into a context and
+    /// then steps past it. Freeing only the 5032-byte context BLOCK there
+    /// (instead of the whole context) orphaned that copy on every single
+    /// read — 8.36 MB of the 8.79 MB of unreachable heap a 40-cycle reopen
+    /// loop of a 600-record brain left behind (the profile is documented on
+    /// `find_stream`). The fix releases what the scan copied; this test
+    /// reads one segment repeatedly and refuses a heap that climbs with it.
+    #[test]
+    fn reading_a_segment_repeatedly_does_not_grow_the_heap() {
+        let dir = tmpdir("p2-4-leak");
+        let path = dir.join(segment_file(1, 1)).to_string_lossy().to_string();
+        let dim = 256usize;
+        // SEGMENT_CAP records at dim f32s = the "memories" tensor one read
+        // copies (256 * 256 * 4 = 256 KiB), so the leak signal is
+        // unmistakable next to the codec's own scratch allocations.
+        let recs: Vec<SegRecord> = (0..SEGMENT_CAP as u32).map(|i| rec_emb(i, dim)).collect();
+        // SAFETY: plain path/records; the segment exists before it is read.
+        unsafe { write_segment(&path, dim, &recs).expect("segment") };
+
+        let tensor_bytes = SEGMENT_CAP * dim * 4;
+        const READS: usize = 48;
+
+        // Two independent halves, and the SMALLER one decides: a parallel
+        // cargo test can inflate one half's high-water mark once, while a
+        // systematic per-read leak inflates both.
+        let mut halves = [0usize; 2];
+        for half in halves.iter_mut() {
+            let before = peak_rss_bytes();
+            // SAFETY: read_segment opens, reads and frees its own container.
+            unsafe {
+                for _ in 0..READS {
+                    let back = read_segment(&path).expect("read");
+                    assert_eq!(back.len(), SEGMENT_CAP, "the read still returns every record");
+                }
+            }
+            *half = peak_rss_bytes().saturating_sub(before);
+        }
+        let systematic = halves[0].min(halves[1]);
+        let leaked = READS * tensor_bytes;
+        assert!(
+            systematic < leaked / 6,
+            "reading one {tensor_bytes}-byte segment {READS}x raised peak RSS by {systematic} B \
+             (halves {halves:?}); a per-read leak of the tensor would retain ~{leaked} B — \
+             find_stream must release every stream it scans past (AUDIT-2026-10-31 P2-4)"
+        );
     }
 
 }

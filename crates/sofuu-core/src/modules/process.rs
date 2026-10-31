@@ -107,6 +107,9 @@ thread_local! {
     static STDIN_ON_DATA: Cell<JSValue> = const { Cell::new(zero_jsvalue()) };
     static STDIN_ON_END: Cell<JSValue> = const { Cell::new(zero_jsvalue()) };
     static STDIN_ON_ERROR: Cell<JSValue> = const { Cell::new(zero_jsvalue()) };
+    /// AUDIT-2026-10-31 P2-1: the writable handed to process.stdin.pipe(). The
+    /// trampolines installed as stdin's data/end handlers forward to it.
+    static STDIN_PIPE_DEST: Cell<JSValue> = const { Cell::new(zero_jsvalue()) };
     /// F-2: the engine that stored the .on() handlers (first writer wins —
     /// STDIN_CTX is only stamped when the pipe itself opens, but "end"/
     /// "error" handlers can be registered without it). mod_process_cleanup
@@ -609,6 +612,241 @@ unsafe extern "C" fn js_stdin_pause(
         uv::uv_read_stop(pipe as *mut UvStream);
     }
     qjs::sofuu_js_undefined()
+}
+
+/* ── AUDIT-2026-10-31 P2-1: process.stdin.pipe(dest) ──────────────
+ *
+ * Node's Readable.pipe over the one data/end pair this stdin object has: the
+ * destination's write() receives every chunk, its end() runs at EOF, and the
+ * call returns the destination (Node's contract). Backpressure is not
+ * modelled — uv hands us fd 0 as fast as it arrives and this stdin has no
+ * buffered queue to hold back (the same is true of the existing .on('data')
+ * path) — so pipe() does not pause on write() === false; a destination that
+ * needs to throttle has to pause()/resume() stdin itself. */
+
+/// The destination's `name` property, or an undefined value. # Safety: ctx live.
+unsafe fn stdin_pipe_dest_prop(ctx: *mut JSContext, name: *const c_char) -> JSValue {
+    let dest = STDIN_PIPE_DEST.with(|d| d.get());
+    if !unsafe { qjs::is_object(dest) } {
+        return qjs::sofuu_js_undefined();
+    }
+    qjs::sofuu_js_get_property_str(ctx, dest, name)
+}
+
+/// stdin's data handler while a pipe() is armed: dest.write(chunk).
+unsafe extern "C" fn js_stdin_pipe_data(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::sofuu_js_undefined();
+    }
+    let dest = STDIN_PIPE_DEST.with(|d| d.get());
+    let write = unsafe { stdin_pipe_dest_prop(ctx, c"write".as_ptr()) };
+    if qjs::JS_IsFunction(ctx, write) != 0 {
+        let ret = unsafe { qjs::JS_Call(ctx, write, dest, 1, argv) };
+        unsafe { qjs::sofuu_js_free_value(ctx, ret) };
+    }
+    unsafe { qjs::sofuu_js_free_value(ctx, write) };
+    qjs::sofuu_js_undefined()
+}
+
+/// stdin's end handler while a pipe() is armed: dest.end() when it has one.
+unsafe extern "C" fn js_stdin_pipe_end(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let dest = STDIN_PIPE_DEST.with(|d| d.get());
+    let end = unsafe { stdin_pipe_dest_prop(ctx, c"end".as_ptr()) };
+    if qjs::JS_IsFunction(ctx, end) != 0 {
+        let ret = unsafe { qjs::JS_Call(ctx, end, dest, 0, ptr::null()) };
+        unsafe { qjs::sofuu_js_free_value(ctx, ret) };
+    }
+    unsafe { qjs::sofuu_js_free_value(ctx, end) };
+    qjs::sofuu_js_undefined()
+}
+
+unsafe extern "C" fn js_stdin_pipe(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 || !unsafe { qjs::is_object(*argv) } {
+        return qjs::JS_ThrowTypeError(ctx, c"stdin.pipe requires a writable destination".as_ptr());
+    }
+    let dest = *argv;
+    let write = qjs::sofuu_js_get_property_str(ctx, dest, c"write".as_ptr());
+    let has_write = qjs::JS_IsFunction(ctx, write);
+    qjs::sofuu_js_free_value(ctx, write);
+    if has_write == 0 {
+        return qjs::JS_ThrowTypeError(
+            ctx,
+            c"stdin.pipe: the destination has no write() method".as_ptr(),
+        );
+    }
+
+    /* First engine to arm a pipe owns the destination value (F-2 rule). */
+    if STDIN_OWNER.with(|o| o.get()).is_null() {
+        STDIN_OWNER.with(|o| o.set(ctx));
+    }
+    STDIN_PIPE_DEST.with(|d| {
+        qjs::sofuu_js_free_value(ctx, d.replace(qjs::sofuu_js_dup_value(ctx, dest)));
+    });
+    let data = qjs::sofuu_js_new_cfunction(ctx, js_stdin_pipe_data, c"data".as_ptr(), 1);
+    STDIN_ON_DATA.with(|d| {
+        qjs::sofuu_js_free_value(ctx, d.replace(data));
+    });
+    let end = qjs::sofuu_js_new_cfunction(ctx, js_stdin_pipe_end, c"end".as_ptr(), 0);
+    STDIN_ON_END.with(|e| {
+        qjs::sofuu_js_free_value(ctx, e.replace(end));
+    });
+
+    unsafe { ensure_stdin_open(ctx) };
+    let pipe = STDIN_PIPE.with(|p| p.get());
+    uv::uv_read_start(pipe as *mut UvStream, Some(stdin_alloc_cb), Some(stdin_read_cb));
+    qjs::sofuu_js_dup_value(ctx, dest)
+}
+
+/* ── AUDIT-2026-10-31 P2-1: process.memoryUsage() ──────────────────
+ *
+ * The audit found "process.memoryUsage is not a function", which breaks
+ * every library that samples it (tools.js already feature-detects it). The
+ * numbers are measurements, not placeholders:
+ *   rss          — this process's resident set (the same measurement the TUI
+ *                  footer's RAM metric takes).
+ *   heapTotal    — bytes the QuickJS allocator is holding for this runtime.
+ *   heapUsed     — live JS payload inside that (QuickJS's own accounting).
+ *   external     — 0, always: this runtime attaches no native-heap objects to
+ *                  JS objects, which is what the field means in Node.
+ *   arrayBuffers — QuickJS's binary-object bytes (ArrayBuffer/TypedArray).
+ * process.memoryUsage.rss() is Node's cheap variant and is provided too.
+ */
+
+#[repr(C)]
+struct JsMemoryUsage {
+    malloc_size: i64,
+    malloc_limit: i64,
+    memory_used_size: i64,
+    malloc_count: i64,
+    memory_used_count: i64,
+    atom_count: i64,
+    atom_size: i64,
+    str_count: i64,
+    str_size: i64,
+    obj_count: i64,
+    obj_size: i64,
+    prop_count: i64,
+    prop_size: i64,
+    shape_count: i64,
+    shape_size: i64,
+    js_func_count: i64,
+    js_func_size: i64,
+    js_func_code_size: i64,
+    js_func_pc2line_count: i64,
+    js_func_pc2line_size: i64,
+    c_func_count: i64,
+    array_count: i64,
+    fast_array_count: i64,
+    fast_array_elements: i64,
+    binary_object_count: i64,
+    binary_object_size: i64,
+}
+
+extern "C" {
+    fn JS_ComputeMemoryUsage(rt: *mut qjs::JSRuntime, s: *mut JsMemoryUsage);
+}
+
+/// Current resident set size (bytes) of this process. macOS: task_info;
+/// Linux: /proc/self/statm. 0 when the platform has no cheap answer.
+fn process_rss_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: task_info fills the struct; KERN_SUCCESS is 0.
+        unsafe {
+            let mut info: libc::mach_task_basic_info = std::mem::zeroed();
+            let mut count = libc::MACH_TASK_BASIC_INFO_COUNT as libc::mach_msg_type_number_t;
+            let kr = libc::task_info(
+                libc::mach_task_self(),
+                libc::MACH_TASK_BASIC_INFO,
+                &mut info as *mut libc::mach_task_basic_info as *mut libc::integer_t,
+                &mut count,
+            );
+            if kr == 0 {
+                return info.resident_size as u64;
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(kb) = s.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()) {
+                return kb * 4096; /* pages → bytes (page size 4k) */
+            }
+        }
+    }
+    0
+}
+
+unsafe extern "C" fn js_process_rss(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    qjs::sofuu_js_new_float64(ctx, process_rss_bytes() as f64)
+}
+
+unsafe extern "C" fn js_process_memory_usage(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    // SAFETY: zeroed is a valid JSMemoryUsage; the engine context's runtime is
+    // live for as long as ctx is.
+    let mut m: JsMemoryUsage = unsafe { std::mem::zeroed() };
+    let rt = qjs::JS_GetRuntime(ctx);
+    if !rt.is_null() {
+        // SAFETY: rt/&mut m are live for the call.
+        unsafe { JS_ComputeMemoryUsage(rt, &mut m) };
+    }
+    let obj = qjs::sofuu_js_new_object(ctx);
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        obj,
+        c"rss".as_ptr(),
+        qjs::sofuu_js_new_float64(ctx, process_rss_bytes() as f64),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        obj,
+        c"heapTotal".as_ptr(),
+        qjs::sofuu_js_new_float64(ctx, m.malloc_size as f64),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        obj,
+        c"heapUsed".as_ptr(),
+        qjs::sofuu_js_new_float64(ctx, m.memory_used_size as f64),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        obj,
+        c"external".as_ptr(),
+        qjs::sofuu_js_new_float64(ctx, 0.0),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        obj,
+        c"arrayBuffers".as_ptr(),
+        qjs::sofuu_js_new_float64(ctx, m.binary_object_size as f64),
+    );
+    obj
 }
 
 unsafe extern "C" fn js_stdin_set_encoding(
@@ -3598,6 +3836,17 @@ pub unsafe extern "C" fn mod_process_register(ctx: *mut JSContext) {
         c"off".as_ptr(),
         qjs::sofuu_js_new_cfunction(ctx, js_process_off, c"off".as_ptr(), 1),
     );
+    /* AUDIT-2026-10-31 P2-1: process.memoryUsage() (+ Node's cheap
+     * process.memoryUsage.rss() variant). */
+    let memory_usage =
+        qjs::sofuu_js_new_cfunction(ctx, js_process_memory_usage, c"memoryUsage".as_ptr(), 0);
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        memory_usage,
+        c"rss".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_process_rss, c"rss".as_ptr(), 0),
+    );
+    qjs::sofuu_js_set_property_str(ctx, process, c"memoryUsage".as_ptr(), memory_usage);
 
     /* -- process.stdin -- */
     STDIN_ON_DATA.with(|d| d.set(qjs::sofuu_js_undefined()));
@@ -3628,6 +3877,13 @@ pub unsafe extern "C" fn mod_process_register(ctx: *mut JSContext) {
         stdin_obj,
         c"setEncoding".as_ptr(),
         qjs::sofuu_js_new_cfunction(ctx, js_stdin_set_encoding, c"setEncoding".as_ptr(), 1),
+    );
+    /* AUDIT-2026-10-31 P2-1: process.stdin.pipe(dest). */
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        stdin_obj,
+        c"pipe".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_stdin_pipe, c"pipe".as_ptr(), 1),
     );
     qjs::sofuu_js_set_property_str(
         ctx,
@@ -3836,6 +4092,9 @@ pub unsafe extern "C" fn mod_process_cleanup(ctx: *mut JSContext) {
         STDIN_ON_DATA.with(|d| qjs::sofuu_js_free_value(ctx, d.replace(qjs::sofuu_js_undefined())));
         STDIN_ON_END.with(|e| qjs::sofuu_js_free_value(ctx, e.replace(qjs::sofuu_js_undefined())));
         STDIN_ON_ERROR.with(|e| qjs::sofuu_js_free_value(ctx, e.replace(qjs::sofuu_js_undefined())));
+        /* P2-1: pipe()'s destination is held by the same rule. */
+        STDIN_PIPE_DEST
+            .with(|d| qjs::sofuu_js_free_value(ctx, d.replace(qjs::sofuu_js_undefined())));
         STDIN_OWNER.with(|o| o.set(ptr::null_mut()));
     }
     CTX.with(|c| c.set(ptr::null_mut()));
@@ -3987,6 +4246,83 @@ mod tests {
         let emoji = "\u{1f389}".repeat(30).into_bytes();
         let cut_e = cut_to_cells(&emoji, 10);
         assert_eq!(cut_e, 20, "expected 5 emoji (4 bytes each), cut at {cut_e}");
+    }
+
+    /// AUDIT-2026-10-31 P2-1: process.memoryUsage was "not a function" and
+    /// process.stdin had no pipe, so the two commonest process idioms failed
+    /// outright. Both must exist now, memoryUsage must answer with the Node
+    /// field set (measured, not placeholder zeros) and pipe must refuse a
+    /// destination it could not forward to.
+    #[test]
+    fn process_surface_has_memory_usage_and_stdin_pipe() {
+        use sofuu_ffi::qjs::CtxPtr;
+        let _loop_guard = crate::rt::test_loop_lock();
+        // SAFETY: standalone runtime + context (the M0 pattern fs.rs uses).
+        let rt = unsafe { qjs::JS_NewRuntime() };
+        let ctx = unsafe { qjs::JS_NewContext(rt) };
+        let _ctp = unsafe { CtxPtr::new(ctx) };
+        // SAFETY: registers the process object on this fresh context.
+        unsafe { mod_process_register(ctx) };
+
+        let script = CString::new(
+            "var mu = process.memoryUsage(); \
+             var keys = ['rss','heapTotal','heapUsed','external','arrayBuffers']; \
+             var bad = keys.filter(function (k) { return typeof mu[k] !== 'number'; }); \
+             var pipeThrew = false; \
+             try { process.stdin.pipe({}); } catch (e) { pipeThrew = (e instanceof TypeError); } \
+             globalThis.P21 = JSON.stringify({ \
+                 bad: bad, rss: mu.rss, heapTotal: mu.heapTotal, heapUsed: mu.heapUsed, \
+                 external: mu.external, arrayBuffers: mu.arrayBuffers, \
+                 rssFn: typeof process.memoryUsage.rss === 'function' ? process.memoryUsage.rss() : -1, \
+                 pipe: typeof process.stdin.pipe, pipeThrew: pipeThrew });",
+        )
+        .unwrap();
+        let r = unsafe {
+            qjs::JS_Eval(
+                ctx,
+                script.as_ptr(),
+                script.to_bytes().len(),
+                c"<p2-1>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            )
+        };
+        assert!(!unsafe { qjs::is_exception(r) }, "the probe script must not throw");
+        unsafe { qjs::sofuu_js_free_value(ctx, r) };
+
+        let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
+        let v = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"P21".as_ptr()) };
+        let raw = unsafe { qjs::sofuu_js_to_cstring(ctx, v) };
+        assert!(!raw.is_null(), "the probe must leave a JSON summary");
+        let json = unsafe { CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        unsafe {
+            qjs::sofuu_js_free_cstring(ctx, raw);
+            qjs::sofuu_js_free_value(ctx, v);
+            qjs::sofuu_js_free_value(ctx, global);
+        }
+
+        assert!(json.contains("\"bad\":[]"), "every field must be a number: {json}");
+        assert!(json.contains("\"pipe\":\"function\""), "stdin.pipe must exist: {json}");
+        assert!(json.contains("\"pipeThrew\":true"), "a dest with no write() must throw: {json}");
+        assert!(json.contains("\"external\":0"), "external is 0 by contract: {json}");
+        // Measured values: a live context has a heap and the process has an RSS.
+        let num = |key: &str| -> f64 {
+            let pat = format!("\"{key}\":");
+            let i = json.find(&pat).expect("field present") + pat.len();
+            json[i..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect::<String>()
+                .parse::<f64>()
+                .expect("number")
+        };
+        assert!(num("heapTotal") > 0.0, "heapTotal must be measured: {json}");
+        assert!(num("heapUsed") > 0.0, "heapUsed must be measured: {json}");
+        assert!(num("rss") > 0.0, "rss must be measured: {json}");
+        assert!(num("rssFn") > 0.0, "process.memoryUsage.rss() must answer: {json}");
+        assert!(
+            num("heapUsed") <= num("heapTotal"),
+            "used must not exceed total: {json}"
+        );
     }
 
     #[test]

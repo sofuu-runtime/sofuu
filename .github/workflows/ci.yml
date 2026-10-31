@@ -35,6 +35,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Documentation freshness
+        # Runs first because it takes ~50 ms and needs no toolchain: a doc that
+        # asserts a retired measurement should not wait 20 minutes behind a build.
+        # docs/ is gitignored, so CI checks tracked markdown only; a local run of
+        # the same script also covers docs/.
+        run: ./scripts/check-doc-metrics.sh
+
       - name: Install dependencies
         # libuv is installed because Homebrew's curl links it transitively
         # (via libssh2). sofuu-ffi links that curl dynamically, so the

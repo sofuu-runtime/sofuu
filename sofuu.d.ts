@@ -884,8 +884,20 @@ export interface MemoryHandle {
 export interface MemoryHit {
   id: string | number | null;
   text: string;
-  /** Cosine similarity clamped to [0, 1] — an exact hit is 1.0. */
+  /**
+   * RANKING score, for ordering only. It is relevance multiplied by the
+   * engagement/recency/tier boosts, so it is **not** a cosine and it is
+   * **not** bounded by 1: an exact vector hit settles near 0.92 and a boosted
+   * text-mode hit has been observed at 1.242. Do not threshold on it.
+   */
   score: number;
+  /** Index distance: 0 on an exact match, sqrt(2) between orthogonal unit
+   *  vectors. Stable across recalls (the boosts do not touch it) — threshold
+   *  on this, or on `similarity`. */
+  distance?: number;
+  /** 1 / (1 + distance): 1.0 exactly on an exact match, strictly inside
+   *  (0, 1], monotone in `distance`. Use this for threshold-based retrieval. */
+  similarity?: number;
   metadata?: Record<string, any>;
   timestamp?: number | null;
 }

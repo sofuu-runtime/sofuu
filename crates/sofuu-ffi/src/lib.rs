@@ -335,6 +335,39 @@ mod tests {
     use super::*;
     use crate::qjs;
 
+    /// AUDIT-2026-10-31 P1-8: the generated kernels_metal.h must carry the
+    /// MSL source GZIPPED. As a raw string literal it was 403,186 B — the
+    /// largest single .rodata item in every shipped binary — for text only
+    /// the runtime-compile fallback reads. Fails loudly if that regresses.
+    #[test]
+    fn metal_kernel_header_carries_gzip_not_raw_source() {
+        let h = include_str!(concat!(env!("OUT_DIR"), "/kernels_metal.h"));
+        assert!(
+            !h.contains("#include <metal_simdgroup_matrix>"),
+            "kernels_metal.h embeds the MSL source raw; it must be gzipped"
+        );
+        let num = |prefix: &str| -> usize {
+            let at = h
+                .find(prefix)
+                .unwrap_or_else(|| panic!("generated header lacks {prefix}"))
+                + prefix.len();
+            h[at..]
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .expect("numeric constant in generated header")
+        };
+        let raw = num("SOFUU_METAL_MSL_LEN = ");
+        let gz = num("SOFUU_METAL_MSL_GZ_LEN = ");
+        assert!(raw > 100_000, "MSL source is {raw} B — expected the whole shader");
+        assert!(
+            gz * 2 < raw,
+            "kernel payload is {gz} B for {raw} B of source — not compressed"
+        );
+    }
+
     // ── M0 keystone tests: the new qjs bindings boot and drive QuickJS ──
 
     /// Boot a standalone QuickJS context through the M0 bindings, eval

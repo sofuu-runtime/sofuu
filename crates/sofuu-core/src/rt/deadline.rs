@@ -17,23 +17,21 @@
 //     disarmDeadline() drops the newest arm and only at zero clears the
 //     deadline, so one call's disarm can never cancel another call's earlier
 //     one.
-//   * When the deadline fires the handler returns 1 (QuickJS raises the
-//     ordinary, catchable InternalError 'interrupted') and the deadline STAYS
-//     armed: a caller that swallows the error cannot make progress.
-//   * The sandbox runtime is private, so no pre-existing handler can be
-//     clobbered. The engine's previous poll COUNTER is saved and restored on
-//     the final disarm, and the handler is cleared there.
+//   * When the deadline fires the poll returns 1 (QuickJS raises the
+//     uncatchable InternalError 'interrupted') and the deadline STAYS armed:
+//     a caller that swallows the error cannot make progress.
+//   * AUDIT-2026-10-31 P1-14: the runtime has ONE interrupt slot and the
+//     regexp guard needs it too, so the slot is owned by rt/interrupt.rs,
+//     installed once at boot; arm/disarm only publish state here and
+//     poll_expired() is what that handler calls.
 
-use std::ffi::{c_int, c_void};
+use std::ffi::c_int;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sofuu_ffi::qjs::{self, JSContext, JSRuntime, JSValue, JSValueConst};
+use sofuu_ffi::qjs::{self, JSContext, JSValue, JSValueConst};
 
-/// QuickJS runs the handler after this many bytecode ops (the sandbox uses the
-/// same batch, so a deadline is felt at the same granularity in both).
-const POLL_BATCH: c_int = 10_000;
 /// Nested arms tracked explicitly; deeper nesting folds into the nearest.
 const MAX_ARMS: usize = 16;
 /// The 'no deadline' sentinel: no arm is 0 us since the epoch.
@@ -44,7 +42,7 @@ const MAX_ARM_MS: f64 = 86_400_000.0;
 /// Earliest active deadline in us since the Unix epoch; DISARMED = none.
 /// Written under BOOK by arm/disarm only; read (relaxed) by the handler.
 static EARLIEST_US: AtomicU64 = AtomicU64::new(DISARMED);
-/// Number of active arms. Only 0->1 installs the handler, 1->0 removes it.
+/// Number of active arms (a count only — the handler slot is permanent).
 static ARMS: AtomicI32 = AtomicI32::new(0);
 
 struct Book {
@@ -52,16 +50,12 @@ struct Book {
     /// The budget (ms) each arm asked for — reported back as "after <ms> ms".
     budget_ms: [u64; MAX_ARMS],
     n: usize,
-    /// The engine context's poll counter before the first arm (restored on
-    /// the final disarm, so nothing that predates us is left re-tuned).
-    prev_counter: c_int,
 }
 
 static BOOK: Mutex<Book> = Mutex::new(Book {
     deadlines: [0; MAX_ARMS],
     budget_ms: [0; MAX_ARMS],
     n: 0,
-    prev_counter: 0,
 });
 
 /// Budget (ms) of the arm that owns EARLIEST_US, published by publish().
@@ -73,7 +67,7 @@ static FIRED_US: AtomicU64 = AtomicU64::new(0);
 /// The budget (ms) of the arm that fired — copied from EARLIEST_MS on firing.
 static FIRED_MS: AtomicU64 = AtomicU64::new(0);
 
-fn now_us() -> u64 {
+pub(crate) fn now_us() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
@@ -97,9 +91,11 @@ fn publish(book: &Book) {
     EARLIEST_MS.store(ms, Ordering::SeqCst);
 }
 
-/// The QuickJS poll hook. 1 aborts the running script with the ordinary
-/// 'InternalError: interrupted'; the deadline is deliberately left in place.
-unsafe extern "C" fn deadline_interrupt_cb(_rt: *mut JSRuntime, _opaque: *mut c_void) -> c_int {
+/// The deadline half of the engine's interrupt poll (see rt/interrupt.rs,
+/// which owns the QuickJS handler slot). 1 aborts the running script with the
+/// uncatchable 'InternalError: interrupted'; the arm is deliberately kept
+/// until a new arm supersedes it.
+pub(crate) fn poll_expired() -> c_int {
     let deadline = EARLIEST_US.load(Ordering::Relaxed);
     if deadline == DISARMED {
         return 0;
@@ -188,24 +184,20 @@ unsafe extern "C" fn js_arm_deadline(
             book.budget_ms[loosest] = budget;
         }
     }
-    if ARMS.fetch_add(1, Ordering::SeqCst) == 0 {
-        /* First arm: remember the engine's poll counter, install the hook and
-         * make it run often enough for a deadline to be felt. */
-        book.prev_counter = unsafe { qjs::JS_GetInterruptCounter(ctx) };
-        let rt = unsafe { qjs::JS_GetRuntime(ctx) };
-        if !rt.is_null() {
-            unsafe { qjs::JS_SetInterruptHandler(rt, Some(deadline_interrupt_cb), std::ptr::null_mut()) };
-        }
-        unsafe { qjs::JS_SetInterruptCounter(ctx, POLL_BATCH) };
-    }
+    /* P1-14: the handler slot belongs to rt/interrupt.rs and is installed
+     * once at boot, so arming here only publishes the deadline. (It is
+     * installed as a safety net too: a host that armed a deadline before
+     * builtins finished still gets its hook.) */
+    ARMS.fetch_add(1, Ordering::SeqCst);
+    unsafe { crate::rt::interrupt::ensure_installed(ctx) };
     publish(&book);
     unsafe { qjs::sofuu_js_undefined() }
 }
 
 /// disarmDeadline() -> undefined. Drops the newest arm; at zero it clears the
-/// deadline, removes the hook and restores the pre-arm poll counter.
+/// published deadline (the handler slot stays with rt/interrupt.rs).
 unsafe extern "C" fn js_disarm_deadline(
-    ctx: *mut JSContext,
+    _ctx: *mut JSContext,
     _this: JSValueConst,
     _argc: c_int,
     _argv: *const JSValueConst,
@@ -219,15 +211,10 @@ unsafe extern "C" fn js_disarm_deadline(
     }
     publish(&book);
     if ARMS.fetch_sub(1, Ordering::SeqCst) <= 1 {
-        /* Last arm gone: nothing may interrupt this runtime any more. */
+        /* Last arm gone: nothing may interrupt this runtime any more. The
+         * handler itself stays installed (rt/interrupt.rs owns the slot for
+         * the regexp guard); with no deadline published it answers 0. */
         FIRED_US.store(0, Ordering::SeqCst);
-        let rt = unsafe { qjs::JS_GetRuntime(ctx) };
-        if !rt.is_null() {
-            unsafe { qjs::JS_SetInterruptHandler(rt, None, std::ptr::null_mut()) };
-        }
-        if book.prev_counter > 0 {
-            unsafe { qjs::JS_SetInterruptCounter(ctx, book.prev_counter) };
-        }
     }
     unsafe { qjs::sofuu_js_undefined() }
 }

@@ -342,13 +342,16 @@ impl BpeTokenizer {
 
     /// Encode input text into a list of token IDs with special token support.
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        if text.is_empty() {
-            return Vec::new();
-        }
-
         let mut tokens = Vec::new();
         if let Some(bos) = self.bos_token_id {
             tokens.push(bos);
+        }
+        /* AUDIT-2026-10-31 P2-13: empty text used to short-circuit to an empty
+         * vector BEFORE the BOS was pushed, so `sofuu infer <model> ''` failed
+         * with "prompt produced zero tokens" instead of sampling from BOS —
+         * which is what the same tokenizer does for every non-empty prompt. */
+        if text.is_empty() {
+            return tokens;
         }
 
         if self.special_tokens.is_empty() {
@@ -823,6 +826,25 @@ mod tests {
                 .collect();
             assert_same(&tok, &s);
         }
+    }
+
+    /// AUDIT-2026-10-31 P2-13: an empty prompt is "sample from BOS", not
+    /// "no tokens". The early return used to drop the BOS the tokenizer had
+    /// already queued, so `sofuu infer <model> ''` exited 1.
+    #[test]
+    fn empty_prompt_encodes_to_bos() {
+        let mut tok = toy_tokenizer();
+        assert!(tok.encode("").is_empty(), "no BOS configured, so no tokens");
+        tok.bos_token_id = Some(7);
+        assert_eq!(tok.encode(""), vec![7], "empty prompt must start at BOS");
+        // A non-empty prompt keeps the same BOS prefix it always had.
+        let non_empty = tok.encode("hello");
+        assert_eq!(non_empty.first(), Some(&7));
+        assert_eq!(
+            tok.encode(""),
+            non_empty[..1].to_vec(),
+            "the empty prompt is exactly the non-empty prompt's BOS prefix"
+        );
     }
 
     /// A merge that duplicates an earlier key must keep the later rank (the

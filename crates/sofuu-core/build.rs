@@ -129,14 +129,16 @@ fn main() {
     } else if let Some(dir) = &qtsq_dir {
         panic!(
             "{} not found at {} — QTSQ is a mandatory core component of Sofuu. \
-             Set SOFUU_QTSQ_DIR to a built QTSQ checkout (SOFUU_QTSQ_LIB overrides the archive path on Windows).",
+             Set SOFUU_QTSQ_DIR to a built QTSQ checkout (SOFUU_QTSQ_LIB overrides the archive path on Windows); \
+             CONTRIBUTING.md \"Building & Testing Locally\" lists what building that checkout needs.",
             qtsq_lib.file_name().and_then(|n| n.to_str()).unwrap_or("QTSQ archive"),
             dir.display()
         );
     } else {
         panic!(
             "SOFUU_QTSQ_DIR not set — QTSQ is a mandatory core component of Sofuu. \
-             Set it to a built QTSQ checkout to build Sofuu."
+             Set it to a built QTSQ checkout; CONTRIBUTING.md \"Building & Testing Locally\" \
+             lists the rest of the prerequisites (zlib headers for QTSQ, libcurl/libssl for the link)."
         );
     }
     println!("cargo:rerun-if-env-changed=SOFUU_QTSQ_DIR");
@@ -180,6 +182,39 @@ fn main() {
         println!("cargo:warning=weights_img.sem is empty — image embeddings report model-unavailable until trained");
     }
     let _ = std::fs::write(&staged, bytes);
+
+    // ── AUDIT-2026-10-31 P1-8: shipped JS assets, embedded gzipped ───────
+    // These files are read as text at runtime but only on one code path each
+    // (engine compat seam, RLM driver, chat TUI). Embedded raw they were
+    // 271 KB of the binary's .rodata against a 5.5 MB cap; gzip-9 is ~4x
+    // smaller, and the inflate happens where the text is first needed
+    // (shipped::inflate_gz, cached for the life of the process). The .js
+    // files stay the single source of truth: the compression runs here, so an
+    // edit can never ship stale bytes and there is no committed .gz to forget
+    // to regenerate.
+    // memory_api.js (24,449 B -> 8,373) and memory_adapters.js (34,361 ->
+    // 9,525) are the memory surface's two largest .rodata items; both are
+    // inflated once, on the path that needs them (memory_register / the first
+    // non-native backend open), so they ride the same mechanism.
+    for asset in [
+        "compat.js",
+        "rlm.js",
+        "chat_tui.js",
+        "memory_api.js",
+        "memory_adapters.js",
+    ] {
+        use std::io::Write as _;
+        let path = manifest.join("../../src/js").join(asset);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let src = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!("src/js/{asset} must exist (embedded by the binary): {e}")
+        });
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&src).expect("gzip shipped JS asset");
+        let gz = enc.finish().expect("finish gzip shipped JS asset");
+        std::fs::write(out_dir.join(format!("{asset}.gz")), &gz)
+            .expect("stage gzipped shipped JS asset");
+    }
 
     // ── PC-07: stamp the source revision ─────────────────────────────────
     let root = manifest.canonicalize().unwrap_or_else(|_| manifest.clone());

@@ -122,6 +122,13 @@ struct FetchReq {
      * the rejection after the cap instead of a generic curl write error. */
     max_body: usize,
     cap_hit: c_int,
+
+    /* P1-2 (AUDIT-2026-10-31): AbortSignal support. `signal` is a dup'd
+     * JSValue (undefined when the caller passed none) polled by
+     * abort_poll_cb while the transfer is in flight; `aborted` latches the
+     * first observation so the promise/stream settles exactly once. */
+    signal: JSValue,
+    aborted: c_int,
 }
 
 const REQ_MAGIC: usize = 0x5FF51_0002;
@@ -155,6 +162,12 @@ struct ResponseData {
     /* 1 once the finalizer ran while the transfer was still writing into
      * this ResponseData — the free is deferred to the transfer's DONE. */
     finalized: usize,
+    /* 1 once the pointer was queued in ORPHAN_RESP (park_orphan_resp) —
+     * keeps the park idempotent across the DONE path and the pump. */
+    parked: c_int,
+    /* 1 when the transfer ended because the caller aborted its signal, so
+     * every body consumer rejects with name "AbortError" (P1-2). */
+    aborted: c_int,
     pending_next: *mut PromiseHandle, /* one awaiting consumer at a time */
     pending_resolve: JSValue,         /* the resolver for the stream */
     /* net-8: a LIST — a single slot made the second mid-stream text()/
@@ -176,8 +189,19 @@ unsafe extern "C" fn response_finalizer(_rt: *mut qjs::JSRuntime, val: JSValue) 
      * the curl callbacks fault on freed memory (the app-closing crash).
      * Keep the response in the RESPONSES list and its waiters pending: the
      * DONE pump settles them and the orphan is reclaimed at the next fetch. */
-    if (*r).done == 0 {
+    if (*r).done == 0
+        || !(*r).pending_settle.is_empty()
+        || !(*r).pending_next.is_null()
+    {
+        /* AUDIT-2026-10-31 P1-3: DONE with armed waiters defers too. done=1
+         * arms the uv_check pump, but a collection inside the microtask
+         * flush in between used to reject those waiters with "response
+         * finalized" — an ordinary concurrent fetch turned into an error.
+         * Serving them is the pump's job; it parks the response afterwards. */
         (*r).finalized = 1;
+        if (*r).done != 0 {
+            fetch_stream_pump();
+        }
         return;
     }
 
@@ -188,7 +212,10 @@ unsafe extern "C" fn response_finalizer(_rt: *mut qjs::JSRuntime, val: JSValue) 
             rs.swap_remove(i);
         }
     });
-    /* Still-pending settle waiters would leak — reject them all (net-8). */
+    /* Waiters still armed at this point would leak — reject them all (net-8).
+     * P1-3: unreachable — the deferral above keeps every armed response in
+     * RESPONSES until the pump has served it; kept as a belt-and-braces
+     * cleanup if a future path arms a waiter after the park. */
     for p in (*r).pending_settle.drain(..) {
         sofuu_promise_reject_str(p, c"response finalized".as_ptr());
     }
@@ -210,38 +237,57 @@ unsafe extern "C" fn response_finalizer(_rt: *mut qjs::JSRuntime, val: JSValue) 
 
 static RESPONSE_CLASS_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/* ResponseData whose JS object was collected before the transfer finished.
- * The transfer's DONE settles its waiters; the body remains readable only
- * inside that eval_string, so reclaiming at the NEXT fetch (when every
- * prior microtask has long flushed) is the only safe free point. */
+/* Responses whose JS object was collected before all of their readers were
+ * served. The transfer's DONE settles the waiters; the body stays readable
+ * only inside that eval_string, so the free happens at the NEXT fetch, when
+ * every prior microtask has long flushed.
+ *
+ * AUDIT-2026-10-31 P1-3: this is a LIST. The single slot lost the first of
+ * two orphans completed in one multi drain (leak) and forced the reclaim
+ * below to reject the still-armed waiters of whatever it found. */
 thread_local! {
-    static ORPHAN_RESP: std::cell::Cell<*mut ResponseData> = const { std::cell::Cell::new(ptr::null_mut()) };
+    static ORPHAN_RESP: std::cell::RefCell<Vec<*mut ResponseData>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Reclaim the previous orphaned response (safe: called at fetch start,
-/// far from any curl callback and after all earlier microtasks ran).
+/// Park a collected response for a later reclaim. Idempotent (the DONE path
+/// parks, then the pump parks again once the waiters are drained).
+unsafe fn park_orphan_resp(r: *mut ResponseData) {
+    if r.is_null() || (*r).parked != 0 {
+        return;
+    }
+    (*r).parked = 1;
+    ORPHAN_RESP.with(|o| o.borrow_mut().push(r));
+}
+
+/// Reclaim parked responses (safe: called at fetch start, far from any curl
+/// callback and after all earlier microtasks ran).
+///
+/// AUDIT-2026-10-31 P1-3: an orphan whose waiters are still armed is NOT
+/// freeable. The uv_check pump that serves them runs after the current multi
+/// drain, so this reclaim — the next fetch entry, which is exactly the shape
+/// `Promise.all(urls.map(u => fetch(u).then(r => r.json())))` produces — used
+/// to reject them with "response finalized". Anything still pending stays
+/// parked and is freed on a later pass, once the pump has delivered the body
+/// (the reader's continuation is queued before any later fetch can run, so it
+/// has always consumed the body by then).
 unsafe fn reclaim_orphan_resp() {
-    let orphan = ORPHAN_RESP.with(|o| o.replace(ptr::null_mut()));
-    if !orphan.is_null() {
+    let parked = ORPHAN_RESP.with(|o| std::mem::take(&mut *o.borrow_mut()));
+    for orphan in parked {
+        if orphan.is_null() {
+            continue;
+        }
+        if !(*orphan).pending_settle.is_empty() || !(*orphan).pending_next.is_null() {
+            /* net-9: serving them is the pump's job — never strand the await
+             * by dropping the handles, and never free the body it reads. */
+            ORPHAN_RESP.with(|o| o.borrow_mut().push(orphan));
+            continue;
+        }
         RESPONSES.with(|rs| {
             let mut rs = rs.borrow_mut();
             if let Some(i) = rs.iter().position(|x| *x == orphan) {
                 rs.swap_remove(i);
             }
         });
-        /* net-9: waiters the DONE pump never reached would leak their
-         * handles and hang their awaits forever — reject before freeing,
-         * mirroring response_finalizer's cleanup (net-8: all of them). */
-        for p in (*orphan).pending_settle.drain(..) {
-            sofuu_promise_reject_str(p, c"response finalized".as_ptr());
-        }
-        if !(*orphan).pending_next.is_null() {
-            sofuu_promise_reject_str(
-                (*orphan).pending_next,
-                c"response finalized".as_ptr(),
-            );
-            (*orphan).pending_next = ptr::null_mut();
-        }
         if !qjs::is_undefined((*orphan).pending_resolve) {
             qjs::sofuu_js_free_value((*orphan).ctx, (*orphan).pending_resolve);
             (*orphan).pending_resolve = qjs::sofuu_js_undefined();
@@ -260,15 +306,24 @@ unsafe fn resp_err_msg(r: *mut ResponseData) -> String {
         .unwrap_or_else(|| "fetch response incomplete: connection error".to_string())
 }
 
+/// The rejection a body consumer sees: an aborted transfer keeps its
+/// AbortError identity (P1-2), everything else is the transport error (P1-5).
+unsafe fn body_error(ctx: *mut JSContext, r: *mut ResponseData) -> JSValue {
+    if (*r).aborted != 0 {
+        new_abort_error(ctx)
+    } else {
+        new_fetch_error(ctx, &resp_err_msg(r))
+    }
+}
+
 /// A promise rejected with the response's transport error (P1-5: an errored
 /// transfer must surface as a rejection everywhere — stream next()/wait(),
 /// pending read fulfillment, settle waiters, and direct body reads — never
 /// as a clean end-of-stream or a truncated-body resolve).
 unsafe fn rejected_body_promise(ctx: *mut JSContext, r: *mut ResponseData) -> JSValue {
-    let msg = resp_err_msg(r);
     let mut resolvers: [JSValue; 2] = [std::mem::zeroed(); 2];
     let promise = qjs::JS_NewPromiseCapability(ctx, resolvers.as_mut_ptr());
-    let err = new_fetch_error(ctx, &msg);
+    let err = body_error(ctx, r);
     let ret = qjs::JS_Call(ctx, resolvers[1], qjs::sofuu_js_undefined(), 1, &err);
     qjs::sofuu_js_free_value(ctx, ret);
     qjs::sofuu_js_free_value(ctx, err);
@@ -986,7 +1041,7 @@ unsafe fn response_fulfill_pending(ctx: *mut JSContext, r: *mut ResponseData) {
         /* P1-5: the transfer failed mid-body — reject the pending read
          * instead of handing it a clean {done:true} end-of-stream. r is
          * read only before new_fetch_error runs any JS (P1-4 rule). */
-        let err = new_fetch_error(ctx, &resp_err_msg(r));
+        let err = body_error(ctx, r);
         let p_box = Box::from_raw(p);
         let ret = qjs::JS_Call(ctx, p_box.reject, qjs::sofuu_js_undefined(), 1, &err);
         qjs::sofuu_js_free_value(ctx, ret);
@@ -1048,6 +1103,8 @@ unsafe fn build_response(
         errored: 0,
         err_msg: None,
         finalized: 0,
+        parked: 0,
+        aborted: 0,
         pending_next: ptr::null_mut(),
         pending_resolve: qjs::sofuu_js_undefined(),
         pending_settle: Vec::new(),
@@ -1327,28 +1384,33 @@ unsafe extern "C" fn stream_check_cb(_h: *mut UvCheck) {
         *mut ResponseData,
         Vec<*mut PromiseHandle>,
         Option<String>,
+        bool,
     )> = Vec::new();
     RESPONSES.with(|rs| {
         let rs = rs.borrow();
         for &r in rs.iter() {
             let mut settle_err: Option<String> = None;
+            let mut settle_abort = false;
             let mut settles: Vec<*mut PromiseHandle> = Vec::new();
             if (*r).done != 0 {
                 settles = std::mem::take(&mut (*r).pending_settle);
                 /* P1-5: snapshot the error message under the borrow — the
-                 * settle path below never dereferences r again (P1-4 rule). */
+                 * settle path below never dereferences r again (P1-4 rule).
+                 * P1-2: the abort flag rides along so the rejection keeps its
+                 * AbortError name. */
                 if (*r).errored != 0 {
                     settle_err = Some(resp_err_msg(r));
+                    settle_abort = (*r).aborted != 0;
                 }
             }
             let needs_fulfill =
                 !(*r).pending_next.is_null() && (!(*r).chunks.is_empty() || (*r).done != 0);
             if !settles.is_empty() || needs_fulfill {
-                work.push(((*r).ctx, r, settles, settle_err));
+                work.push(((*r).ctx, r, settles, settle_err, settle_abort));
             }
         }
     });
-    for (ctx, r, settles, settle_err) in work {
+    for (ctx, r, settles, settle_err, settle_abort) in work {
         if is_live_response(r) {
             response_fulfill_pending(ctx, r);
         }
@@ -1357,10 +1419,38 @@ unsafe extern "C" fn stream_check_cb(_h: *mut UvCheck) {
                 /* P1-5: an errored transfer rejects its text()/json()/
                  * arrayBuffer() waiters instead of resolving them. reject
                  * consumes the error (promise.rs memory contract). */
-                Some(msg) => sofuu_promise_reject(settle, new_fetch_error(ctx, msg)),
+                Some(msg) => {
+                    let err = if settle_abort {
+                        new_abort_error(ctx)
+                    } else {
+                        new_fetch_error(ctx, msg)
+                    };
+                    sofuu_promise_reject(settle, err)
+                }
                 None => sofuu_promise_resolve(settle, qjs::sofuu_js_undefined()),
             }
         }
+    }
+    /* AUDIT-2026-10-31 P1-3: a response collected after DONE (the finalizer
+     * defers while its waiters are armed) is parked HERE, once it has none
+     * left — the reader's continuation is queued by the settle above, so the
+     * next fetch's reclaim runs after it consumed the body. */
+    let mut park: Vec<*mut ResponseData> = Vec::new();
+    RESPONSES.with(|rs| {
+        let rs = rs.borrow();
+        for &r in rs.iter() {
+            if (*r).finalized != 0
+                && (*r).done != 0
+                && (*r).parked == 0
+                && (*r).pending_settle.is_empty()
+                && (*r).pending_next.is_null()
+            {
+                park.push(r);
+            }
+        }
+    });
+    for r in park {
+        park_orphan_resp(r);
     }
 }
 
@@ -1496,7 +1586,7 @@ unsafe fn check_multi_info_global() {
                              * reader microtask has run and nothing references it
                              * (freeing now would hit the async parse). */
                             reclaim_orphan_resp();
-                            ORPHAN_RESP.with(|o| o.set(resp));
+                            park_orphan_resp(resp);
                             (*req).resp = ptr::null_mut();
                         }
                         fetch_stream_pump();
@@ -1554,7 +1644,7 @@ unsafe fn check_multi_info_global() {
                          * settles its waiters; the orphan is reclaimed at the
                          * next fetch, after every reader microtask has run. */
                         reclaim_orphan_resp();
-                        ORPHAN_RESP.with(|o| o.set(resp));
+                        park_orphan_resp(resp);
                         (*req).resp = ptr::null_mut();
                     }
                     fetch_stream_pump();
@@ -1567,7 +1657,16 @@ unsafe fn check_multi_info_global() {
                 if !(*req).req_headers.is_null() {
                     curl::curl_slist_free_all((*req).req_headers);
                 }
+                /* P1-2: the transfer is over — untrack it and drop the
+                 * caller's signal ref (the poller's list must never hold a
+                 * freed pointer). */
+                unregister_req(req);
+                let signal = (*req).signal;
+                (*req).signal = qjs::sofuu_js_undefined();
                 drop(Box::from_raw(req));
+                if !qjs::is_undefined(signal) {
+                    qjs::sofuu_js_free_value(ctx, signal);
+                }
 
                 sofuu_flush_jobs(ctx);
             }
@@ -1897,6 +1996,23 @@ unsafe extern "C" fn opensocket_cb(
     libc::socket((*address).family, (*address).socktype, (*address).protocol)
 }
 
+/// P1-2 (AUDIT-2026-10-31): an aborted transfer rejects with name
+/// "AbortError" — callers branch on `err.name`, and a generic Error made a
+/// cancel indistinguishable from a transport failure.
+fn new_abort_error(ctx: *mut JSContext) -> JSValue {
+    unsafe {
+        let err = new_fetch_error(ctx, "AbortError: the operation was aborted");
+        let name = CString::new("AbortError").unwrap_or_default();
+        qjs::sofuu_js_set_property_str(
+            ctx,
+            err,
+            c"name".as_ptr(),
+            qjs::sofuu_js_new_string(ctx, name.as_ptr()),
+        );
+        err
+    }
+}
+
 fn new_fetch_error(ctx: *mut JSContext, msg: &str) -> JSValue {
     unsafe {
         let err = qjs::JS_NewError(ctx);
@@ -2086,6 +2202,8 @@ unsafe extern "C" fn js_sofuu_fetch(
     const CURLOPT_HTTP_VERSION: c_int = 84;
     const CURL_HTTP_VERSION_1_1: c_long = 2;
     const CURLOPT_ACCEPT_ENCODING: c_int = 10102;
+    /* CURLOPTTYPE_OBJECTPOINT(10000) + 18 (SDK curl.h). */
+    const CURLOPT_USERAGENT: c_int = 10018;
 
     /* Resolved once: every hop of this fetch is judged against the policy
      * that was in force when the caller asked (see FetchReq.policy_*). */
@@ -2109,6 +2227,8 @@ unsafe extern "C" fn js_sofuu_fetch(
         method: None,
         max_body: 0,
         cap_hit: 0,
+        signal: qjs::sofuu_js_undefined(),
+        aborted: 0,
     });
     if req.easy.is_null() {
         // curl_easy_init OOM — fail loudly instead of NULL-deref below.
@@ -2147,11 +2267,22 @@ unsafe extern "C" fn js_sofuu_fetch(
      * headers to the body callback and text()/json() get "HTTP/1.1 200 OK"
      * prepended. The header callback captures real headers separately. */
     curl::curl_easy_setopt(req.easy, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1); /* avoid HTTP/2 pseudo-header splitting */
-    curl::curl_easy_setopt(req.easy, CURLOPT_ACCEPT_ENCODING, ptr::null::<c_char>()); /* enable compressed transfers */
+    /* P1-4 (AUDIT-2026-10-31): "" is what ENABLES every encoding libcurl was
+     * built with (gzip/deflate/zstd/br) and transparently decodes the response
+     * — the old NULL sent no Accept-Encoding at all and text() handed callers
+     * raw gzip bytes. A caller's own Accept-Encoding header still wins (curl
+     * then stops decoding, per its own contract). */
+    curl::curl_easy_setopt(req.easy, CURLOPT_ACCEPT_ENCODING, c"".as_ptr());
+    /* P1-4: a default User-Agent. libcurl sends none, so hosts that require
+     * one (the GitHub API answers 403) saw an anonymous client. A caller's
+     * own User-Agent header replaces this value (CURLOPT_HTTPHEADER wins). */
+    let default_ua = CString::new(format!("sofuu/{}", env!("CARGO_PKG_VERSION"))).unwrap_or_default();
+    curl::curl_easy_setopt(req.easy, CURLOPT_USERAGENT, default_ua.as_ptr());
 
     qjs::sofuu_js_free_cstring(ctx, url_ptr);
 
-    /* Parse options: { method, headers, body } */
+    /* Parse options: { method, headers, body, signal } */
+    let mut pre_aborted = false;
     if argc > 1 && qjs::is_object(*argv.add(1)) {
         /* method — net-6: must be a valid RFC 7230 token; a CR/LF (or any
          * other non-token byte) would inject a header into the request
@@ -2306,6 +2437,18 @@ unsafe extern "C" fn js_sofuu_fetch(
             }
         }
         qjs::sofuu_js_free_value(ctx, body_val);
+
+        /* P1-2 (AUDIT-2026-10-31): the caller's AbortSignal. Held for the
+         * life of the transfer and polled by abort_poll_cb; an already-aborted
+         * signal rejects below without ever starting a connection. */
+        let signal_val = qjs::sofuu_js_get_property_str(ctx, *argv.add(1), c"signal".as_ptr());
+        if qjs::sofuu_js_is_object(signal_val) != 0 {
+            (*req).signal = qjs::sofuu_js_dup_value(ctx, signal_val);
+            let ab = qjs::sofuu_js_get_property_str(ctx, signal_val, c"aborted".as_ptr());
+            pre_aborted = qjs::JS_ToBool(ctx, ab) != 0;
+            qjs::sofuu_js_free_value(ctx, ab);
+        }
+        qjs::sofuu_js_free_value(ctx, signal_val);
     }
 
     let mut out: *mut PromiseHandle = ptr::null_mut();
@@ -2317,9 +2460,33 @@ unsafe extern "C" fn js_sofuu_fetch(
             curl::curl_slist_free_all(req.req_headers);
         }
         curl::curl_easy_cleanup(req.easy);
+        let signal = req.signal;
+        req.signal = qjs::sofuu_js_undefined();
+        if !qjs::is_undefined(signal) {
+            qjs::sofuu_js_free_value(ctx, signal);
+        }
         return promise;
     }
     req.promise = out;
+
+    if pre_aborted {
+        /* P1-2: the signal was already aborted when fetch() was called. The
+         * platform rejects instead of resolving with a response the caller
+         * already cancelled — nothing is dialled. */
+        if !req.req_headers.is_null() {
+            curl::curl_slist_free_all(req.req_headers);
+        }
+        curl::curl_easy_cleanup(req.easy);
+        let signal = req.signal;
+        req.signal = qjs::sofuu_js_undefined();
+        drop(req);
+        if !qjs::is_undefined(signal) {
+            qjs::sofuu_js_free_value(ctx, signal);
+        }
+        sofuu_promise_reject(out, new_abort_error(ctx));
+        sofuu_flush_jobs(ctx);
+        return promise;
+    }
 
     let req_ptr = Box::into_raw(req);
     /* net-12: if the add fails the transfer is never driven — reject the
@@ -2332,11 +2499,18 @@ unsafe extern "C" fn js_sofuu_fetch(
             curl::curl_slist_free_all((*req_ptr).req_headers);
         }
         curl::curl_easy_cleanup((*req_ptr).easy);
+        let signal = (*req_ptr).signal;
+        (*req_ptr).signal = qjs::sofuu_js_undefined();
         drop(Box::from_raw(req_ptr));
+        if !qjs::is_undefined(signal) {
+            qjs::sofuu_js_free_value(ctx, signal);
+        }
         sofuu_promise_reject_str(handle, c"fetch: failed to start transfer".as_ptr());
         sofuu_flush_jobs(ctx);
         return promise;
     }
+
+    register_req(req_ptr);
 
     let mut running_handles: c_int = 0;
     curl::curl_multi_socket_action(curl_multi(), curl::CURL_SOCKET_TIMEOUT, 0, &mut running_handles);
@@ -2364,6 +2538,141 @@ unsafe fn ensure_multi() {
     curl::curl_multi_setopt(multi, CURLMOPT_SOCKETFUNCTION, handle_socket as *const c_void);
     curl::curl_multi_setopt(multi, CURLMOPT_TIMERFUNCTION, start_timeout as *const c_void);
     GLOBAL_INIT_DONE.with(|g| g.set(1));
+}
+
+// ── P1-2 (AUDIT-2026-10-31): AbortSignal ────────────────────────────
+//
+// fetch(url, {signal}) used to ignore `signal` completely: abort() during a
+// body read left the reader waiting (the process never exited), and abort()
+// before the headers let the fetch resolve with 200. The signal is now polled
+// — never observed through a JS callback — because the poller runs on its own
+// uv_timer, outside every curl callback, which is the only place where
+// removing a handle from the multi is legal. 10 ms is finer than a curl
+// socket event and costs nothing while no signal is in flight (the timer is
+// started on the first signalled fetch and stopped with the last one).
+
+thread_local! {
+    /// Live transfers, so the poller can validate the pointer it holds before
+    /// dereferencing it (same contract as RESPONSES for responses).
+    static LIVE_REQS: RefCell<Vec<*mut FetchReq>> = const { RefCell::new(Vec::new()) };
+    static ABORT_TIMER: Cell<*mut UvTimer> = const { Cell::new(ptr::null_mut()) };
+    static ABORT_TIMER_ON: Cell<c_int> = const { Cell::new(0) };
+}
+
+unsafe fn abort_timer_start() {
+    if ABORT_TIMER_ON.with(|c| c.get()) != 0 {
+        return;
+    }
+    let mut timer = ABORT_TIMER.with(|c| c.get());
+    if timer.is_null() {
+        timer = libc::malloc(uv::sofuu_uv_timer_size()) as *mut UvTimer;
+        uv::uv_timer_init(sofuu_loop_get(), timer);
+        ABORT_TIMER.with(|c| c.set(timer));
+    }
+    uv::uv_timer_start(timer, Some(abort_poll_cb), 10, 10);
+    ABORT_TIMER_ON.with(|c| c.set(1));
+}
+
+unsafe fn abort_timer_stop() {
+    if ABORT_TIMER_ON.with(|c| c.get()) == 0 {
+        return;
+    }
+    let timer = ABORT_TIMER.with(|c| c.get());
+    if !timer.is_null() {
+        uv::uv_timer_stop(timer);
+    }
+    ABORT_TIMER_ON.with(|c| c.set(0));
+}
+
+/// Track a started transfer. Arms the poller when the request carries a signal.
+unsafe fn register_req(req: *mut FetchReq) {
+    LIVE_REQS.with(|l| l.borrow_mut().push(req));
+    if !qjs::is_undefined((*req).signal) {
+        abort_timer_start();
+    }
+}
+
+/// Untrack a finished transfer; disarms the poller with the last signal.
+unsafe fn unregister_req(req: *mut FetchReq) {
+    LIVE_REQS.with(|l| {
+        let mut l = l.borrow_mut();
+        if let Some(i) = l.iter().position(|x| *x == req) {
+            l.swap_remove(i);
+        }
+    });
+    let any_signal = LIVE_REQS.with(|l| {
+        l.borrow()
+            .iter()
+            .any(|&r| !qjs::is_undefined((*r).signal))
+    });
+    if !any_signal {
+        abort_timer_stop();
+    }
+}
+
+unsafe extern "C" fn abort_poll_cb(_t: *mut UvTimer) {
+    poll_aborts();
+}
+
+/// Observe every live signal; abort the transfers whose signal fired.
+unsafe fn poll_aborts() {
+    let live = LIVE_REQS.with(|l| l.borrow().clone());
+    for req in live {
+        if req.is_null() || (*req).aborted != 0 || qjs::is_undefined((*req).signal) {
+            continue;
+        }
+        let ctx = (*req).ctx;
+        let ab = qjs::sofuu_js_get_property_str(ctx, (*req).signal, c"aborted".as_ptr());
+        let fired = qjs::JS_ToBool(ctx, ab) != 0;
+        qjs::sofuu_js_free_value(ctx, ab);
+        if fired {
+            abort_req(req);
+        }
+    }
+}
+
+/// Abort one transfer: reject whatever the caller is still awaiting, stop the
+/// transfer, and release every handle it owned (so the loop can exit).
+unsafe fn abort_req(req: *mut FetchReq) {
+    let ctx = (*req).ctx;
+    (*req).aborted = 1;
+    if !(*req).resp.is_null() {
+        /* Headers already delivered: the fetch promise resolved and the body
+         * is streaming. End the stream errored so body readers, text(),
+         * json() and arrayBuffer() all reject instead of hanging. */
+        let resp = (*req).resp;
+        (*resp).done = 1;
+        (*resp).errored = 1;
+        (*resp).aborted = 1;
+        (*resp).err_msg = Some("AbortError: the operation was aborted".to_string());
+        if (*resp).finalized != 0 {
+            reclaim_orphan_resp();
+            park_orphan_resp(resp);
+            (*req).resp = ptr::null_mut();
+        }
+        fetch_stream_pump();
+    } else {
+        let err = new_abort_error(ctx);
+        sofuu_promise_reject((*req).promise, err);
+    }
+
+    /* Same teardown as the DONE tail: free the slist + req, drop the easy
+     * handle out of the multi (which closes its uv_poll sockets) and free the
+     * signal ref. */
+    unregister_req(req);
+    if !(*req).req_headers.is_null() {
+        curl::curl_slist_free_all((*req).req_headers);
+    }
+    let easy = (*req).easy;
+    let signal = (*req).signal;
+    (*req).signal = qjs::sofuu_js_undefined();
+    drop(Box::from_raw(req));
+    curl::curl_multi_remove_handle(curl_multi(), easy);
+    curl::curl_easy_cleanup(easy);
+    if !qjs::is_undefined(signal) {
+        qjs::sofuu_js_free_value(ctx, signal);
+    }
+    sofuu_flush_jobs(ctx);
 }
 
 // ── registration (C symbol replacement for mod_http_client_register) ──
@@ -3105,7 +3414,7 @@ function go(f) {
     // arm them. Pre-fix: reclaim freed the Box and dropped the handles —
     // both awaits hung forever (out1/out2 stay '').
     #[test]
-    fn orphan_reclaim_rejects_armed_waiters() {
+    fn orphan_reclaim_defers_armed_waiters() {
         let _loop_guard = crate::rt::test_loop_lock();
         unsafe {
             let rt = qjs::JS_NewRuntime();
@@ -3124,6 +3433,8 @@ function go(f) {
                 errored: 0,
                 err_msg: None,
                 finalized: 1,
+                parked: 0,
+                aborted: 0,
                 pending_next: ptr::null_mut(),
                 pending_resolve: qjs::sofuu_js_undefined(),
                 pending_settle: Vec::new(),
@@ -3131,7 +3442,7 @@ function go(f) {
             }));
             RESPONSES.with(|rs| rs.borrow_mut().push(r));
             // Park it as the DONE path does for a finalized response.
-            ORPHAN_RESP.with(|o| o.set(r));
+            park_orphan_resp(r);
 
             // Arm the settle waiter (response_wait_done's pending branch).
             let mut resolvers: [JSValue; 2] = [std::mem::zeroed(); 2];
@@ -3180,23 +3491,39 @@ function go(f) {
             assert!(!qjs::is_exception(sres), "observer eval threw");
             qjs::sofuu_js_free_value(ctx, sres);
 
-            // The next fetch's entry reclaim. With the fix both waiters are
-            // rejected before the Box is freed; pre-fix they never fire.
+            // The next fetch's entry reclaim. AUDIT-2026-10-31 P1-3: an orphan
+            // with armed waiters must NOT be freed here — the pump serves them
+            // first. Pre-fix this rejected both waiters ("response finalized")
+            // on an ordinary concurrent fetch.
             reclaim_orphan_resp();
             crate::rt::promise::sofuu_flush_jobs(ctx);
 
             let out1 = read_global(ctx, c"out1");
             let out2 = read_global(ctx, c"out2");
-            assert!(
-                out1.starts_with("REJECTED") && out1.contains("finalized"),
-                "settle waiter must reject at reclaim, got: {out1:?}"
-            );
-            assert!(
-                out2.starts_with("REJECTED") && out2.contains("finalized"),
-                "stream waiter must reject at reclaim, got: {out2:?}"
-            );
+            assert_eq!(out1, "", "armed settle waiter must stay pending, got: {out1:?}");
+            assert_eq!(out2, "", "armed stream waiter must stay pending, got: {out2:?}");
             let left = RESPONSES.with(|rs| rs.borrow().len());
-            assert_eq!(left, 0, "orphan must leave RESPONSES");
+            assert_eq!(left, 1, "an orphan with armed waiters must stay live");
+            let parked = ORPHAN_RESP.with(|o| o.borrow().len());
+            assert_eq!(parked, 1, "the orphan must stay parked for a later reclaim");
+
+            // Serve the waiters exactly as stream_check_cb does (outermost
+            // uv_check_t skipped — no loop is running in this test), then let
+            // the next fetch's reclaim free the body they read.
+            (*r).done = 1;
+            let settles = std::mem::take(&mut (*r).pending_settle);
+            response_fulfill_pending(ctx, r);
+            for settle in settles {
+                sofuu_promise_resolve(settle, qjs::sofuu_js_undefined());
+            }
+            crate::rt::promise::sofuu_flush_jobs(ctx);
+            let out1 = read_global(ctx, c"out1");
+            let out2 = read_global(ctx, c"out2");
+            assert!(out1.starts_with("RESOLVED"), "settle waiter must be served, got: {out1:?}");
+            assert!(out2.starts_with("RESOLVED"), "stream waiter must be served, got: {out2:?}");
+            reclaim_orphan_resp();
+            let left = RESPONSES.with(|rs| rs.borrow().len());
+            assert_eq!(left, 0, "a drained orphan must leave RESPONSES");
 
             qjs::JS_FreeContext(ctx);
             qjs::JS_FreeRuntime(rt);
@@ -3284,6 +3611,8 @@ function go(f) {
                 policy_refused: None,
                 headers_vec: Vec::new(),
                 method: None,
+                signal: qjs::sofuu_js_undefined(),
+                aborted: 0,
                 max_body: 0,
                 cap_hit: 0,
             }));
@@ -3903,4 +4232,374 @@ function go(f) {
             qjs::JS_FreeRuntime(rt);
         }
     }
+    // ── P1-3: concurrent fetch must never reject "response finalized" ──
+    // The audit's repro: N parallel fetches whose bodies arrive after the
+    // headers. Response A completes while the JS Response object is already
+    // collected, parks as an orphan, and the NEXT fetch entry used to reject
+    // A's still-armed text()/json() waiter before the uv_check pump served it
+    // — 1 failure at N=33, 6 at N=36, 10 at N=100, 39 at N=200.
+    // Pre-fix this test reports err="response finalized" x (N-5).
+
+    /// Headers first, body `delay_ms` later — the window where the Response
+    /// object can be collected while a reader is still armed.
+    fn spawn_slow_body_server(n: usize, delay_ms: u64, body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                if i >= n {
+                    break;
+                }
+                let Ok(mut stream) = stream else { break };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(k) => {
+                                buf.extend_from_slice(&chunk[..k]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.flush();
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    let _ = stream.write_all(body.as_bytes());
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    #[test]
+    fn concurrent_fetch_serves_every_reader() {
+        let n = 60usize;
+        let url = spawn_slow_body_server(n, 30, "{\"ok\":true}".to_string());
+        unsafe {
+            with_engine(
+                &format!(
+                    "globalThis.err=''; globalThis.ok=0; globalThis.done='';
+                     var ps = [];
+                     for (var i=0;i<{n};i++) {{
+                       ps.push(fetch('{url}/x').then(function(r){{ return r.json(); }}).then(
+                         function(j){{ if (j.ok) globalThis.ok++; }},
+                         function(e){{ globalThis.err += String((e && e.message) || e) + ';'; }}));
+                       /* allocation pressure: let the collector run mid-flight */
+                       var junk = []; for (var k=0;k<3000;k++) junk.push({{a:k,b:'x'+k}});
+                     }}
+                     Promise.all(ps).then(function(){{ globalThis.done='1'; }},
+                                         function(){{ globalThis.done='2'; }});",
+                    url = url,
+                    n = n
+                ),
+                |ctx| {
+                    let err = read_global(ctx, c"err");
+                    let ok = read_global(ctx, c"ok");
+                    let done = read_global(ctx, c"done");
+                    assert!(err.is_empty(), "every fetch must resolve, got errors: {err}");
+                    assert_eq!(ok, n.to_string(), "all {n} bodies must parse");
+                    assert_eq!(done, "1", "Promise.all must settle");
+                },
+            )
+            .unwrap()
+        }
+    }
+
+    // ── P1-2: AbortSignal ────────────────────────────────────────────
+    // Pre-fix: fetch ignored `signal` completely — abort() before the
+    // headers resolved with status 200, and abort() during a body read left
+    // the reader awaiting forever (the transfer, and the process, lived on).
+
+    /// with_engine + the real AbortController shim (rt/async_context.rs), so
+    /// the tests drive the same AbortSignal the engine hands to scripts.
+    unsafe fn with_engine_ac(script: &str, check: impl FnOnce(*mut qjs::JSContext)) {
+        let _loop_guard = crate::rt::test_loop_lock();
+        let rt = qjs::JS_NewRuntime();
+        let ctx = qjs::JS_NewContext(rt);
+        let _ctx_guard = CtxPtr::new(ctx);
+        crate::rt::event_loop::sofuu_loop_init();
+        mod_http_client_register(ctx);
+        crate::rt::timer::mod_timer_register(ctx);
+        crate::rt::async_context::mod_async_context_register(ctx);
+
+        let script_c = CString::new(script).unwrap();
+        let r = qjs::JS_Eval(
+            ctx,
+            script_c.as_ptr(),
+            script_c.as_bytes().len(),
+            c"<p1-2-abort>".as_ptr(),
+            qjs::JS_EVAL_TYPE_GLOBAL,
+        );
+        if qjs::is_exception(r) {
+            qjs::js_std_dump_error(ctx);
+        }
+        assert!(!qjs::is_exception(r), "script eval threw");
+        qjs::sofuu_js_free_value(ctx, r);
+        crate::rt::event_loop::sofuu_loop_run_bounded(
+            ctx,
+            Some(std::time::Duration::from_secs(20)),
+        );
+        check(ctx);
+        crate::rt::event_loop::sofuu_loop_close();
+        qjs::JS_FreeContext(ctx);
+        qjs::JS_FreeRuntime(rt);
+    }
+
+    /// Headers only after `head_delay_ms`; body `body_delay_ms` after that.
+    fn spawn_delayed_server(n: usize, head_delay_ms: u64, body_delay_ms: u64, body: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                if i >= n {
+                    break;
+                }
+                let Ok(mut stream) = stream else { break };
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(k) => {
+                                buf.extend_from_slice(&chunk[..k]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(head_delay_ms));
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.flush();
+                    std::thread::sleep(std::time::Duration::from_millis(body_delay_ms));
+                    let _ = stream.write_all(body.as_bytes());
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    #[test]
+    fn abort_before_headers_rejects_with_abort_error() {
+        let url = spawn_delayed_server(1, 1_500, 0, "late".to_string());
+        unsafe {
+            with_engine_ac(
+                &format!(
+                    "globalThis.out='';
+                     var ac = new AbortController();
+                     setTimeout(function () {{ ac.abort('stop'); }}, 50);
+                     fetch('{url}/x', {{ signal: ac.signal }}).then(
+                       function (r) {{ globalThis.out = 'RESOLVED ' + r.status; }},
+                       function (e) {{ globalThis.out = 'REJECTED ' + e.name + ': ' + (e.message || ''); }});",
+                    url = url
+                ),
+                |ctx| {
+                    let out = read_global(ctx, c"out");
+                    assert!(
+                        out.starts_with("REJECTED AbortError"),
+                        "an aborted fetch must reject with AbortError, got: {out:?}"
+                    );
+                },
+            )
+        }
+    }
+
+    #[test]
+    fn abort_mid_body_stops_the_reader_and_the_loop() {
+        /* 40 chunks at 30 ms: without abort support the read loop keeps
+         * going for the whole body and the process never exits. */
+        let url = spawn_stream_server(1, 30, 40);
+        unsafe {
+            let started = std::time::Instant::now();
+            with_engine_ac(
+                &format!(
+                    "globalThis.out='';
+                     var ac = new AbortController();
+                     fetch('{url}/x', {{ signal: ac.signal }}).then(function (r) {{
+                       /* async iterator: the harness has no ReadableStream,
+                        * and both surfaces share __fetch_stream_wait. */
+                       var n = 0;
+                       async function pump() {{
+                         for await (var c of r.body) {{
+                           n += c.byteLength;
+                           if (n > 2) ac.abort('stop');
+                         }}
+                         return n;
+                       }}
+                       pump().then(function (m) {{ globalThis.out = 'NO-THROW n=' + m; }},
+                                   function (e) {{ globalThis.out = 'ABORTED ' + e.name + ' after ' + n + ' bytes'; }});
+                     }}, function (e) {{ globalThis.out = 'FETCH-REJECTED ' + e.name; }});",
+                    url = url
+                ),
+                |ctx| {
+                    let out = read_global(ctx, c"out");
+                    assert!(
+                        out.starts_with("ABORTED AbortError"),
+                        "an aborted body read must reject with AbortError, got: {out:?}"
+                    );
+                },
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "aborting must release the loop, took {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    /// Chunked stream: `n` chunks, one every `gap_ms`.
+    fn spawn_stream_server(n: usize, gap_ms: u64, chunks: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                if i >= n {
+                    break;
+                }
+                let Ok(mut stream) = stream else { break };
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut c = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut c) {
+                            Ok(0) => break,
+                            Ok(k) => {
+                                buf.extend_from_slice(&c[..k]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                    );
+                    let _ = stream.flush();
+                    for _ in 0..chunks {
+                        let payload = b"data: 1\n\n";
+                        let _ = stream.write_all(format!("{:x}\r\n", payload.len()).as_bytes());
+                        let _ = stream.write_all(payload);
+                        let _ = stream.write_all(b"\r\n");
+                        let _ = stream.flush();
+                        std::thread::sleep(std::time::Duration::from_millis(gap_ms));
+                    }
+                    let _ = stream.write_all(b"0\r\n\r\n");
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        format!("http://127.0.0.1:{}", port)
+    }
+
+    // ── P1-4: Content-Encoding + default User-Agent ──────────────────
+    // Pre-fix: no Accept-Encoding was sent, so a gzip/deflate response body
+    // reached text() as raw compressed bytes, and the request carried no
+    // User-Agent at all (GitHub API answers 403 to that).
+
+    /// One-connection server that answers `/enc` with a compressed body and
+    /// records the request headers it saw.
+    fn spawn_encoding_server(body: &'static str, encoding: &'static str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let reqs = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(k) => {
+                            buf.extend_from_slice(&chunk[..k]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let req_head = String::from_utf8_lossy(&buf).into_owned();
+                let mut reqs = reqs.lock().unwrap();
+                reqs.push(req_head);
+                drop(reqs);
+
+                let body_bytes: Vec<u8> = match encoding {
+                    "gzip" => {
+                        use std::io::Write as _;
+                        let mut enc =
+                            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                        enc.write_all(body.as_bytes()).unwrap();
+                        enc.finish().unwrap()
+                    }
+                    _ => body.as_bytes().to_vec(),
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Encoding: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    encoding,
+                    body_bytes.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body_bytes);
+                let _ = stream.flush();
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                break;
+            }
+        });
+        (format!("http://127.0.0.1:{}", port), seen)
+    }
+
+    #[test]
+    fn gzip_response_body_is_decoded() {
+        let (url, seen) = spawn_encoding_server("gzipped-payload-gzipped-payload", "gzip");
+        unsafe {
+            with_engine(
+                &format!(
+                    "globalThis.err=''; globalThis.body='';
+                     fetch('{url}/enc').then(function (r) {{ return r.text(); }})
+                      .then(function (t) {{ globalThis.body = t; }},
+                            function (e) {{ globalThis.err = String(e && e.message || e); }});",
+                    url = url
+                ),
+                |ctx| {
+                    let err = read_global(ctx, c"err");
+                    assert!(err.is_empty(), "unexpected error: {err}");
+                    let body = read_global(ctx, c"body");
+                    assert_eq!(body, "gzipped-payload-gzipped-payload", "gzip body must be decoded");
+                },
+            )
+            .unwrap()
+        }
+        let head = seen.lock().unwrap().first().cloned().unwrap_or_default().to_ascii_lowercase();
+        assert!(head.contains("accept-encoding:"), "Accept-Encoding must be sent, saw: {head}");
+        assert!(
+            head.contains("user-agent: sofuu/"),
+            "a default User-Agent must be sent, saw: {head}"
+        );
+    }
+
 }

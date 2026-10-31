@@ -52,6 +52,7 @@ pub mod bytecode; // Phase 6 (agent plan): sofuu.aotEval - AOT bytecode snapshot
 pub mod engine; // M10: engine.c + sofuu.c + repl.c (boot, loader, Sofuu aliases, eval, destroy)
 pub mod host_poke; // PLAN-DESKTOP A: thread-safe host→engine wakeup (uv_async poke)
 pub mod deadline; // sofuu.host.armDeadline/disarmDeadline: JS-callable interrupt deadline
+pub mod interrupt; // P1-14: the engine runtime's one interrupt slot + the regexp budget
 pub mod session_js; // PLAN-DESKTOP C: sync session-mesh primitives for shipped chat.js
 pub mod tui; // M10: io/tui.c — the chat alt-screen renderer (tui_* exports)
 

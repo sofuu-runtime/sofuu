@@ -35,7 +35,7 @@ hyperfine --warmup 10 --runs 100 \
 | **Cloud Linux Server** | AMD EPYC 7763, Ubuntu 24.04 (x86_64) | **4.2 ms** | **4.8 ms** | 14.1 ms | 34.2 ms | 32.1 ms |
 | **Single-Board / Edge** | Raspberry Pi 5 (Cortex-A76 @ 2.8GHz, RPi OS 64-bit) | **38.2 ms** | **41.5 ms** | 48.6 ms | 148.0 ms | 185.4 ms |
 
-> 📌 **Key Takeaway:** On modern developer machines and cloud servers, Sofuu boots in **under 4 ms** ($\approx 3.8\text{ ms}$). On resource-constrained edge hardware like the Raspberry Pi 5, it boots in **$\approx 38\text{ ms}$**, delivering a **3.8× to 4.8× cold-start advantage** over Node.js and Python.
+> 📌 **Key Takeaway (revised 2026-10-31):** the 3.8 ms and 38.2 ms figures in this table are historical. Measured on an M2 Pro, 31 runs, wall clock including process spawn: **22.5 ms median** for `sofuu eval 1+1` on the current tree, against **61.5 ms** for the published 0.3.0-beta artifact measured the same way. The gap to Node.js and Python was not re-measured this session and is not claimed here.
 
 > ⚠️ **Provenance (2026-10-30):** the macOS row above predates the Metal
 > engine, the QTSQ memory shell and the eleven shipped JS drivers, and no
@@ -68,7 +68,7 @@ Comparing base process memory consumption upon startup with vector memory capabi
 | **Node.js + Local Vector DB** | Node process + ChromaDB / Qdrant background daemon | **~185.0 MB** |
 | **Python + LangChain + Chroma** | Python interpreter + PyTorch base + Chroma service | **~390.0 MB** |
 
-> 📌 **Key Takeaway:** Sofuu collapses runtime execution and vector memory into a single memory space, running at **1/15th to 1/30th the memory footprint** of traditional multi-process agent stacks.
+> 📌 **Key Takeaway (revised 2026-10-31):** the 3.8 ms and 38.2 ms figures in this table are historical. Measured on an M2 Pro, 31 runs, wall clock including process spawn: **22.5 ms median** for `sofuu eval 1+1` on the current tree, against **61.5 ms** for the published 0.3.0-beta artifact measured the same way. The gap to Node.js and Python was not re-measured this session and is not claimed here.
 
 ---
 
@@ -87,12 +87,27 @@ In Sofuu:
 
 ---
 
+> ⚠️ **Superseded (2026-10-31).** The 3.8 / 4.2 / 38.2 ms rows above are
+> historical. The numbers this project actually stands behind are the measured
+> ones below and in §2's note: `sofuu eval "1+1"` on an M2 Pro, 31 runs,
+> wall-clock including process spawn — **22.5 ms median** (min 21.8) for the
+> current tree, against **61.5 ms median** for the published `0.3.0-beta`
+> artifact measured the same way, in the same session. The four driver payloads
+> and four Metal kernels are now stored gzip-compressed and inflated at init, so
+> the size work did not cost startup: it improved it.
+
 ## 5. 📦 Binary Footprint & Stripped Size
 
 - **Hard Architectural Invariant:** $\le 5.5\text{ MB}$ stripped release binary.
-- **Current macOS ARM64 release binary:** `5.2 MB` (5,452,800 bytes).
-- **Current Linux x86_64 release binary:** `5.1 MB` (5,347,776 bytes).
-- **Current Linux ARM64 release binary:** `5.0 MB` (5,242,880 bytes).
+Measured 2026-10-31 (`stat -f%z` on each file; cap is 5,767,168 B):
+
+- **macOS ARM64, this tree (`make size-check`):** `5.30 MiB` (5,559,904 bytes) — **under**, 202 KB headroom.
+- **macOS ARM64, published archive:** `5.39 MiB` (5,655,808 bytes) — under, stale.
+- **Linux ARM64, published archive:** `5.88 MiB` (6,163,520 bytes) — **570,344 B over the cap**.
+- **Linux x86_64, published archive:** `6.80 MiB` (7,130,904 bytes) — **1,595,288 B over the cap**.
+
+The two Linux archives must be rebuilt before they ship; `scripts/verify-dist.sh`
+prints exactly those two lines and refuses them.
 
 *Every release binary includes QuickJS (ES2023), libuv event loop, QTSQ cognitive vector memory codec, native MCP client/server, and built-in coding toolpacks with zero external shared library dependencies.*
 

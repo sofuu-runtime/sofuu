@@ -127,6 +127,38 @@ pub const OBSERVABILITY_JS: &str = include_str!("../../../src/js/observability.j
 pub const OBSERVABILITY_JS: &str = "";
 pub const OBSERVABILITY_BC: &[u8] = include_bytes!("../../../src/js/observability.bc.gz");
 
+/// Inflate one gzipped embedded asset (AUDIT-2026-10-31 P1-8).
+///
+/// The shipped JS that only one code path needs is embedded gzipped, so its
+/// text stops costing binary budget: `build.rs` compresses the committed .js
+/// into OUT_DIR and the site that evals it inflates once into a
+/// process-lifetime cache. Nothing here is on the startup path — a caller
+/// that never reaches the feature never inflates.
+///
+/// `what` names the asset so a torn payload fails with the file it came from
+/// rather than a bare zlib error. Returns None (after saying so) instead of an
+/// empty string, so a caller can fail loudly rather than silently run without
+/// the feature.
+pub fn inflate_gz(gz: &[u8], what: &str) -> Option<String> {
+    use std::io::Read;
+    if gz.len() < 2 || gz[0] != 0x1f || gz[1] != 0x8b {
+        eprintln!("[sofuu] {what}: embedded payload is not gzip (build.rs staging?)");
+        return None;
+    }
+    let mut s = String::new();
+    match flate2::read::GzDecoder::new(gz).read_to_string(&mut s) {
+        Ok(_) if s.is_empty() => {
+            eprintln!("[sofuu] {what}: embedded payload inflated to nothing");
+            None
+        }
+        Ok(_) => Some(s),
+        Err(e) => {
+            eprintln!("[sofuu] {what}: embedded payload failed to inflate: {e}");
+            None
+        }
+    }
+}
+
 /// Eval one shipped JS driver into the engine context. A driver failure
 /// must never take the engine down (the drivers guard their own deps) —
 /// log the exception and let startup continue, matching the rlm.js seam's
@@ -302,6 +334,26 @@ pub unsafe fn eval_shipped_with_bytecode(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AUDIT-2026-10-31 P1-8: the gzipped assets build.rs stages must
+    /// inflate to exactly the committed sources. Staging in build.rs instead
+    /// of committing a .gz is what makes drift impossible; this is the test
+    /// that holds it to the files the binary actually embeds.
+    #[test]
+    fn gzipped_shipped_assets_match_their_sources() {
+        for (asset, src) in [
+            ("compat.js", include_str!("../../../src/js/compat.js")),
+            ("rlm.js", include_str!("../../../src/js/rlm.js")),
+            ("chat_tui.js", include_str!("../../../src/js/chat_tui.js")),
+        ] {
+            let path = std::path::Path::new(env!("OUT_DIR")).join(format!("{asset}.gz"));
+            let gz = std::fs::read(&path)
+                .unwrap_or_else(|e| panic!("{asset}.gz not staged by build.rs: {e}"));
+            let got = inflate_gz(&gz, asset).unwrap_or_else(|| panic!("{asset}.gz: inflate failed"));
+            assert_eq!(got.len(), src.len(), "{asset}: inflated length differs from source");
+            assert!(got == src, "{asset}: staged gzip does not match src/js/{asset}");
+        }
+    }
 
     /// Source text is embedded in debug builds only, so this runs there.
     #[cfg(debug_assertions)]

@@ -181,7 +181,11 @@ except Exception:
                 fail "build stamp '$rev' does not appear in the binary's strings"
             fi
             case "$rev" in
-                *-dirty) say "WARN built from a dirty tree ($rev) — release artifacts must come from a clean checkout" ;;
+                *-dirty)
+                    # AUDIT-2026-10-31 P0-1: the artifact users downloaded was
+                    # '0924a297b-dirty'. A warning was not enough.
+                    fail "built from a dirty tree ($rev) — a release artifact must be built from a clean checkout at the tagged commit"
+                    ;;
             esac
             base=${rev%-dirty}
             # Compare against the full sha by prefix: git's abbreviation width
@@ -210,6 +214,28 @@ except Exception:
             done
             ;;
     esac
+
+    # ── 6. binary size cap on EVERY artifact (P1-8) ────────────────────────
+    # AUDIT-2026-10-31 P1-8: 'make size-check' only ever measured ./sofuu, so
+    # three of the four shipped artifacts sat over the 5.5 MB cap with nothing
+    # failing. The cap is the Makefile's SIZE_LIMIT — keep the two in step.
+    size_cap=5767168
+    check_size() { # <file> <label>
+        sz=$(stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null) || return 0
+        [ -n "${sz:-}" ] || return 0
+        if [ "$sz" -le "$size_cap" ]; then
+            say "OK  $2: $sz B <= $size_cap B cap"
+        else
+            fail "$2 is $sz B, $((sz - size_cap)) B over the $size_cap B cap — do not publish it"
+        fi
+    }
+    check_size "$BIN" "$(basename "$BIN")"
+    for art in "$DIST"/sofuu-*; do
+        [ -f "$art" ] || continue
+        case "$art" in *.tar.gz | *.sha256 | *.txt) continue ;; esac
+        [ "$art" = "$BIN" ] && continue
+        check_size "$art" "$(basename "$art")"
+    done
 fi
 
 exit $rc

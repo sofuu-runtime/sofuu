@@ -22,3 +22,7 @@ libc = "0.2"
 
 [build-dependencies]
 cc = "1"
+# AUDIT-2026-10-31 P1-8: build.rs gzips src/metal/kernels.metal into the
+# generated kernels_metal.h (403,186 B of .rodata -> 71,519 B). Same features
+# sofuu-core uses, so the dependency graph is unchanged.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

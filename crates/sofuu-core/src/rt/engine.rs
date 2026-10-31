@@ -445,6 +445,9 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         // deadline on THIS context, so a runaway synchronous plugin (run, chat,
         // serve, eval) is abortable — the sandbox meter never covered it.
         crate::rt::deadline::mod_deadline_register(ctx);
+        // P1-14: the runtime's single interrupt slot — deadline arms plus the
+        // regexp backtracking budget — installed once, before any user code.
+        crate::rt::interrupt::ensure_installed(ctx);
     }
     /* M2 (PLAN-MEMORY-TOKENS): a global GC bridge so JS drivers can bound
      * garbage after heavy fan-outs (agent.js runMany/mapContext) — the
@@ -661,13 +664,28 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
     unsafe { register_version_property(ctx) };
 
     // Problem B: Web Standard APIs & Node.js built-ins compatibility layer
-    unsafe {
-        crate::shipped::eval_shipped(
-            ctx as *mut c_void,
-            include_str!("../../../../src/js/compat.js"),
-            "<compat>",
-        );
+    //
+    // AUDIT-2026-10-31 P1-8: compat.js is embedded gzipped (52,261 B ->
+    // ~11.5 KB) by build.rs and inflated here, once — this seam runs once per
+    // engine. A payload that will not inflate must be visible, not a runtime
+    // that quietly lost the compat layer.
+    match compat_js() {
+        Some(src) => unsafe {
+            crate::shipped::eval_shipped(ctx as *mut c_void, src, "<compat>");
+        },
+        None => {
+            eprintln!("[sofuu] compat.js unavailable: embedded payload failed to inflate")
+        }
     }
+}
+
+/// src/js/compat.js, compressed at build time — see shipped::inflate_gz.
+const COMPAT_JS_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/compat.js.gz"));
+
+fn compat_js() -> Option<&'static str> {
+    static SRC: OnceLock<Option<String>> = OnceLock::new();
+    SRC.get_or_init(|| crate::shipped::inflate_gz(COMPAT_JS_GZ, "src/js/compat.js"))
+        .as_deref()
 }
 
 // ── C-01 / C-03 error surfaces shared with promise.rs ─────────────
@@ -1312,8 +1330,13 @@ pub(crate) unsafe fn report_uncaught(ctx: *mut qjs::JSContext, reason: qjs::JSVa
      * into the deadline it was, and only when our handler actually fired:
      * an unrelated InternalError that happens to contain "interrupted" is
      * left alone. */
-    match crate::rt::deadline::classify_interrupted(&msg_s) {
-        Some(deadline_msg) => eprintln!("{}", paint("31", &format!("[sofuu] {}", deadline_msg))),
+    /* P1-14: the same uncatchable interrupt is how the regexp budget ends a
+     * catastrophic match, so it is classified first (its own one-shot flag
+     * decides whether THIS abort was the regexp guard's). */
+    match crate::rt::interrupt::classify_interrupted(&msg_s)
+        .or_else(|| crate::rt::deadline::classify_interrupted(&msg_s))
+    {
+        Some(named) => eprintln!("{}", paint("31", &format!("[sofuu] {}", named))),
         None => eprintln!("{}", paint("31", &format!("[sofuu] UncaughtException: {}", msg_s))),
     }
     let stack = unsafe { qjs::sofuu_js_get_property_str(ctx, reason, c"stack".as_ptr()) };
@@ -1359,6 +1382,17 @@ pub(crate) fn paint<'a>(code: &str, text: &'a str) -> std::borrow::Cow<'a, str> 
     }
 }
 
+/// The name an entry module is registered under: the canonical path when the
+/// file resolves, otherwise the path as given (a missing file still has to
+/// produce a useful error message).
+///
+/// AUDIT-2026-10-31 P2-10: see the call site in engine_eval_file.
+fn canonical_module_name(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
 /// engine_eval_file — load + (TS-strip) + eval a file as a module, then
 /// drain the event loop. Returns 0 on success (1 on any error).
 unsafe fn engine_eval_file(eng: *mut SofuuEngine, path_c: *const c_char) -> c_int {
@@ -1380,19 +1414,31 @@ unsafe fn engine_eval_file(eng: *mut SofuuEngine, path_c: *const c_char) -> c_in
         }
     }
 
+    /* AUDIT-2026-10-31 P2-10: the entry is registered under the CANONICAL
+     * path, not the spelling the user typed. QuickJS keys its loaded_modules
+     * list by the filename handed to JS_Eval, while an import is resolved
+     * through its own path normaliser, which never canonicalises: a cycle's
+     * `import './a.js'` therefore missed an entry opened as `./a.js` (or as
+     * /tmp/... while canonicalisation says /private/tmp/...) and the entry
+     * module was compiled a second time and ran twice (A, B, A). Canonical
+     * on both sides, the cycle resolves back to the in-flight module and
+     * evaluates once, as ESM requires. */
+    let module_name = canonical_module_name(&path);
+    let module_name_c = CString::new(module_name.as_str()).unwrap_or_default();
+
     // Update the module loader opaque: this file is the base for its
     // relative imports (update_loader_base owns the storage).
     let rt = unsafe { (*eng).rt };
-    unsafe { update_loader_base(rt, path.as_str()) };
+    unsafe { update_loader_base(rt, module_name.as_str()) };
 
     // SAFETY: eval_src is NUL-terminated (read_file/strip guarantee it);
-    // eval_len is the payload length; path_c is stable for the call.
+    // eval_len is the payload length; module_name_c outlives the call.
     let result = unsafe {
         qjs::JS_Eval(
             (*eng).ctx,
             eval_src,
             eval_len,
-            path_c,
+            module_name_c.as_ptr(),
             qjs::JS_EVAL_TYPE_MODULE,
         )
     };
@@ -1482,7 +1528,103 @@ unsafe fn engine_eval_string(
     let name = if filename.is_null() { c"<eval>".as_ptr() } else { filename };
     // SAFETY: source is a NUL-terminated C string; strlen from CStr.
     let src_len = unsafe { CStr::from_ptr(source) }.to_bytes().len();
-    let result = unsafe { qjs::JS_Eval(ctx, source, src_len, name, qjs::JS_EVAL_TYPE_GLOBAL) };
+    // SAFETY: eval_source's contract is this one: a live ctx on this thread.
+    let (rc, result) = unsafe { eval_source(ctx, source, src_len, name) };
+    // SAFETY: result is a live value, owned here.
+    unsafe { qjs::sofuu_js_free_value(ctx, result) };
+    rc
+}
+
+/// Is this source a module in disguise? — the P2-2 probe.
+///
+/// `await` at the top level is legal in a module and a SyntaxError in a
+/// global script, which is why a line copied out of a .js file failed under
+/// `sofuu eval` but not under `sofuu run`. The probe parses the source with
+/// COMPILE_ONLY, so it executes nothing and raises no user-visible error; only
+/// when the SCRIPT parser refuses is the source re-parsed as a module.
+///
+/// A runtime throw is never a module candidate: the script parser accepted the
+/// text, so retrying as a module could only run the program twice.
+///
+/// Returns Ok(false) for "a plain script", Ok(true) when only the module
+/// parser accepted it, and Err(()) with the SCRIPT's parse error re-raised as
+/// the pending exception when both refused — the pre-P2-2 message, unchanged.
+unsafe fn module_only_source(
+    ctx: *mut qjs::JSContext,
+    source: *const c_char,
+    len: usize,
+    name: *const c_char,
+) -> Result<bool, ()> {
+    let probe = unsafe {
+        qjs::JS_Eval(
+            ctx,
+            source,
+            len,
+            name,
+            qjs::JS_EVAL_TYPE_GLOBAL | qjs::JS_EVAL_FLAG_COMPILE_ONLY,
+        )
+    };
+    if !unsafe { qjs::is_exception(probe) } {
+        // SAFETY: the compiled script is not needed; the caller re-parses.
+        unsafe { qjs::sofuu_js_free_value(ctx, probe) };
+        return Ok(false);
+    }
+    // SAFETY: the parse error is pending; keep the value while the module
+    // parser runs, then put it back if the module parser refuses too.
+    let script_err = unsafe { qjs::JS_GetException(ctx) };
+    let module = unsafe {
+        qjs::JS_Eval(
+            ctx,
+            source,
+            len,
+            name,
+            qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_COMPILE_ONLY,
+        )
+    };
+    if unsafe { qjs::is_exception(module) } {
+        // SAFETY: both parsers refused: drop the module's error and re-raise
+        // the script's (JS_Throw moves the reference back into ctx).
+        let module_err = unsafe { qjs::JS_GetException(ctx) };
+        unsafe { qjs::sofuu_js_free_value(ctx, module_err) };
+        unsafe { qjs::JS_Throw(ctx, script_err) };
+        return Err(());
+    }
+    // SAFETY: only the parse result was needed, and script_err is spent.
+    unsafe { qjs::sofuu_js_free_value(ctx, module) };
+    unsafe { qjs::sofuu_js_free_value(ctx, script_err) };
+    Ok(true)
+}
+
+/// The shared body of the two eval entry points (engine_eval_string and
+/// eval_completion_display): evaluate, report a throw exactly once, drain the
+/// event loop, and hand the completion value back to the caller.
+///
+/// AUDIT-2026-10-31 P2-2: when the source only parses as a module it is
+/// evaluated as one (top-level await), and a module body that throws rejects
+/// its own promise instead of raising — reported here once, the way
+/// engine_eval_file does it for `sofuu run`.
+unsafe fn eval_source(
+    ctx: *mut qjs::JSContext,
+    source: *const c_char,
+    len: usize,
+    name: *const c_char,
+) -> (c_int, qjs::JSValue) {
+    let is_module = match unsafe { module_only_source(ctx, source, len, name) } {
+        Ok(is_module) => is_module,
+        // Both parsers refused: the script's error is pending.
+        Err(()) => {
+            let exc = unsafe { qjs::JS_GetException(ctx) };
+            unsafe { dispatch_or_report_uncaught(ctx, exc) };
+            unsafe { qjs::sofuu_js_free_value(ctx, exc) };
+            return (1, unsafe { qjs::sofuu_js_undefined() });
+        }
+    };
+    let eval_type = if is_module {
+        qjs::JS_EVAL_TYPE_MODULE
+    } else {
+        qjs::JS_EVAL_TYPE_GLOBAL
+    };
+    let result = unsafe { qjs::JS_Eval(ctx, source, len, name, eval_type) };
 
     if unsafe { qjs::is_exception(result) } {
         // SAFETY: exception value is live; uncaught dispatch borrows it.
@@ -1491,18 +1633,29 @@ unsafe fn engine_eval_string(
         // SAFETY: exc/result are live values.
         unsafe { qjs::sofuu_js_free_value(ctx, exc) };
         unsafe { qjs::sofuu_js_free_value(ctx, result) };
-        return 1;
+        return (1, unsafe { qjs::sofuu_js_undefined() });
     }
 
-    // SAFETY: result is a live value.
-    unsafe { qjs::sofuu_js_free_value(ctx, result) };
+    if is_module
+        && unsafe { qjs::JS_PromiseState(ctx, result) } == qjs::JSPromiseStateEnum::Rejected
+    {
+        let reason = unsafe { qjs::JS_PromiseResult(ctx, result) };
+        // SAFETY: reason lives in this ctx; the tracker holds dups of it.
+        unsafe { crate::rt::promise::sofuu_rt_suppress_rejections(ctx, reason) };
+        let handled = unsafe { process_dispatch_uncaught(ctx, reason) } != 0;
+        if !handled {
+            unsafe { report_uncaught(ctx, reason) };
+        }
+        unsafe { qjs::sofuu_js_free_value(ctx, reason) };
+        unsafe { qjs::sofuu_js_free_value(ctx, result) };
+        return (if handled { 0 } else { 1 }, unsafe { qjs::sofuu_js_undefined() });
+    }
+
     unsafe { sofuu_loop_run(ctx) };
     // An unhandled rejection surfaced during the drain (C-01): exit 1 unless
     // the script picked a code via process.exitCode (main.rs decides).
-    if run_status(ctx).has_uncaught_error {
-        return 1;
-    }
-    0
+    let rc = if run_status(ctx).has_uncaught_error { 1 } else { 0 };
+    (rc, result)
 }
 
 /// Run a compiled program the way `sofuu run` runs an entry file: read the
@@ -1599,9 +1752,11 @@ pub unsafe fn eval_compiled_and_run(
 /// uses, not a second formatter — so a string prints as `'hi'`, an object as
 /// JSON, and a number the way `%g`/`%lld` rules dictate, on both surfaces.
 ///
-/// The evaluation is `engine_eval_string`'s, step for step: same global eval,
-/// same filename, the same uncaughtException dispatch, ONE stderr report, the
-/// same event-loop drain, the same status. (The completed value is held until
+/// The evaluation is `engine_eval_string`'s, step for step (they share
+/// `eval_source`): same parse — a global script, or an ES module when the
+/// source only parses that way so top-level await works (P2-2) — same
+/// filename, the same uncaughtException dispatch, ONE stderr report, the same
+/// event-loop drain, the same status. (The completed value is held until
 /// after the drain instead of being freed before it, because it is about to
 /// be rendered; nothing else about the ordering changes, and no GC-sensitive
 /// behaviour depends on the reference being dropped early.) A program that
@@ -1635,41 +1790,25 @@ pub unsafe fn eval_completion_display(
     let src = CString::new(source).unwrap_or_default();
     let name = CString::new(filename).unwrap_or_default();
 
-    let result = unsafe {
-        qjs::JS_Eval(
-            ctx,
-            src.as_ptr(),
-            src.as_bytes().len(),
-            name.as_ptr(),
-            qjs::JS_EVAL_TYPE_GLOBAL,
-        )
+    /* P2-2: eval_source is engine_eval_string's body — same parse (with the
+     * module fallback for top-level await), same uncaughtException dispatch,
+     * same single report, same drain and status. The completed value is held
+     * until after the drain instead of being freed before it, because it is
+     * about to be rendered. */
+    let (rc, result) =
+        unsafe { eval_source(ctx, src.as_ptr(), src.as_bytes().len(), name.as_ptr()) };
+
+    // A rejection or microtask overflow that surfaced during the drain means
+    // the program did not complete cleanly, so no value is echoed and the
+    // exit-1 signal is the one `engine_eval_string` already gives.
+    let display = if rc == 0 {
+        unsafe { completion_display(ctx, result) }
+    } else {
+        None
     };
-
-    if unsafe { qjs::is_exception(result) } {
-        // SAFETY: the exception value is live; the dispatch borrows it.
-        let exc = unsafe { qjs::JS_GetException(ctx) };
-        unsafe { dispatch_or_report_uncaught(ctx, exc) };
-        // SAFETY: exc/result are live values.
-        unsafe { qjs::sofuu_js_free_value(ctx, exc) };
-        unsafe { qjs::sofuu_js_free_value(ctx, result) };
-        return (1, None);
-    }
-
-    // The loop runs whether or not anyone looks at the value: timers, I/O and
-    // promise chains are part of what `eval` executes. A rejection or
-    // microtask overflow that surfaces during the drain means the program did
-    // not complete cleanly, so no value is echoed and the exit-1 signal is
-    // the one `engine_eval_string` already gives.
-    unsafe { sofuu_loop_run(ctx) };
-    if run_status(ctx).has_uncaught_error {
-        unsafe { qjs::sofuu_js_free_value(ctx, result) };
-        return (1, None);
-    }
-
-    let display = unsafe { completion_display(ctx, result) };
     // SAFETY: result is a live value, owned here.
     unsafe { qjs::sofuu_js_free_value(ctx, result) };
-    (0, display)
+    (rc, display)
 }
 
 /// The echo half of `repl_inspect`: `None` for the two completions that must

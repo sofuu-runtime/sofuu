@@ -509,6 +509,11 @@ fn print_infer_help() {
 
 fn print_version() {
     println!("sofuu {VERSION}");
+    /* AUDIT-2026-10-31 P0-1: the published artifacts carried the same
+     * "0.3.0-beta" string as a 53-commit-newer build, so neither a user nor
+     * support could tell them apart. The revision is compiled in already
+     * (capabilities.rs reads the same env), so surface it here too. */
+    println!("revision {}", env!("SOFUU_BUILD"));
     println!("quickjs 2024-01-13");
     let os = if cfg!(target_os = "macos") {
         "macOS"
@@ -2669,13 +2674,22 @@ fn main() -> ExitCode {
     // the retired C main.c did the same).
     // SAFETY: argv is built here and lives for the call; the callee copies
     // the strings into CString storage.
+    /* AUDIT-2026-10-31 P1-10: `process.argv` leaked the `run` subcommand, so a
+     * script saw [sofuu, "run", script.js, a, b] and the standard Node idiom
+     * `argv.slice(2)` returned the script name instead of the arguments.
+     * Node's shape is [exec, script, ...args]; keep everything else verbatim
+     * (a compiled agent owns its argv, see the payload probe below). */
+    let mut js_args: Vec<String> = args.clone();
+    if js_args.len() >= 3 && js_args[1] == "run" {
+        js_args.remove(1);
+    }
     unsafe {
-        let argv: Vec<CString> = args
+        let argv: Vec<CString> = js_args
             .iter()
             .map(|a| CString::new(a.as_str()).unwrap_or_default())
             .collect();
         let mut ptrs: Vec<*mut c_char> = argv.iter().map(|c| c.as_ptr() as *mut c_char).collect();
-        sofuu_core::modules::process::mod_process_set_args(args.len() as c_int, ptrs.as_mut_ptr());
+        sofuu_core::modules::process::mod_process_set_args(js_args.len() as c_int, ptrs.as_mut_ptr());
     }
 
     /* Standalone payload: a `sofuu compile` artifact carries its program (and
@@ -2685,7 +2699,31 @@ fn main() -> ExitCode {
      * a 32-byte read on a plain binary; `SOFUU_PLAIN=1` opts back into CLI
      * mode when a compiled artifact has to be inspected or recompiled. */
     match sofuu_core::compiler::detect_embedded_payload() {
-        Ok(Some(payload)) => return run_compiled_payload(&payload),
+        Ok(Some(payload)) => {
+            /* AUDIT-2026-10-31 P1-10: a compiled agent was handed
+             * [exec, a, b] while the same script under `run` gets
+             * [exec, script, a, b], so `argv.slice(2)` meant different things
+             * depending on how it was shipped. Give the artifact the same
+             * shape, with its own path in the script slot. */
+            let mut payload_argv: Vec<String> = Vec::with_capacity(args.len() + 1);
+            payload_argv.push(args[0].clone());
+            payload_argv.push(args[0].clone());
+            payload_argv.extend_from_slice(&args[1..]);
+            // SAFETY: the CStrings outlive the call; the callee copies them.
+            unsafe {
+                let owned: Vec<CString> = payload_argv
+                    .iter()
+                    .map(|a| CString::new(a.as_str()).unwrap_or_default())
+                    .collect();
+                let mut ptrs: Vec<*mut c_char> =
+                    owned.iter().map(|c| c.as_ptr() as *mut c_char).collect();
+                sofuu_core::modules::process::mod_process_set_args(
+                    owned.len() as c_int,
+                    ptrs.as_mut_ptr(),
+                );
+            }
+            return run_compiled_payload(&payload);
+        }
         Ok(None) => {}
         /* A trailer that proves a payload exists but whose bytes do not check
          * out is fatal: falling through would run the wrong program. */

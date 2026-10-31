@@ -26,3 +26,10 @@ jpeg-decoder = { version = "0.3", default-features = false }
 # sofuu.crypto: RS256 JWT verification (public-key modular exponentiation).
 # num-bigint is pure Rust and keeps the no-OpenSSL posture.
 num-bigint = { version = "0.4", default-features = false, features = ["std"] }
+
+[build-dependencies]
+# AUDIT-2026-10-31 P1-8: build.rs gzips the shipped JS assets that are only
+# needed on one code path (compat.js, rlm.js, chat_tui.js) instead of
+# embedding ~271 KB of raw text. Same features as the runtime dependency, so
+# the dependency graph is unchanged.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

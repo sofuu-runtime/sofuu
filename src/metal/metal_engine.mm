@@ -5,6 +5,9 @@
 #include <cstring>
 #include <chrono>
 #include <cstdlib>
+// AUDIT-2026-10-31 P1-8: inflate the embedded (gzipped) MSL source — see
+// sofuu_metal_kernel_source below.
+#include <zlib.h>
 
 #include <iostream>
 #include <unistd.h>
@@ -517,7 +520,42 @@ static inline void sofuu_bind_rope(
 // into this header so the RUNTIME-compiled path and the shipped
 // default.metallib (scripts/dist/ios.sh) can never disagree about which
 // kernels exist. See the note in crates/sofuu-ffi/build.rs.
+//
+// AUDIT-2026-10-31 P1-8: the header carries the source gzipped, because the
+// raw literal was 403,186 B of every shipped binary for text only this one
+// fallback reads. sofuu_metal_kernel_source() inflates it back.
 #include "kernels_metal.h"
+
+// Inflate the embedded MSL source (SOFUU_METAL_MSL_GZ, generated). Called once
+// per sofuu_metal_init, and only when there is no complete bundled
+// default.metallib. Returns nil - with a log line, never a guess - if the
+// payload does not inflate to exactly SOFUU_METAL_MSL_LEN bytes.
+static NSString* sofuu_metal_kernel_source(void) {
+    const unsigned long want = SOFUU_METAL_MSL_LEN;
+    if (want == 0 || SOFUU_METAL_MSL_GZ_LEN < 2) return nil;
+    // +1 so the buffer is always NUL-terminated for stringWithUTF8String.
+    NSMutableData* out = [NSMutableData dataWithLength:(NSUInteger)(want + 1)];
+    if (out == nil) return nil;
+    z_stream zs;
+    memset(&zs, 0, sizeof zs);
+    zs.next_in = (Bytef*)SOFUU_METAL_MSL_GZ;
+    zs.avail_in = (uInt)SOFUU_METAL_MSL_GZ_LEN;
+    zs.next_out = (Bytef*)[out mutableBytes];
+    zs.avail_out = (uInt)want;
+    // 15 + 16: DEFLATE wrapped in the gzip header build.rs writes.
+    if (inflateInit2(&zs, 15 + 16) != Z_OK) return nil;
+    int rc = inflate(&zs, Z_FINISH);
+    const unsigned long got = (unsigned long)zs.total_out;
+    inflateEnd(&zs);
+    if (rc != Z_STREAM_END || got != want) {
+        NSLog(@"Sofuu Metal: embedded kernel source did not inflate "
+              @"(zlib rc=%d, %lu/%lu bytes) - rebuild so kernels_metal.h "
+              @"matches src/metal/kernels.metal",
+              rc, got, want);
+        return nil;
+    }
+    return [NSString stringWithUTF8String:(const char*)[out bytes]];
+}
 
 
 static int g_gemv_b1_override = -1;
@@ -682,7 +720,15 @@ void* sofuu_metal_init(void) {
 
         NSError* error = nil;
         if (lib == nil) {
-            NSString* src = [NSString stringWithUTF8String:METAL_KERNEL_SOURCE];
+            // AUDIT-2026-10-31 P1-8: the source is embedded gzipped and
+            // inflated here — the cold path that already compiles it.
+            NSString* src = sofuu_metal_kernel_source();
+            if (src == nil) {
+                NSLog(@"Sofuu Metal: no usable shader library — bundled "
+                      @"default.metallib missing or incomplete, and the "
+                      @"embedded kernel source is unreadable. Running on CPU.");
+                return NULL;
+            }
             lib = [dev newLibraryWithSource:src options:nil error:&error];
             if (lib == nil) {
                 NSLog(@"Sofuu Metal: no usable shader library — bundled "

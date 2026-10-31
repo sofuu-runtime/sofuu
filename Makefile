@@ -6,7 +6,7 @@
 # `make`           → Rust-first build (cargo; build.rs compiles the C
 #                    engine layer: QuickJS + SIMD + http-parser)
 # `make test`      → JS parity suite
-# `make size-check`→ fail if binary exceeds SIZE_LIMIT (default 5MB)
+# `make size-check`→ fail if binary exceeds SIZE_LIMIT (default 5.5 MiB = 5,767,168 B)
 # `make c-only`    → REMOVED in M10 (the pure-C binary died; see
 #                    PLAN-RUST-MIGRATION.md) — prints an error
 # `make linux`     → cross-compile via scripts/cross (cargo + zig)
@@ -36,7 +36,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: all clean install test protocol-test serve-test c-only size-check bc-check cargo-build sandbox-stress \
+.PHONY: all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
 	observability-stress asan fuzz-simd policy-dx modern-npm sbom sign-dist \
         deps scoreboard scoreboard-check \
         libsofuu libsofuu-linux-x86_64 zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
@@ -79,7 +79,7 @@ cargo-build:
 
 $(TARGET): cargo-build
 	@echo "  \033[36mCARGO\033[0m  $@  [arch=$(ARCH)]"
-	@cp target/release/$(TARGET) $(TARGET)
+	@rm -f $(TARGET) && cp target/release/$(TARGET) $(TARGET)
 	@if [ "$$(uname -s)" = "Darwin" ]; then strip $(TARGET) 2>/dev/null || true; codesign --force --sign - $(TARGET) 2>/dev/null || true; fi
 	@echo "  \033[32mBuilt:\033[0m ./$(TARGET) ($(shell du -sh $(TARGET) | cut -f1))"
 
@@ -217,8 +217,17 @@ size-check: $(TARGET)
 		echo "  \033[31m✗ Size $$SIZE bytes exceeds cap $(SIZE_LIMIT) bytes\033[0m"; \
 		exit 1; \
 	else \
-		echo "  \033[32m✓ Size $$SIZE bytes ≤ $(SIZE_LIMIT) bytes\033[0m"; \
+		echo "  \033[32m✓ Size $SIZE bytes ≤ $(SIZE_LIMIT) bytes\033[0m"; \
 	fi
+
+# ── Documentation freshness (no build required) ─────────────────
+# Prose is not compiled, so a retired measurement only fails when a human reads it.
+# Two of them reached the public site that way before anyone noticed. This target
+# greps the live docs for numbers that have since gone false; the pattern list and
+# the waiver convention live in scripts/check-doc-metrics.sh.
+# Sources of truth: RULES.md §3.1 (size cap), BENCHMARKS.md (speed).
+docs-lint:
+	@./scripts/check-doc-metrics.sh
 
 # ── Sofuu Desktop (PLAN-DESKTOP) ─────────────────────────────────
 # Tauri v2 macOS app: Rust backend links sofuu-core in-process, the

@@ -19,7 +19,17 @@ use std::ffi::{CStr, CString};
 
 use sofuu_ffi::qjs;
 
-const ADAPTERS_JS: &str = include_str!("../../../../src/js/memory_adapters.js");
+/* AUDIT-2026-10-31 (size lever, workstream D): 34,361 B raw -> 9,525 B
+ * gzipped, inflated once when the first non-native backend asks for it. The
+ * loader was already lazy in TIME; this makes it lazy in BINARY SIZE too. */
+const ADAPTERS_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/memory_adapters.js.gz"));
+
+fn adapters_source() -> &'static str {
+    static SRC: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        crate::shipped::inflate_gz(ADAPTERS_GZ, "src/js/memory_adapters.js").unwrap_or_default()
+    });
+    SRC.as_str()
+}
 
 /// `sofuu.memory.__loadAdapters() → boolean`.
 ///
@@ -33,7 +43,13 @@ unsafe extern "C" fn js_load_adapters(
     _argc: std::ffi::c_int,
     _argv: *const qjs::JSValueConst,
 ) -> qjs::JSValue {
-    let src = ADAPTERS_JS;
+    let src = adapters_source();
+    if src.is_empty() {
+        /* Loud: an un-inflatable adapter file must become the caller's typed
+         * E_ADAPTER refusal, never a silently empty install. */
+        eprintln!("[sofuu] memory_adapters: embedded memory_adapters.js failed to inflate");
+        return unsafe { qjs::sofuu_js_new_bool(ctx, 0) };
+    }
     let Ok(c_src) = CString::new(src) else {
         return unsafe { qjs::sofuu_js_new_bool(ctx, 0) };
     };

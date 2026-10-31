@@ -1447,6 +1447,69 @@ function (e) {{ posErr = (e && e.message) ? e.message : String(e); }});",
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// AUDIT-2026-10-31 P2-11: this "finding" does not reproduce — a
+    /// character device reads as an empty result, not as `{}`.
+    ///
+    /// The audit's probe was `JSON.stringify(sofuu.fs.readFile('/dev/null'))`
+    /// without an await, and JSON.stringify of a *pending promise* is "{}" for
+    /// every path in every runtime. Awaiting it gives '' (the readFile
+    /// contract), and the synchronous form gives a zero-length Uint8Array
+    /// (the Node Buffer substitute this API documents). Pinned here so a
+    /// future rewrite cannot change either without a test saying so.
+    #[cfg(unix)]
+    #[test]
+    fn read_dev_null_is_empty_not_an_object() {
+        let _loop_guard = crate::rt::test_loop_lock();
+        // SAFETY: standalone runtime + context (M0 pattern).
+        let rt = unsafe { qjs::JS_NewRuntime() };
+        let ctx = unsafe { qjs::JS_NewContext(rt) };
+        let _ctp = unsafe { CtxPtr::new(ctx) };
+        unsafe { crate::rt::event_loop::sofuu_loop_init() };
+        // SAFETY: registers sofuu.fs on this fresh context.
+        unsafe { mod_fs_register(ctx) };
+
+        let script = CString::new(
+            "var asyncVal = 'pending'; \
+             sofuu.fs.readFile('/dev/null').then( \
+                 function (v) { asyncVal = typeof v + ':' + v.length + ':' + (v === ''); }, \
+                 function (e) { asyncVal = 'REJECT:' + e; }); \
+             var syncVal = sofuu.fs.readFileSync('/dev/null'); \
+             var syncStr = typeof syncVal + ':' + syncVal.length;",
+        )
+        .unwrap();
+        let r = unsafe {
+            qjs::JS_Eval(
+                ctx,
+                script.as_ptr(),
+                script.to_bytes().len(),
+                c"<fs-p211>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            )
+        };
+        assert!(!unsafe { qjs::is_exception(r) }, "the probe must not throw");
+        unsafe { qjs::sofuu_js_free_value(ctx, r) };
+        // SAFETY: ctx live on this thread; drain the readFile promise.
+        unsafe {
+            crate::rt::event_loop::sofuu_loop_run_bounded(
+                ctx,
+                Some(std::time::Duration::from_secs(30)),
+            )
+        };
+
+        let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
+        let async_val = read_str_global(ctx, global, c"asyncVal");
+        let sync_str = read_str_global(ctx, global, c"syncStr");
+        unsafe { qjs::sofuu_js_free_value(ctx, global) };
+
+        assert_eq!(async_val, "string:0:true", "readFile('/dev/null') must resolve to ''");
+        assert_eq!(sync_str, "object:0", "readFileSync('/dev/null') must be a 0-byte view");
+
+        // SAFETY: teardown AFTER the loop is closed (M0 discipline).
+        unsafe { crate::rt::event_loop::sofuu_loop_close() };
+        unsafe { qjs::JS_FreeContext(ctx) };
+        unsafe { qjs::JS_FreeRuntime(rt) };
+    }
+
     /// P3 (AUDIT-2026-09-07) pf-2 companion: readFileBytes reserves its
     /// buffer WITHOUT zeroing (capacity only, `set_len(n)` after the read —
     /// the clippy::uninit_vec-clean discipline). This pins the observable

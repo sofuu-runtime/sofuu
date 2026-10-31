@@ -1480,7 +1480,16 @@ impl InferEngine {
             );
         }
         if input_tokens.is_empty() {
-            return Err("prompt produced zero tokens".to_string());
+            /* AUDIT-2026-10-31 P2-13: an empty prompt now tokenizes to [BOS]
+             * whenever the model has one, so reaching this arm means the model
+             * itself offers no sentence start (add_bos_token=false and no
+             * bos_token_id). Say so, instead of blaming the prompt. */
+            return Err(if prompt.is_empty() {
+                "empty prompt and this model has no BOS token to start from — pass a non-empty prompt"
+                    .to_string()
+            } else {
+                "prompt produced zero tokens".to_string()
+            });
         }
 
         // 2. Multi-turn prefix cache reuse

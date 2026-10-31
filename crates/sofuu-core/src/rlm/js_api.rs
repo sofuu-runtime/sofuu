@@ -40,8 +40,23 @@ use super::episode::{Episode, EpisodeAction};
 use super::router::{self, Route};
 use super::{RlmOpts, RlmRequest, ToolSpec};
 
-/// The shipped async driver — single source of truth is src/js/rlm.js.
-const DRIVER_JS: &str = include_str!("../../../../src/js/rlm.js");
+/// The shipped async driver — single source of truth is src/js/rlm.js,
+/// embedded gzipped (AUDIT-2026-10-31 P1-8) and inflated on first engine
+/// start. It stays the source fallback for a stale/corrupt rlm.bc.gz.
+const DRIVER_JS_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rlm.js.gz"));
+
+fn driver_js() -> &'static str {
+    static SRC: OnceLock<String> = OnceLock::new();
+    SRC.get_or_init(|| {
+        crate::shipped::inflate_gz(DRIVER_JS_GZ, "src/js/rlm.js").unwrap_or_else(|| {
+            // Loud: a torn payload must surface as a driver eval error, not
+            // as an empty source that reads like "this build has no driver".
+            String::from(
+                "throw new Error(\"sofuu.rlm unavailable: embedded rlm.js failed to inflate\");\n",
+            )
+        })
+    })
+}
 
 /* ── Episode registry ────────────────────────────────────────────
  * Episode owns a nested QuickJS sandbox (raw pointers, !Send), so — like
@@ -502,7 +517,7 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
 
         crate::shipped::eval_shipped_with_bytecode(
             ctx as *mut c_void,
-            DRIVER_JS,
+            driver_js(),
             Some(crate::shipped::RLM_BC),
             "<rlm-driver>",
         );

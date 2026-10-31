@@ -194,9 +194,48 @@ export default defineTool({
 
 ---
 
+---
+
 ## 6. Summary
 
 - **No Rewrite Required**: AI SDKs (`openai`, `@anthropic-ai/sdk`, `@modelcontextprotocol/sdk`) run out-of-the-box.
 - **Node Built-in Shims**: `path`, `events`, `crypto`, `buffer`, `fs`, `os`, `util`, `stream`, `assert`, `url`, and `async_hooks` are fully supported for agent workloads.
-- **TypeScript Native**: Run `.ts` scripts directly with sub-4ms cold start.
-- **Embedded & Sovereign**: Bundle scripts into a 5.2 MB standalone binary via `sofuu compile`.
+- **TypeScript Native**: Run `.ts` scripts directly — no `tsc` step, no run-time type checking. Cold start is tracked in `BENCHMARKS.md`.
+- **Embedded & Sovereign**: Bundle scripts into a single standalone executable via `sofuu compile` (the runtime base is 5.39 MiB on macOS arm64).
+
+## 7. Surface added 2026-10-31
+
+Added or changed by the audit remediation. Anything not listed is unchanged; anything
+listed as absent is deliberately absent, not missing.
+
+**Web globals** — `structuredClone` (cycles, Date/RegExp/Map/Set/ArrayBuffer views,
+`DataCloneError` on functions), `Blob`, `File`, `FormData`, `Event`, `EventTarget`,
+`CustomEvent`, `MessageChannel`, `MessagePort`, `navigator`, and a `localStorage` that
+persists to `.sofuu/localStorage.json` (`SOFUU_LOCALSTORAGE_PATH` overrides).
+
+**Deliberately absent, and why** — `WeakRef` and `FinalizationRegistry` (QuickJS has no
+weak references; a strong stand-in would be the leak the caller was avoiding),
+`WebAssembly`, `Intl`, `WebSocket`, `EventSource`.
+
+**HTTP server** — `listen()` refs its handle, so a server keeps the process alive the way
+Node's does; `server.unref()` and `SOFUU_SERVERS_UNREF=1` opt out, and embedded hosts keep
+the old behaviour. A handler that throws — synchronously or inside an `async` function —
+answers `500` exactly once instead of leaving the client to time out.
+`req.on('data' | 'end' | 'close')` exists; an unknown event name, or registering
+`data`/`end` after they fired, throws a `TypeError` rather than never firing.
+
+**`process.argv`** — `[exec, script, ...args]` under `sofuu run` and in compiled artifacts
+alike, so `argv.slice(2)` is the argument list in both.
+
+**Also now present** — `process.memoryUsage()`, `process.stdin.pipe(dest)`, and top-level
+`await` under `sofuu eval`.
+
+**Regular expressions** — a permanent QuickJS interrupt handler bounds each call:
+`SOFUU_REGEX_BUDGET_MS` (default `1000`, `0` disables) turns catastrophic backtracking into
+a caught error instead of a hung loop.
+
+**TypeScript erasure** — object literals, constructor parameter properties, `enum`,
+generics and generic arrows, `implements`, `abstract` classes and members,
+`as`/`satisfies`, `declare`, and `export type`/`export interface` are handled.
+`namespace` and decorators are refused with a `SyntaxError`: they need a transform the
+eraser does not do, and refusing loudly beats mistranslating.

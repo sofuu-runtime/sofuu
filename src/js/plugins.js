@@ -3124,6 +3124,11 @@
      * it registered itself (export default defineTool(...) evaluates the
      * factory first). Re-registering would double-count it, so report it. */
     if (lastExp.category) return lastExp;
+    /* P2-6 (AUDIT-2026-10-31): the OpenAI / JSON-schema shape — a default
+     * object whose callable is `handler` rather than run/execute — used to
+     * fall through every branch and be reported "loaded but registered
+     * nothing". Aliased here so defineTool sees one canonical name. */
+    if (typeof lastExp.run !== 'function' && typeof lastExp.handler === 'function') lastExp.run = lastExp.handler;
     if (typeof lastExp.run === 'function' || typeof lastExp.execute === 'function') return P.defineTool(lastExp);
     if (typeof lastExp.complete === 'function' || typeof lastExp.stream === 'function') return P.defineProvider(lastExp);
     if (typeof lastExp.onStart === 'function' || typeof lastExp.onTurnStart === 'function' || typeof lastExp.onStop === 'function') return P.defineService(lastExp);
@@ -3208,7 +3213,7 @@
         var added = registryDiff(before);
         if (!added.length && adopted) added.push(String(adopted.category || 'plugin') + ':' + String(adopted.name || fname));
         tagOrigin(added, fpath);
-        if (!added.length) out.broken.push({ file: fname, error: 'loaded but registered nothing (no defineTool/defineProvider/defineService/defineStorage export)' });
+        if (!added.length) out.broken.push({ file: fname, error: 'registered nothing: export a defineTool/defineProvider/defineService/defineStorage result, or a default object with run|execute (tool), complete|stream (provider), onStart|onTurnStart|onStop (service), upsert|query (store) or get|set (storage)' });
         else out.loaded.push({ file: fname, items: added });
       } catch (eErr) {
         out.broken.push({ file: fname, error: String((eErr && eErr.message) || eErr) });
@@ -3402,7 +3407,7 @@
       tagOrigin(found, file);
       warnOnMissingSchemas(found);
       if (!found.length) {
-        console.error('Validation failed: ' + file + ' did not register or export any tool, provider, store, or service');
+        console.error('Validation failed: ' + file + ' registered nothing: export a defineTool/defineProvider/defineService/defineStorage result, or a default object with run|execute (tool), complete|stream (provider), onStart|onTurnStart|onStop (service), upsert|query (store) or get|set (storage)');
         return cliExit(1);
       }
       console.log('Plugin ' + file + ' is valid (' + found.join(', ') + ')');

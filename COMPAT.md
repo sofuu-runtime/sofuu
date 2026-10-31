@@ -2,7 +2,7 @@
 
 *Last audited: October 2026 (v0.3.0-beta)*
 
-Sofuu is a full-suite, single-binary runtime for AI and AI applications — built edge-first and equally for workstations and servers. Designed for deterministic agent execution, fast measured cold start (22.5 ms median wall clock; see BENCHMARKS.md), and self-contained deployment, Sofuu provides a **strict, high-performance compatibility layer** covering modern Web standards, essential Node.js built-ins, and the top npm packages used by modern AI agents and LLM tool chains.
+Sofuu is a general-purpose runtime for AI — built to run anywhere from servers to smart devices. Designed for deterministic agent execution, fast measured cold start (22.5 ms median wall clock; see BENCHMARKS.md), and self-contained deployment, Sofuu provides a **strict, high-performance compatibility layer** covering modern Web standards, essential Node.js built-ins, and the top npm packages used by modern AI agents and LLM tool chains.
 
 ---
 

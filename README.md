@@ -2,7 +2,7 @@
 
 # ⚡ Sofuu (素風)
 
-> *Sofuu is a full-suite, single-binary runtime for AI and AI applications — built edge-first (phones, Raspberry Pi–class boards, wearables, robotics, smart devices) and equally at home on workstations and cloud servers. A sovereign systems engine (Rust/C core, QuickJS/libuv) combining in-process CPU/GPU inference (experimental), multi-format models (GGUF + SafeTensors), autonomous agent loops, encrypted cognitive vector memory (QTSQ, Apache-2.0), and native MCP in a single <= 5.5 MiB binary (5.30 MiB on macOS arm64 with bundled QTSQ cognitive memory; the Linux builds are 5.88 MiB arm64 and 6.80 MiB x86_64 and currently exceed the cap). Zero daemons, zero external dependencies.*
+> *Sofuu is a general-purpose runtime for AI — built to run anywhere from servers to smart devices. A compact, sovereign systems engine (Rust/C core, QuickJS/libuv) combining in-process CPU/GPU inference (experimental), multi-format models (GGUF + SafeTensors), autonomous agent loops, encrypted cognitive vector memory (QTSQ), and native MCP in a single <= 5.5 MiB binary (5.39 MiB on macOS arm64 with bundled QTSQ cognitive memory; the Linux builds are 5.88 MiB arm64 and 6.80 MiB x86_64 and currently exceed the cap). Zero daemons, zero external dependencies.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0--beta-orange.svg)](https://github.com/sofuu-runtime/sofuu/releases)
@@ -19,9 +19,9 @@
 
 ## What is Sofuu?
 
-Sofuu is **a full-suite, single-binary runtime for AI and AI applications — built edge-first (phones, Raspberry Pi–class boards, wearables, robotics, smart devices), and equally at home on workstations and cloud servers**.
+Sofuu is **a general-purpose runtime for AI — built to run anywhere from servers to smart devices**.
 
-Sofuu is **not just an AI runtime for JavaScript/TypeScript, and not just a terminal coding agent or a desktop model runner**; the terminal assistant (`sofuu chat`) is merely one first-party demonstration application running on the engine. TypeScript/JavaScript is the orchestration surface; underneath it is the foundational systems substrate engineered to collapse the fragmented AI stack (Python/Node + LangChain + Chroma + Ollama + FastAPI) into a single in-process, self-contained runtime.
+Sofuu is **not just a terminal coding agent or a desktop model runner**; the terminal assistant (`sofuu chat`) is merely one first-party demonstration application running on the engine. Sofuu is the foundational systems substrate engineered to collapse the fragmented AI stack (Python/Node + LangChain + Chroma + Ollama + FastAPI) into a single in-process, self-contained runtime.
 
 While TypeScript and JavaScript serve as the ergonomic high-level orchestration surface, the engine itself is an ultra-lean systems core (Rust + C) with a clean C ABI. Everything AI applications require is built directly into the single native binary — no npm packages, no Python environments, and no background daemons required:
 - **In-process local LLM inference** (**experimental** — built-in engine is early stage; for production use llama.cpp or another backend via the plugin system) (GGUF, SafeTensors, PyTorch, NumPy on Metal / NEON / AVX2) and cloud streaming
@@ -32,11 +32,11 @@ While TypeScript and JavaScript serve as the ergonomic high-level orchestration 
 - **Async HTTP server & SIMD vector mathematics**
 
 ### Where Sofuu Runs
-Sofuu is built from first principles with a hard **$\le 5.5\text{ MiB}$ binary cap**, a **22.5 ms median cold start** (`sofuu eval "1+1"`, wall clock including process spawn — see [BENCHMARKS.md](BENCHMARKS.md)), and **zero-JIT execution** (making it 100% compliant with strict platform policies like the iOS App Store and RTOS environments). **Edge devices are the primary target**; the same binary runs unchanged everywhere else:
-- **Edge Devices (first):** Phones and single-board computers (Raspberry Pi 5), wearables, AR glasses, drones, robotics, and edge IoT gateways — where tight RAM budgets ($<30\text{ MB}$), offline on-device tensor evaluation, local encrypted memory, and deterministic hardware-safety boundaries enable ambient intelligence without relying on constant cloud roundtrips or bloated OS runtimes.
-- **Mobile Devices (iOS & Android):** Shipped as an embeddable C ABI library (`libsofuu`) with Swift and Kotlin bindings.
+Sofuu is built from first principles with a hard **$\le 5.5\text{ MiB}$ binary cap**, a **22.5 ms median cold start** (`sofuu eval "1+1"`, wall clock including process spawn — see [BENCHMARKS.md](BENCHMARKS.md)), and **zero-JIT execution** (making it 100% compliant with strict platform policies like the iOS App Store and RTOS environments). This enables it to run identically across diverse hardware form factors:
 - **Cloud & Edge Servers:** Headless microservices, streaming LLM proxies, and containerized autonomous agents with microsecond warm-up.
 - **Developer Workstations:** High-throughput local agent workspaces, standalone compiled CLI tools (`sofuu compile`), and zero-config desktop tools.
+- **Mobile Devices (iOS & Android):** Shipped as an embeddable C ABI library (`libsofuu`) with Swift and Kotlin bindings.
+- **Smart Devices, Wearables & Physical Computing:** Drones, robotics, smart watches, AR glasses, and edge IoT gateways — where tight RAM budgets ($<30\text{ MB}$), offline on-device tensor evaluation, local encrypted memory, and deterministic hardware-safety boundaries allow building ambient intelligence without relying on constant cloud roundtrips or bloated OS runtimes.
 
 ---
 

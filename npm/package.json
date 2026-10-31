@@ -1,7 +1,7 @@
 {
   "name": "sofuu",
   "version": "0.3.0-beta",
-  "description": "Sofuu \u2014 a full-suite, single-binary runtime for AI and AI applications, built edge-first (phones, single-board computers, robotics) and equally for workstations and servers.",
+  "description": "Sofuu \u2014 a general-purpose runtime for AI, built to run anywhere from servers to smart devices.",
   "keywords": [
     "ai",
     "agent",

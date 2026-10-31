@@ -15,7 +15,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.sofuu:sofuu-android:0.2.0'
+    implementation 'com.sofuu:sofuu-android:0.3.0'
 }
 ```
 

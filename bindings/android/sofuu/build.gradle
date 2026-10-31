@@ -16,7 +16,7 @@ apply plugin: 'kotlin-android'
 apply plugin: 'maven-publish'
 apply plugin: 'signing'
 
-def sofuuVersion = (project.findProperty('sofuuVersion') ?: '0.2.0').toString()
+def sofuuVersion = (project.findProperty('sofuuVersion') ?: '0.3.0').toString()
 group = 'com.sofuu'
 version = sofuuVersion
 

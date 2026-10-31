@@ -370,16 +370,21 @@ jobs:
           rm -f "$RUNNER_TEMP/sofuu.key"
           echo "signed=true" >> "$GITHUB_OUTPUT"
 
+      # gh release upload --clobber — the softprops action PATCHes the
+      # release object, which 403s for the workflow token here (the release
+      # was created outside the workflow; asset upload itself is fine).
       - name: Upload manifest and SBOM
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          files: |
-            dist/CHECKSUMS.txt
-            dist/SHA256SUMS
-            dist/sofuu-sbom.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            dist/CHECKSUMS.txt \
+            dist/SHA256SUMS \
+            dist/sofuu-sbom.json \
+            --clobber
 
       - name: Upload signature
         if: steps.sign.outputs.signed == 'true'
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          files: dist/SHA256SUMS.minisig
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/SHA256SUMS.minisig --clobber

@@ -16,6 +16,16 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # QTSQ is a mandatory core component and is open source (Apache-2.0):
+      # clone the public checkout, build libqtsq.a, and point the build at it.
+      # (Both v0.3.0-beta release runs failed here — the workflow predated the
+      # mandatory-QTSQ build, which is why the published binaries went stale.)
+      - name: Check out and build QTSQ (open source, Apache-2.0)
+        run: |
+          git clone --depth 1 https://github.com/haruhito2666/qtsq "$HOME/qtsq"
+          make -C "$HOME/qtsq" CPPFLAGS="-D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE"
+          echo "SOFUU_QTSQ_DIR=$HOME/qtsq" >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: brew install curl cmake ninja
 
@@ -146,6 +156,14 @@ jobs:
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      # The sdkmanager in the command-line tools needs Java 17+; the runner's
+      # default is older and dies with UnsupportedClassVersionError (61 vs 55).
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -166,6 +184,15 @@ jobs:
           cd deps/libuv
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
           cmake --build build
+
+      # android.sh refuses a codec-less build: it links the per-ABI QTSQ
+      # archives that build_qtsq_android.sh compiles from the open-source
+      # checkout (SOFUU_QTSQ_SRC).
+      - name: Check out and build QTSQ for both ABIs (open source, Apache-2.0)
+        run: |
+          git clone --depth 1 https://github.com/haruhito2666/qtsq "$HOME/qtsq"
+          echo "SOFUU_QTSQ_SRC=$HOME/qtsq" >> "$GITHUB_ENV"
+          bash scripts/mobile/build_qtsq_android.sh arm64 x86_64
 
       - name: Build the Android .so's
         run: ./scripts/dist/android.sh all

@@ -8,8 +8,11 @@
 
 MOBILE_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK:-$HOME/Library/Android/sdk/ndk/27.0.12077973}}"
 if [ ! -d "$MOBILE_NDK_HOME" ]; then
-    # Fall back to the newest installed NDK.
-    MOBILE_NDK_HOME="$(ls -d "$HOME"/Library/Android/sdk/ndk/*/ 2>/dev/null | sort -V | tail -1)"
+    # Fall back to the newest installed NDK. Callers run with `set -o
+    # pipefail`; a failing `ls` inside the substitution must not kill this
+    # (sourced) script before the "✗ NDK not found" message below — `ls`
+    # exits 2 when the glob matches nothing.
+    MOBILE_NDK_HOME="$(ls -d "$HOME"/Library/Android/sdk/ndk/*/ 2>/dev/null | sort -V | tail -1 || true)"
     MOBILE_NDK_HOME="${MOBILE_NDK_HOME%/}"
 fi
 [ -d "$MOBILE_NDK_HOME" ] || { echo "✗ NDK not found (set ANDROID_NDK_HOME)"; exit 1; }

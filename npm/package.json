@@ -1,6 +1,6 @@
 {
   "name": "sofuu",
-  "version": "0.3.0-beta",
+  "version": "0.3.0-beta.2",
   "description": "Sofuu \u2014 a general-purpose runtime for AI, built to run anywhere from servers to smart devices.",
   "keywords": [
     "ai",

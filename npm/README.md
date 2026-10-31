@@ -1,20 +1,22 @@
 # sofuu (npm)
 
-The private, offline AI runtime — offline embeddings, an encrypted local
-brain, agents, and MCP in a single <= 5.5 MB standalone binary with bundled
-QTSQ cognitive memory. Zero daemons, zero external deps, no API key to ship,
-no telemetry.
+Sofuu is a **general-purpose runtime for AI** — built to run anywhere from
+servers to smart devices. One standalone ≤ 5.5 MiB binary with a Rust/C core
+(QuickJS + libuv, zero JIT): in-process local LLM inference (experimental),
+autonomous agent loops, a native MCP client & server, encrypted QTSQ
+cognitive vector memory, and sandboxed tools — orchestrated in TypeScript
+and JavaScript. Zero daemons, zero Python, no API key to ship, no telemetry.
 
 ```bash
 npx sofuu                 # interactive chat with memory that persists
-npx sofuu run app.ts      # run TypeScript
+npx sofuu run app.ts      # run TypeScript — no build step
 npx sofuu add zod         # install a package
 ```
 
 ## Install
 
 ```bash
-npm install -D sofuu      # or: npm install -g sofuu
+npm install -g sofuu      # or: npx sofuu — no global install needed
 ```
 
 The postinstall step downloads the prebuilt binary for your platform, verifies
@@ -22,20 +24,23 @@ its SHA-256 against the published checksum, and places it under
 `bin/runtime/`. If the verification fails, **nothing is installed** — this
 package will not put an unverified binary on your machine.
 
-Supported today: macOS and Linux, x86_64 and arm64. (Windows is on the
-roadmap; the other installers already cover it.)
+Current release: **v0.3.0-beta.2**. The binary is revision-stamped — run
+`sofuu version` and it prints the exact commit it was built from.
+
+Supported today: macOS (arm64) and Linux, x86_64 and arm64. (Windows is on
+the roadmap; the other installers already cover it.)
 
 ## Why the CLI, when there's a package?
 
 This is the `sofuu` *CLI* — the free developer surface. The embeddable
-runtime that you put inside your own app is a different artifact, distributed
-through Swift Package Manager, CocoaPods, and Gradle:
+runtime that you put inside your own app is a different artifact,
+distributed through Swift Package Manager, CocoaPods, and Gradle:
 
 | What you want | How |
 |---|---|
-| The `sofuu` CLI in your project | `npm i -D sofuu` (this package) |
+| The `sofuu` CLI in your project | `npm i -g sofuu` (this package) |
 | Embed the runtime in an iOS/macOS app | `Package.swift` or `pod 'Sofuu'` |
-| Embed the runtime in an Android app | `implementation 'com.sofuu:sofuu-android'` |
+| Embed the runtime in an Android app | `implementation 'com.sofuu:sofuu-android:0.3.0'` |
 | Link the C ABI directly | release tarballs → `docs/EMBEDDING-DIST.md` |
 
 See https://sofuu.xyz/docs for the full picture.
@@ -48,7 +53,7 @@ Haruhito. The source of truth for the runtime is the
 
 ## What it gives you, offline and with no key
 
-- **Embeddings with no model file** — 0 parameters, 0 bytes, ~2 µs a
+- **Embeddings with no model file** — 0 parameters, 0 bytes, microseconds a
   document, 768 dims. `ai.embed(text)`.
 - **An encrypted local brain** — memory that belongs to your user, on their
   device, exportable, with no provider in the loop.
@@ -72,6 +77,8 @@ SOFUU_BINARY_PATH="$PWD/target/release/sofuu" npm install
 
 ## License
 
-MIT. (A build with the QTSQ encrypted-store codec linked additionally falls
-under `LICENSES/QTSQ-FORMAT.txt`; the release binaries here are the
-QTSQ-free, pure-MIT flavor. See `docs/EMBEDDING-DIST.md`.)
+The Sofuu runtime is MIT-licensed. The release binaries bundle the QTSQ
+cognitive memory engine, which is **open source under the Apache License
+2.0** ([github.com/haruhito2666/qtsq](https://github.com/haruhito2666/qtsq))
+— full license text and third-party notices travel inside the package as
+`LICENSE` and `NOTICE`.

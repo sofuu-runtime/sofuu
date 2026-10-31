@@ -237,6 +237,19 @@ jobs:
           set -euxo pipefail
           bash -x scripts/mobile/build_qtsq_android.sh arm64 x86_64
 
+      # android.sh links the engine .so's against the per-ABI static TLS
+      # stack: OpenSSL (no system OpenSSL on Android) then curl on top of it.
+      # Same pinned, hash-verified tarballs the dev box uses.
+      - name: Build OpenSSL for both ABIs
+        run: |
+          set -euxo pipefail
+          bash scripts/mobile/build_openssl_android.sh arm64 x86_64
+
+      - name: Build libcurl for both ABIs
+        run: |
+          set -euxo pipefail
+          bash scripts/mobile/build_libcurl_android.sh arm64 x86_64
+
       - name: Build the Android .so's
         run: ./scripts/dist/android.sh all
 

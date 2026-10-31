@@ -48,8 +48,8 @@ task_plan.md
 
 # ── Research archive (not part of this repo) ─────
 black-hole-disk/
-# The stale in-tree QTSQ snapshot is proprietary and was never committed —
-# keep it that way (the live checkout lives outside the repo).
+# The in-tree QTSQ snapshot was never committed — the live checkout is the
+# separate open-source repository (Apache-2.0): github.com/haruhito2666/qtsq.
 black-hole-disk-for-sofuu-runtime/
 
 # ── Dependencies ──────────────────────────────────
@@ -178,3 +178,5 @@ npm/NOTICE
 /PLUGIN_SYSTEM_REPORT.pdf
 /RULES.md
 /FIXES.md
+/LANDING_AUDIT_2026-10-30.md
+/THREAT_MODEL.md

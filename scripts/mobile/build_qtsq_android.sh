@@ -25,6 +25,29 @@ source "$REPO_ROOT/scripts/mobile/ndk_env.sh" "$@"
 QTSQ_DIR="${SOFUU_QTSQ_SRC:-$HOME/projects/black-hole-disk}"
 ZLIB_SRC="$REPO_ROOT/dist/zlib-src"
 
+# Vendor zlib exactly like scripts/cross/build_qtsq_cross.sh (keep in
+# lockstep): pinned 1.3.1 tarball, SHA-256 verified before extract. A fresh
+# CI runner has no dist/zlib-src, and the per-ABI libz.a is a link
+# requirement of the codec archive.
+ZLIB_SHA256="9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+if [ ! -f "$ZLIB_SRC/zlib.h" ]; then
+    mkdir -p "$ZLIB_SRC"
+    if [ ! -f /tmp/zlib-1.3.1.tar.gz ]; then
+        curl -fsSL --max-time 60 -o /tmp/zlib-1.3.1.tar.gz \
+            https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz
+    fi
+    GOT_SHA="$(shasum -a 256 /tmp/zlib-1.3.1.tar.gz | cut -d' ' -f1)"
+    if [ "$GOT_SHA" != "$ZLIB_SHA256" ]; then
+        echo "✗ zlib tarball checksum mismatch:"
+        echo "    expected $ZLIB_SHA256"
+        echo "    got      $GOT_SHA"
+        echo "  Refusing to build from an unverified download."
+        exit 1
+    fi
+    tar xzf /tmp/zlib-1.3.1.tar.gz -C /tmp
+    cp -R /tmp/zlib-1.3.1/. "$ZLIB_SRC/"
+fi
+
 # Same lists as scripts/cross/build_qtsq_cross.sh (keep in lockstep).
 QTSQ_CORE="qtsq_utils qtsq_format qtsq_types qtsq_codec qtsq_pixel \
 qtsq_chandrasekhar qtsq_singularity qtsq_horizon qtsq_lensing qtsq_accretion \

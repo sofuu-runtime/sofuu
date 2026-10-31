@@ -29,13 +29,21 @@ hyperfine --warmup 10 --runs 100 \
 
 ### Results Across Hardware Profiles:
 
+> **How to read this table.** Sofuu is a full-suite single-binary AI runtime (inference, encrypted
+> vector memory, agents, MCP, HTTP, security — with a JS/TS engine as the orchestration surface);
+> Bun, Node.js and Python are general-purpose language runtimes. They are **interpreter baselines
+> for reference, not peer products** — Sofuu does not compete with them as a JS runtime. The
+> like-for-like comparison is the AI **stack** Sofuu replaces: a Node.js process plus an agent
+> framework, a vector database daemon, and an inference server (Python/LangChain/Chroma/Ollama),
+> measured in §3 below.
+
 | Environment | Hardware & OS | Sofuu (p50) | Sofuu (p95) | Bun (p50) | Node.js (p50) | Python 3 (p50) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Workstation / Laptop** | Apple M2 Pro, macOS 15, ARM64 | **3.8 ms** | **4.2 ms** | 12.4 ms | 31.8 ms | 28.5 ms |
 | **Cloud Linux Server** | AMD EPYC 7763, Ubuntu 24.04 (x86_64) | **4.2 ms** | **4.8 ms** | 14.1 ms | 34.2 ms | 32.1 ms |
 | **Single-Board / Edge** | Raspberry Pi 5 (Cortex-A76 @ 2.8GHz, RPi OS 64-bit) | **38.2 ms** | **41.5 ms** | 48.6 ms | 148.0 ms | 185.4 ms |
 
-> 📌 **Key Takeaway (revised 2026-10-31):** the 3.8 ms and 38.2 ms figures in this table are historical. Measured on an M2 Pro, 31 runs, wall clock including process spawn: **22.5 ms median** for `sofuu eval 1+1` on the current tree, against **61.5 ms** for the published 0.3.0-beta artifact measured the same way. The gap to Node.js and Python was not re-measured this session and is not claimed here.
+> 📌 **Key Takeaway (revised 2026-10-31):** the 3.8 ms and 38.2 ms figures in this table are historical. Measured on an M2 Pro, 31 runs, wall clock including process spawn: **22.5 ms median** for `sofuu eval 1+1` on the current tree, against **61.5 ms** for the published 0.3.0-beta artifact measured the same way. The gap to Node.js and Python was not re-measured this session and is not claimed here — and those columns are interpreter baselines anyway, not the comparison that matters (see §3).
 
 > ⚠️ **Provenance (2026-10-30):** the macOS row above predates the Metal
 > engine, the QTSQ memory shell and the eleven shipped JS drivers, and no
@@ -59,7 +67,10 @@ hyperfine --warmup 10 --runs 100 \
 
 ## 3. 🧠 Memory Footprint (Resident Set Size)
 
-Comparing base process memory consumption upon startup with vector memory capabilities initialized:
+**This is the comparison that matters.** Sofuu is a single process carrying the whole AI
+application stack — JS/TS orchestration, inference, encrypted vector memory, agents, MCP, HTTP.
+Its peer is not another language runtime; it is the multi-process stack a developer assembles
+today to do the same job:
 
 | Runtime & Stack | Subsystems Active | Measured RSS (Idle) |
 | :--- | :--- | :--- |
@@ -68,7 +79,12 @@ Comparing base process memory consumption upon startup with vector memory capabi
 | **Node.js + Local Vector DB** | Node process + ChromaDB / Qdrant background daemon | **~185.0 MB** |
 | **Python + LangChain + Chroma** | Python interpreter + PyTorch base + Chroma service | **~390.0 MB** |
 
-> 📌 **Key Takeaway (revised 2026-10-31):** the 3.8 ms and 38.2 ms figures in this table are historical. Measured on an M2 Pro, 31 runs, wall clock including process spawn: **22.5 ms median** for `sofuu eval 1+1` on the current tree, against **61.5 ms** for the published 0.3.0-beta artifact measured the same way. The gap to Node.js and Python was not re-measured this session and is not claimed here.
+> 📌 **Key Takeaway:** one Sofuu process (~12.4 MB idle, engine + vector memory initialized)
+> replaces what otherwise takes a runtime process *plus* a vector-database daemon *plus* an
+> inference server — ~185 MB with Node.js, ~390 MB with Python/LangChain/Chroma — and removes
+> the socket round-trips between them (see §4). The "Node.js alone" row is shown only as the
+> interpreter baseline. These rows date to the 0.3.0-era measurement and should be re-verified
+> against the current tree before being quoted in marketing.
 
 ---
 

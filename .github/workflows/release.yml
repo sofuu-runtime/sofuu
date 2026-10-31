@@ -85,6 +85,23 @@ jobs:
           sha256sum dist/libsofuu-darwin-arm64.tar.gz > dist/libsofuu-darwin-arm64.tar.gz.sha256
           ls -lh dist/
 
+      # Upload the CLI + library artifacts BEFORE the SDK work: the iOS
+      # xcframework step has its own (Metal-kernel) failure modes, and a
+      # failure there must never hold the primary release artifacts hostage.
+      - name: Upload to Release (CLI + library + receipts)
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            dist/sofuu-darwin-arm64.tar.gz
+            dist/sofuu-darwin-arm64.tar.gz.sha256
+            dist/libsofuu-darwin-arm64.tar.gz
+            dist/libsofuu-darwin-arm64.tar.gz.sha256
+            dist/conformance-report.json
+            contract/CONFORMANCE.md
+            contract/SCOREBOARD.md
+            contract/scoreboard.json
+          generate_release_notes: true
+
       # ── E1: the iOS beachhead (the positioning plan's Phase 1) ──
       # libsofuu.xcframework is what SwiftPM and CocoaPods resolve, so a
       # release that omits it means `pod 'Sofuu'` and `.package(...)` both
@@ -123,20 +140,12 @@ jobs:
           ruby scripts/check_podspec.rb
           grep -q "$(shasum -a 256 dist/libsofuu.xcframework.zip | awk '{print $1}')" Package.swift
 
-      - name: Upload to Release
+      - name: Upload to Release (SDK payload)
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
-            dist/sofuu-darwin-arm64.tar.gz
-            dist/sofuu-darwin-arm64.tar.gz.sha256
-            dist/libsofuu-darwin-arm64.tar.gz
-            dist/libsofuu-darwin-arm64.tar.gz.sha256
             dist/libsofuu.xcframework.zip
             dist/libsofuu.xcframework.zip.sha256
-            dist/conformance-report.json
-            contract/CONFORMANCE.md
-            contract/SCOREBOARD.md
-            contract/scoreboard.json
           generate_release_notes: true
 
       # The stamped Package.swift is the thing consumers actually resolve, so

@@ -20,12 +20,19 @@ jobs:
       # clone the public checkout, build libqtsq.a, and point the build at it.
       # (Both v0.3.0-beta release runs failed here — the workflow predated the
       # mandatory-QTSQ build, which is why the published binaries went stale.)
-      - name: Check out and build QTSQ (open source, Apache-2.0)
+      - name: Check out and build the QTSQ codec (open source, Apache-2.0)
         run: |
+          set -euxo pipefail
           git clone --depth 1 https://github.com/haruhito2666/qtsq "$HOME/qtsq"
+          # Build ONLY the `lib` target — the codec archive Sofuu statically
+          # links. The linker pulls just the members Sofuu references, so the
+          # 5.5 MiB cap is untouched; QTSQ's cli/viewer/studio/demos targets
+          # are never built and never ship (its `all` also needs tools/ files
+          # the upstream repo does not carry).
           # Plain make on macOS — the -D_POSIX_C_SOURCE overrides used on Linux
           # hide BSD symbols (arc4random_buf) that the codec legitimately uses.
-          make -C "$HOME/qtsq"
+          make -C "$HOME/qtsq" lib
+          test -s "$HOME/qtsq/libqtsq.a"
           echo "SOFUU_QTSQ_DIR=$HOME/qtsq" >> "$GITHUB_ENV"
 
       - name: Install dependencies
@@ -193,11 +200,19 @@ jobs:
 
       # android.sh refuses a codec-less build: it links the per-ABI QTSQ
       # archives that build_qtsq_android.sh compiles from the open-source
-      # checkout (SOFUU_QTSQ_SRC).
-      - name: Check out and build QTSQ for both ABIs (open source, Apache-2.0)
+      # checkout (SOFUU_QTSQ_SRC). The script compiles only the codec source
+      # lists Sofuu's engine links — never the whole QTSQ tree — keeping the
+      # shipped .so (and the AAR) at their audited size.
+      - name: Check out QTSQ (open source, Apache-2.0)
         run: |
+          set -euxo pipefail
           git clone --depth 1 https://github.com/haruhito2666/qtsq "$HOME/qtsq"
+          ls "$HOME/qtsq/src" | head -3
           echo "SOFUU_QTSQ_SRC=$HOME/qtsq" >> "$GITHUB_ENV"
+
+      - name: Build the QTSQ codec for both ABIs
+        run: |
+          set -euxo pipefail
           bash scripts/mobile/build_qtsq_android.sh arm64 x86_64
 
       - name: Build the Android .so's

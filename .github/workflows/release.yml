@@ -102,7 +102,6 @@ jobs:
             contract/CONFORMANCE.md
             contract/SCOREBOARD.md
             contract/scoreboard.json
-          generate_release_notes: true
 
       # ── E1: the iOS beachhead (the positioning plan's Phase 1) ──
       # libsofuu.xcframework is what SwiftPM and CocoaPods resolve, so a
@@ -163,7 +162,6 @@ jobs:
           files: |
             dist/libsofuu.xcframework.zip
             dist/libsofuu.xcframework.zip.sha256
-          generate_release_notes: true
 
       # The stamped Package.swift is the thing consumers actually resolve, so
       # commit it back: otherwise the next release ships a manifest pinned to

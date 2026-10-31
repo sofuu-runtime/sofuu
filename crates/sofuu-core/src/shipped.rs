@@ -51,7 +51,8 @@ pub const WEB_JS: &str = include_str!("../../../src/js/web.js");
 #[cfg(not(debug_assertions))]
 pub const WEB_JS: &str = "";
 pub const WEB_BC: &[u8] = include_bytes!("../../../src/js/web.bc.gz");
-/// The coding-tools driver — single source of truth is src/js/tools.js.
+/// The domain-toolpacks driver (coding, web, memory, system) — single source
+/// of truth is src/js/tools.js.
 #[cfg(debug_assertions)]
 pub const TOOLS_JS: &str = include_str!("../../../src/js/tools.js");
 /// Release builds carry bytecode only - see the file header.

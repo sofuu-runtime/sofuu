@@ -166,10 +166,11 @@ jni/<abi>/libc++_shared.so
 `libsofuu.so` links QTSQ in every published AAR: the encrypted brain codec is
 a core runtime component, not an optional add-on. The AAR's `classes.jar`
 therefore also contains `META-INF/LICENSES/QTSQ-FORMAT.txt` and
-`META-INF/SOFUU-NOTICE.txt`. Section 2 of the QTSPL grants free use — including
-commercial use — through the Sofuu runtime, SDKs, and bindings. Staging
-refuses a codec-less binary, and `verifyAarContents` refuses an AAR missing
-the native libraries or either legal notice.
+`META-INF/SOFUU-NOTICE.txt`. QTSQ is open source under the Apache License,
+Version 2.0 — use, modification, and redistribution (including commercial use)
+are granted under its terms. Staging refuses a codec-less binary, and
+`verifyAarContents` refuses an AAR missing the native libraries or either
+legal notice.
 
 ### Remote publication
 
@@ -202,8 +203,7 @@ CMake wiring: `examples/headless/KotlinSample/` (`CMakeLists.txt`,
 
 ## License
 
-MIT for the runtime. QTSQ, the encrypted-store format linked into every
-published AAR, is governed by the Quantum Tensor Sequence Proprietary License
-(QTSPL) v1.0 in `LICENSES/QTSQ-FORMAT.txt`; use through the Sofuu runtime,
-SDKs, and bindings is free, including commercial use. See
+MIT for the runtime. QTSQ, the encrypted-store engine linked into every
+published AAR, is open source under the Apache License, Version 2.0
+(`LICENSES/QTSQ-FORMAT.txt`, https://github.com/haruhito2666/qtsq). See
 `docs/EMBEDDING-DIST.md`.

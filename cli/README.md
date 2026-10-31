@@ -15,9 +15,10 @@ All four binaries link the same QTSQ static libs (built per-target with
 `.qtsq` files, brain/KV memory persists, and the crypto suite (ML-KEM-768 /
 ML-DSA-65 / Argon2) is present on every platform.
 
-> **Redistribution note:** QTSQ is the proprietary codec checkout
-> (`~/projects/black-hole-disk`, see AUTHORSHIP_SEAL.md/LEGAL.md there).
-> Binaries in this folder carry it — keep them private; do not publish.
+> **Provenance note:** QTSQ is the open-source codec checkout
+> (https://github.com/haruhito2666/qtsq, Apache-2.0; local clone at
+> `~/projects/black-hole-disk`). The binaries in this folder are local
+> builds — official release artifacts come from the release pipeline.
 
 ## Install
 

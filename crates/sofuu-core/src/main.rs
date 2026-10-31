@@ -24,9 +24,9 @@ use sofuu_ffi::SofuuRuntime;
 /// not testing a degraded path — they test real behaviour that only exists when
 /// the codec is linked.
 ///
-/// CI builds QTSQ-free on purpose (the checkout is proprietary), so without
-/// this these 23 tests could only ever pass on one machine — a gate that runs
-/// in one place is not a gate.
+/// CI builds QTSQ-free on purpose (the checkout lives outside this repo), so
+/// without this these 23 tests could only ever pass on one machine — a gate
+/// that runs in one place is not a gate.
 #[cfg(test)]
 macro_rules! require_qtsq {
     () => {
@@ -148,7 +148,7 @@ fn print_help() {
     println!("\nSession mesh: `sofuu chat` syncs with other sessions on the SAME project");
     println!("in real time (tasks, notes, critical notices, shared context).");
     println!("Disable with `--sync off`. Main session data uses bounded .store QTSQ segments; legacy flat .qtsq files remain readable.");
-    println!("\n\x1b[90mBuilt with Rust + QuickJS + C + QTSQ | MIT License (QTSQ proprietary)\x1b[0m\n");
+    println!("\n\x1b[90mBuilt with Rust + QuickJS + C + QTSQ | MIT License · QTSQ engine: Apache-2.0\x1b[0m\n");
 }
 
 // ── R-29: per-subcommand help ─────────────────────────────────────

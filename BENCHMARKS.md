@@ -1,7 +1,7 @@
 # ⚡ Sofuu Benchmark Methodology & Performance Metrics
 
 > **Canonical Source of Truth for all Performance, Latency, and Memory Footprint Claims.**  
-> *Last Verified: October 30, 2026 | Engine Version: 0.3.0-beta*
+> *Last Verified: October 31, 2026 | Engine Version: 0.3.0-beta*
 
 ---
 
@@ -98,16 +98,21 @@ In Sofuu:
 
 ## 5. 📦 Binary Footprint & Stripped Size
 
-- **Hard Architectural Invariant:** $\le 5.5\text{ MB}$ stripped release binary.
+- **Hard Architectural Invariant:** $\le 5.5\text{ MiB}$ ($5,767,168$ bytes) stripped release binary.
 Measured 2026-10-31 (`stat -f%z` on each file; cap is 5,767,168 B):
 
-- **macOS ARM64, this tree (`make size-check`):** `5.30 MiB` (5,559,904 bytes) — **under**, 202 KB headroom.
-- **macOS ARM64, published archive:** `5.39 MiB` (5,655,808 bytes) — under, stale.
-- **Linux ARM64, published archive:** `5.88 MiB` (6,163,520 bytes) — **570,344 B over the cap**.
-- **Linux x86_64, published archive:** `6.80 MiB` (7,130,904 bytes) — **1,595,288 B over the cap**.
+| Artifact | Bytes | vs. cap |
+|---|---:|---|
+| **macOS ARM64, this tree** (`make size-check`) | 5,559,904 B (5.30 MiB) | **passes**, 207,264 B headroom |
+| macOS ARM64, published archive | 5,655,808 B (5.39 MiB) | passes (stale — predates 2026-10-31 fixes) |
+| Linux ARM64, published archive | 6,163,520 B (5.88 MiB) | **396,352 B over the cap** |
+| Linux x86_64, published archive | 7,130,904 B (6.80 MiB) | **1,363,736 B over the cap** |
+| Linux ARM64, local `dist/` copy (Oct 29) | 6,337,512 B | **570,344 B over** |
+| Linux x86_64, local `dist/` copy (Oct 30) | 7,362,456 B | **1,595,288 B over** |
 
-The two Linux archives must be rebuilt before they ship; `scripts/verify-dist.sh`
-prints exactly those two lines and refuses them.
+The Linux archives (both the published set and the older local `dist/` copies)
+must be rebuilt before they ship; `scripts/verify-dist.sh` prints exactly those
+lines and refuses them.
 
 *Every release binary includes QuickJS (ES2023), libuv event loop, QTSQ cognitive vector memory codec, native MCP client/server, and built-in coding toolpacks with zero external shared library dependencies.*
 

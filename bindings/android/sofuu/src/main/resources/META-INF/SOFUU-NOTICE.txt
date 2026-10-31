@@ -2,37 +2,24 @@ Sofuu (素風) JavaScript Runtime
 Copyright (c) 2026 Haruhito
 
 ================================================================================
-OPEN-CORE MODEL — WHAT IS MIT AND WHAT IS NOT
+OPEN SOURCE — WHAT IS MIT AND WHAT IS APACHE-2.0
 ================================================================================
 The Sofuu execution runtime (engine, CLI, JavaScript/TypeScript APIs,
 agents, MCP, HTTP, vector operations, local memory, embeddings, and core
 developer tooling) is open source under the MIT License (see LICENSE).
 
-Not covered by the MIT License:
+QTSQ Cognitive Vector Memory Engine (Apache License 2.0)
+Copyright 2026 Haruhito
 
-QTSQ File Format (.qtsq / .qtsw)
-Copyright (c) 2026 Haruhito. All Rights Reserved.
+The Quantum Tensor Sequence (QTSQ) on-device vector memory engine — including
+the .qtsq/.qtsw file format, the codec, and the storage specification — is
+open source under the Apache License, Version 2.0, developed at
+https://github.com/haruhito2666/qtsq. Under Apache-2.0 you may use, modify,
+and redistribute QTSQ (commercially or non-commercially), including building
+independent tools that read and write .qtsq containers, provided the license
+and copyright notices are preserved.
 
-The Quantum Tensor Sequence (QTSQ) binary file format embedded in this runtime
-is a proprietary format designed and owned solely by the Author. It is governed
-by the Quantum Tensor Sequence Proprietary License (QTSPL) v1.0, which is
-separate and distinct from the MIT License covering the
-Sofuu runtime source code.
-
-Use of the Format through Sofuu (runtime, SDKs, tools — including
-commercial products built on them) is free of charge and needs no separate
-approval; see Section 2 of that license. Restricted without one: forking
-the spec and independent competing read/write implementations.
-
-See: LICENSES/QTSQ-FORMAT.txt for the full QTSQ format license terms.
-
-Key restrictions specific to the QTSQ Format (not covered by the MIT License):
-  - You may NOT modify the .qtsq/.qtsw format specification.
-  - You may NOT build competing tools that read/write .qtsq files outside
-    of the Sofuu Runtime without a separate commercial license.
-  - You may NOT redistribute the Format specification independently.
-
-To inquire about a commercial license for the Format, contact the Author.
+See: LICENSES/QTSQ-FORMAT.txt for the full Apache-2.0 license text.
 
 ================================================================================
 THIRD-PARTY OPEN SOURCE COMPONENTS
@@ -98,5 +85,8 @@ The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.
 
 --------------------------------------------------------------------------------
-ALL LICENSES REPRODUCED ABOVE. No GPL, LGPL, or copyleft licenses are used.
+No copyleft-licensed code is linked into the shipped binaries. Every license
+that IS linked (including Apache-2.0 components: QTSQ and OpenSSL) is
+reproduced above or referenced with its source. See the root NOTICE for the
+full accuracy note.
 --------------------------------------------------------------------------------

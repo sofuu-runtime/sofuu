@@ -30,7 +30,8 @@
 # it is why a cold `make ios-engine` takes a few minutes instead of seconds.
 #
 # ── Why QTSQ is deliberately absent ─────────────────────────────────
-# The proprietary codec checkout is macOS-only, so iOS packs ship pure MIT.
+# The codec checkout is not wired into this iOS cross build, so iOS packs
+# ship pure MIT (the QTSQ engine itself is open source, Apache-2.0).
 # This script points SOFUU_QTSQ_DIR at the repo's empty `dist/no-qtsq` marker
 # directory — deliberately NOT `unset`, because build.rs has a hardcoded
 # fallback that fires when the variable is missing and would drag a macOS
@@ -146,8 +147,8 @@ build_target() {
     export SOFUU_CURL_STATIC_DIR="$(CURL_DIR_FOR "$NAME")/lib"
 
     # ── QTSQ: force the codec-less shape ─────────────────────────────
-    # The proprietary codec checkout is macOS-only, so iOS packs ship pure
-    # MIT. This uses the repo-wide convention — an empty `dist/no-qtsq`
+    # The codec checkout is not wired into the iOS cross build, so iOS packs
+    # ship pure MIT. This uses the repo-wide convention — an empty `dist/no-qtsq`
     # directory — and NOT `unset SOFUU_QTSQ_DIR`.
     #
     # That distinction is load-bearing. Unsetting the variable looks like the

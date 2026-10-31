@@ -23,7 +23,7 @@ build, an artifact with no HEAD stamp, or one over the 5.5 MiB cap.
 **Binary size (P1-8).** Four driver payloads were embedded as raw JavaScript and
 four Metal kernels as text. Bytecode-only embedding in release was already the
 rule for eleven drivers; the stragglers now follow it and the kernels ship
-gzip-compressed and are inflated at init. The host build is 5,559,840 B against
+gzip-compressed and are inflated at init. The host build is 5,559,904 B against
 the 5,767,168 B cap — 207 KB of headroom where the tree was 320 KB over.
 
 **HTTP server (P0-2, P1-12).** `listen()` unrefed its handle, so the README's

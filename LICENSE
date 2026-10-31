@@ -25,7 +25,7 @@ Open Source Architecture:
 Sofuu and its companion on-device cognitive vector memory engine (QTSQ) are
 100% open source:
 - Sofuu Runtime: https://github.com/sofuu-runtime/sofuu (MIT)
-- QTSQ Engine:   https://github.com/haruhito2666/qtsq (Open Source)
+- QTSQ Engine:   https://github.com/haruhito2666/qtsq (Apache License 2.0)
 
 Third-party components:
 Sofuu links or bundles QuickJS, libuv, http-parser, libcurl, libopus and

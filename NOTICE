@@ -10,7 +10,10 @@ developer tooling) is open source under the MIT License (see LICENSE).
 
 QTSQ Cognitive Vector Memory Engine:
 The Quantum Tensor Sequence (QTSQ) on-device vector memory core is open source
-and hosted at https://github.com/haruhito2666/qtsq.
+under the Apache License, Version 2.0 and hosted at
+https://github.com/haruhito2666/qtsq.
+Copyright 2026 Haruhito. The full Apache-2.0 license text ships alongside
+this file as `LICENSES/QTSQ-FORMAT.txt`.
 
 ================================================================================
 THIRD-PARTY OPEN SOURCE COMPONENTS
@@ -76,6 +79,15 @@ The above copyright notice and this permission notice shall be included in all
 copies or substantial portions of the Software.
 
 --------------------------------------------------------------------------------
+OpenSSL — Cryptography and TLS Library (Android/iOS libsofuu builds)
+Copyright 1998-2024 The OpenSSL Project Authors
+License: Apache License, Version 2.0 — https://www.openssl.org/source/license.html
+
+Statically linked into the Android and iOS `libsofuu` builds only (as the TLS
+backend of the bundled libcurl); absent from the desktop/server CLI binaries.
+The full Apache-2.0 text applies — see https://www.apache.org/licenses/LICENSE-2.0.
+
+--------------------------------------------------------------------------------
 libopus (macOS builds with QTSQ audio: linked STATICALLY so the shipped binary
 carries no Homebrew dylib — H-05. Build with SOFUU_NO_OPUS_AUDIO=1 to omit audio
 decoding entirely; other platforms keep the option via SOFUU_LINK_OPUS=1)
@@ -117,7 +129,7 @@ branch is only reachable on the UEFI target, which Sofuu never builds.
 --------------------------------------------------------------------------------
 Desktop wrapper only (NOT part of the shipped CLI binary)
 
-The optional Tauri desktop wrapper under `apps/desktop` pulls five MPL-2.0
+The optional Tauri desktop wrapper under `sofuu-desktop/src-tauri` pulls five MPL-2.0
 crates. They are NOT compiled into `sofuu`, `libsofuu.a` or `libsofuu.dylib`;
 they exist only when the desktop application is built. MPL-2.0 permits
 combination with differently licensed code provided the MPL-covered files

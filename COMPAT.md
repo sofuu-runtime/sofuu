@@ -2,7 +2,7 @@
 
 *Last audited: October 2026 (v0.3.0-beta)*
 
-Sofuu is a general-purpose runtime for AI — built to run anywhere from servers to smart devices. Designed for deterministic agent execution, instant startup (<4 ms), and self-contained deployment, Sofuu provides a **strict, high-performance compatibility layer** covering modern Web standards, essential Node.js built-ins, and the top npm packages used by modern AI agents and LLM tool chains.
+Sofuu is a full-suite, single-binary runtime for AI and AI applications — built edge-first and equally for workstations and servers. Designed for deterministic agent execution, fast measured cold start (22.5 ms median wall clock; see BENCHMARKS.md), and self-contained deployment, Sofuu provides a **strict, high-performance compatibility layer** covering modern Web standards, essential Node.js built-ins, and the top npm packages used by modern AI agents and LLM tool chains.
 
 ---
 
@@ -114,7 +114,7 @@ sofuu run src/agent.ts
 ### How It Works
 1. When a `.ts` file is loaded (either as main entry or via `import`), Sofuu strips type annotations, interfaces, enums, and type assertions in a single-pass native pass.
 2. Type checking occurs inside your IDE (VS Code, Cursor, Neovim) using TypeScript language server (`tsserver`) against `sofuu.d.ts`.
-3. Execution commences immediately in QuickJS with `<4 ms` cold start.
+3. Execution commences immediately in QuickJS — no build step, and the measured cold start is the one published in BENCHMARKS.md.
 
 ### Recommended `tsconfig.json`
 To set up IDE autocomplete and type checking, create a `tsconfig.json` based on the shipped template:

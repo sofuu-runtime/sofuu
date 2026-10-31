@@ -217,7 +217,7 @@ size-check: $(TARGET)
 		echo "  \033[31m✗ Size $$SIZE bytes exceeds cap $(SIZE_LIMIT) bytes\033[0m"; \
 		exit 1; \
 	else \
-		echo "  \033[32m✓ Size $SIZE bytes ≤ $(SIZE_LIMIT) bytes\033[0m"; \
+		echo "  \033[32m✓ Size $$SIZE bytes ≤ $(SIZE_LIMIT) bytes\033[0m"; \
 	fi
 
 # ── Documentation freshness (no build required) ─────────────────

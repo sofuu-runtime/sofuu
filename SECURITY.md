@@ -5,7 +5,8 @@ opens network connections on your behalf. Its security posture is therefore part
 of the product, not a footnote. This page explains what is covered, how to report
 a problem, and what we promise in return.
 
-* **What R7 protects against, and what it cannot** → [`THREAT_MODEL.md`](THREAT_MODEL.md)
+* **What R7 protects against, and what it cannot** → the Scope section below
+  (guarantees and residual risks are stated there, inline)
 * **Normative rules** → `docs/SPEC-RUNTIME-CONTRACT.md` §8 (R7.1–R7.9)
 * **Executable evidence** → `contract/CONFORMANCE.md` (T7 cases) and
   `docs/SANDBOX.md`
@@ -72,14 +73,14 @@ credit you in the advisory unless you prefer to stay anonymous.
 | Fix for medium / low severity | next scheduled release |
 | Public advisory | after the fix ships, coordinated with the reporter |
 
-If a report is out of scope per `THREAT_MODEL.md` §4, we will say so plainly and
-explain why, rather than silently closing it.
+If a report is out of scope per the out-of-scope list below, we will say so
+plainly and explain why, rather than silently closing it.
 
 ---
 
 ## Scope
 
-**In scope** — anything that breaks a guarantee stated in `THREAT_MODEL.md` §3:
+**In scope** — anything that breaks a guarantee the R7 firewall makes:
 policy bypass across any of the four surfaces (JS, CLI, HTTP, C ABI), shell-strip
 evasion, filesystem-jail escape (`..`, symlinks, canonicalisation), network/SSRF
 guard bypass, secret disclosure through events/traces/exports/errors, sandbox
@@ -90,7 +91,8 @@ TypedArray/SIMD or C-ABI boundary, and release-artifact integrity.
 malicious plugins or MCP servers you chose to install, prompt-injection that
 results in *allowed* actions, model behaviour, and denial of service that follows
 from budgets you deliberately unset. These are documented residual risks, not
-bugs; see `THREAT_MODEL.md` §4–§5.
+bugs — they follow from the trust model above (plugins, sandbox bridges, and
+MCP servers are trusted code; redaction is key-based; symlink TOCTOU remains).
 
 ## Bug bounty
 

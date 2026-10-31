@@ -20,7 +20,7 @@ fn main() {
     let is_msvc = target_env == "msvc";
     let is_windows = target_os == "windows";
 
-    // ── QTSQ codec (proprietary, latest checkout) ────────────────
+    // ── QTSQ codec (open source, Apache-2.0 — separate checkout) ─
     // Session data persists as .qtsq files, so the default build links the
     // QTSQ static lib. Point at a different checkout with SOFUU_QTSQ_DIR.
     // POSIX builds link the Makefile product libqtsq.a; Windows links the
@@ -387,7 +387,8 @@ fn main() {
     }
 
     // ── QTSQ static lib (session store + memory integration) ─────
-    // Proprietary / local checkout. CI and third-party builds don't have it:
+    // Separate open-source checkout (Apache-2.0). CI and third-party builds
+    // don't have it:
     // degrade gracefully (no session store / memory persistence) instead of
     // failing the build. Set SOFUU_QTSQ_DIR to a checkout to enable it.
     // Declared unconditionally so the cfg name is always known to rustc —

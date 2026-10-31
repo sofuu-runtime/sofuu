@@ -21,11 +21,11 @@
 ## 🟢 1. Completed & Shipped (Production Ready)
 
 ### ⚡ Runtime Substrate & Event Loop
-- [x] **QuickJS (ES2023) + libuv core**: JIT-free, lightweight JS execution booting in $< 4\text{ ms}$.
+- [x] **QuickJS (ES2023) + libuv core**: JIT-free, lightweight JS execution; measured 22.5 ms median cold start wall-clock incl. process spawn (Apple M2 Pro, 2026-10-31 — see BENCHMARKS.md; the 3.8 ms figure from an earlier methodology is historical).
 - [x] **Cooperative Task Scheduler**: Microtask starvation protection with `scheduler.yield()`.
 - [x] **Zero-Dependency TypeScript**: In-memory lexical type-stripping (`ts.rs`) running `.ts` files with no build step.
 - [x] **ESM Tree-Shaking Bundler**: Fast pure-Rust bundler (`bundler.rs`) emitting self-contained JavaScript files.
-- [x] **Binary Size Strict Discipline**: Maintained $\le 5.5\text{ MB}$ stripped release footprint ($\approx 5.2\text{ MB}$ uncompressed).
+- [x] **Binary Size Strict Discipline**: Hard $\le 5.5\text{ MiB}$ cap, enforced by `make size-check` — macOS arm64 build is 5.30 MiB (5,559,904 B, 202 KB headroom); Linux arm64/x86_64 remain over the cap and are tracked release work.
 
 ### 🧠 Cognitive Vector Memory (CMA v2)
 - [x] **Encrypted `.qtsq` Containers**: On-device vector storage with zero external database dependencies.
@@ -49,8 +49,8 @@
 
 ## 🟡 2. In Progress (Active Sprint — Weeks 1–2)
 
-### 🎯 The "Killer Wedge": Standalone Agent Compiler (`sofuu compile`)
-*See detailed specification in [`docs/STANDALONE_COMPILER_PLAN.md`](docs/STANDALONE_COMPILER_PLAN.md). Shipped 2026-10-30 — see CHANGELOG.*
+### ✅ The "Killer Wedge": Standalone Agent Compiler (`sofuu compile`) — SHIPPED 2026-10-30
+*See detailed specification in [`docs/STANDALONE_COMPILER_PLAN.md`](docs/STANDALONE_COMPILER_PLAN.md). Shipped and verified — see CHANGELOG.*
 - [x] **Trailer Format Implementation**: 32-byte `SOFUU_BIN_V1` binary trailer with CRC32 verification.
 - [x] **Fast-Path Boot Detection**: Two reads (trailer + payload) before CLI dispatch; macOS finds the trailer before `LC_CODE_SIGNATURE`.
 - [x] **AOT Bytecode Bundler**: Bundling TypeScript + QuickJS bytecode into a single executable.
@@ -58,7 +58,7 @@
 - [x] **Embedded Memory Support**: The whole `.qtsq` store (manifest + segments) packed into the binary (`--embed-brain`).
 
 ### 🛡️ Zero-Crash Hardening & Concurrency Fuzzing
-*See detailed specification in [`docs/ENTERPRISE_HARDENING_PLAN.md`](docs/ENTERPRISE_HARDENING_PLAN.md).*
+*See detailed specification in [`docs/ENTERPRISE_HARDENING_PLAN.md`](docs/ENTERPRISE_HARDENING_PLAN.md). Started: the 2026-10-31 audit remediation delivered the server-side rejection handling (handler throws answer 500 exactly once) and the process-global interrupt/deadline layer.*
 - [ ] **Promise Rejection Trap**: Unhandled rejection sink terminating with exit code 1 instead of Rust panics.
 - [ ] **Handle Lifecycle Auditing**: Guaranteeing `uv_loop_alive() == 0` when work drains to eliminate hanging processes.
 - [ ] **10,000-Concurrency Stress Harness**: High-concurrency test verifying 0 leaks under macOS `leaks` and Linux ASan.

@@ -60,7 +60,8 @@ npm run tauri build -- --bundles nsis
 ### Windows notes & limitations
 
 - **QTSQ (full session persistence) is now buildable on Windows.** The
-  proprietary QTSQ checkout ships an MSVC port (`windows/CMakeLists.txt` +
+  open-source QTSQ checkout (github.com/haruhito2666/qtsq, Apache-2.0) ships an
+  MSVC port (`windows/CMakeLists.txt` +
   `windows/shim/` — a single `qtsq.lib` with the qtc compressor, the crypto
   suite, and a Win32 POSIX-compat shim baked in). Build it inside the
   checkout, point `SOFUU_QTSQ_DIR` at it, and `build.rs` links it:
@@ -78,8 +79,8 @@ npm run tauri build -- --bundles nsis
   export SOFUU_QTSQ_DIR="<path to the QTSQ checkout>"
   ```
 
-  CI still builds **without** QTSQ (the checkout is proprietary and cannot
-  ship in CI) — CI artifacts remain fail-closed: providers/models/chat
+  CI still builds **without** QTSQ (the checkout lives outside this repo and
+  is not vendored for CI) — CI artifacts remain fail-closed: providers/models/chat
   itself are unaffected, but chats don't survive an app restart there.
 - **No `Atomics.*` in engine JS.** The vendored QuickJS `CONFIG_ATOMICS`
   (pthread-dependent) is gated off for MSVC; user JS that uses `Atomics`
@@ -140,7 +141,7 @@ needed.
   on Linux (docker gcc:13 clean-build proven) — run `make` inside the QTSQ
   checkout (needs zlib dev headers), export `SOFUU_QTSQ_DIR=<checkout path>`,
   and the app links it: full brain/memory persistence and session store.
-  CI artifacts build without it (the proprietary checkout can't ship in
+  CI artifacts build without it (the checkout is not vendored for
   CI), so they stay fail-closed — chats don't survive an app restart there.
   Providers/models/chat itself are unaffected either way.
 - **API keys** persist in the freedesktop Secret Service (GNOME Keyring /

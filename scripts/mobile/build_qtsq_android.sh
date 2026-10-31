@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# scripts/mobile/build_qtsq_android.sh — the proprietary QTSQ codec,
-# cross-compiled for Android with the NDK clang (aarch64 / x86_64).
+# scripts/mobile/build_qtsq_android.sh — the QTSQ codec (open source,
+# Apache-2.0), cross-compiled for Android with the NDK clang (aarch64 / x86_64).
 #
 # The QTSQ checkout (SOFUU_QTSQ_SRC, default ~/projects/black-hole-disk)
 # already builds under the NDK — the checkout ships an Android Gradle app
@@ -9,7 +9,7 @@
 # the Makefile's SRC_CORE minus the Darwin-only (Metal/CoreAudio) and
 # Opus-optional files, plus the four crypto dirs and the pure-C qtc
 # compressor. This script COMPILES the checkout from source; it never
-# copies the proprietary tree.
+# copies the tree.
 #
 # Archive layout is what crates/sofuu-ffi/build.rs expects:
 #   dist/qtsq-android-<abi>/libqtsq.a        (core + crypto)

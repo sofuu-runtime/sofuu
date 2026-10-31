@@ -264,7 +264,7 @@ fn paths() -> Category {
         ("sofuu-cli", "parses the TOML once at boot", "it caches the parsed table in a OnceLock", "To add a setting"),
         ("sofuu-desktop", "mirrors the engine config into the WebView", "edits flow through the Tauri commands", "To expose a new pref"),
         ("helmor", "resolves the workspace root first", "paths are resolved relative to the workspace", "To relocate state"),
-        ("mimosa", "validates the schema before scan", "validation runs before any scanner starts", "To add a rule class"),
+        ("legacy-project", "validates the schema before scan", "validation runs before any scanner starts", "To add a rule class"),
         ("qtsq-checkout", "guards the codec offset table", "offset 5016 is integrity-checked here", "To touch the codec"),
         ("landing-site", "only reads public/site.json", "the static export has no server config", "To change metadata"),
     ];

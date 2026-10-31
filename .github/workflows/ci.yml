@@ -514,10 +514,10 @@ jobs:
           make ios-typecheck || echo "ios-typecheck: gate recorded (non-blocking until the sim lane lands)"
 
   # ── P5: the QTSQ-enabled job (opt-in, like the Android lane) ─────────────
-  # QTSQ is a proprietary local checkout; the job runs only when the
-  # repository variable SOFUU_QTSQ_CI=1 is set AND the secret provides the
-  # checkout (SOFUU_QTSQ_CI_URL). Absent either, the platform matrix's
-  # capability-gated jobs are the documented posture.
+  # QTSQ is a separate open-source checkout (github.com/haruhito2666/qtsq);
+  # the job runs only when the repository variable SOFUU_QTSQ_CI=1 is set AND
+  # the secret provides the checkout (SOFUU_QTSQ_CI_URL). Absent either, the
+  # platform matrix's capability-gated jobs are the documented posture.
   qtsq:
     name: QTSQ-enabled build (opt-in)
     if: vars.SOFUU_QTSQ_CI == '1'

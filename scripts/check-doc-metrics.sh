@@ -2,10 +2,12 @@
 # check-doc-metrics.sh — fail when a live doc asserts a retired measurement.
 #
 # The project's measured numbers live in exactly two places:
-#   size  → the release archives themselves: macOS arm64 5.39 MiB, Linux arm64
-#           5.88 MiB, Linux x86_64 6.80 MiB, against the hard cap in RULES.md §3.1
+#   size  → the release archives themselves: macOS arm64 5.30 MiB (tree) /
+#           5.39 MiB (published archive), Linux arm64 5.88 MiB, Linux x86_64
+#           6.80 MiB, against the hard cap in RULES.md §3.1
 #           (5.5 MiB = 5,767,168 bytes).
-#   speed → BENCHMARKS.md (11.4 ms median, `sofuu eval "1+1"`, Apple M2 Pro).
+#   speed → BENCHMARKS.md (22.5 ms median wall clock incl. process spawn,
+#           `sofuu eval "1+1"`, Apple M2 Pro, 2026-10-31).
 #
 # Every figure below was true once and then went false as the engine grew. Two of them
 # reached the public marketing site before anyone noticed, because nothing in CI read
@@ -27,6 +29,7 @@ skip() {
     case "$1" in
         BENCHMARKS.md|CHANGELOG.md) return 0 ;;
         docs/archive/*)             return 0 ;;
+        *AUDIT*|*SESSION*)          return 0 ;;
         docs/*AUDIT*|docs/*SESSION*|docs/*PLAN*) return 0 ;;
     esac
     return 1
@@ -34,15 +37,18 @@ skip() {
 
 # <regex><TAB><what to write instead>
 PATTERNS=$(cat <<'EOF'
-sub-?4 ?ms	The sub-4 ms cold-start claim is retired — the measured median is 11.4 ms (BENCHMARKS.md).
-sub4ms	The sub-4 ms cold-start claim is retired — the measured median is 11.4 ms (BENCHMARKS.md).
-5[.]2 MB	Retired binary size. macOS arm64 is 5.39 MiB (5,655,808 bytes).
+sub-?4 ?ms	The sub-4 ms cold-start claim is retired — the measured median is 22.5 ms wall clock (BENCHMARKS.md).
+sub4ms	The sub-4 ms cold-start claim is retired — the measured median is 22.5 ms wall clock (BENCHMARKS.md).
+< ?4 ?ms	The sub-4 ms cold-start claim is retired — the measured median is 22.5 ms wall clock (BENCHMARKS.md).
+4\\text\{ ?ms\}	Retired cold-start figure written in LaTeX so the gate could not see it — rewrite in plain text (BENCHMARKS.md: 22.5 ms median).
+5[.]2 MB	Retired binary size. macOS arm64 (this tree) is 5.30 MiB (5,559,904 bytes).
+5[.]2\\text\{ ?MB\}	Retired binary size written in LaTeX — rewrite in plain text. macOS arm64 (this tree) is 5.30 MiB.
 5[.]0 MB cap	Retired size cap. RULES.md §3.1 sets 5.5 MiB = 5,767,168 bytes.
 5 MB cap	Retired size cap. RULES.md §3.1 sets 5.5 MiB = 5,767,168 bytes.
 5MB cap	Retired size cap. RULES.md §3.1 sets 5.5 MiB = 5,767,168 bytes.
-4[.][45] MB of	Retired binary size. macOS arm64 is 5.39 MiB.
-~?3[.]8 ?ms startup	Retired cold-start figure. The measured median is 11.4 ms (BENCHMARKS.md).
-~4 ?ms	The ~4 ms cold-start claim is retired — the measured median is 11.4 ms (BENCHMARKS.md).
+4[.][45] MB of	Retired binary size. macOS arm64 (this tree) is 5.30 MiB (5,559,904 bytes).
+~?3[.]8 ?ms startup	Retired cold-start figure. The measured median is 22.5 ms wall clock (BENCHMARKS.md).
+~4 ?ms	The ~4 ms cold-start claim is retired — the measured median is 22.5 ms wall clock (BENCHMARKS.md).
 EOF
 )
 

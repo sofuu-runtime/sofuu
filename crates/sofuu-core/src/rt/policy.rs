@@ -61,7 +61,8 @@ fn list_at(v: &serde_json::Value, path: &[&str]) -> Vec<String> {
 }
 
 /* ── schema check (AUDIT-2026-10-31 P1-15) ─────────────────────────────
- * THREAT_MODEL.md states the contract these checks implement: "Policy JSON
+ * The R7 contract (SECURITY.md / docs/SPEC-RUNTIME-CONTRACT.md §8) for policy
+ * JSON: "Policy JSON
  * | --policy, .sofuu/policy.json, sofuu.policy.set | schema-checked; invalid
  * leaves the previous policy; fail closed". Only the "is it a JSON object"
  * half existed, so a typo installed cleanly and then allowed everything it
@@ -841,7 +842,7 @@ unsafe extern "C" fn js_policy_set(
             }
             /* AUDIT-2026-10-31 P1-15: a schema error is a refusal, not a
              * no-op — the previous policy stays installed and the caller is
-             * told why (THREAT_MODEL.md: "invalid leaves the previous
+             * told why (the R7 contract: "invalid leaves the previous
              * policy; fail closed"). */
             Err(e) => policy_error(ctx, &e),
         },

@@ -7,7 +7,8 @@
 # runs a cargo cross-build: rustc links with zig (static musl), the cc
 # crate compiles QuickJS/SIMD/http-parser with `zig cc`, and libuv +
 # libcurl are prebuilt for the target (dist/). QTSQ is skipped — the
-# proprietary checkout is macOS-only; CI covers the same degraded build.
+# separate checkout is not wired into this cross build; CI covers the same
+# degraded build.
 #
 # Usage:
 #   bash scripts/cross/install_zig.sh     # once

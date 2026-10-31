@@ -352,7 +352,8 @@ struct MetalContext {
     // written by the part pass and read by the fin pass. They used to gate
     // independently (fin hardcoded 128 and skipped the head_dim / n_kv_heads
     // checks), so raising SOFUU_PREW_MAXPOS or a head_dim > 128 made them
-    // disagree about who owns head_out - silent corruption (OpenQodex finding 1).
+    // disagree about who owns head_out - silent corruption (found by a
+    // static code review; regression-pinned by the attention tests).
     int pre_window_active;
     id<MTLComputePipelineState> pso_llama_attn_1c_b4;
     id<MTLComputePipelineState> pso_gemv_q4_k_b4c2r;

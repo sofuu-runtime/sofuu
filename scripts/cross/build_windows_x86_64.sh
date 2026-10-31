@@ -11,8 +11,8 @@
 # compiles QuickJS/SIMD/http-parser with `zig cc` (via zig-cc.sh), and
 # libuv + libcurl are prebuilt for the target (dist/). libcurl is built
 # WITH Schannel TLS — Windows's own TLS provider, so https works natively.
-# QTSQ is skipped — the proprietary checkout links from the local checkout
-# only; cross builds degrade exactly like CI (no session persistence).
+# QTSQ is skipped — the separate checkout links from the local clone only;
+# cross builds degrade exactly like CI (no session persistence).
 #
 # Usage:
 #   bash scripts/cross/install_zig.sh     # once

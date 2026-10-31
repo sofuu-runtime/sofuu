@@ -2,9 +2,9 @@
 # build_qtsq_cross.sh — cross-compile the QTSQ static libs for the CLI
 # targets (Linux x86_64/arm64 musl, Windows x64 mingw) with zig cc.
 #
-# QTSQ is the proprietary checkout at ~/projects/black-hole-disk (see
-# AUTHORSHIP_SEAL.md). This script compiles it from source — it never
-# copies the checkout — producing:
+# QTSQ is the open-source checkout (github.com/haruhito2666/qtsq, Apache-2.0;
+# local clone at ~/projects/black-hole-disk). This script compiles it from
+# source — it never copies the checkout — producing:
 #   dist/qtsq-linux-x86_64/libqtsq.a     (+ libqtc.a + libz.a)
 #   dist/qtsq-linux-arm64/libqtsq.a      (+ libqtc.a + libz.a)
 #   dist/qtsq-windows-x86_64/qtsq.lib    (+ libz.a; qtc baked in, shim

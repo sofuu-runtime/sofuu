@@ -2,7 +2,7 @@
 
 # ⚡ Sofuu (素風)
 
-> *Sofuu is a general-purpose runtime for AI — built to run anywhere from servers to smart devices. A compact, sovereign systems engine (Rust/C core, QuickJS/libuv) combining in-process CPU/GPU inference (experimental), multi-format models (GGUF + SafeTensors), autonomous agent loops, encrypted cognitive vector memory (QTSQ), and native MCP in a single <= 5.5 MiB binary (5.39 MiB on macOS arm64 with bundled QTSQ cognitive memory; the Linux builds are 5.88 MiB arm64 and 6.80 MiB x86_64 and currently exceed the cap). Zero daemons, zero external dependencies.*
+> *Sofuu is a full-suite, single-binary runtime for AI and AI applications — built edge-first (phones, Raspberry Pi–class boards, wearables, robotics, smart devices) and equally at home on workstations and cloud servers. A sovereign systems engine (Rust/C core, QuickJS/libuv) combining in-process CPU/GPU inference (experimental), multi-format models (GGUF + SafeTensors), autonomous agent loops, encrypted cognitive vector memory (QTSQ, Apache-2.0), and native MCP in a single <= 5.5 MiB binary (5.30 MiB on macOS arm64 with bundled QTSQ cognitive memory; the Linux builds are 5.88 MiB arm64 and 6.80 MiB x86_64 and currently exceed the cap). Zero daemons, zero external dependencies.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0--beta-orange.svg)](https://github.com/sofuu-runtime/sofuu/releases)
@@ -19,9 +19,9 @@
 
 ## What is Sofuu?
 
-Sofuu is **a general-purpose runtime for AI — built to run anywhere from servers to smart devices**.
+Sofuu is **a full-suite, single-binary runtime for AI and AI applications — built edge-first (phones, Raspberry Pi–class boards, wearables, robotics, smart devices), and equally at home on workstations and cloud servers**.
 
-Sofuu is **not just a terminal coding agent or a desktop model runner**; the terminal assistant (`sofuu chat`) is merely one first-party demonstration application running on the engine. Sofuu is the foundational systems substrate engineered to collapse the fragmented AI stack (Python/Node + LangChain + Chroma + Ollama + FastAPI) into a single in-process, self-contained runtime.
+Sofuu is **not just an AI runtime for JavaScript/TypeScript, and not just a terminal coding agent or a desktop model runner**; the terminal assistant (`sofuu chat`) is merely one first-party demonstration application running on the engine. TypeScript/JavaScript is the orchestration surface; underneath it is the foundational systems substrate engineered to collapse the fragmented AI stack (Python/Node + LangChain + Chroma + Ollama + FastAPI) into a single in-process, self-contained runtime.
 
 While TypeScript and JavaScript serve as the ergonomic high-level orchestration surface, the engine itself is an ultra-lean systems core (Rust + C) with a clean C ABI. Everything AI applications require is built directly into the single native binary — no npm packages, no Python environments, and no background daemons required:
 - **In-process local LLM inference** (**experimental** — built-in engine is early stage; for production use llama.cpp or another backend via the plugin system) (GGUF, SafeTensors, PyTorch, NumPy on Metal / NEON / AVX2) and cloud streaming
@@ -32,17 +32,17 @@ While TypeScript and JavaScript serve as the ergonomic high-level orchestration 
 - **Async HTTP server & SIMD vector mathematics**
 
 ### Where Sofuu Runs
-Sofuu is built from first principles with a hard **$\le 5.5\text{ MiB}$ binary cap**, an **11.4 ms median cold boot** (measured to a completed `1+1` — see [BENCHMARKS.md](BENCHMARKS.md)), and **zero-JIT execution** (making it 100% compliant with strict platform policies like the iOS App Store and RTOS environments). This enables it to run identically across diverse hardware form factors:
+Sofuu is built from first principles with a hard **$\le 5.5\text{ MiB}$ binary cap**, a **22.5 ms median cold start** (`sofuu eval "1+1"`, wall clock including process spawn — see [BENCHMARKS.md](BENCHMARKS.md)), and **zero-JIT execution** (making it 100% compliant with strict platform policies like the iOS App Store and RTOS environments). **Edge devices are the primary target**; the same binary runs unchanged everywhere else:
+- **Edge Devices (first):** Phones and single-board computers (Raspberry Pi 5), wearables, AR glasses, drones, robotics, and edge IoT gateways — where tight RAM budgets ($<30\text{ MB}$), offline on-device tensor evaluation, local encrypted memory, and deterministic hardware-safety boundaries enable ambient intelligence without relying on constant cloud roundtrips or bloated OS runtimes.
+- **Mobile Devices (iOS & Android):** Shipped as an embeddable C ABI library (`libsofuu`) with Swift and Kotlin bindings.
 - **Cloud & Edge Servers:** Headless microservices, streaming LLM proxies, and containerized autonomous agents with microsecond warm-up.
 - **Developer Workstations:** High-throughput local agent workspaces, standalone compiled CLI tools (`sofuu compile`), and zero-config desktop tools.
-- **Mobile Devices (iOS & Android):** Shipped as an embeddable C ABI library (`libsofuu`) with Swift and Kotlin bindings.
-- **Smart Devices, Wearables & Physical Computing:** Drones, robotics, smart watches, AR glasses, and edge IoT gateways — where tight RAM budgets ($<30\text{ MB}$), offline on-device tensor evaluation, local encrypted memory, and deterministic hardware-safety boundaries allow building ambient intelligence without relying on constant cloud roundtrips or bloated OS runtimes.
 
 ---
 
 ## Features
 
-- **Universal runtime with TS/JS orchestration** — QuickJS (ES2023) + libuv event loop with cooperative scheduler (W3C `scheduler.yield()`, microtask starvation protection), AOT bytecode snapshotting, zero-copy TypedArray SIMD memory bridge, native `AsyncLocalStorage` context propagation, deterministic instruction-metered sandboxing, an 11.4 ms startup median on an Apple M2 Pro (see [BENCHMARKS.md](BENCHMARKS.md); the older 3.8 ms row predates the Metal engine and the QTSQ shell), TypeScript runs with no compiler step, and `sofuu bundle` ships one self-contained file
+- **Universal runtime with TS/JS orchestration** — QuickJS (ES2023) + libuv event loop with cooperative scheduler (W3C `scheduler.yield()`, microtask starvation protection), AOT bytecode snapshotting, zero-copy TypedArray SIMD memory bridge, native `AsyncLocalStorage` context propagation, deterministic instruction-metered sandboxing, a 22.5 ms startup median on an Apple M2 Pro (wall clock incl. process spawn, 31 runs — see [BENCHMARKS.md](BENCHMARKS.md); the older 3.8 ms table row is historical), TypeScript runs with no compiler step, and `sofuu bundle` ships one self-contained file
 - **Local edge inference** (**experimental** — built-in engine; production use: llama.cpp or another backend via plugin) — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), up to ~195 tok/s prefill and ~69 tok/s decode on this battery's hardware, in-place KV cache compaction & sliding-window attention past context limits
 - **Cloud LLM streaming** — `sofuu.ai.stream` / `complete` over OpenAI, Anthropic, or any OpenAI-compatible endpoint (BYO key); per-model context/effort registry, no default model
 - **Agents + workflows** — `sofuu.agent.define/run`, modular domain toolpacks (`coding`, `web`, `memory`, `system`), prompt sovereignty, tool-aware task-gate, budgets, cancel, trace rendering; generalized session documents (`chat`, `agent`, `workflow`, `pipeline`) with state container
@@ -81,8 +81,8 @@ present). Each release also carries a CycloneDX 1.5 SBOM
 (`SHA256SUMS.minisig`) is wired through `scripts/sign_release.sh` and
 `install.sh` — verification turns on the moment a minisign public key is
 published in `install.sh`, and until then the script says plainly that it is
-installing on SHA-256 alone. See [`THREAT_MODEL.md`](THREAT_MODEL.md) for the
-full picture of what is and is not guaranteed.
+installing on SHA-256 alone. See [`SECURITY.md`](SECURITY.md) for the
+security scope — what R7 guarantees and what residual risks you accept.
 
 ---
 
@@ -519,14 +519,14 @@ sofuu version / help
 
 ## Native Frontend & Full-Stack Engine (`sofuu dev`) — experimental
 
-Sofuu embeds an experimental streaming JSX/TSX transpiler, file-based router, and React-compatible reactive micro-runtime directly into the native binary. Develop full-stack reactive web applications with zero npm dependencies and zero background daemons.
+Sofuu embeds an experimental streaming JSX/TSX transpiler, file-based router, and React-API-compatible reactive micro-runtime (nominative reference; not affiliated with the React project) directly into the native binary. Develop full-stack reactive web applications with zero npm dependencies and zero background daemons.
 
 ```bash
 sofuu dev [dir] --port 3000 --host 127.0.0.1
 ```
 
 * **Zero-AST On-the-Fly Transpilation**: Converts JSX and strips TypeScript types in RAM with sub-millisecond latency.
-* **Drop-In React Compatibility**: Write standard React code (`import React, { useState, useEffect } from "react"`, `import ReactDOM from "react-dom"`) with zero `npm install`.
+* **React-API compatibility**: Write standard React code (`import React, { useState, useEffect } from "react"`, `import ReactDOM from "react-dom"`) with zero `npm install` — a nominative compatibility claim; Sofuu is not affiliated with the React project.
 * **Complete Primitives Suite (38 primitives)**:
   - **Hooks & Lifecycle**: `useState`, `useReducer`, `useEffect`, `useLayoutEffect`, `useCallback`, `useMemo`, `useRef`, `useId`, `createContext`, `useContext`, `forwardRef`, `memo`, `useSyncExternalStore`, `useTransition`, `useDeferredValue`, `createPortal`, `Children`.
   - **Client-Side SPA Routing (`sofuu/router`)**: `<Link>`, `useRouter`, `usePathname`, `useSearchParams`.
@@ -736,12 +736,13 @@ curl -s localhost:7707/v1/chat/completions \
 
 Sofuu publishes receipts, not claims:
 
-- **[Threat model](THREAT_MODEL.md)** — what R7 protects against, what it
-  cannot, and the residual risks you are accepting; **[security policy](SECURITY.md)**
-  covers reporting and response.
+- **[Security policy](SECURITY.md)** — the R7 security scope: what the firewall
+  protects against, what it cannot, the residual risks you are accepting, and
+  how to report a vulnerability.
 - **[Contract suite](contract/CONFORMANCE.md)** — 52 clauses, currently
-  42 PASS / 0 FAIL / 10 BLOCKED across the platform matrix; the same page
-  carries the live capability posture and the stability index.
+  51 PASS / 0 FAIL / 1 BLOCKED (macOS QTSQ build; the Linux rows are
+  posture-only); the same page carries the live capability posture and the
+  stability index.
 - **[Surface matrix](contract/SURFACE-MATRIX.md)** — all 48 (primitive × surface)
   cells with status, missing operations and evidence.
 - **[Stability index](contract/STABILITY-INDEX.md)** — T1 (guaranteed), T2
@@ -836,7 +837,7 @@ Key gates: `cargo test --release` · `make test` · `make headless-test` (all 5 
 Sofuu and its underlying cognitive vector memory engine are **100% open source**:
 
 - **Sofuu Runtime Engine**: [sofuu-runtime/sofuu](https://github.com/sofuu-runtime/sofuu) (MIT License)
-- **QTSQ Cognitive Memory Core**: [haruhito2666/qtsq](https://github.com/haruhito2666/qtsq) (Open Source)
+- **QTSQ Cognitive Memory Core**: [haruhito2666/qtsq](https://github.com/haruhito2666/qtsq) (Apache License 2.0)
 
 Use, inspect, modify, and distribute freely, commercially or non-commercially. Third-party components keep their own permissive licenses, all reproduced in [NOTICE](NOTICE): QuickJS, libuv, http-parser, libcurl, and libopus.
 
@@ -884,7 +885,7 @@ flowchart TD
             X4["Catastrophic Shell Deny-List & SOFUU_NO_SHELL"]
             X5["Deterministic Instruction Fuel Metering"]
             X6["Native MCP Client & Server Trust Boundary"]
-            X7["Jailed Coding Tools & Threat Model (THREAT_MODEL.md)"]
+            X7["Jailed Coding Tools & Unified R7 Policy"]
         end
         subgraph P1_Agent["Agent & Mesh Layer"]
             G1["Multi-Step Reasoning Loop"]
@@ -1008,6 +1009,6 @@ flowchart TD
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Both Sofuu and the [QTSQ](https://github.com/haruhito2666/qtsq) memory engine are open source.
+MIT for the Sofuu runtime — see [LICENSE](LICENSE). The [QTSQ](https://github.com/haruhito2666/qtsq) memory engine is open source under the Apache License, Version 2.0. Full component notices: [NOTICE](NOTICE).
 
 © 2026 Haruhito

@@ -2273,8 +2273,9 @@ mod tests {
     /// surface is compiled out (sofuu-core/src/rt/memory.rs gates the
     /// register bodies on `#[cfg(has_qtsq)]`), so there is no brain to open
     /// and the funnel correctly answers `unknown_method`. CI builds this way
-    /// on purpose (QTSQ is a proprietary local checkout), and the JS suite
-    /// covers the brain through a mock server. Without this skip those tests
+    /// on purpose (QTSQ is a separate checkout, not vendored here), and the
+    /// JS suite covers the brain through a mock server. Without this skip
+    /// those tests
     /// would fail in CI while passing locally — a gate that only ever runs on
     /// one machine is not a gate.
     macro_rules! require_qtsq {

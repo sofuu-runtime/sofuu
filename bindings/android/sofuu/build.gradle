@@ -100,13 +100,13 @@ afterEvaluate {
                             name = 'MIT License'
                             url = 'https://opensource.org/licenses/MIT'
                             distribution = 'repo'
-                            comments = 'Covers the Sofuu runtime source. The embedded QTSQ format is licensed separately.'
+                            comments = 'Covers the Sofuu runtime source.'
                         }
                         license {
-                            name = 'Quantum Tensor Sequence Proprietary License (QTSPL) v1.0'
-                            url = 'https://github.com/sofuu-runtime/sofuu/blob/main/LICENSES/QTSQ-FORMAT.txt'
+                            name = 'Apache License, Version 2.0'
+                            url = 'https://www.apache.org/licenses/LICENSE-2.0'
                             distribution = 'repo'
-                            comments = 'Applies to the embedded QTSQ (.qtsq/.qtsw) format. Use through the Sofuu runtime, SDKs, and bindings is free, including commercial use; see Section 2.'
+                            comments = 'Applies to the embedded QTSQ (.qtsq/.qtsw) engine and format, which is open source at https://github.com/haruhito2666/qtsq. Full text in LICENSES/QTSQ-FORMAT.txt.'
                         }
                     }
                     developers {

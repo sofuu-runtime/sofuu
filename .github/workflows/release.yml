@@ -88,20 +88,25 @@ jobs:
       # Upload the CLI + library artifacts BEFORE the SDK work: the iOS
       # xcframework step has its own (Metal-kernel) failure modes, and a
       # failure there must never hold the primary release artifacts hostage.
+      # gh release upload --clobber uses the asset-upload endpoint only.
+      # The softprops action with overwrite:true PATCHes the release object
+      # (update-a-release), which 403s for the workflow token on a release
+      # created outside the workflow ("Resource not accessible by
+      # integration") even though asset upload and asset deletion work.
       - name: Upload to Release (CLI + library + receipts)
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          # Re-runs of the same tag re-attach the same asset names.
-          overwrite: true
-          files: |
-            dist/sofuu-darwin-arm64.tar.gz
-            dist/sofuu-darwin-arm64.tar.gz.sha256
-            dist/libsofuu-darwin-arm64.tar.gz
-            dist/libsofuu-darwin-arm64.tar.gz.sha256
-            dist/conformance-report.json
-            contract/CONFORMANCE.md
-            contract/SCOREBOARD.md
-            contract/scoreboard.json
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" \
+            dist/sofuu-darwin-arm64.tar.gz \
+            dist/sofuu-darwin-arm64.tar.gz.sha256 \
+            dist/libsofuu-darwin-arm64.tar.gz \
+            dist/libsofuu-darwin-arm64.tar.gz.sha256 \
+            dist/conformance-report.json \
+            contract/CONFORMANCE.md \
+            contract/SCOREBOARD.md \
+            contract/scoreboard.json \
+            --clobber
 
       # ── E1: the iOS beachhead (the positioning plan's Phase 1) ──
       # libsofuu.xcframework is what SwiftPM and CocoaPods resolve, so a

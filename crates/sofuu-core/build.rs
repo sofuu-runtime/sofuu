@@ -80,28 +80,41 @@ fn main() {
     //      no absolute username path is compiled into the tree;
     //   3. a vendored deps/qtsq inside this repository, if one is added later.
     // A missing library compiles the memory module out exactly as before.
-    let qtsq_dir = env::var("SOFUU_QTSQ_DIR")
-        .map(PathBuf::from)
-        .ok()
-        .filter(|p| p.join("libqtsq.a").exists())
-        .or_else(|| {
-            let home = env::var("HOME").ok()?;
-            let candidate = PathBuf::from(home).join("projects").join("black-hole-disk");
-            if candidate.join("libqtsq.a").exists() {
-                Some(candidate)
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
-            let candidate = manifest.join("../../deps/qtsq");
-            if candidate.join("libqtsq.a").exists() {
-                Some(candidate)
-            } else {
-                None
-            }
-        });
+    //
+    // The `no-qtsq` marker (repo-wide convention — scripts/dist/ios.sh): a
+    // SOFUU_QTSQ_DIR whose basename is `no-qtsq` is an EXPLICIT codec-less
+    // build. Honor it before anything else — the marker directory is
+    // deliberately empty, and the fallbacks below must never drag a host
+    // QTSQ into an archive that is documented to ship without the codec.
+    let qtsq_explicit = env::var("SOFUU_QTSQ_DIR").ok().map(PathBuf::from);
+    let no_qtsq_marker = qtsq_explicit
+        .as_ref()
+        .and_then(|p| p.file_name().map(|n| n == "no-qtsq"))
+        .unwrap_or(false);
+    let qtsq_dir = if no_qtsq_marker {
+        qtsq_explicit.clone()
+    } else {
+        qtsq_explicit
+            .filter(|p| p.join("libqtsq.a").exists())
+            .or_else(|| {
+                let home = env::var("HOME").ok()?;
+                let candidate = PathBuf::from(home).join("projects").join("black-hole-disk");
+                if candidate.join("libqtsq.a").exists() {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
+                let candidate = manifest.join("../../deps/qtsq");
+                if candidate.join("libqtsq.a").exists() {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            })
+    };
     // P3 (AUDIT-2026-09-07): the probe used to look for libqtsq.a on every
     // host while sofuu-ffi/build.rs links qtsq.lib (or SOFUU_QTSQ_LIB) on
     // Windows — the two crates' has_qtsq cfgs could disagree on a Windows
@@ -114,7 +127,7 @@ fn main() {
         Some(dir) => dir.join("libqtsq.a"),
         None => PathBuf::new(),
     };
-    let has_qtsq = qtsq_dir.is_some() && qtsq_lib.exists();
+    let has_qtsq = !no_qtsq_marker && qtsq_dir.is_some() && qtsq_lib.exists();
     // B7 (ROADMAP-BRAIN-CMA): watch the probed paths on EVERY outcome —
     // emitting them only on success let a failed probe cache forever (the
     // codec owner rebuilds libqtsq.a, cargo never re-probes, and the build
@@ -126,6 +139,10 @@ fn main() {
     }
     if has_qtsq {
         println!("cargo:rustc-cfg=has_qtsq");
+    } else if no_qtsq_marker {
+        // Explicit codec-less build (dist/no-qtsq marker): compile the memory
+        // surface out and proceed. iOS SDK packs ship this shape by design.
+        println!("cargo:warning=sofuu-core: codec-less build (SOFUU_QTSQ_DIR is the no-qtsq marker)");
     } else if let Some(dir) = &qtsq_dir {
         panic!(
             "{} not found at {} — QTSQ is a mandatory core component of Sofuu. \

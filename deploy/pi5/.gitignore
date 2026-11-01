@@ -1,0 +1,13 @@
+# Local artifacts produced by the M-R0/M-R3 procedures: never commit a brain,
+# a compiled device binary, or a build receipt.
+#
+# NOTE: no bare `ambient` pattern here — it would hide the source directory
+# deploy/pi5/ambient/ from git. Only built files are ignored.
+*.qtsq
+*.qtsq.d/
+*.brain.qtsq
+*.brain.qtsq.d/
+/ambient/ambient
+/ambient/seed.brain.qtsq
+build/
+pi5-baseline-*.json

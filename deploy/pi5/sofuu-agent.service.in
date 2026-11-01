@@ -1,0 +1,64 @@
+; deploy/pi5/sofuu-agent.service.in — systemd unit template for the M-R0/M-R3
+; Pi 5 ambient device.
+;
+; `install.sh` substitutes the two @PLACEHOLDER@ lines and drops the result at
+; /etc/systemd/system/sofuu-agent.service. Nothing else in this file is
+; generated: what you read is what runs.
+;
+; The service runs ONE program, which is either
+;   * a `sofuu compile --embed-brain` artifact (production shape), or
+;   * `/usr/local/bin/sofuu run /usr/local/lib/sofuu/ambient/agent.js`
+;     (development shape — same program, brain opened from disk).
+;
+; Why the hardening below:
+;   * ProtectSystem=strict + ProtectHome=yes mean the binary can only write
+;     what StateDirectory/ReadWritePaths expose — the brain and its WAL.
+;   * RestrictAddressFamilies=AF_UNIX is the STRUCTURAL offline guarantee: a
+;     device that never gets an AF_INET/AF_INET6 socket cannot phone home,
+;     regardless of what the R7 policy or a later prompt says. Add AF_INET
+;     only when a program on the device is meant to reach the network.
+;   * WatchdogSec is deliberately absent. The binary does not call sd_notify
+;     yet (v2); setting WatchdogSec now would make systemd kill a healthy
+;     service every interval. The FC's GCS failsafe is the real dead-man on
+;     vehicles; on ambient devices Restart=on-failure is the supervisor.
+
+[Unit]
+Description=Sofuu ambient device agent
+Documentation=https://sofuu.xyz/docs
+# Deliberately no network-online.target: the device must start offline.
+After=network.target
+
+[Service]
+Type=simple
+User=sofuu
+Group=sofuu
+WorkingDirectory=@WORK_DIR@
+Environment=HOME=/var/lib/sofuu
+EnvironmentFile=-/etc/sofuu/agent.env
+ExecStart=@EXEC_START@
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+KillSignal=SIGTERM
+
+# Writable state: the brain, its .d/ segments and .sofuu/ live here.
+StateDirectory=sofuu
+StateDirectoryMode=0750
+
+# Sandbox
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/sofuu
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+
+# Reserved for v2, when the runtime learns sd_notify:
+#WatchdogSec=30s
+
+[Install]
+WantedBy=multi-user.target

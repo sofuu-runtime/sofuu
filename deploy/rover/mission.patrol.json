@@ -1,0 +1,18 @@
+{
+  "vehicle": "rover-sim",
+  "steps": [
+    { "type": "arm", "on": true },
+    { "type": "speed", "speed": 1.5 },
+    { "type": "goto", "lat": -35.363261, "lon": 149.165230, "alt": 0, "speed": 1.5 },
+    { "type": "goto", "lat": -35.363171, "lon": 149.165230, "alt": 0, "speed": 1.5 },
+    { "type": "goto", "lat": -35.363171, "lon": 149.165320, "alt": 0, "speed": 1.5 },
+    { "type": "goto", "lat": -35.363261, "lon": 149.165320, "alt": 0, "speed": 1.5 },
+    { "type": "hold" },
+    { "type": "rtl" }
+  ],
+  "safety": {
+    "maxAlt": 1,
+    "geofenceRadius": 50,
+    "rtlBattery": 25
+  }
+}

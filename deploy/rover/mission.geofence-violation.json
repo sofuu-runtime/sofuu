@@ -1,0 +1,18 @@
+{
+  "_notes": [
+    "Pre-flight refusal case: the second waypoint is ~100 m east of home while",
+    "the rover policy's geofenceRadiusM is 50 — expect E_SAFETY_VIOLATION /",
+    "R-HW/bounds/geofenceRadiusM and NOTHING sent."
+  ],
+  "vehicle": "rover-sim",
+  "steps": [
+    { "type": "arm", "on": true },
+    { "type": "speed", "speed": 1.5 },
+    { "type": "goto", "lat": -35.363261, "lon": 149.165230, "alt": 0, "speed": 1.5 },
+    { "type": "goto", "lat": -35.363261, "lon": 149.166330, "alt": 0, "speed": 1.5 }
+  ],
+  "safety": {
+    "maxAlt": 1,
+    "geofenceRadius": 50
+  }
+}

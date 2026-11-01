@@ -1,0 +1,45 @@
+{
+  "_notes": [
+    "PLAN-ROBOTICS-PI5-EDGE §4.3 — ground profile for an ArduPilot Rover.",
+    "The mission path is shared with the drone plan; only the bounds and the",
+    "send allowlist are ground-specific. SITL first: add the Mac's address as a",
+    "udpout: entry before a Pi↔Mac run, and keep mavlink.mode allowlist —",
+    "observe cannot command anything.",
+    "maxAltRelM is 1, not 0: a rover mission passes alt=0 on goto, and the gate",
+    "requires a finite altitude at or below the bound."
+  ],
+  "hardware": {
+    "enabled": true,
+    "devices": {
+      "mode": "allowlist",
+      "allow": [
+        { "path": "udp:127.0.0.1:14550", "class": "mavlink-udp" },
+        { "path": "udpout:127.0.0.1:14550", "class": "mavlink-udp" },
+        { "path": "udp:0.0.0.0:14550", "class": "mavlink-udp" }
+      ]
+    },
+    "mavlink": {
+      "mode": "allowlist",
+      "send": ["HEARTBEAT", "COMMAND_*", "SET_POSITION_TARGET_*"],
+      "deny": ["PARAM_SET", "MAV_CMD_DO_MOTOR_TEST"],
+      "rateLimits": {
+        "COMMAND_*": "10Hz",
+        "SET_POSITION_TARGET_*": "20Hz",
+        "HEARTBEAT": "1Hz"
+      }
+    },
+    "bounds": {
+      "maxSpeedMs": 3,
+      "maxAltRelM": 1,
+      "maxYawRateDs": 90,
+      "geofenceRadiusM": 50
+    },
+    "approval": "off"
+  },
+  "shell": {
+    "enabled": false
+  },
+  "net": {
+    "enabled": false
+  }
+}

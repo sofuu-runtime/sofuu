@@ -1,0 +1,16 @@
+{
+  "_notes": [
+    "Pre-flight refusal case: 8 m/s exceeds the ground profile's maxSpeedMs 3.",
+    "Expect E_SAFETY_VIOLATION / R-HW/bounds/maxSpeedMs and NOTHING sent."
+  ],
+  "vehicle": "rover-sim",
+  "steps": [
+    { "type": "arm", "on": true },
+    { "type": "speed", "speed": 8 },
+    { "type": "goto", "lat": -35.363261, "lon": 149.165230, "alt": 0, "speed": 8 }
+  ],
+  "safety": {
+    "maxAlt": 1,
+    "geofenceRadius": 50
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "shell": {
+    "enabled": false
+  },
+  "net": {
+    "enabled": false,
+    "allow": [],
+    "deny": []
+  },
+  "fs": {
+    "read": ["/var/lib/sofuu", "/sys/class/thermal"],
+    "write": ["/var/lib/sofuu"]
+  },
+  "http": {
+    "deny": ["/"]
+  },
+  "mcp": {
+    "servers": {
+      "allow": ["__none__"]
+    }
+  },
+  "tools": {
+    "allow": [],
+    "deny": ["*"]
+  },
+  "approval": {
+    "mode": "never"
+  },
+  "secrets": {
+    "source": "env"
+  },
+  "memory": {
+    "write": "on"
+  }
+}

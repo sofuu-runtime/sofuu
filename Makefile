@@ -38,7 +38,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 
 .PHONY: all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
 	observability-stress asan fuzz-simd policy-dx modern-npm sbom sign-dist \
-        deps scoreboard scoreboard-check \
+        deps scoreboard scoreboard-check cuda-check \
         libsofuu libsofuu-linux-x86_64 zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
         headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
@@ -99,6 +99,13 @@ c-only:
 # file: QuickJS bytecode is deterministic for a given binary.
 bc-check: $(TARGET)
 	@./scripts/check-driver-bc.sh
+
+# ── CUDA kernel gate (PLAN-GPU-CUDA C0/C1) ──────────────────────
+# No GPU required: regenerates/verifies the checked-in PTX and runs the
+# host-compiled kernel math against independent scalar references. The real
+# GPU pass is scripts/cuda/kaggle_gpu_check.sh on Kaggle's T4.
+cuda-check:
+	@bash scripts/cuda/check_kernels.sh
 
 # ── Vendored C dependencies ───────────────────────────────────────────
 # The Rust build links libuv from deps/libuv/build; a fresh clone has no

@@ -1,0 +1,968 @@
+// crates/sofuu-core/src/infer/cuda.rs — safe Rust surface over the runtime
+// CUDA driver loader (PLAN-GPU-CUDA C0/C1).
+//
+// Design constraints from the plan:
+//   * no CUDA toolkit at build time, no libcudart at runtime;
+//   * the driver is dlopen()ed through src/cuda/cuda_loader.c;
+//   * the kernel module is checked-in PTX, inflated here with flate2 (Rust)
+//     rather than zlib (musl cross builds have no system libz);
+//   * every failure degrades to None / Err — callers keep the CPU engine.
+//
+// Platform policy: the real backend is Linux. On macOS this module still
+// compiles, but the release build references no loader symbols, so the C
+// object is not linked and the tight macOS binary budget is unaffected.
+// Tests on either OS exercise the loader's no-driver path directly.
+
+#[allow(unused_imports)]
+use std::ffi::{CStr, CString};
+#[allow(unused_imports)]
+use std::os::raw::{c_char, c_int, c_void};
+#[allow(unused_imports)]
+use std::ptr;
+/// Every kernel name the checked-in PTX must export. Kept in one place so the
+/// generator script, the Rust init check and the tests cannot drift.
+pub const PTX_ENTRIES: [&str; 8] = [
+    "sofuu_gemv_q8_0",
+    "sofuu_gemv_q4_k",
+    "sofuu_gemv_q6_k",
+    "sofuu_gemv_f32",
+    "sofuu_rmsnorm",
+    "sofuu_swiglu",
+    "sofuu_rope_f32",
+    "sofuu_kv_write_f32",
+];
+
+/// Weight layouts the C1 kernels cover. `block_bytes` is the GGML on-disk
+/// block size; `qk` is the number of values per block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quant {
+    F32,
+    Q8_0,
+    Q4K,
+    Q6K,
+}
+
+impl Quant {
+    pub fn entry(self) -> &'static str {
+        match self {
+            Quant::F32 => "sofuu_gemv_f32",
+            Quant::Q8_0 => "sofuu_gemv_q8_0",
+            Quant::Q4K => "sofuu_gemv_q4_k",
+            Quant::Q6K => "sofuu_gemv_q6_k",
+        }
+    }
+
+    /// Values per quant block (1 for f32).
+    pub fn qk(self) -> usize {
+        match self {
+            Quant::F32 => 1,
+            Quant::Q8_0 => 32,
+            Quant::Q4K | Quant::Q6K => 256,
+        }
+    }
+
+    /// Bytes per quant block (4 for f32).
+    pub fn block_bytes(self) -> usize {
+        match self {
+            Quant::F32 => 4,
+            Quant::Q8_0 => 34,
+            Quant::Q4K => 144,
+            Quant::Q6K => 210,
+        }
+    }
+
+    /// True when `cols` is a legal row width for this layout.
+    pub fn accepts_cols(self, cols: usize) -> bool {
+        cols != 0 && cols % self.qk() == 0
+    }
+
+    pub fn row_bytes(self, cols: usize) -> Option<usize> {
+        if !self.accepts_cols(cols) {
+            return None;
+        }
+        Some((cols / self.qk()) * self.block_bytes())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct DeviceInfo {
+    pub name: String,
+    pub cc_major: i32,
+    pub cc_minor: i32,
+    pub total_memory: u64,
+    pub integrated: bool,
+    pub unified_addressing: bool,
+    pub driver_version: i32,
+    pub library: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct CudaError(pub String);
+
+impl std::fmt::Display for CudaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CudaError {}
+
+/// A device allocation. `ptr` is a CUdeviceptr value, not a host pointer.
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceBuf {
+    pub ptr: u64,
+    pub bytes: usize,
+}
+
+fn debug_on() -> bool {
+    std::env::var("SOFUU_CUDA_DEBUG")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false)
+}
+
+fn kill_switch() -> bool {
+    matches!(
+        std::env::var("SOFUU_CUDA").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
+fn debug(msg: impl std::fmt::Display) {
+    if debug_on() {
+        eprintln!("[cuda] {msg}");
+    }
+}
+
+// The loader is linked on Linux in every build, and on macOS only in test
+// binaries (a macOS release has no CUDA consumer, so the object stays out of
+// the binary and the 5.5 MiB budget is unchanged).
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+mod sys {
+    use super::*;
+
+    extern "C" {
+        pub fn sofuu_cuda_driver_open(path: *const c_char) -> *mut c_void;
+        pub fn sofuu_cuda_driver_close(driver: *mut c_void);
+        pub fn sofuu_cuda_driver_path(driver: *const c_void) -> *const c_char;
+        pub fn sofuu_cuda_driver_version(driver: *const c_void) -> c_int;
+        pub fn sofuu_cuda_driver_device_count(driver: *const c_void) -> c_int;
+        pub fn sofuu_cuda_driver_device_info(
+            driver: *const c_void,
+            ordinal: c_int,
+            name: *mut c_char,
+            name_cap: usize,
+            cc_major: *mut c_int,
+            cc_minor: *mut c_int,
+            total_mem: *mut u64,
+            integrated: *mut c_int,
+            unified: *mut c_int,
+        ) -> c_int;
+        pub fn sofuu_cuda_ctx_create(driver: *mut c_void, ordinal: c_int) -> *mut c_void;
+        pub fn sofuu_cuda_ctx_destroy(ctx: *mut c_void);
+        pub fn sofuu_cuda_ctx_load_ptx(ctx: *mut c_void, ptx: *const c_char) -> c_int;
+        pub fn sofuu_cuda_ctx_function(
+            ctx: *mut c_void,
+            name: *const c_char,
+            out: *mut *mut c_void,
+        ) -> c_int;
+        pub fn sofuu_cuda_ctx_alloc(ctx: *mut c_void, bytes: u64, out: *mut u64) -> c_int;
+        pub fn sofuu_cuda_ctx_free(ctx: *mut c_void, ptr: u64) -> c_int;
+        pub fn sofuu_cuda_ctx_upload(
+            ctx: *mut c_void,
+            dst: u64,
+            src: *const c_void,
+            bytes: usize,
+        ) -> c_int;
+        pub fn sofuu_cuda_ctx_download(
+            ctx: *mut c_void,
+            dst: *mut c_void,
+            src: u64,
+            bytes: usize,
+        ) -> c_int;
+        pub fn sofuu_cuda_ctx_launch(
+            ctx: *mut c_void,
+            function: *mut c_void,
+            gx: u32,
+            gy: u32,
+            gz: u32,
+            bx: u32,
+            by: u32,
+            bz: u32,
+            shared: u32,
+            params: *mut *mut c_void,
+        ) -> c_int;
+        pub fn sofuu_cuda_ctx_sync(ctx: *mut c_void) -> c_int;
+        pub fn sofuu_cuda_ctx_host_register(
+            ctx: *mut c_void,
+            host: *mut c_void,
+            bytes: usize,
+            out_dev: *mut u64,
+        ) -> c_int;
+        pub fn sofuu_cuda_ctx_host_unregister(ctx: *mut c_void, host: *mut c_void) -> c_int;
+        pub fn sofuu_cuda_last_error() -> *const c_char;
+        pub fn sofuu_cuda_driver_present() -> c_int;
+    }
+
+    pub fn last_error() -> String {
+        unsafe {
+            let p = sofuu_cuda_last_error();
+            if p.is_null() {
+                "unknown CUDA error".to_string()
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        }
+    }
+}
+
+pub use imp::CudaEngine;
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+mod imp {
+    use super::*;
+    use std::collections::HashMap;
+
+    // Embedded on Linux for the real backend, and in test builds so the PTX
+    // inflation path is exercised on any host (the bytes are 5.7 KB gzipped).
+    const PTX_GZ: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../src/cuda/kernels.ptx.gz"
+    ));
+
+    fn inflate_ptx() -> Result<String, CudaError> {
+        use std::io::Read;
+        let mut gz = flate2::read::GzDecoder::new(PTX_GZ);
+        let mut out = String::new();
+        gz.read_to_string(&mut out)
+            .map_err(|e| CudaError(format!("inflate kernels.ptx.gz: {e}")))?;
+        if out.is_empty() {
+            return Err(CudaError("embedded kernels.ptx.gz is empty".into()));
+        }
+        Ok(out)
+    }
+
+    fn take_error(what: &str) -> CudaError {
+        let msg = sys::last_error();
+        debug(format!("{what}: {msg}"));
+        CudaError(format!("{what}: {msg}"))
+    }
+
+    fn info_from(driver: *const c_void, ordinal: i32) -> Result<DeviceInfo, CudaError> {
+        let mut name = [0 as c_char; 256];
+        let (mut major, mut minor) = (0 as c_int, 0 as c_int);
+        let mut total = 0u64;
+        let (mut integrated, mut unified) = (0 as c_int, 0 as c_int);
+        let rc = unsafe {
+            sys::sofuu_cuda_driver_device_info(
+                driver,
+                ordinal,
+                name.as_mut_ptr(),
+                name.len(),
+                &mut major,
+                &mut minor,
+                &mut total,
+                &mut integrated,
+                &mut unified,
+            )
+        };
+        if rc != 0 {
+            return Err(take_error("device_info"));
+        }
+        let cname = unsafe { CStr::from_ptr(name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        let lib = unsafe {
+            let p = sys::sofuu_cuda_driver_path(driver);
+            if p.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(p).to_string_lossy().into_owned()
+            }
+        };
+        Ok(DeviceInfo {
+            name: cname,
+            cc_major: major,
+            cc_minor: minor,
+            total_memory: total,
+            integrated: integrated != 0,
+            unified_addressing: unified != 0,
+            driver_version: unsafe { sys::sofuu_cuda_driver_version(driver) },
+            library: lib,
+        })
+    }
+
+    /// Cheap probe: opens the driver and reads device 0, without creating a
+    /// context or JIT-compiling the module.
+    pub fn probe() -> Option<DeviceInfo> {
+        if kill_switch() {
+            debug("SOFUU_CUDA=0 — CUDA disabled");
+            return None;
+        }
+        let driver = unsafe { sys::sofuu_cuda_driver_open(ptr::null()) };
+        if driver.is_null() {
+            debug(format!("no CUDA driver: {}", sys::last_error()));
+            return None;
+        }
+        let ordinal = device_ordinal();
+        let info = info_from(driver, ordinal);
+        unsafe { sys::sofuu_cuda_driver_close(driver) };
+        match info {
+            Ok(i) => Some(i),
+            Err(e) => {
+                debug(e.0);
+                None
+            }
+        }
+    }
+
+    pub fn driver_present() -> bool {
+        unsafe { sys::sofuu_cuda_driver_present() != 0 }
+    }
+
+    fn device_ordinal() -> i32 {
+        std::env::var("SOFUU_CUDA_DEVICE")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(0)
+    }
+
+    pub struct CudaEngine {
+        driver: *mut c_void,
+        ctx: *mut c_void,
+        funcs: HashMap<&'static str, *mut c_void>,
+        info: DeviceInfo,
+    }
+
+    impl CudaEngine {
+        /// Initialise driver → device → context → PTX module → entry points.
+        /// Any failure returns None; the caller keeps the CPU engine.
+        pub fn try_init() -> Option<Self> {
+            if kill_switch() {
+                debug("SOFUU_CUDA=0 — CUDA disabled");
+                return None;
+            }
+            unsafe {
+                let driver = sys::sofuu_cuda_driver_open(ptr::null());
+                if driver.is_null() {
+                    debug(format!("no CUDA driver: {}", sys::last_error()));
+                    return None;
+                }
+                let ordinal = device_ordinal();
+                let info = match info_from(driver, ordinal) {
+                    Ok(i) => i,
+                    Err(e) => {
+                        debug(e.0);
+                        sys::sofuu_cuda_driver_close(driver);
+                        return None;
+                    }
+                };
+                let ctx = sys::sofuu_cuda_ctx_create(driver, ordinal);
+                if ctx.is_null() {
+                    debug(format!("context: {}", sys::last_error()));
+                    sys::sofuu_cuda_driver_close(driver);
+                    return None;
+                }
+
+                let ptx = match inflate_ptx() {
+                    Ok(p) => p,
+                    Err(e) => {
+                        debug(e.0);
+                        sys::sofuu_cuda_ctx_destroy(ctx);
+                        sys::sofuu_cuda_driver_close(driver);
+                        return None;
+                    }
+                };
+                let Ok(ptx_c) = CString::new(ptx) else {
+                    debug("PTX contains an interior NUL");
+                    sys::sofuu_cuda_ctx_destroy(ctx);
+                    sys::sofuu_cuda_driver_close(driver);
+                    return None;
+                };
+                if sys::sofuu_cuda_ctx_load_ptx(ctx, ptx_c.as_ptr()) != 0 {
+                    debug(format!("cuModuleLoadData: {}", sys::last_error()));
+                    sys::sofuu_cuda_ctx_destroy(ctx);
+                    sys::sofuu_cuda_driver_close(driver);
+                    return None;
+                }
+
+                let mut funcs = HashMap::with_capacity(PTX_ENTRIES.len());
+                for name in PTX_ENTRIES {
+                    let Ok(cname) = CString::new(name) else {
+                        continue;
+                    };
+                    let mut f: *mut c_void = ptr::null_mut();
+                    if sys::sofuu_cuda_ctx_function(ctx, cname.as_ptr(), &mut f) != 0 {
+                        debug(format!("missing kernel {name}: {}", sys::last_error()));
+                        sys::sofuu_cuda_ctx_destroy(ctx);
+                        sys::sofuu_cuda_driver_close(driver);
+                        return None;
+                    }
+                    funcs.insert(name, f);
+                }
+
+                debug(format!(
+                    "initialised {} cc{}.{} on {}",
+                    info.name, info.cc_major, info.cc_minor, info.library
+                ));
+                Some(CudaEngine {
+                    driver,
+                    ctx,
+                    funcs,
+                    info,
+                })
+            }
+        }
+
+        pub fn device_info(&self) -> &DeviceInfo {
+            &self.info
+        }
+
+        pub fn is_unified_memory(&self) -> bool {
+            self.info.integrated || self.info.unified_addressing
+        }
+
+        pub fn alloc(&self, bytes: usize) -> Result<DeviceBuf, CudaError> {
+            if bytes == 0 {
+                return Err(CudaError("cannot allocate 0 bytes".into()));
+            }
+            let mut ptr = 0u64;
+            if unsafe { sys::sofuu_cuda_ctx_alloc(self.ctx, bytes as u64, &mut ptr) } != 0 {
+                return Err(take_error("cuMemAlloc"));
+            }
+            Ok(DeviceBuf { ptr, bytes })
+        }
+
+        pub fn free_buf(&self, buf: DeviceBuf) -> Result<(), CudaError> {
+            if unsafe { sys::sofuu_cuda_ctx_free(self.ctx, buf.ptr) } != 0 {
+                return Err(take_error("cuMemFree"));
+            }
+            Ok(())
+        }
+
+        pub fn upload(&self, dst: DeviceBuf, host: &[u8]) -> Result<(), CudaError> {
+            if host.len() > dst.bytes {
+                return Err(CudaError(format!(
+                    "upload {} B into a {} B device buffer",
+                    host.len(),
+                    dst.bytes
+                )));
+            }
+            if unsafe {
+                sys::sofuu_cuda_ctx_upload(
+                    self.ctx,
+                    dst.ptr,
+                    host.as_ptr() as *const c_void,
+                    host.len(),
+                )
+            } != 0
+            {
+                return Err(take_error("cuMemcpyHtoD"));
+            }
+            Ok(())
+        }
+
+        pub fn download(&self, dst: &mut [u8], src: DeviceBuf) -> Result<(), CudaError> {
+            if dst.len() > src.bytes {
+                return Err(CudaError(format!(
+                    "download {} B from a {} B device buffer",
+                    dst.len(),
+                    src.bytes
+                )));
+            }
+            if unsafe {
+                sys::sofuu_cuda_ctx_download(
+                    self.ctx,
+                    dst.as_mut_ptr() as *mut c_void,
+                    src.ptr,
+                    dst.len(),
+                )
+            } != 0
+            {
+                return Err(take_error("cuMemcpyDtoH"));
+            }
+            Ok(())
+        }
+
+        pub fn sync(&self) -> Result<(), CudaError> {
+            if unsafe { sys::sofuu_cuda_ctx_sync(self.ctx) } != 0 {
+                return Err(take_error("cuStreamSynchronize"));
+            }
+            Ok(())
+        }
+
+        fn function(&self, name: &str) -> Result<*mut c_void, CudaError> {
+            self.funcs
+                .get(name)
+                .copied()
+                .ok_or_else(|| CudaError(format!("kernel {name} is not in the PTX module")))
+        }
+
+        fn launch(
+            &self,
+            name: &str,
+            grid: (u32, u32, u32),
+            block: (u32, u32, u32),
+            params: &mut [*mut c_void],
+        ) -> Result<(), CudaError> {
+            let f = self.function(name)?;
+            let rc = unsafe {
+                sys::sofuu_cuda_ctx_launch(
+                    self.ctx,
+                    f,
+                    grid.0,
+                    grid.1,
+                    grid.2,
+                    block.0,
+                    block.1,
+                    block.2,
+                    0,
+                    params.as_mut_ptr(),
+                )
+            };
+            if rc != 0 {
+                return Err(take_error(name));
+            }
+            self.sync()
+        }
+
+        /// Row-major GEMV: y[r] = dot(weights[r], x). `weights` holds
+        /// `rows * row_bytes(cols)` bytes in GGML layout for `quant`.
+        pub fn gemv(
+            &self,
+            quant: Quant,
+            weights: DeviceBuf,
+            x: DeviceBuf,
+            y: DeviceBuf,
+            rows: usize,
+            cols: usize,
+        ) -> Result<(), CudaError> {
+            let Some(row_bytes) = quant.row_bytes(cols) else {
+                return Err(CudaError(format!(
+                    "{} does not accept cols={cols}",
+                    quant.entry()
+                )));
+            };
+            let need_w = row_bytes
+                .checked_mul(rows)
+                .ok_or_else(|| CudaError("weight size overflow".into()))?;
+            let need_x = cols * 4; // every kernel takes f32 activations
+            let need_y = rows * 4;
+            if weights.bytes < need_w || x.bytes < need_x || y.bytes < need_y {
+                return Err(CudaError(format!(
+                    "gemv buffers too small: w {}<{}, x {}<{}, y {}<{}",
+                    weights.bytes, need_w, x.bytes, need_x, y.bytes, need_y
+                )));
+            }
+            let mut w = weights.ptr;
+            let mut xp = x.ptr;
+            let mut yp = y.ptr;
+            let mut r = rows as i32;
+            let mut c = cols as i32;
+            let mut params: [*mut c_void; 5] = [
+                &mut w as *mut u64 as *mut c_void,
+                &mut xp as *mut u64 as *mut c_void,
+                &mut yp as *mut u64 as *mut c_void,
+                &mut r as *mut i32 as *mut c_void,
+                &mut c as *mut i32 as *mut c_void,
+            ];
+            self.launch(quant.entry(), (rows as u32, 1, 1), (256, 1, 1), &mut params)
+        }
+
+        pub fn rmsnorm(
+            &self,
+            x: DeviceBuf,
+            w: DeviceBuf,
+            y: DeviceBuf,
+            n: usize,
+            eps: f32,
+        ) -> Result<(), CudaError> {
+            let mut xp = x.ptr;
+            let mut wp = w.ptr;
+            let mut yp = y.ptr;
+            let mut nn = n as i32;
+            let mut ee = eps;
+            let mut params: [*mut c_void; 5] = [
+                &mut xp as *mut u64 as *mut c_void,
+                &mut wp as *mut u64 as *mut c_void,
+                &mut yp as *mut u64 as *mut c_void,
+                &mut nn as *mut i32 as *mut c_void,
+                &mut ee as *mut f32 as *mut c_void,
+            ];
+            self.launch("sofuu_rmsnorm", (1, 1, 1), (256, 1, 1), &mut params)
+        }
+
+        pub fn swiglu(
+            &self,
+            g: DeviceBuf,
+            u: DeviceBuf,
+            y: DeviceBuf,
+            n: usize,
+        ) -> Result<(), CudaError> {
+            let mut gp = g.ptr;
+            let mut up = u.ptr;
+            let mut yp = y.ptr;
+            let mut nn = n as i32;
+            let mut params: [*mut c_void; 4] = [
+                &mut gp as *mut u64 as *mut c_void,
+                &mut up as *mut u64 as *mut c_void,
+                &mut yp as *mut u64 as *mut c_void,
+                &mut nn as *mut i32 as *mut c_void,
+            ];
+            let grid = ((n + 255) / 256) as u32;
+            self.launch("sofuu_swiglu", (grid, 1, 1), (256, 1, 1), &mut params)
+        }
+
+        pub fn rope(
+            &self,
+            x: DeviceBuf,
+            cos_tab: DeviceBuf,
+            sin_tab: DeviceBuf,
+            n_heads: usize,
+            head_dim: usize,
+            n_rot: usize,
+            interleaved: bool,
+        ) -> Result<(), CudaError> {
+            let mut xp = x.ptr;
+            let mut cp = cos_tab.ptr;
+            let mut sp = sin_tab.ptr;
+            let mut h = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut nr = n_rot as i32;
+            let mut il = if interleaved { 1i32 } else { 0i32 };
+            let mut params: [*mut c_void; 7] = [
+                &mut xp as *mut u64 as *mut c_void,
+                &mut cp as *mut u64 as *mut c_void,
+                &mut sp as *mut u64 as *mut c_void,
+                &mut h as *mut i32 as *mut c_void,
+                &mut hd as *mut i32 as *mut c_void,
+                &mut nr as *mut i32 as *mut c_void,
+                &mut il as *mut i32 as *mut c_void,
+            ];
+            self.launch(
+                "sofuu_rope_f32",
+                (n_heads as u32, 1, 1),
+                (128, 1, 1),
+                &mut params,
+            )
+        }
+
+        pub fn kv_write(
+            &self,
+            k_cache: DeviceBuf,
+            v_cache: DeviceBuf,
+            k: DeviceBuf,
+            v: DeviceBuf,
+            pos: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            cap: usize,
+        ) -> Result<(), CudaError> {
+            let mut kc = k_cache.ptr;
+            let mut vc = v_cache.ptr;
+            let mut kp = k.ptr;
+            let mut vp = v.ptr;
+            let mut p = pos as i32;
+            let mut h = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut c = cap as i32;
+            let mut params: [*mut c_void; 8] = [
+                &mut kc as *mut u64 as *mut c_void,
+                &mut vc as *mut u64 as *mut c_void,
+                &mut kp as *mut u64 as *mut c_void,
+                &mut vp as *mut u64 as *mut c_void,
+                &mut p as *mut i32 as *mut c_void,
+                &mut h as *mut i32 as *mut c_void,
+                &mut hd as *mut i32 as *mut c_void,
+                &mut c as *mut i32 as *mut c_void,
+            ];
+            self.launch(
+                "sofuu_kv_write_f32",
+                (n_kv_heads as u32, 1, 1),
+                (128, 1, 1),
+                &mut params,
+            )
+        }
+
+        /// Host-side convenience used by integration tests: upload, run, read
+        /// back. Not on the model's hot path.
+        pub fn gemv_host(
+            &self,
+            quant: Quant,
+            weights: &[u8],
+            x: &[f32],
+            rows: usize,
+            cols: usize,
+        ) -> Result<Vec<f32>, CudaError> {
+            let row_bytes = quant
+                .row_bytes(cols)
+                .ok_or_else(|| CudaError("bad cols".into()))?;
+            if weights.len() < row_bytes * rows {
+                return Err(CudaError("weights slice too short".into()));
+            }
+            if x.len() < cols {
+                return Err(CudaError("x slice too short".into()));
+            }
+            let dw = self.alloc(row_bytes * rows)?;
+            let dx = self.alloc(cols * 4)?;
+            let dy = self.alloc(rows * 4)?;
+            let result = (|| {
+                self.upload(dw, &weights[..row_bytes * rows])?;
+                self.upload(dx, bytemuck_view(x))?;
+                self.gemv(quant, dw, dx, dy, rows, cols)?;
+                let mut out = vec![0f32; rows];
+                let mut bytes = vec![0u8; rows * 4];
+                self.download(&mut bytes, dy)?;
+                for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+                    out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                }
+                Ok(out)
+            })();
+            let _ = self.free_buf(dw);
+            let _ = self.free_buf(dx);
+            let _ = self.free_buf(dy);
+            result
+        }
+    }
+
+    /// View a float slice as bytes without unsafe pointer casts at call sites.
+    fn bytemuck_view(v: &[f32]) -> &[u8] {
+        // Safe: `[f32]` has no padding and every bit pattern is valid for u8.
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+    }
+
+    impl Drop for CudaEngine {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.ctx.is_null() {
+                    sys::sofuu_cuda_ctx_destroy(self.ctx);
+                    self.ctx = ptr::null_mut();
+                }
+                if !self.driver.is_null() {
+                    sys::sofuu_cuda_driver_close(self.driver);
+                    self.driver = ptr::null_mut();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", all(test, target_os = "macos"))))]
+mod imp {
+    use super::*;
+
+    /// On non-Linux release targets the native backend is not built. The type
+    /// still exists so model code can compile a single portable call site.
+    pub struct CudaEngine {
+        _private: (),
+    }
+
+    impl CudaEngine {
+        pub fn try_init() -> Option<Self> {
+            None
+        }
+
+        pub fn device_info(&self) -> &DeviceInfo {
+            unreachable!("CudaEngine can never be constructed on this target")
+        }
+
+        pub fn is_unified_memory(&self) -> bool {
+            false
+        }
+
+        pub fn alloc(&self, _bytes: usize) -> Result<DeviceBuf, CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn free_buf(&self, _buf: DeviceBuf) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn upload(&self, _dst: DeviceBuf, _host: &[u8]) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn download(&self, _dst: &mut [u8], _src: DeviceBuf) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn sync(&self) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn gemv(
+            &self,
+            _quant: Quant,
+            _weights: DeviceBuf,
+            _x: DeviceBuf,
+            _y: DeviceBuf,
+            _rows: usize,
+            _cols: usize,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn rmsnorm(
+            &self,
+            _x: DeviceBuf,
+            _w: DeviceBuf,
+            _y: DeviceBuf,
+            _n: usize,
+            _eps: f32,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn swiglu(
+            &self,
+            _g: DeviceBuf,
+            _u: DeviceBuf,
+            _y: DeviceBuf,
+            _n: usize,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn rope(
+            &self,
+            _x: DeviceBuf,
+            _cos: DeviceBuf,
+            _sin: DeviceBuf,
+            _n_heads: usize,
+            _head_dim: usize,
+            _n_rot: usize,
+            _interleaved: bool,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn kv_write(
+            &self,
+            _kc: DeviceBuf,
+            _vc: DeviceBuf,
+            _k: DeviceBuf,
+            _v: DeviceBuf,
+            _pos: usize,
+            _n_kv_heads: usize,
+            _head_dim: usize,
+            _cap: usize,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn gemv_host(
+            &self,
+            _quant: Quant,
+            _weights: &[u8],
+            _x: &[f32],
+            _rows: usize,
+            _cols: usize,
+        ) -> Result<Vec<f32>, CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+    }
+}
+
+/// True when a CUDA driver library + device are present. Cheap enough for
+/// diagnostics; does not create a context or JIT the module.
+pub fn driver_present() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        imp::driver_present()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Device identity without initialising the module. None when CUDA is
+/// unavailable or disabled with SOFUU_CUDA=0.
+pub fn probe() -> Option<DeviceInfo> {
+    #[cfg(target_os = "linux")]
+    {
+        imp::probe()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_is_absent_without_a_driver() {
+        // macOS/CI: graceful None, never a panic or a link error. On a real
+        // NVIDIA host the GPU gate (Kaggle) covers initialisation instead.
+        if driver_present() {
+            return;
+        }
+        assert!(CudaEngine::try_init().is_none());
+    }
+
+    #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+    #[test]
+    fn loader_reports_missing_driver_cleanly() {
+        let p = unsafe { sys::sofuu_cuda_driver_open(ptr::null()) };
+        if !p.is_null() {
+            unsafe { sys::sofuu_cuda_driver_close(p) };
+            return; // a real GPU host: the GPU gate covers this path
+        }
+        let msg = sys::last_error();
+        assert!(!msg.is_empty());
+        assert!(
+            msg.contains("no CUDA driver") || msg.contains("libcuda"),
+            "unexpected error text: {msg}"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+    #[test]
+    fn loader_rejects_a_bogus_library_path() {
+        let bogus = CString::new("/nonexistent/sofuu-libcuda.so.1").unwrap();
+        let p = unsafe { sys::sofuu_cuda_driver_open(bogus.as_ptr()) };
+        assert!(p.is_null());
+        let msg = sys::last_error();
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn ptx_manifest_contains_every_kernel() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src/cuda/kernels.ptx");
+        let ptx = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        for name in PTX_ENTRIES {
+            assert!(
+                ptx.contains(&format!(".entry {name}(")),
+                "kernels.ptx is missing {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_in_gzip_matches_ptx_source() {
+        use std::io::Read;
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src/cuda");
+        let ptx = std::fs::read_to_string(base.join("kernels.ptx")).unwrap();
+        let gz = std::fs::read(base.join("kernels.ptx.gz")).unwrap();
+        let mut decoded = String::new();
+        flate2::read::GzDecoder::new(&gz[..])
+            .read_to_string(&mut decoded)
+            .expect("inflate kernels.ptx.gz");
+        assert_eq!(decoded, ptx, "kernels.ptx.gz is stale");
+    }
+
+    #[test]
+    fn quant_layout_guards_are_honest() {
+        assert_eq!(Quant::Q8_0.block_bytes(), 34);
+        assert_eq!(Quant::Q4K.block_bytes(), 144);
+        assert_eq!(Quant::Q6K.block_bytes(), 210);
+        assert_eq!(Quant::Q4K.row_bytes(4096), Some(16 * 144));
+        assert_eq!(Quant::Q4K.row_bytes(1000), None);
+        assert_eq!(Quant::Q8_0.row_bytes(1024), Some(32 * 34));
+        assert_eq!(Quant::F32.row_bytes(7), Some(28));
+    }
+}

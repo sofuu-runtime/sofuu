@@ -5,6 +5,7 @@
 
 pub mod block_graph;
 pub mod continuous;
+pub mod cuda;
 pub mod dynamic_ffn;
 pub mod gguf;
 pub mod gptx3;

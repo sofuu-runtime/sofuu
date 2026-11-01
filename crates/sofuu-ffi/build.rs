@@ -242,6 +242,27 @@ fn main() {
     std::fs::write(out_dir.join("kernels_metal.h"), header)
         .expect("failed to write generated kernels_metal.h");
 
+    // ── CUDA driver loader (PLAN-GPU-CUDA C0) ──────────────────
+    // The loader opens libcuda.so.1 with dlopen() at RUNTIME; there is no
+    // CUDA toolkit, header, or link-time dependency anywhere in this build.
+    // The PTX module is embedded by sofuu-core (Rust + flate2), not here, so
+    // this block adds no .rodata and no zlib dependency (musl cross builds
+    // have no system libz). On macOS the object is compiled for the loader
+    // tests but a release binary references no symbol from it, so it is not
+    // linked and the 5.5 MiB budget is unchanged.
+    if target_os == "linux" || target_os == "macos" {
+        let cuda_loader = src.join("cuda/cuda_loader.c");
+        println!("cargo:rerun-if-changed={}", cuda_loader.display());
+        if cuda_loader.exists() {
+            let mut cuda = cc::Build::new();
+            cuda.opt_level(2)
+                .warnings(false)
+                .include(src.join("cuda"))
+                .file(&cuda_loader);
+            cuda.compile("sofuu_cuda_loader");
+        }
+    }
+
     // The Metal engine compiles for iOS as well as macOS (PLAN-EMBED-SDK
     // E3): the iOS xcframework slices used to contain no Metal code at all,
     // so an iPhone ran the CPU path no matter what the model config asked

@@ -32,18 +32,22 @@ pub const V2_THRESHOLD: f32 = 0.50;
 /// and precision 1.000 at this value.
 pub const THRESHOLD: f32 = 0.50;
 
-static WEIGHTS: &[u8] = include_bytes!("weights_v2.f32");
-pub static WEIGHTS_V2: &[u8] = WEIGHTS;
+static WEIGHTS_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ml_freshness_weights_v2.f32.gz"));
+static WEIGHTS_INFLATED: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+/// Inflated once, inside the lazy initialiser that already guards this model.
+fn weights() -> &'static [u8] {
+    WEIGHTS_INFLATED.get_or_init(|| crate::shipped::inflate_static(WEIGHTS_GZ, "ml freshness weights"))
+}
 
 pub static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
     // The blob is committed and CRC-checked by eval.rs on every test run;
     // a corrupt bake is a build-time mistake, not a runtime condition.
-    TinyMlp::from_blob(WEIGHTS).expect("committed freshness weights must load")
+    TinyMlp::from_blob(weights()).expect("committed freshness weights must load")
 });
 
 pub static NET_V2: LazyLock<&'static TinyMlp> = LazyLock::new(|| &NET);
 
-static BLOB_HASH: LazyLock<u64> = LazyLock::new(|| crate::ml::net::fnv1a64(WEIGHTS));
+static BLOB_HASH: LazyLock<u64> = LazyLock::new(|| crate::ml::net::fnv1a64(weights()));
 pub(crate) fn blob_hash() -> u64 {
     *BLOB_HASH
 }

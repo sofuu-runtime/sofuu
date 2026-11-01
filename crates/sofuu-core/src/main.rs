@@ -3793,6 +3793,17 @@ fn main() -> ExitCode {
             }
         }
         "swarm" => cmd_swarm(&args),
+        "drone" => {
+            /* PLAN-DRONES §4.6: the MAVLink link, no QuickJS boot. Every frame
+             * crosses rt/mavlink_gate.rs; `drone why` explains a refusal. */
+            let sub: Vec<String> = args.get(2..).unwrap_or(&[]).to_vec();
+            let rc = sofuu_core::drone_cmd::run(&sub);
+            if rc == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         "brain" => {
             /* W7: `sofuu brain …`. Only `migrate` needs the JS engine (the
              * runtime's own open→flush conversion); verify/repair/stats/

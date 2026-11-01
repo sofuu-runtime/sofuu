@@ -441,6 +441,30 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         // P3 (SPEC §5/§6): the session document — one export/import format
         // behind `sofuu.session` (T4.5) and the CLI's export/import arms.
         crate::rt::session_doc::mod_session_doc_register(ctx);
+        /* PLAN-DRONES §4.3/§4.4: the drone surface is CAPABILITY-GATED. With
+         * `hardware.enabled` absent or false, neither the native globals nor
+         * the `sofuu.mavlink` namespace are created — no door beats a locked
+         * door, exactly like a QTSQ-free build. */
+        if crate::rt::mavlink_js::hardware_enabled() {
+            crate::rt::mavlink_js::mod_mavlink_register(ctx);
+            let (mavlink_src, drone_src) = crate::rt::mavlink_js::driver_js();
+            if let Some(src) = mavlink_src {
+                crate::shipped::eval_shipped_with_bytecode(
+                    ctx as *mut std::os::raw::c_void,
+                    &src,
+                    None,
+                    "<mavlink-driver>",
+                );
+            }
+            if let Some(src) = drone_src {
+                crate::shipped::eval_shipped_with_bytecode(
+                    ctx as *mut std::os::raw::c_void,
+                    &src,
+                    None,
+                    "<drone-driver>",
+                );
+            }
+        }
         // sofuu.host.armDeadline(ms)/disarmDeadline(): a JS-callable interrupt
         // deadline on THIS context, so a runaway synchronous plugin (run, chat,
         // serve, eval) is abortable — the sandbox meter never covered it.

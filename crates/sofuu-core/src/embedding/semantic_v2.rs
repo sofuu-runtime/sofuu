@@ -453,17 +453,22 @@ impl QuantizedV2 {
 /// The graded round-9 soup artifact (seed 47 kept): fnv1a64 id
 /// dffb00185d090662, 30,636 B.  Never retrain silently — a new artifact
 /// gets a new file AND fails the golden test below on purpose.
-static WEIGHTS_V2: &[u8] = include_bytes!("weights_v2.sem");
+static WEIGHTS_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/embedding_weights_v2.sem.gz"));
+static WEIGHTS_INFLATED: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+/// Inflated once, inside the lazy initialiser that already guards this model.
+fn weights() -> &'static [u8] {
+    WEIGHTS_INFLATED.get_or_init(|| crate::shipped::inflate_static(WEIGHTS_GZ, "semantic v2 projector"))
+}
 static BAKED_MODEL_V2: OnceLock<Result<QuantizedV2, &'static str>> = OnceLock::new();
 
 /// Raw bytes of the baked SEM2 artifact (for cross-checks).
 pub fn weights_v2_bytes() -> &'static [u8] {
-    WEIGHTS_V2
+    weights()
 }
 
 pub fn baked_model_v2() -> Result<&'static QuantizedV2, &'static str> {
     BAKED_MODEL_V2
-        .get_or_init(|| QuantizedV2::from_blob(WEIGHTS_V2))
+        .get_or_init(|| QuantizedV2::from_blob(weights()))
         .as_ref()
         .map_err(|e| *e)
 }
@@ -480,7 +485,7 @@ pub fn semantic_v2(text: &str) -> Option<Vec<f32>> {
 }
 
 pub fn model_artifact_id_v2() -> String {
-    format!("{:016x}", fnv1a64(WEIGHTS_V2))
+    format!("{:016x}", fnv1a64(weights()))
 }
 
 /// Identity + availability JSON for the JS side (mirrors model_info_json;
@@ -550,8 +555,8 @@ mod tests {
         // dffb00185d090662 is the §10-graded artifact (fused OVERALL 0.917).
         // If this fires, the baked bytes changed — that is a re-grade event,
         // not a fix-forward.
-        assert_eq!(WEIGHTS_V2.len(), 30_636);
-        assert!(WEIGHTS_V2.len() <= 32 * 1024, "SEM2 must fit the budget");
+        assert_eq!(weights().len(), 30_636);
+        assert!(weights().len() <= 32 * 1024, "SEM2 must fit the budget");
         assert_eq!(model_artifact_id_v2(), "dffb00185d090662");
         assert!(baked_model_v2().is_ok(), "graded artifact must parse");
     }
@@ -559,7 +564,7 @@ mod tests {
     #[test]
     fn blob_round_trips_byte_identically() {
         let q = baked_model_v2().unwrap();
-        assert_eq!(q.to_blob(), WEIGHTS_V2, "round-trip must be byte-identical");
+        assert_eq!(q.to_blob(), weights(), "round-trip must be byte-identical");
     }
 
     #[test]
@@ -569,11 +574,11 @@ mod tests {
         // fallback to hash-only).
         let cases: Vec<(&str, Vec<u8>)> = vec![
             ("empty", vec![]),
-            ("short header", WEIGHTS_V2[..20].to_vec()),
+            ("short header", weights()[..20].to_vec()),
             (
                 "bad magic",
                 {
-                            let mut b = WEIGHTS_V2.to_vec();
+                            let mut b = weights().to_vec();
                             b[0] ^= 0xFF;
                             b
                         },
@@ -581,7 +586,7 @@ mod tests {
             (
                 "bad version",
                 {
-                            let mut b = WEIGHTS_V2.to_vec();
+                            let mut b = weights().to_vec();
                             b[4] = 99;
                             b
                         },
@@ -589,7 +594,7 @@ mod tests {
             (
                 "bad B",
                 {
-                            let mut b = WEIGHTS_V2.to_vec();
+                            let mut b = weights().to_vec();
                             b[8] = 1; // 1025 ≠ 1024 (the low byte of 1024 is already 0)
                             b
                         },
@@ -597,7 +602,7 @@ mod tests {
             (
                 "bad D",
                 {
-                            let mut b = WEIGHTS_V2.to_vec();
+                            let mut b = weights().to_vec();
                             b[12] = 0;
                             b
                         },
@@ -605,7 +610,7 @@ mod tests {
             (
                 "bad H",
                 {
-                            let mut b = WEIGHTS_V2.to_vec();
+                            let mut b = weights().to_vec();
                             b[16] = 9;
                             b
                         },
@@ -613,7 +618,7 @@ mod tests {
             (
                 "bad out width",
                 {
-                            let mut b = WEIGHTS_V2.to_vec();
+                            let mut b = weights().to_vec();
                             b[20] = 32;
                             b
                         },
@@ -621,7 +626,7 @@ mod tests {
             (
                 "bad params",
                 {
-                            let mut b = WEIGHTS_V2.to_vec();
+                            let mut b = weights().to_vec();
                             b[24] = 1;
                             b
                         },
@@ -629,7 +634,7 @@ mod tests {
             (
                 "bad quant",
                 {
-                            let mut b = WEIGHTS_V2.to_vec();
+                            let mut b = weights().to_vec();
                             b[28] = 7;
                             b
                         },
@@ -637,7 +642,7 @@ mod tests {
             (
                 "bad payload len",
                 {
-                            let mut b = WEIGHTS_V2.to_vec();
+                            let mut b = weights().to_vec();
                             b[32] = 0;
                             b
                         },
@@ -645,7 +650,7 @@ mod tests {
             (
                 "trailing byte",
                 {
-                            let mut b = WEIGHTS_V2.to_vec();
+                            let mut b = weights().to_vec();
                             b.push(0);
                             b
                         },
@@ -653,15 +658,15 @@ mod tests {
             (
                 "crc break",
                 {
-                            let n = WEIGHTS_V2.len() - 1;
-                            let mut b = WEIGHTS_V2.to_vec();
+                            let n = weights().len() - 1;
+                            let mut b = weights().to_vec();
                             b[n] ^= 0x01;
                             b
                         },
             ),
             (
                 "truncated payload",
-                WEIGHTS_V2[..WEIGHTS_V2.len() - 16].to_vec(),
+                weights()[..weights().len() - 16].to_vec(),
             ),
         ];
         for (name, bytes) in cases {

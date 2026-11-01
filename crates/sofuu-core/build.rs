@@ -219,6 +219,11 @@ fn main() {
         "chat_tui.js",
         "memory_api.js",
         "memory_adapters.js",
+        /* PLAN-DRONES §4.6: the drone surface and skill layer are embedded but
+         * read on exactly one path (a policy that enables `hardware`), so they
+         * ride the same gzip mechanism as the other single-path drivers. */
+        "mavlink.js",
+        "drone.js",
     ] {
         use std::io::Write as _;
         let path = manifest.join("../../src/js").join(asset);
@@ -231,6 +236,63 @@ fn main() {
         let gz = enc.finish().expect("finish gzip shipped JS asset");
         std::fs::write(out_dir.join(format!("{asset}.gz")), &gz)
             .expect("stage gzipped shipped JS asset");
+    }
+
+    // ── Learned-model weight blobs, embedded gzipped ─────────────────────
+    // ~320 KB of committed weights sat raw in .rodata. They compress poorly
+    // (5% for the f32 nets, 21% for the .sem projectors) but against a 5.5 MiB
+    // cap that is ~23 KB of headroom, and each blob is inflated once, lazily,
+    // behind the OnceLock that already guards its model. Five modules ship a
+    // file called weights_v2.f32, so the staged names are made unique.
+    for (src, dst) in [
+        ("src/ml/relevance/weights_v2.f32", "ml_relevance_weights_v2.f32.gz"),
+        ("src/ml/supervisor/weights_v2.f32", "ml_supervisor_weights_v2.f32.gz"),
+        ("src/ml/compaction/weights_v2.f32", "ml_compaction_weights_v2.f32.gz"),
+        ("src/ml/freshness/weights_v2.f32", "ml_freshness_weights_v2.f32.gz"),
+        ("src/ml/alloc/weights_v2.f32", "ml_alloc_weights_v2.f32.gz"),
+        ("src/embedding/weights_v1.sem", "embedding_weights_v1.sem.gz"),
+        ("src/embedding/weights_v2.sem", "embedding_weights_v2.sem.gz"),
+    ] {
+        use std::io::Write as _;
+        let path = manifest.join(src); // src/ lives inside the crate
+        println!("cargo:rerun-if-changed={}", path.display());
+        let raw = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!("{src} must exist (embedded by the binary): {e}")
+        });
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&raw).expect("gzip embedded weights");
+        let gz = enc.finish().expect("finish gzip embedded weights");
+        std::fs::write(out_dir.join(dst), &gz).expect("stage gzipped weights");
+    }
+
+    // Gzip matrix.json (contract matrix: 18 KB -> 2.5 KB)
+    {
+        use std::io::Write as _;
+        let path = manifest.join("../../contract/matrix.json");
+        println!("cargo:rerun-if-changed={}", path.display());
+        let src = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!("contract/matrix.json must exist (embedded by capabilities.rs): {e}")
+        });
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&src).expect("gzip contract/matrix.json");
+        let gz = enc.finish().expect("finish gzip contract/matrix.json");
+        std::fs::write(out_dir.join("matrix.json.gz"), &gz)
+            .expect("stage gzipped contract/matrix.json");
+    }
+
+    // Gzip rlm_bootstrap.js (7.5 KB -> 2.1 KB)
+    {
+        use std::io::Write as _;
+        let path = manifest.join("js/rlm_bootstrap.js");
+        println!("cargo:rerun-if-changed={}", path.display());
+        let src = std::fs::read(&path).unwrap_or_else(|e| {
+            panic!("js/rlm_bootstrap.js must exist: {e}")
+        });
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&src).expect("gzip rlm_bootstrap.js");
+        let gz = enc.finish().expect("finish gzip rlm_bootstrap.js");
+        std::fs::write(out_dir.join("rlm_bootstrap.js.gz"), &gz)
+            .expect("stage gzipped rlm_bootstrap.js");
     }
 
     // ── PC-07: stamp the source revision ─────────────────────────────────

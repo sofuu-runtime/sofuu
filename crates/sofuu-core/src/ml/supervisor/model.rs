@@ -36,13 +36,17 @@ pub const V2_THRESHOLD: f32 = 0.95;
 /// weights_v2.f32.
 pub const THRESHOLD: f32 = 0.95;
 
-static WEIGHTS: &[u8] = include_bytes!("weights_v2.f32");
-pub static WEIGHTS_V2: &[u8] = WEIGHTS;
+static WEIGHTS_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ml_supervisor_weights_v2.f32.gz"));
+static WEIGHTS_INFLATED: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+/// Inflated once, inside the lazy initialiser that already guards this model.
+fn weights() -> &'static [u8] {
+    WEIGHTS_INFLATED.get_or_init(|| crate::shipped::inflate_static(WEIGHTS_GZ, "ml supervisor weights"))
+}
 
 static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
     // The blob is committed and CRC-checked by eval.rs on every test run;
     // a corrupt bake is a build-time mistake, not a runtime condition.
-    TinyMlp::from_blob(WEIGHTS).expect("committed supervisor weights must load")
+    TinyMlp::from_blob(weights()).expect("committed supervisor weights must load")
 });
 
 pub static NET_V2: LazyLock<&'static TinyMlp> = LazyLock::new(|| &NET);
@@ -52,7 +56,7 @@ pub(crate) fn net() -> &'static TinyMlp {
     &NET
 }
 
-static BLOB_HASH: LazyLock<u64> = LazyLock::new(|| crate::ml::net::fnv1a64(WEIGHTS));
+static BLOB_HASH: LazyLock<u64> = LazyLock::new(|| crate::ml::net::fnv1a64(weights()));
 
 /// FNV-1a 64 over the committed blob — the identity key that ties an
 /// online-adapted layer to the exact pretrained weights it came from.

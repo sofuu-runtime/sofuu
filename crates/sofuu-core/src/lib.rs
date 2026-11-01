@@ -162,6 +162,7 @@ pub mod ml; // PLAN-ML-GATES: context-economy models + the in-memory working set
 pub mod modules; // M2: console shell (more land in later phases)
 pub mod npm;
 pub mod rlm;
+pub mod drone_cmd; // PLAN-DRONES §4.6: `sofuu drone observe|status|send|why|init`
 pub mod rt; // M1: event loop + promise bridge (replaces src/io/loop.c + promises.c)
 pub mod shipped; // shipped JS drivers beyond RLM: agent.js + web.js (PLAN-AGENTS)
 pub mod ts;

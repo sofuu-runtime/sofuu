@@ -6,7 +6,7 @@
 // the loop thread — the `LoopPtr` wrapper is `!Send` to make that
 // compile-time-enforced, matching `qjs::CtxPtr`.
 
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, c_uint, c_void};
 
 pub const UV_RUN_DEFAULT: c_int = 0;
 pub const UV_RUN_ONCE: c_int = 1;
@@ -42,6 +42,17 @@ pub type UvSignal = c_void;
 pub type UvTty = c_void;
 pub type UvPoll = c_void;
 pub type UvTcp = c_void;
+pub type UvUdp = c_void;
+/// `uv_udp_send_t` — a uv_req_t subclass; `data` is its first field.
+pub type UvUdpSend = c_void;
+
+/// uv_alloc_cb — (handle, suggested_size, buf) (uv.h:323).
+pub type UvAllocCb = unsafe extern "C" fn(*mut UvHandle, usize, *mut UvBuf);
+/// uv_udp_send_cb — (req, status) (uv.h:713).
+pub type UvUdpSendCb = unsafe extern "C" fn(*mut UvUdpSend, c_int);
+/// uv_udp_recv_cb — (handle, nread, buf, addr, flags) (uv.h:714).
+pub type UvUdpRecvCb =
+    unsafe extern "C" fn(*mut UvUdp, isize, *const UvBuf, *const libc::sockaddr, c_uint);
 
 /// uv_connection_cb — (server_stream, status).
 pub type UvConnectionCb = unsafe extern "C" fn(*mut UvStream, c_int);
@@ -244,6 +255,26 @@ extern "C" {
     pub fn uv_listen(stream: *mut UvStream, backlog: c_int, cb: Option<UvConnectionCb>) -> c_int;
     pub fn uv_accept(server: *mut UvStream, client: *mut UvStream) -> c_int;
 
+    // ── PLAN-DRONES M-D2: MAVLink over UDP (uv_udp) ─────────────
+    // Signatures verbatim from deps/libuv/include/uv.h:744-796.
+    pub fn uv_udp_init(loop_: *mut UvLoop, handle: *mut UvUdp) -> c_int;
+    pub fn uv_udp_bind(handle: *mut UvUdp, addr: *const libc::sockaddr, flags: u32) -> c_int;
+    pub fn uv_udp_send(
+        req: *mut UvUdpSend,
+        handle: *mut UvUdp,
+        bufs: *const UvBuf,
+        nbufs: c_uint,
+        addr: *const libc::sockaddr,
+        send_cb: Option<UvUdpSendCb>,
+    ) -> c_int;
+    pub fn uv_udp_recv_start(
+        handle: *mut UvUdp,
+        alloc_cb: Option<UvAllocCb>,
+        recv_cb: Option<UvUdpRecvCb>,
+    ) -> c_int;
+    pub fn uv_udp_recv_stop(handle: *mut UvUdp) -> c_int;
+    pub fn uv_udp_set_broadcast(handle: *mut UvUdp, on: c_int) -> c_int;
+
     pub fn uv_strerror(err: c_int) -> *const c_char;
 }
 
@@ -275,10 +306,12 @@ const UV_HANDLE_PROCESS: c_int = 10;
 const UV_HANDLE_TCP: c_int = 12;
 const UV_HANDLE_TIMER: c_int = 13;
 const UV_HANDLE_TTY: c_int = 14;
+const UV_HANDLE_UDP: c_int = 15;
 const UV_HANDLE_SIGNAL: c_int = 16;
 
 /// `UV_WRITE` / `UV_FS` (uv_req_type) — enum order from UV_REQ_TYPE_MAP.
 const UV_REQ_WRITE: c_int = 3;
+const UV_REQ_UDP_SEND: c_int = 5;
 const UV_REQ_FS: c_int = 6;
 
 /// `uv_stat_t` — the portable libuv stat struct (uv.h:376-401). st_size is
@@ -378,6 +411,20 @@ pub unsafe extern "C" fn sofuu_uv_async_size() -> usize {
 pub unsafe extern "C" fn sofuu_uv_tcp_size() -> usize {
     // SAFETY: trivial getter.
     unsafe { uv_handle_size(UV_HANDLE_TCP) }
+}
+
+/// PLAN-DRONES M-D2: `uv_udp_t`'s true size (opaque to Rust; libuv owns layout).
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_uv_udp_size() -> usize {
+    // SAFETY: trivial getter.
+    unsafe { uv_handle_size(UV_HANDLE_UDP) }
+}
+
+/// `uv_udp_send_t`'s true size — one allocation per datagram send.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_uv_udp_send_size() -> usize {
+    // SAFETY: trivial getter.
+    unsafe { uv_req_size(UV_REQ_UDP_SEND) }
 }
 
 /// `req->result` (ssize_t) — via libuv's public accessor.

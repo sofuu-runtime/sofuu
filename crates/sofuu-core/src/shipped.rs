@@ -140,6 +140,31 @@ pub const OBSERVABILITY_BC: &[u8] = include_bytes!("../../../src/js/observabilit
 /// rather than a bare zlib error. Returns None (after saying so) instead of an
 /// empty string, so a caller can fail loudly rather than silently run without
 /// the feature.
+/// Inflate a gzip-staged **binary** payload to `&'static [u8]`.
+///
+/// The learned-model blobs (`weights_*.f32`, `weights_*.sem`) are ~320 KB of
+/// committed weights sitting uncompressed in `.rodata`. They compress poorly
+/// (5% for the f32 nets, 21% for the `.sem` projectors) but against a 5.5 MiB
+/// cap that is ~23 KB of headroom won back for one inflate per process. Every
+/// caller already sits behind a `OnceLock`/`LazyLock`, so it runs once per
+/// model and the leak is the model's own lifetime. The bytes handed back are
+/// identical to the old `include_bytes!`, so weight-parity and round-trip
+/// tests compare the same blob.
+pub fn inflate_static(gz: &'static [u8], what: &str) -> &'static [u8] {
+    use std::io::Read;
+    if gz.len() < 2 || gz[0] != 0x1f || gz[1] != 0x8b {
+        panic!("{what}: embedded payload is not gzip (build.rs staging?)");
+    }
+    let mut out = Vec::with_capacity(gz.len() * 2);
+    if let Err(e) = flate2::read::GzDecoder::new(gz).read_to_end(&mut out) {
+        panic!("{what}: embedded payload failed to inflate: {e}");
+    }
+    if out.is_empty() {
+        panic!("{what}: embedded payload inflated to nothing");
+    }
+    Box::leak(out.into_boxed_slice())
+}
+
 pub fn inflate_gz(gz: &[u8], what: &str) -> Option<String> {
     use std::io::Read;
     if gz.len() < 2 || gz[0] != 0x1f || gz[1] != 0x8b {

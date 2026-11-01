@@ -88,6 +88,13 @@ enum Ty {
     OneOf(&'static [&'static str]),
     /// A nested section of the shape { <key>: Ty }.
     Section(&'static [(&'static str, Ty)]),
+    /// `hardware.devices.allow`: a list of `{ path, class?, baud? }` entries.
+    /// `path` is REQUIRED — an entry without one is a typo that would otherwise
+    /// silently disappear from the allowlist instead of refusing the policy.
+    DeviceList,
+    /// An object of arbitrary keys with string values (`mavlink.rateLimits`,
+    /// e.g. `{ "COMMAND_*": "10Hz" }`).
+    StrMap,
 }
 
 const FS_MODES: &[&str] = &[
@@ -161,6 +168,43 @@ const POLICY_SCHEMA: &[(&str, Ty)] = &[
         ]),
     ),
     ("memory", Ty::Section(&[("write", Ty::OneOf(&["on", "off"]))])),
+    /* PLAN-DRONES-MAVLINK §4.3: the tenth section. Absent or `enabled:false`
+     * means the `sofuu.mavlink` surface is never registered — no door beats a
+     * locked door. Enforcement lives in `rt/mavlink_gate.rs`; this is the
+     * schema that makes a typo refuse the whole policy instead of quietly
+     * widening it. */
+    (
+        "hardware",
+        Ty::Section(&[
+            ("enabled", Ty::Bool),
+            (
+                "devices",
+                Ty::Section(&[
+                    ("mode", Ty::OneOf(&["off", "allowlist", "allow-list", "allow"])),
+                    ("allow", Ty::DeviceList),
+                ]),
+            ),
+            (
+                "mavlink",
+                Ty::Section(&[
+                    ("mode", Ty::OneOf(&["off", "observe", "allowlist", "allow-list", "allow"])),
+                    ("send", Ty::StrList { single: false }),
+                    ("deny", Ty::StrList { single: false }),
+                    ("rateLimits", Ty::StrMap),
+                ]),
+            ),
+            (
+                "bounds",
+                Ty::Section(&[
+                    ("maxSpeedMs", Ty::Num),
+                    ("maxAltRelM", Ty::Num),
+                    ("maxYawRateDs", Ty::Num),
+                    ("geofenceRadiusM", Ty::Num),
+                ]),
+            ),
+            ("approval", Ty::OneOf(&["off", "every", "once-per-run", "onceperrun"])),
+        ]),
+    ),
 ];
 
 fn describe(v: &serde_json::Value) -> &'static str {
@@ -184,6 +228,8 @@ fn want_text(ty: Ty) -> String {
         Ty::FsMode => "off|workspace|allowlist|any, a boolean, or an array of roots".into(),
         Ty::OneOf(vals) => format!("one of {}", vals.join("|")),
         Ty::Section(_) => "an object".into(),
+        Ty::DeviceList => "an array of {path, class?, baud?} objects".into(),
+        Ty::StrMap => "an object of string values".into(),
     }
 }
 
@@ -232,6 +278,59 @@ fn check_ty(path: &str, ty: Ty, v: &serde_json::Value, errs: &mut Vec<String>) {
                 false
             }
         }
+        Ty::DeviceList => {
+            let ok = v
+                .as_array()
+                .map(|a| {
+                    a.iter().enumerate().all(|(i, entry)| {
+                        let at = format!("{path}[{i}]");
+                        let Some(obj) = entry.as_object() else {
+                            errs.push(format!("{at}: expected an object, got {}", describe(entry)));
+                            return false;
+                        };
+                        let mut good = true;
+                        match entry.get("path") {
+                            Some(p) if p.is_string() => {}
+                            Some(p) => {
+                                errs.push(format!("{at}.path: expected a string, got {}", describe(p)));
+                                good = false;
+                            }
+                            None => {
+                                errs.push(format!(
+                                    "{at}.path: required (an allowlist entry without a device path \
+                                     would silently vanish)"
+                                ));
+                                good = false;
+                            }
+                        }
+                        if let Some(c) = obj.get("class") {
+                            if !c.is_string() {
+                                errs.push(format!("{at}.class: expected a string, got {}", describe(c)));
+                                good = false;
+                            }
+                        }
+                        if let Some(b) = obj.get("baud") {
+                            if !b.is_number() {
+                                errs.push(format!("{at}.baud: expected a number, got {}", describe(b)));
+                                good = false;
+                            }
+                        }
+                        for k in obj.keys() {
+                            if !matches!(k.as_str(), "path" | "class" | "baud") {
+                                errs.push(format!("{at}.{k}: unknown key (known: path, class, baud)"));
+                                good = false;
+                            }
+                        }
+                        good
+                    })
+                })
+                .unwrap_or(false);
+            ok
+        }
+        Ty::StrMap => v
+            .as_object()
+            .map(|o| o.values().all(|x| x.is_string()))
+            .unwrap_or(false),
     };
     if !ok {
         errs.push(format!(
@@ -348,6 +447,14 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// The one matcher, exported for the hardware gate's `send`/`deny` lists, the
+/// same way `norm_host` is exported for the fetch path. A policy rule must not
+/// mean one thing to `evaluate` and another to the gate that enforces it —
+/// a spelling difference would be an allow the evaluator reports as a deny.
+pub(crate) fn glob_matches(pattern: &str, text: &str) -> bool {
+    glob_match(pattern, text)
 }
 
 /// Normalize a host/authority before any rule sees it — the SAME
@@ -673,6 +780,64 @@ pub fn evaluate(req: &serde_json::Value, policy: &serde_json::Value) -> serde_js
             }
             _ => {}
         }
+    }
+
+    /* ── hardware (PLAN-DRONES-MAVLINK §4.3) ────────────────────────
+     * evaluate/enforcement parity, the P1-6 lesson applied to a wire: the
+     * SAME resolver (`mavlink_gate::gate_send`) answers this question and
+     * judges the frame on the send path. Time-dependent rules (GPS freshness,
+     * rate limits, approvals) answer as they would on a link that has received
+     * no telemetry yet — pass `state` in the request to ask about a specific
+     * live situation instead of guessing at one. */
+    if op == "hardware.send" {
+        let hp = crate::rt::mavlink_gate::HardwarePolicy::from_policy(policy);
+        let device = req.get("device").and_then(|v| v.as_str()).unwrap_or("");
+        let mut core = crate::rt::mavlink_link::LinkCore::new(device, hp);
+        if let Some(st) = req.get("state") {
+            if let Some(fix) = st.get("gps_fix_type").and_then(|v| v.as_u64()) {
+                core.state.gps_fix_type = fix as u8;
+            }
+            if let Some(hdop) = st.get("gps_hdop").and_then(|v| v.as_f64()) {
+                core.state.gps_hdop = Some(hdop as f32);
+            }
+            if st.get("gps_age_ms").and_then(|v| v.as_u64()).is_some() {
+                core.state.last_gps_ms = Some(0);
+            }
+            if let Some(home) = st.get("home").and_then(|v| v.as_array()) {
+                if home.len() == 2 {
+                    if let (Some(la), Some(lo)) = (home[0].as_f64(), home[1].as_f64()) {
+                        core.state.home = Some((la, lo));
+                    }
+                }
+            }
+        }
+        let built = if let Some(msg) = req.get("message").and_then(|v| v.as_str()) {
+            let mut obj = req.clone();
+            if let Some(o) = obj.as_object_mut() {
+                o.insert("type".into(), serde_json::Value::String(msg.to_string()));
+            }
+            crate::rt::mavlink_link::frame_from_json(&core, &obj)
+        } else {
+            Err("hardware.send needs a `message`".to_string())
+        };
+        return match built {
+            Ok(frame) => {
+                let v = crate::rt::mavlink_gate::gate_send(
+                    &core.policy,
+                    &mut core.state,
+                    &crate::rt::mavlink_gate::SendRequest { device, frame: &frame },
+                    0,
+                    req.get("approved").and_then(|x| x.as_bool()).unwrap_or(false),
+                );
+                let reason: &str = if v.allowed {
+                    "the hardware gate allows this frame"
+                } else {
+                    v.reason.as_str()
+                };
+                decision(if v.allowed { "allow" } else { "deny" }, v.rule, reason)
+            }
+            Err(e) => decision("deny", "R-HW/badRequest", &e),
+        };
     }
 
     let mut out = decision("allow", "R7/default", "no policy rule denies this operation");
@@ -1948,6 +2113,159 @@ mod tests {
         assert!(validate_policy(&serde_json::json!({"approval":{"mode":"sometimes"}})).is_err());
         /* A non-object policy. */
         assert!(validate_policy(&serde_json::json!(["off"])).is_err());
+    }
+
+    /* ── PLAN-DRONES-MAVLINK §4.3: the `hardware` section ─────────── */
+
+    #[test]
+    fn hardware_section_accepts_the_documented_shape() {
+        assert!(validate_policy(&serde_json::json!({
+            "hardware": {
+                "enabled": false,
+                "devices": {
+                    "mode": "allowlist",
+                    "allow": [
+                        {"path": "udp:192.168.1.20:14550", "class": "mavlink-udp"},
+                        {"path": "/dev/ttyAMA0", "class": "uart", "baud": 57600},
+                    ],
+                },
+                "mavlink": {
+                    "mode": "observe",
+                    "send": ["HEARTBEAT", "COMMAND_LONG"],
+                    "deny": ["PARAM_SET", "MAV_CMD_DO_MOTOR_TEST"],
+                    "rateLimits": {"COMMAND_*": "10Hz", "HEARTBEAT": "1Hz"},
+                },
+                "bounds": {"maxSpeedMs": 30, "maxAltRelM": 120, "maxYawRateDs": 180, "geofenceRadiusM": 500},
+                "approval": "off",
+            }
+        }))
+        .is_ok());
+        /* Every documented shorthand for the two modes. */
+        for mode in ["off", "allowlist", "allow-list", "allow"] {
+            assert!(validate_policy(&serde_json::json!({"hardware":{"devices":{"mode":mode}}})).is_ok());
+        }
+        for mode in ["off", "observe", "allowlist"] {
+            assert!(validate_policy(&serde_json::json!({"hardware":{"mavlink":{"mode":mode}}})).is_ok());
+        }
+        for mode in ["off", "every", "once-per-run"] {
+            assert!(validate_policy(&serde_json::json!({"hardware":{"approval":mode}})).is_ok());
+        }
+        /* A disabled section with nothing else is valid — that is the default. */
+        assert!(validate_policy(&serde_json::json!({"hardware":{"enabled":false}})).is_ok());
+    }
+
+    #[test]
+    fn hardware_section_typos_are_refused_not_ignored() {
+        /* The whole point of P1-15 applied to the gate: a misspelt key would
+         * read as "no rule" and let a frame through unjudged. */
+        let e = validate_policy(&serde_json::json!({"hardware":{"enabeld":true}}))
+            .expect_err("misspelt enabled must be refused");
+        assert!(e.contains("hardware.enabeld"), "{e}");
+
+        let e = validate_policy(&serde_json::json!({"hardware":{"mavlink":{"sendd":["HEARTBEAT"]}}}))
+            .expect_err("misspelt send must be refused");
+        assert!(e.contains("hardware.mavlink.sendd"), "{e}");
+
+        /* An unknown mode would fall back to Off in the resolver — refuse it
+         * while the operator is still looking at the file. */
+        assert!(validate_policy(&serde_json::json!({"hardware":{"mavlink":{"mode":"send"}}})).is_err());
+
+        /* A device entry without a path would silently vanish from the
+         * allowlist; a bad class/baud would be ignored. Both must refuse. */
+        let e = validate_policy(&serde_json::json!({"hardware":{"devices":{"allow":[{"class":"uart"}]}}}))
+            .expect_err("an allowlist entry without a path must be refused");
+        assert!(e.contains("path"), "{e}");
+        assert!(validate_policy(&serde_json::json!({
+            "hardware":{"devices":{"allow":[{"path":"/dev/x","baud":"fast"}]}}
+        }))
+        .is_err());
+        assert!(validate_policy(&serde_json::json!({
+            "hardware":{"devices":{"allow":[{"path":"/dev/x","klass":"uart"}]}}
+        }))
+        .is_err());
+
+        /* rateLimits is an object of strings, not a list or a nested object. */
+        assert!(validate_policy(&serde_json::json!({"hardware":{"mavlink":{"rateLimits":["1Hz"]}}})).is_err());
+        assert!(validate_policy(&serde_json::json!({"hardware":{"mavlink":{"rateLimits":{"X":10}}}})).is_err());
+
+        /* Bounds are numbers. */
+        assert!(validate_policy(&serde_json::json!({"hardware":{"bounds":{"maxAltRelM":"120m"}}})).is_err());
+    }
+
+    /* ── PLAN-DRONES-MAVLINK §4.3: evaluate() vs the gate ────────── */
+
+    #[test]
+    fn evaluate_hardware_send_names_the_same_rule_the_gate_enforces() {
+        let p = serde_json::json!({
+            "hardware": {
+                "enabled": true,
+                "devices": { "mode": "allowlist",
+                             "allow": [{ "path": "udp:127.0.0.1:14550", "class": "mavlink-udp" }] },
+                "mavlink": { "mode": "allowlist", "send": ["COMMAND_*", "HEARTBEAT"] },
+                "bounds": { "maxSpeedMs": 10, "maxAltRelM": 50, "maxYawRateDs": 90, "geofenceRadiusM": 300 }
+            }
+        });
+        // A permanent deny answers even with no telemetry at all.
+        let d = evaluate(
+            &serde_json::json!({"op":"hardware.send","device":"udp:127.0.0.1:14550",
+                                "message":"COMMAND_LONG","command":"MAV_CMD_DO_MOTOR_TEST"}),
+            &p,
+        );
+        assert_eq!(d["decision"], "deny");
+        assert_eq!(d["rule"], "R-HW/deny/always");
+
+        // An out-of-bounds takeoff names the bounds rule.
+        let d = evaluate(
+            &serde_json::json!({"op":"hardware.send","device":"udp:127.0.0.1:14550",
+                                "message":"COMMAND_LONG","command":"MAV_CMD_NAV_TAKEOFF","alt":999}),
+            &p,
+        );
+        assert_eq!(d["decision"], "deny");
+        assert_eq!(d["rule"], "R-HW/bounds/maxAltRelM");
+
+        // An in-bounds takeoff is allowed once the request carries a live fix
+        // (the fail-closed rules answer as they would on a cold link otherwise).
+        let d = evaluate(
+            &serde_json::json!({"op":"hardware.send","device":"udp:127.0.0.1:14550",
+                                "message":"COMMAND_LONG","command":"MAV_CMD_NAV_TAKEOFF","alt":10}),
+            &p,
+        );
+        assert_eq!(d["decision"], "allow", "{d}");
+
+        // A device outside the allowlist is refused before anything else.
+        let d = evaluate(
+            &serde_json::json!({"op":"hardware.send","device":"udp:10.0.0.9:14550",
+                                "message":"HEARTBEAT"}),
+            &p,
+        );
+        assert_eq!(d["rule"], "R-HW/devices.allow");
+    }
+
+    #[test]
+    fn evaluate_hardware_send_reads_the_supplied_state() {
+        let p = serde_json::json!({
+            "hardware": {
+                "enabled": true,
+                "devices": { "mode": "allowlist",
+                             "allow": [{ "path": "udp:127.0.0.1:14550", "class": "mavlink-udp" }] },
+                "mavlink": { "mode": "allowlist", "send": ["SET_POSITION_TARGET_*"] }
+            }
+        });
+        let req = serde_json::json!({
+            "op": "hardware.send", "device": "udp:127.0.0.1:14550",
+            "message": "SET_POSITION_TARGET_GLOBAL_INT",
+            "lat": 52.1234, "lon": 4.1234, "alt": 20.0,
+            "state": { "gps_fix_type": 3, "gps_hdop": 0.8, "gps_age_ms": 10, "home": [52.1234, 4.1234] }
+        });
+        let d = evaluate(&req, &p);
+        assert_eq!(d["decision"], "allow", "{d}");
+
+        // The same question with a 2D fix is refused, naming the fail-closed rule.
+        let mut weak = req.clone();
+        weak["state"]["gps_fix_type"] = serde_json::json!(2);
+        let d = evaluate(&weak, &p);
+        assert_eq!(d["decision"], "deny");
+        assert_eq!(d["rule"], "R-HW/failClosed");
     }
 
     /* ── AUDIT-2026-10-31 P1-6: evaluate() vs the gate ───────────── */

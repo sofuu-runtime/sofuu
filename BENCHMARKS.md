@@ -63,6 +63,30 @@ hyperfine --warmup 10 --runs 100 \
 > in the CHANGELOG entries of 2026-10-30. The Linux and Pi 5 rows have not been
 > re-measured against the current tree and are historical until they are.
 
+### Pi 5 re-measure (M-D0, 2026-11-01)
+
+Measured on the lab Pi 5 (BCM2712, `arm_freq=2800`, `over_voltage_delta=25000`,
+governor `ondemand`, idle load 0.01) against **the binary that was on the box**,
+`sofuu-linux-arm64` `0.2.0-beta` (5,289,392 B) — an Oct-11-era revision, so these
+describe the published artifact, not this tree. They replace the "historical
+until re-measured" caveat above with measured values.
+
+| Measurement | Value | Method |
+|---|---:|---|
+| Spawn floor (any process) | 0.44 ms | median of 10 × `/bin/true` |
+| `sofuu version` (CLI only, no engine) | 0.53 ms | median of 10 |
+| **Engine boot** (runs `console.log(1+1)`) | **4.85 ms** | median of 10 (min 4.76, max 6.27) |
+| Idle RSS (runtime idling on `setTimeout`) | **4.5 MB** (4,656 KB) | `VmRSS` after 2 s |
+| Qwen3-0.6B Q4_K_M load | 1.26 s | 28 layers, 16 heads, 4 threads |
+| Prefill | 74.1 tk/s | 5-token prompt |
+| Decode | **32.4 tk/s** | 48 tokens, temp 0 |
+| Thermal under that load | 45.8 → 55.6 °C | sampled at 2 Hz |
+| Clock under load | 1700 → 2800 MHz | never dropped below the idle floor |
+
+The two figures the drone plan inherits are **engine boot ~5 ms** and **idle RSS
+~4.5 MB**, both far inside the 30 MB companion-computer envelope. They are lower
+than the macOS rows because this revision boots no Metal probe and loads no model.
+
 ---
 
 ## 3. 🧠 Memory Footprint (Resident Set Size)

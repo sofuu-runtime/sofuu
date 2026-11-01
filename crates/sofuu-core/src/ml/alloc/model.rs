@@ -75,16 +75,20 @@ const WRITING_OUTPUT_BOOST: f32 = 1.25;
 /// an oversized request).
 const UNKNOWN_PRESSURE_FLOOR: f32 = 0.50;
 
-static WEIGHTS: &[u8] = include_bytes!("weights_v2.f32");
-pub static WEIGHTS_V2: &[u8] = WEIGHTS;
+static WEIGHTS_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ml_alloc_weights_v2.f32.gz"));
+static WEIGHTS_INFLATED: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+/// Inflated once, inside the lazy initialiser that already guards this model.
+fn weights() -> &'static [u8] {
+    WEIGHTS_INFLATED.get_or_init(|| crate::shipped::inflate_static(WEIGHTS_GZ, "ml alloc weights"))
+}
 
 pub static NET: LazyLock<TinyMlp> = LazyLock::new(|| {
-    TinyMlp::from_blob(WEIGHTS).expect("committed alloc weights must load")
+    TinyMlp::from_blob(weights()).expect("committed alloc weights must load")
 });
 
 pub static NET_V2: LazyLock<&'static TinyMlp> = LazyLock::new(|| &NET);
 
-static BLOB_HASH: LazyLock<u64> = LazyLock::new(|| crate::ml::net::fnv1a64(WEIGHTS));
+static BLOB_HASH: LazyLock<u64> = LazyLock::new(|| crate::ml::net::fnv1a64(weights()));
 pub(crate) fn blob_hash() -> u64 {
     *BLOB_HASH
 }

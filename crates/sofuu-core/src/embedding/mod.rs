@@ -821,12 +821,17 @@ pub fn hash_features_at(text: &str, dim: usize) -> Vec<f32> {
     out
 }
 
-static WEIGHTS: &[u8] = include_bytes!("weights_v1.sem");
+static WEIGHTS_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/embedding_weights_v1.sem.gz"));
+static WEIGHTS_INFLATED: std::sync::OnceLock<&'static [u8]> = std::sync::OnceLock::new();
+/// Inflated once, inside the lazy initialiser that already guards this model.
+fn weights() -> &'static [u8] {
+    WEIGHTS_INFLATED.get_or_init(|| crate::shipped::inflate_static(WEIGHTS_GZ, "semantic v1 projector"))
+}
 static BAKED_MODEL: OnceLock<Result<QuantizedProjector, &'static str>> = OnceLock::new();
 
 pub fn baked_model() -> Result<&'static QuantizedProjector, &'static str> {
     BAKED_MODEL
-        .get_or_init(|| QuantizedProjector::from_blob(WEIGHTS))
+        .get_or_init(|| QuantizedProjector::from_blob(weights()))
         .as_ref()
         .map_err(|e| *e)
 }
@@ -841,7 +846,7 @@ pub fn semantic_v1(text: &str) -> Option<Vec<f32>> {
 }
 
 pub fn model_artifact_id() -> String {
-    artifact_id_for(WEIGHTS)
+    artifact_id_for(weights())
 }
 
 pub fn artifact_id_for(bytes: &[u8]) -> String {
@@ -851,7 +856,7 @@ pub fn artifact_id_for(bytes: &[u8]) -> String {
 /// (blob version, hidden width, stored parameter count) parsed from the
 /// baked artifact header — the honest values for the info surface.
 pub fn blob_summary() -> (u32, usize, usize) {
-    let bytes = WEIGHTS;
+    let bytes = weights();
     if bytes.len() < HEADER_LEN {
         return (0, 0, 0);
     }
@@ -1267,7 +1272,7 @@ mod tests {
         if !baked_build() {
             return;
         }
-        let blob: &[u8] = WEIGHTS;
+        let blob: &[u8] = weights();
         assert!(QuantizedProjector::from_blob(blob).is_ok());
 
         /* Truncations: one byte short, header-short, empty. */

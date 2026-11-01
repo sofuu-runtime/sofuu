@@ -64,3 +64,9 @@ name = "fuzz_simd_bridge"
 path = "fuzz_targets/fuzz_simd_bridge.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "mavlink"
+path = "fuzz_targets/mavlink.rs"
+test = false
+doc = false

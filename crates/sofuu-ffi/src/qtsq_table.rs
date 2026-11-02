@@ -630,8 +630,15 @@ impl SofuTable {
         c_query.offset = q.offset;
         c_query.order_desc = q.order_desc;
 
-        let _pinned_name = q.filter_col_name.as_ref().map(|s| CString::new(s.as_str()).unwrap());
-        if let Some(ref c_str) = _pinned_name {
+        // An interior NUL in a column name is a caller error, not a reason to
+        // abort the process: refuse the query and say which field was wrong.
+        let pinned_name = q
+            .filter_col_name
+            .as_ref()
+            .map(|s| CString::new(s.as_str()))
+            .transpose()
+            .map_err(|_| "filter column name contains a NUL byte".to_string())?;
+        if let Some(ref c_str) = pinned_name {
             c_query.filter_col_name = c_str.as_ptr();
         }
 
@@ -661,8 +668,11 @@ impl SofuTable {
         let path_str = path.as_ref().to_str().ok_or("Invalid UTF-8 path")?;
         let c_path = CString::new(path_str).map_err(|e| e.to_string())?;
 
-        let _pass_cs = password.map(|p| CString::new(p).unwrap());
-        let pass_ptr = _pass_cs.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
+        let pass_cs = password
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| "password contains a NUL byte".to_string())?;
+        let pass_ptr = pass_cs.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
 
         let rc = unsafe { sofuu_table_write_qtsq(self.raw, c_path.as_ptr(), pass_ptr) };
         if rc != 0 {
@@ -681,8 +691,11 @@ impl SofuTable {
         let c_path = CString::new(path_str).map_err(|e| e.to_string())?;
         let c_name = CString::new(table_name).map_err(|e| e.to_string())?;
 
-        let _pass_cs = password.map(|p| CString::new(p).unwrap());
-        let pass_ptr = _pass_cs.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
+        let pass_cs = password
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| "password contains a NUL byte".to_string())?;
+        let pass_ptr = pass_cs.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
 
         let res_ptr = unsafe {
             sofuu_table_read_qtsq(c_path.as_ptr(), c_name.as_ptr(), pass_ptr)
@@ -713,8 +726,11 @@ impl SofuTable {
         let c_path = CString::new(path_str).map_err(|e| e.to_string())?;
         let c_name = CString::new(table_name).map_err(|e| e.to_string())?;
 
-        let _pass_cs = password.map(|p| CString::new(p).unwrap());
-        let pass_ptr = _pass_cs.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
+        let pass_cs = password
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| "password contains a NUL byte".to_string())?;
+        let pass_ptr = pass_cs.as_ref().map(|c| c.as_ptr()).unwrap_or(std::ptr::null());
 
         let mut c_query = SofuuQueryC::default();
         c_query.min_id = query.min_id;
@@ -725,8 +741,13 @@ impl SofuTable {
         c_query.offset = query.offset;
         c_query.order_desc = query.order_desc;
 
-        let _pinned_name = query.filter_col_name.as_ref().map(|s| CString::new(s.as_str()).unwrap());
-        if let Some(ref c_str) = _pinned_name {
+        let pinned_name = query
+            .filter_col_name
+            .as_ref()
+            .map(|s| CString::new(s.as_str()))
+            .transpose()
+            .map_err(|_| "filter column name contains a NUL byte".to_string())?;
+        if let Some(ref c_str) = pinned_name {
             c_query.filter_col_name = c_str.as_ptr();
         }
 

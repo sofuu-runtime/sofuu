@@ -320,7 +320,7 @@ fn known_ops(family: &str) -> String {
     for op in [
         "arm", "takeoff", "land", "rtl", "hold", "goto", "stop", "telemetry", "forward", "backward",
         "turn_left", "turn_right", "temperature", "humidity", "distance", "front_distance", "read",
-        "set_relay", "pulse", "read_gpio", "save", "recall", "detects", "allow", "reject", "info",
+        "set_relay", "set_duty", "pulse", "read_gpio", "save", "recall", "detects", "allow", "reject", "info",
         "warn", "error", "debug", "send",
     ] {
         if caps::known_op(family, op) {
@@ -344,7 +344,7 @@ fn capability_result(family: &str, op: &str) -> Ty {
         | ("drone", "takeoff") | ("drone", "land") | ("drone", "rtl") | ("drone", "hold")
         | ("drone", "goto") | ("drone", "stop") | ("rover", "forward") | ("rover", "backward")
         | ("rover", "turn_left") | ("rover", "turn_right") | ("rover", "stop")
-        | ("device", "set_relay") | ("device", "pulse") => Ty::Unit,
+        | ("device", "set_relay") | ("device", "set_duty") | ("device", "pulse") => Ty::Unit,
         _ => Ty::Any,
     }
 }

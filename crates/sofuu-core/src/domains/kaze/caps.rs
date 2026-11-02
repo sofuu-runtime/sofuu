@@ -78,6 +78,7 @@ pub fn op_arity(family: &str, op: &str) -> Option<(usize, usize)> {
         ("sensor", "read") => Some((1, 1)),
         ("sensor", "telemetry") => Some((1, 1)),
         ("device", "set_relay") => Some((2, 2)),
+        ("device", "set_duty") => Some((2, 2)),
         ("device", "pulse") => Some((2, 2)),
         ("device", "read_gpio") => Some((1, 1)),
         ("memory", "save") => Some((2, 2)),
@@ -133,6 +134,11 @@ pub struct SimState {
     pub humidity: f64,
     pub distance: f64,
     pub relays: Vec<(String, bool)>,
+    /// PWM channels set by `device.set_duty`, as (channel, percent). The
+    /// shipping engine has no PWM backend yet, so this is the simulator's
+    /// record of the intent — the live bus refuses the verb rather than
+    /// pretending a duty cycle was written.
+    pub duties: Vec<(String, f64)>,
     pub memory: Vec<(String, String)>,
 }
 
@@ -151,6 +157,7 @@ impl Default for SimState {
             humidity: 45.0,
             distance: 2.0,
             relays: Vec::new(),
+            duties: Vec::new(),
             memory: Vec::new(),
         }
     }
@@ -233,7 +240,7 @@ pub fn render_value(v: Value, arena: &Arena, heap: &Heap) -> String {
 fn str_at(args: &[Value], idx: usize, arena: &Arena) -> String {
     match args.get(idx) {
         Some(Value::Str(s)) => arena.get(*s).to_string(),
-        Some(other) => render_value(*other, arena, &Heap::new()),
+        Some(other) => render_value(*other, arena, &Heap::empty()),
         None => String::new(),
     }
 }
@@ -285,6 +292,14 @@ impl SimHost {
             args: args.to_vec(),
             result,
         });
+    }
+
+    fn duty(&mut self, name: &str) -> Option<&mut f64> {
+        self.state
+            .duties
+            .iter_mut()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v)
     }
 
     fn relay(&mut self, name: &str) -> Option<&mut bool> {
@@ -422,6 +437,15 @@ impl CapHost for SimHost {
                 }
                 Ok(Value::Unit)
             }
+            ("device", "set_duty") => {
+                let name = str_at(args, 0, arena);
+                let percent = num_at(args, 1, 0.0);
+                match self.duty(&name) {
+                    Some(slot) => *slot = percent,
+                    None => self.state.duties.push((name, percent)),
+                }
+                Ok(Value::Unit)
+            }
             ("device", "pulse") => Ok(Value::Unit),
 
             ("memory", "save") => {
@@ -439,7 +463,7 @@ impl CapHost for SimHost {
                     .filter(|(k, v)| k.to_lowercase().contains(&query) || v.to_lowercase().contains(&query))
                     .filter_map(|(_, v)| arena.alloc(v).ok().map(Value::Str))
                     .collect();
-                Ok(heap.push_array(hits))
+                heap.push_array(hits)
             }
             ("policy", "detects") | ("policy", "detect") => {
                 let kind = str_at(args, 0, arena).to_lowercase();
@@ -548,6 +572,7 @@ mod tests {
             ("rover", "turn_right"),
             ("sensor", "front_distance"),
             ("device", "set_relay"),
+            ("device", "set_duty"),
             ("device", "pulse"),
             ("memory", "save"),
             ("memory", "recall"),
@@ -565,7 +590,7 @@ mod tests {
     fn the_simulation_records_a_deterministic_trace() {
         let mut host = SimHost::new(SimState::default());
         let mut arena = Arena::new(1024);
-        let mut heap = Heap::new();
+        let mut heap = Heap::default();
         host.call("drone", "arm", &[], &mut arena, &mut heap).unwrap();
         host.call("drone", "takeoff", &[Value::Num(15.0)], &mut arena, &mut heap).unwrap();
         let lines: Vec<String> = host.actions().iter().map(|a| a.render()).collect();
@@ -575,10 +600,21 @@ mod tests {
     }
 
     #[test]
+    fn set_duty_records_the_requested_duty_cycle() {
+        let mut host = SimHost::new(SimState::default());
+        let mut arena = Arena::new(1024);
+        let mut heap = Heap::default();
+        let name = arena.alloc("fan").unwrap();
+        host.call("device", "set_duty", &[Value::Str(name), Value::Num(40.0)], &mut arena, &mut heap)
+            .unwrap();
+        assert_eq!(host.state.duties, vec![("fan".to_string(), 40.0)]);
+    }
+
+    #[test]
     fn taking_off_unarmed_is_a_typed_failure_not_a_silent_no_op() {
         let mut host = SimHost::new(SimState::default());
         let mut arena = Arena::new(1024);
-        let mut heap = Heap::new();
+        let mut heap = Heap::default();
         let e = host
             .call("drone", "takeoff", &[Value::Num(15.0)], &mut arena, &mut heap)
             .unwrap_err();

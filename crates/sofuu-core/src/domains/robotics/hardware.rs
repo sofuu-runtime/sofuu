@@ -173,6 +173,7 @@ pub fn validate_arguments(family: &str, op: &str, args: &[Value], _arena: &Arena
         }
         ("rover", "forward") | ("rover", "backward") => range(family, op, 0, args, 0.0, 10.0, "m/s")?,
         ("rover", "turn_left") | ("rover", "turn_right") => range(family, op, 0, args, 0.0, 360.0, "degrees")?,
+        ("device", "set_duty") => range(family, op, 1, args, 0.0, 100.0, "percent")?,
         ("device", "pulse") => range(family, op, 1, args, 0.0, 3600.0, "seconds")?,
         ("device", "read_gpio") => range(family, op, 0, args, 0.0, 255.0, "pin")?,
         ("sensor", "read") => {
@@ -275,6 +276,18 @@ mod tests {
         let a = Arena::new(1024);
         let d = validate_arguments("drone", "goto", &[Value::Num(52.1), Value::Num(900.0)], &a).unwrap_err();
         assert_eq!(d.code, "E_KAZE_RANGE");
+    }
+
+    #[test]
+    fn a_duty_cycle_outside_zero_to_hundred_percent_is_refused() {
+        let arena = Arena::new(1024);
+        let d = validate_arguments("device", "set_duty", &[Value::Unit, Value::Num(101.0)], &arena)
+            .unwrap_err();
+        assert_eq!(d.code, "E_KAZE_RANGE");
+        assert_eq!(d.rule, "H-4/range");
+        assert!(d.reason.contains("percent"), "{}", d.reason);
+        assert!(validate_arguments("device", "set_duty", &[Value::Unit, Value::Num(40.0)], &arena)
+            .is_ok());
     }
 
     #[test]

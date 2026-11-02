@@ -21,6 +21,7 @@
 	.param .u32 sofuu_gemv_q8_0_param_3,
 	.param .u32 sofuu_gemv_q8_0_param_4
 )
+.maxntid 256
 {
 	.reg .pred 	%p<12>;
 	.reg .b16 	%rs<9>;
@@ -263,7 +264,8 @@ $L__BB0_25:
 	.param .u64 .ptr .align 1 sofuu_gemv_q4_k_param_2,
 	.param .u32 sofuu_gemv_q4_k_param_3,
 	.param .u32 sofuu_gemv_q4_k_param_4
-)                                       // @sofuu_gemv_q4_k
+)
+.maxntid 256                            // @sofuu_gemv_q4_k
 {
 	.reg .pred 	%p<17>;
 	.reg .b16 	%rs<22>;
@@ -534,7 +536,8 @@ $L__BB1_13:
 	.param .u64 .ptr .align 1 sofuu_gemv_q6_k_param_2,
 	.param .u32 sofuu_gemv_q6_k_param_3,
 	.param .u32 sofuu_gemv_q6_k_param_4
-)                                       // @sofuu_gemv_q6_k
+)
+.maxntid 256                            // @sofuu_gemv_q6_k
 {
 	.reg .pred 	%p<13>;
 	.reg .b16 	%rs<6>;
@@ -775,7 +778,8 @@ $L__BB2_16:
 	.param .u64 .ptr .align 1 sofuu_gemv_f32_param_2,
 	.param .u32 sofuu_gemv_f32_param_3,
 	.param .u32 sofuu_gemv_f32_param_4
-)                                       // @sofuu_gemv_f32
+)
+.maxntid 256                            // @sofuu_gemv_f32
 {
 	.reg .pred 	%p<8>;
 	.reg .b32 	%r<46>;
@@ -922,7 +926,8 @@ $L__BB3_11:
 	.param .u64 .ptr .align 1 sofuu_rmsnorm_param_2,
 	.param .u32 sofuu_rmsnorm_param_3,
 	.param .f32 sofuu_rmsnorm_param_4
-)                                       // @sofuu_rmsnorm
+)
+.maxntid 256                            // @sofuu_rmsnorm
 {
 	.reg .pred 	%p<9>;
 	.reg .b32 	%r<55>;
@@ -1087,7 +1092,8 @@ $L__BB4_14:
 	.param .u64 .ptr .align 1 sofuu_swiglu_param_1,
 	.param .u64 .ptr .align 1 sofuu_swiglu_param_2,
 	.param .u32 sofuu_swiglu_param_3
-)                                       // @sofuu_swiglu
+)
+.maxntid 256                            // @sofuu_swiglu
 {
 	.reg .pred 	%p<2>;
 	.reg .b32 	%r<13>;
@@ -1141,7 +1147,8 @@ $L__BB5_2:
 	.param .u32 sofuu_rope_f32_param_4,
 	.param .u32 sofuu_rope_f32_param_5,
 	.param .u32 sofuu_rope_f32_param_6
-)                                       // @sofuu_rope_f32
+)
+.maxntid 128                            // @sofuu_rope_f32
 {
 	.reg .pred 	%p<4>;
 	.reg .b32 	%r<23>;
@@ -1219,63 +1226,74 @@ $L__BB6_3:
 	.param .u32 sofuu_kv_write_f32_param_5,
 	.param .u32 sofuu_kv_write_f32_param_6,
 	.param .u32 sofuu_kv_write_f32_param_7
-)                                       // @sofuu_kv_write_f32
+)
+.maxntid 128                            // @sofuu_kv_write_f32
 {
-	.reg .pred 	%p<3>;
-	.reg .b32 	%r<8>;
-	.reg .b64 	%rd<27>;
+	.reg .pred 	%p<8>;
+	.reg .b32 	%r<10>;
+	.reg .b64 	%rd<28>;
 
 // %bb.0:
-	ld.param.b32 	%r1, [sofuu_kv_write_f32_param_6];
-	ld.param.b64 	%rd10, [sofuu_kv_write_f32_param_0];
-	ld.param.b64 	%rd11, [sofuu_kv_write_f32_param_2];
-	cvta.to.global.u64 	%rd12, %rd11;
-	ld.param.b64 	%rd13, [sofuu_kv_write_f32_param_1];
-	ld.param.b64 	%rd14, [sofuu_kv_write_f32_param_3];
-	cvta.to.global.u64 	%rd15, %rd14;
-	cvta.to.global.u64 	%rd1, %rd10;
-	cvta.to.global.u64 	%rd2, %rd13;
+	ld.param.b32 	%r3, [sofuu_kv_write_f32_param_7];
+	ld.param.b32 	%r1, [sofuu_kv_write_f32_param_4];
+	ld.param.b64 	%rd12, [sofuu_kv_write_f32_param_0];
+	ld.param.b64 	%rd13, [sofuu_kv_write_f32_param_2];
+	cvta.to.global.u64 	%rd1, %rd13;
+	ld.param.b64 	%rd14, [sofuu_kv_write_f32_param_1];
+	ld.param.b64 	%rd15, [sofuu_kv_write_f32_param_3];
+	cvta.to.global.u64 	%rd2, %rd15;
+	cvta.to.global.u64 	%rd3, %rd12;
+	cvta.to.global.u64 	%rd4, %rd14;
 	// begin inline asm
-	mov.u32 %r2, %ctaid.x;
+	mov.u32 %r4, %ctaid.x;
+	// end inline asm
+	ld.param.b32 	%r6, [sofuu_kv_write_f32_param_5];
+	// begin inline asm
+	mov.u32 %r9, %tid.x;
 	// end inline asm
 	// begin inline asm
-	mov.u32 %r7, %tid.x;
+	mov.u32 %r5, %ntid.x;
 	// end inline asm
-	// begin inline asm
-	mov.u32 %r3, %ntid.x;
-	// end inline asm
-	setp.ge.s32 	%p1, %r7, %r1;
-	@%p1 bra 	$L__BB7_3;
+	setp.lt.s32 	%p1, %r1, 0;
+	setp.ge.s32 	%p2, %r1, %r3;
+	setp.ge.s32 	%p3, %r4, %r6;
+	or.pred 	%p4, %p2, %p3;
+	or.pred 	%p5, %p4, %p1;
+	@%p5 bra 	$L__BB7_4;
 // %bb.1:
-	ld.param.s32 	%rd16, [sofuu_kv_write_f32_param_4];
-	ld.param.b32 	%r4, [sofuu_kv_write_f32_param_7];
-	mul.wide.s32 	%rd17, %r2, %r4;
-	add.s64 	%rd3, %rd17, %rd16;
-	cvt.s64.s32 	%rd4, %r1;
-	mul.wide.s32 	%rd18, %r2, %r1;
-	shl.b64 	%rd19, %rd18, 2;
-	add.s64 	%rd5, %rd12, %rd19;
-	add.s64 	%rd6, %rd15, %rd19;
-	mul.wide.s32 	%rd26, %r7, 4;
-	mul.wide.s32 	%rd7, %r3, 4;
-	mul.lo.s64 	%rd20, %rd3, %rd4;
-	shl.b64 	%rd21, %rd20, 2;
-	add.s64 	%rd8, %rd1, %rd21;
-	add.s64 	%rd9, %rd2, %rd21;
-$L__BB7_2:                              // =>This Inner Loop Header: Depth=1
-	add.s64 	%rd22, %rd5, %rd26;
-	ld.global.b32 	%r5, [%rd22];
-	add.s64 	%rd23, %rd8, %rd26;
-	st.global.b32 	[%rd23], %r5;
-	add.s64 	%rd24, %rd6, %rd26;
-	ld.global.b32 	%r6, [%rd24];
-	add.s64 	%rd25, %rd9, %rd26;
-	st.global.b32 	[%rd25], %r6;
-	add.s32 	%r7, %r7, %r3;
-	add.s64 	%rd26, %rd26, %rd7;
-	setp.lt.s32 	%p2, %r7, %r1;
-	@%p2 bra 	$L__BB7_2;
-$L__BB7_3:
+	ld.param.b32 	%r2, [sofuu_kv_write_f32_param_6];
+	setp.ge.s32 	%p6, %r9, %r2;
+	@%p6 bra 	$L__BB7_4;
+// %bb.2:
+	cvt.s64.s32 	%rd16, %r4;
+	cvt.u64.u32 	%rd17, %r3;
+	cvt.u64.u32 	%rd18, %r1;
+	mad.lo.s64 	%rd5, %rd16, %rd17, %rd18;
+	cvt.s64.s32 	%rd6, %r2;
+	mul.wide.s32 	%rd19, %r4, %r2;
+	shl.b64 	%rd20, %rd19, 2;
+	add.s64 	%rd7, %rd1, %rd20;
+	add.s64 	%rd8, %rd2, %rd20;
+	mul.wide.s32 	%rd27, %r9, 4;
+	mul.wide.s32 	%rd9, %r5, 4;
+	mul.lo.s64 	%rd21, %rd5, %rd6;
+	shl.b64 	%rd22, %rd21, 2;
+	add.s64 	%rd10, %rd3, %rd22;
+	add.s64 	%rd11, %rd4, %rd22;
+$L__BB7_3:                              // =>This Inner Loop Header: Depth=1
+	add.s64 	%rd23, %rd7, %rd27;
+	ld.global.b32 	%r7, [%rd23];
+	add.s64 	%rd24, %rd10, %rd27;
+	st.global.b32 	[%rd24], %r7;
+	add.s64 	%rd25, %rd8, %rd27;
+	ld.global.b32 	%r8, [%rd25];
+	add.s64 	%rd26, %rd11, %rd27;
+	st.global.b32 	[%rd26], %r8;
+	add.s32 	%r9, %r9, %r5;
+	add.s64 	%rd27, %rd27, %rd9;
+	setp.lt.s32 	%p7, %r9, %r2;
+	@%p7 bra 	$L__BB7_3;
+$L__BB7_4:
 	ret;
                                         // -- End function
 }

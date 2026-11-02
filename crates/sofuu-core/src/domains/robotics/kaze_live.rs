@@ -648,6 +648,14 @@ fn live_device(
             let name = name_of(args);
             Ok(Value::Bool(bus.read(&name)?))
         }
+        // The GPIO bus is on/off only: there is no pwmchip backend in this build,
+        // so a duty cycle cannot be written. Refusing is the honest answer — a
+        // script that believes it set 40% would be acting on a lie.
+        "set_duty" => Err(format!(
+            "E_KAZE_LINK: the GPIO bus has no PWM channel for '{}' in this build; \
+             set_duty is simulated, not actuated",
+            name_of(args)
+        )),
         other => Err(format!("E_KAZE_LINK: the live device bus has no '{}'", other)),
     }
 }
@@ -718,7 +726,7 @@ fn live_drone(link: &mut DroneLink, op: &str, args: &[Value], arena: &mut Arena)
             .command(mavlink::cmd::NAV_LOITER_UNLIM, [0.0; 7])
             .map(|_| Value::Unit),
         "telemetry" => {
-            let field = args.first().map(|v| render_value(*v, arena, &Heap::new())).unwrap_or_default();
+            let field = args.first().map(|v| render_value(*v, arena, &Heap::empty())).unwrap_or_default();
             let field = field.trim_matches('"').to_string();
             Ok(link.telemetry().read(&field))
         }

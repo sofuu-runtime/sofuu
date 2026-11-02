@@ -21,11 +21,19 @@
 #define SOFUU_GLOBAL
 #define SOFUU_SHARED
 #define SOFUU_INLINE inline
+#define SOFUU_LAUNCH_BOUNDS(n)
 #else
 #define SOFUU_DEVICE __attribute__((device))
 #define SOFUU_GLOBAL __attribute__((global))
 #define SOFUU_SHARED __attribute__((shared))
 #define SOFUU_INLINE __inline__ __attribute__((always_inline))
+// Declare the block size each kernel is launched with, so the compiler budgets
+// registers for it instead of guessing. Without this a future edit can push a
+// kernel over the per-thread register limit and the launch fails at runtime
+// with cudaErrorLaunchOutOfResources (701) on the one machine nobody tested.
+// Emitted into the PTX as .maxntid, which is what makes it verifiable without
+// a GPU: see the .maxntid assertion in domains/infer/cuda.rs.
+#define SOFUU_LAUNCH_BOUNDS(n) __attribute__((launch_bounds(n)))
 #endif
 
 // ── GGML block layouts (packed, little-endian host) ────────────────────────
@@ -230,7 +238,7 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_block_reduce(float v,
 // ── GEMV kernels ───────────────────────────────────────────────────────────
 // q8_0: one thread owns one 32-value block.
 #if !defined(SOFUU_CUDA_HOST)
-extern "C" SOFUU_GLOBAL void sofuu_gemv_q8_0(const unsigned char *w,
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q8_0(const unsigned char *w,
                                              const float *x, float *y,
                                              int rows, int cols) {
     int row = (int)sofuu_ctaid_x();
@@ -254,7 +262,7 @@ extern "C" SOFUU_GLOBAL void sofuu_gemv_q8_0(const unsigned char *w,
 
 // q4_K: eight threads own one 256-value super-block, one 32-value sub-block
 // each; 256 threads cover 32 super-blocks per iteration.
-extern "C" SOFUU_GLOBAL void sofuu_gemv_q4_k(const unsigned char *w,
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q4_k(const unsigned char *w,
                                              const float *x, float *y,
                                              int rows, int cols) {
     int row = (int)sofuu_ctaid_x();
@@ -279,7 +287,7 @@ extern "C" SOFUU_GLOBAL void sofuu_gemv_q4_k(const unsigned char *w,
 }
 
 // q6_K: eight threads own one 256-value super-block, one 32-value run each.
-extern "C" SOFUU_GLOBAL void sofuu_gemv_q6_k(const unsigned char *w,
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q6_k(const unsigned char *w,
                                              const float *x, float *y,
                                              int rows, int cols) {
     int row = (int)sofuu_ctaid_x();
@@ -304,7 +312,7 @@ extern "C" SOFUU_GLOBAL void sofuu_gemv_q6_k(const unsigned char *w,
 }
 
 // f32 reference GEMV (also the C1 correctness floor).
-extern "C" SOFUU_GLOBAL void sofuu_gemv_f32(const float *w, const float *x,
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_f32(const float *w, const float *x,
                                             float *y, int rows, int cols) {
     int row = (int)sofuu_ctaid_x();
     unsigned int tid = sofuu_tid_x();
@@ -319,7 +327,7 @@ extern "C" SOFUU_GLOBAL void sofuu_gemv_f32(const float *w, const float *x,
 }
 
 // ── RMSNorm (one block per row) ────────────────────────────────────────────
-extern "C" SOFUU_GLOBAL void sofuu_rmsnorm(const float *x, const float *w,
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_rmsnorm(const float *x, const float *w,
                                            float *y, int n, float eps) {
     unsigned int tid = sofuu_tid_x();
     float ss = 0.0f;
@@ -338,7 +346,7 @@ extern "C" SOFUU_GLOBAL void sofuu_rmsnorm(const float *x, const float *w,
 }
 
 // ── SwiGLU: y = silu(g) * u ────────────────────────────────────────────────
-extern "C" SOFUU_GLOBAL void sofuu_swiglu(const float *g, const float *u,
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_swiglu(const float *g, const float *u,
                                           float *y, int n) {
     unsigned int tid = sofuu_tid_x();
     unsigned int stride = sofuu_ntid_x();
@@ -348,7 +356,7 @@ extern "C" SOFUU_GLOBAL void sofuu_swiglu(const float *g, const float *u,
 }
 
 // ── RoPE (in place), split-half and interleaved ────────────────────────────
-extern "C" SOFUU_GLOBAL void sofuu_rope_f32(float *x, const float *cos_tab,
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(128) void sofuu_rope_f32(float *x, const float *cos_tab,
                                             const float *sin_tab, int n_heads,
                                             int head_dim, int n_rot,
                                             int interleaved) {
@@ -370,13 +378,18 @@ extern "C" SOFUU_GLOBAL void sofuu_rope_f32(float *x, const float *cos_tab,
 }
 
 // ── KV cache write (f32), one block per KV head ────────────────────────────
-extern "C" SOFUU_GLOBAL void sofuu_kv_write_f32(float *k_cache, float *v_cache,
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(128) void sofuu_kv_write_f32(float *k_cache, float *v_cache,
                                                 const float *k, const float *v,
                                                 int pos, int n_kv_heads,
                                                 int head_dim, int cap) {
     int head = (int)sofuu_ctaid_x();
     unsigned int tid = sofuu_tid_x();
     unsigned int stride = sofuu_ntid_x();
+    // The host validates this too; a kernel that trusts its arguments is one
+    // refactor away from writing past the end of the cache.
+    if (pos < 0 || pos >= cap || head >= n_kv_heads) {
+        return;
+    }
     unsigned long long slot =
         ((unsigned long long)head * (unsigned long long)cap +
          (unsigned long long)pos) *

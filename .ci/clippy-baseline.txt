@@ -1,0 +1,18 @@
+# .ci/clippy-baseline.txt — the clippy warning ratchet (PLAN-AUDIT-REMEDIATION §5).
+#
+# Format:  <crate>:<target>:<max-warnings>
+# Checked by scripts/check-clippy-ratchet.sh, which runs on every `make test`.
+#
+# The rule: this file may only ever go DOWN. A change that adds a warning fails
+# the gate, and the fix is to remove the warning, not to raise the number. When a
+# refactor removes warnings, lower the number in the same commit.
+#
+# Why a ratchet and not `-D warnings`: 733 default-clippy warnings exist today
+# (127 missing `# Safety` sections, 69 needless_range_loop in hot loops, 64
+# too_many_arguments across the FFI surface). Zeroing them is a refactor of the
+# whole tree, not a gate. The gate is that the number never rises while that
+# refactor happens. `clippy::unwrap_used` is the one lint already at deny level
+# (crates/sofuu-ffi), which is why the five unwraps it found were real errors.
+sofuu-core:lib:675
+sofuu-ffi:lib:52
+sofuu-ffi:build:6

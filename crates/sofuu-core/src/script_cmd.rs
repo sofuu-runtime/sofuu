@@ -37,6 +37,7 @@ pub fn print_help() {
          \x20 --entry <name>         Routine to run (default: main, or the only one)\n\
          \x20 --arg <name>=<json>    Bind a parameter (repeatable)\n\
          \x20 --fuel <n>             Instruction budget (default 200000)\n\
+         \x20 --heap-kb <n>          Budget for lists and records in KiB (default 4096)\n\
          \x20 --ticks <n>            Supervisor ticks after the entry (default 0)\n\
          \x20 --tick-ms <n>          Virtual tick period (default 100)\n\
          \x20 --sim <k=v,k=v>        Initial machine state (battery=15,armed=true)\n\
@@ -57,6 +58,7 @@ struct Flags {
     entry: Option<String>,
     args: serde_json::Map<String, serde_json::Value>,
     fuel: Option<u64>,
+    heap_kb: Option<u64>,
     ticks: Option<u32>,
     tick_ms: Option<u64>,
     sim: String,
@@ -78,6 +80,7 @@ fn parse_flags(argv: &[String]) -> Result<Flags, String> {
         entry: None,
         args: serde_json::Map::new(),
         fuel: None,
+        heap_kb: None,
         ticks: None,
         tick_ms: None,
         sim: String::new(),
@@ -138,6 +141,10 @@ fn parse_flags(argv: &[String]) -> Result<Flags, String> {
                 let v = next("--fuel")?;
                 f.fuel = Some(v.parse().map_err(|_| format!("--fuel '{}' is not a number", v))?);
             }
+            "--heap-kb" => {
+                let v = next("--heap-kb")?;
+                f.heap_kb = Some(v.parse().map_err(|_| format!("--heap-kb '{}' is not a number", v))?);
+            }
             "--ticks" => {
                 let v = next("--ticks")?;
                 f.ticks = Some(v.parse().map_err(|_| format!("--ticks '{}' is not a number", v))?);
@@ -177,6 +184,10 @@ fn options_from(f: &Flags) -> Result<RunOptions, String> {
         args: f.args.clone(),
         grants: f.caps.clone(),
         fuel: f.fuel.unwrap_or(sfs::vm::Limits::default().fuel),
+        heap_bytes: f
+            .heap_kb
+            .map(|kb| (kb as usize).saturating_mul(1024))
+            .unwrap_or(sfs::vm::Limits::default().heap_bytes),
         ticks: f.ticks.unwrap_or(0),
         tick_ms: f.tick_ms.unwrap_or(100),
         sim,
@@ -586,6 +597,10 @@ fn handle_repl_command(
                 args,
                 grants: grants.clone(),
                 fuel: flags.fuel.unwrap_or(sfs::vm::Limits::default().fuel),
+                heap_bytes: flags
+                    .heap_kb
+                    .map(|kb| (kb as usize).saturating_mul(1024))
+                    .unwrap_or(sfs::vm::Limits::default().heap_bytes),
                 ticks: flags.ticks.unwrap_or(0),
                 tick_ms: flags.tick_ms.unwrap_or(100),
                 sim: SimState::default(),

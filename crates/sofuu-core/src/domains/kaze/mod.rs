@@ -98,6 +98,9 @@ pub struct RunOptions {
     /// Capability families the host grants a backend for (`drone=sim` → "drone").
     pub grants: Vec<String>,
     pub fuel: u64,
+    /// Budget for arrays and maps, in bytes. The second meter: `fuel` bounds
+    /// instructions, this bounds retained memory.
+    pub heap_bytes: usize,
     /// Supervisor ticks after the entry finishes; each tick polls `when`/`every`.
     pub ticks: u32,
     pub tick_ms: u64,
@@ -121,6 +124,7 @@ impl Default for RunOptions {
             args: serde_json::Map::new(),
             grants: Vec::new(),
             fuel: Limits::default().fuel,
+            heap_bytes: value::Heap::DEFAULT_LIMIT,
             ticks: 0,
             tick_ms: 100,
             sim: SimState::default(),
@@ -205,7 +209,7 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
     } else {
         Box::new(SimHost::new(opts.sim.clone()))
     };
-    let limits = Limits { fuel: opts.fuel.max(1), ..Limits::default() };
+    let limits = Limits { fuel: opts.fuel.max(1), heap_bytes: opts.heap_bytes, ..Limits::default() };
 
     let entry = resolve_entry(&module, opts)?;
 
@@ -227,7 +231,8 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
             let item = module
                 .item(name)
                 .ok_or_else(|| KazeError::new("E_KAZE_ENTRY", format!("there is no '{}' in this script", name)))?;
-            let args = bind_args(item.params.as_slice(), &opts.args, &mut vm);
+            let args = bind_args(item.params.as_slice(), &opts.args, &mut vm)
+                .map_err(|e| KazeError::new("E_KAZE_MEMORY", format!("{}: {}", prepared.name, e)))?;
             let value = vm
                 .run_item(item, &args)
                 .map_err(|e| KazeError::new(e.code, format!("{}: {} (line {})", prepared.name, e.msg, e.line)))?;
@@ -292,25 +297,25 @@ fn bind_args(
     params: &[String],
     args: &serde_json::Map<String, serde_json::Value>,
     vm: &mut Vm,
-) -> Vec<value::Value> {
+) -> Result<Vec<value::Value>, String> {
     let mut out = Vec::with_capacity(params.len());
     for (i, p) in params.iter().enumerate() {
         let json = args
             .get(p)
             .or_else(|| args.get(&i.to_string()))
             .unwrap_or(&serde_json::Value::Null);
-        out.push(json_to_value(json, &mut vm.arena, &mut vm.heap));
+        out.push(json_to_value(json, &mut vm.arena, &mut vm.heap)?);
     }
-    out
+    Ok(out)
 }
 
 fn json_to_value(
     j: &serde_json::Value,
     arena: &mut arena::Arena,
     heap: &mut value::Heap,
-) -> value::Value {
+) -> Result<value::Value, String> {
     use serde_json::Value as J;
-    match j {
+    Ok(match j {
         J::Null => value::Value::Unit,
         J::Bool(b) => value::Value::Bool(*b),
         J::Number(n) => value::Value::Num(n.as_f64().unwrap_or(0.0)),
@@ -319,11 +324,11 @@ fn json_to_value(
             Err(_) => value::Value::Unit,
         },
         J::Array(items) => {
-            let vals: Vec<value::Value> = items
-                .iter()
-                .map(|i| json_to_value(i, arena, heap))
-                .collect();
-            heap.push_array(vals)
+            let mut vals = Vec::with_capacity(items.len());
+            for i in items {
+                vals.push(json_to_value(i, arena, heap)?);
+            }
+            heap.push_array(vals)?
         }
         J::Object(map) => {
             let mut entries = Vec::with_capacity(map.len());
@@ -332,11 +337,11 @@ fn json_to_value(
                     Ok(r) => value::Value::Str(r),
                     Err(_) => value::Value::Unit,
                 };
-                entries.push((key, json_to_value(v, arena, heap)));
+                entries.push((key, json_to_value(v, arena, heap)?));
             }
-            heap.push_map(entries)
+            heap.push_map(entries)?
         }
-    }
+    })
 }
 
 // ── the JS surface: sofuu.sfs ───────────────────────────────────────
@@ -461,6 +466,9 @@ fn opts_from_json(j: Option<serde_json::Value>) -> RunOptions {
     }
     if let Some(fuel) = map.get("fuel").and_then(|v| v.as_u64()) {
         opts.fuel = fuel;
+    }
+    if let Some(bytes) = map.get("heapBytes").and_then(|v| v.as_u64()) {
+        opts.heap_bytes = bytes as usize;
     }
     if let Some(ticks) = map.get("ticks").and_then(|v| v.as_u64()) {
         opts.ticks = ticks.min(10_000) as u32;

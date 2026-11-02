@@ -53,27 +53,84 @@ impl Value {
 
 /// The collection heap. `arrays` and `maps` are cleared by `free_wholesale`;
 /// an index is never reused within a run, so a stale index cannot alias.
-#[derive(Default)]
+///
+/// The heap is **metered** (PLAN-AUDIT-REMEDIATION §3 Task 1.4). Fuel bounds
+/// instructions, not bytes: without a second meter, a loop that allocates a
+/// list every iteration is unbounded work at bounded fuel (measured: 300k
+/// iterations reached 114 MB against a documented 256 KB arena). Every push
+/// charges the bytes it is about to retain, and a push that would cross the
+/// budget is refused — rejected, never clamped, exactly as H-4 refuses an
+/// out-of-range altitude.
 pub struct Heap {
     pub arrays: Vec<Vec<Value>>,
     pub maps: Vec<Vec<(Value, Value)>>,
+    used_bytes: usize,
+    limit: usize,
+}
+
+impl Default for Heap {
+    /// A bare `Heap` gets the default budget, never an unlimited one.
+    fn default() -> Self {
+        Heap::new(Heap::DEFAULT_LIMIT)
+    }
 }
 
 impl Heap {
-    pub fn new() -> Self {
-        Heap { arrays: Vec::new(), maps: Vec::new() }
+    /// 4 MiB — about 16x the string arena. Generous for any hardware routine,
+    /// small enough that several concurrent scripts still fit a small device.
+    pub const DEFAULT_LIMIT: usize = 4 * 1024 * 1024;
+
+    pub fn new(limit: usize) -> Self {
+        Heap { arrays: Vec::new(), maps: Vec::new(), used_bytes: 0, limit }
     }
 
-    pub fn push_array(&mut self, items: Vec<Value>) -> Value {
+    /// A read-only heap for rendering a value that owns no collections.
+    /// Its budget is zero, so it can never be pushed into by accident.
+    pub fn empty() -> Self {
+        Heap::new(0)
+    }
+
+    pub fn used_bytes(&self) -> usize {
+        self.used_bytes
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Charge the bytes a collection will retain before it is retained.
+    fn charge(&mut self, bytes: usize) -> Result<(), String> {
+        let next = self.used_bytes.saturating_add(bytes);
+        if next > self.limit {
+            return Err(format!(
+                "the run's collection budget of {} bytes was exceeded (arrays and maps are                  rejected, never clamped)",
+                self.limit
+            ));
+        }
+        self.used_bytes = next;
+        Ok(())
+    }
+
+    pub fn push_array(&mut self, items: Vec<Value>) -> Result<Value, String> {
+        let cost = items
+            .len()
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(std::mem::size_of::<Vec<Value>>());
+        self.charge(cost)?;
         let idx = self.arrays.len() as u32;
         self.arrays.push(items);
-        Value::Arr(idx)
+        Ok(Value::Arr(idx))
     }
 
-    pub fn push_map(&mut self, entries: Vec<(Value, Value)>) -> Value {
+    pub fn push_map(&mut self, entries: Vec<(Value, Value)>) -> Result<Value, String> {
+        let cost = entries
+            .len()
+            .saturating_mul(2 * std::mem::size_of::<Value>())
+            .saturating_add(std::mem::size_of::<Vec<Value>>());
+        self.charge(cost)?;
         let idx = self.maps.len() as u32;
         self.maps.push(entries);
-        Value::Map(idx)
+        Ok(Value::Map(idx))
     }
 
     pub fn array(&self, idx: u32) -> Option<&Vec<Value>> {

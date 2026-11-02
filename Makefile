@@ -37,6 +37,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # ──────────────────────────────────────────────────────────────────
 
 .PHONY: all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
+	kaze-drift-check kaze-drift-strict clippy-ratchet \
 	observability-stress asan fuzz-simd policy-dx modern-npm sbom sign-dist \
         deps scoreboard scoreboard-check cuda-check \
         libsofuu libsofuu-linux-x86_64 zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
@@ -333,13 +334,29 @@ clean:
 	rm -f $(TARGET)
 	cargo clean 2>/dev/null || true
 
-test: $(TARGET)
+test: $(TARGET) kaze-drift-check clippy-ratchet
 	@echo ""
 	@echo "\033[1m=== Sofuu Test Suite ===\033[0m"
 	@echo ""
 	@if [ ! -f tests/run_js_tests.sh ]; then \
 		echo "\033[33m— tests/ is local-only (gitignored); nothing to run\033[0m"; \
 	else bash tests/run_js_tests.sh; fi
+
+# The Kaze surface gate (PLAN-AUDIT-REMEDIATION §4 Task 2.1).
+# Two Kaze engines live in this tree and drifted silently once already, so this
+# runs on every `make test`: FAIL if the prototype copy falls behind the product,
+# print every prototype-only verb/opcode and the two version strings. The strict
+# form fails on any difference at all (used when auditing the prototype itself).
+kaze-drift-check:
+	@scripts/kaze-drift-check.sh
+
+kaze-drift-strict:
+	@scripts/kaze-drift-check.sh --strict
+
+# The clippy warning ratchet (PLAN-AUDIT-REMEDIATION §5 Task 3.2). Warnings may
+# fall, never rise; the baseline in .ci/clippy-baseline.txt is the number to beat.
+clippy-ratchet:
+	@scripts/check-clippy-ratchet.sh
 
 # ─── Workstream 6 conformance (protocols/sandbox/tooling) ─────────
 # Local-only runner (tests/ is gitignored). Not wired into CI yet: KNOWN-GAP

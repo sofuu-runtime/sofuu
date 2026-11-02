@@ -114,6 +114,57 @@ pub struct DeviceBuf {
     pub bytes: usize,
 }
 
+/// Validate a KV-cache write before it reaches the driver.
+///
+/// The kernel stores at `(head * cap + pos) * head_dim` with no bounds check of
+/// its own, so a position past the end of the cache silently writes over
+/// whatever CUDA allocated next. That is unrecoverable corruption of a model
+/// mid-generation, and it is cheap to refuse here: we know the device buffer
+/// sizes because we allocated them.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_kv_write(
+    pos: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    cap: usize,
+    k_cache_bytes: usize,
+    v_cache_bytes: usize,
+    k_bytes: usize,
+    v_bytes: usize,
+) -> Result<(), CudaError> {
+    if n_kv_heads == 0 || head_dim == 0 || cap == 0 {
+        return Err(CudaError(
+            "kv_write needs non-zero n_kv_heads, head_dim and cap".into(),
+        ));
+    }
+    if pos >= cap {
+        return Err(CudaError(format!(
+            "kv_write position {pos} is outside a cache of {cap} rows"
+        )));
+    }
+    let bytes = std::mem::size_of::<f32>();
+    let need = n_kv_heads
+        .checked_mul(cap)
+        .and_then(|v| v.checked_mul(head_dim))
+        .and_then(|v| v.checked_mul(bytes))
+        .ok_or_else(|| CudaError("kv_write cache dimensions overflow".into()))?;
+    if k_cache_bytes < need || v_cache_bytes < need {
+        return Err(CudaError(format!(
+            "kv_write needs {need} bytes per cache ({n_kv_heads} heads x {cap} rows x              {head_dim} dims), got {k_cache_bytes} and {v_cache_bytes}"
+        )));
+    }
+    let src = n_kv_heads
+        .checked_mul(head_dim)
+        .and_then(|v| v.checked_mul(bytes))
+        .ok_or_else(|| CudaError("kv_write source dimensions overflow".into()))?;
+    if k_bytes < src || v_bytes < src {
+        return Err(CudaError(format!(
+            "kv_write needs {src} bytes per source row set, got {k_bytes} and {v_bytes}"
+        )));
+    }
+    Ok(())
+}
+
 fn debug_on() -> bool {
     std::env::var("SOFUU_CUDA_DEBUG")
         .map(|v| v != "0" && !v.is_empty())
@@ -657,6 +708,9 @@ mod imp {
             head_dim: usize,
             cap: usize,
         ) -> Result<(), CudaError> {
+            validate_kv_write(
+                pos, n_kv_heads, head_dim, cap, k_cache.bytes, v_cache.bytes, k.bytes, v.bytes,
+            )?;
             let mut kc = k_cache.ptr;
             let mut vc = v_cache.ptr;
             let mut kp = k.ptr;
@@ -938,6 +992,57 @@ mod tests {
             assert!(
                 ptx.contains(&format!(".entry {name}(")),
                 "kernels.ptx is missing {name}"
+            );
+        }
+    }
+
+    /// Every kernel must carry a `.maxntid`, so a future edit cannot silently
+    /// blow the register budget and fail the launch with error 701 on hardware
+    /// nobody tested here. The block size is declared twice — in kernels.cu via
+    /// SOFUU_LAUNCH_BOUNDS and here in the checked-in PTX — and this is what
+    /// keeps the two honest.
+
+    #[test]
+    fn kv_write_bounds_are_refused_before_the_driver_sees_them() {
+        // 2 heads x 8 rows x 4 dims x 4 bytes = 256 bytes per cache.
+        let ok = (256, 64);
+        assert!(validate_kv_write(7, 2, 4, 8, ok.0, ok.0, ok.1, ok.1).is_ok());
+
+        // One past the last row is corruption, not a clamp.
+        let e = validate_kv_write(8, 2, 4, 8, 256, 256, 64, 64).unwrap_err();
+        assert!(e.0.contains("outside a cache"), "{}", e.0);
+
+        // A cache smaller than heads*rows*dims is refused with the arithmetic.
+        let e = validate_kv_write(0, 2, 4, 8, 128, 256, 64, 64).unwrap_err();
+        assert!(e.0.contains("needs 256 bytes"), "{}", e.0);
+
+        // A short source would have the kernel read past the caller's buffer.
+        let e = validate_kv_write(0, 2, 4, 8, 256, 256, 16, 64).unwrap_err();
+        assert!(e.0.contains("source"), "{}", e.0);
+
+        // Degenerate shapes are refused up front rather than divided by zero.
+        assert!(validate_kv_write(0, 0, 4, 8, 256, 256, 64, 64).is_err());
+        assert!(validate_kv_write(0, 2, 0, 8, 256, 256, 64, 64).is_err());
+        assert!(validate_kv_write(0, 2, 4, 0, 256, 256, 64, 64).is_err());
+    }
+
+    #[test]
+    fn every_ptx_entry_declares_its_block_size() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src/cuda/kernels.ptx");
+        let ptx = std::fs::read_to_string(&path).expect("read kernels.ptx");
+        for name in PTX_ENTRIES {
+            let start = ptx
+                .find(&format!(".entry {name}("))
+                .unwrap_or_else(|| panic!("kernels.ptx is missing {name}"));
+            // .maxntid sits between the parameter list and the opening brace, so
+            // the window runs to the body of this entry and no further.
+            let body = ptx[start..].find('{').map(|i| start + i).unwrap_or(start);
+            let window = &ptx[start..(body + 200).min(ptx.len())];
+            assert!(
+                window.contains(".maxntid"),
+                "{name} has no .maxntid: regenerate with scripts/cuda/gen_ptx.sh \
+                 after giving the kernel a SOFUU_LAUNCH_BOUNDS in kernels.cu"
             );
         }
     }

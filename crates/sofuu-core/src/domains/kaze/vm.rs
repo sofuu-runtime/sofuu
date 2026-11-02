@@ -25,13 +25,16 @@ use crate::sfs::value::{Heap, Value};
 pub struct Limits {
     pub fuel: u64,
     pub arena_bytes: usize,
+    /// Budget for arrays and maps. Two meters, not one: fuel bounds work,
+    /// this bounds retained bytes.
+    pub heap_bytes: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         // 200k instructions is a few milliseconds of work and far more than any
         // hardware routine needs; the point is that the bound exists.
-        Limits { fuel: 200_000, arena_bytes: 256 * 1024 }
+        Limits { fuel: 200_000, arena_bytes: 256 * 1024, heap_bytes: Heap::DEFAULT_LIMIT }
     }
 }
 
@@ -86,7 +89,7 @@ impl<'a> Vm<'a> {
         Vm {
             module,
             arena: Arena::new(limits.arena_bytes),
-            heap: Heap::new(),
+            heap: Heap::new(limits.heap_bytes),
             host,
             declared,
             grants,
@@ -156,7 +159,10 @@ impl<'a> Vm<'a> {
                         items.push(self.pop(item.line)?);
                     }
                     items.reverse();
-                    let v = self.heap.push_array(items);
+                    let v = self
+                        .heap
+                        .push_array(items)
+                        .map_err(|msg| VmError { code: "E_KAZE_MEMORY", msg, line: item.line })?;
                     self.push(v, item.line)?;
                 }
                 Op::GetIndex => {

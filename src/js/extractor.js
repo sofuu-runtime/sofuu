@@ -221,7 +221,7 @@
           } else if (typeof b.recall === 'function') {
             existing = b.recall(searchQuery, 3);
           }
-        } catch (eSearch) {}
+        } catch (eSearch) { /* the pre-write search is an optimisation; a backend that cannot search just skips the hit list. */ }
 
         // 2. Tombstone or decay superseded records
         if (Array.isArray(existing)) {
@@ -233,7 +233,7 @@
                 if (typeof b.forget === 'function' && hit.id !== undefined) {
                   b.forget(hit.id);
                 }
-              } catch (eForget) {}
+              } catch (eForget) { /* forgetting the superseded fact is best effort: a backend that refuses keeps both, which is the old behaviour. */ }
             }
           }
         }
@@ -254,7 +254,7 @@
           } else if (typeof b.recall === 'function') {
             dupHits = b.recall(factText, 1);
           }
-        } catch (eDup) {}
+        } catch (eDup) { /* duplicate detection is advisory; a failed search reports no duplicate rather than blocking the write. */ }
 
         if (Array.isArray(dupHits) && dupHits.length > 0 && dupHits[0].distance < 0.08) {
           // Already present almost verbatim
@@ -273,7 +273,7 @@
 
     try {
       if (typeof b.flush === 'function') b.flush();
-    } catch (eFlush) {}
+    } catch (eFlush) { /* flush is durability, not correctness: the fact is already in the backend buffer. */ }
 
     return { added: added, updated: updated, skipped: skipped };
   }

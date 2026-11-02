@@ -96,7 +96,7 @@
         var raw = sofuu.policy.get();
         return raw ? JSON.parse(raw) : {};
       }
-    } catch (e) {}
+    } catch (e) { /* a policy document that does not parse falls back to '{}', which policyVerdict reads as no rule. */ }
     return {};
   }
 
@@ -111,7 +111,7 @@
       if (sofuu.policy && typeof sofuu.policy.evaluate === 'function') {
         return JSON.parse(sofuu.policy.evaluate({ op: 'http.request', path: path, method: method }));
       }
-    } catch (e) {}
+    } catch (e) { /* an unreadable verdict is treated as no verdict below; the caller decides, not this parse. */ }
     return { decision: 'allow', rule: '', reason: '' };
   }
 
@@ -170,7 +170,7 @@
       try {
         qs[decodeURIComponent(parts[i].slice(0, eq))] =
           decodeURIComponent(parts[i].slice(eq + 1).replace(/\+/g, ' '));
-      } catch (e) {}
+      } catch (e) { /* a query parameter that will not decode is skipped; the rest of the query still parses. */ }
     }
     return qs;
   }
@@ -229,11 +229,11 @@
     }
     if (cfg.modelPath && want === cfg.modelPath) return want;
     if (/\.(gguf|safetensors|pt|pth|npz|npy)$/i.test(want)) {
-      try { if (sofuu.fs && await sofuu.fs.exists(want)) return want; } catch (e) {}
+      try { if (sofuu.fs && await sofuu.fs.exists(want)) return want; } catch (e) { /* exists() throwing is the same answer as false here: fall through to the tokenizer probe. */ }
     }
     try {
       if (sofuu.fs && await sofuu.fs.exists(want + '/tokenizer.json')) return want;
-    } catch (e2) {}
+    } catch (e2) { /* same as above: a probe that throws resolves to not-a-model-directory, and the caller reports its own error. */ }
     return null;
   }
 
@@ -258,7 +258,7 @@
           if (info.id) space = info.id;
         }
       }
-    } catch (e0) {}
+    } catch (e0) { /* the vector-space probe is optional; dimension and id keep their defaults. */ }
     var brain = null;
     try {
       brain = (space === undefined)
@@ -657,7 +657,7 @@
       onStep: function (ev) {
         events.push(ev);
         if (wantStream) {
-          try { sseData(res, { run_id: id, event: ev }); } catch (eW) {}
+          try { sseData(res, { run_id: id, event: ev }); } catch (eW) { /* the client hung up mid-run: the step is already recorded in events[], so the run result is unaffected. */ }
         }
       },
     };
@@ -968,7 +968,7 @@
               var matchCat = /[?&](?:category|pack)=([^&]+)/.exec('?' + qStr);
               if (matchCat) queryCat = decodeURIComponent(matchCat[1]);
             }
-          } catch (eQ) {}
+          } catch (eQ) { /* a malformed percent-escape in ?category= leaves queryCat empty, which means unfiltered. */ }
           var inv = (sofuu.tools && typeof sofuu.tools.list === 'function')
             ? sofuu.tools.list(queryCat ? { category: queryCat } : {}) : [];
           send(res, 200, { object: 'list', data: inv });
@@ -1082,7 +1082,7 @@
         var praw = __session_read_file('.sofuu/policy.json');
         if (praw) { try { sofuu.policy.set(String(praw)); } catch (ePol) {} }
       }
-    } catch (ePl) {}
+    } catch (ePl) { /* loading the session policy is best effort: without it the default policy stays in force. */ }
     var auth = authMode();
     if (auth !== 'none' && !cfg.token) {
       throw new Error('serve: a bearer token is required (set --token / SOFUU_SERVE_TOKEN, or policy http.auth:"none" explicitly)');

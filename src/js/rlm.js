@@ -363,7 +363,7 @@
        * it. Clearing on last-exit keeps the P3-13 guard too (the next
        * query is never stillborn-aborted by a stale flag). */
       if (g.__rlm_aborted && EPISODES.length === 0) g.__rlm_aborted = false;
-      try { __rlm_free(id); } catch (e) {}
+      try { __rlm_free(id); } catch (e) { /* freeing the episode is cleanup after the answer exists; a double free is not fatal. */ }
     }
   }
 
@@ -376,7 +376,7 @@
    * route, latencyMs, rlmCalls}) to ~/.sofuu/routing_log.jsonl. */
   function logRoute(d) {
     if (typeof __rlm_log_route !== 'function') return;
-    try { __rlm_log_route(JSON.stringify(d || {})); } catch (e) {}
+    try { __rlm_log_route(JSON.stringify(d || {})); } catch (e) { /* the routing log is telemetry; a write failure must not fail the query. */ }
   }
 
   sofuu.rlm = {

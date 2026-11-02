@@ -418,7 +418,7 @@
     }, opts.timeoutMs || 10000);
     var body = await r.text();
     var ct = '';
-    try { ct = String((r.headers && r.headers.get('content-type')) || ''); } catch (e) {}
+    try { ct = String((r.headers && r.headers.get('content-type')) || ''); } catch (e) { /* a response without readable headers is treated as unknown type. */ }
     var text;
     if (ct.indexOf('html') >= 0 || /^\s*<(!doctype|html)/i.test(body)) {
       text = body

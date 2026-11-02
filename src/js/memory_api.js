@@ -80,7 +80,7 @@
       value: { live: live, refuse: refuse, isView: isView, isOpts: isOpts },
       enumerable: false
     });
-  } catch (eBridge) { }
+  } catch (eBridge) { /* the non-enumerable __flat bridge is optional; without it the surface just exposes fewer introspection hooks. */ }
 
   function adapterSurface() {
     if (ADAPTER_SURFACE) return ADAPTER_SURFACE;
@@ -567,5 +567,5 @@
         typeof S.brain.remember !== 'function')) {
       S.brain = M;
     }
-  } catch (eBrain) {}
+  } catch (eBrain) { /* installing the default brain is best effort; a locked-in brain from the host wins either way. */ }
 })();

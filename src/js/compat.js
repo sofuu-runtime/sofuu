@@ -1295,7 +1295,7 @@ if (typeof globalThis.ReadableStream === "undefined") {
         function (e) {
           try {
             reader.releaseLock();
-          } catch (_) {}
+          } catch (_) { /* the reader is already being torn down on the error path; a failed release is expected here. */ }
           return Promise.reject(e);
         }
       );
@@ -1974,7 +1974,7 @@ if (typeof globalThis.ReadableStream === "undefined") {
       try {
         if (lsDir) {
           try { g.sofuu.fs.mkdirSync(lsDir, { recursive: true }); }
-          catch (eMk) { try { g.sofuu.fs.mkdirSync(lsDir); } catch (eMk2) {} }
+          catch (eMk) { try { g.sofuu.fs.mkdirSync(lsDir); } catch (eMk2) { /* recursive create refused (older host), so try the plain form; if that fails too the lsDir simply stays absent and listing returns empty. */ } }
         }
       } catch (eDir) {}
       try { g.sofuu.fs.writeFileSync(lsPath, JSON.stringify(lsData)); } catch (eWrite) {}

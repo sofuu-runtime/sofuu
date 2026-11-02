@@ -1256,6 +1256,9 @@ mod impl_qtsq {
 
     /// cma_open — the pre-W2 shape every in-tree caller (and the C ABI)
     /// uses: a writable open with the lazy loader and `None` on failure.
+    // Retained deliberately: the writable-open shape the C ABI and the in-tree loaders use; a future
+    // caller outside this module is expected (W2 keeps only the _ex variant wired).
+    #[allow(dead_code)]
     unsafe fn cma_open(
         path: &str,
         vec_dim: usize,
@@ -2065,6 +2068,8 @@ mod impl_qtsq {
     /// bad file is quarantined as `<file>.torn`, and the store is repaired on
     /// disk before it is handed back — so `Err` now means only "not a brain
     /// this build can read at all" (no manifest / wrong key).
+    // Retained deliberately: the torn-write recovery entry; tests exercise the _opts variant.
+    #[allow(dead_code)]
     unsafe fn load_segmented(
         path: &str,
         m: &crate::rt::brain_store::Manifest,
@@ -7204,6 +7209,9 @@ mod impl_qtsq {
 
     /// Write a single-file brain the way the PRE-B4 code did: encrypted with
     /// the legacy fixed password. Used to prove the migration path.
+    // Retained deliberately: the pre-B4 single-file writer, kept as the reference for the migration path
+    // the B4 tests describe.
+    #[allow(dead_code)]
     unsafe fn write_legacy_encrypted_brain(path: &str, dim: usize, texts: &[&str]) {
         let n = texts.len();
         let mut flat: Vec<f32> = Vec::new();
@@ -7285,6 +7293,8 @@ mod impl_qtsq {
     }
 
     /// Can `password` open this file? (Read-only probe.)
+    // Retained deliberately: the read-only password probe; the B4 migration tests use its string form.
+    #[allow(dead_code)]
     unsafe fn opens_with(path: &str, password: &str) -> bool {
         let cpath = CString::new(path).unwrap();
         let ctx = qtsq::qtsq_ctx_alloc();
@@ -7497,6 +7507,8 @@ mod impl_qtsq {
 
     /// Every file under `dir` with its size — a flush's write footprint is
     /// the sum of the size deltas plus any new files.
+    // Retained deliberately: the flush footprint measurement; retained with bytes_touched below.
+    #[allow(dead_code)]
     fn dir_sizes(dir: &std::path::Path) -> std::collections::BTreeMap<String, u64> {
         let mut out = std::collections::BTreeMap::new();
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -7509,6 +7521,8 @@ mod impl_qtsq {
         out
     }
 
+    // Retained deliberately: the companion to dir_sizes.
+    #[allow(dead_code)]
     fn bytes_touched(
         before: &std::collections::BTreeMap<String, u64>,
         after: &std::collections::BTreeMap<String, u64>,
@@ -9169,7 +9183,7 @@ pub struct RepairReport {
 /// process has the brain open.
 pub fn repair(path: &str) -> RepairReport {
     #[cfg(has_qtsq)]
-    unsafe {
+    {
         impl_qtsq::repair_brain(path)
     }
     #[cfg(not(has_qtsq))]

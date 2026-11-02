@@ -1433,18 +1433,46 @@ extern "C" {
     // GQA shape table (see metal_engine.h): the shipped selection rule and the
     // table itself, exposed so the generalized shapes are testable without a
     // GPU and without duplicating the table in Rust.
+    // Unused by the Rust engine today, kept on purpose: this is the GQA shape
+    // table's query surface, and the shape tests reach it through the FFI rather
+    // than duplicating the table in Rust.
+    #[allow(dead_code)]
     fn sofuu_metal_attn_gqa_pick(ratio: u32, avail_mask: u32, allow_opt_in: i32) -> i32;
     // Same rule, but tells "no form for this ratio" (-1) from "the table has
     // forms and none of them is usable" (-2), which the dispatcher reports.
+    // Unused by the Rust engine today, kept on purpose: this is the GQA shape
+    // table's query surface, and the shape tests reach it through the FFI rather
+    // than duplicating the table in Rust.
+    #[allow(dead_code)]
     fn sofuu_metal_attn_gqa_pick_ex(ratio: u32, avail_mask: u32, allow_opt_in: i32) -> i32;
+    // Unused by the Rust engine today, kept on purpose: this is the GQA shape
+    // table's query surface, and the shape tests reach it through the FFI rather
+    // than duplicating the table in Rust.
+    #[allow(dead_code)]
     fn sofuu_metal_attn_gqa_count() -> u32;
+    // Unused by the Rust engine today, kept on purpose: this is the GQA shape
+    // table's query surface, and the shape tests reach it through the FFI rather
+    // than duplicating the table in Rust.
+    #[allow(dead_code)]
     fn sofuu_metal_attn_gqa_threads(idx: i32) -> u32;
+    // Unused by the Rust engine today, kept on purpose: this is the GQA shape
+    // table's query surface, and the shape tests reach it through the FFI rather
+    // than duplicating the table in Rust.
+    #[allow(dead_code)]
     fn sofuu_metal_attn_gqa_rg(idx: i32) -> u32;
+    // Unused by the Rust engine today, kept on purpose: this is the GQA shape
+    // table's query surface, and the shape tests reach it through the FFI rather
+    // than duplicating the table in Rust.
+    #[allow(dead_code)]
     fn sofuu_metal_attn_gqa_ratio(idx: i32) -> u32;
     fn sofuu_metal_attn_gqa_last() -> i32;
     /// maxTotalThreadsPerThreadgroup of the shape's pipeline, 0 when the
     /// pipeline could not be created on this GPU (the ceiling that decides
     /// whether a shape may ever be dispatched is checked against this).
+    // Unused by the Rust engine today, kept on purpose: this is the GQA shape
+    // table's query surface, and the shape tests reach it through the FFI rather
+    // than duplicating the table in Rust.
+    #[allow(dead_code)]
     fn sofuu_metal_attn_gqa_max_threads(idx: i32) -> u32;
     fn sofuu_metal_batch_gguf_b4r(
         ctx: *mut c_void,

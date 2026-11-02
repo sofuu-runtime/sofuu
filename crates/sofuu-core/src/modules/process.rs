@@ -2512,7 +2512,10 @@ pub(crate) unsafe fn clipboard_write(text: &str) -> bool {
 }
 
 /// Standard base64 (RFC 4648) encode — small, allocation-simple, no
-/// external crates. OSC 52 needs it; kept next to its only caller.
+/// external crates. OSC 52 needs it; kept next to its only caller, and gated to
+/// the same cfg as that caller so neither is dead code on macOS — which uses
+/// pbcopy and never reaches this path.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn b64_encode(data: &[u8]) -> String {
     const TBL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);

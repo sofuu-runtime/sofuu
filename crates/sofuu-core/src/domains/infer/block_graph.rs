@@ -404,18 +404,16 @@ fn gemm_batched_mlx4(wm: &WeightMatrix, xs: &[f32], n_tok: usize, ys: &mut [f32]
         // C[t][r0..r0+pr) = X[t][c] * W_panel[r][c], strided via ldc = rows
         #[cfg(target_os = "macos")]
         if crate::infer::lfm2::blas_enabled() {
-            unsafe {
-                crate::infer::lfm2::blas_gemm_panel(
-                    xs,
-                    &fpbuf,
-                    ys,
-                    n_tok,
-                    r0,
-                    rows,
-                    cols,
-                    pr,
-                );
-            }
+            crate::infer::lfm2::blas_gemm_panel(
+                xs,
+                &fpbuf,
+                ys,
+                n_tok,
+                r0,
+                rows,
+                cols,
+                pr,
+            );
             continue;
         }
         // non-macos / blas-off fallback: f32 rows, per-token dots

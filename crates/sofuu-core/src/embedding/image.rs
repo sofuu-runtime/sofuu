@@ -29,8 +29,6 @@ pub const IMGF_VERSION: u32 = 1;
 pub const IMG_FEAT_DIM: usize = 144;
 /// Working thumbnail side (luminance buffer).
 const THUMB: usize = 64;
-/// Luminance analysis grid side.
-const GRID: usize = 8;
 /// Decoder caps.
 const MAX_SIDE: u32 = 2048;
 const MAX_PIXELS: u64 = 8 * 1024 * 1024;

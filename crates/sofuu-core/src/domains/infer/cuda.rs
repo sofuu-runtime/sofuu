@@ -180,6 +180,9 @@ fn debug_on() -> bool {
     false
 }
 
+// Dead on macOS by construction: every caller below is inside a block that
+// only runs when a CUDA driver was opened, which cannot happen off Linux.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn kill_switch() -> bool {
     matches!(
         std::env::var("SOFUU_CUDA").as_deref(),
@@ -187,6 +190,7 @@ fn kill_switch() -> bool {
     )
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn debug(msg: impl std::fmt::Display) {
     if debug_on() {
         eprintln!("[cuda] {msg}");

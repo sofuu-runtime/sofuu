@@ -2175,9 +2175,9 @@ unsafe fn run_gemm_panels(
                 let xr = &x[t * cols..(t + 1) * cols];
                 for ri in 0..panel_rows {
                     #[cfg(target_arch = "aarch64")]
-                    let acc = unsafe { dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols) };
+                    let acc = dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols);
                     #[cfg(not(target_arch = "aarch64"))]
-                    let acc = unsafe { dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols) };
+                    let acc = dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols);
                     y[t * rows + row0 + ri] = acc;
                 }
                 t += 1;
@@ -3438,18 +3438,16 @@ fn gemm_pair_batched(
                         for tk in 0..4 {
                             let xr = &x[(t + tk) * cols..(t + tk + 1) * cols];
                             #[cfg(target_arch = "aarch64")]
-                            let acca = unsafe { dot_f32_neon(buf.as_ptr().add(r1 * cols), xr.as_ptr(), cols) };
+                            let acca = dot_f32_neon(buf.as_ptr().add(r1 * cols), xr.as_ptr(), cols);
                             #[cfg(not(target_arch = "aarch64"))]
-                            let acca = unsafe { dot_f32_neon(buf.as_ptr().add(r1 * cols), xr.as_ptr(), cols) };
+                            let acca = dot_f32_neon(buf.as_ptr().add(r1 * cols), xr.as_ptr(), cols);
                             ya[(t + tk) * rows + row0 + r1] = acca;
                             #[cfg(target_arch = "aarch64")]
-                            let accb = unsafe {
-                                dot_f32_neon(buf.as_ptr().add((ROW_PANEL + r1) * cols), xr.as_ptr(), cols)
-                            };
+                            let accb =
+                                dot_f32_neon(buf.as_ptr().add((ROW_PANEL + r1) * cols), xr.as_ptr(), cols);
                             #[cfg(not(target_arch = "aarch64"))]
-                            let accb = unsafe {
-                                dot_f32_neon(buf.as_ptr().add((ROW_PANEL + r1) * cols), xr.as_ptr(), cols)
-                            };
+                            let accb =
+                                dot_f32_neon(buf.as_ptr().add((ROW_PANEL + r1) * cols), xr.as_ptr(), cols);
                             yb[(t + tk) * rows + row0 + r1] = accb;
                         }
                     }
@@ -3459,18 +3457,16 @@ fn gemm_pair_batched(
                     let xr = &x[t * cols..(t + 1) * cols];
                     for ri in 0..panel_rows {
                         #[cfg(target_arch = "aarch64")]
-                        let acc = unsafe { dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols) };
+                        let acc = dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols);
                         #[cfg(not(target_arch = "aarch64"))]
-                        let acc = unsafe { dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols) };
+                        let acc = dot_f32_neon(buf.as_ptr().add(ri * cols), xr.as_ptr(), cols);
                         ya[t * rows + row0 + ri] = acc;
                         #[cfg(target_arch = "aarch64")]
-                        let accb = unsafe {
-                            dot_f32_neon(buf.as_ptr().add((ROW_PANEL + ri) * cols), xr.as_ptr(), cols)
-                        };
+                        let accb =
+                            dot_f32_neon(buf.as_ptr().add((ROW_PANEL + ri) * cols), xr.as_ptr(), cols);
                         #[cfg(not(target_arch = "aarch64"))]
-                        let accb = unsafe {
-                            dot_f32_neon(buf.as_ptr().add((ROW_PANEL + ri) * cols), xr.as_ptr(), cols)
-                        };
+                        let accb =
+                            dot_f32_neon(buf.as_ptr().add((ROW_PANEL + ri) * cols), xr.as_ptr(), cols);
                         yb[t * rows + row0 + ri] = accb;
                     }
                     t += 1;
@@ -3638,6 +3634,8 @@ impl Lfm2Model {
                         let kp = SendMutPtr(kbuf.as_mut_ptr());
                         let vp = SendMutPtr(vbuf.as_mut_ptr());
                         let hbp = SendMutPtr(hb.as_mut_ptr());
+                        // SAFETY: nested under the closure's unsafe body above; the
+                        // caches are owned by this call and not aliased here.
                         let kcp = SendMutPtr((&mut *self.k_cache).as_mut_ptr());
                         let vcp = SendMutPtr((&mut *self.v_cache).as_mut_ptr());
                         let qlp = SendPtr(q_ln_ptr);

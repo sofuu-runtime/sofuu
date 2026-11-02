@@ -886,8 +886,9 @@ fn gemm_rows_t143_sdot(
     r_off: usize,
     rows: usize,
 ) -> Vec<f32> {
-    const TR: usize = 4;
-    const TT: usize = 8;
+    // TR/TT were tile hints for a blocked variant that no longer exists; the
+    // body tiles by token and row directly, so they only read as intent the
+    // code does not follow.
     let n_in = m.n_in;
     let blocks = n_in / PTQ1_0_BLOCK_VALUES;
     debug_assert!(blocks > 0 && blocks * PTQ1_0_BLOCK_VALUES == n_in);

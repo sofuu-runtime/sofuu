@@ -120,6 +120,26 @@ export RUSTFLAGS="$REMAP -C linker=$REPO_ROOT/scripts/cross/zig-ld.sh -C link-ar
 # duplicate the ones zig's driver links itself → duplicate-symbol errors.
 # With it off, zig supplies the CRT for the -static -pie link.
 
+# ── Lean link (2026-11-02) ──────────────────────────────────────
+# Measured on this tree: Linux x86_64 was 7,735,896 B against a 5,767,168 B
+# cap, and a third of the overage was link furniture, not code. A static-PIE
+# musl link pays for two things a static non-PIE binary does not need:
+#   -C relocation-model=static + -no-pie   → .rela.dyn 380,064 B → 0,
+#                                            .data.rel.ro 268,888 B → 47,960 B
+#   -C force-unwind-tables=no              → no unwind tables from Rust
+#   -Wl,--no-eh-frame-hdr                  → no ELF header for a .eh_frame
+# Result: 7,316,648 B, i.e. 419,248 B smaller. Still over the cap — the rest is
+# C-side .eh_frame (667 KB) and .text, tracked in
+# docs/PLAN-AUDIT-REMEDIATION-2026-11-02.md §9 Task 7.1.
+# SOFUU_LEAN_BUILD=0 falls back to the old picture-based link if a future musl
+# or zig release objects; a lean artifact must be smoke-tested on Linux before
+# it is published, because none of this changes the size gate's own checks.
+if [ "${SOFUU_LEAN_BUILD:-1}" != "0" ]; then
+    RUSTFLAGS="$RUSTFLAGS -C force-unwind-tables=no -C relocation-model=static"
+    RUSTFLAGS="$RUSTFLAGS -C link-arg=-no-pie -C link-arg=-Wl,--no-eh-frame-hdr"
+fi
+export RUSTFLAGS
+
 # -p sofuu-core: build only the CLI package. A whole-workspace build drags
 # in the desktop app (sofuu-desktop/src-tauri), whose notification stack
 # (tauri-plugin-notification → notify-rust → libdbus-sys) requires a

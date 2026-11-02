@@ -185,3 +185,6 @@ npm/NOTICE
 /mav.parm
 /mav.tlog
 /mav.tlog.raw
+
+# Python bytecode from the check scripts
+__pycache__/

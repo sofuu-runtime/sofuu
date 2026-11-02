@@ -40,7 +40,30 @@ if [[ "$ZIP" == "--check" ]]; then
     echo "       Found: $(grep -A1 'let sofuuXCFrameworkURL' "$REPO_ROOT/Package.swift" | tail -1 | tr -d ' ')" >&2
     fail=1
   fi
-  [[ "$fail" -eq 0 ]] && echo "✓ Package.swift is publishable for v$V"
+
+  # The podspec is the second install path and drifts independently: it sat at
+  # 0.2.0 while the project was on 0.3.0-beta, so "pod 'Sofuu', '~> 0.2'" fetched
+  # a release four months older than the one being tagged.
+  PODSPEC="$REPO_ROOT/Sofuu.podspec"
+  if [[ ! -f "$PODSPEC" ]]; then
+    echo "error: Sofuu.podspec is missing." >&2
+    fail=1
+  else
+    # awk -F"'" rather than sed: BSD sed has no \s, and the greedy form silently
+    # returned the whole assignment line as the "version".
+    pod_version="$(awk -F"'" '/s\.version/ {print $2; exit}' "$PODSPEC")"
+    if [[ "$pod_version" != "$V" ]]; then
+      echo "error: Sofuu.podspec says s.version = '$pod_version', the release is '$V'." >&2
+      echo "       A pod version that does not match the tag resolves to an older artifact." >&2
+      fail=1
+    fi
+    if ! grep -q "/v$V/" "$PODSPEC"; then
+      echo "error: Sofuu.podspec does not point at a v$V release asset." >&2
+      fail=1
+    fi
+  fi
+
+  [[ "$fail" -eq 0 ]] && echo "✓ Package.swift and Sofuu.podspec are publishable for v$V"
   exit "$fail"
 fi
 
@@ -86,6 +109,27 @@ if version:
 
 open(path, "w").write(src)
 PY
+
+# The podspec carries the same version + URL pair and drifts on its own, so it is
+# stamped in the same pass. A podspec rewrite that fails is fatal: an artifact
+# pinned by SwiftPM but not by CocoaPods is the drift this script exists to stop.
+if [[ -n "$V" && -f "$REPO_ROOT/Sofuu.podspec" ]]; then
+  python3 - "$REPO_ROOT/Sofuu.podspec" "$V" <<'PY'
+import re, sys
+path, version = sys.argv[1], sys.argv[2]
+src = open(path).read()
+src, n1 = re.subn(r"(s\.version\s*=\s*')[^']*(')",
+                  lambda m: m.group(1) + version + m.group(2), src, count=1)
+url = f"https://github.com/sofuu-runtime/sofuu/releases/download/v{version}/libsofuu.xcframework.zip"
+src, n2 = re.subn(r"(:http\s*=>\s*')[^']*(')",
+                  lambda m: m.group(1) + url + m.group(2), src, count=1)
+if n1 != 1 or n2 != 1:
+    sys.exit(f"error: podspec rewrite matched version={n1} url={n2} (expected 1 and 1)")
+open(path, "w").write(src)
+PY
+  grep -q "s.version          = '$V'" "$REPO_ROOT/Sofuu.podspec" ||
+    { echo "error: podspec version did not take effect" >&2; exit 1; }
+fi
 
 # Verify what we actually wrote, rather than trusting the rewrite.
 if grep -q "let sofuuXCFrameworkChecksum = \"$SHA\"" "$REPO_ROOT/Package.swift"; then

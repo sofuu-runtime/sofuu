@@ -121,10 +121,14 @@ sh scripts/verify-dist.sh   # release gate: stamp, tree state, every artifact
 - **The Linux archives are over the cap** and predate this engine; the next
   release rebuilds and re-stamps them. macOS is already under.
 - **SwiftPM and CocoaPods coordinates do not resolve yet.** The `v0.3.0-beta`
-  tag carries a placeholder checksum and a v0.2.0 asset URL, and no xcframework
-  exists in any tag tree — so the embedding docs now say that instead of
-  pointing at an install that cannot work. A new tag with a stamped
-  `Package.swift` (`scripts/stamp-swiftpm.sh`) closes it.
+  tag carries a placeholder checksum, and both `Package.swift` and
+  `Sofuu.podspec` still point at the v0.2.0 asset (the podspec also says
+  `s.version = '0.2.0'`, so `pod 'Sofuu', '~> 0.2'` would fetch a release four
+  months older than the one being tagged). No xcframework exists in any tag
+  tree — so the embedding docs now say that instead of pointing at an install
+  that cannot work. `SOFUU_VERSION=<v> scripts/stamp-swiftpm.sh --check` audits
+  both manifests, and the release job warns by name when they are unpublishable.
+  A new tag with both stamped closes it.
 - **TypeScript is erased, never checked.** Object literals, parameter
   properties, `enum`s, generics, `implements`/`abstract`, `as`/`satisfies`,
   `declare`, and `export type`/`export interface` are handled; `namespace` and

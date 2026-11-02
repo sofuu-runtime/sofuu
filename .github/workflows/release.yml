@@ -156,7 +156,7 @@ jobs:
       # Deliberately a warning, not a failure: blocking the macOS binary release
       # on an iOS packaging decision that README already discloses would trade
       # one silent problem for a louder one the release cannot fix by itself.
-      - name: Report whether the tagged Package.swift is publishable
+      - name: Report whether the tagged manifests are publishable
         continue-on-error: true
         env:
           SOFUU_VERSION: ${{ github.ref_name }}
@@ -166,7 +166,7 @@ jobs:
           if SOFUU_VERSION="$V" ./scripts/stamp-swiftpm.sh --check; then
             exit 0
           fi
-          echo "::warning title=SwiftPM manifest not publishable::The tagged Package.swift still carries a placeholder checksum or a stale URL for v$V. Build the xcframework, run scripts/stamp-swiftpm.sh, commit the stamped Package.swift, then re-tag."
+          echo "::warning title=SwiftPM/CocoaPods manifests not publishable::The tagged Package.swift or Sofuu.podspec still carries a placeholder checksum, a stale version or a stale URL for v$V. Build the xcframework, run scripts/stamp-swiftpm.sh, commit the stamped manifests, then re-tag."
           echo "" >&2
           echo "The tagged Package.swift is not publishable for v$V." >&2
           echo "README discloses that these coordinates do not resolve yet; this" >&2

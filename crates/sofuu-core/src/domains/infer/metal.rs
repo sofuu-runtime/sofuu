@@ -11153,7 +11153,7 @@ fn gemm_multi_kernels_store_the_subtile_token_offset() {
         };
         &rest[..end]
     }
-    const KERNELS: &str = include_str!("../../../../src/metal/kernels.metal");
+    const KERNELS: &str = include_str!("../../../../../src/metal/kernels.metal");
     for name in ["kernel void gemm_q8_0_multi(", "kernel void gemm_q6_k_multi("] {
         let body = kernel_body(KERNELS, name);
         assert!(
@@ -11212,7 +11212,7 @@ fn q8_0_tiled_fused_strides_rows_by_32_value_blocks() {
         };
         &rest[..end]
     }
-    const KERNELS: &str = include_str!("../../../../src/metal/kernels.metal");
+    const KERNELS: &str = include_str!("../../../../../src/metal/kernels.metal");
     let q8 = kernel_body(KERNELS, "kernel void gemm_q8_0_tiled_fused(");
     assert!(
         q8.contains("cols / 32u") && q8.contains("nb32 * 34u"),

@@ -48,6 +48,7 @@ pub struct Theme {
     pub del: &'static str,
     pub hunk: &'static str,
     pub panel: &'static str,
+    pub subtle: &'static str,
 }
 
 pub const DEFAULT_THEME: &str = "sofuu";
@@ -61,67 +62,67 @@ pub const THEMES: &[Theme] = &[
         accent: "1;38;5;139", tool: "38;5;80", delegate: "38;5;140",
         heading: "1;38;5;80", code: "38;5;180", warn: "38;5;173",
         error: "1;38;5;174", add: "1;38;5;157;48;5;28", del: "1;38;5;174;48;5;52",
-        hunk: "38;5;80", panel: "2;38;5;139" },
+        hunk: "38;5;80", panel: "2;38;5;139", subtle: "38;5;246" },
     Theme { name: "slate", dark: true, bg: 236, // blue-gray monochrome calm
         accent: "1;38;5;110", tool: "38;5;109", delegate: "38;5;103",
         heading: "1;38;5;110", code: "38;5;186", warn: "38;5;179",
         error: "1;38;5;174", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
-        hunk: "38;5;109", panel: "2;38;5;110" },
+        hunk: "38;5;109", panel: "2;38;5;110", subtle: "38;5;152" },
     Theme { name: "moss", dark: true, bg: 22, // green-dominant, warm gray accents
         accent: "1;38;5;150", tool: "38;5;108", delegate: "38;5;144",
         heading: "1;38;5;150", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;157;48;5;28", del: "1;38;5;181;48;5;52",
-        hunk: "38;5;108", panel: "2;38;5;150" },
+        hunk: "38;5;108", panel: "2;38;5;150", subtle: "38;5;151" },
     Theme { name: "clay", dark: true, bg: 94, // terracotta warmth
         accent: "1;38;5;173", tool: "38;5;180", delegate: "38;5;174",
         heading: "1;38;5;173", code: "38;5;186", warn: "38;5;179",
         error: "1;38;5;167", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
-        hunk: "38;5;180", panel: "2;38;5;173" },
+        hunk: "38;5;180", panel: "2;38;5;173", subtle: "38;5;187" },
     Theme { name: "plum", dark: true, bg: 53, // muted purple, low saturation
         accent: "1;38;5;140", tool: "38;5;139", delegate: "38;5;183",
         heading: "1;38;5;140", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;151;48;5;22", del: "1;38;5;181;48;5;52",
-        hunk: "38;5;139", panel: "2;38;5;140" },
+        hunk: "38;5;139", panel: "2;38;5;140", subtle: "38;5;182" },
     Theme { name: "tide", dark: true, bg: 23, // deep teal water
         accent: "1;38;5;115", tool: "38;5;80", delegate: "38;5;109",
         heading: "1;38;5;115", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;157;48;5;29", del: "1;38;5;174;48;5;52",
-        hunk: "38;5;80", panel: "2;38;5;115" },
+        hunk: "38;5;80", panel: "2;38;5;115", subtle: "38;5;116" },
     Theme { name: "ember", dark: true, bg: 233, // ember orange on charcoal
         accent: "1;38;5;180", tool: "38;5;173", delegate: "38;5;174",
         heading: "1;38;5;180", code: "38;5;186", warn: "38;5;179",
         error: "1;38;5;167", add: "1;38;5;151;48;5;22", del: "1;38;5;181;48;5;52",
-        hunk: "38;5;173", panel: "2;38;5;180" },
+        hunk: "38;5;173", panel: "2;38;5;180", subtle: "38;5;245" },
     Theme { name: "dusk", dark: true, bg: 54, // dusky blue-violet evening
         accent: "1;38;5;140", tool: "38;5;110", delegate: "38;5;139",
         heading: "1;38;5;140", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
-        hunk: "38;5;110", panel: "2;38;5;140" },
+        hunk: "38;5;110", panel: "2;38;5;140", subtle: "38;5;189" },
     Theme { name: "forest", dark: true, bg: 22, // deep pine, bark browns
         accent: "1;38;5;108", tool: "38;5;150", delegate: "38;5;144",
         heading: "1;38;5;108", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;157;48;5;28", del: "1;38;5;181;48;5;88",
-        hunk: "38;5;150", panel: "2;38;5;108" },
+        hunk: "38;5;150", panel: "2;38;5;108", subtle: "38;5;107" },
     Theme { name: "wine", dark: true, bg: 52, // muted oxblood red family
         accent: "1;38;5;174", tool: "38;5;181", delegate: "38;5;139",
         heading: "1;38;5;174", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;167", add: "1;38;5;151;48;5;22", del: "1;38;5;181;48;5;88",
-        hunk: "38;5;181", panel: "2;38;5;174" },
+        hunk: "38;5;181", panel: "2;38;5;174", subtle: "38;5;181" },
     Theme { name: "storm", dark: true, bg: 238, // cold steel gray-blue
         accent: "1;38;5;109", tool: "38;5;110", delegate: "38;5;103",
         heading: "1;38;5;109", code: "38;5;186", warn: "38;5;179",
         error: "1;38;5;174", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
-        hunk: "38;5;110", panel: "2;38;5;109" },
+        hunk: "38;5;110", panel: "2;38;5;109", subtle: "38;5;249" },
     Theme { name: "honey", dark: true, bg: 94, // warm amber, softened gold
         accent: "1;38;5;180", tool: "38;5;186", delegate: "38;5;173",
         heading: "1;38;5;180", code: "38;5;223", warn: "38;5;179",
         error: "1;38;5;167", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
-        hunk: "38;5;186", panel: "2;38;5;180" },
+        hunk: "38;5;186", panel: "2;38;5;180", subtle: "38;5;223" },
     Theme { name: "lagoon", dark: true, bg: 24, // pale aqua on deep slate
         accent: "1;38;5;116", tool: "38;5;115", delegate: "38;5;110",
         heading: "1;38;5;116", code: "38;5;186", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;157;48;5;29", del: "1;38;5;181;48;5;52",
-        hunk: "38;5;115", panel: "2;38;5;116" },
+        hunk: "38;5;115", panel: "2;38;5;116", subtle: "38;5;153" },
 ];
 
 /// Palette index of a role's `38;5;N` foreground — feeds the selection
@@ -192,6 +193,7 @@ pub fn fg_remap_pairs(from: &Theme, to: &Theme) -> Vec<(&'static str, &'static s
         (from.del, to.del),
         (from.hunk, to.hunk),
         (from.panel, to.panel),
+        (from.subtle, to.subtle),
     ];
     v.retain(|(a, b)| a != b);
     v.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
@@ -282,6 +284,7 @@ mod tests {
                 ("del", t.del),
                 ("hunk", t.hunk),
                 ("panel", t.panel),
+                ("subtle", t.subtle),
             ] {
                 assert!(
                     valid_params(v),

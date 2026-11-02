@@ -139,6 +139,7 @@ fn print_help() {
     println!("  tools list               List the tools the active policy allows (--json)");
     println!("  policy init|check|dry-run|why  Write a profile, audit a script, explain a rule");
     println!("  mcp list|test|add|remove Manage MCP servers and inspect their tools");
+    println!("  script run|check|compile|repl  Kaze: capability-gated device scripting");
     println!("\n\x1b[1mChat commands (inside the chat UI):\x1b[0m");
     /* P3 (AUDIT-2026-09-07): /models was deliberately removed (unknown
      * command — the model list lives in /provider) — stop advertising it. */
@@ -230,6 +231,7 @@ fn print_subcommand_help(cmd: &str) -> bool {
                -m, --model <path>   model to probe (default: configured)\n\
                --json               machine-readable report\n"
         ),
+        "script" => sofuu_core::script_cmd::print_help(),
         "capabilities" => println!(
             "Usage: sofuu capabilities\n\n\
              Print the runtime capability manifest as JSON (features, GPU\n\
@@ -432,7 +434,8 @@ fn print_plugin_help() {
            validate <file.js|file.ts>           validate syntax, exports, schema\n\
            run <tool_name> [args_json]          execute one plugin tool\n\
            test <tool_name> [args_json]         alias of run, isolated execution\n\
-           init <name> [--category=<kind>]      scaffold a plugin\n\n\
+           init <name> [--category=<kind>]      scaffold a plugin\n\
+           add <name> [--global] [--force]      install an official plugin (llamacpp, ollama)\n\n\
          \x1b[1mOptions:\x1b[0m\n\
                --policy <file>    policy file applied before the plugin runs\n"
     );
@@ -502,7 +505,9 @@ fn print_infer_help() {
                --score-window <n>      scoring window size (0 = whole file)\n\n\
          \x1b[1mEnvironment:\x1b[0m\n\
            SOFUU_LOOKAHEAD=0           same as --no-lookahead\n\
-           SOFUU_KV_RING=<n>           KIVI ring-KV size (default: 4096, min 256)\n"
+           SOFUU_KV_RING=<n>           KIVI ring-KV size (default: 4096, min 256)\n\n\
+         \x1b[1mAcceleration Plugins:\x1b[0m\n\
+           sofuu plugin add llamacpp   install production llama.cpp bridge (Metal/CUDA)\n"
     );
 }
 
@@ -1421,6 +1426,7 @@ fn cmd_plugin(rt: &SofuuRuntime, args: &[String]) -> i32 {
         eprintln!("  sofuu plugin run <tool_name> [args_json]");
         eprintln!("  sofuu plugin test <tool_name> [args_json]   (alias of run)");
         eprintln!("  sofuu plugin init <name> [--category=tool|provider|store|vectorstore|service|openapi]");
+        eprintln!("  sofuu plugin add <name> [--global] [--force]");
         return 1;
     }
     match args[2].as_str() {
@@ -1480,9 +1486,22 @@ fn cmd_plugin(rt: &SofuuRuntime, args: &[String]) -> i32 {
             let code = format!("sofuu.plugins.cliInit({name_js}, {cat_js})");
             rt.eval_string(&code, "<plugin-init>")
         }
+        "add" | "install" => {
+            if args.len() < 4 {
+                eprintln!("\x1b[31mError:\x1b[0m 'sofuu plugin add' requires a plugin name");
+                eprintln!("Usage: sofuu plugin add <name> [--global] [--force]");
+                return 1;
+            }
+            let name = &args[3];
+            let global = args.iter().any(|a| a == "--global" || a == "-g");
+            let force = args.iter().any(|a| a == "--force" || a == "-f");
+            let name_js = serde_json::to_string(name).unwrap_or_else(|_| "\"\"".into());
+            let code = format!("sofuu.plugins.cliAdd({name_js}, {{ global: {global}, force: {force} }})");
+            rt.eval_string(&code, "<plugin-add>")
+        }
         other => {
             eprintln!(
-                "\x1b[31mError:\x1b[0m unknown plugin subcommand '{other}' (list | validate | run | test | init)"
+                "\x1b[31mError:\x1b[0m unknown plugin subcommand '{other}' (list | validate | run | test | init | add)"
             );
             1
         }
@@ -1958,6 +1977,8 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
     // P3 (AUDIT-2026-09-07): value flags parse through value_arg so a
     // following flag is never eaten as the value; missing values error out.
     let mut i = 2;
+    let mut cli_provider: Option<String> = None;
+    let mut cli_model: Option<String> = None;
     while i < args.len() {
         let a = args[i].as_str();
         match a {
@@ -1966,7 +1987,7 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
                     let cleaned = sofuu_core::infer::clean_model_path(&v);
                     let is_gguf = v.ends_with(".gguf")
                         || cleaned.extension().map_or(false, |e| e == "gguf");
-                    if is_gguf {
+                    if is_gguf && (cfg.provider.is_empty() || cfg.provider == "local") {
                         cfg.provider = "local".into();
                         cfg.base_url.clear();
                         cfg.api_key.clear();
@@ -1984,6 +2005,7 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
                             cfg.effort = "off".into();
                         }
                     }
+                    cli_model = Some(v.clone());
                     cfg.model = v;
                     i += 2;
                 }
@@ -2023,10 +2045,12 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
                      * own local default ports, supplied by the adapter — no
                      * base_url fill-in needed here. */
                     "openai" | "anthropic" | "local" | "ollama" | "lmstudio" | "vllm" => {
+                        cli_provider = Some(p.clone());
                         cfg.provider = p;
                         i += 2;
                     }
                     "llamacpp" => {
+                        cli_provider = Some(p.clone());
                         cfg.provider = p;
                         /* Without a default, a bare -p llamacpp would fall
                          * through to the cloud OpenAI endpoint. Only fill it in
@@ -2038,11 +2062,9 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
                         i += 2;
                     }
                     _ => {
-                        let known = chat::ChatConfig::load()
-                            .providers
-                            .iter()
-                            .any(|e| e.name == p);
+                        let known = cfg.providers.iter().any(|e| e.name == p);
                         if known {
+                            cli_provider = Some(p.clone());
                             cfg.provider = p;
                             i += 2;
                         } else {
@@ -2186,6 +2208,72 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
             _ if a.starts_with("--on-error=") => i += 1,
             _ => i += 1,
         }
+    }
+    if let Some(ref prov) = cli_provider {
+        cfg.active = prov.clone();
+        cfg.provider = prov.clone();
+
+        if let Some(entry) = cfg.providers.iter_mut().find(|e| &e.name == prov) {
+            if cfg.api_key_from_cli {
+                entry.api_key = cfg.api_key.clone();
+            } else if !entry.api_key.is_empty() && cfg.api_key.is_empty() {
+                cfg.api_key = entry.api_key.clone();
+            }
+            if args.iter().any(|a| a == "--base-url") {
+                entry.endpoint = cfg.base_url.clone();
+            } else if !entry.endpoint.is_empty() {
+                cfg.base_url = entry.endpoint.clone();
+            }
+            if let Some(ref m) = cli_model {
+                entry.model = m.clone();
+                cfg.model = m.clone();
+            } else {
+                if prov == "llamacpp" && entry.model == "default" {
+                    entry.model.clear();
+                    cfg.model.clear();
+                } else {
+                    cfg.model = entry.model.clone();
+                }
+            }
+            if !entry.profile.is_empty() {
+                cfg.profile = entry.profile.clone();
+            }
+        } else {
+            let endpoint = if !cfg.base_url.is_empty() {
+                cfg.base_url.clone()
+            } else {
+                match prov.as_str() {
+                    "llamacpp" => "http://127.0.0.1:8080/v1".to_string(),
+                    "ollama" => "http://127.0.0.1:11434".to_string(),
+                    "lmstudio" => "http://127.0.0.1:1234/v1".to_string(),
+                    "vllm" => "http://127.0.0.1:8000/v1".to_string(),
+                    "openai" => "https://api.openai.com/v1".to_string(),
+                    "anthropic" => "https://api.anthropic.com/v1".to_string(),
+                    _ => String::new(),
+                }
+            };
+            cfg.base_url = endpoint.clone();
+            let profile = match prov.as_str() {
+                "anthropic" => "anthropic".to_string(),
+                "ollama" | "local" => "local".to_string(),
+                _ => "openai".to_string(),
+            };
+            cfg.profile = profile.clone();
+
+            if cli_model.is_none() {
+                cfg.model.clear();
+            }
+
+            cfg.providers.push(chat::ProviderEntry {
+                name: prov.clone(),
+                endpoint,
+                api_key: cfg.api_key.clone(),
+                model: cfg.model.clone(),
+                profile,
+                models: Vec::new(),
+            });
+        }
+        cfg.save();
     }
     chat::run_chat(rt, cfg)
 }
@@ -3294,6 +3382,7 @@ fn main() -> ExitCode {
                 Ok(eng) => eng,
                 Err(e) => {
                     eprintln!("\x1b[31mError loading model:\x1b[0m {e}");
+                    eprintln!("\x1b[33mTip:\x1b[0m For broad quantization formats (Q4_K_M, Q8_0, IQ3, etc.) and production hardware acceleration, install the local bridge: \x1b[1msofuu plugin add llamacpp\x1b[0m");
                     return ExitCode::FAILURE;
                 }
             };
@@ -3786,6 +3875,17 @@ fn main() -> ExitCode {
                 }
             }
             let rc = cmd_serve(&rt, &clean);
+            if rc == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        "script" => {
+            /* PLAN-KAZE §3.4: the Kaze engine has no QuickJS dependency, so this
+             * arm never builds a runtime — `sofuu script check` answers without
+             * a model, a config or a network. */
+            let rc = sofuu_core::script_cmd::run(&args[2..]);
             if rc == 0 {
                 ExitCode::SUCCESS
             } else {

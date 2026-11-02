@@ -200,6 +200,20 @@ fn main() {
     }
     let _ = std::fs::write(&staged, bytes);
 
+    // ── Watch all JS source files and driver snapshots in src/js ─────────
+    let js_dir = manifest.join("../../src/js");
+    println!("cargo:rerun-if-changed={}", js_dir.display());
+    if let Ok(entries) = std::fs::read_dir(&js_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if ext == "js" || ext == "bc" || ext == "gz" {
+                    println!("cargo:rerun-if-changed={}", path.display());
+                }
+            }
+        }
+    }
+
     // ── AUDIT-2026-10-31 P1-8: shipped JS assets, embedded gzipped ───────
     // These files are read as text at runtime but only on one code path each
     // (engine compat seam, RLM driver, chat TUI). Embedded raw they were

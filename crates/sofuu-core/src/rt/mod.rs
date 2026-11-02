@@ -42,6 +42,9 @@ pub mod diagnostics; // PLAN-MODERN-NPM: actionable failures (native addons, abs
 pub mod async_context; // Phase 4: Native AsyncLocalStorage & Agent Context Propagation
 pub mod sandbox; // Phase 5: Deterministic Agent Sandboxing & Fuel Meters
 pub mod policy; // S4 (R7): one policy evaluator for tools/shell/fs/net/MCP
+pub use crate::domains::robotics::{
+    drone_ops, gpio, hardware, kaze_live, mavlink, mavlink_gate, mavlink_js, mavlink_link,
+};
 pub mod events; // P2 (R6): the unified event envelope + session event log
 pub mod observability; // OBSERVABILITY: run logs, checkpoints, crash cards (reads `events`)
 pub mod async_contract; // P2 (R2): one error taxonomy, nested deadlines, queue bounds
@@ -55,15 +58,6 @@ pub mod deadline; // sofuu.host.armDeadline/disarmDeadline: JS-callable interrup
 pub mod interrupt; // P1-14: the engine runtime's one interrupt slot + the regexp budget
 pub mod session_js; // PLAN-DESKTOP C: sync session-mesh primitives for shipped chat.js
 pub mod tui; // M10: io/tui.c — the chat alt-screen renderer (tui_* exports)
-pub mod mavlink; // PLAN-DRONES M-D1: the hand-rolled MAVLink v2 codec subset (no new crates)
-pub mod mavlink_gate; // PLAN-DRONES M-D1: the frame veto chain (reject-never-clamp).
-                      // NOT `rt/hardware.rs` — that file is the Kaze capability firewall
-                      // (PLAN-KAZE §3.3): capability families + physical ranges. The two are
-                      // layers of one firewall (capability call → frame veto), kept in separate
-                      // files so neither lane rewrites the other.
-pub mod mavlink_link; // PLAN-DRONES M-D2: transports (udp/uart) + the one gated write path + the 1 Hz heartbeat
-pub mod mavlink_js; // PLAN-DRONES §4.4: the sofuu.mavlink native globals (registered only when hardware.enabled)
-pub mod drone_ops; // PLAN-DRONES §4.6: skills + mission DSL + pre-flight validation (L2/L3)
 
 /// End the process the way a default SIGPIPE disposition would have: quietly,
 /// with status 141 and no output.

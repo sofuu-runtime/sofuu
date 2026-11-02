@@ -1488,7 +1488,9 @@ unsafe fn tty_render_line_ui(ctx: *mut JSContext, autocomplete: c_int) {
         let head = if hidden_rows > 1 { "rows" } else { "row" };
         let _ = write!(out, "\x1b[2m… {hidden_rows} more {head} (↑ recall · Enter submits all)\x1b[0m\n");
     }
-    let _ = write!(out, "\x1b[2;35m╭");
+    let panel = crate::rt::tui::tui_panel_sgr();
+    let subtle = crate::rt::tui::tui_subtle_sgr();
+    let _ = write!(out, "{panel}╭");
     for _ in 0..(W - 2) {
         let _ = write!(out, "─");
     }
@@ -1509,16 +1511,16 @@ unsafe fn tty_render_line_ui(ctx: *mut JSContext, autocomplete: c_int) {
         pos = render_box_row(row as usize, pos, input_rows, inner, &mut out);
     }
 
-    let _ = write!(out, "\x1b[2;35m╰");
+    let _ = write!(out, "{panel}╰");
     for _ in 0..(W - 2) {
         let _ = write!(out, "─");
     }
     let _ = write!(out, "╯\x1b[0m\n");
 
-    /* 4. Dim status footer. */
+    /* 4. Subtle status footer. */
     let status = STATUS.with(|s| s.borrow().clone());
     if !status.is_empty() {
-        let _ = write!(out, "\x1b[2m{}\x1b[0m\n", String::from_utf8_lossy(&status));
+        let _ = write!(out, "{subtle}{}\x1b[0m\n", String::from_utf8_lossy(&status));
     } else {
         let _ = write!(out, "\n");
     }
@@ -1595,7 +1597,7 @@ unsafe fn tty_render_tui(
                             let _ = write!(out, "\x1b[{};1H{}\x1b[K  {}{}\x1b[0m", row, crate::rt::tui::tui_bg_prefix(), crate::rt::tui::tui_sel_sgr(), String::from_utf8_lossy(&m[..l]));
                             sel_line = Some(m[..l].to_vec());
                         } else {
-                            let _ = write!(out, "\x1b[{};1H{}\x1b[K  \x1b[2m{}\x1b[0m", row, crate::rt::tui::tui_bg_prefix(), String::from_utf8_lossy(&m[..l]));
+                            let _ = write!(out, "\x1b[{};1H{}\x1b[K  {}{}\x1b[0m", row, crate::rt::tui::tui_bg_prefix(), crate::rt::tui::tui_subtle_sgr(), String::from_utf8_lossy(&m[..l]));
                         }
                         shown += 1;
                         row -= 1;
@@ -1618,13 +1620,13 @@ unsafe fn tty_render_tui(
                         info.push_str(" — ");
                         info.push_str(&opts);
                     }
-                    let _ = write!(out, "\x1b[{};1H{}\x1b[K  \x1b[36m{}\x1b[0m", info_row, crate::rt::tui::tui_bg_prefix(), info);
+                    let _ = write!(out, "\x1b[{};1H{}\x1b[K  {}{}\x1b[0m", info_row, crate::rt::tui::tui_bg_prefix(), crate::rt::tui::tui_subtle_sgr(), info);
                     info_shown = 1;
                 }
             }
             /* "+N more" hint above the window when there are hidden items. */
             if n as usize > start + shown {
-                let _ = write!(out, "\x1b[{};1H{}\x1b[K  \x1b[2m… {} more\x1b[0m", info_row - 1, crate::rt::tui::tui_bg_prefix(), n - (start + shown));
+                let _ = write!(out, "\x1b[{};1H{}\x1b[K  {}… {} more\x1b[0m", info_row - 1, crate::rt::tui::tui_bg_prefix(), crate::rt::tui::tui_subtle_sgr(), n - (start + shown));
             }
         }
         /* Exact-command info (drawn after the list so it wins any overlap):
@@ -1642,7 +1644,7 @@ unsafe fn tty_render_tui(
                 } else {
                     tui_box_top() - 1
                 };
-                let _ = write!(out, "\x1b[{};1H{}\x1b[K  \x1b[36m{}\x1b[0m", info_row, crate::rt::tui::tui_bg_prefix(), info);
+                let _ = write!(out, "\x1b[{};1H{}\x1b[K  {}{}\x1b[0m", info_row, crate::rt::tui::tui_bg_prefix(), crate::rt::tui::tui_subtle_sgr(), info);
                 info_shown = 1;
             }
         }
@@ -1655,14 +1657,17 @@ unsafe fn tty_render_tui(
         /* 3. The input box at fixed rows (T, I, I+1) + footer (F). */
         let T = tui_box_top();
         let I = tui_input_row();
+        let panel_border = crate::rt::tui::tui_panel_sgr();
+        let bg = crate::rt::tui::tui_bg_prefix();
+        let subtle = crate::rt::tui::tui_subtle_sgr();
 
-        let _ = write!(out, "\x1b[{};1H{}\x1b[K\x1b[2;35m╭", T, crate::rt::tui::tui_bg_prefix());
+        let _ = write!(out, "\x1b[{};1H{}{panel_border}╭", T, bg);
         for _ in 0..(W - 2) {
             let _ = write!(out, "─");
         }
-        let _ = write!(out, "╮\x1b[0m");
+        let _ = write!(out, "╮\x1b[0m{bg}");
 
-        let _ = write!(out, "\x1b[{};1H{}\x1b[K\x1b[2;35m│\x1b[0m  ", I, crate::rt::tui::tui_bg_prefix());
+        let _ = write!(out, "\x1b[{};1H{}{panel_border}│\x1b[0m{bg}  ", I, bg);
         let mut prow = 0usize;
         let prompt = RL_PROMPT.with(|p| p.borrow().clone());
         if !prompt.is_empty() {
@@ -1683,9 +1688,9 @@ unsafe fn tty_render_tui(
          * the row reads as "more above" instead of a lone orphan line. */
         if newlines > 0 {
             let marker = if newlines > 1 {
-                format!("\x1b[2m[+{} lines]\x1b[0m", newlines)
+                format!("{subtle}[+{} lines]\x1b[0m{bg}", newlines)
             } else {
-                "\x1b[2m[+1 line]\x1b[0m".to_string()
+                format!("{subtle}[+1 line]\x1b[0m{bg}")
             };
             let _ = write!(out, "{}", marker);
             /* "[+N lines]" cells = 2 + digits + 7; "[+1 line]" = 9. */
@@ -1711,17 +1716,19 @@ unsafe fn tty_render_tui(
             let _ = write!(out, " ");
             pad += 1;
         }
-        let _ = write!(out, "\x1b[2;35m│\x1b[0m");
-        let _ = write!(out, "\x1b[{};1H{}\x1b[K\x1b[2;35m╰", I + 1, crate::rt::tui::tui_bg_prefix());
+        let _ = write!(out, "{panel_border}│\x1b[0m{bg}");
+        let _ = write!(out, "\x1b[{};1H{}{panel_border}╰", I + 1, bg);
         for _ in 0..(W - 2) {
             let _ = write!(out, "─");
         }
-        let _ = write!(out, "╯\x1b[0m");
+        let _ = write!(out, "╯\x1b[0m{bg}");
     }
 
-    /* 4. Footer row F (H-2): left status, right dim hints. */
+    /* 4. Footer row F (H-2): left status, right subtle hints. */
     let F = tui_footer_row();
-    let _ = write!(out, "\x1b[{};1H{}\x1b[K", F, crate::rt::tui::tui_bg_prefix());
+    let bg = crate::rt::tui::tui_bg_prefix();
+    let subtle = crate::rt::tui::tui_subtle_sgr();
+    let _ = write!(out, "\x1b[{};1H{}\x1b[K", F, bg);
     let hints = HINTS.with(|h| h.borrow().clone());
     let status = STATUS.with(|s| s.borrow().clone());
     let hints_w = if !hints.is_empty() {
@@ -1731,13 +1738,16 @@ unsafe fn tty_render_tui(
     };
     if !status.is_empty() {
         let avail = W - gutter - 1 - hints_w as c_int;
-        if avail < 1 { /* no room */ } else {
-        /* Bounded truncation: STATUS is a non-NUL-terminated Vec<u8>; the
-         * strlen-walking C-ABI variant used to read past its allocation
-         * and slice out of range (the 2026-09-09 abort). */
-        let bl = crate::rt::tui::truncate_cells(&status, avail as usize);
-        let _ = write!(out, "\x1b[{};{}H", F, 1 + gutter);
-        let _ = out.write_all(&status[..bl]);
+        if avail >= 1 {
+            let bl = crate::rt::tui::truncate_cells(&status, avail as usize);
+            let _ = write!(out, "\x1b[{};{}H", F, 1 + gutter);
+            if !bg.is_empty() && status[..bl].contains(&b'\x1b') {
+                let st_s = String::from_utf8_lossy(&status[..bl]);
+                let re = st_s.replace("\x1b[0m", &format!("\x1b[0m{bg}"));
+                let _ = out.write_all(re.as_bytes());
+            } else {
+                let _ = out.write_all(&status[..bl]);
+            }
         }
     }
     if hints_w > 0 {
@@ -1745,7 +1755,7 @@ unsafe fn tty_render_tui(
         if hcol < 1 {
             hcol = 1;
         }
-        let _ = write!(out, "\x1b[{};{}H\x1b[2m{}\x1b[0m", F, hcol, String::from_utf8_lossy(&hints));
+        let _ = write!(out, "\x1b[{};{}H{}{}\x1b[0m{bg}", F, hcol, subtle, String::from_utf8_lossy(&hints));
     }
     if scrolled > 0 {
         let ind = format!(" ▲ {} scrolled · PgDn to live ", scrolled);
@@ -1753,22 +1763,21 @@ unsafe fn tty_render_tui(
         let avail = W - gutter - 1 - hints_w as c_int - 1;
         if avail > iw {
             let icol = W - hints_w as c_int - iw - 1;
-            let _ = write!(out, "\x1b[{};{}H\x1b[2m{}\x1b[0m", F, icol.max(1+gutter), ind);
+            let _ = write!(out, "\x1b[{};{}H{}{}\x1b[0m{bg}", F, icol.max(1+gutter), subtle, ind);
         }
     }
 
     /* 5. Footer row 2 (H-1): left context metric + right RAM metric — GUTTER-aligned with H-2. */
     let metric = METRIC.with(|m| m.borrow().clone());
-    let _ = write!(out, "\x1b[{};1H{}\x1b[K", tui_footer2_row(), crate::rt::tui::tui_bg_prefix());
+    let _ = write!(out, "\x1b[{};1H{}\x1b[K", tui_footer2_row(), bg);
     let metric_l = METRIC_LEFT.with(|m| m.borrow().clone());
     if !metric_l.is_empty() {
         let avail_l = W - gutter - 1 - if !metric.is_empty() { tui_disp_width(metric.as_ptr() as *const c_char, metric.len()) as c_int + 1 } else { 0 };
-        /* METRIC_LEFT is likewise non-NUL-terminated — same bounded call
-         * as STATUS above (2026-09-09 abort was exactly this slice at
-         * 141 past an 80-byte buffer on a wide terminal). */
         let bl_l = if avail_l > 0 { crate::rt::tui::truncate_cells(&metric_l, avail_l as usize) } else { 0 };
         if bl_l > 0 {
-            let _ = write!(out, "\x1b[{};{}H\x1b[2m{}\x1b[0m", tui_footer2_row(), 1+gutter, String::from_utf8_lossy(&metric_l[..bl_l]));
+            let ml_s = String::from_utf8_lossy(&metric_l[..bl_l]);
+            let re = if !bg.is_empty() { ml_s.replace("\x1b[0m", &format!("\x1b[0m{bg}")) } else { ml_s.to_string() };
+            let _ = write!(out, "\x1b[{};{}H{}{}\x1b[0m{bg}", tui_footer2_row(), 1+gutter, subtle, re);
         }
     }
     if !metric.is_empty() {
@@ -1777,7 +1786,7 @@ unsafe fn tty_render_tui(
         if mcol < 1 {
             mcol = 1;
         }
-        let _ = write!(out, "\x1b[{};{}H\x1b[2m{}\x1b[0m", tui_footer2_row(), mcol, String::from_utf8_lossy(&metric));
+        let _ = write!(out, "\x1b[{};{}H{}{}\x1b[0m{bg}", tui_footer2_row(), mcol, subtle, String::from_utf8_lossy(&metric));
     }
 
     /* 6. Cursor: visible just AFTER the last typed char.

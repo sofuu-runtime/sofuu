@@ -231,6 +231,11 @@
     var p = asString(path);
     if (!p) return b;
     if (p.charAt(0) !== '/') p = '/' + p;
+    if (b.slice(-p.length) === p) return b;
+    if ((b.slice(-17) === '/chat/completions' || b.slice(-11) === '/completion') &&
+        (p === '/chat/completions' || p === '/v1/chat/completions' || p === '/completion')) {
+      return b;
+    }
     if (b.slice(-3) === '/v1' && p.indexOf('/v1/') === 0) return b + p.slice(3);
     return b + p;
   }
@@ -651,6 +656,28 @@
 
   /* ── OpenAI-compatible wire: llamacpp, openai, lmstudio, vllm ────── */
 
+  function wireTools(tools) {
+    if (!tools || !tools.length) return undefined;
+    var out = [];
+    for (var i = 0; i < tools.length; i++) {
+      var t = tools[i];
+      if (!t) continue;
+      if (t.type === 'function' && t.function) {
+        out.push(t);
+      } else {
+        out.push({
+          type: 'function',
+          function: {
+            name: t.name || '',
+            description: t.description || '',
+            parameters: t.parameters || {}
+          }
+        });
+      }
+    }
+    return out.length ? out : undefined;
+  }
+
   function openAiBody(adapter, req, stream) {
     var body = {
       model: pickModel(adapter, req),
@@ -661,7 +688,8 @@
     if (temp !== null) body.temperature = temp;
     var maxTokens = maxTokensOf(req);
     if (maxTokens !== null) body.max_tokens = maxTokens;
-    if (req && req.tools && req.tools.length) body.tools = req.tools;
+    var wt = wireTools(req && req.tools);
+    if (wt) body.tools = wt;
     var rf = pickOpt(req, 'response_format');
     if (rf) body.response_format = rf;
     /* llama.cpp extension: GBNF grammar. Forwarded only when the caller
@@ -879,7 +907,8 @@
       messages: wireMessages(adapter, req),
       stream: !!stream
     };
-    if (req && req.tools && req.tools.length) body.tools = req.tools;
+    var wt = wireTools(req && req.tools);
+    if (wt) body.tools = wt;
     /* Ollama takes sampling knobs under options; a temperature/max_tokens the
      * caller set is otherwise silently dropped. */
     var options = {};

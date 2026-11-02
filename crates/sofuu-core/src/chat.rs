@@ -874,6 +874,10 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                         sofuu_core::rt::tui::tui_set_sel(
                             theme::accent_index(t.accent).map(|v| v as c_int).unwrap_or(-1),
                         );
+                        let c_panel = std::ffi::CString::new(t.panel).unwrap();
+                        sofuu_core::rt::tui::tui_set_panel(c_panel.as_ptr());
+                        let c_subtle = std::ffi::CString::new(t.subtle).unwrap();
+                        sofuu_core::rt::tui::tui_set_subtle(c_subtle.as_ptr());
                     }
                     let from = theme::lookup(&prev_name);
                     sofuu_core::rt::tui::tui_remap_rows(&theme::fg_remap_pairs(from, t));
@@ -1002,7 +1006,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
             let picked = arg.trim().to_string();
             let is_gguf = picked.ends_with(".gguf")
                 || sofuu_core::infer::clean_model_path(&picked).extension().map_or(false, |e| e == "gguf");
-            if is_gguf {
+            if is_gguf && (cfg.provider.is_empty() || cfg.provider == "local") {
                 cfg.provider = "local".to_string();
                 cfg.base_url.clear();
                 cfg.api_key.clear();
@@ -1891,6 +1895,11 @@ fn theme_accent(cfg: &ChatConfig) -> String {
     format!("\x1b[{}m", theme::lookup(&cfg.theme).accent)
 }
 
+/// SGR open sequence for the active theme's subtle role (secondary text, labels, hints).
+fn theme_subtle(cfg: &ChatConfig) -> String {
+    format!("\x1b[{}m", theme::lookup(&cfg.theme).subtle)
+}
+
 /// One box row: `│  <content><pad>│` at exactly `width` cells.
 fn panel_row(content: &str, width: usize, border: &str) -> String {
     let inner = width.saturating_sub(4);
@@ -1913,10 +1922,11 @@ fn panel_row(content: &str, width: usize, border: &str) -> String {
 fn welcome_bird_rows(cfg: &ChatConfig, _session: &str, _dir: &str, w: usize) -> Vec<String> {
     let border = theme_panel(cfg);
     let accent = theme_accent(cfg);
+    let subtle = theme_subtle(cfg);
     vec![
         panel_row(&format!("  {accent}Welcome to Sofuu!\x1b[0m"), w, &border),
         panel_row(
-            "  \x1b[2mAsk anything (/help for the command list)\x1b[0m",
+            &format!("  {subtle}Ask anything (/help for the command list)\x1b[0m"),
             w,
             &border,
         ),
@@ -1949,11 +1959,21 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
         format!(" - effort {}", cfg.effort)
     };
     let model = if cfg.provider.is_empty() || cfg.model.is_empty() {
-        "not configured · run /provider to pick one".to_string()
+        "not configured · run /model to pick one".to_string()
     } else if cfg.provider == "local" {
-        format!("local: {}{}", cfg.model, effort)
+        let display_name = if cfg.model.starts_with('/') && cfg.model.contains('/') {
+            std::path::Path::new(&cfg.model).file_name().and_then(|s| s.to_str()).unwrap_or(&cfg.model)
+        } else {
+            &cfg.model
+        };
+        format!("local: {}{}", display_name, effort)
     } else {
-        format!("{}/{}{}", cfg.provider, cfg.model, effort)
+        let display_name = if cfg.model.starts_with('/') && cfg.model.contains('/') {
+            std::path::Path::new(&cfg.model).file_name().and_then(|s| s.to_str()).unwrap_or(&cfg.model)
+        } else {
+            &cfg.model
+        };
+        format!("{}/{}{}", cfg.provider, display_name, effort)
     };
     let labels: [(String, String); 6] = [
         ("Directory:".into(), trunc_cells(dir, inner.saturating_sub(14))),
@@ -1988,11 +2008,12 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
         ),
         ("Version:".into(), env!("CARGO_PKG_VERSION").into()),
     ];
+    let subtle = theme_subtle(cfg);
     for (label, value) in labels {
-        // Dim label, plain value — the escape layout is identical on every
+        // Subtle label, plain value — the escape layout is identical on every
         // row so the value column stays byte-aligned (see the layout test).
         rows.push(panel_row(
-            &format!("\x1b[2m{label:<10}\x1b[0m  {value}"),
+            &format!("{subtle}{label:<10}\x1b[0m  {value}"),
             w,
             &border,
         ));
@@ -2001,7 +2022,7 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
 
     rows.push(String::new());
     if session.is_empty() {
-        rows.push("  \x1b[90mNo session here yet — one starts with your first message.\x1b[0m".into());
+        rows.push(format!("  {subtle}No session here yet — one starts with your first message.\x1b[0m"));
     }
     rows
 }
@@ -2014,11 +2035,21 @@ fn welcome_plain(cfg: &ChatConfig, session: Option<&str>, dir: &str) -> Vec<Stri
         format!(" · effort {}", cfg.effort)
     };
     let model_str = if cfg.provider.is_empty() || cfg.model.is_empty() {
-        "not configured · run /provider to pick one".to_string()
+        "not configured · run /model to pick one".to_string()
     } else if cfg.provider == "local" {
-        format!("local: {}{}", cfg.model, effort)
+        let display_name = if cfg.model.starts_with('/') && cfg.model.contains('/') {
+            std::path::Path::new(&cfg.model).file_name().and_then(|s| s.to_str()).unwrap_or(&cfg.model)
+        } else {
+            &cfg.model
+        };
+        format!("local: {}{}", display_name, effort)
     } else {
-        format!("{}/{}{}", cfg.provider, cfg.model, effort)
+        let display_name = if cfg.model.starts_with('/') && cfg.model.contains('/') {
+            std::path::Path::new(&cfg.model).file_name().and_then(|s| s.to_str()).unwrap_or(&cfg.model)
+        } else {
+            &cfg.model
+        };
+        format!("{}/{}{}", cfg.provider, display_name, effort)
     };
     vec![
         format!(
@@ -2643,13 +2674,17 @@ unsafe extern "C" fn js_chat_theme(
         sofuu_core::rt::tui::tui_set_sel(
             theme::accent_index(t.accent).map(|v| v as c_int).unwrap_or(-1),
         );
+        let c_panel = std::ffi::CString::new(t.panel).unwrap();
+        sofuu_core::rt::tui::tui_set_panel(c_panel.as_ptr());
+        let c_subtle = std::ffi::CString::new(t.subtle).unwrap();
+        sofuu_core::rt::tui::tui_set_subtle(c_subtle.as_ptr());
     }
     let json = serde_json::json!({
         "name": t.name, "dark": t.dark, "bg": t.bg,
         "accent": t.accent, "tool": t.tool, "delegate": t.delegate,
         "heading": t.heading, "code": t.code, "warn": t.warn,
         "error": t.error, "add": t.add, "del": t.del,
-        "hunk": t.hunk, "panel": t.panel,
+        "hunk": t.hunk, "panel": t.panel, "subtle": t.subtle,
     })
     .to_string();
     js_new_string(ctx, &json)
@@ -3478,6 +3513,18 @@ static DRIVER: LazyLock<String> = LazyLock::new(|| {
 
 /// Run the chat UI. `initial` is the loaded config (with CLI overrides applied).
 pub fn run_chat(rt: &SofuuRuntime, initial: ChatConfig) -> i32 {
+    let theme_name = initial.theme.clone();
+    let t = theme::lookup(&theme_name);
+    unsafe {
+        sofuu_core::rt::tui::tui_set_bg(t.bg as std::os::raw::c_int);
+        sofuu_core::rt::tui::tui_set_sel(
+            theme::accent_index(t.accent).map(|v| v as std::os::raw::c_int).unwrap_or(-1),
+        );
+        let c_panel = std::ffi::CString::new(t.panel).unwrap();
+        sofuu_core::rt::tui::tui_set_panel(c_panel.as_ptr());
+        let c_subtle = std::ffi::CString::new(t.subtle).unwrap();
+        sofuu_core::rt::tui::tui_set_subtle(c_subtle.as_ptr());
+    }
     *CFG.lock().unwrap() = Some(initial);
     *EXIT_REQUESTED.lock().unwrap() = false;
 

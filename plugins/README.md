@@ -1,4 +1,4 @@
-# Sofuu plugins - four worked examples
+# Sofuu plugins - five worked examples
 
 Every plugin in this directory is a plain `.ts` file that the runtime loads,
 type-strips and evaluates at discovery time. There is no build step, no bundler
@@ -10,6 +10,7 @@ can copy into your own project.
 | `fetch_web.ts` | tool (`defineTool`) | A read-only HTTP fetch with a strict schema, a hard timeout, byte-cap truncation, HTML-to-text, and a deliberately absent `permissions.net` (so Shield 2 keeps the private-IP guard on). |
 | `sqlite_query.ts` | tool (`defineTool`) | A read-only query surface over the native QTSQ structured store, including a refusal path that rejects writes before anything is opened. |
 | `ollama_provider.ts` | provider (`defineProvider`) | A streaming NDJSON `/api/chat` adapter with tool-call passthrough and a `/api/tags` health probe. |
+| `llamacpp_provider.ts` | provider (`defineProvider`) | High-throughput local inference provider bridging llama.cpp server / OpenAI-compatible endpoints with SSE streaming, tool-call mapping, token usage stats, and `/health` probe. |
 | `token_logger.ts` | service (`defineService`) | A per-turn hook that appends one JSONL line, keeps cumulative totals per agent, flushes on stop, and never throws into a turn. |
 
 ## Typing
@@ -42,7 +43,8 @@ The npm package ships the same file (`"types": "sofuu.d.ts"`), so an installed
 ## Running them
 
 ```
-sofuu plugin list                        # discovered tools, providers, stores, services
+sofuu plugin add llamacpp                   # install official local inference bridge
+sofuu plugin list                           # discovered tools, providers, stores, services
 sofuu plugin validate plugins/fetch_web.ts
 sofuu plugin run fetch_web '{"url":"https://example.com"}'
 sofuu plugin test fetch_web '{"url":"https://example.com"}'   # alias of run
@@ -122,6 +124,6 @@ These files obey the contract by construction:
   truncated }` is safe; `{ text: body, truncated: true }` is not. When a
   literal is unavoidable, assign the field after construction.
 
-All four files are verified two ways: `tsc --strict --noEmit` against
+All five files are verified two ways: `tsc --strict --noEmit` against
 `sofuu.d.ts`, and a harness that replays the exact discovery pipeline and then
 evaluates the stripped output.

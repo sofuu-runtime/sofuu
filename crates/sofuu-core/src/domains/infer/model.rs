@@ -8690,7 +8690,7 @@ mod tests {
     /// infer/metal.rs) so a NEW call site cannot be added ungated.
     #[test]
     fn every_prefill_attn_1c_dispatch_sits_behind_the_position_gate() {
-        const KERNELS: &str = include_str!("../../../../src/metal/kernels.metal");
+        const KERNELS: &str = include_str!("../../../../../src/metal/kernels.metal");
         assert_eq!(ATTN_SOFTMAX_CHUNK, 128);
         let start = KERNELS
             .find("kernel void llama_attn_1c_b4(")

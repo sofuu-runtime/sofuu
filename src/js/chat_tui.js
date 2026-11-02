@@ -2061,6 +2061,7 @@
   function usableConfig(view) {
     const v = view || cfg;
     if (!v.provider || !v.model) return false;
+    if (v.provider === 'llamacpp' && v.model === 'default') return false;
     if (v.provider === 'local') return true;
     return true;
   }
@@ -2100,7 +2101,7 @@
    * very next paint) and is otherwise cached for the session. */
   const THEME_FALLBACK = { accent: '1;35', tool: '36', delegate: '35',
     heading: '1;36', code: '33', warn: '33', error: '1;31',
-    add: '1;32', del: '1;31', hunk: '36' };
+    add: '1;32', del: '1;31', hunk: '36', panel: '2;38;5;139', subtle: '38;5;246' };
   let PAL = null;
   function pal() {
     if (!PAL) {
@@ -2919,13 +2920,9 @@
   function detectProfile(base) {
     const u = String(base || '').toLowerCase();
     /* Host-based detection — the reliable, unambiguous signals. */
-    if (u.includes('anthropic') || u.includes('claude')) return 'anthropic';
-    if (u.includes('127.0.0.1') || u.includes('localhost') || u.includes('0.0.0.0')) return 'local';
-    /* Path-based: /v1 with /chat/completions or /models → openai-compat;
-     * /v1/messages → anthropic. */
-    if (u.includes('/messages')) return 'anthropic';
+    if (u.includes('anthropic') || u.includes('claude') || u.includes('/messages')) return 'anthropic';
     if (u.includes('ollama') || u.includes(':11434')) return 'local';
-    /* Default: anything with /v1 (or nothing recognizable) is treated as
+    /* Default: anything with /v1, localhost (llama-server/vllm/lmstudio), or standard API is treated as
      * OpenAI-compatible — the most common server format. */
     return 'openai';
   }
@@ -2977,12 +2974,38 @@
       /* openai-compatible: listing at the API root + /models. */
       const root = wizardModelsRoot(base || WIZARD_BUILTIN_BASE.openai, false);
       const h = key ? { Authorization: 'Bearer ' + key } : {};
-      const r = await fetchWithTimeout(root + '/models', { headers: h }, 6000);
+      let r = await fetchWithTimeout(root + '/models', { headers: h }, 6000);
+      if (r && r.status === 404 && !root.endsWith('/v1')) {
+        try { r = await fetchWithTimeout(root + '/v1/models', { headers: h }, 6000); } catch (e) {}
+      }
       /* text() + JSON.parse — Response.json() truncated some chunked
        * bodies ("unexpected data at the end", e.g. lightning.ai's 53-model
        * listing), so parse the full body ourselves. */
       const j = JSON.parse(await r.text());
-      return (j.data || []).map(m => m.id).filter(Boolean);
+      const raw = Array.isArray(j.data) ? j.data : (Array.isArray(j.models) ? j.models : []);
+      const out = [];
+      const seen = {};
+      for (const m of raw) {
+        if (!m) continue;
+        if (typeof m === 'string') {
+          if (!seen[m]) { seen[m] = 1; out.push(m); }
+          continue;
+        }
+        const id = m.id || m.name || m.model;
+        if (id && !seen[id]) { seen[id] = 1; out.push(id); }
+        if (Array.isArray(m.aliases)) {
+          for (const a of m.aliases) {
+            if (a && typeof a === 'string' && !seen[a]) {
+              seen[a] = 1;
+              out.push(a);
+            }
+          }
+        }
+      }
+      if (prov === 'llamacpp' || (base && String(base).includes(':8080'))) {
+        if (!seen['default']) { seen['default'] = 1; out.push('default'); }
+      }
+      return out;
     } catch (e) {
       return []; // unreachable / no key → fall back to manual entry
     }
@@ -3118,8 +3141,10 @@
   function refreshStatus(tk) {
     lastChip = tk;
     if (typeof __chat_status !== 'function') return;
-    const dim = (s) => '\x1b[2m' + s + '\x1b[0m';
-    let s = 'sofuu ' + dim('·') + ' \x1b[' + T('accent') + 'm' + (cfg.model || '(no model)') + '\x1b[0m'
+    const dim = (s) => '\x1b[' + T('subtle') + 'm' + s + '\x1b[0m';
+    let rawM = cfg.model || '(no model)';
+    let displayM = rawM.includes('/') && (rawM.startsWith('/') || rawM.endsWith('.gguf')) ? rawM.split('/').pop() : rawM;
+    let s = 'sofuu ' + dim('·') + ' \x1b[' + T('accent') + 'm' + displayM + '\x1b[0m'
       /* Mode chip rides the status row only when RESTRICTIVE (plan/edit):
        * the default 'full' stays clean, but a gated turn must never be
        * confused for an unguarded one — amber so it reads at a glance.
@@ -3127,7 +3152,7 @@
        * (≈47 cells on an 80-col pty once hints are subtracted), and the
        * active restriction must survive where provider/effort may not. */
       + (cfg.permissions && cfg.permissions !== 'full'
-        ? ' ' + dim('·') + ' \x1b[33m' + 'mode ' + cfg.permissions + '\x1b[0m'
+        ? ' ' + dim('·') + ' \x1b[' + T('warn') + 'm' + 'mode ' + cfg.permissions + '\x1b[0m'
         : '');
     if (cfg.provider) {
       const prov = cfg.provider === 'custom'
@@ -3156,7 +3181,7 @@
     let ctxMet;
     if (used > 0) {
       ctxMet = 'ctx ' + fmtTk(used) + '/' + fmtTk(win) + (pct >= 1 ? ' · ' + pct + '%' : '');
-      if (used / win > 0.8) ctxMet = '\x1b[33m' + ctxMet + '\x1b[0m';
+      if (used / win > 0.8) ctxMet = '\x1b[' + T('warn') + 'm' + ctxMet + '\x1b[0m';
     } else {
       ctxMet = 'ctx 0/' + fmtTk(win);
     }
@@ -3230,28 +3255,28 @@
       /* Spacing rule: section gaps are multiples of 2 (2 blank rows). */
       rows.push('');
       rows.push('');
-      rows.push('  \x1b[1;35m' + title + '\x1b[0m  \x1b[90m(type to search · esc cancels)\x1b[0m');
-      if (hint) rows.push('  \x1b[90m' + hint + '\x1b[0m');
+      rows.push('  \x1b[' + T('accent') + 'm' + title + '\x1b[0m  \x1b[' + T('subtle') + 'm(type to search · esc cancels)\x1b[0m');
+      if (hint) rows.push('  \x1b[' + T('subtle') + 'm' + hint + '\x1b[0m');
       if (filter)
-        rows.push('  \x1b[90mfilter:\x1b[0m ' + filter + ' \x1b[90m· ' + list.length + ' match' + (list.length === 1 ? '' : 'es') + '\x1b[0m');
+        rows.push('  \x1b[' + T('subtle') + 'mfilter:\x1b[0m ' + filter + ' \x1b[' + T('subtle') + 'm· ' + list.length + ' match' + (list.length === 1 ? '' : 'es') + '\x1b[0m');
       if (tabs.length > 1) {
         rows.push('');
         rows.push('');
         rows.push('  ' + tabs.map((t, i) =>
-          i === tabIdx ? '\x1b[7;35m ' + t + ' \x1b[0m' : '\x1b[90m ' + t + ' \x1b[0m').join('  '));
+          i === tabIdx ? '\x1b[7m\x1b[' + T('accent') + 'm ' + t + ' \x1b[0m' : '\x1b[' + T('subtle') + 'm ' + t + ' \x1b[0m').join('  '));
       }
       rows.push('');
       rows.push('');
       const vis = list.slice(off, off + maxV);
       for (let i = 0; i < vis.length; i++) {
         const gi = off + i, it = vis[i], curRow = gi === sel;
-        rows.push((curRow ? '\x1b[35m❯\x1b[0m \x1b[1m' : '  ') + it.label + (curRow ? '\x1b[0m' : '') +
-                  (it.note ? '  \x1b[90m' + it.note + '\x1b[0m' : '') +
+        rows.push((curRow ? '\x1b[' + T('accent') + 'm❯\x1b[0m \x1b[1m' : '  ') + it.label + (curRow ? '\x1b[0m' : '') +
+                  (it.note ? '  \x1b[' + T('subtle') + 'm' + it.note + '\x1b[0m' : '') +
                   (it.id === currentId ? ' \x1b[32m← current\x1b[0m' : ''));
       }
-      if (list.length === 0) rows.push('  \x1b[90m(no matches)\x1b[0m');
-      if (off + maxV < list.length) rows.push('  \x1b[90m▼ ' + (list.length - off - maxV) + ' more\x1b[0m');
-      if (off > 0) rows.push('  \x1b[90m▲ ' + off + ' above\x1b[0m');
+      if (list.length === 0) rows.push('  \x1b[' + T('subtle') + 'm(no matches)\x1b[0m');
+      if (off + maxV < list.length) rows.push('  \x1b[' + T('subtle') + 'm▼ ' + (list.length - off - maxV) + ' more\x1b[0m');
+      if (off > 0) rows.push('  \x1b[' + T('subtle') + 'm▲ ' + off + ' above\x1b[0m');
       __selector_draw(rows.join('\n'));
     }
 
@@ -3298,7 +3323,7 @@
      * of fake suggestions. Picking from another provider's tab switches
      * the active provider first, so the model applies to the right
      * endpoint/key. */
-    if (!cfg.provider || !cfg.model) {
+    if (!cfg.provider) {
       out('\x1b[90m  No provider configured yet — run /provider first\x1b[0m\n');
       await providerWizard();
       try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
@@ -3312,13 +3337,15 @@
     const tabs = provs.map(p => p.name);
 
     outLast('\x1b[90m  ⏳ Fetching models from ' + tabs.length + ' provider' + (tabs.length === 1 ? '' : 's') + '…\x1b[0m');
+    const activeName = cfg.active || cfg.provider;
     /* All providers in PARALLEL — each fetch races its own timeout, so one
      * slow/unreachable endpoint can't stall the others. */
     const lists = await Promise.all(provs.map(async p => {
       try {
         const profile = p.profile || detectProfile(p.endpoint);
+        const key = p.api_key || (p.name === activeName ? cfg.api_key : '') || '';
         const got = await Promise.race([
-          wizardFetchModels(profile, p.endpoint, p.api_key || ''),
+          wizardFetchModels(profile, p.endpoint, key),
           new Promise(r => setTimeout(() => r(null), 6000)),
         ]);
         if (Array.isArray(got) && got.length) {
@@ -3337,32 +3364,40 @@
     }
 
     const items = [], seen = {};
-    const activeName = cfg.active || cfg.provider;
     for (let ti = 0; ti < provs.length; ti++) {
       const p = provs[ti], live = lists[ti] || [], isCur = p.name === activeName;
-      if (isCur) {
+      if (isCur && cfg.model) {
         /* Current model first on its own tab (sel starts at 0). */
         const id = p.name + '|' + cfg.model;
-        if (!seen[id]) { seen[id] = 1; items.push({ id: id, label: cfg.model, tab: p.name, note: 'current' }); }
+        if (!seen[id]) {
+          seen[id] = 1;
+          const shortLabel = cfg.model.includes('/') && (cfg.model.startsWith('/') || cfg.model.endsWith('.gguf')) ? cfg.model.split('/').pop() : cfg.model;
+          items.push({ id: id, label: shortLabel, tab: p.name, note: 'current' });
+        }
       }
       for (const m of live) {
         const id = p.name + '|' + m;
         if (seen[id]) continue; seen[id] = 1;
-        items.push({ id: id, label: m, tab: p.name, note: '' });
+        const shortLabel = m.includes('/') && (m.startsWith('/') || m.endsWith('.gguf')) ? m.split('/').pop() : m;
+        const note = shortLabel !== m ? 'live · ' + m : 'live';
+        items.push({ id: id, label: shortLabel, tab: p.name, note: note });
       }
       /* Models remembered for this provider (every model the user set here
        * + the last successful listing) — shown even when the live fetch
        * came back empty, so an unreachable endpoint no longer hides them. */
       const stored = Array.isArray(p.models) ? p.models : [];
       for (const m of stored) {
+        if (!m) continue;
         const id = p.name + '|' + m;
         if (seen[id]) continue; seen[id] = 1;
-        items.push({ id: id, label: m, tab: p.name, note: 'saved' });
+        const shortLabel = m.includes('/') && (m.startsWith('/') || m.endsWith('.gguf')) ? m.split('/').pop() : m;
+        items.push({ id: id, label: shortLabel, tab: p.name, note: 'saved' });
       }
       /* The provider's stored default model, when not in the live list. */
       if (p.model && !seen[p.name + '|' + p.model]) {
         seen[p.name + '|' + p.model] = 1;
-        items.push({ id: p.name + '|' + p.model, label: p.model, tab: p.name, note: 'saved' });
+        const shortLabel = p.model.includes('/') && (p.model.startsWith('/') || p.model.endsWith('.gguf')) ? p.model.split('/').pop() : p.model;
+        items.push({ id: p.name + '|' + p.model, label: shortLabel, tab: p.name, note: 'saved' });
       }
       if (isCur && live.length === 0) {
         items.push({ id: '\x00manual', label: '⌨ Type a model name…', tab: p.name,
@@ -3373,7 +3408,7 @@
       title: 'Select a model',
       hint: '↑↓ move · tab switch provider · enter apply · esc cancel',
       tabs: tabs, items: items, initialTab: activeName,
-      currentId: activeName + '|' + cfg.model,
+      currentId: cfg.model ? (activeName + '|' + cfg.model) : (items.length ? items[0].id : ''),
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
     if (it.id === '\x00manual') {
@@ -3655,16 +3690,33 @@
      * persists the choice to ~/.sofuu/config.json, so it survives restarts
      * until the user changes it with /provider or /model. */
     if (!usableConfig()) {
-      out('\x1b[90m  No usable model configured yet — set one up to start chatting.\x1b[0m');
-      await providerWizard();
-      try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
-      refreshStatus('');
-      if (usableConfig()) {
-        out('\x1b[32m  ✓ Ready — ' + cfg.provider + ' · ' + cfg.model + '\x1b[0m\n');
-      } else {
-        out('\x1b[90m  Setup skipped — run /provider any time to configure a model.\x1b[0m\n');
+      if (!TTY) {
+        try {
+          const profile = cfg.profile || detectProfile(cfg.base_url);
+          const live = await wizardFetchModels(profile, cfg.base_url, cfg.api_key || '');
+          if (live && live.length) {
+            __chat_slash('/model ' + live[0]);
+            try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+          }
+        } catch (e) {}
       }
-      maybeRefreshPanel();
+      if (!usableConfig()) {
+        if (!cfg.provider) {
+          out('\x1b[90m  No provider configured yet — set one up to start chatting.\x1b[0m');
+          await providerWizard();
+        } else {
+          out('\x1b[90m  No model configured for ' + cfg.provider + ' — please select one.\x1b[0m');
+          await pickModel();
+        }
+        try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+        refreshStatus('');
+        if (usableConfig()) {
+          out('\x1b[32m  ✓ Ready — ' + cfg.provider + ' · ' + cfg.model + '\x1b[0m\n');
+        } else {
+          out('\x1b[90m  Setup skipped — run /model any time to configure a model.\x1b[0m\n');
+        }
+        maybeRefreshPanel();
+      }
     }
     while (!__chat_exit_check()) {
       let notices = [];

@@ -55,8 +55,6 @@ use crate::rt::{
     promise::{sofuu_rt_install_rejection_tracker, sofuu_rt_report_pending_rejections},
     timer::mod_timer_register,
 };
-#[cfg(has_qtsq)]
-use crate::rt::memory::{mod_agent_register, mod_kv_register, mod_memory_register};
 use sofuu_ffi::qjs;
 
 /// The public runtime handle — mirrors `struct SofuuRuntime { SofuuEngine
@@ -441,30 +439,6 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         // P3 (SPEC §5/§6): the session document — one export/import format
         // behind `sofuu.session` (T4.5) and the CLI's export/import arms.
         crate::rt::session_doc::mod_session_doc_register(ctx);
-        /* PLAN-DRONES §4.3/§4.4: the drone surface is CAPABILITY-GATED. With
-         * `hardware.enabled` absent or false, neither the native globals nor
-         * the `sofuu.mavlink` namespace are created — no door beats a locked
-         * door, exactly like a QTSQ-free build. */
-        if crate::rt::mavlink_js::hardware_enabled() {
-            crate::rt::mavlink_js::mod_mavlink_register(ctx);
-            let (mavlink_src, drone_src) = crate::rt::mavlink_js::driver_js();
-            if let Some(src) = mavlink_src {
-                crate::shipped::eval_shipped_with_bytecode(
-                    ctx as *mut std::os::raw::c_void,
-                    &src,
-                    None,
-                    "<mavlink-driver>",
-                );
-            }
-            if let Some(src) = drone_src {
-                crate::shipped::eval_shipped_with_bytecode(
-                    ctx as *mut std::os::raw::c_void,
-                    &src,
-                    None,
-                    "<drone-driver>",
-                );
-            }
-        }
         // sofuu.host.armDeadline(ms)/disarmDeadline(): a JS-callable interrupt
         // deadline on THIS context, so a runaway synchronous plugin (run, chat,
         // serve, eval) is abortable — the sandbox meter never covered it.
@@ -490,21 +464,6 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         qjs::sofuu_js_undefined()
     }
     unsafe { sofuu_ffi::bridge::register_global_fn(ctx, "__sofuu_gc", js_sofuu_gc) };
-    #[cfg(has_qtsq)]
-    unsafe {
-        // SOFUU_MEMORY && SOFUU_QTSQ_PRESENT — the memory/kv/agent shells
-        // register only when the QTSQ codec is linked (same gate as C).
-        mod_memory_register(ctx);
-        mod_kv_register(ctx);
-        mod_agent_register(ctx);
-        crate::rt::storage::mod_storage_register(ctx);
-    }
-    #[cfg(not(has_qtsq))]
-    unsafe {
-        // R1.2 (SPEC T1.3): a QTSQ-free build must refuse memory loudly, not
-        // silently no-op it — the guard the brain-less 2026-09-22 tarball lacked.
-        crate::capabilities::mod_memory_unavailable_register(ctx);
-    }
 
     // Phase 3: Zero-Copy TypedArray & Native Memory Bridge (sofuu.memory.* / sofuu.buffer.*)
     unsafe {
@@ -537,6 +496,9 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
     unsafe {
         crate::rt::bytecode::mod_bytecode_register(ctx);
     }
+
+    // Subsystem capsule declarative dispatch (PLAN-ZERO-RISK-MODULARIZATION §3.2)
+    let _ = crate::domains::init_subsystems(ctx);
 
     // ── Build capital-S 'Sofuu' convenience global ────────────────
     let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
@@ -1133,7 +1095,7 @@ pub unsafe extern "C" fn sofuu_module_loader(
 
     let builtin_code: Option<&'static [u8]> = match norm_name {
         "async_hooks" => Some(b"export const AsyncLocalStorage = (globalThis.sofuu && globalThis.sofuu.context && globalThis.sofuu.context.AsyncLocalStorage) || globalThis.AsyncLocalStorage; export default { AsyncLocalStorage };\0"),
-        "sofuu" => Some(b"const p=globalThis.sofuu?.plugins||{};export const defineTool=p.defineTool,defineProvider=p.defineProvider,defineService=p.defineService,defineVectorStore=p.defineVectorStore,defineStorage=p.defineStorage,z=p.z,sofuu=globalThis.sofuu;export default globalThis.sofuu;\0"),
+        "sofuu" => Some(b"const p=globalThis.sofuu?.plugins||{};export const defineTool=p.defineTool,defineProvider=p.defineProvider,defineService=p.defineService,defineVectorStore=p.defineVectorStore,defineStorage=p.defineStorage,z=p.z,sofuu=globalThis.sofuu,sfs=globalThis.sofuu?.sfs;export default globalThis.sofuu;\0"),
         "zod" => Some(b"export const z=globalThis.sofuu?.plugins?.z;export default{z};\0"),
         "path" => Some(b"const m=globalThis.__sofuu_node_modules.path;export const join=m.join,resolve=m.resolve,normalize=m.normalize,isAbsolute=m.isAbsolute,relative=m.relative,dirname=m.dirname,basename=m.basename,extname=m.extname,parse=m.parse,format=m.format,sep=m.sep,delimiter=m.delimiter,posix=m.posix,win32=m.win32;export default m;\0"),
         "events" => Some(b"const m=globalThis.__sofuu_node_modules.events;export const EventEmitter=m.EventEmitter,defaultMaxListeners=m.defaultMaxListeners,getEventListeners=m.getEventListeners,once=m.once;export default m;\0"),

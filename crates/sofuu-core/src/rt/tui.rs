@@ -54,6 +54,10 @@ thread_local! {
     /* Accent palette index for the selection bar (set alongside G_BG on
      * every theme sync), or -1 for the classic raw-inverse look. */
     static G_SEL: Cell<i32> = const { Cell::new(-1) };
+    /* Panel border SGR params for chrome borders */
+    static G_PANEL: RefCell<String> = const { RefCell::new(String::new()) };
+    /* Subtle text SGR params for hints, labels, and secondary metrics */
+    static G_SUBTLE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 /// Background SGR for the active theme, or "" when unthemed (byte-exact
@@ -93,6 +97,44 @@ pub fn tui_sel_sgr() -> String {
         format!("\x1b[38;5;16;48;5;{n}m")
     } else {
         "\x1b[7m".to_string()
+    }
+}
+
+/// Select the panel border SGR params.
+#[no_mangle]
+pub unsafe extern "C" fn tui_set_panel(panel_sgr: *const c_char) {
+    if !panel_sgr.is_null() {
+        if let Ok(s) = std::ffi::CStr::from_ptr(panel_sgr).to_str() {
+            G_PANEL.with(|p| *p.borrow_mut() = s.to_string());
+        }
+    }
+}
+
+pub fn tui_panel_sgr() -> String {
+    let p = G_PANEL.with(|p| p.borrow().clone());
+    if !p.is_empty() {
+        format!("\x1b[{p}m")
+    } else {
+        "\x1b[2;35m".to_string()
+    }
+}
+
+/// Select the subtle text SGR params.
+#[no_mangle]
+pub unsafe extern "C" fn tui_set_subtle(subtle_sgr: *const c_char) {
+    if !subtle_sgr.is_null() {
+        if let Ok(s) = std::ffi::CStr::from_ptr(subtle_sgr).to_str() {
+            G_SUBTLE.with(|p| *p.borrow_mut() = s.to_string());
+        }
+    }
+}
+
+pub fn tui_subtle_sgr() -> String {
+    let p = G_SUBTLE.with(|p| p.borrow().clone());
+    if !p.is_empty() {
+        format!("\x1b[{p}m")
+    } else {
+        "\x1b[38;5;246m".to_string()
     }
 }
 
@@ -389,6 +431,8 @@ pub unsafe extern "C" fn tui_exit() {
     write_out("\x1b[0m");
     G_BG.with(|g| g.set(-1));
     G_SEL.with(|g| g.set(-1));
+    G_PANEL.with(|p| p.borrow_mut().clear());
+    G_SUBTLE.with(|s| s.borrow_mut().clear());
     write_out("\x1b[?25h\x1b[?1049l"); /* cursor back, alt screen off */
 }
 
@@ -726,8 +770,16 @@ unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
                     out.push('…');
                 }
                 out.push_str("\x1b[0m");
+                if !bg.is_empty() {
+                    out.push_str(&bg);
+                }
             } else {
-                out.push_str(&l[..bl]);
+                if !bg.is_empty() && l[..bl].contains("\x1b[0m") {
+                    let re_bg = l[..bl].replace("\x1b[0m", &format!("\x1b[0m{bg}"));
+                    out.push_str(&re_bg);
+                } else {
+                    out.push_str(&l[..bl]);
+                }
                 if bl < full {
                     out.push('…'); /* only when truly truncated */
                 }

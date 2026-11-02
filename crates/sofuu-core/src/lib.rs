@@ -155,13 +155,16 @@ mod ffi_runtime_test {
     }
 }
 pub mod http;
-pub mod infer; // CPU-first GGUF inference engine (C++ SIMD GEMV kernels + Rust)
+pub use domains::infer; // CPU-first GGUF inference engine (encapsulated under domains::infer)
 pub mod mcp;
-pub mod memory;
+pub use domains::memory; // CMA cognitive memory (encapsulated under domains::memory)
 pub mod ml; // PLAN-ML-GATES: context-economy models + the in-memory working set
 pub mod modules; // M2: console shell (more land in later phases)
 pub mod npm;
 pub mod rlm;
+pub mod domains;
+pub use domains::kaze as sfs; // PLAN-KAZE-LANGUAGE: encapsulated under domains::kaze
+pub mod script_cmd; // PLAN-KAZE §3.4: `sofuu script run|check|compile|repl`
 pub mod drone_cmd; // PLAN-DRONES §4.6: `sofuu drone observe|status|send|why|init`
 pub mod rt; // M1: event loop + promise bridge (replaces src/io/loop.c + promises.c)
 pub mod shipped; // shipped JS drivers beyond RLM: agent.js + web.js (PLAN-AGENTS)

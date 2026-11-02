@@ -50,6 +50,8 @@ Sofuu is built from first principles with a hard **$\le 5.5\text{ MiB}$ binary c
 - **Offline embeddings** — `ai.embed` (768-dim, zero-byte model), `ai.embedImage` (joint text/image space), SIMD `similarity`/`dot`/`l2`
 - **Speech in/out** — `ai.transcribe` / `ai.speak` via provider endpoints or on-device OS engines
 - **Long-context Q&A** — `sofuu.rlm.query` answers over contexts far larger than any model window via a sandboxed reader loop
+- **Kaze device scripting** — `sofuu script run|check|compile|repl`: a small typed language for drones, rovers and edge devices, with declared capabilities, a fuel meter and bytecode from day one. Additive to JS, never a replacement — [spec](docs/KAZE-SPEC.md)
+- **Robotics, Autonomous Drones & MAVLink** — `sofuu drone observe|status|send|mission|why|init`, `sofuu.mavlink`, and `sofuu.drone`: zero-dependency MAVLink v2 codec, deterministic R7 hardware safety gate (reject-never-clamp, geofences, fail-closed GPS dropouts), 1 Hz autonomous dead-man heartbeat, PreArm diagnostics, Linux GPIO/pulse timers, and ground rover pre-flight verification — [plan](docs/PLAN-DRONES-MAVLINK.md)
 - **Context-economy gates** — `sofuu.ml` freshness/supervisor/compaction/relevance models (~8k params each) advise the loop to cut token waste; hard off via `/ml off` or `SOFUU_NO_ML=1`
 - **MCP + HTTP + web** — `sofuu.mcp.connect/serve`, `sofuu.http.createServer`, keyless `sofuu.web.search/open`
 - **Modern npm + Web Streams** — conditional `package.json#exports` (subpaths, `./*` wildcards, `import`/`require` conditions), and `Response.body` as a real `ReadableStream` (`getReader`, `pipeThrough(new TextDecoderStream())`, `for await`), so official AI SDK streaming loops run unmodified; unsupported packages fail with a coded, actionable diagnostic instead of a cryptic error
@@ -373,6 +375,7 @@ The five shields, and the error each one raises:
 5. **Panic guard** — a throw, a rejected promise, a circular return or a BigInt result becomes a typed tool result; the host process keeps running (`E_TOOL`, `E_CAPABILITY`, `E_BACKPRESSURE`).
 
 ```bash
+sofuu plugin add llamacpp                   # install official local inference bridge (or ollama)
 sofuu plugin init weather --category=tool   # scaffold ./plugins/weather.ts
 sofuu plugin validate plugins/weather.ts    # parse + register + report
 sofuu plugin test weather '{"city":"Guwahati"}'   # invoke once, print the envelope
@@ -491,6 +494,56 @@ Full guide: [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) · specification: [do
 
 ---
 
+## Kaze (風) — Device Scripting
+
+Kaze is a small language for the work a general-purpose runtime is bad at: a
+patrol loop, a sensor threshold, a relay schedule. It has no ambient I/O — a
+script declares what it needs and the host grants a backend per device family,
+so the whole permission story fits on line one.
+
+```kaze
+needs: drone, log
+
+action patrol(points):
+    log "Starting automated perimeter patrol"
+    arm drone
+    takeoff to 15 meters
+    for each point in points:
+        fly to point at 15 meters
+    return to launch
+
+when battery < 20%:
+    log warning "Battery critical!"
+    return to launch
+```
+
+```bash
+sofuu script check examples/kaze/patrol.kaze          # parse + check, no execution
+sofuu script run   examples/kaze/patrol.kaze \
+    --cap drone=sim --arg 'points=[1,2,3]' --ticks 3   # deterministic trace
+sofuu script run   examples/kaze/hello.kaze --plain      # canonical text trace
+sofuu script compile examples/kaze/patrol.kaze -o patrol.kazebc --disasm
+sofuu script run   patrol.kazebc --cap drone=sim        # runs the artifact, no front end
+sofuu script repl                                       # define routines, then .run
+```
+
+Records arrive as JSON arguments and are read with `record.field`; the
+capability surface is the one the spec lists, including `drone.goto(lat, lon,
+alt)`, `sensor.read(pin)` and `device.read_gpio(pin)`.
+
+Every instruction costs fuel, so a runaway loop stops with `E_TIMEOUT` instead of
+hanging the robot; every capability call passes the R7 hardware gate, so an
+undeclared or ungranted family is refused *before* an actuator moves, and an
+out-of-range argument is rejected rather than clamped. The same script, inputs
+and simulated state always produce the same trace and the same compiled bytes.
+
+Language reference: [docs/KAZE-SPEC.md](docs/KAZE-SPEC.md) · examples:
+[`examples/kaze/`](examples/kaze/) — the five scripts, plus
+[`patrol_tool.mjs`](examples/kaze/patrol_tool.mjs), which wires a Kaze script
+into an agent tool with `import { defineTool, sfs } from "sofuu"`.
+
+---
+
 ## CLI Reference
 
 ```bash
@@ -501,12 +554,17 @@ sofuu infer <model> "<p>"    # Pure CPU LLM inference (GGUF, zero deps, experime
 sofuu repl                   # JavaScript evaluation REPL
 sofuu run <file.js|ts>       # Run a JavaScript/TypeScript file
 sofuu eval "<code>"          # Evaluate a JS expression inline
+sofuu script run|check|compile|repl <file.kaze> # Kaze device scripting (--cap drone=sim --fuel 200000)
+sofuu drone observe|status|send|mission|why|init # Fly vehicle through R7 hardware safety gate
 sofuu bundle <entry.js> [-o <out.js>]  # Bundle into one file
-sofuu compile <entry.ts> [-o <out>]    # Standalone single-file binary (--embed-brain)
+sofuu compile <entry.ts> [-o <out>]    # Standalone single-file binary (--embed-brain, --no-strip)
 sofuu install / add <package>          # npm packages
-sofuu agent list             # List agent definitions (~/.sofuu/agents/*.js)
+sofuu agent init <name> | validate <f> # Scaffold and dry-run validate agent definitions
+sofuu agent list                       # List agent definitions (~/.sofuu/agents/*.js)
 sofuu agent run <name> "task" [--json] # Run one agent headless
-sofuu plugin list|validate|test|init   # Manage and test 5-shield plugins
+sofuu brain verify|repair|stats|backup <path> # Segmented QTSQ cognitive memory maintenance
+sofuu session list|show|inspect <id>   # Multi-turn project session inspection & pruning
+sofuu plugin list|validate|test|init|add   # Manage and test 5-shield plugins (add llamacpp, ollama)
 sofuu logs [--last-error]    # Inspect runs and crash post-mortem cards
 sofuu logs show <run_id>     # Step-by-step trace transcript
 sofuu resume <run_id>        # Resume execution from last checkpoint
@@ -642,6 +700,36 @@ const res = await sofuu.rlm.query(bigText, "What error caused the outage?", {
 res.answer; res.calls; res.rounds; res.stopped; res.trace;
 sofuu.rlm.route(ctxTokens, windowTokens, question)  // → "rlm" | "plain"
 ```
+
+### `sofuu.sfs` — Kaze device scripts
+
+Run a Kaze program from JS and read back what it did. The device families the
+script declares must be granted a backend here; `log`, `memory` and `policy`
+are in-process and need no grant. Both surfaces are the same object:
+
+```js
+import { sfs } from "sofuu";        // module form
+const run = sfs.run("./patrol.kaze", { points: [1, 2, 3] }, {
+  caps: { drone: "sim" },       // grant a backend per family
+  ticks: 3, tickMs: 100,        // virtual supervisor clock
+  fuel: 200000,                 // instruction budget
+});
+run.ok;            // true
+run.actions;       // ["drone.arm -> nothing", "drone.takeoff(15) -> nothing", …]
+run.result;        // the routine's return value, rendered
+run.verdict;       // filters: { allow: true|false, reason }
+run.fuel;          // instructions actually spent
+
+sfs.check(srcOrPath);          // { ok: true } or { ok: false, code, error }
+sfs.compile(srcOrPath);        // { ok, bytes, items, caps, consts }
+sfs.version;                   // "0.1"
+```
+
+The global `sofuu.sfs` is the same object, so `await` works on either: a run is
+synchronous by design, and `await` on a non-promise resolves to the report.
+
+A run never throws: a failure comes back with its code (`E_CAP_MISSING`,
+`E_TIMEOUT`, `E_KAZE_CHECK`, …) so a tool loop can branch on `ok`.
 
 ### `sofuu.ml` — Context-Economy Gates
 

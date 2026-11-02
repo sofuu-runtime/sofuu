@@ -3651,7 +3651,14 @@
      * is defensive in every direction — a missing driver, a broken registry
      * or a spec without complete()/stream() all fall back to native, so an
      * agent run can never fail because a plugin provider is half-loaded. */
-    var NATIVE_PROVIDER_NAMES = { openai: 1, anthropic: 1, local: 1 };
+    var NATIVE_PROVIDER_NAMES = {
+      openai: 1,
+      anthropic: 1,
+      local: 1,
+      llamacpp: 1,
+      'llama.cpp': 1,
+      'llama-server': 1
+    };
     function pluginProviderFor(ro) {
       if (!ro || !ro.provider) return null;
       var nm = String(ro.provider);
@@ -3726,8 +3733,8 @@
         if (typeof pp.stream === 'function') {
           return Promise.resolve(pp.stream(req, ctx, function (ev) {
             if (!ev || aborted) return;
-            if (ev.type === 'delta' && typeof ev.text === 'string' && ev.text) push({ text: ev.text });
-            else if (ev.type === 'think' && typeof ev.text === 'string' && ev.text) push({ think: ev.text });
+            if ((ev.type === 'delta' || ev.type === 'text') && typeof ev.text === 'string' && ev.text) push({ text: ev.text });
+            else if ((ev.type === 'think' || ev.type === 'thinking') && typeof ev.text === 'string' && ev.text) push({ think: ev.text });
             else if (ev.type === 'done') absorbUsage(ev.usage, ev.toolCalls, ev.finishReason);
           })).then(function (rStream) {
             if (rStream && typeof rStream === 'object') {

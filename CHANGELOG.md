@@ -4,6 +4,155 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Zero-Risk Codebase Decoupling & In-Tree Capsule Modularization — 2026-11-02
+
+[`PLAN-ZERO-RISK-MODULARIZATION.md`](docs/PLAN-ZERO-RISK-MODULARIZATION.md) is implemented and verified end to end: encapsulates core systems substrate and domain expansions into isolated capsules with zero binary size inflation and zero linker churn.
+
+**Domain capsule encapsulation (`crates/sofuu-core/src/domains/`).**
+- **Kaze Domain (`domains/kaze/`):** Full 115 KB clean-room VM, lexer, parser, checker, compiler, and capabilities isolated from `sfs/`. Backward-compatible alias `pub use domains::kaze as sfs;` in `lib.rs`.
+- **Robotics & Hardware Domain (`domains/robotics/`):** Consolidates MAVLink v2 streaming, 6-stage hardware veto gate, transports, 1 Hz dead-man switch, GPIO, and mission operations out of `rt/`.
+- **Cognitive Memory Domain (`domains/memory/`):** Encapsulates CMA v2, HNSW, and decay evaluators under clean domain boundaries.
+- **Inference Domain (`domains/infer/`):** Encapsulates tensor graph execution and model architectures under clean domain boundaries.
+
+**Subsystem registration trait (`domains/subsystem.rs`).**
+Introduced unified `Subsystem` trait (`name()`, `register_js()`, `health_check()`) and `init_subsystems(ctx)` dispatch, cleanly decoupling domain global initialization from `rt/engine.rs`.
+
+**Local invariant preflight gate (`scripts/preflight.sh`).**
+Shipped 4-stage automated gate verifying zero cross-domain coupling, QuickJS bytecode snapshot synchronization (`make bc-check`), strict binary cap compliance ($\le 5.5\text{ MiB}$), and test execution.
+
+**Verification and test receipts.**
+- 1,138 unit tests passing (0 failed).
+- `make size-check` passing at 5,594,992 B ($\le 5,767,168$ B cap, 172 KB headroom).
+- All Kaze tests (15/15 language, 3/3 live) and MAVLink tests (91/91) passing green.
+- Full contract test suite (`scripts/contract/run_contract_tests.sh`) passing 51/52 (0 failed, 1 runner-blocked).
+
+## Drones, MAVLink v2 & Robotics Ground / Ambient Subsystem — 2026-11-01
+
+[`PLAN-DRONES-MAVLINK.md`](docs/PLAN-DRONES-MAVLINK.md) and [`PLAN-ROBOTICS-PI5-EDGE.md`](docs/PLAN-ROBOTICS-PI5-EDGE.md) are implemented and verified: a full companion-computer brain for aerial drones, ground rovers, and Raspberry Pi 5 ambient edge devices, governed by the deterministic R7 hardware safety firewall.
+
+**Zero-dependency MAVLink v2 codec (`domains/robotics/mavlink.rs`).** Hand-rolled streaming parser and serializer with CRC-16/MCRF4XX checksum calculation, pinned `CRC_EXTRA` table, sliding-window resynchronization over EMI/motor noise, and PreArm diagnostic extraction from `STATUSTEXT` (msgid 253).
+
+**Deterministic R7 hardware safety gate (`domains/robotics/mavlink_gate.rs`, `domains/robotics/hardware.rs`).** Enforces a 6-stage veto chain on every outgoing frame (device allowlist → deny-list → send-whitelist → MAV_CMD whitelist → non-clamping payload bounds → rate limits → approvals). GPS fix quality drops (< 3 sats or HDOP > 2.0) or telemetry loss (> 1.5s) immediately veto coordinate commands with typed `E_NO_GPS_FIX`.
+
+**Transports & heartbeat dead-man switch (`domains/robotics/mavlink_link.rs`).** Implemented dual UDP transport (`udp:` bind-and-learn + `udpout:` direct peer) and UART serial over PTY pairs. Runtime-scheduled 1 Hz `HEARTBEAT` loop triggers ArduPilot's native GCS failsafes upon interruption.
+
+**JavaScript surface, drone skills & mission DSL (`src/js/drone.js`, `domains/robotics/drone_ops.rs`).** Exposes `sofuu.drone` and `sofuu.mavlink`, along with `PACKS.drone` registering 6 agent tools (`drone_arm`, `drone_takeoff`, `drone_goto`, `drone_rtl`, `drone_hold`, `drone_telemetry`). Static pre-flight validator checks entire missions before any frame exists.
+
+**Ground rover & Linux GPIO (`domains/robotics/gpio.rs`, `deploy/rover/`).** Zero-dependency GPIO driver supporting `/sys/class/gpio` and Raspberry Pi 5 `/dev/gpiochip*` v2 line ABI with non-blocking kernel pulse timers. Ground rover test harness (`scripts/rover/preflight_cases.sh`) verifies 5/5 passing cases against geofence and speed violations.
+
+**Kaze live hardware bridge (`domains/robotics/kaze_live.rs`).** Couples Kaze natural-phrasing scripts directly to live MAVLink flight links and GPIO buses behind `CapHost`.
+
+**CLI toolchain (`sofuu drone`).** Shipped subcommands: `observe`, `status`, `send`, `mission`, `why`, and `init`.
+
+**Verification and test receipts.**
+- 123 unit and integration tests passing across MAVLink, drone operations, GPIO, and Kaze live backends.
+- Fuzzing target `crates/fuzz/fuzz_targets/mavlink.rs` active.
+- Live ArduPilot SITL flight over Wi-Fi verified (`takeoff -> goto -> rtl`).
+
+
+## Production Local Inference Plugin Bridge & Plugin Add CLI — 2026-11-01
+
+Enterprise Hardening Phase 3 is implemented end to end: high-throughput local
+inference bridging, automated CLI plugin installation, and zero-overhead
+provider execution while maintaining the $\le 5.5\text{ MiB}$ standalone binary
+envelope.
+
+**Local inference provider (`plugins/llamacpp_provider.ts`).** Implemented a
+production Category 2 `defineProvider` plugin connecting Sofuu to local
+`llama.cpp` server instances (or any OpenAI-compatible local runtime such as
+vLLM or LocalAI). Features SSE stream decoding, completion mapping, micro-tool
+call parsing, token usage metrics, model metadata extraction, and active health
+probing (`/health`). Internal symbols are scoped to prevent namespace collisions
+across QuickJS evaluation frames.
+
+**CLI plugin management (`sofuu plugin add <name>`).** Added turnkey plugin
+installation (`P.cliAdd` in `src/js/plugins.js` wired to `cmd_plugin` in
+`crates/sofuu-core/src/main.rs`). Supports official presets (`sofuu plugin add llamacpp`,
+`sofuu plugin add ollama`) as well as custom scaffolds with flags `--global` (installing
+to `~/.sofuu/plugins/`) and `--force` (overwriting existing implementations). All
+templates strip cleanly under Sofuu's built-in TypeScript parser without requiring
+`node_modules` or bundlers.
+
+**Fallback guidance and acceleration tips.** Integrated acceleration suggestions
+into `print_infer_help()` and runtime error paths in `sofuu infer` and `sofuu chat`,
+guiding users to activate hardware-accelerated local inference plugins without
+obscuring native fallback paths.
+
+**Verification and constraints.**
+- Zero model weights downloaded (`AGENTS.md` compliant).
+- Recompiled QuickJS bytecode snapshot (`src/js/plugins.bc`).
+- Binary size checked at 5,659,776 B ($\le 5,767,168$ B cap, 107 KB of headroom).
+- All 5 cookbook plugins validated cleanly (`make plugin-check`).
+
+
+## Kaze v0.1 — the device scripting language — 2026-11-01
+
+[`PLAN-KAZE-LANGUAGE.md`](docs/PLAN-KAZE-LANGUAGE.md) is implemented end to
+end: a new domain language, its own bytecode engine, a command surface and a JS
+bridge. Kaze is additive — QuickJS, the shipped drivers and every existing
+`sofuu.*` API are untouched.
+
+**The engine** (`crates/sofuu-core/src/domains/kaze/`, with backward-compatible `crate::sfs` alias) is a clean-room pipeline written
+with no new crates: lexer (indentation-aware, tabs refused) → parser
+(natural-phrasing verbs, unit normalization) → checker (declared capabilities,
+op arity, unit conflicts, `filter` termination on every path) → compiler
+(fixed 4-byte ISA, 33 opcodes) → VM (linear arena, fuel per instruction, host
+deadline poll at every loop head). Compiling the same source twice produces
+identical bytes, and `sofuu script compile` writes a `.kazebc` module that
+reloads and runs without the front end (`sofuu script run patrol.kazebc` executes
+the artifact from its bytes, with the same trace as the source). Equality branches compile to the fused
+`JEQ`/`JNE` opcodes, so a decision costs one instruction and materialises no
+boolean.
+
+**Safety is structural, not advisory.** A script has no instruction that can
+reach the outside world: `CALL_CAP` is the single door, and it passes the R7
+hardware gate in `rt/hardware.rs` first — `E_CAP_UNDECLARED` (H-1),
+`E_CAP_MISSING` (H-2), `E_CAP_DENIED` (H-3) through the one policy evaluator,
+and `E_KAZE_RANGE` (H-4). Arguments are rejected, never clamped: `takeoff to
+900 meters` stops the run instead of flying somewhere else. Fuel bounds every
+run, and a JS caller's deadline interrupts it: both report `E_TIMEOUT` as the
+plan requires, and the message says which limit fired.
+
+**The capability surface is the spec's, not a subset.** `drone.goto(lat, lon,
+alt)` takes the three arguments its own signature names, `sensor.read(pin)` and
+`device.read_gpio(pin)` read a named telemetry field (or a deterministic `0` for
+a numeric pin), and records — the maps JSON arguments already produce — are read
+with `record.field`, which compiles to `GET_FIELD`. A missing field reads as
+`nothing`; a field read on something that is not a record is `E_KAZE_TYPE`.
+
+**Surfaces.** `sofuu script run|check|compile|repl` — the command never
+initialises QuickJS, so `check` answers with no model, config or network — and
+`sofuu.sfs.run/check/compile/version` from JS, which returns a report object
+(`ok`, `actions`, `logs`, `result`, `verdict`, `fuel`) instead of throwing,
+so a tool loop can branch on `ok`.
+
+**Examples and docs.** `examples/kaze/` ships the four canonical scripts from
+the plan (drone patrol with a low-battery hook, rover obstacle loop, greenhouse
+climate check, prompt guardrail), a minimal one, and
+[`patrol_tool.mjs`](examples/kaze/patrol_tool.mjs) — the §6.2 agent-tool shape,
+wired with `import { defineTool, sfs } from "sofuu"` (the `sofuu` module now
+exports `sfs`);
+`crates/sofuu-core/tests/kaze_language.rs` exercises them, including the
+refusal paths. `docs/KAZE-SPEC.md` freezes the grammar, unit table, capability
+schema, opcode table, module layout and error codes; `README.md` gains a Kaze
+section and a `sofuu.sfs` API entry.
+
+**Verified on a release build.**
+`cargo test -p sofuu-core --lib sfs::` and `hardware::` pass (64 tests), and
+`cargo test -p sofuu-core --test kaze_language` passes (15 tests, one of them
+comparing every example against the byte-exact trace in
+`examples/kaze/golden/`). The traced
+patrol run, the `E_CAP_MISSING` refusal, the fuel `E_TIMEOUT` stop, the guardrail
+verdicts, the `triage` run that reads `record.kind` and `record.level`, and the
+JS round-trip quoted above were produced by `./sofuu`, not by inspection.
+
+**Size.** A differential build of the same tree with the Kaze modules disabled
+measures the engine at 115,520 B of binary. `make size-check` passes after the
+final change: 5,759,808 B stripped against the 5,767,168 B cap — 7,360 B of
+headroom, and shrinking while the in-flight M-D1 work lands in the same tree.
+
+---
+
 ## Audit remediation: 36 defect classes closed — 2026-10-31
 
 A full stress audit of the macOS and AWS builds produced 54 findings across the

@@ -40,6 +40,15 @@
 - [x] **Multi-Terminal Session Mesh**: Local IPC task synchronization (`/work`, `/done`) across simultaneous developer terminals.
 - [x] **Observability Stream**: Structured `.jsonl` audit logging with crash-resilient write-ahead logging (WAL).
 
+### 🛸 Robotics, Autonomous Drones & Ambient Computing
+- [x] **Zero-Dependency MAVLink v2 Codec**: Pure-Rust streaming parser and serializer with CRC-16/MCRF4XX, pinned CRC_EXTRA table, and sliding-window resync.
+- [x] **R7 Hardware Safety Gate**: 6-layer veto chain with reject-never-clamp bounds, dynamic geofencing, rate limiting, and fail-closed GPS dropout protection (`E_NO_GPS_FIX`).
+- [x] **Autonomous Dead-Man Switch**: Runtime-scheduled 1 Hz heartbeat triggering ArduPilot native GCS failsafes upon interruption.
+- [x] **Drone Agent Tools & Mission DSL**: High-level `sofuu.drone`, `sofuu.mavlink`, `PACKS.drone` (6 agent tools), pre-flight mission validator, and survey grid generators.
+- [x] **Ground Rover & Linux GPIO**: Portable `/sys/class/gpio` and Raspberry Pi 5 chardev `/dev/gpiochip*` v2 line ABI with pulse timers; ground rover pre-flight test suite passing 5/5 cases.
+- [x] **Kaze Live Hardware Bridge**: Direct coupling between Kaze natural scripting and active flight links/GPIO buses.
+- [x] **Field CLI Toolchain**: `sofuu drone observe / status / send / mission / why / init`.
+
 ### 🌐 Ecosystem & Public Launch
 - [x] **Official Documentation & Website**: Live at [sofuu.xyz](https://sofuu.xyz) and [sofuu.xyz/docs](https://sofuu.xyz/docs).
 - [x] **Official AI Coding Skill**: Machine-readable agent guide deployed at [sofuu.xyz/SKILL.md](https://sofuu.xyz/SKILL.md).
@@ -70,6 +79,12 @@
 - [x] **Declarative Tool Builder (`sofuu.tools.define`)**: Unified helper generating OpenAI, Anthropic, MCP, and JSON Schema draft-07 specs automatically.
 - [x] **Self-Correcting Tool Validation**: Invalid parameters return path-precise structured error messages (`-32602`) directly to the agent without crashing the loop, enabling LLM self-correction.
 - [x] **TypeScript Declarations**: Comprehensive `types/sofuu.d.ts`, `npm/sofuu.d.ts`, and root `sofuu.d.ts` for instant Cursor / VS Code IntelliSense with 100% parity (`make plugin-check`).
+
+### 🏛️ Zero-Risk Codebase Decoupling & In-Tree Capsule Modularization [COMPLETED]
+*See detailed specification in [`docs/PLAN-ZERO-RISK-MODULARIZATION.md`](docs/PLAN-ZERO-RISK-MODULARIZATION.md). Encapsulates domain logic into clean capsules with zero binary size inflation and zero linker churn.*
+- [x] **In-Tree Domain Capsules**: Reorganized `crates/sofuu-core/src/domains/` (`kaze/`, `robotics/`, `memory/`, `infer/`) with strict visibility boundaries and backward-compatible re-exports.
+- [x] **Subsystem Registration Trait**: Standardized `Subsystem` trait (`name()`, `register_js()`, `health_check()`) decoupling domain initialization from `rt/engine.rs`.
+- [x] **Local Invariant Preflight Gate (`scripts/preflight.sh`)**: Automated gate verifying domain boundary isolation, bytecode sync, size cap ($\le 5.5\text{ MiB}$), and unit test suites.
 
 ---
 

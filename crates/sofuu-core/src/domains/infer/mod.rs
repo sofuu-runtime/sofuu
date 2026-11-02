@@ -2504,3 +2504,16 @@ mod score_ppl_tests {
     }
 }
 
+pub struct InferSubsystem;
+
+impl crate::domains::Subsystem for InferSubsystem {
+    fn name(&self) -> &'static str {
+        "infer"
+    }
+
+    fn register_js(&self, _ctx: *mut sofuu_ffi::qjs::JSContext) -> Result<(), &'static str> {
+        // In-process tensor inference is consumed via sofuu.ai (rt/ai.rs)
+        Ok(())
+    }
+}
+

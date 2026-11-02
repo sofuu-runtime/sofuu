@@ -109,6 +109,20 @@ fi
 # substitution — it does not touch the linker or the cc invocation.
 REMAP="$(bash "$REPO_ROOT/scripts/cross/remap_flags.sh")"
 export RUSTFLAGS="$REMAP -C linker=$REPO_ROOT/scripts/cross/zig-ld.sh -C link-arg=-target -C link-arg=$TARGET -C link-self-contained=no"
+
+# ── Revision stamp ──────────────────────────────────────────
+# build_stamp() in crates/sofuu-core/build.rs reads SOFUU_BUILD first and only
+# falls back to git when it is unset. A cross build here has no reason to lose
+# that: without a stamp the artifact cannot be tied to a commit, which is what
+# scripts/verify-dist.sh checks ("carries no stamp for <rev>").
+if [ -z "${SOFUU_BUILD:-}" ]; then
+    _rev=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
+    if ! git -C "$REPO_ROOT" diff --quiet --untracked-files=no 2>/dev/null; then
+        _rev="${_rev}-dirty"
+    fi
+    export SOFUU_BUILD="$_rev"
+fi
+echo "→ build stamp: $SOFUU_BUILD"
 # link-self-contained=no: rustc's bundled musl CRT objects (rcrt1.o/crti.o)
 # duplicate the ones zig's driver links itself → duplicate-symbol errors.
 # With it off, zig supplies the CRT for the -static -pie link.

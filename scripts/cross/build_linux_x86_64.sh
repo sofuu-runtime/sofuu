@@ -194,9 +194,21 @@ export RUSTFLAGS
 cp "target/${RUST_TARGET}/release/sofuu" "$OUT"
 chmod +x "$OUT"
 
-SIZE=$(du -sh "$OUT" 2>/dev/null | cut -f1)
+# The size gate is a rule, not a preference (RULES.md §3.1: 5,767,168 B, no
+# per-platform exemption). The build reports where it stands rather than saying
+# "Built" as though that were the same thing as "publishable" — an artifact
+# over the cap must not look finished.
+CAP=5767168
+BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)
 echo ""
-echo "✅ Built: $OUT ($SIZE)"
+if [ "$BYTES" -le "$CAP" ]; then
+    echo "✅ Built: $OUT ($BYTES B, ✓ under the $CAP B cap)"
+else
+    echo "⚠️  Built: $OUT ($BYTES B, OVER the $CAP B cap by $((BYTES - CAP)) B)"
+    echo "   Not publishable as-is. See docs/PLAN-AUDIT-REMEDIATION-2026-11-02.md §16"
+    echo "   for the measured levers and what is left."
+fi
 echo "   Target: $TARGET (static musl, runs on any Linux x86_64)"
 echo "   QTSQ: $([ -f "$SOFUU_QTSQ_DIR/libqtsq.a" ] && echo linked || echo OFF)"
+echo "   Smoke test before publishing (needs a Linux host): scripts/cross/smoke_linux.sh $OUT"
 echo ""

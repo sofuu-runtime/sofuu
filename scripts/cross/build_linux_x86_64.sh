@@ -152,11 +152,44 @@ if [ "${SOFUU_LEAN_BUILD:-1}" != "0" ]; then
 fi
 export RUSTFLAGS
 
+# ── Build std with the panic machinery removed (SOFUU_BUILD_STD) ──────
+#
+# Worth 1,151,672 B: 7,239,432 → 6,087,760, measured on a clean tree with the
+# flags above already in place. panic = "immediate-abort" is a real panic
+# strategy as of the nightly used here, and it lets the compiler drop the
+# formatting machinery behind every panic message plus std's own unwind tables
+# (.eh_frame fell from 599,664 B to 138,792 B). The release profile already says
+# panic = "abort", so nothing about the program's behaviour changes: a panic was
+# already an abort, this only stops compiling the code that explains it.
+#
+# It needs a NIGHTLY toolchain with rust-src:
+#     rustup toolchain install nightly
+#     rustup component add rust-src --toolchain nightly
+# SOFUU_BUILD_STD=0 keeps the stable build, which is 1.15 MB larger and over the
+# 5,767,168 B cap in RULES.md §3.1.
+BUILD_STD="${SOFUU_BUILD_STD:-1}"
+CARGO_CMD=(cargo build)
+if [ "$BUILD_STD" != "0" ]; then
+    if ! rustc +nightly --version >/dev/null 2>&1; then
+        echo "ERROR: SOFUU_BUILD_STD=1 needs a nightly toolchain (rustup toolchain install nightly)." >&2
+        echo "       Set SOFUU_BUILD_STD=0 to build with stable, 1.15 MB over the cap." >&2
+        exit 1
+    fi
+    if [ ! -d "$(rustc +nightly --print sysroot)/lib/rustlib/src/rust/library" ]; then
+        echo "ERROR: nightly is missing rust-src (rustup component add rust-src --toolchain nightly)." >&2
+        exit 1
+    fi
+    RUSTFLAGS="$RUSTFLAGS -Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none"
+    CARGO_CMD=(cargo +nightly build -Z build-std=std,panic_abort)
+    echo "→ building std from source with panic=immediate-abort"
+fi
+export RUSTFLAGS
+
 # -p sofuu-core: build only the CLI package. A whole-workspace build drags
 # in the desktop app (sofuu-desktop/src-tauri), whose notification stack
 # (tauri-plugin-notification → notify-rust → libdbus-sys) requires a
 # target pkg-config for libdbus — unusable on a cross host.
-cargo build --release --target "$RUST_TARGET" -p sofuu-core 2>&1 | tail -20
+"${CARGO_CMD[@]}" --release --target "$RUST_TARGET" -p sofuu-core 2>&1 | tail -20
 
 cp "target/${RUST_TARGET}/release/sofuu" "$OUT"
 chmod +x "$OUT"

@@ -1810,7 +1810,7 @@
         var calls = evt.toolCalls || (evt.delta && evt.delta.tool_calls);
         if (calls) toolCalls = calls;
       }
-      try { emit(evt); } catch (eEmit) {}
+        try { emit(evt); } catch (eEmit) { /* one listener that throws must not break the emitter for the others. */ }
     };
 
     var outcome = await runWithWatchdog('Provider ' + spec.name, timeoutMs, ctx.signal || null, async function (signal) {
@@ -1898,7 +1898,7 @@
     if (!rec.failed || rec.failed % 10 !== 0) return;
     try {
       console.error('[mirror:' + rec.key + '] ' + rec.failed + ' background write(s) failed; last error: ' + rec.lastError);
-    } catch (eLog) {}
+      } catch (eLog) { /* reporting a failure that is already being reported: a broken stderr must not recurse. */ }
   }
 
   function armQueue(rec) {
@@ -2172,7 +2172,7 @@
   function serviceLog(service, hook, e) {
     try {
       console.error('[service:' + service.name + '] ' + hook + ' failed: ' + String((e && e.message) || e));
-    } catch (eLog) {}
+      } catch (eLog) { /* same contract as the mirror report: the message is best effort, the failure is already surfaced. */ }
   }
 
   P.defineService = function defineService(spec) {
@@ -3231,7 +3231,7 @@
               var res = await ctx.fetch(url, init);
               var text = await res.text();
               var data = text;
-              try { data = JSON.parse(text); } catch (eParse) {}
+      try { data = JSON.parse(text); } catch (eParse) { /* a non-JSON body is a valid result: data keeps the raw text and the OpenAPI tool returns it as-is. */ }
               if (!res.ok) {
                 throw makeError('E_TOOL', 'OpenAPI ' + method.toUpperCase() + ' ' + pathKey + ' -> HTTP ' + res.status + ': ' + text.slice(0, 300));
               }
@@ -3450,7 +3450,7 @@
           var s = sets[i];
           if (s && (s.name === name || s.server === name) && s.command) { spec.command = s.command; if (s.args) spec.args = s.args; if (s.env) spec.env = s.env; break; }
         }
-      } catch (eCfg) {}
+    } catch (eCfg) { /* an unreadable config means no config, and the defaults below are the documented behaviour. */ }
     }
     if (!spec.command && !spec.url) {
       return { ok: false, error: { code: 'E_CAPABILITY', message: 'MCP server "' + name + '" is not configured (pass opts.command for stdio or opts.url for http/sse)' } };
@@ -3922,11 +3922,11 @@ export default defineProvider({\n\
       var home = envOf().HOME || envOf().USERPROFILE || '';
       var dir = (opts.global && home) ? (home + '/.sofuu/plugins') : './plugins';
       if (sofuu.fs && sofuu.fs.mkdir) {
-        try { await sofuu.fs.mkdir(dir, { recursive: true }); } catch (eMk) {}
+        try { await sofuu.fs.mkdir(dir, { recursive: true }); } catch (eMk) { /* recursive mkdir on an existing dir is not a failure; if it really failed the write below reports the real error. */ }
       }
       var targetFile = dir + '/' + entry.file;
       var exists = false;
-      try { exists = await sofuu.fs.exists(targetFile); } catch (eEx) {}
+      try { exists = await sofuu.fs.exists(targetFile); } catch (eEx) { /* unknown counts as absent; the write below is the source of truth. */ }
       if (exists && !opts.force) {
         console.error('Plugin file ' + targetFile + ' already exists (use --force to overwrite)');
         return cliExit(1);
@@ -3935,7 +3935,7 @@ export default defineProvider({\n\
       try {
         var existing = await fsReadFile('./plugins/' + entry.file);
         if (existing) content = String(existing);
-      } catch (eRd) {}
+      } catch (eRd) { /* no existing file reads as empty; the template below fills content, and a missing file is the normal first-copy path. */ }
       if (!content && typeof entry.content === 'function') {
         content = entry.content();
       }

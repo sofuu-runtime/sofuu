@@ -36,7 +36,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: js-swallow-check all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
+.PHONY: js-swallow-check env-knobs-check all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
 	kaze-drift-check kaze-drift-strict clippy-ratchet \
 	observability-stress asan fuzz-simd policy-dx modern-npm sbom sign-dist \
         deps scoreboard scoreboard-check cuda-check \
@@ -334,7 +334,7 @@ clean:
 	rm -f $(TARGET)
 	cargo clean 2>/dev/null || true
 
-test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check
+test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check env-knobs-check
 	@echo ""
 	@echo "\033[1m=== Sofuu Test Suite ===\033[0m"
 	@echo ""
@@ -352,6 +352,12 @@ test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check
 # retire deliberately, not something to sweep blind, so the count may only fall.
 js-swallow-check:
 	@python3 scripts/check-js-swallow.py
+
+# Documented SOFUU_* names that no code reads (PLAN-AUDIT-REMEDIATION §6 Task
+# 5.5). docs/ is history, so the receipts keep their mentions; the gate is that
+# the list of names the binary does not honour never grows.
+env-knobs-check:
+	@python3 scripts/check-env-knobs.py
 
 kaze-drift-check:
 	@scripts/kaze-drift-check.sh

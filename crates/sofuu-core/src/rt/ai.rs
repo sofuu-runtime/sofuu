@@ -4058,6 +4058,9 @@ struct LocalStreamState {
     tool_calls_fn: JSValue,
     rx: std::sync::mpsc::Receiver<LocalStreamMsg>,
     async_handle: *mut uv::UvAsync,
+    /// Kept alive for the stream's lifetime: LOCAL_ABORTS holds the other
+    /// handle, and the reader is what clears it on drop.
+    #[allow(dead_code)]
     aborted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     sid: i64,
 }

@@ -83,6 +83,9 @@ const OFF_SCHEMA_DIMENSIONS: usize = 68; // qtsq_schema_t.dimensions[8]
 const OFF_SCHEMA_NUM_DIMS: usize = 100; // qtsq_schema_t.num_dims
 const OFF_IS_ENCRYPTED: usize = 4908; // qtsq_context_t.is_encrypted (int)
 const OFF_CODEC: usize = 5016; // qtsq_context_t.codec (uint8, Phase 6a)
+// Consumed only by the layout drift test below; in a release build the assert
+// is compiled out, so the constant has no reader and must not read as rot.
+#[cfg_attr(not(test), allow(dead_code))]
 const OFF_QUALITY: usize = 5020; // qtsq_context_t.quality (float, after codec)
 const OFF_STREAM_CODEC_ID: usize = 5024; // qtsq_context_t.stream_codec_id (uint32, Phase 1)
 

@@ -865,6 +865,12 @@ fn find_and_load_vec<S: AsRef<str>>(table: &UnifiedTensorTable, candidates: &[S]
     Err(format!("failed to find norm vector matching candidates"))
 }
 
+/// Deserialized from a HuggingFace config.json. Several fields are recorded and
+/// not read: the graph builder asks the GGUF key-value blocks for dimensions, so
+/// this is a forward-compatibility carrier rather than the source of truth. The
+/// audit rule for dead fields is "wired or deleted", and wiring these would
+/// create a second opinion about model shape, which is worse than one source.
+#[allow(dead_code)]
 #[derive(serde::Deserialize, Default, Debug)]
 struct HfConfig {
     #[serde(default)]

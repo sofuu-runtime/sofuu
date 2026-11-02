@@ -7,9 +7,9 @@
 # M10: the runtime is Rust (crates/) over the C engine layer, so this now
 # runs a cargo cross-build: rustc links with zig (static musl), the cc
 # crate compiles QuickJS/SIMD/http-parser with `zig cc`, and libuv +
-# libcurl are prebuilt for the target (dist/). QTSQ is skipped — the
-# separate checkout is not wired into this cross build; CI covers the same
-# degraded build.
+# libcurl are prebuilt for the target (dist/). QTSQ is a mandatory core
+# component (sofuu-ffi/build.rs refuses to configure without it), so it must be
+# cross-compiled first with scripts/cross/build_qtsq_cross.sh.
 #
 # Usage:
 #   bash scripts/cross/install_zig.sh     # once
@@ -97,16 +97,18 @@ export RANLIB="$ZIG ranlib"
 export SOFUU_UV_DIR="$REPO_ROOT/$UV_BUILD"
 export SOFUU_CURL_STATIC_DIR="$CURL_LIB"
 # QTSQ persistence: link the QTSQ static libs cross-compiled by
-# scripts/cross/build_qtsq_cross.sh (run it first). Fallback: an empty dir
-# keeps the build alive as a degraded no-QTSQ binary.
+# scripts/cross/build_qtsq_cross.sh (run it first).
+#
+# There is no degraded no-QTSQ build to fall back to: sofuu-ffi/build.rs treats
+# QTSQ as a mandatory core component and refuses to configure without it, so an
+# empty SOFUU_QTSQ_DIR does not keep the build alive — it only moves the failure
+# deeper, into a build-script panic. Fail here, where the fix is obvious.
 export SOFUU_QTSQ_DIR="$DIST/qtsq-linux-x86_64"
 export SOFUU_ZLIB_DIR="$DIST/qtsq-linux-x86_64"
 if [ ! -f "$SOFUU_QTSQ_DIR/libqtsq.a" ]; then
-    echo "WARNING: dist/qtsq-linux-x86_64/libqtsq.a missing — building WITHOUT QTSQ." >&2
-    echo "  Run scripts/cross/build_qtsq_cross.sh first." >&2
-    mkdir -p "$DIST/no-qtsq"
-    export SOFUU_QTSQ_DIR="$DIST/no-qtsq"
-    unset SOFUU_ZLIB_DIR
+    echo "ERROR: $SOFUU_QTSQ_DIR/libqtsq.a is missing, and QTSQ cannot be skipped." >&2
+    echo "  Run: bash scripts/cross/build_qtsq_cross.sh" >&2
+    exit 1
 fi
 # -C linker via zig-ld.sh: rustc emits its own leading flags (-m64) before
 # any link-arg, so a bare `zig`/`link-arg=cc` chain can't work — the wrapper

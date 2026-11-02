@@ -38,8 +38,6 @@ pub const DEFAULT_POLL_MS: u64 = 50;
 pub const PEER_WAIT_MS: u64 = 1_500;
 /// How long `connect` waits for the first position report after saying hello.
 pub const WARMUP_MS: u64 = 30_000;
-/// How often the warm-up looks for a new message while it waits.
-const WARMUP_STEP_MS: u64 = 20;
 /// How long a command waits for its COMMAND_ACK before the script is told the
 /// link did not answer.
 pub const DEFAULT_ACK_TIMEOUT_MS: u64 = 3_000;

@@ -763,11 +763,16 @@ extern "C" {
     );
     fn sofuu_bench_attn(b: i32, heads: i32, kv_heads: i32, head_dim: i32, seq: i32, iters: i32);
     fn sofuu_set_gqa_attn(mode: i32);
+    // Called by the bench harness and the C-side self-tests, neither of which
+    // is part of a release build, so these read as unused to the Rust compiler.
+    #[allow(dead_code)]
     fn sofuu_gqa_attn_calls() -> u64;
     fn sofuu_gqa4_attn_groups() -> u64;
     fn sofuu_kv16_fast_path() -> i32;
     fn sofuu_simd_features() -> i32;
+    #[allow(dead_code)] // C-side self-test entry points (see the note above)
     fn sofuu_test_qk_rows8_f32(q: *const f32, k: *const f32, head_dim: usize, count: usize, out: *mut f32, scale: f32);
+    #[allow(dead_code)]
     fn sofuu_test_qk_rows8_k16(q: *const f32, k: *const u16, head_dim: usize, count: usize, out: *mut f32, scale: f32);
     fn sofuu_batched_attention_ext_k16(
         q_batch: *const f32,

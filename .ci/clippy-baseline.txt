@@ -13,6 +13,6 @@
 # whole tree, not a gate. The gate is that the number never rises while that
 # refactor happens. `clippy::unwrap_used` is the one lint already at deny level
 # (crates/sofuu-ffi), which is why the five unwraps it found were real errors.
-sofuu-core:lib:642
-sofuu-ffi:lib:52
+sofuu-core:lib:619
+sofuu-ffi:lib:51
 sofuu-ffi:build:6

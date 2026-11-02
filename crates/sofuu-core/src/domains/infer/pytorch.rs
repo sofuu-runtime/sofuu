@@ -39,8 +39,11 @@ pub struct PyTorchCheckpoint {
 #[derive(Debug, Clone)]
 enum PickleValue {
     None,
-    Bool(bool),
-    Int(i64),
+    /// Like Int below: parsed so the reader can walk past it, never consumed.
+    Bool(#[allow(dead_code)] bool),
+    /// Parsed and carried so the reader can skip past it; the tensor importer
+    /// only consumes the arrays, never a scalar.
+    Int(#[allow(dead_code)] i64),
     String(String),
     Tuple(Vec<PickleValue>),
     List(Vec<PickleValue>),

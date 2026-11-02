@@ -32,6 +32,11 @@ struct Slot {
 #[derive(Default)]
 struct Registry {
     next_id: u32,
+    /// The last failure from a link call. Written on every error path and not
+    /// read back yet: the JS side gets the message on the throwing call, so this
+    /// field is for a link.lastError() accessor that does not exist. Keep it -
+    /// deleting it would lose the diagnostic that says why the link died.
+    #[allow(dead_code)]
     last_error: String,
     links: HashMap<u32, Slot>,
 }

@@ -3460,12 +3460,9 @@ impl MetalEngine {
         }
     }
 
-    /// Fused residual-add + RMSNorm. SOFUU_FUSE_NORM=1 arms it. Measured neutral
-    /// end to end (90.1 vs 90.3 tg/s), so it stays off.
-    fn fuse_norm_enabled() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var("SOFUU_FUSE_NORM").map(|v| v == "1").unwrap_or(false))
-    }
+    // The fused residual+norm knob lives in model.rs (fuse_norm_enabled); this
+    // copy outlived the call site that used it, so SOFUU_FUSE_NORM looked like
+    // it had two readers when it has one.
 
     /// Flat one-dispatch q4_K GEMV. SOFUU_GEMV_FLAT=1 arms it. It is 3x faster than the
     /// shipped kernel in isolation (149 vs 49 GB/s on the same bytes) and 2% slower
@@ -10234,6 +10231,8 @@ fn mmq_tile_value_probe() {
     unsafe { libc::munmap(xp1 as *mut libc::c_void, xsz1) };
 }
 
+// Used by the f16 dequant tests, which only build under test/bench cfgs.
+#[allow(dead_code)]
 fn half_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
     let exp = ((h >> 10) & 0x1f) as u32;

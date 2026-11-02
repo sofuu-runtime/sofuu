@@ -236,12 +236,21 @@ struct Lfm2GpuSlots {
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub struct Lfm2GpuDecode {
+    // Model shape, recorded at construction. The kernels take these as arguments
+    // from the caller, so the copies here have no reader; they are what a shape
+    // assertion would compare against.
+    #[allow(dead_code)]
     dim: usize,
+    #[allow(dead_code)]
     n_heads: usize,
+    #[allow(dead_code)]
     n_kv_heads: usize,
+    #[allow(dead_code)]
     head_dim: usize,
     max_seq: usize,
+    #[allow(dead_code)]
     norm_eps: f32,
+    #[allow(dead_code)]
     rope_base: f32,
     /// Driver-managed copy of the whole model file; byte offsets identical to
     /// the mmap (1:1 copy), so every weight bind is unchanged.
@@ -2605,8 +2614,15 @@ unsafe fn sdot16(mut acc: std::arch::aarch64::int32x4_t, w: std::arch::aarch64::
 struct Pre8Slab {
     codes: Vec<i8>,   // [rows][cols]
     scales: Vec<f32>, // [rows][groups]
+    // Descriptor of the cached span. The int8 prefill derives rows/cols/groups
+    // from the tensor it was asked about, so these are recorded and not read;
+    // they stay because a mismatch between them and the request is the check a
+    // future cache hit wants.
+    #[allow(dead_code)]
     rows: usize,
+    #[allow(dead_code)]
     cols: usize,
+    #[allow(dead_code)]
     groups: usize,
 }
 

@@ -6017,7 +6017,13 @@ impl TransformerModel {
             if !wok {
                 return false;
             }
-            pend = 0;
+            // Reset for the next window; the receipt that reports pend is only
+            // built in the bench harness, so the write has no reader in a
+            // release binary.
+            #[allow(unused_assignments)]
+            {
+                pend = 0;
+            }
             if !g.engine.batch_open_async() {
                 return false;
             }
@@ -6053,7 +6059,12 @@ impl TransformerModel {
             if !wok {
                 return false;
             }
-            pend = 1;
+            // pend marks the phase for the bench receipt (see the note on the
+            // first reset); nothing in the binary reads it.
+            #[allow(unused_assignments)]
+            {
+                pend = 1;
+            }
             if !g.engine.batch_open_async() {
                 return false;
             }
@@ -6111,7 +6122,13 @@ impl TransformerModel {
             if !wok {
                 return false;
             }
-            pend = 0;
+            // Reset for the next window; the receipt that reports pend is only
+            // built in the bench harness, so the write has no reader in a
+            // release binary.
+            #[allow(unused_assignments)]
+            {
+                pend = 0;
+            }
             if !g.engine.batch_open_async() {
                 return false;
             }
@@ -6426,6 +6443,9 @@ impl TransformerModel {
     let multi_dbg_dec = std::env::var_os("SOFUU_MULTI_DEBUG").is_some();
     let multi_dbg_dec_done = std::cell::Cell::new(false);
     let multi_dbg_dec_dumped = std::cell::Cell::new(false);
+    // fast is set by the probe loop and read by the receipt the bench harness
+    // prints; that receipt is not compiled into the binary.
+    #[allow(unused_assignments)]
     macro_rules! gemm_fused_dec {
         ($secs:expr, $rows_total:expr, $cols:expr, $x_off:expr) => {{
             // P1/P2: type-grouped section runs — consecutive sections of
@@ -6434,6 +6454,8 @@ impl TransformerModel {
             // the 1B's attn_k sits BELOW attn_q; a first-section base made
             // the k delta underflow u32 = the b4blob OOB receipt).
             let mut all_ok = fuse_multi && !$secs.is_empty();
+            // Read by the bench-harness receipt, which is not compiled here.
+            #[allow(unused_assignments)]
             let mut fast = false;
             let mut groups: Vec<(u32, Vec<(usize, u32, u32, u32)>)> = Vec::new(); // (type, [(secs idx, rows, y_off, y_stride)])
             for (i, (tv, rows, y_off, y_stride)) in $secs.iter().enumerate().take(4) {
@@ -8916,6 +8938,9 @@ pub struct GgufGpu {
     /// GPU3 attention meta buffer (shared across layers, barrier-ordered):
     /// per head-chunk {max,sum} pair + per head-chunk partial V sums.
     meta_buf: crate::infer::metal::MetalBuffer,
+    /// Host pages behind meta_buf, allocated with it so the buffer wraps mapped
+    /// memory. Nothing reads the handle: the GPU reaches it through meta_buf.
+    #[allow(dead_code)]
     meta: crate::infer::model::AnonBuffer,
     skip_attn: bool,
     skip_ffn: bool,

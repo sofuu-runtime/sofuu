@@ -1064,7 +1064,10 @@ unsafe fn read_back_streams(path: &str) -> Option<(Vec<f32>, String)> {
 }
 
 /// True when two record slices are the same records bit for bit: same
-/// order, ids, metadata and VECTOR BITS.
+/// order, ids, metadata and VECTOR BITS. This is the invariant the write path
+/// relies on, spelled out where it can be read; nothing calls it, so it must
+/// not read as forgotten production code.
+#[allow(dead_code)]
 fn records_bit_identical(a: &[SegRecord], b: &[SegRecord]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b.iter()).all(|(x, y)| {

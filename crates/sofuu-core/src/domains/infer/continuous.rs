@@ -293,8 +293,13 @@ pub struct ContinuousBatchServer {
     /// takes this one only, so it cannot be stopped by a running iteration.
     inbound: Arc<Mutex<InboundQueue>>,
     condvar: Arc<Condvar>,
+    /// Held so the engine outlives the worker thread it was started with.
+    #[allow(dead_code)]
     engine: Arc<Mutex<InferEngine>>,
     block_pools: Arc<Mutex<Vec<BlockPool>>>,
+    /// Sequence for request ids; requests are currently keyed by the caller's
+    /// own id, so this has no reader yet.
+    #[allow(dead_code)]
     next_id: AtomicU64,
     worker_handle: Option<std::thread::JoinHandle<()>>,
 }

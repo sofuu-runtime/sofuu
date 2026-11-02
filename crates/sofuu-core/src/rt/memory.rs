@@ -854,7 +854,10 @@ mod impl_qtsq {
 
     impl BrainLayout {
         /// Placeholder used while the real layout is carried alongside the
-        /// loaded data (the loader returns them together).
+        /// loaded data (the loader returns them together). Nothing calls it any
+        /// more: every caller passes the real layout. Kept because it documents
+        /// what a valid empty layout looks like (epoch 1, no segments).
+        #[allow(dead_code)]
         fn empty() -> Self {
             Self {
                 dir: String::new(),
@@ -2821,12 +2824,11 @@ mod impl_qtsq {
          */
         shell.flushes_since_sweep = shell.flushes_since_sweep.saturating_add(1);
         let sweep = shell.last_sweep_epoch != Some(layout.epoch) || shell.flushes_since_sweep >= 64;
-        let mut keep: Vec<String> = Vec::new();
         let mut reclaimed = 0usize;
         if sweep {
             shell.last_sweep_epoch = Some(layout.epoch);
             shell.flushes_since_sweep = 0;
-            keep = layout.segments.iter().map(|s| s.file.clone()).collect();
+            let keep: Vec<String> = layout.segments.iter().map(|s| s.file.clone()).collect();
             crate::rt::brain_store::remove_orphan_segments(&dir, &keep, 600);
         }
 

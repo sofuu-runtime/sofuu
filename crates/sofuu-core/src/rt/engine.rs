@@ -1255,6 +1255,10 @@ pub unsafe extern "C" fn sofuu_module_loader(
 }
 
 /// dump_error — print an exception + stack to stderr (the eval-file path).
+/// The eval-file path now surfaces the exception as a thrown JS error instead,
+/// so this has no caller; kept because it is the only place that renders a
+/// qjs stack trace, which is what a future --verbose needs.
+#[allow(dead_code)]
 unsafe fn dump_error(ctx: *mut qjs::JSContext) {
     // SAFETY: ctx is live; every value below is freed exactly once.
     let exception = unsafe { qjs::JS_GetException(ctx) };

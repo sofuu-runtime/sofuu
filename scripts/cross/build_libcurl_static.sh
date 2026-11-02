@@ -85,7 +85,7 @@ cmake -S "$CURL_SRC" -B "$BUILD_DIR" \
     -DCMAKE_INSTALL_PREFIX="$CURL_INSTALL" \
     -DCMAKE_C_COMPILER="$ZIG" \
     -DCMAKE_C_COMPILER_ARG1="cc -target ${TARGET}" \
-    -DCMAKE_C_FLAGS="-target ${TARGET}" \
+    -DCMAKE_C_FLAGS="-target ${TARGET} -fno-asynchronous-unwind-tables -fno-unwind-tables" \
     -DCMAKE_EXE_LINKER_FLAGS="-target ${TARGET} -static" \
     -DCMAKE_SYSTEM_NAME=Linux \
     -DCMAKE_SYSTEM_PROCESSOR="$CMAKE_ARCH" \

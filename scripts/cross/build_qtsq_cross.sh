@@ -119,7 +119,10 @@ inffast trees uncompr zutil"
 build_one() {
     local target="$1" outdir="$2" win="$3"
     local out="$REPO_ROOT/dist/$outdir"
-    mkdir -p "$out/obj"
+    # The object cache is keyed by optimisation level. It was not, and a stale
+    # -O2 cache silently produced an -O2 archive no matter what was asked for.
+    local obj="$out/obj/${QTSQ_OPT:--Oz}"
+    mkdir -p "$obj"
     # Stage the checkout's public headers: sofuu-ffi's build.rs layout
     # guard compiles qtsq_layout_guard.c against $SOFUU_QTSQ_DIR/include.
     mkdir -p "$out/include" "$out/compressor/include"
@@ -131,7 +134,16 @@ build_one() {
     # archive, exactly like scripts/mobile/build_qtsq_android.sh.
     cp "$QTSQ_DIR/compressor/include/"*.h "$out/compressor/include/"
     local linkargs=(-target "$target")
-    local cc=("$ZIG" cc "${linkargs[@]}" -O2 -std=c11 -c)
+    # QTSQ is 1,019,120 B of the linked Linux artifact — a third of the overage
+    # against the 5,767,168 B cap in RULES.md §3.1 — so its optimisation level
+    # is a size decision, not a detail. -Oz is the default because the cap does
+    # not fit without it (5,723,504 B against 5,767,168 B with every lever on);
+    # QTSQ_OPT=-O2 restores the faster codec for a caller that is not shipping
+    # the release artifact. No unwind tables either: nothing in QTSQ unwinds
+    # through a signal handler, and the tables are pure weight in a static
+    # binary.
+    local cc=("$ZIG" cc "${linkargs[@]}" "${QTSQ_OPT:--Oz}" -std=c11 \
+              -fno-asynchronous-unwind-tables -fno-unwind-tables -c)
     local inc=(-I"$QTSQ_DIR/include" -I"$QTSQ_DIR/compressor/include" \
                -I"$QTSQ_DIR/crypto/common" -I"$QTSQ_DIR/crypto/ml-kem-768" \
                -I"$QTSQ_DIR/crypto/ml-dsa-65" -I"$QTSQ_DIR/crypto/argon2" \
@@ -152,7 +164,7 @@ build_one() {
     # zlib (independent archive; QTSQ core + qtc reference it).
     local zobjs=()
     for o in $ZLIB_OBJS; do
-        local f="$out/obj/z_$o.o"
+        local f="$obj/z_$o.o"
         [ -f "$f" ] || "${cc[@]}" -I"$ZLIB_SRC" -DNO_GZIP \
             "$ZLIB_SRC/$o.c" -o "$f"
         zobjs+=("$f")
@@ -166,7 +178,7 @@ build_one() {
     # into qtsq.lib, mirroring the CMake single-archive layout).
     local qtc_objs=()
     for s in $qtc_list; do
-        local f="$out/obj/qtc_$s.o"
+        local f="$obj/qtc_$s.o"
         [ -f "$f" ] || "${cc[@]}" "${defines[@]}" "${inc[@]}" \
             "$QTSQ_DIR/compressor/src/$s.c" -o "$f"
         qtc_objs+=("$f")
@@ -181,7 +193,7 @@ build_one() {
     [ "$win" = 1 ] && fi=(-include "$QTSQ_DIR/windows/shim/qtsq_win_compat.h")
     local qtsq_objs=()
     for s in $qtsq_list; do
-        local f="$out/obj/$s.o"
+        local f="$obj/$s.o"
         [ -f "$f" ] || "${cc[@]}" "${defines[@]}" "${inc[@]}" \
             ${fi[@]+"${fi[@]}"} "$QTSQ_DIR/src/$s.c" -o "$f"
         qtsq_objs+=("$f")
@@ -194,7 +206,7 @@ build_one() {
         # avoids). Tag every crypto object with its directory.
         local tag; tag="$(dirname "$c")"; tag="${tag#crypto/}"
         tag="${tag//[^A-Za-z0-9]/_}"
-        local f="$out/obj/crypto_${tag}_$(basename "$c" .c).o"
+        local f="$obj/crypto_${tag}_$(basename "$c" .c).o"
         [ -f "$f" ] || "${cc[@]}" "${defines[@]}" "${inc[@]}" \
             ${fi[@]+"${fi[@]}"} "$QTSQ_DIR/$c" -o "$f"
         qtsq_objs+=("$f")
@@ -202,7 +214,7 @@ build_one() {
     if [ "$win" = 1 ]; then
         local win_objs=("${qtc_objs[@]}" "${qtsq_objs[@]}")
         for s in qtsq_win_compat qtsq_mmap_win; do
-            local f="$out/obj/shim_$s.o"
+            local f="$obj/shim_$s.o"
             [ -f "$f" ] || "${cc[@]}" "${defines[@]}" "${inc[@]}" \
                 "$QTSQ_DIR/windows/shim/$s.c" -o "$f"
             win_objs+=("$f")
@@ -230,7 +242,7 @@ build_one() {
     fi
 }
 
-build_one x86_64-linux-musl qtsq-linux-x86_64 0
+build_one x86_64-linux-musl "${QTSQ_OUTDIR:-qtsq-linux-x86_64}" 0
 build_one aarch64-linux-musl qtsq-linux-arm64 0
 build_one x86_64-windows-gnu qtsq-windows-x86_64 1
 # glibc variant: rustc DROPS the cdylib crate type for *-linux-musl (musl has

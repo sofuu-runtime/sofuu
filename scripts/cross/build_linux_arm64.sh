@@ -54,7 +54,7 @@ UV_BUILD="$UV_DIR/build-linux-arm64"
 
 cmake -S "$UV_DIR" -B "$UV_BUILD" \
     -G "Unix Makefiles" \
-    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_BUILD_TYPE=MinSizeRel \
     -DBUILD_TESTING=OFF \
     -DCMAKE_C_COMPILER="$ZIG" \
     -DCMAKE_C_COMPILER_ARG1="cc -target $TARGET" \
@@ -112,6 +112,39 @@ export RUSTFLAGS="$REMAP -C linker=$REPO_ROOT/scripts/cross/zig-ld.sh -C link-ar
 # link-self-contained=no: rustc's bundled musl CRT objects (rcrt1.o/crti.o)
 # duplicate the ones zig's driver links itself → duplicate-symbol errors.
 # With it off, zig supplies the CRT for the -static -pie link.
+# link-self-contained=no: rustc's bundled musl CRT objects (rcrt1.o/crti.o)
+# duplicate the ones zig's driver links itself → duplicate-symbol errors.
+
+# ── Size levers, identical to build_linux_x86_64.sh ───────────────
+# The cap is 5,767,168 B with no per-platform exemption (RULES.md §3.1), and
+# arm64 was 6,163,520 B. These are the same levers that took x86_64 from
+# 7,735,896 to 5,723,504 B; see that script for what each one is worth.
+export SOFUU_KERNEL_OPT="${SOFUU_KERNEL_OPT:-z}"
+if [ "${SOFUU_LEAN_BUILD:-1}" != "0" ]; then
+    RUSTFLAGS="$RUSTFLAGS -C force-unwind-tables=no -C relocation-model=static"
+    RUSTFLAGS="$RUSTFLAGS -C link-arg=-no-pie -C link-arg=-Wl,--no-eh-frame-hdr"
+    NOUNWIND="-fno-asynchronous-unwind-tables -fno-unwind-tables"
+    export CFLAGS="${CFLAGS:-} $NOUNWIND"
+    export CFLAGS_aarch64_unknown_linux_musl="${CFLAGS_aarch64_unknown_linux_musl:-} $NOUNWIND"
+    export CXXFLAGS="${CXXFLAGS:-} $NOUNWIND"
+fi
+
+BUILD_STD="${SOFUU_BUILD_STD:-1}"
+CARGO_CMD=(cargo build)
+if [ "$BUILD_STD" != "0" ]; then
+    if ! rustc +nightly --version >/dev/null 2>&1; then
+        echo "ERROR: SOFUU_BUILD_STD=1 needs a nightly toolchain (rustup toolchain install nightly)." >&2
+        exit 1
+    fi
+    if [ ! -d "$(rustc +nightly --print sysroot)/lib/rustlib/src/rust/library" ]; then
+        echo "ERROR: nightly is missing rust-src (rustup component add rust-src --toolchain nightly)." >&2
+        exit 1
+    fi
+    RUSTFLAGS="$RUSTFLAGS -Zunstable-options -Cpanic=immediate-abort -Zlocation-detail=none -Zfmt-debug=none"
+    CARGO_CMD=(cargo +nightly build -Z build-std=std,panic_abort)
+    echo "→ building std from source with panic=immediate-abort"
+fi
+export RUSTFLAGS
 
 # ── Pi 5 tuned codegen (SOFUU_PI5_TUNED=1) ────────────────────────
 # The C++ SIMD kernels already get -mcpu=cortex_a76 (zig-cc.sh) and
@@ -152,14 +185,24 @@ fi
 # in the desktop app (sofuu-desktop/src-tauri), whose notification stack
 # (tauri-plugin-notification → notify-rust → libdbus-sys) requires a
 # target pkg-config for libdbus — unusable on a cross host.
-cargo build --release --target "$RUST_TARGET" -p sofuu-core 2>&1 | tail -20
+"${CARGO_CMD[@]}" --release --target "$RUST_TARGET" -p sofuu-core 2>&1 | tail -20
 
 cp "target/${RUST_TARGET}/release/sofuu" "$OUT"
 chmod +x "$OUT"
 
-SIZE=$(du -sh "$OUT" 2>/dev/null | cut -f1)
+# The cap is a rule, not a preference (RULES.md §3.1: 5,767,168 B, no
+# per-platform exemption), so this reports where the artifact stands instead
+# of calling it done.
+CAP=5767168
+BYTES=$(wc -c < "$OUT" 2>/dev/null || echo 0)
 echo ""
-echo "✅ Built: $OUT ($SIZE)"
+if [ "$BYTES" -le "$CAP" ]; then
+    echo "✅ Built: $OUT ($BYTES B, ✓ under the $CAP B cap)"
+else
+    echo "⚠️  Built: $OUT ($BYTES B, OVER the $CAP B cap by $((BYTES - CAP)) B)"
+    echo "   Not publishable as-is. See docs/PLAN-AUDIT-REMEDIATION-2026-11-02.md §16"
+fi
 echo "   Target: $TARGET (static musl, runs on Graviton / RPi / Oracle ARM)"
 echo "   QTSQ: $([ -f "$SOFUU_QTSQ_DIR/libqtsq.a" ] && echo linked || echo OFF)"
+echo "   Smoke test before publishing (needs a Linux host): scripts/cross/smoke_linux.sh $OUT"
 echo ""

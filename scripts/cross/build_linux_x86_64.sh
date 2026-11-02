@@ -62,7 +62,7 @@ export RANLIB="$ZIG ranlib"
 
 cmake -S "$UV_DIR" -B "$UV_BUILD" \
     -G "Unix Makefiles" \
-    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_BUILD_TYPE=MinSizeRel \
     -DBUILD_TESTING=OFF \
     -DCMAKE_C_COMPILER="$ZIG" \
     -DCMAKE_C_COMPILER_ARG1="cc -target $TARGET" \
@@ -167,6 +167,9 @@ export RUSTFLAGS
 #     rustup component add rust-src --toolchain nightly
 # SOFUU_BUILD_STD=0 keeps the stable build, which is 1.15 MB larger and over the
 # 5,767,168 B cap in RULES.md §3.1.
+# The kernels are the last size lever that costs nothing but throughput, and
+# the cap does not fit without them at -Oz. Set SOFUU_KERNEL_OPT=3 to get -O3.
+export SOFUU_KERNEL_OPT="${SOFUU_KERNEL_OPT:-z}"
 BUILD_STD="${SOFUU_BUILD_STD:-1}"
 CARGO_CMD=(cargo build)
 if [ "$BUILD_STD" != "0" ]; then

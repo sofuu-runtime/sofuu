@@ -165,10 +165,19 @@ pub fn validate_kv_write(
     Ok(())
 }
 
+/// One reader for SOFUU_CUDA_DEBUG: the loader owns it, this asks. Two parsers
+/// of one flag is two behaviours waiting to disagree.
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 fn debug_on() -> bool {
-    std::env::var("SOFUU_CUDA_DEBUG")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false)
+    // SAFETY: takes no arguments and returns an int; the loader only reads the
+    // environment, so this is safe before any driver is opened.
+    unsafe { sys::sofuu_cuda_debug_enabled() != 0 }
+}
+
+/// Platforms that never link the loader have no CUDA to trace.
+#[cfg(not(any(target_os = "linux", all(test, target_os = "macos"))))]
+fn debug_on() -> bool {
+    false
 }
 
 fn kill_switch() -> bool {
@@ -252,6 +261,7 @@ mod sys {
         pub fn sofuu_cuda_ctx_host_unregister(ctx: *mut c_void, host: *mut c_void) -> c_int;
         pub fn sofuu_cuda_last_error() -> *const c_char;
         pub fn sofuu_cuda_driver_present() -> c_int;
+        pub fn sofuu_cuda_debug_enabled() -> c_int;
     }
 
     pub fn last_error() -> String {

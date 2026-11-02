@@ -187,7 +187,7 @@ impl<'a> Vm<'a> {
                     pc += 1;
                     let b = self.pop(item.line)?;
                     let a = self.pop(item.line)?;
-                    let eq = crate::sfs::arena::values_equal(a, b, &self.arena);
+                    let eq = crate::sfs::arena::values_equal(a, b, &self.arena, &self.heap);
                     let taken = if op == Op::Jeq { eq } else { !eq };
                     if taken {
                         pc = jump(pc, imm, code.len(), item.line)?;
@@ -227,7 +227,7 @@ impl<'a> Vm<'a> {
                 Op::CmpEq | Op::CmpNe => {
                     let b = self.pop(item.line)?;
                     let a = self.pop(item.line)?;
-                    let eq = crate::sfs::arena::values_equal(a, b, &self.arena);
+                    let eq = crate::sfs::arena::values_equal(a, b, &self.arena, &self.heap);
                     self.push(Value::Bool(if op == Op::CmpEq { eq } else { !eq }), item.line)?;
                 }
                 Op::Not => {

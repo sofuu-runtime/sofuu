@@ -927,7 +927,15 @@ pub fn layered_policy_from_disk() -> Result<serde_json::Value, String> {
 
 /* ── JS surface ────────────────────────────────────────────────────── */
 
-unsafe fn read_json_arg(ctx: *mut JSContext, v: JSValueConst) -> Option<String> {
+unsafe fn read_json_arg(ctx: *mut JSContext, argc: c_int, argv: *const JSValueConst) -> Option<String> {
+    // argv is only valid for argc elements. A JS caller may pass nothing, so
+    // reading argv[0] when argc is 0 would read whatever the frame happens to
+    // hold and hand it to the parser as if it were the caller's argument.
+    if argc < 1 || argv.is_null() {
+        return None;
+    }
+    let arg = *argv;
+    let v = arg;
     if qjs::is_object(v) {
         let js = qjs::JS_JSONStringify(ctx, v, qjs::sofuu_js_undefined(), qjs::sofuu_js_undefined());
         if qjs::is_exception(js) || qjs::is_undefined(js) {
@@ -995,7 +1003,7 @@ unsafe extern "C" fn js_policy_set(
     if argc < 1 {
         return qjs::JS_ThrowTypeError(ctx, c"policy.set: policy object or JSON required".as_ptr());
     }
-    let Some(raw) = read_json_arg(ctx, *argv) else {
+    let Some(raw) = read_json_arg(ctx, argc, argv) else {
         let msg = qjs::sofuu_js_new_string(ctx, c"{\"ok\":false,\"error\":\"policy is not serializable\"}".as_ptr());
         return msg;
     };
@@ -1158,7 +1166,7 @@ unsafe extern "C" fn js_policy_evaluate(
         let cs = json_str("{\"decision\":\"deny\",\"rule\":\"R7/invalid-request\",\"reason\":\"no request\"}");
         return qjs::sofuu_js_new_string(ctx, cs.as_ptr());
     }
-    let Some(raw) = read_json_arg(ctx, *argv) else {
+    let Some(raw) = read_json_arg(ctx, argc, argv) else {
         let cs = json_str("{\"decision\":\"deny\",\"rule\":\"R7/invalid-request\",\"reason\":\"request is not serializable\"}");
         return qjs::sofuu_js_new_string(ctx, cs.as_ptr());
     };

@@ -132,7 +132,14 @@ fn json_str(v: &str) -> CString {
     CString::new(v).unwrap_or_default()
 }
 
-unsafe fn read_json_arg(ctx: *mut JSContext, arg: JSValueConst) -> Option<Value> {
+unsafe fn read_json_arg(ctx: *mut JSContext, argc: c_int, argv: *const JSValueConst) -> Option<Value> {
+    // argv is only valid for argc elements. A JS caller may pass nothing, so
+    // reading argv[0] when argc is 0 would read whatever the frame happens to
+    // hold and hand it to the parser as if it were the caller's argument.
+    if argc < 1 || argv.is_null() {
+        return None;
+    }
+    let arg = *argv;
     let mut len = 0usize;
     let c = qjs::JS_ToCStringLen2(ctx, &mut len, arg, 0);
     if c.is_null() {
@@ -150,7 +157,7 @@ unsafe extern "C" fn js_async_make_error(
         make_error(&json!({"code": "E_INTERNAL", "op": "async.makeError",
             "message": "makeError requires an options object"}))
     } else {
-        read_json_arg(ctx, *argv)
+        read_json_arg(ctx, argc, argv)
             .map(|a| make_error(&a))
             .unwrap_or_else(|| make_error(&json!({"code": "E_SCHEMA",
                 "op": "async.makeError", "message": "argument must be a JSON object"})))
@@ -166,7 +173,7 @@ unsafe extern "C" fn js_async_child_deadline(
         make_error(&json!({"code": "E_SCHEMA", "op": "async.childDeadline",
             "message": "childDeadline requires {parent_ms, child_ms}"}))
     } else {
-        read_json_arg(ctx, *argv)
+        read_json_arg(ctx, argc, argv)
             .map(|a| child_deadline(&a))
             .unwrap_or_else(|| make_error(&json!({"code": "E_SCHEMA",
                 "op": "async.childDeadline", "message": "argument must be a JSON object"})))

@@ -136,6 +136,11 @@ const char *sofuu_cuda_last_error(void);
 // 0 otherwise. Does not initialise CUDA and does not create a context.
 int sofuu_cuda_driver_present(void);
 
+// Non-zero when SOFUU_CUDA_DEBUG is set to anything but empty or "0". This is
+// the single source of truth for CUDA tracing; the Rust side calls it rather
+// than parsing the same variable a second time.
+int sofuu_cuda_debug_enabled(void);
+
 #ifdef __cplusplus
 }
 #endif

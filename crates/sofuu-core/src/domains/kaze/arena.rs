@@ -11,7 +11,7 @@
 // is the property a 10 Hz vehicle controller needs: bounded, O(1), and
 // impossible to leak across runs.
 
-use crate::sfs::value::Value;
+use crate::sfs::value::{Heap, Value};
 
 /// A slice of the arena. `off`/`len` are byte offsets, valid only while the
 /// arena that produced them is alive.
@@ -80,11 +80,43 @@ impl Arena {
 }
 
 /// Structural equality across the two value kinds that can hold strings.
-pub fn values_equal(a: Value, b: Value, arena: &Arena) -> bool {
+pub fn values_equal(a: Value, b: Value, arena: &Arena, heap: &Heap) -> bool {
+    values_equal_at(a, b, arena, heap, 0)
+}
+
+/// Belt and braces for a future that allows mutation. Collections are immutable
+/// in v0.1 (the grammar has no field or element assignment), so a cycle cannot
+/// exist today and this recursion always terminates.
+const MAX_EQUAL_DEPTH: u32 = 64;
+
+fn values_equal_at(a: Value, b: Value, arena: &Arena, heap: &Heap, depth: u32) -> bool {
+    if depth > MAX_EQUAL_DEPTH {
+        return false;
+    }
     match (a, b) {
         (Value::Str(x), Value::Str(y)) => arena.get(x) == arena.get(y),
-        (Value::Arr(x), Value::Arr(y)) => x == y,
-        (Value::Map(x), Value::Map(y)) => x == y,
+        (Value::Arr(x), Value::Arr(y)) => match (heap.array(x), heap.array(y)) {
+            (Some(l), Some(r)) => {
+                l.len() == r.len()
+                    && l.iter()
+                        .zip(r.iter())
+                        .all(|(p, q)| values_equal_at(*p, *q, arena, heap, depth + 1))
+            }
+            _ => false,
+        },
+        // Records compare as ordered key/value sequences. Host records arrive
+        // from serde_json, whose maps are ordered, so two records built from the
+        // same JSON always compare equal.
+        (Value::Map(x), Value::Map(y)) => match (heap.map(x), heap.map(y)) {
+            (Some(l), Some(r)) => {
+                l.len() == r.len()
+                    && l.iter().zip(r.iter()).all(|((k1, v1), (k2, v2))| {
+                        values_equal_at(*k1, *k2, arena, heap, depth + 1)
+                            && values_equal_at(*v1, *v2, arena, heap, depth + 1)
+                    })
+            }
+            _ => false,
+        },
         _ => a == b,
     }
 }

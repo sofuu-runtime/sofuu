@@ -2228,7 +2228,7 @@ fn cmd_chat(rt: &SofuuRuntime, args: &[String]) -> i32 {
                 entry.model = m.clone();
                 cfg.model = m.clone();
             } else {
-                if prov == "llamacpp" && entry.model == "default" {
+                if prov == "llamacpp" && (entry.model == "default" || entry.model.starts_with("zai-org/") || entry.model.starts_with("anthropic/") || entry.model.starts_with("openai/") || entry.model.starts_with("google/")) {
                     entry.model.clear();
                     cfg.model.clear();
                 } else {

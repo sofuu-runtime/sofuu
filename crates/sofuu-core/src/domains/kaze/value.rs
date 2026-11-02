@@ -145,7 +145,7 @@ impl Heap {
     pub fn map_get(&self, idx: u32, key: Value, arena: &crate::sfs::arena::Arena) -> Option<Value> {
         let entries = self.maps.get(idx as usize)?;
         for (k, v) in entries {
-            if crate::sfs::arena::values_equal(*k, key, arena) {
+            if crate::sfs::arena::values_equal(*k, key, arena, self) {
                 return Some(*v);
             }
         }
@@ -153,9 +153,12 @@ impl Heap {
     }
 
     /// One operation, zero fragmentation — the whole run's collections go.
+    /// The meter is part of that: a wholesale free that left the budget spent
+    /// would refuse every allocation made afterwards.
     pub fn free_wholesale(&mut self) {
         self.arrays.clear();
         self.maps.clear();
+        self.used_bytes = 0;
     }
 
     pub fn used(&self) -> usize {

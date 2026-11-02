@@ -454,7 +454,14 @@ fn json_str(v: &str) -> CString {
 /// One-JSON-argument convention (mirrors events.rs): the host passes a JSON
 /// string. A bare JS object is stringified first, so a script can hand over
 /// `{...}` without pre-serialising it.
-unsafe fn read_json_arg(ctx: *mut JSContext, arg: JSValueConst) -> Option<Value> {
+unsafe fn read_json_arg(ctx: *mut JSContext, argc: c_int, argv: *const JSValueConst) -> Option<Value> {
+    // argv is only valid for argc elements. A JS caller may pass nothing, so
+    // reading argv[0] when argc is 0 would read whatever the frame happens to
+    // hold and hand it to the parser as if it were the caller's argument.
+    if argc < 1 || argv.is_null() {
+        return None;
+    }
+    let arg = *argv;
     let mut len = 0usize;
     let c = qjs::JS_ToCStringLen2(ctx, &mut len, arg, 0);
     if !c.is_null() {
@@ -488,9 +495,9 @@ unsafe fn read_json_arg(ctx: *mut JSContext, arg: JSValueConst) -> Option<Value>
 }
 
 unsafe extern "C" fn js_observability_runs(
-    ctx: *mut JSContext, _this: JSValueConst, _argc: c_int, argv: *const JSValueConst,
+    ctx: *mut JSContext, _this: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out = read_json_arg(ctx, *argv)
+    let out = read_json_arg(ctx, argc, argv)
         .map(|args| runs(&args))
         .unwrap_or_else(|| json!({"ok": false, "code": "E_SCHEMA", "message": "argument must be a JSON object"}));
     let cs = json_str(&serde_json::to_string(&out).unwrap_or_else(|_| "{}".into()));
@@ -498,9 +505,9 @@ unsafe extern "C" fn js_observability_runs(
 }
 
 unsafe extern "C" fn js_observability_last_checkpoint(
-    ctx: *mut JSContext, _this: JSValueConst, _argc: c_int, argv: *const JSValueConst,
+    ctx: *mut JSContext, _this: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out = read_json_arg(ctx, *argv)
+    let out = read_json_arg(ctx, argc, argv)
         .map(|args| last_checkpoint(&args))
         .unwrap_or_else(|| json!({"ok": false, "code": "E_SCHEMA", "message": "argument must be a JSON object"}));
     let cs = json_str(&serde_json::to_string(&out).unwrap_or_else(|_| "{}".into()));
@@ -508,9 +515,9 @@ unsafe extern "C" fn js_observability_last_checkpoint(
 }
 
 unsafe extern "C" fn js_observability_postmortem(
-    ctx: *mut JSContext, _this: JSValueConst, _argc: c_int, argv: *const JSValueConst,
+    ctx: *mut JSContext, _this: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out = read_json_arg(ctx, *argv)
+    let out = read_json_arg(ctx, argc, argv)
         .map(|args| postmortem(&args))
         .unwrap_or_else(|| json!({"ok": false, "code": "E_SCHEMA", "message": "argument must be a JSON object"}));
     let cs = json_str(&serde_json::to_string(&out).unwrap_or_else(|_| "{}".into()));
@@ -518,9 +525,9 @@ unsafe extern "C" fn js_observability_postmortem(
 }
 
 unsafe extern "C" fn js_observability_crash_card(
-    ctx: *mut JSContext, _this: JSValueConst, _argc: c_int, argv: *const JSValueConst,
+    ctx: *mut JSContext, _this: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out = read_json_arg(ctx, *argv)
+    let out = read_json_arg(ctx, argc, argv)
         .map(|args| crash_card(&args))
         .unwrap_or_else(|| json!({"ok": false, "code": "E_SCHEMA", "message": "argument must be a JSON object"}));
     let cs = json_str(&serde_json::to_string(&out).unwrap_or_else(|_| "{}".into()));

@@ -31,6 +31,7 @@ use crate::{output_archive, session, theme};
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
+    pub args: Vec<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -321,7 +322,16 @@ impl ChatConfig {
             .filter_map(|item| {
                 let name = item.get("name").and_then(|x| x.as_str())?.to_string();
                 let command = item.get("command").and_then(|x| x.as_str())?.to_string();
-                Some(McpServerConfig { name, command })
+                let args = item
+                    .get("args")
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                Some(McpServerConfig { name, command, args })
             })
             .collect()
     }
@@ -3435,7 +3445,7 @@ unsafe extern "C" fn js_chat_mcpservers(
     let json = serde_json::json!(
         servers
             .iter()
-            .map(|s| serde_json::json!({ "name": s.name, "command": s.command }))
+            .map(|s| serde_json::json!({ "name": s.name, "command": s.command, "args": s.args }))
             .collect::<Vec<_>>()
     )
     .to_string();

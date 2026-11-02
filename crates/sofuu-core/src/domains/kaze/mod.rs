@@ -261,6 +261,11 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
 
         report.fuel_used = vm.fuel_used;
         report.instructions = vm.instructions;
+        // KAZE-SPEC §8 says a run's memory is released in one operation when it
+        // ends. Do exactly that, here, so the documented mechanism is the one
+        // that runs rather than a side effect of dropping the Vm.
+        vm.heap.free_wholesale();
+        vm.arena.free_wholesale();
     }
 
     report.actions = host.actions().iter().map(|a: &Action| a.render()).collect();
@@ -638,6 +643,32 @@ impl crate::domains::Subsystem for KazeSubsystem {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn lists_compare_by_content_not_by_identity() {
+        // Two separately built lists with the same items are equal, matching how
+        // strings already behave. Before this, equality was the heap index, so
+        // this returned 0 while "a" == "a" returned 1.
+        let src = "needs: log\naction main():\n    let a = [1, 2]\n    let b = [1, 2]\n    \
+                   if a == b:\n        return 1\n    return 0\n";
+        let report = run_source(src, "<eq>", &RunOptions::default()).expect("runs");
+        assert_eq!(report.value, "1");
+
+        let src = "needs: log\naction main():\n    let a = [1, 2]\n    let b = [1, 3]\n    \
+                   if a == b:\n        return 1\n    return 0\n";
+        let report = run_source(src, "<ne>", &RunOptions::default()).expect("runs");
+        assert_eq!(report.value, "0");
+    }
+
+    #[test]
+    fn a_wholesale_free_gives_the_whole_budget_back() {
+        let mut heap = value::Heap::new(256);
+        heap.push_array(vec![value::Value::Num(1.0); 4]).expect("fits");
+        assert!(heap.used_bytes() > 0);
+        assert!(heap.used_bytes() <= 256);
+        heap.free_wholesale();
+        assert_eq!(heap.used_bytes(), 0, "the meter must be part of the free");
+    }
     use super::*;
 
     fn run(src: &str, opts: &RunOptions) -> RunReport {

@@ -596,7 +596,14 @@ fn json_str(v: &str) -> CString {
     CString::new(v).unwrap_or_default()
 }
 
-unsafe fn read_json_arg(ctx: *mut JSContext, arg: JSValueConst) -> Option<Value> {
+unsafe fn read_json_arg(ctx: *mut JSContext, argc: c_int, argv: *const JSValueConst) -> Option<Value> {
+    // argv is only valid for argc elements. A JS caller may pass nothing, so
+    // reading argv[0] when argc is 0 would read whatever the frame happens to
+    // hold and hand it to the parser as if it were the caller's argument.
+    if argc < 1 || argv.is_null() {
+        return None;
+    }
+    let arg = *argv;
     let mut len = 0usize;
     let c = qjs::JS_ToCStringLen2(ctx, &mut len, arg, 0);
     if !c.is_null() {
@@ -634,9 +641,9 @@ fn project_arg(args: &Value) -> String {
 }
 
 unsafe extern "C" fn js_session_list(
-    ctx: *mut JSContext, _t: JSValueConst, _argc: c_int, argv: *const JSValueConst,
+    ctx: *mut JSContext, _t: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out = read_json_arg(ctx, *argv)
+    let out = read_json_arg(ctx, argc, argv)
         .map(|a| list(&project_arg(&a)))
         .unwrap_or_else(|| list("."));
     let cs = json_str(&serde_json::to_string(&out).unwrap_or_else(|_| "{}".into()));
@@ -644,9 +651,9 @@ unsafe extern "C" fn js_session_list(
 }
 
 unsafe extern "C" fn js_session_export(
-    ctx: *mut JSContext, _t: JSValueConst, _argc: c_int, argv: *const JSValueConst,
+    ctx: *mut JSContext, _t: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out: String = match read_json_arg(ctx, *argv) {
+    let out: String = match read_json_arg(ctx, argc, argv) {
         Some(a) => {
             let sid = a.get("sid").and_then(Value::as_str).unwrap_or("").to_string();
             match build(&project_arg(&a), &sid, None) {
@@ -664,9 +671,9 @@ unsafe extern "C" fn js_session_export(
 }
 
 unsafe extern "C" fn js_session_import(
-    ctx: *mut JSContext, _t: JSValueConst, _argc: c_int, argv: *const JSValueConst,
+    ctx: *mut JSContext, _t: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out: Value = match read_json_arg(ctx, *argv) {
+    let out: Value = match read_json_arg(ctx, argc, argv) {
         Some(d) => match import(".", &d.to_string()) {
             Ok(r) => r,
             Err(e) => json!({"ok": false, "code": "E_SCHEMA", "message": e}),
@@ -678,9 +685,9 @@ unsafe extern "C" fn js_session_import(
 }
 
 unsafe extern "C" fn js_session_sync(
-    ctx: *mut JSContext, _t: JSValueConst, _argc: c_int, argv: *const JSValueConst,
+    ctx: *mut JSContext, _t: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out: Value = match read_json_arg(ctx, *argv) {
+    let out: Value = match read_json_arg(ctx, argc, argv) {
         Some(a) => {
             let sid = a.get("sid").and_then(Value::as_str).unwrap_or("").to_string();
             let project = project_arg(&a);

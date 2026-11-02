@@ -730,7 +730,14 @@ fn json_str(v: &str) -> CString {
 
 /// One-JSON-argument convention (mirrors policy.rs): the host passes a JSON
 /// object or string; a non-object argument is reported as a typed error.
-unsafe fn read_json_arg(ctx: *mut JSContext, arg: JSValueConst) -> Option<Value> {
+unsafe fn read_json_arg(ctx: *mut JSContext, argc: c_int, argv: *const JSValueConst) -> Option<Value> {
+    // argv is only valid for argc elements. A JS caller may pass nothing, so
+    // reading argv[0] when argc is 0 would read whatever the frame happens to
+    // hold and hand it to the parser as if it were the caller's argument.
+    if argc < 1 || argv.is_null() {
+        return None;
+    }
+    let arg = *argv;
     let mut len = 0usize;
     let c = qjs::JS_ToCStringLen2(ctx, &mut len, arg, 0);
     if c.is_null() {
@@ -755,7 +762,7 @@ unsafe extern "C" fn js_events_schema(
 unsafe extern "C" fn js_events_validate(
     ctx: *mut JSContext, _this: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out = match read_json_arg(ctx, *argv) {
+    let out = match read_json_arg(ctx, argc, argv) {
         Some(ev) => {
             let errs = validate(&ev);
             json!({"ok": errs.is_empty(), "errors": errs})
@@ -769,7 +776,7 @@ unsafe extern "C" fn js_events_validate(
 unsafe extern "C" fn js_events_redact(
     ctx: *mut JSContext, _this: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out = read_json_arg(ctx, *argv).map(|ev| redact(&ev)).unwrap_or_else(|| {
+    let out = read_json_arg(ctx, argc, argv).map(|ev| redact(&ev)).unwrap_or_else(|| {
         json!({"ok": false, "code": "E_SCHEMA", "message": "argument must be a JSON event object"})
     });
     let cs = json_str(&serde_json::to_string(&out).unwrap_or_else(|_| "{}".into()));
@@ -779,7 +786,7 @@ unsafe extern "C" fn js_events_redact(
 unsafe extern "C" fn js_events_append(
     ctx: *mut JSContext, _this: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out = read_json_arg(ctx, *argv)
+    let out = read_json_arg(ctx, argc, argv)
         .map(|args| append(&args))
         .unwrap_or_else(|| json!({"ok": false, "code": "E_SCHEMA", "message": "argument must be a JSON object"}));
     let cs = json_str(&serde_json::to_string(&out).unwrap_or_else(|_| "{}".into()));
@@ -789,7 +796,7 @@ unsafe extern "C" fn js_events_append(
 unsafe extern "C" fn js_events_read(
     ctx: *mut JSContext, _this: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out = read_json_arg(ctx, *argv)
+    let out = read_json_arg(ctx, argc, argv)
         .map(|args| read(&args))
         .unwrap_or_else(|| json!({"ok": false, "code": "E_SCHEMA", "message": "argument must be a JSON object"}));
     let cs = json_str(&serde_json::to_string(&out).unwrap_or_else(|_| "{}".into()));
@@ -799,7 +806,7 @@ unsafe extern "C" fn js_events_read(
 unsafe extern "C" fn js_events_reconstruct(
     ctx: *mut JSContext, _this: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let out = read_json_arg(ctx, *argv)
+    let out = read_json_arg(ctx, argc, argv)
         .map(|args| reconstruct(&args))
         .unwrap_or_else(|| json!({"ok": false, "code": "E_SCHEMA", "message": "argument must be a JSON object"}));
     let cs = json_str(&serde_json::to_string(&out).unwrap_or_else(|_| "{}".into()));
@@ -809,7 +816,7 @@ unsafe extern "C" fn js_events_reconstruct(
 unsafe extern "C" fn js_events_render(
     ctx: *mut JSContext, _this: JSValueConst, argc: c_int, argv: *const JSValueConst,
 ) -> JSValue {
-    let events: Vec<Value> = read_json_arg(ctx, *argv)
+    let events: Vec<Value> = read_json_arg(ctx, argc, argv)
         .filter(|a| !a.is_null())
         .and_then(|a| {
             if a.is_array() {
@@ -829,7 +836,7 @@ unsafe extern "C" fn js_events_canonical_usage(
     let out = if argc < 1 {
         canonical_usage(&json!({}))
     } else {
-        read_json_arg(ctx, *argv)
+        read_json_arg(ctx, argc, argv)
             .map(|a| canonical_usage(&a))
             .unwrap_or_else(|| json!({"in": 0, "out": 0, "model": "unknown", "provider": "unknown", "cost_usd": 0}))
     };

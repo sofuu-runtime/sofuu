@@ -191,6 +191,13 @@ static int debug_enabled(void) {
     return v && v[0] && strcmp(v, "0") != 0;
 }
 
+/* One reader for SOFUU_CUDA_DEBUG. The Rust side asks this instead of parsing
+ * the environment a second time, so the two layers cannot disagree about
+ * whether tracing is on. */
+int sofuu_cuda_debug_enabled(void) {
+    return debug_enabled();
+}
+
 static const char *driver_error(const sofuu_cuda_driver *d, CUresult r,
                                 char *buf, size_t cap) {
     const char *s = NULL;

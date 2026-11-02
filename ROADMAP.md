@@ -66,12 +66,21 @@
 - [x] **OS Signing & Integrity**: Mach-O `__LINKEDIT` extension + automated ad-hoc signing; ELF/PE plain append.
 - [x] **Embedded Memory Support**: The whole `.qtsq` store (manifest + segments) packed into the binary (`--embed-brain`).
 
-### 🛡️ Zero-Crash Hardening & Concurrency Fuzzing [COMPLETED]
-*See detailed specification in [`docs/ENTERPRISE_HARDENING_PLAN.md`](docs/ENTERPRISE_HARDENING_PLAN.md). Phase 1 delivered the global rejection sink (`process.on('unhandledRejection')` and exit 1 on unhandled), timer scaling (65,536 limit), 10,000-concurrency torture harness (`tests/stress/concurrency_stress.js`), QuickJS `-Os` binary size reduction, and strict compliance with the $\le 5.5\text{ MiB}$ binary limit.*
+### 🛡️ Zero-Crash Hardening & Concurrency Fuzzing — JavaScript level [COMPLETED]
+*See detailed specification in [`docs/ENTERPRISE_HARDENING_PLAN.md`](docs/ENTERPRISE_HARDENING_PLAN.md). Phase 1 delivered the global rejection sink (`process.on('unhandledRejection')` and exit 1 on unhandled), timer scaling (65,536 limit), the 10,000-concurrency torture harness (`tests/stress/concurrency_stress.js`), QuickJS `-Os` binary size reduction, and strict compliance with the $\le 5.5\text{ MiB}$ binary limit.*
+
+**What "zero-crash" covers here: the JavaScript level.** Unhandled promise
+rejections, timer exhaustion, event-loop starvation and QuickJS allocation
+exhaustion are all handled, tested and terminated cleanly. It does **not** mean a
+Rust panic is survivable — see the open item below.
 - [x] **Promise Rejection Trap**: Unhandled rejection sink terminating with exit code 1 instead of Rust panics; `process.on('unhandledRejection')` support.
 - [x] **Handle Lifecycle Auditing**: Guaranteeing `uv_loop_alive() == 0` when work drains to eliminate hanging processes.
 - [x] **10,000-Concurrency Stress Harness**: High-concurrency test (`tests/stress/concurrency_stress.js`) passing 10k timers, 1k files, 500 SIMD ops, 100 subprocesses, and 5k ALS continuations in 668ms.
 - [x] **OOM Memory Guardrails & Binary Size Gate**: Graceful JavaScript `RangeError` on QuickJS allocation exhaustion; release binary stripped & signed at **5,611,328 B** ($\le 5,767,168\text{ B}$ ceiling).
+
+### ⚠️ Rust panic paths [OPEN]
+- [ ] **Panic is abort, not recovery.** `Cargo.toml` sets `panic = "abort"`, so any Rust panic ends the process immediately: no unwinding, no `Drop`, no cleanup, no error object for the host to catch. That is a deliberate choice and the right one for a panic inside a QuickJS extern-C callback, where unwinding across the FFI boundary would be undefined behaviour — but it means "zero-crash" at the JS level does not extend to the Rust level.
+- [ ] **`unwrap`/`expect` on input-reachable paths.** Roughly 11 panic sites exist on production paths, concentrated in `domains/infer/metal.rs`. Converting them to typed errors and asserting the invariants at load time is tracked in `docs/PLAN-AUDIT-REMEDIATION-2026-11-02.md` §8 (Task 6.2).
 
 ### 🧰 Developer Experience: Global Schema Tool Calling [COMPLETED]
 *See detailed specification in [`docs/ENTERPRISE_HARDENING_PLAN.md`](docs/ENTERPRISE_HARDENING_PLAN.md). Phase 2 delivered zero-install schema tools (`sofuu.z` / `globalThis.z`), declarative `sofuu.tools.define`, multi-format exports (OpenAI, Anthropic, MCP, JSON Schema draft-07), in-process argument validation with self-correction feedback, and full TypeScript autocompletion (`types/sofuu.d.ts`).*

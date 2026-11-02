@@ -1548,7 +1548,8 @@
        * a prune). Flush before dropping — a clean store's flush is a
        * no-op, and a failed one only delays to the next open. */
       try { if (BRAINS[keys[0]] && BRAINS[keys[0]].cma) BRAINS[keys[0]].cma.flush(); } catch (eV1) {}
-      try { if (BRAINS[keys[0]] && BRAINS[keys[0]].sem) BRAINS[keys[0]].sem.flush(); } catch (eV2) {}
+      try { if (BRAINS[keys[0]] && BRAINS[keys[0]].sem) BRAINS[keys[0]].sem.flush(); } catch (eV2) { /* a flush
+         of a cache we are about to drop: the state is rebuilt from the store. */ }
       delete BRAINS[keys[0]];
     }
     return entry;
@@ -1595,7 +1596,8 @@
           var pruned = entry.sem.retainAgainst(entry.cma) || 0;
           if (pruned > 0) { try { entry.sem.flush(); } catch (e3) {} }
         }
-      } catch (e) {}
+      } catch (e) { /* flush after pruning: the entries are already gone from the
+         in-memory index, and a failed flush only costs a re-parse. */ }
     }
     return consolidated;
   }
@@ -1759,7 +1761,8 @@
           if (stu) entry.sem.rememberEntity(stu, clip(task, STORE_CAP_CHARS), entTask, 'agent');
           if (sa) entry.sem.rememberEntity(sa, clip(answer, STORE_CAP_CHARS), entAns, 'agent');
           entry.sem.flush();
-        } catch (e2) {}
+        } catch (e2) { /* see the prune above: a cache flush that fails costs a
+           re-parse, never data. */ }
       }
       return;
     }
@@ -1812,7 +1815,8 @@
           entry.sem.remember(av, clip(answer, STORE_CAP_CHARS), 'assistant', 0);
         }
         if (promotedSem > 0) entry.sem.flush();
-      } catch (e3) {}
+      } catch (e3) { /* promotion flush: the promoted entries are already in the
+         index; the next load re-derives them from the store. */ }
     }
   }
   async function rememberIdentity(d, backend, entry) {
@@ -1833,10 +1837,11 @@
               entry.sem.rememberEntity(sv, txt, 'agent:' + d.name, 'agent-identity');
               entry.sem.flush();
             }
-          } catch (e2) {}
+          } catch (e2) { /* same cache-flush contract as the sites above. */ }
         }
       }
-    } catch (e) {}
+    } catch (e) { /* the whole memory-maintenance pass is opportunistic: nothing
+       it does is required for correctness of the current turn. */ }
   }
 
   /* ── MCP pool (lazy, one connection per command; idle-disconnect so
@@ -4177,7 +4182,7 @@
                         }
                         semCma.flush();
                       }
-                    } catch (eS) {}
+                    } catch (eS) { /* cache flush; state is rebuilt on load. */ }
                   }
                   results.push('saved to memory brain (id: ' + id + ')');
                 }
@@ -4857,7 +4862,9 @@
             await sofuu.fs.mkdir(spillDir, { recursive: true });
             var spillPath = spillDir + '/' + stepsTotal + '.txt';
             await sofuu.fs.writeFile(spillPath, String(result));
-            try { await sofuu.fs.chmod(spillPath, 384); } catch (eCh) {}
+            try { await sofuu.fs.chmod(spillPath, 384); } catch (eCh) { /* 0600 is a
+               hardening step; the file exists and is already written, and failing
+               here must not lose the spill. */ }
             cappedR.spill_path = spillPath;
             cappedR.text += '\n[full result saved at ' + spillPath + ']';
           } catch (eSpill) { /* spill is best-effort; the cap still holds */ }
@@ -6659,7 +6666,8 @@
           await sofuu.fs.writeFile(path + '.1', prev);
           await sofuu.fs.writeFile(path, '');
         }
-      } catch (e) {}
+      } catch (e) { /* rotation is best effort: an unreadable or oversized log
+         still gets appended to, which is better than dropping the record. */ }
       var line = JSON.stringify({
         t: Date.now(), runId: res.runId, name: res.name,
         task: clip(task, 500), answer: clip(res.answer, 500),
@@ -6670,7 +6678,8 @@
          * history + session archives. */
       });
       await sofuu.fs.appendFile(path, line + '\n');
-    } catch (e) {}
+    } catch (e) { /* see the contract above: logging never breaks a run, so the
+       outer guard is deliberate silence, not a forgotten handler. */ }
   }
 
   /* ── Export (merge into the live sofuu.agent object) ───────────── */
@@ -6796,7 +6805,7 @@
             }
             entry.sem.flush();
           }
-        } catch (eS) {}
+        } catch (eS) { /* cache flush; state is rebuilt on load. */ }
       }
       return { ok: typeof gist === 'number', id: gist, ns: ns };
     } catch (e) {

@@ -697,7 +697,9 @@
       var res = (existed ? 'overwrote ' : 'created ') + rel(p) + ' (' + a.content.length + ' chars)';
       try {
         res += anchorRider(await sofuu.fs.readFile(p, 'utf8'), 0, 2);
-      } catch (eW) {}
+      } catch (eW) { /* the write above already succeeded; the anchor rider is
+         decorative context for the result line, so a read-back failure must not
+         turn a completed write into an error. */ }
       return res;
     },
   };

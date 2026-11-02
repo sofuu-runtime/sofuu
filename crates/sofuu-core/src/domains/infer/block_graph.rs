@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 use super::model::ModelConfig;
 use super::npy::TensorDType;
-use super::lfm2::{SendMutPtr, SendPtr};
+// (SendPtr/SendMutPtr used to be imported here for a thread-pool path that moved
+// to lfm2; the import outlived its callers.)
 use super::quant::{bf16_to_f32, f16_to_f32, rmsnorm, rope, swiglu_in_place};
 use super::tensor_table::{UnifiedTensorData, UnifiedTensorTable};
 

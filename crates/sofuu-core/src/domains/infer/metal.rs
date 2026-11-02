@@ -1811,7 +1811,14 @@ impl MetalEngine {
         rows: usize, cols: usize,
     ) -> bool {
         if std::env::var_os("SOFUU_GGUF_DBG").is_some() {
-            Self::gguf_histogram().lock().unwrap().entry((ty, rows, cols)).and_modify(|c| *c += 1).or_insert(1);
+            // Recover from a poisoned lock instead of panicking. This is a
+            // debugging histogram: a thread that panicked while holding it must
+            // not take the process down on the next inference, least of all in
+            // a release build where panic = "abort".
+            let mut hist = Self::gguf_histogram()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            hist.entry((ty, rows, cols)).and_modify(|c| *c += 1).or_insert(1);
         }
         if ty == 12 && (Self::gemv_flat_enabled() || Self::gemv_flat_forced()) && cols % 256 == 0
             && unsafe {

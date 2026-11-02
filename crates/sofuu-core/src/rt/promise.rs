@@ -33,6 +33,13 @@ extern "C" {
     /// when nothing handled it. Does NOT take ownership of `exc`. Stays C
     /// until M3.
     fn process_dispatch_uncaught(ctx: *mut JSContext, exc: JSValue) -> c_int;
+    /// mod_process.rs — dispatch to process.on('unhandledRejection') if
+    /// registered. Returns 1 when a handler ran, 0 when nothing handled it.
+    fn process_dispatch_unhandled_rejection(
+        ctx: *mut JSContext,
+        reason: JSValueConst,
+        promise: JSValueConst,
+    ) -> c_int;
 }
 
 /// The C `sofuu_promise_t` — { ctx, resolve, reject } (promises.h). Callers
@@ -346,11 +353,15 @@ pub unsafe fn sofuu_rt_suppress_rejections(ctx: *mut JSContext, reason: JSValueC
 }
 
 /// # Safety
-/// `ctx` live; `reason` a live value of `ctx`.
-unsafe fn print_rejection(ctx: *mut JSContext, reason: JSValueConst) {
+/// `ctx` live; `reason` and `promise` live values of `ctx`.
+unsafe fn print_rejection(ctx: *mut JSContext, reason: JSValueConst, promise: JSValueConst) {
     // An OOM is not a script-level rejection: name the real cause (C-03).
     if is_oom_reason(ctx, reason) {
         report_microtask_overflow(ctx, 0);
+        return;
+    }
+    // C-01: if user registered process.on('unhandledRejection', ...), dispatch to it
+    if process_dispatch_unhandled_rejection(ctx, reason, promise) != 0 {
         return;
     }
     // SAFETY: str_v is live; freed below.
@@ -448,7 +459,7 @@ unsafe extern "C" fn rejection_tracker(
         evicted
     });
     if let Some(old) = evicted {
-        print_rejection(ctx, old.reason);
+        print_rejection(ctx, old.reason, old.promise);
         qjs::sofuu_js_free_value(ctx, old.promise);
         qjs::sofuu_js_free_value(ctx, old.reason);
     }
@@ -478,22 +489,23 @@ pub unsafe extern "C" fn sofuu_rt_install_rejection_tracker(rt: *mut JSRuntime) 
 /// `ctx` must be the live runtime context.
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_report_pending_rejections(ctx: *mut JSContext) {
-    let drained: Vec<JSValue> = PENDING.with(|p| {
+    let drained: Vec<(JSValue, JSValue)> = PENDING.with(|p| {
         let mut pending = p.borrow_mut();
-        let mut reasons = Vec::new();
+        let mut items = Vec::new();
         for r in pending.drain(..) {
             if !r.reported {
-                reasons.push(r.reason);
+                items.push((r.reason, r.promise));
             } else {
                 qjs::sofuu_js_free_value(ctx, r.reason);
+                qjs::sofuu_js_free_value(ctx, r.promise);
             }
-            qjs::sofuu_js_free_value(ctx, r.promise);
         }
-        reasons
+        items
     });
-    for reason in drained {
-        print_rejection(ctx, reason);
+    for (reason, promise) in drained {
+        print_rejection(ctx, reason, promise);
         qjs::sofuu_js_free_value(ctx, reason);
+        qjs::sofuu_js_free_value(ctx, promise);
     }
 }
 

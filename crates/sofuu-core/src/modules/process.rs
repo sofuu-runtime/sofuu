@@ -290,6 +290,49 @@ pub unsafe extern "C" fn process_dispatch_uncaught(ctx: *mut JSContext, exc: JSV
     1
 }
 
+/// # Safety
+/// `ctx` live; `reason` and `promise` live values (ownership stays with the caller).
+#[no_mangle]
+pub unsafe extern "C" fn process_dispatch_unhandled_rejection(
+    ctx: *mut JSContext,
+    reason: JSValueConst,
+    promise: JSValueConst,
+) -> c_int {
+    let cb = get_process_cb(ctx, "__unhandled_rejection_handler");
+    let handled = qjs::JS_IsFunction(ctx, cb);
+    if handled == 0 {
+        qjs::sofuu_js_free_value(ctx, cb);
+        return 0;
+    }
+    let args = [
+        qjs::sofuu_js_dup_value(ctx, reason),
+        qjs::sofuu_js_dup_value(ctx, promise),
+    ];
+    let ret = qjs::JS_Call(ctx, cb, qjs::sofuu_js_undefined(), 2, args.as_ptr());
+    qjs::sofuu_js_free_value(ctx, args[0]);
+    qjs::sofuu_js_free_value(ctx, args[1]);
+    if qjs::is_exception(ret) {
+        let e2 = qjs::sofuu_js_get_exception(ctx);
+        let msg_v = qjs::JS_ToString(ctx, e2);
+        let s = qjs::sofuu_js_to_cstring(ctx, msg_v);
+        let msg = if s.is_null() {
+            "?".to_string()
+        } else {
+            CStr::from_ptr(s).to_string_lossy().into_owned()
+        };
+        eprintln!("[sofuu] Error in unhandledRejection handler: {}", msg);
+        if !s.is_null() {
+            qjs::sofuu_js_free_cstring(ctx, s);
+        }
+        qjs::sofuu_js_free_value(ctx, msg_v);
+        qjs::sofuu_js_free_value(ctx, e2);
+    }
+    qjs::sofuu_js_free_value(ctx, ret);
+    qjs::sofuu_js_free_value(ctx, cb);
+    sofuu_flush_jobs(ctx);
+    1
+}
+
 /// Invoke a no-arg UI hook global (e.g. __on_esc / __on_ctrl_c registered
 /// by the chat driver). No-op when the hook doesn't exist. Does NOT flush
 /// jobs — we may be inside a libuv read callback; the loop pumps.
@@ -3666,7 +3709,7 @@ unsafe extern "C" fn js_process_on(
             set_process_cb(ctx, "__uncaught_handler", qjs::sofuu_js_dup_value(ctx, *argv.add(1)));
         }
         "unhandledRejection" => {
-            /* Acknowledged — the M1 rejection tracker handles this. */
+            set_process_cb(ctx, "__unhandled_rejection_handler", qjs::sofuu_js_dup_value(ctx, *argv.add(1)));
         }
         _ => { /* silently ignore unknown events */ }
     }
@@ -3695,6 +3738,7 @@ unsafe extern "C" fn js_process_off(
         "SIGTERM" => set_process_cb(ctx, "__sigterm_handler", qjs::sofuu_js_undefined()),
         "exit" => set_process_cb(ctx, "__exit_handler", qjs::sofuu_js_undefined()),
         "uncaughtException" => set_process_cb(ctx, "__uncaught_handler", qjs::sofuu_js_undefined()),
+        "unhandledRejection" => set_process_cb(ctx, "__unhandled_rejection_handler", qjs::sofuu_js_undefined()),
         _ => {}
     }
 

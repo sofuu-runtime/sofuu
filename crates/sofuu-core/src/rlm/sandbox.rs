@@ -27,7 +27,15 @@ use sofuu_ffi::qjs_rt::{QjsSandbox, RawOutcome, SandboxEvent, SandboxState};
 
 use super::ToolCall;
 
-const BOOTSTRAP: &str = include_str!("../../js/rlm_bootstrap.js");
+const BOOTSTRAP_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rlm_bootstrap.js.gz"));
+
+fn get_bootstrap() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        crate::shipped::inflate_gz(BOOTSTRAP_GZ, "rlm_bootstrap.js")
+            .unwrap_or_default()
+    }).clone()
+}
 
 /// Characters of overlap between consecutive chunks (PLAN-RLM R1.4).
 const CHUNK_OVERLAP_CHARS: usize = 200;
@@ -79,7 +87,8 @@ impl Sandbox {
         let qjs = QjsSandbox::new(id, mem_limit_bytes, stack_bytes, deadline, state_ptr)
             .ok_or_else(|| "failed to create QuickJS sandbox".to_string())?;
         let sb = Sandbox { qjs, state, watermark: 0, last_snippet: None };
-        match sb.qjs.eval(BOOTSTRAP) {
+        let bootstrap = get_bootstrap();
+        match sb.qjs.eval(&bootstrap) {
             RawOutcome::Value(_) => Ok(sb),
             RawOutcome::Exception(e) => Err(format!(
                 "sandbox bootstrap failed: {}",

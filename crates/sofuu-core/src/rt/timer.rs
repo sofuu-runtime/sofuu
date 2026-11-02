@@ -39,7 +39,7 @@ struct Timer {
     async_context: JSValue,
 }
 
-const MAX_TIMERS: usize = 1024;
+const MAX_TIMERS: usize = 65536;
 
 thread_local! {
     /// Registry of active timers (linear scan, exactly like the C array).

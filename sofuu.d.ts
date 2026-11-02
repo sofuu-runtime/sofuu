@@ -167,6 +167,8 @@ export interface ZodType<Output = unknown, Def extends ZodTypeDef = ZodTypeDef, 
   /** The value used when the key is absent (`.default(v)`). */
   _default?: Output;
   safeParse(value: unknown): ZodSafeParseResult<Output>;
+  parse(value: unknown): Output;
+  toJSONSchema(): JSONSchema;
   describe(text: string): this;
   optional(): ZodOptional<this>;
   /**
@@ -191,18 +193,26 @@ export interface ZodOptional<T extends ZodTypeAny> extends ZodType<Infer<T> | un
   readonly _optional: true;
 }
 
-export interface ZodString extends ZodType<string, ZodTypeDef, string> {}
+export interface ZodString extends ZodType<string, ZodTypeDef, string> {
+  min(length: number): ZodString;
+  max(length: number): ZodString;
+}
 
 export interface ZodNumber extends ZodType<number, ZodTypeDef, number> {
   /** Switches the JSON Schema type to integer and enforces it on parse. */
   int(): ZodNumber;
   /** Sets minimum = 1 and rejects values <= 0. */
   positive(): ZodNumber;
+  min(value: number): ZodNumber;
+  max(value: number): ZodNumber;
 }
 
 export interface ZodBoolean extends ZodType<boolean, ZodTypeDef, boolean> {}
 
-export interface ZodArray<T extends ZodTypeAny> extends ZodType<Array<Infer<T>>, ZodTypeDef, Array<Infer<T>>> {}
+export interface ZodArray<T extends ZodTypeAny> extends ZodType<Array<Infer<T>>, ZodTypeDef, Array<Infer<T>>> {
+  min(count: number): ZodArray<T>;
+  max(count: number): ZodArray<T>;
+}
 
 export interface ZodEnum<Values extends string = string> extends ZodType<Values, ZodTypeDef, Values> {
   /** The accepted string values, exactly as passed to z.enum(). */
@@ -213,7 +223,7 @@ export interface ZodLiteral<T extends string | number | boolean> extends ZodType
 
 export interface ZodAny extends ZodType<unknown, ZodTypeDef, unknown> {}
 
-export interface ZodRecord extends ZodType<Record<string, unknown>, ZodTypeDef, Record<string, unknown>> {}
+export interface ZodRecord<T extends ZodTypeAny = ZodAny> extends ZodType<Record<string, Infer<T>>, ZodTypeDef, Record<string, Infer<T>>> {}
 
 /** The shape argument of z.object({...}). */
 export type ZodRawShape = Record<string, ZodTypeAny>;
@@ -228,6 +238,9 @@ export interface ZodObject<Shape extends ZodRawShape = ZodRawShape>
   readonly properties: Record<string, JSONSchema>;
   readonly required: string[];
   parse(value: unknown): InferObject<Shape>;
+  extend<Extra extends ZodRawShape>(extra: Extra): ZodObject<Shape & Extra>;
+  pick<Keys extends keyof Shape>(keys: Record<Keys, true>): ZodObject<Pick<Shape, Keys>>;
+  omit<Keys extends keyof Shape>(keys: Record<Keys, true>): ZodObject<Omit<Shape, Keys>>;
 }
 
 /** Keys whose schema is an optional(): omitted from the required list. */
@@ -257,11 +270,12 @@ export interface MicroZod {
   string(): ZodString;
   number(): ZodNumber;
   boolean(): ZodBoolean;
-  array<T extends ZodTypeAny>(item: T): ZodArray<T>;
+  array<T extends ZodTypeAny>(item?: T): ZodArray<T>;
   enum<Values extends string>(values: ReadonlyArray<Values>): ZodEnum<Values>;
   literal<T extends string | number | boolean>(expected: T): ZodLiteral<T>;
   any(): ZodAny;
-  record(): ZodRecord;
+  record<T extends ZodTypeAny = ZodAny>(valueType?: T): ZodRecord<T>;
+  record<TKey extends ZodTypeAny, TVal extends ZodTypeAny>(keyType: TKey, valueType: TVal): ZodRecord<TVal>;
   object<Shape extends ZodRawShape>(shape: Shape): ZodObject<Shape>;
 }
 
@@ -429,6 +443,53 @@ export interface Tool<TSchema extends ZodTypeAny = ZodTypeAny, TOutput = unknown
   run(args: Infer<TSchema>, ctx?: ToolContextOverrides): Promise<ToolResult<TOutput>>;
   /** Same function as run. */
   execute(args: Infer<TSchema>, ctx?: ToolContextOverrides): Promise<ToolResult<TOutput>>;
+
+  /** Exports standard JSON Schema (draft-07) definition. */
+  toJSONSchema(): ToolJSONSchema;
+  /** Exports OpenAI Function Calling format. */
+  toOpenAI(): OpenAIToolSpec;
+  /** Exports Anthropic Claude Tool Specification format. */
+  toAnthropic(): AnthropicToolSpec;
+  /** Exports Model Context Protocol (MCP) Tool Schema format. */
+  toMCP(): MCPToolSpec;
+
+  readonly openAIFunction: OpenAIToolSpec;
+  readonly anthropicTool: AnthropicToolSpec;
+  readonly mcpTool: MCPToolSpec;
+  readonly inputSchema: JSONSchema;
+  readonly input_schema: JSONSchema;
+}
+
+/** JSON Schema (draft-07) tool definition. */
+export interface ToolJSONSchema {
+  $schema?: string;
+  name: string;
+  description: string;
+  parameters: JSONSchema;
+}
+
+/** OpenAI Function Definition format. */
+export interface OpenAIToolSpec {
+  type: 'function';
+  function: {
+    name: string;
+    description: string;
+    parameters: JSONSchema;
+  };
+}
+
+/** Anthropic Claude Tool Specification format. */
+export interface AnthropicToolSpec {
+  name: string;
+  description: string;
+  input_schema: JSONSchema;
+}
+
+/** Model Context Protocol (MCP) Tool Schema format. */
+export interface MCPToolSpec {
+  name: string;
+  description: string;
+  inputSchema: JSONSchema;
 }
 
 /* ================================================================== 
@@ -851,6 +912,7 @@ export interface SofuuTools {
   VERSION?: string;
   list?(): ToolDescriptor[];
   describe?(name: string): unknown;
+  define<TSchema extends ZodTypeAny, TOutput = unknown>(spec: ToolSpec<TSchema, TOutput>): Tool<TSchema, TOutput>;
   validateArgs?(schema: JSONSchema, args: unknown): ValidateArgsResult;
   execute?(name: string, args: unknown, options?: unknown): Promise<unknown>;
   /** Normalises an MCP tool result into the agent text/data envelope. */
@@ -1474,6 +1536,8 @@ export interface SofuuRuntime {
   plugins: SofuuPlugins;
   ai: SofuuAi;
   tools: SofuuTools;
+  z: MicroZod;
+  defineTool: SofuuSdk['defineTool'];
   memory: SofuuMemory;
   /** Present when the MCP driver is loaded. */
   mcp?: SofuuMcp;

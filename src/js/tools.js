@@ -28,6 +28,18 @@
   sofuu.tools = sofuu.tools || {};
   if (sofuu.tools._loaded) return;
 
+  if (typeof sofuu.tools.define !== 'function') {
+    sofuu.tools.define = function (spec) {
+      if (sofuu.plugins && typeof sofuu.plugins.defineTool === 'function') {
+        return sofuu.plugins.defineTool(spec);
+      }
+      if (typeof globalThis.defineTool === 'function') {
+        return globalThis.defineTool(spec);
+      }
+      throw new Error('defineTool is not available');
+    };
+  }
+
   var READ_CAP_CHARS = 60000;
   var GREP_MAX_FILES = 1500;
   var GREP_MAX_MATCHES = 50;
@@ -2379,6 +2391,24 @@
         if (schemaTypeOk(v, types[ti])) { okT = true; break; }
       }
       if (!okT) return { path: path || '$', error: 'must be ' + types.join('|') };
+    }
+    if (typeof schema.minimum === 'number' && typeof v === 'number' && v < schema.minimum) {
+      return { path: path || '$', error: 'must be >= ' + schema.minimum };
+    }
+    if (typeof schema.maximum === 'number' && typeof v === 'number' && v > schema.maximum) {
+      return { path: path || '$', error: 'must be <= ' + schema.maximum };
+    }
+    if (typeof schema.minLength === 'number' && typeof v === 'string' && v.length < schema.minLength) {
+      return { path: path || '$', error: 'must have at least ' + schema.minLength + ' characters' };
+    }
+    if (typeof schema.maxLength === 'number' && typeof v === 'string' && v.length > schema.maxLength) {
+      return { path: path || '$', error: 'must have at most ' + schema.maxLength + ' characters' };
+    }
+    if (typeof schema.minItems === 'number' && Array.isArray(v) && v.length < schema.minItems) {
+      return { path: path || '$', error: 'must have at least ' + schema.minItems + ' items' };
+    }
+    if (typeof schema.maxItems === 'number' && Array.isArray(v) && v.length > schema.maxItems) {
+      return { path: path || '$', error: 'must have at most ' + schema.maxItems + ' items' };
     }
     if (v && typeof v === 'object' && !Array.isArray(v)) {
       var req = Array.isArray(schema.required) ? schema.required : [];

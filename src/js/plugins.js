@@ -201,11 +201,22 @@
     if (node.type) out.type = node.type;
     if (Array.isArray(node.enum)) out.enum = node.enum.slice();
     if (node.description) out.description = node.description;
-    if (node.minimum !== undefined && typeof node.minimum !== 'function') out.minimum = node.minimum;
-    if (node.maximum !== undefined && typeof node.maximum !== 'function') out.maximum = node.maximum;
+    if (typeof node.minimum === 'number') out.minimum = node.minimum;
+    else if (node.minimum !== undefined && typeof node.minimum !== 'function') out.minimum = node.minimum;
+    if (typeof node.maximum === 'number') out.maximum = node.maximum;
+    else if (node.maximum !== undefined && typeof node.maximum !== 'function') out.maximum = node.maximum;
+    if (typeof node.minLength === 'number') out.minLength = node.minLength;
+    if (typeof node.maxLength === 'number') out.maxLength = node.maxLength;
+    if (typeof node.minItems === 'number') out.minItems = node.minItems;
+    if (typeof node.maxItems === 'number') out.maxItems = node.maxItems;
     if (node._default !== undefined) out.default = node._default;
     else if (node.default !== undefined && typeof node.default !== 'function') out.default = node.default;
     if (node.items) out.items = zodNodeToJSON(node.items);
+    if (node.additionalProperties) {
+      out.additionalProperties = (typeof node.additionalProperties === 'object')
+        ? zodNodeToJSON(node.additionalProperties)
+        : node.additionalProperties;
+    }
     if (node.properties && typeof node.properties === 'object') {
       out.properties = {};
       for (var k in node.properties) {
@@ -280,6 +291,24 @@
       var tm = typeMismatch(schema, data, path);
       if (!tm.ok) return tm;
     }
+    if (typeof schema.minimum === 'number' && typeof data === 'number' && data < schema.minimum) {
+      return { ok: false, path: path, error: 'Value must be >= ' + schema.minimum };
+    }
+    if (typeof schema.maximum === 'number' && typeof data === 'number' && data > schema.maximum) {
+      return { ok: false, path: path, error: 'Value must be <= ' + schema.maximum };
+    }
+    if (typeof schema.minLength === 'number' && typeof data === 'string' && data.length < schema.minLength) {
+      return { ok: false, path: path, error: 'String length must be >= ' + schema.minLength };
+    }
+    if (typeof schema.maxLength === 'number' && typeof data === 'string' && data.length > schema.maxLength) {
+      return { ok: false, path: path, error: 'String length must be <= ' + schema.maxLength };
+    }
+    if (typeof schema.minItems === 'number' && Array.isArray(data) && data.length < schema.minItems) {
+      return { ok: false, path: path, error: 'Array length must be >= ' + schema.minItems };
+    }
+    if (typeof schema.maxItems === 'number' && Array.isArray(data) && data.length > schema.maxItems) {
+      return { ok: false, path: path, error: 'Array length must be <= ' + schema.maxItems };
+    }
     if (schema.type === 'object' && data && typeof data === 'object' && !Array.isArray(data)) {
       var required = schema.required || [];
       for (var i = 0; i < required.length; i++) {
@@ -305,6 +334,20 @@
     return { ok: true };
   }
 
+  function schemaParse(val) {
+    var r = this.safeParse(val);
+    if (!r.success) {
+      var err = makeError('E_SCHEMA', r.error.message, r.error);
+      if (r.error.path) err.path = r.error.path;
+      throw err;
+    }
+    return r.data;
+  }
+
+  function schemaToJSONSchema() {
+    return zodToJSONSchema(this);
+  }
+
   var microZod = {
     string: function () {
       return {
@@ -312,12 +355,20 @@
         type: 'string',
         describe: function (d) { this.description = d; return this; },
         optional: function () { this.isOptional = true; return this; },
-        /* PLAN §2 Cat 1 uses z.enum([...]).default('celsius'): a missing key
-         * must fall back to the default instead of failing validation. */
         default: function (v) { this._default = v; this.isOptional = true; return this; },
+        min: function (n) { this.minLength = n; return this; },
+        max: function (n) { this.maxLength = n; return this; },
+        toJSONSchema: schemaToJSONSchema,
+        parse: schemaParse,
         safeParse: function (val) {
-          if (val === undefined && this.isOptional) return { success: true, data: val };
-          if (typeof val !== 'string') return { success: false, error: { message: 'Expected string, received ' + typeof val } };
+          if (val === undefined && this.isOptional) return { success: true, data: this._default !== undefined ? this._default : val };
+          if (typeof val !== 'string') return { success: false, error: { message: 'Expected string, received ' + typeof val, path: [] } };
+          if (typeof this.minLength === 'number' && val.length < this.minLength) {
+            return { success: false, error: { message: 'String must contain at least ' + this.minLength + ' character(s)', path: [] } };
+          }
+          if (typeof this.maxLength === 'number' && val.length > this.maxLength) {
+            return { success: false, error: { message: 'String must contain at most ' + this.maxLength + ' character(s)', path: [] } };
+          }
           return { success: true, data: val };
         }
       };
@@ -330,14 +381,22 @@
         positive: function () { this.minimum = 1; this.isPositive = true; return this; },
         describe: function (d) { this.description = d; return this; },
         optional: function () { this.isOptional = true; return this; },
-        /* PLAN §2 Cat 1 uses z.enum([...]).default('celsius'): a missing key
-         * must fall back to the default instead of failing validation. */
         default: function (v) { this._default = v; this.isOptional = true; return this; },
+        min: function (n) { this.minimum = n; return this; },
+        max: function (n) { this.maximum = n; return this; },
+        toJSONSchema: schemaToJSONSchema,
+        parse: schemaParse,
         safeParse: function (val) {
-          if (val === undefined && this.isOptional) return { success: true, data: val };
-          if (typeof val !== 'number' || isNaN(val)) return { success: false, error: { message: 'Expected number, received ' + typeof val } };
-          if (this.isInt && !Number.isInteger(val)) return { success: false, error: { message: 'Expected integer, received float' } };
-          if (this.isPositive && val <= 0) return { success: false, error: { message: 'Number must be positive' } };
+          if (val === undefined && this.isOptional) return { success: true, data: this._default !== undefined ? this._default : val };
+          if (typeof val !== 'number' || isNaN(val)) return { success: false, error: { message: 'Expected number, received ' + typeof val, path: [] } };
+          if (this.isInt && !Number.isInteger(val)) return { success: false, error: { message: 'Expected integer, received float', path: [] } };
+          if (this.isPositive && val <= 0) return { success: false, error: { message: 'Number must be positive', path: [] } };
+          if (typeof this.minimum === 'number' && val < this.minimum) {
+            return { success: false, error: { message: 'Number must be greater than or equal to ' + this.minimum, path: [] } };
+          }
+          if (typeof this.maximum === 'number' && val > this.maximum) {
+            return { success: false, error: { message: 'Number must be less than or equal to ' + this.maximum, path: [] } };
+          }
           return { success: true, data: val };
         }
       };
@@ -348,12 +407,12 @@
         type: 'boolean',
         describe: function (d) { this.description = d; return this; },
         optional: function () { this.isOptional = true; return this; },
-        /* PLAN §2 Cat 1 uses z.enum([...]).default('celsius'): a missing key
-         * must fall back to the default instead of failing validation. */
         default: function (v) { this._default = v; this.isOptional = true; return this; },
+        toJSONSchema: schemaToJSONSchema,
+        parse: schemaParse,
         safeParse: function (val) {
-          if (val === undefined && this.isOptional) return { success: true, data: val };
-          if (typeof val !== 'boolean') return { success: false, error: { message: 'Expected boolean, received ' + typeof val } };
+          if (val === undefined && this.isOptional) return { success: true, data: this._default !== undefined ? this._default : val };
+          if (typeof val !== 'boolean') return { success: false, error: { message: 'Expected boolean, received ' + typeof val, path: [] } };
           return { success: true, data: val };
         }
       };
@@ -362,23 +421,35 @@
       return {
         _isJSONSchema: true,
         type: 'array',
-        items: zodToJSONSchema(item),
+        items: item ? zodToJSONSchema(item) : undefined,
         itemSchema: item,
         describe: function (d) { this.description = d; return this; },
         optional: function () { this.isOptional = true; return this; },
-        /* PLAN §2 Cat 1 uses z.enum([...]).default('celsius'): a missing key
-         * must fall back to the default instead of failing validation. */
         default: function (v) { this._default = v; this.isOptional = true; return this; },
+        min: function (n) { this.minItems = n; return this; },
+        max: function (n) { this.maxItems = n; return this; },
+        toJSONSchema: schemaToJSONSchema,
+        parse: schemaParse,
         safeParse: function (val) {
-          if (val === undefined && this.isOptional) return { success: true, data: val };
-          if (!Array.isArray(val)) return { success: false, error: { message: 'Expected array, received ' + typeof val } };
+          if (val === undefined && this.isOptional) return { success: true, data: this._default !== undefined ? this._default : val };
+          if (!Array.isArray(val)) return { success: false, error: { message: 'Expected array, received ' + typeof val, path: [] } };
+          if (typeof this.minItems === 'number' && val.length < this.minItems) {
+            return { success: false, error: { message: 'Array must contain at least ' + this.minItems + ' element(s)', path: [] } };
+          }
+          if (typeof this.maxItems === 'number' && val.length > this.maxItems) {
+            return { success: false, error: { message: 'Array must contain at most ' + this.maxItems + ' element(s)', path: [] } };
+          }
+          var out = [];
           if (this.itemSchema && typeof this.itemSchema.safeParse === 'function') {
             for (var i = 0; i < val.length; i++) {
               var r = this.itemSchema.safeParse(val[i]);
               if (!r.success) return { success: false, error: { message: r.error.message, path: [i].concat(r.error.path || []) } };
+              out.push(r.data !== undefined ? r.data : val[i]);
             }
+          } else {
+            out = val.slice();
           }
-          return { success: true, data: val };
+          return { success: true, data: out };
         }
       };
     },
@@ -389,13 +460,13 @@
         enum: Array.isArray(values) ? values : [],
         describe: function (d) { this.description = d; return this; },
         optional: function () { this.isOptional = true; return this; },
-        /* PLAN §2 Cat 1 uses z.enum([...]).default('celsius'): a missing key
-         * must fall back to the default instead of failing validation. */
         default: function (v) { this._default = v; this.isOptional = true; return this; },
+        toJSONSchema: schemaToJSONSchema,
+        parse: schemaParse,
         safeParse: function (val) {
-          if (val === undefined && this.isOptional) return { success: true, data: val };
+          if (val === undefined && this.isOptional) return { success: true, data: this._default !== undefined ? this._default : val };
           if (typeof val !== 'string' || this.enum.indexOf(val) < 0) {
-            return { success: false, error: { message: 'Expected one of ' + JSON.stringify(this.enum) + ', received ' + JSON.stringify(val) } };
+            return { success: false, error: { message: 'Expected one of ' + JSON.stringify(this.enum) + ', received ' + JSON.stringify(val), path: [] } };
           }
           return { success: true, data: val };
         }
@@ -407,25 +478,47 @@
         type: 'any',
         describe: function (d) { this.description = d; return this; },
         optional: function () { this.isOptional = true; return this; },
-        /* PLAN §2 Cat 1 uses z.enum([...]).default('celsius'): a missing key
-         * must fall back to the default instead of failing validation. */
         default: function (v) { this._default = v; this.isOptional = true; return this; },
-        safeParse: function (val) { return { success: true, data: val }; }
+        toJSONSchema: schemaToJSONSchema,
+        parse: schemaParse,
+        safeParse: function (val) {
+          if (val === undefined && this.isOptional) return { success: true, data: this._default !== undefined ? this._default : val };
+          return { success: true, data: val };
+        }
       };
     },
-    record: function () {
+    record: function (keyOrVal, valSchema) {
+      var item = valSchema || keyOrVal;
       return {
         _isJSONSchema: true,
         type: 'object',
+        itemSchema: item,
+        additionalProperties: item ? zodToJSONSchema(item) : true,
         describe: function (d) { this.description = d; return this; },
         optional: function () { this.isOptional = true; return this; },
-        /* PLAN §2 Cat 1 uses z.enum([...]).default('celsius'): a missing key
-         * must fall back to the default instead of failing validation. */
         default: function (v) { this._default = v; this.isOptional = true; return this; },
+        toJSONSchema: schemaToJSONSchema,
+        parse: schemaParse,
         safeParse: function (val) {
-          if (val === undefined && this.isOptional) return { success: true, data: val };
-          if (!val || typeof val !== 'object' || Array.isArray(val)) return { success: false, error: { message: 'Expected record object' } };
-          return { success: true, data: val };
+          if (val === undefined && this.isOptional) return { success: true, data: this._default !== undefined ? this._default : val };
+          if (!val || typeof val !== 'object' || Array.isArray(val)) return { success: false, error: { message: 'Expected record object', path: [] } };
+          var out = {};
+          if (this.itemSchema && typeof this.itemSchema.safeParse === 'function') {
+            for (var k in val) {
+              if (Object.prototype.hasOwnProperty.call(val, k)) {
+                var r = this.itemSchema.safeParse(val[k]);
+                if (!r.success) {
+                  return { success: false, error: { message: 'Invalid value for ' + k + ': ' + r.error.message, path: [k].concat(r.error.path || []) } };
+                }
+                out[k] = r.data !== undefined ? r.data : val[k];
+              }
+            }
+          } else {
+            for (var ck in val) {
+              if (Object.prototype.hasOwnProperty.call(val, ck)) out[ck] = val[ck];
+            }
+          }
+          return { success: true, data: out };
         }
       };
     },
@@ -433,14 +526,15 @@
       return {
         _isJSONSchema: true,
         type: typeof expected,
+        expected: expected,
         describe: function (d) { this.description = d; return this; },
         optional: function () { this.isOptional = true; return this; },
-        /* PLAN §2 Cat 1 uses z.enum([...]).default('celsius'): a missing key
-         * must fall back to the default instead of failing validation. */
         default: function (v) { this._default = v; this.isOptional = true; return this; },
+        toJSONSchema: schemaToJSONSchema,
+        parse: schemaParse,
         safeParse: function (val) {
-          if (val === undefined && this.isOptional) return { success: true, data: val };
-          if (val !== expected) return { success: false, error: { message: 'Expected literal ' + JSON.stringify(expected) } };
+          if (val === undefined && this.isOptional) return { success: true, data: this._default !== undefined ? this._default : val };
+          if (val !== expected) return { success: false, error: { message: 'Expected literal ' + JSON.stringify(expected), path: [] } };
           return { success: true, data: val };
         }
       };
@@ -463,7 +557,31 @@
         required: required,
         shape: shape,
         describe: function (d) { this.description = d; return this; },
+        optional: function () { this.isOptional = true; return this; },
+        default: function (v) { this._default = v; this.isOptional = true; return this; },
+        toJSONSchema: schemaToJSONSchema,
+        extend: function (extra) {
+          var merged = {};
+          for (var sk in shape) { if (Object.prototype.hasOwnProperty.call(shape, sk)) merged[sk] = shape[sk]; }
+          for (var ek in extra) { if (Object.prototype.hasOwnProperty.call(extra, ek)) merged[ek] = extra[ek]; }
+          return microZod.object(merged);
+        },
+        pick: function (keys) {
+          var picked = {};
+          for (var pk in keys) {
+            if (Object.prototype.hasOwnProperty.call(keys, pk) && shape[pk]) picked[pk] = shape[pk];
+          }
+          return microZod.object(picked);
+        },
+        omit: function (keys) {
+          var kept = {};
+          for (var ok in shape) {
+            if (Object.prototype.hasOwnProperty.call(shape, ok) && !keys[ok]) kept[ok] = shape[ok];
+          }
+          return microZod.object(kept);
+        },
         safeParse: function (val) {
+          if (val === undefined && this.isOptional) return { success: true, data: this._default !== undefined ? this._default : val };
           if (!val || typeof val !== 'object' || Array.isArray(val)) {
             return { success: false, error: { message: 'Expected object, received ' + typeof val, path: [] } };
           }
@@ -494,22 +612,22 @@
                     var innerPath = [propKey].concat(res.error.path || []);
                     return { success: false, error: { message: 'Invalid value for ' + propKey + ': ' + res.error.message, path: innerPath } };
                   }
+                  if (res.data !== undefined) out[propKey] = res.data;
                 }
               }
             }
           }
           return { success: true, data: out };
         },
-        parse: function (val) {
-          var r = this.safeParse(val);
-          if (!r.success) throw makeError('E_SCHEMA', r.error.message, r.error);
-          return r.data;
-        }
+        parse: schemaParse
       };
     }
   };
   P.z = microZod;
-  g.z = g.z || microZod;
+  g.z = microZod;
+  if (typeof sofuu !== 'undefined' && sofuu) {
+    sofuu.z = microZod;
+  }
 
   /* ── Shield 1 helpers (shared by tools and providers) ─────────────── */
 
@@ -1251,9 +1369,54 @@
       return res;
     };
     wrappedTool.run = wrappedTool.execute;
+
+    wrappedTool.toJSONSchema = function () {
+      return {
+        $schema: 'http://json-schema.org/draft-07/schema#',
+        name: wrappedTool.name,
+        description: wrappedTool.description,
+        parameters: jsonSchema
+      };
+    };
+
+    wrappedTool.toOpenAI = function () {
+      return {
+        type: 'function',
+        function: {
+          name: wrappedTool.name,
+          description: wrappedTool.description,
+          parameters: jsonSchema
+        }
+      };
+    };
+
+    wrappedTool.toAnthropic = function () {
+      return {
+        name: wrappedTool.name,
+        description: wrappedTool.description,
+        input_schema: jsonSchema
+      };
+    };
+
+    wrappedTool.toMCP = function () {
+      return {
+        name: wrappedTool.name,
+        description: wrappedTool.description,
+        inputSchema: jsonSchema
+      };
+    };
+
+    wrappedTool.openAIFunction = wrappedTool.toOpenAI();
+    wrappedTool.anthropicTool = wrappedTool.toAnthropic();
+    wrappedTool.mcpTool = wrappedTool.toMCP();
+    wrappedTool.inputSchema = jsonSchema;
+    wrappedTool.input_schema = jsonSchema;
+
     P.TOOLS[name] = wrappedTool;
 
-    if (sofuu.tools) {
+    if (typeof sofuu !== 'undefined' && sofuu) {
+      sofuu.tools = sofuu.tools || {};
+      sofuu.tools.define = P.defineTool;
       if (!sofuu.tools.TOOLS) sofuu.tools.TOOLS = {};
       sofuu.tools.TOOLS[name] = {
         name: name,
@@ -3634,14 +3797,177 @@
     }
   };
 
+  var OFFICIAL_PLUGINS = {
+    llamacpp: {
+      file: 'llamacpp_provider.ts',
+      content: function () {
+        return "import { defineProvider } from 'sofuu';\n\
+export default defineProvider({\n\
+  name: 'llamacpp',\n\
+  kind: 'llamacpp',\n\
+  baseUrl: (typeof process !== 'undefined' && process.env && process.env.LLAMACPP_HOST) || 'http://127.0.0.1:8080',\n\
+  model: 'default',\n\
+  description: 'Production llama.cpp inference bridge (/v1/chat/completions)',\n\
+  async complete(req, ctx) {\n\
+    var msgs = req.messages || (req.prompt ? [{ role: 'user', content: req.prompt }] : []);\n\
+    if (req.system) msgs = [{ role: 'system', content: req.system }].concat(msgs);\n\
+    var res = await ctx.fetch((this.baseUrl || 'http://127.0.0.1:8080') + '/v1/chat/completions', {\n\
+      method: 'POST',\n\
+      headers: { 'content-type': 'application/json' },\n\
+      body: JSON.stringify({ model: req.model || this.model, messages: msgs, stream: false, temperature: req.temperature, max_tokens: req.maxTokens })\n\
+    });\n\
+    if (!res || !res.ok) throw new Error('llama.cpp HTTP ' + (res ? res.status : 0));\n\
+    var d = await res.json();\n\
+    var c = (d.choices && d.choices[0]) || {};\n\
+    var m = c.message || {};\n\
+    return { text: m.content || '', model: d.model || req.model, finishReason: c.finish_reason };\n\
+  },\n\
+  async stream(req, ctx, onEvent) {\n\
+    var msgs = req.messages || (req.prompt ? [{ role: 'user', content: req.prompt }] : []);\n\
+    if (req.system) msgs = [{ role: 'system', content: req.system }].concat(msgs);\n\
+    var res = await ctx.fetch((this.baseUrl || 'http://127.0.0.1:8080') + '/v1/chat/completions', {\n\
+      method: 'POST',\n\
+      headers: { 'content-type': 'application/json' },\n\
+      body: JSON.stringify({ model: req.model || this.model, messages: msgs, stream: true })\n\
+    });\n\
+    if (!res || !res.ok) throw new Error('llama.cpp HTTP ' + (res ? res.status : 0));\n\
+    var text = await res.text();\n\
+    var lines = (text || '').split('\\n');\n\
+    var acc = { text: '' };\n\
+    for (var i = 0; i < lines.length; i++) {\n\
+      var l = lines[i].trim();\n\
+      if (!l.startsWith('data:') || l.slice(5).trim() === '[DONE]') continue;\n\
+      try {\n\
+        var ch = JSON.parse(l.slice(5).trim());\n\
+        var d = (ch.choices && ch.choices[0] && ch.choices[0].delta) || {};\n\
+        if (d.content) { acc.text += d.content; onEvent({ type: 'text', text: d.content }); }\n\
+      } catch (e) {}\n\
+    }\n\
+    onEvent({ type: 'done' });\n\
+    return acc;\n\
+  },\n\
+  async health() {\n\
+    try { var r = await fetch((this.baseUrl || 'http://127.0.0.1:8080') + '/health'); return { ok: Boolean(r && r.ok) }; }\n\
+    catch (e) { return { ok: false, error: String(e) }; }\n\
+  }\n\
+});\n";
+      }
+    },
+    ollama: {
+      file: 'ollama_provider.ts',
+      content: function () {
+        return "import { defineProvider } from 'sofuu';\n\
+export default defineProvider({\n\
+  name: 'ollama',\n\
+  kind: 'ollama',\n\
+  baseUrl: (typeof process !== 'undefined' && process.env && process.env.OLLAMA_HOST) || 'http://127.0.0.1:11434',\n\
+  model: 'llama3.2',\n\
+  description: 'Local Ollama bridge (/api/chat)',\n\
+  async complete(req, ctx) {\n\
+    var msgs = req.messages || (req.prompt ? [{ role: 'user', content: req.prompt }] : []);\n\
+    if (req.system) msgs = [{ role: 'system', content: req.system }].concat(msgs);\n\
+    var res = await ctx.fetch((this.baseUrl || 'http://127.0.0.1:11434') + '/api/chat', {\n\
+      method: 'POST',\n\
+      headers: { 'content-type': 'application/json' },\n\
+      body: JSON.stringify({ model: req.model || this.model, messages: msgs, stream: false })\n\
+    });\n\
+    if (!res || !res.ok) throw new Error('Ollama HTTP ' + (res ? res.status : 0));\n\
+    var d = await res.json();\n\
+    return { text: (d.message && d.message.content) || '', model: d.model || req.model };\n\
+  },\n\
+  async stream(req, ctx, onEvent) {\n\
+    var msgs = req.messages || (req.prompt ? [{ role: 'user', content: req.prompt }] : []);\n\
+    if (req.system) msgs = [{ role: 'system', content: req.system }].concat(msgs);\n\
+    var res = await ctx.fetch((this.baseUrl || 'http://127.0.0.1:11434') + '/api/chat', {\n\
+      method: 'POST',\n\
+      headers: { 'content-type': 'application/json' },\n\
+      body: JSON.stringify({ model: req.model || this.model, messages: msgs, stream: true })\n\
+    });\n\
+    if (!res || !res.ok) throw new Error('Ollama HTTP ' + (res ? res.status : 0));\n\
+    var text = await res.text();\n\
+    var lines = (text || '').split('\\n');\n\
+    var acc = { text: '' };\n\
+    for (var i = 0; i < lines.length; i++) {\n\
+      var l = lines[i].trim();\n\
+      if (!l) continue;\n\
+      try {\n\
+        var ch = JSON.parse(l);\n\
+        if (ch.message && ch.message.content) { acc.text += ch.message.content; onEvent({ type: 'text', text: ch.message.content }); }\n\
+      } catch (e) {}\n\
+    }\n\
+    onEvent({ type: 'done' });\n\
+    return acc;\n\
+  },\n\
+  async health() {\n\
+    try { var r = await fetch((this.baseUrl || 'http://127.0.0.1:11434') + '/api/tags'); return { ok: Boolean(r && r.ok) }; }\n\
+    catch (e) { return { ok: false, error: String(e) }; }\n\
+  }\n\
+});\n";
+      }
+    }
+  };
+  OFFICIAL_PLUGINS['sofuu-plugin-llamacpp'] = OFFICIAL_PLUGINS.llamacpp;
+  OFFICIAL_PLUGINS['sofuu-plugin-ollama'] = OFFICIAL_PLUGINS.ollama;
+
+  P.cliAdd = async function (name, opts) {
+    opts = opts || {};
+    try {
+      var norm = String(name || '').toLowerCase().trim();
+      var entry = OFFICIAL_PLUGINS[norm] || OFFICIAL_PLUGINS[norm.replace(/^sofuu-plugin-/, '')];
+      if (!entry) {
+        console.error('Unknown plugin "' + name + '". Available official plugins: llamacpp, ollama');
+        console.error('To scaffold a new custom plugin, run: sofuu plugin init <name>');
+        return cliExit(1);
+      }
+      var home = envOf().HOME || envOf().USERPROFILE || '';
+      var dir = (opts.global && home) ? (home + '/.sofuu/plugins') : './plugins';
+      if (sofuu.fs && sofuu.fs.mkdir) {
+        try { await sofuu.fs.mkdir(dir, { recursive: true }); } catch (eMk) {}
+      }
+      var targetFile = dir + '/' + entry.file;
+      var exists = false;
+      try { exists = await sofuu.fs.exists(targetFile); } catch (eEx) {}
+      if (exists && !opts.force) {
+        console.error('Plugin file ' + targetFile + ' already exists (use --force to overwrite)');
+        return cliExit(1);
+      }
+      var content = '';
+      try {
+        var existing = await fsReadFile('./plugins/' + entry.file);
+        if (existing) content = String(existing);
+      } catch (eRd) {}
+      if (!content && typeof entry.content === 'function') {
+        content = entry.content();
+      }
+      if (!content) {
+        console.error('Failed to resolve template content for ' + name);
+        return cliExit(1);
+      }
+      await sofuu.fs.writeFile(targetFile, content);
+      console.log('Installed ' + name + ' -> ' + targetFile);
+      await P.cliValidate(targetFile);
+    } catch (e) {
+      console.error(String((e && e.message) || e));
+      return cliExit(1);
+    }
+  };
+
   /* ── Global primitive exports (the `import { ... } from 'sofuu'` path
    *    resolves to sofuu.plugins.*, these globals are the script shorthand) */
+  g.z = microZod;
   g.defineTool = P.defineTool;
   g.defineProvider = P.defineProvider;
   g.defineStorage = P.defineStorage;
   g.defineVectorStore = P.defineVectorStore;
   g.defineService = P.defineService;
   g.useOpenAPI = P.useOpenAPI;
+
+  if (typeof sofuu !== 'undefined' && sofuu) {
+    sofuu.z = microZod;
+    sofuu.defineTool = P.defineTool;
+    sofuu.tools = sofuu.tools || {};
+    sofuu.tools.define = P.defineTool;
+  }
 
 })();
 

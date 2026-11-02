@@ -91,7 +91,7 @@ fn main() {
     // existed for engine.c / ffi_shim.c and are gone with them; the Rust
     // side carries the same facts via cargo cfgs (has_qtsq).
     let mut cc = cc::Build::new();
-    cc.opt_level(2)
+    cc.opt_level_str("s")
         .warnings(false)
         .include(&deps.join("quickjs"))
         .include(&deps.join("libuv").join("include"))

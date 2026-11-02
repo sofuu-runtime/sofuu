@@ -27,7 +27,15 @@ pub const SCHEMA: u32 = 1;
 /// The P0 audit is the source of truth for per-surface availability.
 /// `contract/` is tracked; a build without it fails here by design rather
 /// than silently reporting a stale matrix.
-const MATRIX: &str = include_str!("../../../contract/matrix.json");
+const MATRIX_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/matrix.json.gz"));
+
+fn matrix_str() -> String {
+    use std::io::Read as _;
+    let mut d = flate2::read::GzDecoder::new(MATRIX_GZ);
+    let mut s = String::new();
+    let _ = d.read_to_string(&mut s);
+    s
+}
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 unsafe extern "C" {
@@ -91,7 +99,8 @@ fn ram_mb() -> Option<u64> {
 /// Transform the audited matrix cells into the manifest's surface map:
 /// surface -> primitive -> {status, missing?, reason?, applicable?}.
 fn surfaces() -> Value {
-    let parsed: Value = serde_json::from_str(MATRIX).unwrap_or(Value::Null);
+    let m_str = matrix_str();
+    let parsed: Value = serde_json::from_str(&m_str).unwrap_or(Value::Null);
     let mut out = Map::new();
     let Some(cells) = parsed.get("cells").and_then(Value::as_array) else {
         return Value::Object(out);

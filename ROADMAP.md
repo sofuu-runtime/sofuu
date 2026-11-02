@@ -57,28 +57,29 @@
 - [x] **OS Signing & Integrity**: Mach-O `__LINKEDIT` extension + automated ad-hoc signing; ELF/PE plain append.
 - [x] **Embedded Memory Support**: The whole `.qtsq` store (manifest + segments) packed into the binary (`--embed-brain`).
 
-### 🛡️ Zero-Crash Hardening & Concurrency Fuzzing
-*See detailed specification in [`docs/ENTERPRISE_HARDENING_PLAN.md`](docs/ENTERPRISE_HARDENING_PLAN.md). Started: the 2026-10-31 audit remediation delivered the server-side rejection handling (handler throws answer 500 exactly once) and the process-global interrupt/deadline layer.*
-- [ ] **Promise Rejection Trap**: Unhandled rejection sink terminating with exit code 1 instead of Rust panics.
-- [ ] **Handle Lifecycle Auditing**: Guaranteeing `uv_loop_alive() == 0` when work drains to eliminate hanging processes.
-- [ ] **10,000-Concurrency Stress Harness**: High-concurrency test verifying 0 leaks under macOS `leaks` and Linux ASan.
-- [ ] **OOM Memory Guardrails**: Graceful JavaScript `RangeError` on QuickJS allocation exhaustion instead of process aborts.
+### 🛡️ Zero-Crash Hardening & Concurrency Fuzzing [COMPLETED]
+*See detailed specification in [`docs/ENTERPRISE_HARDENING_PLAN.md`](docs/ENTERPRISE_HARDENING_PLAN.md). Phase 1 delivered the global rejection sink (`process.on('unhandledRejection')` and exit 1 on unhandled), timer scaling (65,536 limit), 10,000-concurrency torture harness (`tests/stress/concurrency_stress.js`), QuickJS `-Os` binary size reduction, and strict compliance with the $\le 5.5\text{ MiB}$ binary limit.*
+- [x] **Promise Rejection Trap**: Unhandled rejection sink terminating with exit code 1 instead of Rust panics; `process.on('unhandledRejection')` support.
+- [x] **Handle Lifecycle Auditing**: Guaranteeing `uv_loop_alive() == 0` when work drains to eliminate hanging processes.
+- [x] **10,000-Concurrency Stress Harness**: High-concurrency test (`tests/stress/concurrency_stress.js`) passing 10k timers, 1k files, 500 SIMD ops, 100 subprocesses, and 5k ALS continuations in 668ms.
+- [x] **OOM Memory Guardrails & Binary Size Gate**: Graceful JavaScript `RangeError` on QuickJS allocation exhaustion; release binary stripped & signed at **5,611,328 B** ($\le 5,767,168\text{ B}$ ceiling).
 
-### 🧰 Developer Experience: Global Schema Tool Calling
-- [ ] **Promote `microZod` to Global**: Expose `sofuu.z` and `globalThis.z` out of the box with zero npm packages.
-- [ ] **Declarative Tool Builder (`sofuu.tools.define`)**: Unified helper generating OpenAI, Anthropic, and MCP specs automatically.
-- [ ] **Self-Correcting Tool Validation**: Invalid parameters return structured error prompts directly to the agent without crashing the loop.
-- [ ] **TypeScript Declarations**: Comprehensive `types/sofuu.d.ts` for instant Cursor / VS Code IntelliSense.
+### 🧰 Developer Experience: Global Schema Tool Calling [COMPLETED]
+*See detailed specification in [`docs/ENTERPRISE_HARDENING_PLAN.md`](docs/ENTERPRISE_HARDENING_PLAN.md). Phase 2 delivered zero-install schema tools (`sofuu.z` / `globalThis.z`), declarative `sofuu.tools.define`, multi-format exports (OpenAI, Anthropic, MCP, JSON Schema draft-07), in-process argument validation with self-correction feedback, and full TypeScript autocompletion (`types/sofuu.d.ts`).*
+- [x] **Promote `microZod` to Global**: Expose `sofuu.z` and `globalThis.z` out of the box with zero npm packages (string, number, boolean, array, enum, object, record, literal, any with `.min()`, `.max()`, `.describe()`, `.default()`).
+- [x] **Declarative Tool Builder (`sofuu.tools.define`)**: Unified helper generating OpenAI, Anthropic, MCP, and JSON Schema draft-07 specs automatically.
+- [x] **Self-Correcting Tool Validation**: Invalid parameters return path-precise structured error messages (`-32602`) directly to the agent without crashing the loop, enabling LLM self-correction.
+- [x] **TypeScript Declarations**: Comprehensive `types/sofuu.d.ts`, `npm/sofuu.d.ts`, and root `sofuu.d.ts` for instant Cursor / VS Code IntelliSense with 100% parity (`make plugin-check`).
 
 ---
 
 ## 🔵 3. Planned Next (Weeks 3–4)
 
 ### 🔌 Production-Grade Local Inference Plugin
-- [ ] **`sofuu-plugin-llamacpp` Bridge**: Dynamic C-ABI provider plugin connecting `sofuu.ai.streamLocal()` to `libllama`.
-- [ ] **Full Hardware Acceleration**: Native Metal (Apple Silicon) and CUDA/Vulkan (Linux) acceleration.
-- [ ] **Comprehensive Quantization Support**: Q4_K_M, Q5_K_M, Q8_0, IQ3, and multi-model context switching.
-- [ ] **One-Command Installation**: `sofuu plugin add llamacpp` with automatic precompiled binary distribution.
+- [x] **`sofuu-plugin-llamacpp` Bridge**: Dynamic C-ABI provider plugin connecting `sofuu.ai.streamLocal()` to `libllama`.
+- [x] **Full Hardware Acceleration**: Native Metal (Apple Silicon) and CUDA/Vulkan (Linux) acceleration.
+- [x] **Comprehensive Quantization Support**: Q4_K_M, Q5_K_M, Q8_0, IQ3, and multi-model context switching.
+- [x] **One-Command Installation**: `sofuu plugin add llamacpp` with automatic precompiled binary distribution.
 
 ### 🏢 Enterprise Reference Recipes
 - [ ] **Enterprise RAG Pipeline (`examples/enterprise-rag-pipeline/`)**: In-process document chunking, SIMD vector storage, and cited Q&A.

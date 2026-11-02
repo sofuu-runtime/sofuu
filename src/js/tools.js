@@ -224,7 +224,7 @@
   }
   function toolDispatchEnd() {
     TOOL_ACTIVE = TOOL_ACTIVE > 0 ? TOOL_ACTIVE - 1 : 0;
-    try { globalThis.__sofuu_tool_active = TOOL_ACTIVE; } catch (e) {}
+    try { globalThis.__sofuu_tool_active = TOOL_ACTIVE; } catch (e) { /* the counter is mirrored onto globalThis for embedders; a frozen global must not break dispatch accounting. */ }
   }
 
   /* The single enforcement point. Works when copied off the object and called

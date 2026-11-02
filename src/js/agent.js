@@ -95,9 +95,9 @@
   };
   async function yieldCooperative() {
     if (globalThis.scheduler && typeof globalThis.scheduler.yield === 'function') {
-      try { await globalThis.scheduler.yield(); } catch (_) {}
+      try { await globalThis.scheduler.yield(); } catch (_) { /* cooperative yield is an optimisation: the work still completes without it. */ }
     } else if (typeof sofuu !== 'undefined' && typeof sofuu.yield === 'function') {
-      try { await sofuu.yield(); } catch (_) {}
+      try { await sofuu.yield(); } catch (_) { /* same contract as scheduler.yield above: yielding is best effort. */ }
     }
   }
   var PERMISSION_PROFILE = 'full';
@@ -438,7 +438,7 @@
       var p = (typeof process !== 'undefined') ? process : null;
       if (p && p.stdout && p.stdout.isTTY) return true;
       if (p && p.stdin && p.stdin.isTTY) return true;
-    } catch (e) {}
+    } catch (e) { /* no process object means not a TTY, which is the answer the caller acts on. */ }
     return false;
   }
   /* Resolve the error policy: opts.onError, then SOFUU_ON_ERROR, then the
@@ -1216,7 +1216,7 @@
   function hashDim() {
     // Probe, don't assume: the contract is "whatever embedLocal returns".
     if (sofuu.ai && typeof sofuu.ai.embedLocal === 'function') {
-      try { var v = sofuu.ai.embedLocal(''); if (v && v.length) return v.length | 0; } catch (e) {}
+      try { var v = sofuu.ai.embedLocal(''); if (v && v.length) return v.length | 0; } catch (e) { /* the probe falls through to the documented 768 so a missing embedder cannot break hashing. */ }
     }
     return 768;
   }
@@ -2370,7 +2370,7 @@
       if (fn.arguments) e.args = e.args + String(fn.arguments);
       if (!fn.name && t.name) e.name = String(t.name);
       if (t.arguments && typeof t.arguments === 'object') {
-        try { e.args = JSON.stringify(t.arguments); } catch (er) {}
+        try { e.args = JSON.stringify(t.arguments); } catch (er) { /* arguments that cannot be stringified (a cycle) leave the raw text already in e.args. */ }
       }
     }
     var out = [];
@@ -2564,7 +2564,7 @@
       if (direct !== undefined) return direct;
       var fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
       if (fence && fence[1]) {
-        try { return JSON.parse(fence[1].trim()); } catch (e2) {}
+        try { return JSON.parse(fence[1].trim()); } catch (e2) { /* a fenced block that is not JSON falls through to the brace-scan below. */ }
       }
       var opens = s.indexOf('{'), opensA = s.indexOf('[');
       var ch = (opensA >= 0 && (opens < 0 || opensA < opens)) ? '[' : '{';
@@ -2646,7 +2646,7 @@
         t.slice(0, 4000), String(task == null ? '' : task),
         JSON.stringify({ kind: kind })));
       if (v && v.stale) return v;
-    } catch (eMl) {}
+    } catch (eMl) { /* the freshness model is optional: null means 'do not gate', which is the safe default. */ }
     return null;
   }
   /* Relevance gate (PLAN-ML-GATES §6): pre-retrieval advisor over the menu
@@ -3181,7 +3181,7 @@
       }
       if (opts.onStep) {
         try { opts.onStep({ runId: runId, name: d.name, depth: depth, t: e.t, kind: kind, payload: payload }); }
-        catch (e2) {}
+        catch (e2) { /* an onStep observer that throws must not abort the run it is observing. */ }
       }
     }
     /* P1-18: the supervisor was trained with ONE tool call per LLM turn
@@ -3319,11 +3319,11 @@
       }
       if (mlEnabled(d)) {
         try { sofuu.ml.track(JSON.stringify({ kind: 'run_end', run: String(runId) })); }
-        catch (eMl) {}
+        catch (eMl) { /* telemetry: a failed track loses a counter, never a result. */ }
       }
       if (opts.logs) logRun(res, task, wall);
       /* T4: close code_eval realms and drop the per-run todo namespace. */
-      try { if (sofuu.tools && sofuu.tools.endRunScope) sofuu.tools.endRunScope(String(runId)); } catch (eSc) {}
+      try { if (sofuu.tools && sofuu.tools.endRunScope) sofuu.tools.endRunScope(String(runId)); } catch (eSc) { /* scope teardown runs after the answer exists; a failure here cannot change it. */ }
       try {
         if (typeof sofuu !== 'undefined' && sofuu.plugins && typeof sofuu.plugins.emitTurnEnd === 'function') {
           sofuu.plugins.emitTurnEnd({
@@ -3340,7 +3340,7 @@
       ACTIVE_COUNT--;
       if (ACTIVE_COUNT === 0) runTick(mcpIdleDisconnect);
       if (traceStorage && traceStorage.db && typeof traceStorage.db.flush === 'function') {
-        try { traceStorage.db.flush(); } catch (eFl) {}
+        try { traceStorage.db.flush(); } catch (eFl) { /* trace persistence is diagnostic; the run result is already assembled. */ }
       }
       return res;
     }

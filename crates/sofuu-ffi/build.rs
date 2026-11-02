@@ -152,15 +152,34 @@ fn main() {
     // Hot SIMD GEMV kernels (Q4_0, Q8_0, F16, F32, RMSNorm, RoPE, SwiGLU)
     // compiled with full C++ optimization (-O3, -ffast-math) where C++
     // intrinsics and auto-vectorization beat Rust abstractions.
+    //
+    // SOFUU_KERNEL_OPT exists because -O3 is not free: on the Linux static
+    // artifact the whole binary has 11,856 B of headroom against the cap in
+    // RULES.md §3.1, and per-function inlining is what -O3 spends it on.
+    // Default stays 3 so nothing changes for anyone who does not ask.
+    // Numeric levels go through cc-rs; "z" and "s" are passed straight to the
+    // compiler, which is what makes them reachable at all: -Oz on this file is
+    // a 11x smaller object (3,293,432 -> 294,600 B) and is the difference
+    // between fitting the Linux artifact under the cap and not.
+    let cpp_opt = std::env::var("SOFUU_KERNEL_OPT").unwrap_or_else(|_| "3".to_string());
+    println!("cargo:rerun-if-env-changed=SOFUU_KERNEL_OPT");
     let mut cpp = cc::Build::new();
     cpp.cpp(true)
         .std("c++17")
-        .opt_level(3)
         .warnings(false)
         .include(&src)
         .include(&src.join("simd"))
         .include(&out_dir) // generated kernels_metal.h (below)
         .file(src.join("simd/infer_kernels.cpp"));
+    match cpp_opt.parse::<u32>() {
+        Ok(n) => {
+            cpp.opt_level(n);
+        }
+        Err(_) => {
+            cpp.opt_level(0);
+            cpp.flag(format!("-O{cpp_opt}"));
+        }
+    }
 
     if target_arch == "aarch64" {
         // +fp16 is what defines __ARM_FEATURE_FP16_VECTOR_ARITHMETIC, and that

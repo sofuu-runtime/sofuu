@@ -17,8 +17,36 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ZIP="${1:-}"
 
+# --check: assert the checked-in manifest is publishable for SOFUU_VERSION,
+# without an artifact in hand. A release uses this to prove the tree it is
+# tagging actually resolves; the stamping path below only proves it could.
+if [[ "$ZIP" == "--check" ]]; then
+  V="${SOFUU_VERSION:-}"
+  if [[ -z "$V" ]]; then
+    echo "usage: SOFUU_VERSION=<v> $0 --check" >&2
+    exit 2
+  fi
+  V="${V#v}"
+  fail=0
+  if grep -qE 'let sofuuXCFrameworkChecksum = "0{64}"' "$REPO_ROOT/Package.swift"; then
+    echo "error: Package.swift still carries the all-zero checksum placeholder." >&2
+    echo "       SwiftPM cannot resolve a binary target without a real checksum." >&2
+    echo "       Stamp it after building the artifact, then commit the result:" >&2
+    echo "         SOFUU_VERSION=$V scripts/stamp-swiftpm.sh dist/libsofuu.xcframework.zip" >&2
+    fail=1
+  fi
+  if ! grep -q "/v$V/" "$REPO_ROOT/Package.swift"; then
+    echo "error: Package.swift does not point at a v$V release asset." >&2
+    echo "       Found: $(grep -A1 'let sofuuXCFrameworkURL' "$REPO_ROOT/Package.swift" | tail -1 | tr -d ' ')" >&2
+    fail=1
+  fi
+  [[ "$fail" -eq 0 ]] && echo "✓ Package.swift is publishable for v$V"
+  exit "$fail"
+fi
+
 if [[ -z "$ZIP" ]]; then
   echo "usage: SOFUU_VERSION=<v> $0 <libsofuu.xcframework.zip>" >&2
+  echo "       SOFUU_VERSION=<v> $0 --check" >&2
   exit 2
 fi
 if [[ ! -f "$ZIP" ]]; then

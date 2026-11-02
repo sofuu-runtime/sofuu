@@ -36,7 +36,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
+.PHONY: js-swallow-check all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
 	kaze-drift-check kaze-drift-strict clippy-ratchet \
 	observability-stress asan fuzz-simd policy-dx modern-npm sbom sign-dist \
         deps scoreboard scoreboard-check cuda-check \
@@ -334,7 +334,7 @@ clean:
 	rm -f $(TARGET)
 	cargo clean 2>/dev/null || true
 
-test: $(TARGET) kaze-drift-check clippy-ratchet
+test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check
 	@echo ""
 	@echo "\033[1m=== Sofuu Test Suite ===\033[0m"
 	@echo ""
@@ -347,6 +347,12 @@ test: $(TARGET) kaze-drift-check clippy-ratchet
 # runs on every `make test`: FAIL if the prototype copy falls behind the product,
 # print every prototype-only verb/opcode and the two version strings. The strict
 # form fails on any difference at all (used when auditing the prototype itself).
+# The empty-catch ratchet (PLAN-AUDIT-REMEDIATION §7 Task 5.6): src/js has 337
+# catch blocks that swallow their error with no explanation. That is a backlog to
+# retire deliberately, not something to sweep blind, so the count may only fall.
+js-swallow-check:
+	@python3 scripts/check-js-swallow.py
+
 kaze-drift-check:
 	@scripts/kaze-drift-check.sh
 

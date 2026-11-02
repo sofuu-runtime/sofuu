@@ -137,6 +137,16 @@ export RUSTFLAGS="$REMAP -C linker=$REPO_ROOT/scripts/cross/zig-ld.sh -C link-ar
 if [ "${SOFUU_LEAN_BUILD:-1}" != "0" ]; then
     RUSTFLAGS="$RUSTFLAGS -C force-unwind-tables=no -C relocation-model=static"
     RUSTFLAGS="$RUSTFLAGS -C link-arg=-no-pie -C link-arg=-Wl,--no-eh-frame-hdr"
+    # The C dependencies (QuickJS, http-parser) ship unwind tables by default
+    # and nothing C here throws: worth 77,216 B on a clean tree. Must be set
+    # before cargo runs, and it only takes effect when the C objects are
+    # rebuilt — cc-rs caches them, so measure it with a clean target dir or the
+    # byte count will lie.
+    NOUNWIND="-fno-asynchronous-unwind-tables -fno-unwind-tables"
+    export CFLAGS="${CFLAGS:-} $NOUNWIND"
+    export CFLAGS_x86_64_unknown_linux_musl="${CFLAGS_x86_64_unknown_linux_musl:-} $NOUNWIND"
+    export CFLAGS_arm64_unknown_linux_musl="${CFLAGS_arm64_unknown_linux_musl:-} $NOUNWIND"
+    export CXXFLAGS="${CXXFLAGS:-} $NOUNWIND"
 fi
 export RUSTFLAGS
 

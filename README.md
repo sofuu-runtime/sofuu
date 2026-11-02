@@ -2,7 +2,7 @@
 
 # ⚡ Sofuu (素風)
 
-> *Sofuu is a general-purpose runtime for AI — built to run anywhere from servers to smart devices. A compact, sovereign systems engine (Rust/C core, QuickJS/libuv) combining in-process CPU/GPU inference (experimental), multi-format models (GGUF + SafeTensors), autonomous agent loops, encrypted cognitive vector memory (QTSQ), and native MCP in a single <= 5.5 MiB binary (5.39 MiB on macOS arm64 with bundled QTSQ cognitive memory; the Linux builds are 5.88 MiB arm64 and 6.80 MiB x86_64 and currently exceed the cap). Zero daemons, zero external dependencies.*
+> *Sofuu is a general-purpose runtime for AI — built to run anywhere from servers to smart devices. A compact, sovereign systems engine (Rust/C core, QuickJS/libuv) combining in-process CPU/GPU inference (experimental), multi-format models (GGUF + SafeTensors), autonomous agent loops, encrypted cognitive vector memory (QTSQ), and native MCP in a single <= 5.5 MiB binary (5.49 MiB on macOS arm64, 4.86 MiB Linux arm64, 5.46 MiB Linux x86_64, each with bundled QTSQ cognitive memory). Zero daemons, zero external dependencies.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0--beta-orange.svg)](https://github.com/sofuu-runtime/sofuu/releases)
@@ -102,10 +102,10 @@ platform: macOS arm64
 
 | Artifact | Size | vs. the 5.5 MiB (5,767,168 B) cap |
 | --- | --- | --- |
-| macOS arm64 — this tree, `make size-check` | 5,559,904 B (5.30 MiB) | **passes**, 202 KB headroom |
-| macOS arm64 — published archive | 5,655,808 B (5.39 MiB) | passes |
-| Linux arm64 — published archive | 6,163,520 B (5.88 MiB) | **over** |
-| Linux x86_64 — published archive | 7,130,904 B (6.80 MiB) | **over** |
+| macOS arm64 — this tree | 5,595,072 B (5.34 MiB) | passes, 172,096 B headroom |
+| macOS arm64 — `dist/sofuu-darwin-arm64` | 5,755,312 B (5.49 MiB) | passes, 11,856 B headroom |
+| Linux arm64 — `scripts/cross/build_linux_arm64.sh` | 5,091,760 B (4.86 MiB) | passes, 675,408 B headroom |
+| Linux x86_64 — `scripts/cross/build_linux_x86_64.sh` | 5,723,504 B (5.46 MiB) | passes, 43,664 B headroom |
 
 The cap is enforced rather than asserted: `make size-check` fails the build over
 it, and `scripts/verify-dist.sh` fails a release that ships an artifact over the
@@ -114,12 +114,21 @@ cap, a binary with no HEAD stamp, or one built from a dirty tree.
 ```bash
 make size-check      # host build against the cap
 sh scripts/verify-dist.sh   # release gate: stamp, tree state, every artifact
+bash scripts/cross/vm-smoke.sh dist/sofuu-linux-x86_64 dist/sofuu-linux-arm64
+                     # boot each Linux artifact on a real kernel under qemu
 ```
 
 ### Known limits
 
-- **The Linux archives are over the cap** and predate this engine; the next
-  release rebuilds and re-stamps them. macOS is already under.
+- **Linux x86_64 builds require AVX2.** The SIMD kernels are compiled with
+  `-mavx2 -mfma`, so the binary takes SIGILL on a CPU older than roughly
+  Haswell (2013) — under qemu's default `qemu64` model it dies before printing
+  anything, and runs fine under `-cpu max`. x86_64 has 43,664 B of headroom, so
+  a runtime dispatch to a portable kernel path would need to fit in that, or the
+  floor needs to be documented as a requirement rather than a surprise.
+- **Every shipped artifact is now under the cap**; the Linux archives on the
+  download page are older builds and still need the re-cutting release, which
+  also re-stamps `dist/SHA256SUMS`.
 - **SwiftPM and CocoaPods coordinates do not resolve yet.** The `v0.3.0-beta`
   tag carries a placeholder checksum, and both `Package.swift` and
   `Sofuu.podspec` still point at the v0.2.0 asset (the podspec also says

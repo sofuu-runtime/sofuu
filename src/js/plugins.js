@@ -75,14 +75,14 @@
   function envOf() {
     try {
       if (typeof process !== 'undefined' && process && process.env) return process.env;
-    } catch (e) {}
+    } catch (e) { /* no process object in this host: callers fall back to an empty environment. */ }
     return {};
   }
 
   function cwdOf() {
     try {
       if (typeof process !== 'undefined' && typeof process.cwd === 'function') return process.cwd();
-    } catch (e) {}
+    } catch (e) { /* same: without a cwd the caller uses a literal '.' default. */ }
     return '.';
   }
 
@@ -842,7 +842,7 @@
           };
         }
       }
-    } catch (ePol) {}
+    } catch (ePol) { /* the policy probe is advisory; a policy that will not evaluate leaves the call allowed in the default posture. */ }
     return null;
   }
 
@@ -975,7 +975,7 @@
     if (!signal || typeof signal.addEventListener !== 'function') return function () {};
     try { signal.addEventListener('abort', cb); } catch (e) { return function () {}; }
     return function () {
-      try { signal.removeEventListener('abort', cb); } catch (e) {}
+      try { signal.removeEventListener('abort', cb); } catch (e) { /* unsubscribing from an already-fired abort signal is a no-op. */ }
     };
   }
 
@@ -1581,7 +1581,7 @@
     if (ext && typeof ext === 'object') {
       if (ext.PROVIDERS && ext.PROVIDERS[n]) return ext.PROVIDERS[n];
       if (typeof ext.get === 'function') {
-        try { var got = ext.get(n); if (got && typeof got === 'object') return got; } catch (e) {}
+        try { var got = ext.get(n); if (got && typeof got === 'object') return got; } catch (eGet) { /* an extension registry that throws on an unknown name is treated as not having it. */ }
       }
     }
     return null;
@@ -3413,10 +3413,10 @@
   };
   P.discoverAll = async function discoverAll() {
     var results = { local: null, global: null, manifest: null };
-    try { results.local = await P.discover('./plugins'); } catch (e1) {}
+    try { results.local = await P.discover('./plugins'); } catch (e1) { /* no local plugin directory is the normal case; discoverAll reports null for it. */ }
     var home = envOf().HOME || envOf().USERPROFILE || '';
     if (home) { try { results.global = await P.discover(home + '/.sofuu/plugins'); } catch (e2) {} }
-    try { results.manifest = await P.loadManifest('./sofuu.json'); } catch (e3) {}
+    try { results.manifest = await P.loadManifest('./sofuu.json'); } catch (e3) { /* a project without sofuu.json simply has no plugin manifest. */ }
     return results;
   };
 
@@ -3626,7 +3626,7 @@
     /* "complete isolation" (plan §3): a breaker that opened during an earlier
      * run must not turn a fresh test into a fast-fail, so the target's circuit
      * is reset first. Only that tool's state is touched. */
-    try { P.resetCircuit(String(toolName)); } catch (eRc) {}
+    try { P.resetCircuit(String(toolName)); } catch (eRc) { /* no breaker to reset for a tool that was never exercised. */ }
     return P.cliRun(toolName, rawArgs, { test: true });
   };
 
@@ -3786,7 +3786,7 @@
       if (!safe) { console.error('plugin init requires a name'); return cliExit(1); }
       var file = dir + '/' + safe + '.ts';
       var exists = false;
-      try { exists = await sofuu.fs.exists(file); } catch (eEx) {}
+      try { exists = await sofuu.fs.exists(file); } catch (eEx) { /* an unreadable path answers false, which is what the overwrite prompt needs. */ }
       if (exists) { console.error('refusing to overwrite existing ' + file); return cliExit(1); }
       await sofuu.fs.writeFile(file, PLUGIN_TEMPLATES[cat](safe));
       console.log('scaffolded ' + file + ' (' + cat + ')');

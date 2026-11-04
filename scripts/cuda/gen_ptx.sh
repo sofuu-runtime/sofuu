@@ -30,6 +30,14 @@ ENTRIES=(
     sofuu_kv_write_f32
     sofuu_attn_decode_f32
     sofuu_add_f32
+    sofuu_gemm_q4_k_b8
+    sofuu_gemm_q6_k_b8
+    sofuu_gemm_q8_0_b8
+    sofuu_gemm_f32_b8
+    sofuu_rmsnorm_batch
+    sofuu_rope_batch
+    sofuu_kv_write_batch
+    sofuu_attn_prefill_f32
 )
 
 find_clang() {

@@ -96,7 +96,27 @@ pub struct CudaModel {
     logits_host: Vec<f32>,
     logit_bytes: Vec<u8>,
     rope_host: Vec<f32>,
+
+    // Batched-prefill scratch: eight token rows per buffer, token-major. The
+    // kernels use one warp per token, so the cap of eight is a kernel contract,
+    // not a tuning knob.
+    xb: DeviceBuf,
+    x_norm_b: DeviceBuf,
+    q_b: DeviceBuf,
+    k_b: DeviceBuf,
+    v_b: DeviceBuf,
+    attn_b: DeviceBuf,
+    proj_b: DeviceBuf,
+    gate_b: DeviceBuf,
+    up_b: DeviceBuf,
+    act_b: DeviceBuf,
+    down_b: DeviceBuf,
+    rope_b: DeviceBuf,
+    rope_host_b: Vec<f32>,
 }
+
+/// Tokens per prefill chunk. Every b8 kernel has eight warps, one per token.
+pub const PREFILL_BATCH: usize = 8;
 
 impl CudaModel {
     /// Build the VRAM-resident model, or return the reason it cannot be built.
@@ -307,7 +327,10 @@ impl CudaModel {
             .n_layers
             .checked_mul(per_layer_kv)
             .ok_or_else(|| "KV layer total overflows".to_string())?;
-        let scratch = 4 * dim + 2 * q_dim + 2 * kv_dim + 3 * cfg.hidden_dim + cfg.vocab_size + cfg.head_dim;
+        // Scratch: the single-token row set plus the eight-row prefill set.
+        let single = 4 * dim + 2 * q_dim + 2 * kv_dim + 3 * cfg.hidden_dim;
+        let scratch = single + cfg.vocab_size + cfg.head_dim
+            + PREFILL_BATCH * (single + cfg.head_dim);
         let need = weight_bytes
             .checked_add(2 * kv_total * 4)
             .and_then(|v| v.checked_add(scratch * 4))
@@ -345,6 +368,19 @@ impl CudaModel {
         let down = alloc_f32!(dim, "down");
         let logits_dev = alloc_f32!(cfg.vocab_size, "logits");
         let rope_dev = alloc_f32!(cfg.head_dim, "rope_table");
+
+        let xb = alloc_f32!(PREFILL_BATCH * dim, "x_batch");
+        let x_norm_b = alloc_f32!(PREFILL_BATCH * dim, "x_norm_batch");
+        let q_b = alloc_f32!(PREFILL_BATCH * q_dim, "q_batch");
+        let k_b = alloc_f32!(PREFILL_BATCH * kv_dim, "k_batch");
+        let v_b = alloc_f32!(PREFILL_BATCH * kv_dim, "v_batch");
+        let attn_b = alloc_f32!(PREFILL_BATCH * q_dim, "attn_batch");
+        let proj_b = alloc_f32!(PREFILL_BATCH * dim, "proj_batch");
+        let gate_b = alloc_f32!(PREFILL_BATCH * cfg.hidden_dim, "gate_batch");
+        let up_b = alloc_f32!(PREFILL_BATCH * cfg.hidden_dim, "up_batch");
+        let act_b = alloc_f32!(PREFILL_BATCH * cfg.hidden_dim, "act_batch");
+        let down_b = alloc_f32!(PREFILL_BATCH * dim, "down_batch");
+        let rope_b = alloc_f32!(PREFILL_BATCH * cfg.head_dim, "rope_batch");
 
         eprintln!(
             "[cuda] {} cc{}.{} · {:.2} GiB VRAM · weights {:.2} GiB · KV {} rows ({:.0} MiB x2)",
@@ -399,6 +435,19 @@ impl CudaModel {
             logits_host: vec![0.0; cfg.vocab_size],
             logit_bytes: vec![0u8; cfg.vocab_size * 4],
             rope_host: vec![0.0; cfg.head_dim],
+            xb,
+            x_norm_b,
+            q_b,
+            k_b,
+            v_b,
+            attn_b,
+            proj_b,
+            gate_b,
+            up_b,
+            act_b,
+            down_b,
+            rope_b,
+            rope_host_b: vec![0.0; PREFILL_BATCH * cfg.head_dim],
         })
     }
 
@@ -603,6 +652,281 @@ impl CudaModel {
         self.pos = pos + 1;
         Ok(())
     }
+
+    /// Prefill `n_tokens` (1..=8) embeddings starting at `pos` in one pass.
+    /// `x_host` is [n_tokens, dim], token-major. The layer order and arithmetic
+    /// match `forward`, but each weight tile is read once and shared by all
+    /// eight token warps instead of being streamed once per token.
+    pub fn forward_batch(
+        &mut self,
+        x_host: &[f32],
+        pos: usize,
+        n_tokens: usize,
+        compute_logits: bool,
+    ) -> Result<(), String> {
+        if std::thread::current().id() != self.owner {
+            return Err(
+                "CUDA context belongs to another thread (load and generate on the same thread)"
+                    .into(),
+            );
+        }
+        if n_tokens == 0 || n_tokens > PREFILL_BATCH {
+            return Err(format!(
+                "prefill chunk has {n_tokens} tokens; the b8 kernels take 1..={PREFILL_BATCH}"
+            ));
+        }
+        if x_host.len() < n_tokens * self.dim {
+            return Err(format!(
+                "prefill chunk has {} embedding values, need {}",
+                x_host.len(),
+                n_tokens * self.dim
+            ));
+        }
+        if pos
+            .checked_add(n_tokens)
+            .is_none_or(|end| end > self.cap)
+        {
+            return Err(format!(
+                "chunk {pos}..{} is past the {}-row CUDA KV cache; raise SOFUU_CUDA_CTX",
+                pos + n_tokens,
+                self.cap
+            ));
+        }
+        if pos != self.pos {
+            return Err(format!(
+                "non-contiguous position {pos}: the device cache holds rows 0..{}; a new                  request must call reset_cache() first",
+                self.pos
+            ));
+        }
+
+        let e = &self.engine;
+        e.upload(self.xb, f32_bytes(&x_host[..n_tokens * self.dim]))
+            .map_err(|err| format!("upload prefill embeddings: {err}"))?;
+
+        let mut positions = [0usize; PREFILL_BATCH];
+        for (i, p) in positions.iter_mut().take(n_tokens).enumerate() {
+            *p = pos + i;
+        }
+        quant::rope_table_rows(
+            &mut self.rope_host_b,
+            self.head_dim,
+            self.rope_n_rot,
+            self.rope_mscale,
+            self.rope_base,
+            &self.rope_adjust,
+            &positions[..n_tokens],
+        );
+        e.upload(
+            self.rope_b,
+            f32_bytes(&self.rope_host_b[..n_tokens * self.head_dim]),
+        )
+        .map_err(|err| format!("upload rope batch table: {err}"))?;
+
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let n = n_tokens;
+
+        for (li, l) in self.layers.iter().enumerate() {
+            e.rmsnorm_batch(
+                self.xb,
+                l.attn_norm,
+                self.x_norm_b,
+                self.dim,
+                self.eps,
+                n,
+            )
+            .map_err(|err| format!("layer {li} attn_norm batch: {err}"))?;
+            e.gemm_b8(
+                l.attn_q_quant,
+                l.attn_q,
+                self.x_norm_b,
+                self.q_b,
+                self.q_dim,
+                self.dim,
+                n,
+                row_tile(self.q_dim),
+            )
+            .map_err(|err| format!("layer {li} attn_q batch: {err}"))?;
+            e.gemm_b8(
+                l.attn_k_quant,
+                l.attn_k,
+                self.x_norm_b,
+                self.k_b,
+                self.kv_dim,
+                self.dim,
+                n,
+                row_tile(self.kv_dim),
+            )
+            .map_err(|err| format!("layer {li} attn_k batch: {err}"))?;
+            e.gemm_b8(
+                l.attn_v_quant,
+                l.attn_v,
+                self.x_norm_b,
+                self.v_b,
+                self.kv_dim,
+                self.dim,
+                n,
+                row_tile(self.kv_dim),
+            )
+            .map_err(|err| format!("layer {li} attn_v batch: {err}"))?;
+
+            e.rope_batch(
+                self.q_b,
+                self.rope_b,
+                self.n_heads,
+                self.head_dim,
+                self.rope_n_rot,
+                self.rope_interleaved,
+                n,
+            )
+            .map_err(|err| format!("layer {li} q rope batch: {err}"))?;
+            e.rope_batch(
+                self.k_b,
+                self.rope_b,
+                self.n_kv_heads,
+                self.head_dim,
+                self.rope_n_rot,
+                self.rope_interleaved,
+                n,
+            )
+            .map_err(|err| format!("layer {li} k rope batch: {err}"))?;
+
+            let k_slice = layer_slice(self.k_cache, li, self.per_layer_kv);
+            let v_slice = layer_slice(self.v_cache, li, self.per_layer_kv);
+            e.kv_write_batch(
+                k_slice,
+                v_slice,
+                self.k_b,
+                self.v_b,
+                pos,
+                n,
+                self.n_kv_heads,
+                self.head_dim,
+                self.cap,
+            )
+            .map_err(|err| format!("layer {li} kv_write batch: {err}"))?;
+            e.attn_prefill(
+                self.q_b,
+                k_slice,
+                v_slice,
+                self.attn_b,
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                pos,
+                n,
+                self.cap,
+                scale,
+            )
+            .map_err(|err| format!("layer {li} prefill attention: {err}"))?;
+            e.gemm_b8(
+                l.attn_output_quant,
+                l.attn_output,
+                self.attn_b,
+                self.proj_b,
+                self.dim,
+                self.q_dim,
+                n,
+                row_tile(self.dim),
+            )
+            .map_err(|err| format!("layer {li} attn_output batch: {err}"))?;
+            e.add(self.xb, self.proj_b, self.xb, n * self.dim)
+                .map_err(|err| format!("layer {li} attn residual batch: {err}"))?;
+
+            e.rmsnorm_batch(
+                self.xb,
+                l.ffn_norm,
+                self.x_norm_b,
+                self.dim,
+                self.eps,
+                n,
+            )
+            .map_err(|err| format!("layer {li} ffn_norm batch: {err}"))?;
+            e.gemm_b8(
+                l.ffn_gate_quant,
+                l.ffn_gate,
+                self.x_norm_b,
+                self.gate_b,
+                self.hidden_dim,
+                self.dim,
+                n,
+                row_tile(self.hidden_dim),
+            )
+            .map_err(|err| format!("layer {li} ffn_gate batch: {err}"))?;
+            e.gemm_b8(
+                l.ffn_up_quant,
+                l.ffn_up,
+                self.x_norm_b,
+                self.up_b,
+                self.hidden_dim,
+                self.dim,
+                n,
+                row_tile(self.hidden_dim),
+            )
+            .map_err(|err| format!("layer {li} ffn_up batch: {err}"))?;
+            e.swiglu(
+                self.gate_b,
+                self.up_b,
+                self.act_b,
+                n * self.hidden_dim,
+            )
+            .map_err(|err| format!("layer {li} swiglu batch: {err}"))?;
+            e.gemm_b8(
+                l.ffn_down_quant,
+                l.ffn_down,
+                self.act_b,
+                self.down_b,
+                self.dim,
+                self.hidden_dim,
+                n,
+                row_tile(self.dim),
+            )
+            .map_err(|err| format!("layer {li} ffn_down batch: {err}"))?;
+            e.add(self.xb, self.down_b, self.xb, n * self.dim)
+                .map_err(|err| format!("layer {li} ffn residual batch: {err}"))?;
+        }
+
+        if compute_logits {
+            // Only the last token of the chunk is needed: the caller samples
+            // from it. The other rows stay in `xb` for the next decode token's
+            // KV history.
+            let off = (n - 1) * self.dim * std::mem::size_of::<f32>();
+            let x_last = DeviceBuf {
+                ptr: self.xb.ptr + off as u64,
+                bytes: self.dim * std::mem::size_of::<f32>(),
+            };
+            let xn_last = DeviceBuf {
+                ptr: self.x_norm_b.ptr + off as u64,
+                bytes: self.dim * std::mem::size_of::<f32>(),
+            };
+            e.rmsnorm(x_last, self.output_norm, xn_last, self.dim, self.eps)
+                .map_err(|err| format!("output_norm batch: {err}"))?;
+            e.gemv(
+                self.output_quant,
+                self.output,
+                xn_last,
+                self.logits_dev,
+                self.vocab,
+                self.dim,
+            )
+            .map_err(|err| format!("lm_head batch: {err}"))?;
+            e.sync()
+                .map_err(|err| format!("sync before batch logits: {err}"))?;
+            e.download(&mut self.logit_bytes, self.logits_dev)
+                .map_err(|err| format!("download batch logits: {err}"))?;
+            for (i, c) in self.logit_bytes.chunks_exact(4).enumerate() {
+                self.logits_host[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+
+        self.pos = pos + n;
+        Ok(())
+    }
+}
+
+/// Rows per b8 block. Small projections use eight rows so the 40-SM T4 still
+/// gets enough blocks; wide FFN rows use 32 so the x tile is reloaded less.
+fn row_tile(rows: usize) -> usize {
+    if rows >= 4096 { 32 } else { 8 }
 }
 
 fn effective_n_rot(cfg: &ModelConfig) -> usize {

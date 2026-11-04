@@ -332,6 +332,267 @@ void test_tiled_gemv(uint32_t &seed) {
 }
 
 
+// The batched prefill kernels give one warp one token: lane l owns eight
+// consecutive values at cg + l*8, and each block covers `row_tile` rows. These
+// loops mirror that indexing for eight tokens at once, which is where a
+// token/row/column mix-up would live.
+void check_dots(const char *name, const std::vector<float> &got,
+                const std::vector<sofuu_ref::Dot> &want) {
+    double worst_ratio = 0.0, worst_err = 0.0, worst_bound = 0.0;
+    double worst_ref = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        double err = std::fabs((double)got[i] - want[i].value);
+        double bound = 1e-5 * (want[i].l1 > 1.0 ? want[i].l1 : 1.0) + 1e-6;
+        double ratio = err / bound;
+        if (ratio > worst_ratio) {
+            worst_ratio = ratio;
+            worst_err = err;
+            worst_bound = bound;
+            worst_ref = want[i].value;
+        }
+    }
+    report(name, worst_ratio <= 1.0, worst_err, worst_bound, worst_ref);
+}
+
+void test_b8_gemm(uint32_t &seed) {
+    const int rows = 20, tokens = 8;
+    for (int cols : {2048, 8192}) {
+        int nb = cols / 256;
+        std::vector<uint8_t> w4, w6;
+        fill_q4_k(w4, rows, cols, seed);
+        fill_q6_k(w6, rows, cols, seed);
+        std::vector<float> x = random_vec(tokens * cols, seed, -1.0f, 1.0f);
+        std::vector<float> got4((size_t)tokens * rows, 0.0f);
+        std::vector<float> got6((size_t)tokens * rows, 0.0f);
+        std::vector<sofuu_ref::Dot> want4, want6;
+        want4.reserve((size_t)tokens * rows);
+        want6.reserve((size_t)tokens * rows);
+        for (int t = 0; t < tokens; ++t) {
+            const float *xrow = x.data() + (size_t)t * cols;
+            for (int row = 0; row < rows; ++row) {
+                const uint8_t *row4 = w4.data() + (size_t)row * nb * 144;
+                const uint8_t *row6 = w6.data() + (size_t)row * nb * 210;
+                float a4 = 0.0f, a6 = 0.0f;
+                for (int cg = 0; cg < cols; cg += 256) {
+                    int bi = cg >> 8;
+                    const auto *b4 = reinterpret_cast<const sofuu_block_q4_K *>(
+                        row4 + (size_t)bi * 144);
+                    const auto *b6 = reinterpret_cast<const sofuu_block_q6_K *>(
+                        row6 + (size_t)bi * 210);
+                    for (int lane = 0; lane < 32; ++lane) {
+                        int sub = lane >> 2, l0 = (lane & 3) << 3;
+                        unsigned int sc, mn;
+                        sofuu_q4k_scale_min(sub, b4->scales, &sc, &mn);
+                        float d4 = sofuu_f16_to_f32(b4->d);
+                        float dm = sofuu_f16_to_f32(b4->dmin);
+                        float s4 = d4 * (float)sc, m4 = dm * (float)mn;
+                        const uint8_t *qs4 = b4->qs + (sub >> 1) * 32;
+                        unsigned int hi = (unsigned int)(sub & 1);
+                        int n6 = sub >> 2, rr = sub & 3;
+                        float d6 = sofuu_f16_to_f32(b6->d);
+                        int sb = n6 * 8 + 2 * rr;
+                        float sc0 = (float)b6->scales[sb];
+                        float sc1 = (float)b6->scales[sb + 1];
+                        int ql_base = n6 * 64 + ((rr == 1 || rr == 3) ? 32 : 0);
+                        for (int k = 0; k < 8; ++k) {
+                            int col = cg + lane * 8 + k;
+                            float xv = xrow[col];
+                            unsigned int byte = qs4[l0 + k];
+                            unsigned int q4v = hi ? (byte >> 4) : (byte & 0x0fu);
+                            a4 += (s4 * (float)q4v - m4) * xv;
+                            int l = l0 + k;
+                            unsigned int ql = b6->ql[ql_base + l];
+                            unsigned int nib = (rr < 2) ? (ql & 0x0fu) : (ql >> 4);
+                            unsigned int hi2 =
+                                ((unsigned int)b6->qh[n6 * 32 + l] >> (2 * rr)) & 3u;
+                            int q6v = (int)(nib | (hi2 << 4)) - 32;
+                            float sc6 = (l >= 16) ? sc1 : sc0;
+                            a6 += d6 * sc6 * (float)q6v * xv;
+                        }
+                    }
+                }
+                got4[(size_t)t * rows + row] = a4;
+                got6[(size_t)t * rows + row] = a6;
+                want4.push_back(sofuu_ref::dot_q4_k(row4, xrow, cols));
+                want6.push_back(sofuu_ref::dot_q6_k(row6, xrow, cols));
+            }
+        }
+        check_dots(cols == 2048 ? "b8_q4_k" : "b8_q4_k_wide", got4, want4);
+        check_dots(cols == 2048 ? "b8_q6_k" : "b8_q6_k_wide", got6, want6);
+    }
+
+    for (int cols : {1024, 4096}) {
+        int nb = cols / 32;
+        std::vector<uint8_t> w;
+        fill_q8_0(w, rows, cols, seed);
+        std::vector<float> x = random_vec(tokens * cols, seed, -1.0f, 1.0f);
+        std::vector<float> got((size_t)tokens * rows, 0.0f);
+        std::vector<sofuu_ref::Dot> want;
+        want.reserve((size_t)tokens * rows);
+        for (int t = 0; t < tokens; ++t) {
+            const float *xrow = x.data() + (size_t)t * cols;
+            for (int row = 0; row < rows; ++row) {
+                const uint8_t *roww = w.data() + (size_t)row * nb * 34;
+                float acc = 0.0f;
+                for (int cg = 0; cg < cols; cg += 256) {
+                    for (int lane = 0; lane < 32; ++lane) {
+                        int bi = (cg >> 5) + (lane >> 2);
+                        int lane_in_block = lane & 3;
+                        const auto *b = reinterpret_cast<const sofuu_block_q8_0 *>(
+                            roww + (size_t)bi * 34);
+                        float d = sofuu_f16_to_f32(b->d);
+                        for (int k = 0; k < 8; ++k) {
+                            int col = cg + lane * 8 + k;
+                            acc += d * (float)b->qs[lane_in_block * 8 + k] *
+                                   xrow[col];
+                        }
+                    }
+                }
+                got[(size_t)t * rows + row] = acc;
+                want.push_back(sofuu_ref::dot_q8_0(roww, xrow, cols));
+            }
+        }
+        check_dots(cols == 1024 ? "b8_q8_0" : "b8_q8_0_wide", got, want);
+    }
+
+    // f32 has no quant blocks; the same warp/token map with a plain dot.
+    {
+        const int cols = 2048;
+        std::vector<float> w = random_vec(rows * cols, seed, -1.0f, 1.0f);
+        std::vector<float> x = random_vec(tokens * cols, seed, -1.0f, 1.0f);
+        std::vector<float> got((size_t)tokens * rows, 0.0f);
+        std::vector<sofuu_ref::Dot> want;
+        want.reserve((size_t)tokens * rows);
+        for (int t = 0; t < tokens; ++t) {
+            const float *xrow = x.data() + (size_t)t * cols;
+            for (int row = 0; row < rows; ++row) {
+                const float *roww = w.data() + (size_t)row * cols;
+                float acc = 0.0f;
+                for (int cg = 0; cg < cols; cg += 256) {
+                    for (int lane = 0; lane < 32; ++lane) {
+                        for (int k = 0; k < 8; ++k) {
+                            int col = cg + lane * 8 + k;
+                            acc += roww[col] * xrow[col];
+                        }
+                    }
+                }
+                got[(size_t)t * rows + row] = acc;
+                double sum = 0.0, l1 = 0.0;
+                for (int c = 0; c < cols; ++c) {
+                    double p = (double)roww[c] * xrow[c];
+                    sum += p;
+                    l1 += std::fabs(p);
+                }
+                want.push_back({sum, l1});
+            }
+        }
+        check_dots("b8_f32", got, want);
+    }
+}
+
+// Batched elementwise/attention indexing: each loop is the kernel's own
+// (token, head) decomposition, checked against the single-row references.
+void test_batch_paths(uint32_t &seed) {
+    const int tokens = 8, n_heads = 8, n_kv = 2, hd = 64, cap = 32, start = 5;
+
+    // RMSNorm over eight rows.
+    {
+        const int n = 512;
+        std::vector<float> x = random_vec(tokens * n, seed, -2.0f, 2.0f);
+        std::vector<float> w = random_vec(n, seed, 0.5f, 1.5f);
+        std::vector<float> got((size_t)tokens * n), want((size_t)tokens * n);
+        for (int t = 0; t < tokens; ++t) {
+            sofuu_ref::rmsnorm_ref(x.data() + (size_t)t * n, w.data(),
+                                   want.data() + (size_t)t * n, n, 1e-5f);
+            // Mirror the kernel's float accumulation.
+            const float *xr = x.data() + (size_t)t * n;
+            float *yr = got.data() + (size_t)t * n;
+            float ss = 0.0f;
+            for (int i = 0; i < n; ++i) ss += xr[i] * xr[i];
+            float scale = 1.0f / std::sqrt(ss / (float)n + 1e-5f);
+            for (int i = 0; i < n; ++i) yr[i] = xr[i] * scale * w[i];
+        }
+        check_vec("rmsnorm_batch", got.data(), want.data(), tokens * n, 1e-6, 1e-6);
+    }
+
+    // RoPE over a table with one row per token.
+    for (int interleaved = 0; interleaved < 2; ++interleaved) {
+        const int n_rot = hd;
+        std::vector<float> x = random_vec(tokens * n_heads * hd, seed, -1.0f, 1.0f);
+        std::vector<float> table = random_vec(tokens * hd, seed, -1.0f, 1.0f);
+        std::vector<float> got = x, want = x;
+        for (int t = 0; t < tokens; ++t) {
+            for (int h = 0; h < n_heads; ++h) {
+                size_t off = ((size_t)t * n_heads + h) * hd;
+                const float *ct = table.data() + (size_t)t * hd;
+                sofuu_ref::rope_ref(want.data() + off, ct, ct + hd / 2, 1, hd,
+                                    n_rot, interleaved);
+                float *base = got.data() + off;
+                for (int i = 0; i < n_rot / 2; ++i) {
+                    int i0 = interleaved ? 2 * i : i;
+                    int i1 = interleaved ? 2 * i + 1 : i + n_rot / 2;
+                    float c = ct[i], s = ct[hd / 2 + i];
+                    float x0 = base[i0], x1 = base[i1];
+                    base[i0] = x0 * c - x1 * s;
+                    base[i1] = x0 * s + x1 * c;
+                }
+            }
+        }
+        check_vec(interleaved ? "rope_batch_interleaved" : "rope_batch_split",
+                  got.data(), want.data(), tokens * n_heads * hd, 1e-6, 1e-6);
+    }
+
+    // KV writes for a chunk.
+    {
+        std::vector<float> kc((size_t)n_kv * cap * hd, 0.0f);
+        std::vector<float> vc((size_t)n_kv * cap * hd, 0.0f);
+        std::vector<float> k = random_vec(tokens * n_kv * hd, seed, -1.0f, 1.0f);
+        std::vector<float> v = random_vec(tokens * n_kv * hd, seed, -1.0f, 1.0f);
+        std::vector<float> got_k = kc, got_v = vc;
+        std::vector<float> want_k = kc, want_v = vc;
+        for (int t = 0; t < tokens; ++t) {
+            for (int h = 0; h < n_kv; ++h) {
+                size_t slot = ((size_t)h * cap + start + t) * hd;
+                const float *kr = k.data() + ((size_t)t * n_kv + h) * hd;
+                const float *vr = v.data() + ((size_t)t * n_kv + h) * hd;
+                std::memcpy(got_k.data() + slot, kr, hd * 4);
+                std::memcpy(got_v.data() + slot, vr, hd * 4);
+            }
+            sofuu_ref::kv_write_ref(want_k.data(), want_v.data(),
+                                    k.data() + (size_t)t * n_kv * hd,
+                                    v.data() + (size_t)t * n_kv * hd, start + t,
+                                    n_kv, hd, cap);
+        }
+        check_vec("kv_write_batch_k", got_k.data(), want_k.data(), n_kv * cap * hd,
+                  0.0, 0.0);
+        check_vec("kv_write_batch_v", got_v.data(), want_v.data(), n_kv * cap * hd,
+                  0.0, 0.0);
+    }
+
+    // Causal chunk attention: token t sees rows 0..start+t.
+    {
+        std::vector<float> q = random_vec(tokens * n_heads * hd, seed, -1.0f, 1.0f);
+        std::vector<float> kc = random_vec(n_kv * cap * hd, seed, -1.0f, 1.0f);
+        std::vector<float> vc = random_vec(n_kv * cap * hd, seed, -1.0f, 1.0f);
+        std::vector<float> got((size_t)tokens * n_heads * hd, 0.0f);
+        std::vector<float> want((size_t)tokens * n_heads * hd, 0.0f);
+        float scale = 1.0f / std::sqrt((float)hd);
+        for (int t = 0; t < tokens; ++t) {
+            sofuu_ref::attn_decode_ref(
+                q.data() + (size_t)t * n_heads * hd, kc.data(), vc.data(),
+                want.data() + (size_t)t * n_heads * hd, n_heads, n_kv, hd,
+                start + t + 1, cap, scale);
+            // The prefill kernel is the decode math with a token offset.
+            sofuu_host_attn_decode(q.data() + (size_t)t * n_heads * hd,
+                                   kc.data(), vc.data(),
+                                   got.data() + (size_t)t * n_heads * hd,
+                                   n_heads, n_kv, hd, start + t + 1, cap, scale);
+        }
+        check_vec("attn_prefill", got.data(), want.data(), tokens * n_heads * hd,
+                  2e-5, 2e-6);
+    }
+}
+
 // The q4_K kernel reads eight qs bytes as one little-endian uint64. Verify the
 // shift/nibble extraction against the per-byte definition on the host.
 void test_q4_vector_extract(uint32_t &seed) {
@@ -372,6 +633,8 @@ int main(void) {
     test_add(seed);
     test_tiled_gemv(seed);
     test_q4_vector_extract(seed);
+    test_b8_gemm(seed);
+    test_batch_paths(seed);
     if (g_failures == 0) {
         std::printf("RESULT: PASS (all host kernel references match)\n");
         return 0;

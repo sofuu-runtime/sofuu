@@ -2074,12 +2074,38 @@ impl TransformerModel {
         }
         #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
         if self.cuda.is_some() {
-            // The CUDA path is one token at a time for v1: a prompt token
-            // still runs the whole block stack on the device, so the KV is
-            // built exactly as decode expects it. Batched GEMM prefill is C3.
-            for &tok in tokens {
-                self.forward_impl(tok, start_pos, false);
-                start_pos += 1;
+            if tokens.len() == 1 {
+                self.forward_impl(tokens[0], start_pos, false);
+                return;
+            }
+            // One chunk = one pass through the block stack: the b8 kernels
+            // give each warp one token, so the weight tile is read once for
+            // the chunk instead of once per prompt token.
+            let dim = self.config.dim;
+            // The shared x_batch may be smaller than eight if the operator
+            // lowered SOFUU_PREFILL_BATCH; the kernels accept 1..=8.
+            let batch = super::cuda_model::PREFILL_BATCH.min(max_prefill_batch());
+            for chunk in tokens.chunks(batch) {
+                let n = chunk.len();
+                for (i, &tok) in chunk.iter().enumerate() {
+                    Self::lookup_embedding(
+                        &self.gguf,
+                        &self.token_embd,
+                        tok,
+                        dim,
+                        &mut self.x_batch[i * dim..(i + 1) * dim],
+                    );
+                }
+                let cuda = self.cuda.as_mut().expect("checked above");
+                if let Err(e) =
+                    cuda.forward_batch(&self.x_batch[..n * dim], start_pos, n, false)
+                {
+                    eprintln!(
+                        "\x1b[31m[cuda] prefill chunk failed at pos {start_pos}: {e}\x1b[0m"
+                    );
+                    panic!("CUDA prefill failed");
+                }
+                start_pos += n;
             }
             return;
         }
@@ -2116,9 +2142,43 @@ impl TransformerModel {
         }
         #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
         if self.cuda.is_some() {
-            let last = tokens.len() - 1;
-            for (i, &tok) in tokens.iter().enumerate() {
-                self.forward_impl(tok, start_pos + i, i == last);
+            if tokens.len() == 1 {
+                return self.forward(tokens[0], start_pos);
+            }
+            let dim = self.config.dim;
+            let batch = super::cuda_model::PREFILL_BATCH.min(max_prefill_batch());
+            let mut cur = start_pos;
+            let mut off = 0;
+            while off < tokens.len() {
+                let n = (tokens.len() - off).min(batch);
+                let chunk = &tokens[off..off + n];
+                for (i, &tok) in chunk.iter().enumerate() {
+                    Self::lookup_embedding(
+                        &self.gguf,
+                        &self.token_embd,
+                        tok,
+                        dim,
+                        &mut self.x_batch[i * dim..(i + 1) * dim],
+                    );
+                }
+                let last_chunk = off + n == tokens.len();
+                let cuda = self.cuda.as_mut().expect("checked above");
+                if let Err(e) = cuda.forward_batch(
+                    &self.x_batch[..n * dim],
+                    cur,
+                    n,
+                    last_chunk,
+                ) {
+                    eprintln!(
+                        "\x1b[31m[cuda] prefill chunk failed at pos {cur}: {e}\x1b[0m"
+                    );
+                    panic!("CUDA prefill failed");
+                }
+                if last_chunk {
+                    self.logits.copy_from_slice(cuda.logits());
+                }
+                cur += n;
+                off += n;
             }
             return &self.logits;
         }

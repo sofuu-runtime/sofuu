@@ -287,6 +287,171 @@ void test_gemv_f32(void *fn, uint32_t &seed) {
     sofuu_cuda_ctx_free(g_ctx, dy);
 }
 
+// ── Batched prefill ───────────────────────────────────────────────────────
+// The b8 kernels are one warp per token. Verify every (token, row) pair, not
+// just row 0, because a token/row mix-up would still produce plausible values.
+void test_gemm_b8(void *fn, uint32_t &seed, int kind, int cols) {
+    const int rows = 20, tokens = 8, tile = 8;
+    std::vector<uint8_t> wbytes;
+    std::vector<float> wf;
+    const uint8_t *wdata = nullptr;
+    size_t wsize = 0;
+    if (kind == 0) {
+        fill_q8_0(wbytes, rows, cols, seed);
+        wdata = wbytes.data();
+        wsize = wbytes.size();
+    } else if (kind == 1) {
+        fill_q4_k(wbytes, rows, cols, seed);
+        wdata = wbytes.data();
+        wsize = wbytes.size();
+    } else if (kind == 2) {
+        fill_q6_k(wbytes, rows, cols, seed);
+        wdata = wbytes.data();
+        wsize = wbytes.size();
+    } else {
+        wf = random_vec(rows * cols, seed, -1.0f, 1.0f);
+        wdata = reinterpret_cast<const uint8_t *>(wf.data());
+        wsize = wf.size() * sizeof(float);
+    }
+    std::vector<float> x = random_vec(tokens * cols, seed, -1.0f, 1.0f);
+    std::vector<float> got((size_t)tokens * rows, 0.0f);
+
+    unsigned long long dw = 0, dx = 0, dy = 0;
+    if (!alloc_upload(wdata, wsize, &dw) ||
+        !alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
+        !alloc_only((unsigned long long)tokens * rows * sizeof(float), &dy)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    std::vector<void *> params = {&dw, &dx, &dy, (void *)&rows, (void *)&cols,
+                                  (void *)&tokens, (void *)&tile};
+    bool ok = launch(fn, (unsigned)((rows + tile - 1) / tile), 256, params) &&
+              download(dy, got.data(), (size_t)tokens * rows * sizeof(float));
+
+    double worst_ratio = 0.0, worst_err = 0.0, worst_bound = 0.0;
+    double first_ref = 0.0;
+    for (int t = 0; t < tokens; ++t) {
+        const float *xrow = x.data() + (size_t)t * cols;
+        for (int row = 0; row < rows; ++row) {
+            const uint8_t *roww = wdata + (size_t)row *
+                                             (size_t)(kind == 0 ? (cols / 32) * 34
+                                                    : kind == 1 ? (cols / 256) * 144
+                                                    : kind == 2 ? (cols / 256) * 210
+                                                                : (size_t)cols * 4);
+            sofuu_ref::Dot want;
+            if (kind == 0) want = sofuu_ref::dot_q8_0(roww, xrow, cols);
+            else if (kind == 1) want = sofuu_ref::dot_q4_k(roww, xrow, cols);
+            else if (kind == 2) want = sofuu_ref::dot_q6_k(roww, xrow, cols);
+            else {
+                const float *rowf = wf.data() + (size_t)row * cols;
+                double sum = 0.0, l1 = 0.0;
+                for (int c = 0; c < cols; ++c) {
+                    double p = (double)rowf[c] * xrow[c];
+                    sum += p;
+                    l1 += std::fabs(p);
+                }
+                want = {sum, l1};
+            }
+            double err = std::fabs((double)got[(size_t)t * rows + row] - want.value);
+            double bound = 1e-5 * (want.l1 > 1.0 ? want.l1 : 1.0) + 1e-6;
+            double ratio = err / bound;
+            if (ratio > worst_ratio) {
+                worst_ratio = ratio;
+                worst_err = err;
+                worst_bound = bound;
+                first_ref = want.value;
+            }
+        }
+    }
+    const char *base = kind == 0 ? "b8_q8_0" : kind == 1 ? "b8_q4_k"
+                       : kind == 2 ? "b8_q6_k" : "b8_f32";
+    bool wide = cols >= 4096;
+    char name[32];
+    std::snprintf(name, sizeof(name), "%s%s", base, wide ? "_wide" : "");
+    report(name, ok && worst_ratio <= 1.0, worst_err, worst_bound, first_ref);
+    sofuu_cuda_ctx_free(g_ctx, dw);
+    sofuu_cuda_ctx_free(g_ctx, dx);
+    sofuu_cuda_ctx_free(g_ctx, dy);
+}
+
+void test_attn_prefill(void *fn, uint32_t &seed) {
+    const int tokens = 8, n_heads = 8, n_kv = 2, hd = 64, cap = 32, start = 5;
+    std::vector<float> q = random_vec(tokens * n_heads * hd, seed, -1.0f, 1.0f);
+    std::vector<float> kc = random_vec(n_kv * cap * hd, seed, -1.0f, 1.0f);
+    std::vector<float> vc = random_vec(n_kv * cap * hd, seed, -1.0f, 1.0f);
+    std::vector<float> got((size_t)tokens * n_heads * hd, 0.0f);
+    std::vector<float> want((size_t)tokens * n_heads * hd, 0.0f);
+    float scale = 1.0f / std::sqrt((float)hd);
+
+    unsigned long long dq = 0, dk = 0, dv = 0, dout = 0;
+    if (!alloc_upload(q.data(), q.size() * sizeof(float), &dq) ||
+        !alloc_upload(kc.data(), kc.size() * sizeof(float), &dk) ||
+        !alloc_upload(vc.data(), vc.size() * sizeof(float), &dv) ||
+        !alloc_only((unsigned long long)tokens * n_heads * hd * sizeof(float), &dout)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    std::vector<void *> params = {&dq, &dk, &dv, &dout, (void *)&n_heads,
+                                  (void *)&n_kv, (void *)&hd, (void *)&start,
+                                  (void *)&tokens, (void *)&cap, &scale};
+    bool ok = launch(fn, (unsigned)(tokens * n_heads), 256, params) &&
+              download(dout, got.data(), (size_t)tokens * n_heads * hd * sizeof(float));
+    for (int t = 0; t < tokens; ++t) {
+        sofuu_ref::attn_decode_ref(
+            q.data() + (size_t)t * n_heads * hd, kc.data(), vc.data(),
+            want.data() + (size_t)t * n_heads * hd, n_heads, n_kv, hd,
+            start + t + 1, cap, scale);
+    }
+    double max_err = 0.0, max_ref = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        max_err = std::fmax(max_err, std::fabs((double)got[i] - want[i]));
+        max_ref = std::fmax(max_ref, std::fabs((double)want[i]));
+    }
+    double bound = 2e-5 * (max_ref > 1.0 ? max_ref : 1.0) + 1e-6;
+    report("attn_prefill", ok && max_err <= bound, max_err, bound,
+           (double)want[0]);
+    sofuu_cuda_ctx_free(g_ctx, dq);
+    sofuu_cuda_ctx_free(g_ctx, dk);
+    sofuu_cuda_ctx_free(g_ctx, dv);
+    sofuu_cuda_ctx_free(g_ctx, dout);
+}
+
+void test_rmsnorm_batch(void *fn, uint32_t &seed) {
+    const int rows = 8, n = 512;
+    float eps = 1e-5f;
+    std::vector<float> x = random_vec(rows * n, seed, -2.0f, 2.0f);
+    std::vector<float> w = random_vec(n, seed, 0.5f, 1.5f);
+    std::vector<float> got((size_t)rows * n, 0.0f), want((size_t)rows * n, 0.0f);
+    for (int r = 0; r < rows; ++r)
+        sofuu_ref::rmsnorm_ref(x.data() + (size_t)r * n, w.data(),
+                               want.data() + (size_t)r * n, n, eps);
+    unsigned long long dx = 0, dw = 0, dy = 0;
+    if (!alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
+        !alloc_upload(w.data(), w.size() * sizeof(float), &dw) ||
+        !alloc_only((unsigned long long)rows * n * sizeof(float), &dy)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    std::vector<void *> params = {&dx, &dw, &dy, (void *)&n, &eps,
+                                  (void *)&rows};
+    bool ok = launch(fn, (unsigned)rows, 256, params) &&
+              download(dy, got.data(), (size_t)rows * n * sizeof(float));
+    double max_err = 0.0, max_ref = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        max_err = std::fmax(max_err, std::fabs((double)got[i] - want[i]));
+        max_ref = std::fmax(max_ref, std::fabs((double)want[i]));
+    }
+    double bound = 1e-4 * (max_ref > 1.0 ? max_ref : 1.0) + 1e-5;
+    report("rmsnorm_batch", ok && max_err <= bound, max_err, bound,
+           (double)want[0]);
+    sofuu_cuda_ctx_free(g_ctx, dx);
+    sofuu_cuda_ctx_free(g_ctx, dw);
+    sofuu_cuda_ctx_free(g_ctx, dy);
+}
+
 // ── Elementwise tests ──────────────────────────────────────────────────────
 void test_rmsnorm(void *fn, uint32_t &seed) {
     const int n = 1024;
@@ -541,6 +706,8 @@ int main(int argc, char **argv) {
     void *f_q8 = nullptr, *f_q4 = nullptr, *f_q6 = nullptr, *f_f32 = nullptr;
     void *f_rms = nullptr, *f_swi = nullptr, *f_rope = nullptr, *f_kv = nullptr;
     void *f_attn = nullptr, *f_add = nullptr;
+    void *f_b8_q4 = nullptr, *f_b8_q6 = nullptr, *f_b8_q8 = nullptr;
+    void *f_b8_f32 = nullptr, *f_rms_b = nullptr, *f_attn_p = nullptr;
     if (!get_function("sofuu_gemv_q8_0", &f_q8) ||
         !get_function("sofuu_gemv_q4_k", &f_q4) ||
         !get_function("sofuu_gemv_q6_k", &f_q6) ||
@@ -550,7 +717,13 @@ int main(int argc, char **argv) {
         !get_function("sofuu_rope_f32", &f_rope) ||
         !get_function("sofuu_kv_write_f32", &f_kv) ||
         !get_function("sofuu_attn_decode_f32", &f_attn) ||
-        !get_function("sofuu_add_f32", &f_add)) {
+        !get_function("sofuu_add_f32", &f_add) ||
+        !get_function("sofuu_gemm_q4_k_b8", &f_b8_q4) ||
+        !get_function("sofuu_gemm_q6_k_b8", &f_b8_q6) ||
+        !get_function("sofuu_gemm_q8_0_b8", &f_b8_q8) ||
+        !get_function("sofuu_gemm_f32_b8", &f_b8_f32) ||
+        !get_function("sofuu_rmsnorm_batch", &f_rms_b) ||
+        !get_function("sofuu_attn_prefill_f32", &f_attn_p)) {
         return 1;
     }
 
@@ -567,6 +740,14 @@ int main(int argc, char **argv) {
     test_kv_write(f_kv, seed);
     test_attn_decode(f_attn, seed);
     test_add(f_add, seed);
+    for (int cols : {1024, 4096}) test_gemm_b8(f_b8_q8, seed, 0, cols);
+    for (int cols : {2048, 8192}) {
+        test_gemm_b8(f_b8_q4, seed, 1, cols);
+        test_gemm_b8(f_b8_q6, seed, 2, cols);
+    }
+    test_gemm_b8(f_b8_f32, seed, 3, 1024);
+    test_rmsnorm_batch(f_rms_b, seed);
+    test_attn_prefill(f_attn_p, seed);
 
     sofuu_cuda_ctx_destroy(g_ctx);
     sofuu_cuda_driver_close(g_drv);

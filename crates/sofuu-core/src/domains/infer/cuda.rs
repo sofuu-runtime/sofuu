@@ -21,7 +21,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 /// Every kernel name the checked-in PTX must export. Kept in one place so the
 /// generator script, the Rust init check and the tests cannot drift.
-pub const PTX_ENTRIES: [&str; 10] = [
+pub const PTX_ENTRIES: [&str; 18] = [
     "sofuu_gemv_q8_0",
     "sofuu_gemv_q4_k",
     "sofuu_gemv_q6_k",
@@ -32,6 +32,14 @@ pub const PTX_ENTRIES: [&str; 10] = [
     "sofuu_kv_write_f32",
     "sofuu_attn_decode_f32",
     "sofuu_add_f32",
+    "sofuu_gemm_q4_k_b8",
+    "sofuu_gemm_q6_k_b8",
+    "sofuu_gemm_q8_0_b8",
+    "sofuu_gemm_f32_b8",
+    "sofuu_rmsnorm_batch",
+    "sofuu_rope_batch",
+    "sofuu_kv_write_batch",
+    "sofuu_attn_prefill_f32",
 ];
 
 /// Weight layouts the C1 kernels cover. `block_bytes` is the GGML on-disk
@@ -51,6 +59,18 @@ impl Quant {
             Quant::Q8_0 => "sofuu_gemv_q8_0",
             Quant::Q4K => "sofuu_gemv_q4_k",
             Quant::Q6K => "sofuu_gemv_q6_k",
+        }
+    }
+
+    /// Batched-prefill kernel: one warp per token, eight tokens per weight
+    /// read. Keeping the name beside `entry` means a new quant cannot be added
+    /// to one path and forgotten in the other.
+    pub fn batch_entry(self) -> &'static str {
+        match self {
+            Quant::F32 => "sofuu_gemm_f32_b8",
+            Quant::Q8_0 => "sofuu_gemm_q8_0_b8",
+            Quant::Q4K => "sofuu_gemm_q4_k_b8",
+            Quant::Q6K => "sofuu_gemm_q6_k_b8",
         }
     }
 
@@ -220,6 +240,180 @@ pub fn validate_attn_decode(
     if k_bytes < cache_need || v_bytes < cache_need {
         return Err(CudaError(format!(
             "attn_decode needs {cache_need} bytes per KV cache, got {k_bytes} and {v_bytes}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a batched-prefill GEMV. `x` holds `n_tokens` rows of `cols`
+/// activations and `y` holds `n_tokens` rows of `rows` outputs, both
+/// token-major; the kernel writes `y[t * rows + row]`.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_gemm_b8(
+    quant: Quant,
+    rows: usize,
+    cols: usize,
+    n_tokens: usize,
+    row_tile: usize,
+    w_bytes: usize,
+    x_bytes: usize,
+    y_bytes: usize,
+) -> Result<(), CudaError> {
+    if rows == 0 || cols == 0 {
+        return Err(CudaError("gemm_b8 needs non-zero rows and cols".into()));
+    }
+    // Activations are loaded as aligned float4s; a row width that is not a
+    // multiple of four would misalign every token row after the first.
+    if cols % 4 != 0 {
+        return Err(CudaError(format!(
+            "gemm_b8 cols {cols} is not a multiple of 4 (aligned float4 rows)"
+        )));
+    }
+    if n_tokens == 0 || n_tokens > 8 {
+        return Err(CudaError(format!(
+            "gemm_b8 n_tokens {n_tokens} is outside 1..=8 (one warp per token)"
+        )));
+    }
+    if row_tile == 0 || row_tile > 32 || row_tile % 8 != 0 {
+        return Err(CudaError(format!(
+            "gemm_b8 row_tile {row_tile} must be a multiple of 8 in 8..=32"
+        )));
+    }
+    let Some(row_bytes) = quant.row_bytes(cols) else {
+        return Err(CudaError(format!(
+            "{} does not accept cols={cols}",
+            quant.batch_entry()
+        )));
+    };
+    let need_w = row_bytes
+        .checked_mul(rows)
+        .ok_or_else(|| CudaError("gemm_b8 weight size overflow".into()))?;
+    let need_x = n_tokens
+        .checked_mul(cols)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or_else(|| CudaError("gemm_b8 x size overflow".into()))?;
+    let need_y = n_tokens
+        .checked_mul(rows)
+        .and_then(|v| v.checked_mul(4))
+        .ok_or_else(|| CudaError("gemm_b8 y size overflow".into()))?;
+    if w_bytes < need_w || x_bytes < need_x || y_bytes < need_y {
+        return Err(CudaError(format!(
+            "gemm_b8 buffers too small: w {w_bytes}<{need_w}, x {x_bytes}<{need_x}, y {y_bytes}<{need_y}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a batched KV write for `n_tokens` consecutive positions.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_kv_write_batch(
+    start_pos: usize,
+    n_tokens: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    cap: usize,
+    k_cache_bytes: usize,
+    v_cache_bytes: usize,
+    k_bytes: usize,
+    v_bytes: usize,
+) -> Result<(), CudaError> {
+    if n_tokens == 0 || n_kv_heads == 0 || head_dim == 0 || cap == 0 {
+        return Err(CudaError(
+            "kv_write_batch needs non-zero tokens, heads, head_dim and cap".into(),
+        ));
+    }
+    if start_pos
+        .checked_add(n_tokens)
+        .is_none_or(|end| end > cap)
+    {
+        return Err(CudaError(format!(
+            "kv_write_batch positions {start_pos}..{} leave a cache of {cap} rows",
+            start_pos + n_tokens
+        )));
+    }
+    let bytes = std::mem::size_of::<f32>();
+    let cache_need = n_kv_heads
+        .checked_mul(cap)
+        .and_then(|v| v.checked_mul(head_dim))
+        .and_then(|v| v.checked_mul(bytes))
+        .ok_or_else(|| CudaError("kv_write_batch cache shape overflow".into()))?;
+    if k_cache_bytes < cache_need || v_cache_bytes < cache_need {
+        return Err(CudaError(format!(
+            "kv_write_batch needs {cache_need} bytes per cache, got {k_cache_bytes} and {v_cache_bytes}"
+        )));
+    }
+    let src = n_tokens
+        .checked_mul(n_kv_heads)
+        .and_then(|v| v.checked_mul(head_dim))
+        .and_then(|v| v.checked_mul(bytes))
+        .ok_or_else(|| CudaError("kv_write_batch source shape overflow".into()))?;
+    if k_bytes < src || v_bytes < src {
+        return Err(CudaError(format!(
+            "kv_write_batch needs {src} bytes per source batch, got {k_bytes} and {v_bytes}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the batched causal-attention launch. Every token in the chunk
+/// attends over at most `start_pos + n_tokens` rows, so that is the bound the
+/// cache must hold.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_attn_prefill(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    start_pos: usize,
+    n_tokens: usize,
+    cap: usize,
+    q_bytes: usize,
+    k_bytes: usize,
+    v_bytes: usize,
+    out_bytes: usize,
+) -> Result<(), CudaError> {
+    if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || cap == 0 || n_tokens == 0 {
+        return Err(CudaError(
+            "attn_prefill needs non-zero heads, head_dim, cap and tokens".into(),
+        ));
+    }
+    if head_dim > 256 {
+        return Err(CudaError(format!(
+            "attn_prefill head_dim {head_dim} exceeds the 256-thread block"
+        )));
+    }
+    if !n_heads.is_multiple_of(n_kv_heads) {
+        return Err(CudaError(format!(
+            "attn_prefill n_heads {n_heads} is not a multiple of n_kv_heads {n_kv_heads}"
+        )));
+    }
+    if start_pos
+        .checked_add(n_tokens)
+        .is_none_or(|end| end > cap)
+    {
+        return Err(CudaError(format!(
+            "attn_prefill chunk {start_pos}..{} leaves a cache of {cap} rows",
+            start_pos + n_tokens
+        )));
+    }
+    let f32b = std::mem::size_of::<f32>();
+    let q_need = n_tokens
+        .checked_mul(n_heads)
+        .and_then(|v| v.checked_mul(head_dim))
+        .and_then(|v| v.checked_mul(f32b))
+        .ok_or_else(|| CudaError("attn_prefill q shape overflow".into()))?;
+    let cache_need = n_kv_heads
+        .checked_mul(cap)
+        .and_then(|v| v.checked_mul(head_dim))
+        .and_then(|v| v.checked_mul(f32b))
+        .ok_or_else(|| CudaError("attn_prefill cache shape overflow".into()))?;
+    if q_bytes < q_need || out_bytes < q_need {
+        return Err(CudaError(format!(
+            "attn_prefill needs {q_need} bytes for q/out, got {q_bytes} and {out_bytes}"
+        )));
+    }
+    if k_bytes < cache_need || v_bytes < cache_need {
+        return Err(CudaError(format!(
+            "attn_prefill needs {cache_need} bytes per KV cache, got {k_bytes} and {v_bytes}"
         )));
     }
     Ok(())
@@ -911,6 +1105,247 @@ mod imp {
             )
         }
 
+        /// Batched prefill GEMV: one warp per token, `row_tile` output rows per
+        /// block. `x` is [n_tokens, cols] and `y` is [n_tokens, rows], both
+        /// token-major; the weight is read once and reused across the chunk.
+        #[allow(clippy::too_many_arguments)]
+        pub fn gemm_b8(
+            &self,
+            quant: Quant,
+            weights: DeviceBuf,
+            x: DeviceBuf,
+            y: DeviceBuf,
+            rows: usize,
+            cols: usize,
+            n_tokens: usize,
+            row_tile: usize,
+        ) -> Result<(), CudaError> {
+            validate_gemm_b8(
+                quant, rows, cols, n_tokens, row_tile, weights.bytes, x.bytes, y.bytes,
+            )?;
+            let mut wp = weights.ptr;
+            let mut xp = x.ptr;
+            let mut yp = y.ptr;
+            let mut r = rows as i32;
+            let mut c = cols as i32;
+            let mut n = n_tokens as i32;
+            let mut rt = row_tile as i32;
+            let mut params: [*mut c_void; 7] = [
+                &mut wp as *mut u64 as *mut c_void,
+                &mut xp as *mut u64 as *mut c_void,
+                &mut yp as *mut u64 as *mut c_void,
+                &mut r as *mut i32 as *mut c_void,
+                &mut c as *mut i32 as *mut c_void,
+                &mut n as *mut i32 as *mut c_void,
+                &mut rt as *mut i32 as *mut c_void,
+            ];
+            let grid = ((rows + row_tile - 1) / row_tile) as u32;
+            self.launch(quant.batch_entry(), (grid, 1, 1), (256, 1, 1), &mut params)
+        }
+
+        /// RMSNorm over `rows` consecutive rows of `n` values.
+        pub fn rmsnorm_batch(
+            &self,
+            x: DeviceBuf,
+            w: DeviceBuf,
+            y: DeviceBuf,
+            n: usize,
+            eps: f32,
+            rows: usize,
+        ) -> Result<(), CudaError> {
+            let need = rows
+                .checked_mul(n)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(|| CudaError("rmsnorm_batch shape overflow".into()))?;
+            if n == 0 || rows == 0 || x.bytes < need || y.bytes < need || w.bytes < n * 4 {
+                return Err(CudaError(format!(
+                    "rmsnorm_batch buffers too small: x {} y {} w {} need {need}/{need}/{}",
+                    x.bytes, y.bytes, w.bytes, n * 4
+                )));
+            }
+            let mut xp = x.ptr;
+            let mut wp = w.ptr;
+            let mut yp = y.ptr;
+            let mut nn = n as i32;
+            let mut ee = eps;
+            let mut rr = rows as i32;
+            let mut params: [*mut c_void; 6] = [
+                &mut xp as *mut u64 as *mut c_void,
+                &mut wp as *mut u64 as *mut c_void,
+                &mut yp as *mut u64 as *mut c_void,
+                &mut nn as *mut i32 as *mut c_void,
+                &mut ee as *mut f32 as *mut c_void,
+                &mut rr as *mut i32 as *mut c_void,
+            ];
+            self.launch(
+                "sofuu_rmsnorm_batch",
+                (rows as u32, 1, 1),
+                (256, 1, 1),
+                &mut params,
+            )
+        }
+
+        /// RoPE over `n_tokens` tokens. `table` holds one [head_dim] row per
+        /// token (cosine half then sine half), built by `quant::rope_table_rows`.
+        #[allow(clippy::too_many_arguments)]
+        pub fn rope_batch(
+            &self,
+            x: DeviceBuf,
+            table: DeviceBuf,
+            n_heads: usize,
+            head_dim: usize,
+            n_rot: usize,
+            interleaved: bool,
+            n_tokens: usize,
+        ) -> Result<(), CudaError> {
+            let need = n_tokens
+                .checked_mul(head_dim)
+                .and_then(|v| v.checked_mul(4))
+                .ok_or_else(|| CudaError("rope_batch table shape overflow".into()))?;
+            if table.bytes < need {
+                return Err(CudaError(format!(
+                    "rope_batch table {}<{need} bytes",
+                    table.bytes
+                )));
+            }
+            let mut xp = x.ptr;
+            let mut tp = table.ptr;
+            let mut h = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut nr = n_rot as i32;
+            let mut il = if interleaved { 1i32 } else { 0i32 };
+            let mut n = n_tokens as i32;
+            let mut params: [*mut c_void; 7] = [
+                &mut xp as *mut u64 as *mut c_void,
+                &mut tp as *mut u64 as *mut c_void,
+                &mut h as *mut i32 as *mut c_void,
+                &mut hd as *mut i32 as *mut c_void,
+                &mut nr as *mut i32 as *mut c_void,
+                &mut il as *mut i32 as *mut c_void,
+                &mut n as *mut i32 as *mut c_void,
+            ];
+            self.launch(
+                "sofuu_rope_batch",
+                ((n_tokens * n_heads) as u32, 1, 1),
+                (128, 1, 1),
+                &mut params,
+            )
+        }
+
+        /// Write `n_tokens` consecutive K/V rows into the cache.
+        #[allow(clippy::too_many_arguments)]
+        pub fn kv_write_batch(
+            &self,
+            k_cache: DeviceBuf,
+            v_cache: DeviceBuf,
+            k: DeviceBuf,
+            v: DeviceBuf,
+            start_pos: usize,
+            n_tokens: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            cap: usize,
+        ) -> Result<(), CudaError> {
+            validate_kv_write_batch(
+                start_pos,
+                n_tokens,
+                n_kv_heads,
+                head_dim,
+                cap,
+                k_cache.bytes,
+                v_cache.bytes,
+                k.bytes,
+                v.bytes,
+            )?;
+            let mut kc = k_cache.ptr;
+            let mut vc = v_cache.ptr;
+            let mut kp = k.ptr;
+            let mut vp = v.ptr;
+            let mut p = start_pos as i32;
+            let mut nt = n_tokens as i32;
+            let mut h = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut c = cap as i32;
+            let mut params: [*mut c_void; 9] = [
+                &mut kc as *mut u64 as *mut c_void,
+                &mut vc as *mut u64 as *mut c_void,
+                &mut kp as *mut u64 as *mut c_void,
+                &mut vp as *mut u64 as *mut c_void,
+                &mut p as *mut i32 as *mut c_void,
+                &mut nt as *mut i32 as *mut c_void,
+                &mut h as *mut i32 as *mut c_void,
+                &mut hd as *mut i32 as *mut c_void,
+                &mut c as *mut i32 as *mut c_void,
+            ];
+            self.launch(
+                "sofuu_kv_write_batch",
+                ((n_tokens * n_kv_heads) as u32, 1, 1),
+                (128, 1, 1),
+                &mut params,
+            )
+        }
+
+        /// Causal attention for a whole chunk: one block per (token, head),
+        /// token t attending over [0, start_pos+t].
+        #[allow(clippy::too_many_arguments)]
+        pub fn attn_prefill(
+            &self,
+            q: DeviceBuf,
+            k_cache: DeviceBuf,
+            v_cache: DeviceBuf,
+            out: DeviceBuf,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            start_pos: usize,
+            n_tokens: usize,
+            cap: usize,
+            scale: f32,
+        ) -> Result<(), CudaError> {
+            validate_attn_prefill(
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                start_pos,
+                n_tokens,
+                cap,
+                q.bytes,
+                k_cache.bytes,
+                v_cache.bytes,
+                out.bytes,
+            )?;
+            let mut qp = q.ptr;
+            let mut kc = k_cache.ptr;
+            let mut vc = v_cache.ptr;
+            let mut op = out.ptr;
+            let mut nh = n_heads as i32;
+            let mut nk = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut sp = start_pos as i32;
+            let mut nt = n_tokens as i32;
+            let mut c = cap as i32;
+            let mut s = scale;
+            let mut params: [*mut c_void; 11] = [
+                &mut qp as *mut u64 as *mut c_void,
+                &mut kc as *mut u64 as *mut c_void,
+                &mut vc as *mut u64 as *mut c_void,
+                &mut op as *mut u64 as *mut c_void,
+                &mut nh as *mut i32 as *mut c_void,
+                &mut nk as *mut i32 as *mut c_void,
+                &mut hd as *mut i32 as *mut c_void,
+                &mut sp as *mut i32 as *mut c_void,
+                &mut nt as *mut i32 as *mut c_void,
+                &mut c as *mut i32 as *mut c_void,
+                &mut s as *mut f32 as *mut c_void,
+            ];
+            self.launch(
+                "sofuu_attn_prefill_f32",
+                ((n_tokens * n_heads) as u32, 1, 1),
+                (256, 1, 1),
+                &mut params,
+            )
+        }
+
         /// Host-side convenience used by integration tests: upload, run, read
         /// back. Not on the model's hot path.
         pub fn gemv_host(
@@ -1104,6 +1539,82 @@ mod imp {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }
 
+        #[allow(clippy::too_many_arguments)]
+        pub fn gemm_b8(
+            &self,
+            _quant: Quant,
+            _weights: DeviceBuf,
+            _x: DeviceBuf,
+            _y: DeviceBuf,
+            _rows: usize,
+            _cols: usize,
+            _n_tokens: usize,
+            _row_tile: usize,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn rmsnorm_batch(
+            &self,
+            _x: DeviceBuf,
+            _w: DeviceBuf,
+            _y: DeviceBuf,
+            _n: usize,
+            _eps: f32,
+            _rows: usize,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn rope_batch(
+            &self,
+            _x: DeviceBuf,
+            _table: DeviceBuf,
+            _n_heads: usize,
+            _head_dim: usize,
+            _n_rot: usize,
+            _interleaved: bool,
+            _n_tokens: usize,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn kv_write_batch(
+            &self,
+            _kc: DeviceBuf,
+            _vc: DeviceBuf,
+            _k: DeviceBuf,
+            _v: DeviceBuf,
+            _start_pos: usize,
+            _n_tokens: usize,
+            _n_kv_heads: usize,
+            _head_dim: usize,
+            _cap: usize,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn attn_prefill(
+            &self,
+            _q: DeviceBuf,
+            _kc: DeviceBuf,
+            _vc: DeviceBuf,
+            _out: DeviceBuf,
+            _n_heads: usize,
+            _n_kv_heads: usize,
+            _head_dim: usize,
+            _start_pos: usize,
+            _n_tokens: usize,
+            _cap: usize,
+            _scale: f32,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
         pub fn gemv_host(
             &self,
             _quant: Quant,
@@ -1241,6 +1752,50 @@ mod tests {
         assert!(validate_kv_write(0, 0, 4, 8, 256, 256, 64, 64).is_err());
         assert!(validate_kv_write(0, 2, 0, 8, 256, 256, 64, 64).is_err());
         assert!(validate_kv_write(0, 2, 4, 0, 256, 256, 64, 64).is_err());
+    }
+
+    #[test]
+    fn gemm_b8_bounds_are_refused_before_the_driver() {
+        // q4_K, 8 rows x 256 cols, eight tokens, eight-row tiles.
+        let w = 8 * 144;
+        let x = 8 * 256 * 4;
+        let y = 8 * 8 * 4;
+        assert!(validate_gemm_b8(Quant::Q4K, 8, 256, 8, 8, w, x, y).is_ok());
+
+        // The kernels are one warp per token and cannot take a ninth.
+        let e = validate_gemm_b8(Quant::Q4K, 8, 256, 9, 8, w, x, y).unwrap_err();
+        assert!(e.0.contains("outside 1..=8"), "{}", e.0);
+        assert!(validate_gemm_b8(Quant::Q4K, 8, 256, 0, 8, w, x, y).is_err());
+
+        // Row tiles are the 8-row accumulator groups.
+        assert!(validate_gemm_b8(Quant::Q4K, 8, 256, 8, 7, w, x, y).is_err());
+        assert!(validate_gemm_b8(Quant::Q4K, 8, 256, 8, 40, w, x, y).is_err());
+
+        // A short activation or output buffer would read/write out of bounds.
+        let e = validate_gemm_b8(Quant::Q4K, 8, 256, 8, 8, w, x - 4, y).unwrap_err();
+        assert!(e.0.contains("buffers too small"), "{}", e.0);
+        let e = validate_gemm_b8(Quant::Q4K, 8, 256, 8, 8, w, x, y - 4).unwrap_err();
+        assert!(e.0.contains("buffers too small"), "{}", e.0);
+
+        // f32 rows still need the aligned float4 width.
+        let e = validate_gemm_b8(Quant::F32, 8, 6, 1, 8, 8 * 6 * 4, 6 * 4, 8 * 4)
+            .unwrap_err();
+        assert!(e.0.contains("multiple of 4"), "{}", e.0);
+    }
+
+    #[test]
+    fn attn_prefill_bounds_are_refused_before_the_driver() {
+        let q = 8 * 8 * 64 * 4;
+        let cache = 2 * 32 * 64 * 4;
+        assert!(validate_attn_prefill(8, 2, 64, 5, 8, 32, q, cache, cache, q).is_ok());
+
+        // The chunk's last token attends over start_pos + n_tokens rows.
+        let e = validate_attn_prefill(8, 2, 64, 30, 8, 32, q, cache, cache, q)
+            .unwrap_err();
+        assert!(e.0.contains("leaves a cache"), "{}", e.0);
+        assert!(validate_attn_prefill(8, 2, 64, 5, 0, 32, q, cache, cache, q).is_err());
+        assert!(validate_attn_prefill(8, 3, 64, 5, 8, 32, q, cache, cache, q).is_err());
+        assert!(validate_attn_prefill(8, 2, 64, 5, 8, 32, q - 4, cache, cache, q).is_err());
     }
 
     #[test]

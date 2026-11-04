@@ -1878,7 +1878,7 @@
             entry.note = method;
           }
         };
-      } catch (eN) {}
+      } catch (eN) { /* the notify socket is optional: agents run without a dashboard listener. */ }
       return entry;
     })();
     MCP_POOL[key].catch(function () { delete MCP_POOL[key]; });
@@ -3381,7 +3381,7 @@
     if (mlEnabled(d)) {
       try { sofuu.ml.track(JSON.stringify({ kind: 'run_start', run: String(runId),
                                             task: clip(String(task == null ? '' : task), 300) })); }
-      catch (eMl) {}
+      catch (eMl) { /* telemetry: a failed run_start track loses one record, not the run. */ }
     }
     /* Freshness gate state for this run (§5): stale verdicts collected as
      * material comes in, flushed as ONE notice at the next context
@@ -3440,7 +3440,7 @@
        * overhead with a calibrated meter; bare runs estimate it.) */
       var overheadTk = estTok(String(d.system || ''));
       if (tools && tools.length) {
-        try { overheadTk += estTok(JSON.stringify(tools)); } catch (eT) {}
+        try { overheadTk += estTok(JSON.stringify(tools)); } catch (eT) { /* unserialisable tool specs add no overhead estimate. */ }
       }
       var taskTk = estTok(String(task == null ? '' : task));
       var attachTk = estTok(String(opts.context || '')) +
@@ -3938,7 +3938,7 @@
                              budgetCut: gated.budgetCut, scope: d.memory,
                              hits: [], skipped: 'window' });
           }
-        } catch (e) {}
+        } catch (e) { /* a skipped window read is reported in the same result as a gap. */ }
       }
 
       var identityLine = d.identity
@@ -4063,7 +4063,7 @@
         if (ACTIVE_COUNT === 0) runTick(mcpIdleDisconnect);
         if (mlEnabled(d)) {
           try { sofuu.ml.track(JSON.stringify({ kind: 'run_end', run: String(runId) })); }
-          catch (eEsM) {}
+          catch (eEsM) { /* same for run_end: telemetry never fails a run. */ }
         }
         refreshPlan();
         var esToolNames = [];
@@ -4076,13 +4076,13 @@
           esToolNames.push(esName);
           var esSpec = (sofuu.web && sofuu.web.TOOLS && sofuu.web.TOOLS[esName]) ||
                        (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[esName]);
-          try { esToolTk += estTok(esSpec ? JSON.stringify(esSpec) : esName); } catch (eEs) {}
+          try { esToolTk += estTok(esSpec ? JSON.stringify(esSpec) : esName); } catch (eEs) { /* a tool spec that will not serialise contributes none. */ }
         }
         for (var esJ = 0; esJ < d.inlineTools.length; esJ++) {
           esToolNames.push(d.inlineTools[esJ].name);
           try { esToolTk += estTok(JSON.stringify(d.inlineTools[esJ].name +
                  ' ' + (d.inlineTools[esJ].description || '') +
-                 ' ' + JSON.stringify(d.inlineTools[esJ].parameters || {}))); } catch (eEs2) {}
+                 ' ' + JSON.stringify(d.inlineTools[esJ].parameters || {}))); } catch (eEs2) { /* same for inline tools: estimate only. */ }
         }
         esToolTk += d.mcpSets.length * 40; /* mcp tools are name-only until spawn; flat tax */
         var esHeadTk = estTok(String(d.system || '')) +
@@ -4165,7 +4165,7 @@
                   } else {
                     id = cma.remember(v.vec, clip(fact, STORE_CAP_CHARS), 'user', 0, 'pin');
                   }
-                  try { cma.flush(); } catch (eF) {}
+                  try { cma.flush(); } catch (eF) { /* the pin is in memory either way; flush retries on the next open. */ }
                   if (semCma) {
                     try {
                       var sv = embedSemV2(clip(fact, STORE_CAP_CHARS));
@@ -4385,7 +4385,7 @@
             try {
               sofuu.rlm.logRoute({ ctxTokens: tokens, windowTokens: win, question: String(task),
                                    route: 'plain', latencyMs: 0, rlmCalls: 0 });
-            } catch (eLogP) {}
+            } catch (eLogP) { /* route logging is diagnostic; the answer is already produced. */ }
           }
           if (route === 'rlm') {
             /* Token budget (2026-10-14): the episode is metered. It runs
@@ -4453,7 +4453,7 @@
             tree.llmCalls += (res && res.calls) || 0;
             if (res && res.ms) { own.wallMs = res.ms; }
             try { sofuu.rlm.logRoute({ ctxTokens: tokens, windowTokens: win, question: String(task),
-                                       route: 'rlm', latencyMs: (res && res.ms) || 0, rlmCalls: (res && res.calls) || 0 }); } catch (e) {}
+                                       route: 'rlm', latencyMs: (res && res.ms) || 0, rlmCalls: (res && res.calls) || 0 }); } catch (e)  { /* telemetry: the run result is unaffected. */ }
             var rlmUsage = (res && res.usage) || {};
             emit('rlm:done', { calls: (res && res.calls) || 0, toolCalls: (res && (res.toolCalls || res.tool_calls)) || 0,
                                rounds: (res && res.rounds) || 0,
@@ -4716,7 +4716,7 @@
                                  nudge: clip(mlNudge, 160) });
               }
             }
-          } catch (eMl) {}
+          } catch (eMl) { /* telemetry again: the run result is unaffected. */ }
         }
         var result;
         var errored = false;
@@ -4753,7 +4753,7 @@
                * wall race so a cancel kills the in-flight child on either
                * branch; deregistered right after the tool settles. */
               var toolAbort = function () {
-                try { if (sofuu.tools && sofuu.tools.killActive) sofuu.tools.killActive(); } catch (eKa) {}
+                try { if (sofuu.tools && sofuu.tools.killActive) sofuu.tools.killActive(); } catch (eKa)  { /* killing a tool that already finished is not an error. */ }
               };
               state.aborts.push(toolAbort);
               var wallLeft = d.budget.maxWallMs - (Date.now() - started);
@@ -4856,7 +4856,7 @@
             try {
               spillTmp = (typeof process !== 'undefined' && process.env &&
                 (process.env.TMPDIR || process.env.TMP || process.env.TEMP)) || '';
-            } catch (eTmp) {}
+            } catch (eTmp) { /* no TMPDIR: spill files fall back to the working directory. */ }
             if (!spillTmp) spillTmp = '/tmp';
             var spillDir = String(spillTmp).replace(/\/+$/, '') + '/sofuu-tool-results/' + String(runId);
             await sofuu.fs.mkdir(spillDir, { recursive: true });

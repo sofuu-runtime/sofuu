@@ -933,6 +933,24 @@
       }));
       names[mt.name] = 1;
     }
+    if (sofuu.plugins && sofuu.plugins.TOOLS) {
+      var pKeys = Object.keys(sofuu.plugins.TOOLS);
+      for (var p = 0; p < pKeys.length; p++) {
+        var pk = pKeys[p];
+        if (names[pk]) continue;
+        var pt = sofuu.plugins.TOOLS[pk];
+        if (!pt) continue;
+        defs.push(gateTool({
+          name: pt.name,
+          description: pt.description || ('Plugin tool ' + pt.name),
+          parameters: pt.parameters || pt.schema || { type: 'object', properties: {} },
+          execute: (function (toolObj) {
+            return function (args, ctx) { return toolObj.execute(args, ctx); };
+          })(pt),
+        }));
+        names[pt.name] = 1;
+      }
+    }
     return defs;
   }
 
@@ -1621,6 +1639,11 @@
     if (!S.agentsDirLoaded) {
       S.agentsDirLoaded = true;
       try { if (typeof sofuu.agent.loadDir === 'function') await sofuu.agent.loadDir(); } catch (e) { /* the flag is set first, so a failed load is not retried in a loop. */ }
+    }
+    /* Plugins from ./plugins and ~/.sofuu/plugins (loaded once per session). */
+    if (!S.pluginsLoaded) {
+      S.pluginsLoaded = true;
+      try { if (sofuu.plugins && typeof sofuu.plugins.discoverAll === 'function') await sofuu.plugins.discoverAll(); } catch (eP) { /* best effort */ }
     }
     var subAgentNames = [];
     try {

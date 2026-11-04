@@ -242,19 +242,59 @@
     }
   }
   function showTools() {
-    if (mcpTools.length === 0) {
-      out('\n\x1b[90m  No MCP servers connected. Add one to ~/.sofuu/mcp.json:\x1b[0m');
-      out('  \x1b[90m  [{"name":"fs","command":"npx @modelcontextprotocol/server-filesystem /tmp"}]\x1b[0m\n');
+    let hasAny = false;
+    const pKeys = (sofuu.plugins && sofuu.plugins.TOOLS) ? Object.keys(sofuu.plugins.TOOLS) : [];
+    if (pKeys.length > 0) {
+      hasAny = true;
+      out('\n\x1b[1m  Plugin tools\x1b[0m \x1b[90m(' + pKeys.length + ' active · 5-Shield sandboxed)\x1b[0m');
+      for (const pk of pKeys) {
+        const pt = sofuu.plugins.TOOLS[pk];
+        out('    \x1b[35m•\x1b[0m \x1b[1m' + pt.name + '\x1b[0m' + (pt.description ? ' — ' + String(pt.description).slice(0, 80) : ''));
+      }
+    }
+    if (mcpTools.length > 0) {
+      hasAny = true;
+      out('\n\x1b[1m  MCP tools\x1b[0m \x1b[90m(' + mcpTools.length + ' tools across ' + mcpClients.length + ' server' + (mcpClients.length === 1 ? '' : 's') + ')\x1b[0m');
+      let lastServer = '';
+      for (const t of mcpTools) {
+        if (t.server !== lastServer) {
+          out('  \x1b[36m' + t.server + '\x1b[0m');
+          lastServer = t.server;
+        }
+        out('    • ' + t.name + (t.description ? ' — ' + String(t.description).slice(0, 80) : ''));
+      }
+    }
+    if (!hasAny) {
+      out('\n\x1b[90m  No plugin or MCP tools active.\x1b[0m');
+      out('  \x1b[90m  Plugins: place TypeScript/JS plugins in ./plugins/ or ~/.sofuu/plugins/\x1b[0m');
+      out('  \x1b[90m  MCP: configure servers in ~/.sofuu/mcp.json\x1b[0m\n');
       return;
     }
-    out('\n\x1b[1m  MCP tools\x1b[0m');
-    let lastServer = '';
-    for (const t of mcpTools) {
-      if (t.server !== lastServer) {
-        out('  \x1b[36m' + t.server + '\x1b[0m');
-        lastServer = t.server;
-      }
-      out('    • ' + t.name + (t.description ? ' — ' + String(t.description).slice(0, 80) : ''));
+    out('');
+  }
+  async function handlePluginsCmd() {
+    if (!sofuu.plugins) {
+      out('\x1b[90m  plugin runtime unavailable\x1b[0m\n');
+      return;
+    }
+    try { await sofuu.plugins.discoverAll(); } catch (e) { /* best-effort discovery when listing plugins */ }
+    const list = sofuu.plugins.list ? sofuu.plugins.list() : [];
+    if (!list || list.length === 0) {
+      out('\n\x1b[90m  No plugins installed.\x1b[0m');
+      out('  \x1b[90m  To add official plugins: sofuu plugin add <llamacpp|ollama|firecrawl|github>\x1b[0m');
+      out('  \x1b[90m  Or place TypeScript/JS plugins in ./plugins/ or ~/.sofuu/plugins/\x1b[0m\n');
+      return;
+    }
+    out('\n\x1b[1m  Installed Plugins\x1b[0m \x1b[90m(' + list.length + ' active · 5-Shield sandboxed)\x1b[0m');
+    for (const p of list) {
+      const circ = p.circuit || 'CLOSED';
+      const circColor = circ === 'CLOSED' ? '\x1b[32m' : (circ === 'HALF_OPEN' ? '\x1b[33m' : '\x1b[31m');
+      const kind = p.category || 'tool';
+      out('  \x1b[35m' + (p.name || '').padEnd(20) + '\x1b[0m' +
+          '\x1b[90m' + kind.padEnd(12) + '\x1b[0m' +
+          circColor + circ.padEnd(12) + '\x1b[0m' +
+          (p.timeoutMs ? '\x1b[90m' + p.timeoutMs + 'ms\x1b[0m ' : '') +
+          (p.description ? '— ' + p.description : ''));
     }
     out('');
   }
@@ -270,6 +310,20 @@
         execute: (args) => callMcpTool(t.name, args),
       });
       names[t.name] = 1;
+    }
+    if (sofuu.plugins && sofuu.plugins.TOOLS) {
+      for (const pk of Object.keys(sofuu.plugins.TOOLS)) {
+        if (names[pk]) continue;
+        const pt = sofuu.plugins.TOOLS[pk];
+        if (!pt) continue;
+        defs.push({
+          name: pt.name,
+          description: pt.description || ('Plugin tool ' + pt.name),
+          parameters: pt.parameters || pt.schema || { type: 'object', properties: {} },
+          execute: (args, ctx) => pt.execute(args, ctx),
+        });
+        names[pt.name] = 1;
+      }
     }
     return defs;
   }
@@ -391,6 +445,20 @@
         execute: (args) => callMcpTool(t.name, args),
       });
       names[t.name] = 1;
+    }
+    if (sofuu.plugins && sofuu.plugins.TOOLS) {
+      for (const pk of Object.keys(sofuu.plugins.TOOLS)) {
+        if (names[pk]) continue;
+        const pt = sofuu.plugins.TOOLS[pk];
+        if (!pt) continue;
+        defs.push({
+          name: pt.name,
+          description: pt.description || ('Plugin tool ' + pt.name),
+          parameters: pt.parameters || pt.schema || { type: 'object', properties: {} },
+          execute: (args, ctx) => pt.execute(args, ctx),
+        });
+        names[pt.name] = 1;
+      }
     }
     return defs;
   }
@@ -3720,6 +3788,10 @@
         }
       } catch (e) { /* a selector that throws leaves the previous selection active */ }
     }
+    /* Auto-discover local and global plugins on startup */
+    if (sofuu.plugins && typeof sofuu.plugins.discoverAll === 'function') {
+      try { await sofuu.plugins.discoverAll(); } catch (eDisc) { /* best effort */ }
+    }
     /* ── First-run onboarding: no usable model → force the guided setup
      * wizard (provider → URL → key → model list → pick). The wizard
      * persists the choice to ~/.sofuu/config.json, so it survives restarts
@@ -3884,6 +3956,7 @@
         }
         else if (r === 'compact') { await compact(); }
         else if (r === 'tools') { await connectMcpServers(); showTools(); }
+        else if (r === 'plugins') { await handlePluginsCmd(); }
         else if (r === 'agents') { await handleAgentsCmd(); }
         // F1–F11 feature dispatch
         else if (r === 'remember') { await handleRemember(t.replace(/^\/remember\s*/, '').trim()); }

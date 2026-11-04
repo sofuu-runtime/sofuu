@@ -693,7 +693,7 @@ fn clamp_max_output(n: i64) -> i64 {
 
 /// Every slash command — the single source of truth for the C readline's
 /// TAB completion (`__chat_complete`) and for "did you mean" suggestions.
-const ALL_COMMANDS: [&str; 41] = [
+const ALL_COMMANDS: [&str; 42] = [
     "/help",
     "/version",
     "/model",
@@ -713,6 +713,7 @@ const ALL_COMMANDS: [&str; 41] = [
     "/maxout",
     "/outputs",
     "/tools",
+    "/plugins",
     "/agents",
     "/sessions",
     "/context",
@@ -770,6 +771,7 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     ("/maxout", "View/set max output tokens per response", "<tokens> | default  (default = model's real max output, cap 384k)"),
     ("/outputs", "Inspect timestamped model/tool output history", "[list|show <id>|search <text>|context <task>|stats|rebuild-index|prune|on|off]"),
     ("/tools", "List connected MCP servers + tools", ""),
+    ("/plugins", "List installed plugins and their circuit status", ""),
     ("/agents", "List agent definitions (+ ~/.sofuu/agents/*.js)", ""),
     ("/sessions", "Browse sessions on this project", "[id]  (bare = picker · ↑↓ + Enter resumes)"),
     ("/context", "Show a session's full context", "[id]  (default: this session)"),
@@ -1314,6 +1316,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
             }
         }
         "/tools" => "tools",
+        "/plugins" => "plugins",
         "/agents" => "agents",
         "/ctx" => {
             // /ctx          → config panel (DRIVER handles "pick_ctx")
@@ -1583,6 +1586,7 @@ fn print_help() {
     c(&mut rows, "/ctx [<tokens>]", "view/set the context window (max 4M)");
     c(&mut rows, "/maxout [<tokens>]", "view/set max output tokens (max 384k)");
     c(&mut rows, "/tools", "list connected MCP servers + their tools");
+    c(&mut rows, "/plugins", "list installed plugins (~/.sofuu/plugins)");
     c(&mut rows, "/agents", "list agent definitions (~/.sofuu/agents/*.js)");
     c(&mut rows, "/version", "print the runtime version");
     h(&mut rows, "  Brain & memory");
@@ -4088,6 +4092,8 @@ mod tests {
         let mut c = ChatConfig::defaults();
         assert_eq!(handle_slash(&mut c, "/clear"), "clear");
         assert_eq!(handle_slash(&mut c, "/compact"), "compact");
+        assert_eq!(handle_slash(&mut c, "/tools"), "tools");
+        assert_eq!(handle_slash(&mut c, "/plugins"), "plugins");
         // Removed commands are unknown.
         assert_eq!(handle_slash(&mut c, "/models"), "unknown");
         assert_eq!(handle_slash(&mut c, "/apikey"), "unknown");

@@ -1456,6 +1456,8 @@
       };
     }
   };
+  P.runTool = P.invoke;
+  P.call = P.invoke;
 
   P.list = function list() {
     var out = [];
@@ -3904,10 +3906,92 @@ export default defineProvider({\n\
   }\n\
 });\n";
       }
+    },
+    firecrawl: {
+      file: 'firecrawl.ts',
+      content: function () {
+        return "import { defineTool, z } from 'sofuu';\n\
+\n\
+export default defineTool({\n\
+  name: 'firecrawl_scrape',\n\
+  description: 'Scrape and extract clean markdown content from any web page using Firecrawl API',\n\
+  permissions: { net: ['api.firecrawl.dev'] },\n\
+  schema: z.object({\n\
+    url: z.string().describe('The URL to scrape and convert to markdown'),\n\
+    formats: z.array(z.string()).default(['markdown']).describe('Formats to extract (e.g. markdown, html)')\n\
+  }),\n\
+  timeoutMs: 15000,\n\
+  requiresApproval: false,\n\
+  async run(args, ctx) {\n\
+    var apiKey = (typeof process !== 'undefined' && process.env && process.env.FIRECRAWL_API_KEY) || '';\n\
+    if (!apiKey) {\n\
+      throw new Error('FIRECRAWL_API_KEY environment variable is required to use Firecrawl');\n\
+    }\n\
+    var res = await ctx.fetch('https://api.firecrawl.dev/v1/scrape', {\n\
+      method: 'POST',\n\
+      headers: {\n\
+        'Content-Type': 'application/json',\n\
+        'Authorization': 'Bearer ' + apiKey\n\
+      },\n\
+      body: JSON.stringify({ url: args.url, formats: args.formats || ['markdown'] })\n\
+    });\n\
+    if (!res || !res.ok) {\n\
+      var errText = res ? await res.text() : 'network failure';\n\
+      throw new Error('Firecrawl API error (HTTP ' + (res ? res.status : 0) + '): ' + errText);\n\
+    }\n\
+    var data = await res.json();\n\
+    return {\n\
+      url: args.url,\n\
+      markdown: (data.data && data.data.markdown) || data.markdown || '',\n\
+      title: (data.data && data.data.metadata && data.data.metadata.title) || ''\n\
+    };\n\
+  }\n\
+});\n";
+      }
+    },
+    github: {
+      file: 'github_repo.ts',
+      content: function () {
+        return "import { defineTool, z } from 'sofuu';\n\
+\n\
+export default defineTool({\n\
+  name: 'github_repo',\n\
+  description: 'Fetch real-time stats and metadata for a public GitHub repository',\n\
+  permissions: { net: ['api.github.com'] },\n\
+  schema: z.object({\n\
+    owner: z.string().describe('Repository owner (e.g. facebook)'),\n\
+    repo: z.string().describe('Repository name (e.g. react)')\n\
+  }),\n\
+  timeoutMs: 8000,\n\
+  async run(args, ctx) {\n\
+    var url = 'https://api.github.com/repos/' + encodeURIComponent(args.owner) + '/' + encodeURIComponent(args.repo);\n\
+    var res = await ctx.fetch(url, {\n\
+      headers: {\n\
+        'Accept': 'application/vnd.github.v3+json',\n\
+        'User-Agent': 'sofuu-plugin-github/0.3'\n\
+      }\n\
+    });\n\
+    if (!res || !res.ok) {\n\
+      throw new Error('GitHub API error (HTTP ' + (res ? res.status : 'unknown') + ')');\n\
+    }\n\
+    var d = await res.json();\n\
+    return {\n\
+      fullName: d.full_name,\n\
+      description: d.description,\n\
+      stars: d.stargazers_count,\n\
+      forks: d.forks_count,\n\
+      openIssues: d.open_issues_count,\n\
+      license: d.license ? d.license.spdx_id : 'none'\n\
+    };\n\
+  }\n\
+});\n";
+      }
     }
   };
   OFFICIAL_PLUGINS['sofuu-plugin-llamacpp'] = OFFICIAL_PLUGINS.llamacpp;
   OFFICIAL_PLUGINS['sofuu-plugin-ollama'] = OFFICIAL_PLUGINS.ollama;
+  OFFICIAL_PLUGINS['sofuu-plugin-firecrawl'] = OFFICIAL_PLUGINS.firecrawl;
+  OFFICIAL_PLUGINS['sofuu-plugin-github'] = OFFICIAL_PLUGINS.github;
 
   P.cliAdd = async function (name, opts) {
     opts = opts || {};
@@ -3915,7 +3999,7 @@ export default defineProvider({\n\
       var norm = String(name || '').toLowerCase().trim();
       var entry = OFFICIAL_PLUGINS[norm] || OFFICIAL_PLUGINS[norm.replace(/^sofuu-plugin-/, '')];
       if (!entry) {
-        console.error('Unknown plugin "' + name + '". Available official plugins: llamacpp, ollama');
+        console.error('Unknown plugin "' + name + '". Available official plugins: llamacpp, ollama, firecrawl, github');
         console.error('To scaffold a new custom plugin, run: sofuu plugin init <name>');
         return cliExit(1);
       }

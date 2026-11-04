@@ -976,6 +976,7 @@
       mcpSets: [],
       webTools: [],
       codeTools: [],
+      pluginTools: [],
       systemTools: [],
       memoryTools: [],
       /* E2 (PLAN-EMBED-SDK): host-registered native tools (Swift/Kotlin/C
@@ -1065,11 +1066,26 @@
         d.systemTools = ['system_info'];
         continue;
       }
+      if (t === 'plugins') {
+        if (sofuu.plugins && sofuu.plugins.TOOLS) {
+          var pKeys = Object.keys(sofuu.plugins.TOOLS);
+          for (var pk = 0; pk < pKeys.length; pk++) {
+            if (d.pluginTools.indexOf(pKeys[pk]) < 0) d.pluginTools.push(pKeys[pk]);
+          }
+        }
+        continue;
+      }
       if (t === 'all') {
         if (sofuu.tools && sofuu.tools.GROUP) d.codeTools = sofuu.tools.GROUP.slice();
         d.webTools = ['web_search', 'web_open'];
         d.memoryTools = ['memory_search', 'memory_remember'];
         d.systemTools = ['system_info'];
+        if (sofuu.plugins && sofuu.plugins.TOOLS) {
+          var pKeysAll = Object.keys(sofuu.plugins.TOOLS);
+          for (var pka = 0; pka < pKeysAll.length; pka++) {
+            if (d.pluginTools.indexOf(pKeysAll[pka]) < 0) d.pluginTools.push(pKeysAll[pka]);
+          }
+        }
         continue;
       }
       if (typeof t === 'string') {
@@ -1085,11 +1101,11 @@
           if (d.systemTools.indexOf(t) < 0) d.systemTools.push(t);
           continue;
         }
-        if (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[t]) {
-          if (d.codeTools.indexOf(t) < 0) d.codeTools.push(t);
+        if (sofuu.plugins && sofuu.plugins.TOOLS && sofuu.plugins.TOOLS[t]) {
+          if (d.pluginTools.indexOf(t) < 0) d.pluginTools.push(t);
           continue;
         }
-        if (sofuu.plugins && sofuu.plugins.TOOLS && sofuu.plugins.TOOLS[t]) {
+        if (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[t]) {
           if (d.codeTools.indexOf(t) < 0) d.codeTools.push(t);
           continue;
         }
@@ -1943,6 +1959,31 @@
         var cdSpec = { name: cd.name, description: cd.description, parameters: cd.parameters };
         if (cd.selfTimed) cdSpec.selfTimed = true;
         add(cdSpec, cd.execute, 'builtin');
+      } else if (sofuu.plugins && sofuu.plugins.TOOLS && sofuu.plugins.TOOLS[cn]) {
+        var pcd = sofuu.plugins.TOOLS[cn];
+        var pcdSpec = {
+          name: pcd.name,
+          description: pcd.description || ('Plugin tool ' + pcd.name),
+          parameters: pcd.parameters || pcd.schema || { type: 'object', properties: {} },
+          selfTimed: true
+        };
+        add(pcdSpec, pcd.execute, 'plugin');
+      }
+    }
+    if (d.pluginTools) {
+      for (var pt = 0; pt < d.pluginTools.length; pt++) {
+        var pn = d.pluginTools[pt];
+        var pTool = (sofuu.plugins && sofuu.plugins.TOOLS && sofuu.plugins.TOOLS[pn])
+                 || (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[pn]);
+        if (pTool) {
+          var pSpec = {
+            name: pTool.name,
+            description: pTool.description || ('Plugin tool ' + pTool.name),
+            parameters: pTool.parameters || pTool.schema || { type: 'object', properties: {} },
+            selfTimed: true
+          };
+          add(pSpec, pTool.execute, 'plugin');
+        }
       }
     }
     if (d.systemTools) {
@@ -4068,14 +4109,15 @@
         refreshPlan();
         var esToolNames = [];
         var esTools = []
-          .concat(d.webTools).concat(d.codeTools).concat(d.hostTools)
+          .concat(d.webTools).concat(d.codeTools).concat(d.pluginTools || []).concat(d.hostTools)
           .concat(d.memoryTools || []).concat(d.systemTools || []);
         var esToolTk = 0;
         for (var esI = 0; esI < esTools.length; esI++) {
           var esName = String(esTools[esI]);
           esToolNames.push(esName);
           var esSpec = (sofuu.web && sofuu.web.TOOLS && sofuu.web.TOOLS[esName]) ||
-                       (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[esName]);
+                       (sofuu.tools && sofuu.tools.TOOLS && sofuu.tools.TOOLS[esName]) ||
+                       (sofuu.plugins && sofuu.plugins.TOOLS && sofuu.plugins.TOOLS[esName]);
           try { esToolTk += estTok(esSpec ? JSON.stringify(esSpec) : esName); } catch (eEs) { /* a tool spec that will not serialise contributes none. */ }
         }
         for (var esJ = 0; esJ < d.inlineTools.length; esJ++) {
@@ -6553,7 +6595,7 @@
         when: clip(d.when || '', 80),
         provider: d.provider, model: d.model,
         memory: d.memory,
-        tools: d.inlineTools.length + d.webTools.length + d.codeTools.length + (d.memoryTools ? d.memoryTools.length : 0) + (d.systemTools ? d.systemTools.length : 0),
+        tools: d.inlineTools.length + d.webTools.length + d.codeTools.length + (d.pluginTools ? d.pluginTools.length : 0) + (d.memoryTools ? d.memoryTools.length : 0) + (d.systemTools ? d.systemTools.length : 0),
         mcpServers: d.mcpSets.length,
         agents: d.agents.slice(),
         runs24h: (RUN_COUNTS[name] && RUN_COUNTS[name].n) || 0,

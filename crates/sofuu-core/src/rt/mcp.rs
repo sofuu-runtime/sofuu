@@ -21,6 +21,7 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicI32, Ordering};
+use std::sync::{Mutex, Once};
 
 use sofuu_ffi::qjs::{self, JSContext, JSValue, JSValueConst};
 use sofuu_ffi::uv::{self, UvHandle, UvPipe, UvProcess, UvStream, UvTimer, UvWriteReq};
@@ -38,6 +39,24 @@ const MCP_STDERR_CAP: usize = 1024;
 
 const MCP_READ_BUF: usize = 65536;
 const MAX_TOOLS: usize = 64;
+
+static ACTIVE_MCP_CHILDREN: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
+static MCP_ATEXIT_INIT: Once = Once::new();
+
+/// Zombie defense: terminate all active MCP child processes when parent exits.
+pub extern "C" fn mcp_reap_active_children() {
+    if let Ok(mut lock) = ACTIVE_MCP_CHILDREN.lock() {
+        for &pid in lock.iter() {
+            if pid > 1 {
+                unsafe {
+                    #[cfg(unix)]
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+        }
+        lock.clear();
+    }
+}
 
 /* ── R-30: the client's OWN error codes ──────────────────────────────
  * A server's JSON-RPC codes (-32700…-32603 and its own -32000..-32099
@@ -768,6 +787,12 @@ unsafe extern "C" fn mcp_on_alloc(_h: *mut UvHandle, suggested: usize, buf: *mut
 }
 
 unsafe extern "C" fn mcp_on_exit(_proc: *mut UvProcess, exit_status: i64, term_signal: c_int) {
+    let pid = uv::uv_process_get_pid(_proc);
+    if pid > 0 {
+        if let Ok(mut lock) = ACTIVE_MCP_CHILDREN.lock() {
+            lock.retain(|&p| p != pid);
+        }
+    }
     // SAFETY: process handle's data set after spawn.
     let client = *(_proc as *mut *mut McpClient);
     if client.is_null() || (*client).done != 0 {
@@ -965,8 +990,7 @@ unsafe extern "C" fn js_mcp_call(
             "MCP write failed (server unreachable)",
             None,
         );
-        sofuu_promise_reject(p, err); /* consumes err */
-        sofuu_flush_jobs(ctx);
+        sofuu_promise_reject(p, err); /* consumes err; caller attaches handler on ret */
     } else if timeout_ms > 0 {
         mcp_arm_timeout(client);
     }
@@ -1006,9 +1030,29 @@ unsafe extern "C" fn js_mcp_disconnect(
 ) -> JSValue {
     let client = qjs::JS_GetOpaque(this_val, MCP_CLIENT_CLASS_ID.load(Ordering::Relaxed)) as *mut McpClient;
     if !client.is_null() && !(*client).process.is_null() {
+        let pid = uv::uv_process_get_pid((*client).process);
+        if pid > 0 {
+            if let Ok(mut lock) = ACTIVE_MCP_CHILDREN.lock() {
+                lock.retain(|&p| p != pid);
+            }
+        }
         uv::uv_process_kill((*client).process, libc::SIGTERM);
     }
     qjs::sofuu_js_undefined()
+}
+
+unsafe extern "C" fn js_mcp_pid(
+    ctx: *mut JSContext,
+    this_val: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    let client = qjs::JS_GetOpaque(this_val, MCP_CLIENT_CLASS_ID.load(Ordering::Relaxed)) as *mut McpClient;
+    if client.is_null() || (*client).process.is_null() {
+        return qjs::sofuu_js_new_int32(ctx, 0);
+    }
+    let pid = uv::uv_process_get_pid((*client).process);
+    qjs::sofuu_js_new_int32(ctx, pid)
 }
 
 /// M1: the protocol version the server negotiated (offered 2025-06-18;
@@ -1035,7 +1079,7 @@ unsafe extern "C" fn js_mcp_protocol_version(
 
 thread_local! {
     // JS_CFUNC_DEF(name, length, func): magic=0, u.func = { length, generic, func }.
-    static MCP_CLIENT_PROTO: [qjs::JSCFunctionListEntry; 5] = [
+    static MCP_CLIENT_PROTO: [qjs::JSCFunctionListEntry; 6] = [
         qjs::JSCFunctionListEntry {
             name: c"call".as_ptr(),
             prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
@@ -1070,6 +1114,13 @@ thread_local! {
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 0, cproto: 0, _pad: [0; 6], cfunc: js_mcp_protocol_version },
+        },
+        qjs::JSCFunctionListEntry {
+            name: c"pid".as_ptr(),
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            def_type: qjs::JS_DEF_CFUNC,
+            magic: 0,
+            u: qjs::JSCFunctionListEntryFunc { length: 0, cproto: 0, _pad: [0; 6], cfunc: js_mcp_pid },
         },
     ];
 }
@@ -1410,6 +1461,19 @@ unsafe extern "C" fn js_mcp_connect(
         let data_text = serde_json::to_string(&data).unwrap_or_else(|_| "null".into());
         let err = mcp_error_value(ctx, MCP_ERR_CONNECT_FAILED, &msg, Some(&data_text));
         return mcp_rejected_promise(ctx, err);
+    }
+
+    MCP_ATEXIT_INIT.call_once(|| {
+        unsafe {
+            libc::atexit(mcp_reap_active_children);
+        }
+    });
+
+    let pid = uv::uv_process_get_pid(process);
+    if pid > 0 {
+        if let Ok(mut lock) = ACTIVE_MCP_CHILDREN.lock() {
+            lock.push(pid);
+        }
     }
 
     /* CRITICAL: proc->data must point back at the client so mcp_on_exit
@@ -2905,7 +2969,7 @@ pub unsafe extern "C" fn mod_mcp_register(ctx: *mut JSContext) {
     };
     let _nc1 = qjs::JS_NewClass(qjs::JS_GetRuntime(ctx), class_id, &client_class);
     let client_proto = qjs::sofuu_js_new_object(ctx);
-    MCP_CLIENT_PROTO.with(|f| qjs::JS_SetPropertyFunctionList(ctx, client_proto, f.as_ptr(), 5));
+    MCP_CLIENT_PROTO.with(|f| qjs::JS_SetPropertyFunctionList(ctx, client_proto, f.as_ptr(), f.len() as i32));
     qjs::JS_SetClassProto(ctx, class_id, client_proto);
 
     /* Register MCPServer class — JS_NewClassID only ALLOCATES when

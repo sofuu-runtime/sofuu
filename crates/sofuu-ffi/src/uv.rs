@@ -225,6 +225,7 @@ extern "C" {
     pub fn uv_pipe_open(pipe: *mut UvPipe, fd: u64) -> c_int;
 
     pub fn uv_process_kill(process: *mut UvProcess, signum: c_int) -> c_int;
+    pub fn uv_process_get_pid(process: *const UvProcess) -> c_int;
     pub fn uv_signal_init(loop_: *mut UvLoop, signal: *mut UvSignal) -> c_int;
     pub fn uv_signal_start(
         signal: *mut UvSignal,

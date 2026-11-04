@@ -2228,17 +2228,192 @@
       }
       try { cfg.env = resolveSecretEnv(cfg.env); }
       catch (eSec) { return Promise.reject(eSec); }
-      function finishClient(client) {
-        if (!client || client.__paged) return client;
-        try {
-          client.listTools = function () { return all(client, 'tools/list', 'tools'); };
-          client.listResources = function () { return all(client, 'resources/list', 'resources'); };
-          var defMs = policyCallTimeout();
-          if (defMs > 0 && typeof client.call === 'function') {
-            var realCall = client.call;
-            client.call = function (method, params, copts) {
-              var has = copts && typeof copts === 'object' && copts.timeoutMs !== undefined;
-              if (!has) {
+      function isTransportLoss(err) {
+        if (!err) return false;
+        if (err.code === -32000 || err.code === 'E_MCP_DISCONNECTED' || err.code === 'EPIPE' || err.code === 'ECONNRESET') return true;
+        var msg = String((err && err.message) || err || '');
+        return (
+          msg.indexOf('MCP server process exited') >= 0 ||
+          msg.indexOf('MCP server disconnected') >= 0 ||
+          msg.indexOf('pipe is gone') >= 0 ||
+          msg.indexOf('killed by signal') >= 0 ||
+          msg.indexOf('exit code') >= 0 ||
+          msg.indexOf('broken pipe') >= 0
+        );
+      }
+
+      function createRawClient() {
+        if (useSse) return Promise.resolve(sofuu.mcp._connectSse(cfg));
+        if (useHttp) {
+          return Promise.resolve(sofuu.mcp._connectHttp(cfg)).catch(function (eHttp) {
+            /* Transport 'auto' with a command: fall back to stdio. */
+            if (transport === 'auto' && cfg.command) {
+              var spec = { command: cfg.command, server: server };
+              if (cfg.args) spec.args = cfg.args;
+              if (cfg.env) spec.env = cfg.env;
+              if (cfg.cwd) spec.cwd = cfg.cwd;
+              return Promise.resolve(realConnect(spec));
+            }
+            throw eHttp;
+          });
+        }
+        return Promise.resolve(realConnect(cfg));
+      }
+
+      function wrapResilient(rawClient) {
+        if (!rawClient || rawClient.__paged) return rawClient;
+
+        var recCfg = (opts && opts.reconnect) || (arg && arg.reconnect) || {};
+        var reconnectEnabled = (recCfg.enabled !== undefined)
+          ? Boolean(recCfg.enabled)
+          : (!useHttp && !useSse);
+        var maxRetries = (typeof recCfg.maxRetries === 'number' && recCfg.maxRetries >= 0)
+          ? recCfg.maxRetries
+          : 3;
+        var initialBackoffMs = (typeof recCfg.initialBackoffMs === 'number' && recCfg.initialBackoffMs > 0)
+          ? recCfg.initialBackoffMs
+          : 250;
+        var maxBackoffMs = (typeof recCfg.maxBackoffMs === 'number' && recCfg.maxBackoffMs > 0)
+          ? recCfg.maxBackoffMs
+          : 2000;
+
+        var curClient = rawClient;
+        var clientState = 'CONNECTED';
+        var replayQueue = [];
+        var reconnectingPromise = null;
+
+        /* Pillar 1 §3.3: Remote Transport Circuit Breaker */
+        var circuitState = 'CLOSED';
+        var circuitFailures = 0;
+        var circuitTripUntil = 0;
+
+        function startReconnectLoop() {
+          if (reconnectingPromise) return reconnectingPromise;
+          reconnectingPromise = (async function () {
+            var lastErr = null;
+            for (var attempt = 1; attempt <= maxRetries; attempt++) {
+              var backoff = Math.min(maxBackoffMs, initialBackoffMs * Math.pow(2, attempt - 1));
+              await new Promise(function (res) { setTimeout(res, backoff); });
+              try {
+                var freshClient = await createRawClient();
+                clientState = 'REPLAYING';
+                var toolsRes = await all(freshClient, 'tools/list', 'tools').catch(function () { return { tools: [] }; });
+                var toolNames = {};
+                var tArr = (toolsRes && toolsRes.tools) || [];
+                for (var ti = 0; ti < tArr.length; ti++) {
+                  if (tArr[ti] && tArr[ti].name) toolNames[tArr[ti].name] = true;
+                }
+                curClient = freshClient;
+                clientState = 'CONNECTED';
+                reconnectingPromise = null;
+
+                /* Drain and replay pending requests */
+                var queued = replayQueue.slice();
+                replayQueue = [];
+                for (var q = 0; q < queued.length; q++) {
+                  var item = queued[q];
+                  if (item.method === 'tools/call' && item.params && item.params.name && !toolNames[item.params.name]) {
+                    var missingErr = new Error("MCP tool '" + item.params.name + "' not found on reconnected server");
+                    missingErr.code = 'E_SCHEMA';
+                    item.reject(missingErr);
+                    continue;
+                  }
+                  var remainingMs = undefined;
+                  if (item.copts && typeof item.copts.timeoutMs === 'number') {
+                    var elapsed = Date.now() - item.enqueuedAt;
+                    remainingMs = item.copts.timeoutMs - elapsed;
+                    if (remainingMs <= 0) {
+                      var toErr = new Error('MCP call timed out during reconnection');
+                      toErr.code = 'E_TIMEOUT';
+                      item.reject(toErr);
+                      continue;
+                    }
+                  }
+                  var callOpts = item.copts;
+                  if (remainingMs !== undefined) {
+                    callOpts = {};
+                    for (var cp in item.copts) callOpts[cp] = item.copts[cp];
+                    callOpts.timeoutMs = remainingMs;
+                  }
+                  (function (it, cOpts) {
+                    Promise.resolve(curClient.call(it.method, it.params, cOpts)).then(it.resolve, it.reject);
+                  })(item, callOpts);
+                }
+                return;
+              } catch (eRetry) {
+                lastErr = eRetry;
+                /* retry next backoff iteration */
+              }
+            }
+            clientState = 'CLOSED';
+            reconnectingPromise = null;
+            var discErr = new Error('MCP server disconnected and reconnect failed after ' + maxRetries + ' attempts' + (lastErr ? ': ' + (lastErr.message || lastErr) : ''));
+            discErr.code = 'E_MCP_DISCONNECTED';
+            var failed = replayQueue.slice();
+            replayQueue = [];
+            for (var f = 0; f < failed.length; f++) {
+              failed[f].reject(discErr);
+            }
+          })();
+          return reconnectingPromise;
+        }
+
+        var wrapper = {
+          get state() { return clientState; },
+          get circuitState() { return circuitState; },
+          get reconnect() { return { enabled: reconnectEnabled, maxRetries: maxRetries, initialBackoffMs: initialBackoffMs, maxBackoffMs: maxBackoffMs }; },
+          pid: function () {
+            if (curClient && typeof curClient.pid === 'function') return curClient.pid();
+            return 0;
+          },
+          protocolVersion: function () {
+            if (curClient && typeof curClient.protocolVersion === 'function') return curClient.protocolVersion();
+            return 'unknown';
+          },
+          disconnect: function () {
+            clientState = 'CLOSED';
+            var failed = replayQueue.slice();
+            replayQueue = [];
+            var closedErr = new Error('MCP client was disconnected by caller');
+            closedErr.code = 'E_MCP_DISCONNECTED';
+            for (var f = 0; f < failed.length; f++) failed[f].reject(closedErr);
+            if (curClient && typeof curClient.disconnect === 'function') {
+              try { curClient.disconnect(); } catch (eDisc) { /* best-effort child termination */ }
+            }
+          },
+          listTools: function () {
+            if (clientState === 'CLOSED') return Promise.reject(new Error('MCP client is closed'));
+            return all(wrapper, 'tools/list', 'tools');
+          },
+          listResources: function () {
+            if (clientState === 'CLOSED') return Promise.reject(new Error('MCP client is closed'));
+            return all(wrapper, 'resources/list', 'resources');
+          },
+          call: function (method, params, copts) {
+            if (clientState === 'CLOSED') {
+              var closedErr = new Error('MCP client is closed');
+              closedErr.code = 'E_MCP_DISCONNECTED';
+              return Promise.reject(closedErr);
+            }
+
+            /* Remote Circuit Breaker evaluation */
+            if (useHttp || useSse) {
+              var now = Date.now();
+              if (circuitState === 'OPEN') {
+                if (now < circuitTripUntil) {
+                  var cbErr = new Error("MCP circuit breaker is OPEN for server '" + server + "' (cooling down for 15s)");
+                  cbErr.code = 'E_MCP_CIRCUIT_OPEN';
+                  return Promise.reject(cbErr);
+                }
+                circuitState = 'HALF_OPEN';
+              }
+            }
+
+            /* Apply policy default timeout if not set */
+            var defMs = policyCallTimeout();
+            if (defMs > 0) {
+              var hasTo = copts && typeof copts === 'object' && copts.timeoutMs !== undefined;
+              if (!hasTo) {
                 var merged = { timeoutMs: defMs };
                 if (copts && typeof copts === 'object') {
                   for (var ck in copts) {
@@ -2247,33 +2422,82 @@
                 }
                 copts = merged;
               }
-              return realCall.call(client, method, params, copts);
-            };
-            try { Object.defineProperty(client, '__callDefaulted', { value: true, enumerable: false }); }
-            catch (eD) { client.__callDefaulted = true; }
+            }
+
+            /* If reconnecting or replaying, queue the request */
+            if (clientState === 'RECONNECTING' || clientState === 'REPLAYING') {
+              if (replayQueue.length >= 64) {
+                var ovfErr = new Error('MCP replay queue overflow (limit 64)');
+                ovfErr.code = 'E_MCP_QUEUE_FULL';
+                return Promise.reject(ovfErr);
+              }
+              return new Promise(function (res, rej) {
+                replayQueue.push({
+                  method: method,
+                  params: params,
+                  copts: copts,
+                  resolve: res,
+                  reject: rej,
+                  enqueuedAt: Date.now()
+                });
+              });
+            }
+
+            return new Promise(function (resolve, reject) {
+              Promise.resolve(curClient.call(method, params, copts)).then(function (res) {
+                if (useHttp || useSse) {
+                  circuitFailures = 0;
+                  circuitState = 'CLOSED';
+                }
+                resolve(res);
+              }, function (err) {
+                if (useHttp || useSse) {
+                  var emsg = String((err && err.message) || err || '');
+                  if (/status\s*5\d\d|5\d\d|timeout|ETIMEDOUT/i.test(emsg) || (err && err.code === 'ETIMEDOUT')) {
+                    circuitFailures++;
+                    if (circuitFailures >= 2 || circuitState === 'HALF_OPEN') {
+                      circuitState = 'OPEN';
+                      circuitTripUntil = Date.now() + 15000;
+                      circuitFailures = 0;
+                    }
+                  }
+                  reject(err);
+                  return;
+                }
+
+                /* Stdio transport loss check: auto-respawn and replay */
+                if (isTransportLoss(err) && reconnectEnabled && clientState === 'CONNECTED') {
+                  clientState = 'RECONNECTING';
+                  if (replayQueue.length >= 64) {
+                    var qErr = new Error('MCP replay queue overflow (limit 64)');
+                    qErr.code = 'E_MCP_QUEUE_FULL';
+                    reject(qErr);
+                    return;
+                  }
+                  replayQueue.push({
+                    method: method,
+                    params: params,
+                    copts: copts,
+                    resolve: resolve,
+                    reject: reject,
+                    enqueuedAt: Date.now()
+                  });
+                  startReconnectLoop();
+                  return;
+                }
+
+                reject(err);
+              });
+            });
           }
-          try { Object.defineProperty(client, '__paged', { value: true, enumerable: false }); }
-          catch (eP) { client.__paged = true; }
-        } catch (eM) { /* a server that will not paginate still works unpaged. */ }
-        return client;
+        };
+
+        try { Object.defineProperty(wrapper, '__paged', { value: true, enumerable: false }); }
+        catch (eP) { /* defineProperty fallback */ wrapper.__paged = true; }
+        return wrapper;
       }
-      if (useSse) {
-        return Promise.resolve(sofuu.mcp._connectSse(cfg)).then(finishClient);
-      }
-      if (useHttp) {
-        return Promise.resolve(sofuu.mcp._connectHttp(cfg)).then(finishClient, function (eHttp) {
-          /* Transport 'auto' with a command: fall back to stdio. */
-          if (transport === 'auto' && cfg.command) {
-            var spec = { command: cfg.command, server: server };
-            if (cfg.args) spec.args = cfg.args;
-            if (cfg.env) spec.env = cfg.env;
-            if (cfg.cwd) spec.cwd = cfg.cwd;
-            return Promise.resolve(realConnect(spec)).then(finishClient);
-          }
-          throw eHttp;
-        });
-      }
-      return Promise.resolve(realConnect(cfg)).then(finishClient);
+
+      return Promise.resolve(createRawClient()).then(wrapResilient);
     };
     sofuu.mcp.__paged = true;
   })();

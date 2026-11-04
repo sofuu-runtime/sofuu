@@ -1976,8 +1976,8 @@ if (typeof globalThis.ReadableStream === "undefined") {
           try { g.sofuu.fs.mkdirSync(lsDir, { recursive: true }); }
           catch (eMk) { try { g.sofuu.fs.mkdirSync(lsDir); } catch (eMk2) { /* recursive create refused (older host), so try the plain form; if that fails too the lsDir simply stays absent and listing returns empty. */ } }
         }
-      } catch (eDir) {}
-      try { g.sofuu.fs.writeFileSync(lsPath, JSON.stringify(lsData)); } catch (eWrite) {}
+      } catch (eDir) { /* the ls cache directory could not be created: listing still works, it is just slower. */ }
+      try { g.sofuu.fs.writeFileSync(lsPath, JSON.stringify(lsData)); } catch (eWrite) { /* the cache is an optimisation; a read-only tree means every listing re-reads. */ }
     };
     var lsApi = {
       getItem: function (k) {

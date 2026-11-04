@@ -110,11 +110,16 @@ if version:
 open(path, "w").write(src)
 PY
 
-# The podspec carries the same version + URL pair and drifts on its own, so it is
+# The podspec carries the same version + URL pair and drifts on its own, so it
 # stamped in the same pass. A podspec rewrite that fails is fatal: an artifact
 # pinned by SwiftPM but not by CocoaPods is the drift this script exists to stop.
-if [[ -n "$V" && -f "$REPO_ROOT/Sofuu.podspec" ]]; then
-  python3 - "$REPO_ROOT/Sofuu.podspec" "$V" <<'PY'
+#
+# This block used $V, which is only assigned in the --check branch above, so the
+# stamping path died with "V: unbound variable" under set -u *after* rewriting
+# Package.swift and before touching the podspec - leaving the SwiftPM checksum
+# updated and CocoaPods still on v0.2.0. The version for this path is $VERSION.
+if [[ -n "$VERSION" && -f "$REPO_ROOT/Sofuu.podspec" ]]; then
+  python3 - "$REPO_ROOT/Sofuu.podspec" "$VERSION" <<'PY'
 import re, sys
 path, version = sys.argv[1], sys.argv[2]
 src = open(path).read()
@@ -127,7 +132,7 @@ if n1 != 1 or n2 != 1:
     sys.exit(f"error: podspec rewrite matched version={n1} url={n2} (expected 1 and 1)")
 open(path, "w").write(src)
 PY
-  grep -q "s.version          = '$V'" "$REPO_ROOT/Sofuu.podspec" ||
+  grep -q "s.version          = '$VERSION'" "$REPO_ROOT/Sofuu.podspec" ||
     { echo "error: podspec version did not take effect" >&2; exit 1; }
 fi
 

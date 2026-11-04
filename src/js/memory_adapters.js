@@ -145,12 +145,12 @@
         var v = S.policy.secret(name);
         if (v) return textOf(v);
       }
-    } catch (eS) { }
+    } catch (eS) { /* the policy secret store is optional; without it the env fallback below is the answer. */ }
     try {
       if (typeof process !== 'undefined' && process && process.env) {
         return textOf(process.env[name] || '');
       }
-    } catch (eE) { }
+    } catch (eE) { /* no process or env in this host: the caller gets an empty string, meaning no key is configured. */ }
     return '';
   }
 
@@ -484,7 +484,7 @@
       h.toJSON = function () {
         return { handle: id, adapter: meta.adapter, dim: meta.dim | 0 };
       };
-    } catch (e) { }
+    } catch (e) { /* the handle toJSON shim is a debug nicety; JSON.stringify falls back to the plain object. */ }
     return h;
   }
 

@@ -249,6 +249,15 @@ build_target() {
     # Prove the archive is iOS and not a stray macOS build — the failure mode
     # that cost an afternoon on libuv. Architecture alone proves nothing
     # (both are arm64), so check the LC_BUILD_VERSION platform too.
+    # Strip debug info from the merged members before measuring.
+    #
+    # rustc applies profile.release.strip at LINK time, and a --crate-type
+    # staticlib is never linked, so every member kept its DWARF. The size cap
+    # below exists precisely to catch bundled debug info, and it did: the
+    # 2026-11 device slice reached 34,194,800 B against a 33,554,432 B
+    # ceiling. Stripping took it to 29,715,624 B with all 21,854 global text
+    # symbols intact, which is what an app linker consumes.
+    strip -S "$DIST/$OUT_NAME" 2>/dev/null || true
     local plat
     plat="$(lipo -info "$DIST/$OUT_NAME" 2>/dev/null | sed 's/.*architecture[s]*: //')"
     local SIZE
@@ -340,14 +349,26 @@ ios_build_metallib() {
     # Every pipeline the engine loads must be in the library it will pick up
     # first — a stale or truncated metallib is a pack failure here, not a nil
     # pipeline state at inference time.
+    # One strings pass, then grep the file.
+    #
+    # This used to be "strings "$out" | grep -qx "$fn" and it reported the
+    # FIRST kernel missing on a metallib that contained it. The script runs
+    # under set -o pipefail, grep -q exits at the first match, and strings
+    # then dies of SIGPIPE (141) - which pipefail reports as the pipeline's
+    # status, so a match looked like a failure. Same trap the symbol-set code
+    # below avoids on purpose.
+    local strfile
+    strfile="$(mktemp)"   # $tmp is already gone by here
+    strings "$out" > "$strfile"
     local fn
     for fn in gemv_bf16 gemv_f16 gemv_f32 gemv_mlx4_affine_f16 \
               gemv_mlx4_affine_bf16 rmsnorm swiglu conv1d_3; do
-        if ! strings "$out" | grep -qx "$fn"; then
+        if ! grep -qx "$fn" "$strfile"; then
             echo "  \033[31m✗ $out is missing kernel $fn\033[0m"
             exit 1
         fi
     done
+    rm -f "$strfile"
     echo "  metallib $slice: $(du -h "$out" | cut -f1), 8 kernels verified"
 }
 

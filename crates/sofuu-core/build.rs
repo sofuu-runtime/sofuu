@@ -24,6 +24,33 @@ use std::process::Command;
 // "unknown" instead of a build failure (release tarball, vendored source
 // drops). SOFUU_BUILD overrides the whole thing so those builds can stamp the
 // revision they came from.
+/// Read a source file that a person or another agent may be rewriting right now.
+///
+/// `fs::read` on a file whose writer just truncated it returns a short buffer and
+/// no error, and a build script has no way to notice. That is how a torn read of
+/// `src/js/agent.js` once embedded a fragment of the file: the resulting binary
+/// failed `shipped::tests::shipped_sources_are_nonempty_and_parseable_names` with
+/// "agent.js: failed to compile to bytecode", and cargo did not rebuild it - the
+/// file on disk was unchanged from what cargo had already recorded, so nothing
+/// invalidated the stale embed.
+///
+/// Read, then check the file did not change underneath the read (same length
+/// before and after, and the bytes match that length). Retry a few times, then
+/// give up and return whatever the last read produced.
+fn read_stable(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    for _ in 0..5 {
+        let before = std::fs::metadata(path)?.len();
+        let data = std::fs::read(path)?;
+        let after = std::fs::metadata(path)?.len();
+        if before == after && data.len() as u64 == after {
+            return Ok(data);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    eprintln!("cargo:warning={} kept changing while being read", path.display());
+    std::fs::read(path)
+}
+
 fn git(repo: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -242,7 +269,7 @@ fn main() {
         use std::io::Write as _;
         let path = manifest.join("../../src/js").join(asset);
         println!("cargo:rerun-if-changed={}", path.display());
-        let src = std::fs::read(&path).unwrap_or_else(|e| {
+        let src = read_stable(&path).unwrap_or_else(|e| {
             panic!("src/js/{asset} must exist (embedded by the binary): {e}")
         });
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
@@ -270,7 +297,7 @@ fn main() {
         use std::io::Write as _;
         let path = manifest.join(src); // src/ lives inside the crate
         println!("cargo:rerun-if-changed={}", path.display());
-        let raw = std::fs::read(&path).unwrap_or_else(|e| {
+        let raw = read_stable(&path).unwrap_or_else(|e| {
             panic!("{src} must exist (embedded by the binary): {e}")
         });
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
@@ -284,7 +311,7 @@ fn main() {
         use std::io::Write as _;
         let path = manifest.join("../../contract/matrix.json");
         println!("cargo:rerun-if-changed={}", path.display());
-        let src = std::fs::read(&path).unwrap_or_else(|e| {
+        let src = read_stable(&path).unwrap_or_else(|e| {
             panic!("contract/matrix.json must exist (embedded by capabilities.rs): {e}")
         });
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
@@ -299,7 +326,7 @@ fn main() {
         use std::io::Write as _;
         let path = manifest.join("js/rlm_bootstrap.js");
         println!("cargo:rerun-if-changed={}", path.display());
-        let src = std::fs::read(&path).unwrap_or_else(|e| {
+        let src = read_stable(&path).unwrap_or_else(|e| {
             panic!("js/rlm_bootstrap.js must exist: {e}")
         });
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());

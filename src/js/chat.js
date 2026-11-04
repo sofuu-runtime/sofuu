@@ -141,7 +141,7 @@
     var p = configPath();
     var msg = p + ' is corrupt — using defaults; providers/settings from this file are being ignored (left in place, not overwritten)';
     var line = 'Warning: ' + msg;
-    try { console.warn(line); } catch (e) {}
+    try { console.warn(line); } catch (e) { /* no console in this host: the warning has already been recorded in the status line. */ }
     emit({ kind: 'warn', payload: { message: msg } });
   }
   function loadConfig() {
@@ -208,7 +208,7 @@
         var caps = JSON.parse(j);
         return (caps && caps.known) ? caps : null;
       }
-    } catch (e) {}
+    } catch (e) { /* capabilities probe refused: the caller falls back to its built-in defaults. */ }
     return null;
   }
   /* The evidence-ladder resolve (Rust: ml::alloc::policy::resolve) —
@@ -324,7 +324,7 @@
   }
   function estTok(s) {
     if (sofuu.ai && typeof sofuu.ai.estimateTokens === 'function') {
-      try { return sofuu.ai.estimateTokens(s) | 0; } catch (e) {}
+      try { return sofuu.ai.estimateTokens(s) | 0; } catch (e) { /* no tokenizer: the character heuristic below answers instead. */ }
     }
     return Math.ceil(String(s).length / 4);
   }
@@ -381,7 +381,7 @@
       /* Retained transcripts bill their tool_calls JSON too — the provider
        * counts the whole assistant message, not just its (null) content. */
       if (S.history[i].tool_calls) {
-        try { n += estTok(JSON.stringify(S.history[i].tool_calls)); } catch (eTC) {}
+        try { n += estTok(JSON.stringify(S.history[i].tool_calls)); } catch (eTC) { /* unserialisable tool_calls add nothing to the count. */ }
       }
     }
     return n;
@@ -471,7 +471,7 @@
     try {
       var planC = allocPlanChat(0, 0);
       if (planC && planC.compactAt > 0) compactAt = planC.compactAt;
-    } catch (ePC) {}
+    } catch (ePC) { /* no allocator plan for this model: the default compact threshold stands. */ }
     var cMl = cfg();
     if (cMl && cMl.ml && S.history.length > 4 && historyTokens() > budget * 0.5) {
       try {
@@ -624,7 +624,7 @@
         MCP_WARNED = true;
         var msg = 'Warning: ' + ((cfg && cfg.path) || 'mcp config') + ' is corrupt (' +
           ((cfg && cfg.error) || 'unreadable') + ') — MCP servers disabled until it is fixed (left in place, not overwritten)';
-        try { console.warn(msg); } catch (e2) {}
+        try { console.warn(msg); } catch (e2) { /* no console: the message is already on the status line. */ }
         emit({ kind: 'warn', payload: { message: msg } });
       }
       return [];
@@ -873,7 +873,7 @@
     delete S.pendingApprovals[key];
     /* The approval settled early — disarm its ceiling timer so the slot
      * returns to the runtime registry immediately (js-3). */
-    try { if (p.timer) clearTimeout(p.timer); } catch (eT) {}
+    try { if (p.timer) clearTimeout(p.timer); } catch (eT) { /* the timer may already have fired; clearing twice is harmless. */ }
     if (always && allow) {
       /* bash never gets a wholesale session pass — 'always' scopes to the
        * exact command string (the whole-tool pass would auto-run any

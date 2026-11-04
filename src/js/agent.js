@@ -448,7 +448,7 @@
     var raw = '';
     try {
       if (opts && opts.onError !== undefined && opts.onError !== null) raw = String(opts.onError);
-    } catch (e) {}
+    } catch (e) { /* onError is a display hook; a host value that will not stringify leaves the default label. */ }
     if (!raw) raw = String(env('SOFUU_ON_ERROR') || '');
     var mode = raw || (obsTty() ? 'interactive' : 'auto-retry');
     if (!OBS_MODES[mode]) {
@@ -578,7 +578,7 @@
         for (var i = 0; i < 8; i++) r += b[i].toString(16);
         return r;
       }
-    } catch (e) {}
+    } catch (e) { /* the retry probe fell through: the caller rethrows the original error with its own context. */ }
     return Math.floor(Math.random() * 0xffffffff).toString(36) +
            Math.floor(Math.random() * 0xffffffff).toString(36);
   }
@@ -668,7 +668,7 @@
   }
   function estTok(s) {
     if (sofuu.ai && typeof sofuu.ai.estimateTokens === 'function') {
-      try { return sofuu.ai.estimateTokens(s) | 0; } catch (e) {}
+      try { return sofuu.ai.estimateTokens(s) | 0; } catch (e) { /* no tokenizer: the character heuristic below is the fallback. */ }
     }
     return Math.ceil(String(s).length / 4);
   }
@@ -689,7 +689,7 @@
         if (!m) continue;
         var tk = estTok(String(m.content || ''));
         if (m.tool_calls) {
-          try { tk += estTok(JSON.stringify(m.tool_calls)); } catch (eTC) {}
+          try { tk += estTok(JSON.stringify(m.tool_calls)); } catch (eTC) { /* tool_calls that will not serialise contribute 0 tokens. */ }
         }
         if (i === 0 && m.role === 'system') out.system += tk;
         else if (i === 1 && m.role === 'user' &&
@@ -704,7 +704,7 @@
           var sTk = estTok(JSON.stringify(spec));
           if (mcpNames.indexOf(spec.name) >= 0) out.mcpTools += sTk;
           else out.systemTools += sTk;
-        } catch (eTS) {}
+        } catch (eTS) { /* one tool spec that throws contributes no tokens instead of failing the whole estimate. */ }
       }
     }
     return out;
@@ -1210,7 +1210,7 @@
       if (sofuu.ai && typeof sofuu.ai.embedInfo === 'function') {
         return JSON.parse(sofuu.ai.embedInfo());
       }
-    } catch (e) {}
+    } catch (e) { /* no embedInfo from this build: the caller treats it as unknown and keeps its default dimension. */ }
     return null;
   }
   function hashDim() {
@@ -1247,7 +1247,7 @@
       if (sofuu.ai && typeof sofuu.ai.embedInfoV2 === 'function') {
         return JSON.parse(sofuu.ai.embedInfoV2());
       }
-    } catch (e) {}
+    } catch (e) { /* same for the v2 probe. */ }
     return null;
   }
   function semanticInfoV2() {
@@ -1273,7 +1273,7 @@
     try {
       var s = sofuu.ai.embedLocalSemanticV2(String(text));
       if (s && s.length) return mustF32(s, SEM2_DIM);
-    } catch (e) {}
+    } catch (e) { /* a backend that refuses this text falls through to the next embedding path. */ }
     return null;
   }
   /* Sibling path for the fused v2 store: extension-stripped base of the
@@ -1300,7 +1300,7 @@
    * possible, they never decide what is true. */
   var AGENTS_FILE_TOKENS = 3072; /* ~12k chars; generous but bounded */
   function agentsMdPath() {
-    try { return process.cwd() + '/AGENTS.md'; } catch (e) {}
+    try { return process.cwd() + '/AGENTS.md'; } catch (e) { /* no cwd in this host: agentsMdPath returns undefined and the caller skips the file. */ }
     return '';
   }
   /* Read side: fresh at every run() start (a per-run cache, not global —
@@ -1484,21 +1484,21 @@
             return { vec: mustF32(raw, n), backend: { kind: 'remote', id: backend.id, dim: n } };
           }
         }
-      } catch (e2) {}
+      } catch (e2) { /* this backend refused: the loop continues to the next one. */ }
       return null;
     }
     if (backend.kind === 'semantic' && sofuu.ai && typeof sofuu.ai.embedLocalSemantic === 'function') {
       try {
         var s = sofuu.ai.embedLocalSemantic(text);
         if (s) return { vec: mustF32(s, backend.dim), backend: backend };
-      } catch (e3) {}
+      } catch (e3) { /* same, for the local-semantic probe. */ }
       return null;
     }
     if (sofuu.ai && typeof sofuu.ai.embedLocal === 'function') {
       try {
         var v = sofuu.ai.embedLocal(text);
         if (v) return { vec: mustF32(v, backend.dim), backend: backend };
-      } catch (e4) {}
+      } catch (e4) { /* same, for the plain local embedder. */ }
     }
     return null;
   }
@@ -1510,7 +1510,7 @@
      * memories. An explicit def.brainPath / config brainPath still wins
      * (a host may point anywhere deliberately). */
     var cwdPath = '';
-    try { cwdPath = process.cwd() + '/.sofuu/brain/brain.qtsq'; } catch (eC) {}
+    try { cwdPath = process.cwd() + '/.sofuu/brain/brain.qtsq'; } catch (eC) { /* no cwd: no default brain path, which the caller already handles. */ }
     var path = d.brainPath || (ec && ec.brainPath) ||
       cwdPath || ((env('HOME') || env('USERPROFILE') || '.') + '/.sofuu/brain/brain.qtsq');
     // One handle per (path, vector space): two backends over one file
@@ -1547,7 +1547,7 @@
        * evicted handle lost its unreached changes (recall reinforcement,
        * a prune). Flush before dropping — a clean store's flush is a
        * no-op, and a failed one only delays to the next open. */
-      try { if (BRAINS[keys[0]] && BRAINS[keys[0]].cma) BRAINS[keys[0]].cma.flush(); } catch (eV1) {}
+      try { if (BRAINS[keys[0]] && BRAINS[keys[0]].cma) BRAINS[keys[0]].cma.flush(); } catch (eV) { /* evicting a brain is best effort: an unflushed store reopens clean later. */ }
       try { if (BRAINS[keys[0]] && BRAINS[keys[0]].sem) BRAINS[keys[0]].sem.flush(); } catch (eV2) { /* a flush
          of a cache we are about to drop: the state is rebuilt from the store. */ }
       delete BRAINS[keys[0]];
@@ -1571,7 +1571,7 @@
       entry.lastDecay = nowMs;
       if (typeof entry.cma.retain === 'function') dropped = entry.cma.retain() || 0;
       consolidated = brainConsolidateIfDue(entry);
-    } catch (e) {}
+    } catch (e) { /* consolidate/retain are maintenance: a refusal leaves counts at their previous values. */ }
     /* P1 (audit 2026-10-14): the canonical prune must reach disk. Only
      * consolidation flushes itself, so a tick whose only change was the
      * retain() drop left the tombstones in the FILE — a fresh open
@@ -1580,7 +1580,7 @@
      * failed flush is safe (the prune stays in memory and the next
      * successful flush persists it). */
     if (dropped > 0 && consolidated === 0) {
-      try { entry.cma.flush(); } catch (eF) {}
+      try { entry.cma.flush(); } catch (eF) { /* persistence is retried on the next open; the prune itself already happened. */ }
     }
     /* B3.5 (ROADMAP-BRAIN-CMA): the SEM2 channel is a DERIVED index over
      * the canonical records — it no longer runs its own decay or retain
@@ -1753,7 +1753,7 @@
           cma.rememberEntity(ansVec, clip(answer, STORE_CAP_CHARS), entAns, 'agent');
         }
       }
-      try { cma.flush(); } catch (e) {}
+      try { cma.flush(); } catch (e) { /* same: a failed flush only delays durability to the next open. */ }
       if (entry.sem) {
         try {
           var stu = taskVec ? embedSemV2(clip(task, STORE_CAP_CHARS)) : null;
@@ -1779,7 +1779,7 @@
       try {
         var pr = JSON.parse(cma.promoteWorking(JSON.stringify(recalledHashIdsForStore)));
         promotedHash = ((pr && pr.promoted) | 0) + ((pr && pr.merged) | 0);
-      } catch (eP) {}
+      } catch (eP) { /* promotion is an optimisation of the store; a refusal keeps the working set in place. */ }
     }
     /* B1.2 provenance: the source names the scope the memory came from. */
     if (taskVec && typeof cma.rememberWorking === 'function') {
@@ -1800,7 +1800,7 @@
           try {
             var spr = JSON.parse(entry.sem.promoteWorking(JSON.stringify(recalledSemIdsForStore)));
             promotedSem = ((spr && spr.promoted) | 0) + ((spr && spr.merged) | 0);
-          } catch (e4) {}
+          } catch (e4) { /* same for the semantic store. */ }
         }
         var su = taskVec ? embedSemV2(clip(task, STORE_CAP_CHARS)) : null;
         var av = ansVec ? embedSemV2(clip(answer, STORE_CAP_CHARS)) : null;
@@ -2571,7 +2571,7 @@
       var close = ch === '[' ? ']' : '}';
       var from = s.indexOf(ch), to = s.lastIndexOf(close);
       if (from >= 0 && to > from) {
-        try { return JSON.parse(s.slice(from, to + 1)); } catch (e3) {}
+        try { return JSON.parse(s.slice(from, to + 1)); } catch (e3) { /* substring was not JSON after all: fall through to the next strategy. */ }
       }
       return undefined;
     } catch (e) {
@@ -2674,7 +2674,7 @@
         candidates: cands })));
       if (!v || !Array.isArray(v.use) || !Array.isArray(v.skip)) return null;
       return v;
-    } catch (eMl) {}
+    } catch (eMl) { /* malformed model list: the caller treats it as no preference. */ }
     return null;
   }
   /* Render one relevance guidance notice from a plan, or null when there is
@@ -2723,7 +2723,7 @@
       try {
         var db = sofuu.storage.open(dbPath);
         return db ? db.traces : null;
-      } catch (e) {}
+      } catch (e) { /* no storage backend: trace replay is unavailable, which callers already check for. */ }
     }
     return null;
   }
@@ -2816,7 +2816,7 @@
         sig.addEventListener('abort', function () {
           state.cancelled = true;
           for (var i = 0; i < state.aborts.length; i++) {
-            try { state.aborts[i](); } catch (e) {}
+            try { state.aborts[i](); } catch (e) { /* one abort handler throwing must not stop the others. */ }
           }
         });
       }
@@ -3168,7 +3168,7 @@
             duration_ms: dur,
             timestamp: Date.now()
           });
-        } catch (eTr) {}
+        } catch (eTr) { /* trace records are telemetry; a failed append loses one record. */ }
       }
       /* M4: bound the HEAVY data, keep the shape — the first-16 skeleton
        * (start/plan) and the freshest (TRACE_CAP-16) events keep their
@@ -3334,7 +3334,7 @@
             agent: d.name
           });
         }
-      } catch (eEndHook) {}
+      } catch (eEndHook) { /* user end-hooks are best effort by contract; the run result is already computed. */ }
       delete ACTIVE[runId];
       delete SIGNALS[cancelId];
       ACTIVE_COUNT--;
@@ -3362,7 +3362,7 @@
           emit('prompt_rewritten', { turnId: runId, by: 'service' });
         }
       }
-    } catch (eStartHook) {}
+    } catch (eStartHook) { /* same for start-hooks: the run proceeds without one. */ }
     emit('start', { agentName: d.name, task: task, fullTask: task, depth: depth, chain: chain.slice() });
     /* SPEC §3: the run's first log event. budget rides along so a reader
      * can tell a run that finished from one its guardrail cut short, and

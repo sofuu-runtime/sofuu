@@ -36,7 +36,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: js-swallow-check env-knobs-check all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
+.PHONY: js-swallow-check env-knobs-check swiftpm-consistency-check all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
 	kaze-drift-check kaze-drift-strict clippy-ratchet \
 	observability-stress asan fuzz-simd policy-dx modern-npm sbom sign-dist \
         deps scoreboard scoreboard-check cuda-check \
@@ -334,7 +334,7 @@ clean:
 	rm -f $(TARGET)
 	cargo clean 2>/dev/null || true
 
-test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check env-knobs-check
+test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check env-knobs-check swiftpm-consistency-check
 	@echo ""
 	@echo "\033[1m=== Sofuu Test Suite ===\033[0m"
 	@echo ""
@@ -358,6 +358,14 @@ js-swallow-check:
 # the list of names the binary does not honour never grows.
 env-knobs-check:
 	@python3 scripts/check-env-knobs.py
+
+# The two install paths must agree (PLAN-AUDIT-REMEDIATION §7 Task 7.3). A
+# release stamps Package.swift and Sofuu.podspec in one pass; a stamp that
+# rewrote only one of them is how the podspec sat on 0.2.0 through two releases
+# and "pod 'Sofuu'" fetched an artifact four months older than the tag. Needs no
+# artifact and no version argument, so it runs on every commit.
+swiftpm-consistency-check:
+	@scripts/stamp-swiftpm.sh --consistency
 
 kaze-drift-check:
 	@scripts/kaze-drift-check.sh

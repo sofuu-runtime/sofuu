@@ -17,6 +17,38 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ZIP="${1:-}"
 
+# --consistency: the two manifests must at least agree with each other.
+#
+# --check answers "is this tree publishable for vX", which needs SOFUU_VERSION and
+# a release in progress. This mode needs neither, so `make test` can run it on
+# every commit: it catches the drift the audit found without waiting for a tag.
+# The manifests track the most recent *published* release, not Cargo.toml, so
+# agreeing with each other is the invariant - the stamp moves both to the new
+# version in one pass, and a half-finished stamp (one file rewritten, the other
+# left behind) is how Sofuu.podspec stayed on 0.2.0 through two releases.
+if [[ "$ZIP" == "--consistency" ]]; then
+  fail=0
+  pkg_version="$(grep -A1 'let sofuuXCFrameworkURL' "$REPO_ROOT/Package.swift" \
+                 | tr -d ' \n' | sed -n 's#.*/download/v\([^/]*\)/libsofuu.xcframework.zip.*#\1#p')"
+  pod_version="$(awk -F"'" '/s\.version/ {print $2; exit}' "$REPO_ROOT/Sofuu.podspec")"
+  if [[ -z "$pkg_version" ]]; then
+    echo "error: could not read a release version out of Package.swift URL." >&2
+    fail=1
+  elif [[ "$pkg_version" != "$pod_version" ]]; then
+    echo "error: the install paths disagree - Package.swift points at v$pkg_version," >&2
+    echo "       Sofuu.podspec says s.version = '$pod_version'." >&2
+    echo "       A half-stamped release sends SwiftPM and CocoaPods to different artifacts." >&2
+    echo "       Fix: SOFUU_VERSION=<v> scripts/stamp-swiftpm.sh dist/libsofuu.xcframework.zip" >&2
+    fail=1
+  fi
+  if grep -qE 'let sofuuXCFrameworkChecksum = "0{64}"' "$REPO_ROOT/Package.swift"; then
+    echo "note: Package.swift carries the all-zero checksum placeholder." >&2
+    echo "      That is the pre-release state, and README says so; the release stamp" >&2
+    echo "      replaces it with the checksum of the published zip." >&2
+  fi
+  [[ "$fail" -eq 0 ]] && echo "OK SwiftPM and CocoaPods agree: both point at v$pkg_version"
+  exit "$fail"
+fi
 # --check: assert the checked-in manifest is publishable for SOFUU_VERSION,
 # without an artifact in hand. A release uses this to prove the tree it is
 # tagging actually resolves; the stamping path below only proves it could.

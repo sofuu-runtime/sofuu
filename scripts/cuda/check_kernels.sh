@@ -74,7 +74,15 @@ CXX_BIN="${CXX:-c++}"
     "$CUDA/parity/host_check.cpp" -o "$TMP/host_check"
 "$TMP/host_check"
 
-# 5. Loader portability
+# 5. The GPU harness must compile cleanly even where it cannot run. This is
+#    where the `!sofuu_cuda_ctx_alloc(...)` mistake (0 means success) would
+#    have been caught before a Kaggle round-trip.
+"$CXX_BIN" -std=c++17 -O2 -Wall -Wextra -Werror -I "$CUDA" -I "$CUDA/parity" \
+    -fsyntax-only "$CUDA/parity/gpu_check.cpp"
+echo "[PASS] gpu_check.cpp compiles clean under -Wall -Wextra -Werror"
+pass=$((pass + 1))
+
+# 6. Loader portability
 CC_BIN="${CC:-cc}"
 "$CC_BIN" -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror -I "$CUDA" \
     -c "$CUDA/cuda_loader.c" -o "$TMP/cuda_loader.o"

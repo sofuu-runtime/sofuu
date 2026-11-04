@@ -234,9 +234,12 @@ static void *resolve(void *lib, const char *versioned, const char *plain) {
     do {                                                                       \
         void *_p = resolve(lib, versioned, plain);                             \
         if (!_p) {                                                             \
-            set_error("libcuda: missing required symbol %s%s%s", versioned,    \
-                      (plain && strcmp(plain, versioned) != 0) ? " / " : "",   \
-                      (plain && strcmp(plain, versioned) != 0) ? plain : "");  \
+            if (plain) {                                                   \
+                set_error("libcuda: missing required symbol %s / %s",      \
+                          versioned, plain);                               \
+            } else {                                                       \
+                set_error("libcuda: missing required symbol %s", versioned); \
+            }                                                              \
             dlclose(lib);                                                      \
             return NULL;                                                       \
         }                                                                      \

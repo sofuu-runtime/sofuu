@@ -52,6 +52,18 @@ bool alloc_upload(const void *host, size_t bytes, unsigned long long *out) {
     return true;
 }
 
+// Allocate a device-only buffer (no host copy). The raw API returns 0 for
+// success, so this small wrapper keeps call sites on the same bool convention
+// as alloc_upload; `!sofuu_cuda_ctx_alloc(...)` inverted success and made six
+// kernels report a bogus allocation failure on the T4 while allocation worked.
+bool alloc_only(size_t bytes, unsigned long long *out) {
+    if (sofuu_cuda_ctx_alloc(g_ctx, (unsigned long long)bytes, out) != 0) {
+        fail_msg("cuMemAlloc");
+        return false;
+    }
+    return true;
+}
+
 bool download(unsigned long long dev, void *host, size_t bytes) {
     if (sofuu_cuda_ctx_download(g_ctx, host, dev, bytes) != 0) {
         fail_msg("cuMemcpyDtoH");
@@ -144,7 +156,7 @@ void test_gemv_q8_0(void *fn, uint32_t &seed) {
     unsigned long long dw = 0, dx = 0, dy = 0;
     if (!alloc_upload(w.data(), w.size(), &dw) ||
         !alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
-        !sofuu_cuda_ctx_alloc(g_ctx, (unsigned long long)rows * sizeof(float), &dy)) {
+        !alloc_only((unsigned long long)rows * sizeof(float), &dy)) {
         fail_msg("alloc");
         ++g_failures;
         return;
@@ -179,7 +191,7 @@ void test_gemv_q4_k(void *fn, uint32_t &seed) {
     unsigned long long dw = 0, dx = 0, dy = 0;
     if (!alloc_upload(w.data(), w.size(), &dw) ||
         !alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
-        !sofuu_cuda_ctx_alloc(g_ctx, (unsigned long long)rows * sizeof(float), &dy)) {
+        !alloc_only((unsigned long long)rows * sizeof(float), &dy)) {
         fail_msg("alloc");
         ++g_failures;
         return;
@@ -214,7 +226,7 @@ void test_gemv_q6_k(void *fn, uint32_t &seed) {
     unsigned long long dw = 0, dx = 0, dy = 0;
     if (!alloc_upload(w.data(), w.size(), &dw) ||
         !alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
-        !sofuu_cuda_ctx_alloc(g_ctx, (unsigned long long)rows * sizeof(float), &dy)) {
+        !alloc_only((unsigned long long)rows * sizeof(float), &dy)) {
         fail_msg("alloc");
         ++g_failures;
         return;
@@ -247,7 +259,7 @@ void test_gemv_f32(void *fn, uint32_t &seed) {
     unsigned long long dw = 0, dx = 0, dy = 0;
     if (!alloc_upload(w.data(), w.size() * sizeof(float), &dw) ||
         !alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
-        !sofuu_cuda_ctx_alloc(g_ctx, (unsigned long long)rows * sizeof(float), &dy)) {
+        !alloc_only((unsigned long long)rows * sizeof(float), &dy)) {
         fail_msg("alloc");
         ++g_failures;
         return;
@@ -286,7 +298,7 @@ void test_rmsnorm(void *fn, uint32_t &seed) {
     unsigned long long dx = 0, dw = 0, dy = 0;
     if (!alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
         !alloc_upload(w.data(), w.size() * sizeof(float), &dw) ||
-        !sofuu_cuda_ctx_alloc(g_ctx, (unsigned long long)n * sizeof(float), &dy)) {
+        !alloc_only((unsigned long long)n * sizeof(float), &dy)) {
         fail_msg("alloc");
         ++g_failures;
         return;
@@ -315,7 +327,7 @@ void test_swiglu(void *fn, uint32_t &seed) {
     unsigned long long dg = 0, du = 0, dy = 0;
     if (!alloc_upload(g.data(), g.size() * sizeof(float), &dg) ||
         !alloc_upload(u.data(), u.size() * sizeof(float), &du) ||
-        !sofuu_cuda_ctx_alloc(g_ctx, (unsigned long long)n * sizeof(float), &dy)) {
+        !alloc_only((unsigned long long)n * sizeof(float), &dy)) {
         fail_msg("alloc");
         ++g_failures;
         return;

@@ -126,7 +126,7 @@ export RUSTFLAGS="$REMAP -C linker=$REPO_ROOT/scripts/cross/zig-ld.sh -C link-ar
 # scripts/verify-dist.sh checks ("carries no stamp for <rev>").
 if [ -z "${SOFUU_BUILD:-}" ]; then
     _rev=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
-    if ! git -C "$REPO_ROOT" diff --quiet --untracked-files=no 2>/dev/null; then
+    if [ -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
         _rev="${_rev}-dirty"
     fi
     export SOFUU_BUILD="$_rev"

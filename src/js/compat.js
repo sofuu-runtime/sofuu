@@ -1238,7 +1238,7 @@ if (typeof globalThis.ReadableStream === "undefined") {
         this._resolveClosed = resolve;
         this._rejectClosed = reject;
       });
-      this._closedPromise.catch(function () {});
+      this._closedPromise.catch(function () { /* a stream nobody awaits closing is not an error. */ });
       this._controller = new ReadableStreamDefaultController(this);
       try {
         if (typeof this._source.start === "function") {
@@ -1268,6 +1268,7 @@ if (typeof globalThis.ReadableStream === "undefined") {
         try {
           this._source.cancel(reason);
         } catch (e) {
+          /* the source may already be cancelled or closed; there is nothing to undo. */
         }
       }
       if (this._state === "readable") {
@@ -1696,7 +1697,7 @@ if (typeof globalThis.ReadableStream === "undefined") {
       if (value instanceof Error) {
         try { out = new value.constructor(value.message); } catch (eCtor) { out = new Error(value.message); }
         out.name = value.name;
-        if (value.stack) { try { out.stack = value.stack; } catch (eSt) {} }
+        if (value.stack) { try { out.stack = value.stack; } catch (eSt) { /* a frozen stack keeps the clone without one. */ } }
         return out;
       }
       if (!missing("Blob") && value instanceof g.Blob) return value.slice(0, value.size, value.type);

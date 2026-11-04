@@ -2326,7 +2326,7 @@
     for (var id in S.pendingApprovals) {
       var p = S.pendingApprovals[id];
       delete S.pendingApprovals[id];
-      try { if (p.timer) clearTimeout(p.timer); } catch (eT) {}
+      try { if (p.timer) clearTimeout(p.timer); } catch (eT) { /* the approval ceiling already fired; clearing it twice is harmless. */ }
       emit({ kind: 'approval_resolved', payload: { id: id } });
       try { p.resolve(false); } catch (e) { /* a promise already settled ignores the second resolve. */ }
     }

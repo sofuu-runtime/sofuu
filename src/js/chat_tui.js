@@ -19,7 +19,7 @@
     try {
       if (sofuu.agent && typeof sofuu.agent.setPermissions === 'function')
         sofuu.agent.setPermissions(cfg.permissions || 'full');
-    } catch (e) {}
+    } catch (e) { /* permissions are a host policy hint; a refusal leaves the agent's default posture */ }
   }
   applyMode();
   let history = [];
@@ -91,7 +91,7 @@
         const kinds = items.slice(0, 3).map(function (item) { return String(item.kind || 'output'); }).join(' + ');
         try { out('\x1b[90m  ⏺ recovered ' + items.length + ' historical output' + (items.length === 1 ? '' : 's') +
           (latest && latest.created_at ? ' · latest ' + latest.created_at : '') +
-          (kinds ? ' · ' + kinds : '') + '\x1b[0m\n'); } catch (eNotice) {}
+          (kinds ? ' · ' + kinds : '') + '\x1b[0m\n'); } catch (eNotice) { /* the recovered-output notice is cosmetic; the history is already restored */ }
       }
       return result && result.bundle && result.bundle.context ? String(result.bundle.context) : '';
     } catch (e) {
@@ -403,7 +403,7 @@
   function requestExit() {
     if (exiting) return;
     exiting = true;
-    try { __chat_slash('/exit'); } catch (e) {}
+    try { __chat_slash('/exit'); } catch (e) { /* the slash handler is a host binding; exiting proceeds either way */ }
   }
   globalThis.__on_esc = function() {
     /* Abort an in-flight RLM episode — the rlm driver loop checks this
@@ -413,7 +413,7 @@
     if (typeof stopPhase === 'function') stopPhase();
     /* Cancel the in-flight agent run (PLAN-AGENTS A5). */
     if (sofuu.agent && typeof sofuu.agent.cancel === 'function') {
-      try { sofuu.agent.cancel('chat'); } catch (e) {}
+      try { sofuu.agent.cancel('chat'); } catch (e) { /* nothing in flight to cancel is the common case on exit */ }
     }
   };
   globalThis.__on_ctrl_c = function() {
@@ -432,7 +432,7 @@
    * the live footer already report the new settings. TTY-only: piped, a
    * refresh appends a duplicate panel instead of replacing in place. */
   function maybeRefreshPanel() {
-    if (TTY && history.length === 0) { try { __chat_refresh(); } catch (e) {} }
+    if (TTY && history.length === 0) { try { __chat_refresh(); } catch (e) { /* the refresh is a redraw hint; the caller re-enters its loop without one */ } }
   }
   globalThis.__on_tab = function() {
     const order = ['full', 'edit', 'plan'];
@@ -440,7 +440,7 @@
     let next = order.indexOf(cur);
     next = order[(next + 1) % order.length];
     __chat_slash('/mode ' + next);
-    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     applyMode();
     refreshStatus(lastChip);
     maybeRefreshPanel();
@@ -486,7 +486,7 @@
     /* Display/metadata mirror of agent.js brainFor's path chain: explicit
      * config override, then project-local, then HOME. */
     if (cfg.brain_path) return cfg.brain_path;
-    try { return process.cwd() + '/.sofuu/brain/brain.qtsq'; } catch (e) {}
+    try { return process.cwd() + '/.sofuu/brain/brain.qtsq'; } catch (e) { /* no cwd in this host: the caller falls back to its configured brain path */ }
     return (env('HOME') || env('USERPROFILE') || '.') + '/.sofuu/brain/brain.qtsq';
   }
   function env(n) { try { return process.env[n] || ''; } catch (e) { return ''; } }
@@ -556,7 +556,7 @@
       }
       let dim = 768;
       if (sofuu.ai && typeof sofuu.ai.embedLocal === 'function') {
-        try { const v = sofuu.ai.embedLocal(''); if (v && v.length) dim = v.length; } catch (e) {}
+        try { const v = sofuu.ai.embedLocal(''); if (v && v.length) dim = v.length; } catch (e) { /* no local embedder: the 768 default is the documented dimension */ }
       }
       return { kind: 'hash', id: 'hash-v1', dim: dim };
     } catch (e) { return null; }
@@ -569,14 +569,14 @@
       try {
         const v = await sofuu.ai.embedLocalSemantic(text);
         if (v && v.length === be.dim) return v;
-      } catch (e) {}
+      } catch (e) { /* this backend refused the text; the next embedding path is tried */ }
       return null;
     }
     if (sofuu.ai && typeof sofuu.ai.embedLocal === 'function') {
       try {
         const v = await sofuu.ai.embedLocal(text);
         if (v && v.length === be.dim) return v;
-      } catch (e) {}
+      } catch (e) { /* same, for the plain local embedder */ }
     }
     /* Fall back to a remote embedding provider if configured. */
     if (cfg.embed_provider && cfg.embed_model && sofuu.ai && typeof sofuu.ai.embed === 'function') {
@@ -585,7 +585,7 @@
         if (r && r.vector) return r.vector;
         if (r && r.embedding) return r.embedding;
         if (Array.isArray(r)) return r;
-      } catch (e) {}
+      } catch (e) { /* a backend that returns neither embedding shape is skipped */ }
     }
     return null;
   }
@@ -613,7 +613,7 @@
             if (mirrorToSem2(r0.text, 'user_pin', 'pin')) semNote = ' · mirrored to v2';
           }
         }
-      } catch (eM) {}
+      } catch (eM) { /* a brain that will not open leaves the memory unwritten for this turn */ }
       /* AGENTS.md (2026-09-12): the fact also lands in the project context
        * file so it rides EVERY request as standing context, not just via
        * semantic recall. Never fatal — the brain pin above already held. */
@@ -623,7 +623,7 @@
           const r = await sofuu.agent.pinProjectFact(fact);
           if (r === 'added') fileNote = ' · pinned to AGENTS.md';
           else if (r === 'exists') fileNote = ' · already in AGENTS.md';
-        } catch (eP) {}
+        } catch (eP) { /* pinning to AGENTS.md is best effort; the fact itself is already stored */ }
       }
       out('\x1b[90m  ⏺ remembered · ' + brain.count() + ' memories · ' + brainPath() + fileNote + semNote + '\x1b[0m\n');
     } catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); }
@@ -729,7 +729,7 @@
       if (entry && entry.cma) { brain = entry.cma; sem = entry.sem || null; }
       if (driverBrainBackend && driverBrainBackend.id) backendId = driverBrainBackend.id;
       else if (entry && entry.backend && entry.backend.id) backendId = entry.backend.id;
-    } catch (e) {}
+    } catch (e) { /* no backend id in either source: the caller keeps the driver default */ }
     if (!brain || typeof brain.stats !== 'function') {
       out('\x1b[90m  Brain unavailable (QTSQ not linked?)\x1b[0m\n'); return;
     }
@@ -740,7 +740,7 @@
     const tiers = [];
     for (let t = 0; t <= 4; t++) {
       let total = 0;
-      try { total = (JSON.parse(brain.list({ tier: t, limit: 1 })).total) | 0; } catch (e) {}
+      try { total = (JSON.parse(brain.list({ tier: t, limit: 1 })).total) | 0; } catch (e) { /* a tier that will not report a count reads as zero */ }
       tiers.push(total);
     }
     const hist = TIER_NAMES.map((n, i) => n + ' ' + tiers[i]).join(' · ');
@@ -751,7 +751,7 @@
           ' (in-RAM — promoted when a turn uses them)\x1b[0m');
     }
     let cap = 100000;
-    try { cap = parseInt(process.env.SOFUU_BRAIN_MAX_RECORDS, 10); } catch (e) {}
+    try { cap = parseInt(process.env.SOFUU_BRAIN_MAX_RECORDS, 10); } catch (e) { /* an unparseable cap falls back to the 100000 default */ }
     if (!(cap > 0 || cap === 0)) cap = 100000;
     if (cap === 0) out('  \x1b[2m  capacity: cap disabled (SOFUU_BRAIN_MAX_RECORDS=0)\x1b[0m');
     else {
@@ -794,7 +794,7 @@
       const res = JSON.parse(brain.list({ offset: id, limit: 1 }));
       const first = (res.records || [])[0];
       if (first && first.id === id) rec = first;
-    } catch (e) {}
+    } catch (e) { /* the record was not found at the front of the first page, which is not an error */ }
     if (!rec) {
       out('\x1b[90m  No memory with id ' + id +
           ' — ids renumber when dead records are pruned; re-check with /memory.\x1b[0m\n');
@@ -823,7 +823,7 @@
           for (const r of rows) { if (r.text === rec.text && sem.forget(r.id)) f++; }
           if (f) sem.flush();
         }
-      } catch (eS) {}
+      } catch (eS) { /* a semantic flush that fails only defers durability to the next open */ }
       out('\x1b[90m  ⏺ forgot #' + id + ' · pruned at the next turn boundary\x1b[0m\n');
     } catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); }
   }
@@ -938,7 +938,7 @@
     } else {
       /* Bare /resume — show picker */
       let sessions = [];
-      try { sessions = JSON.parse(__chat_sessions()); } catch (e) {}
+      try { sessions = JSON.parse(__chat_sessions()); } catch (e) { /* no session list is not a failure: the picker opens empty */ }
       if (!sessions.length) {
         out('\x1b[90m  No other sessions found on this project.\x1b[0m\n');
         return;
@@ -966,7 +966,7 @@
       sessionId = picked.id;
     }
     let turns = [];
-    try { turns = JSON.parse(__chat_resume_turns(sessionId)); } catch (e) {}
+    try { turns = JSON.parse(__chat_resume_turns(sessionId)); } catch (e) { /* a session whose turns will not parse still resumes with an empty transcript */ }
     if (!turns.length) {
       out('\x1b[90m  Session has no turns to resume.\x1b[0m\n');
       return;
@@ -1044,10 +1044,10 @@
   async function handleSessions(arg) {
     if (arg && arg.length > 0) { await handleResume(arg); return; }
     let project = '';
-    try { project = __chat_project() || ''; } catch (e) {}
-    if (!project) { try { project = process.cwd(); } catch (e) {} }
+    try { project = __chat_project() || ''; } catch (e) { /* no project context in this host */ }
+    if (!project) { try { project = process.cwd(); } catch (e) { /* no project context in this host */ } }
     let sessions = [];
-    try { sessions = JSON.parse(__chat_sessions()); } catch (e) {}
+    try { sessions = JSON.parse(__chat_sessions()); } catch (e) { /* no session list is not a failure: the picker opens empty */ }
     if (!sessions.length) {
       out('\x1b[90m  No other sessions found on this project' +
           (project ? ' (' + project + ')' : '') + '.\x1b[0m\n');
@@ -1205,7 +1205,7 @@
           return { id: info.id || 'hash-v1', dimension: info.dimension };
         }
       }
-    } catch (e) {}
+    } catch (e) { /* the brain size probe is advisory; the caller reports unknown */ }
     const b = driverBackend();
     if (b && b.id && b.dim) return { id: b.id, dimension: b.dim };
     return { id: 'hash-v1', dimension: 768 };
@@ -1312,7 +1312,7 @@
             if (mirrorToSem2(t, r.role, r.source || 'import')) mirrored++;
           }
         }
-      } catch (eM) {}
+      } catch (eM) { /* an import line that will not parse is skipped, the rest still import */ }
       out('\x1b[90m  ⏺ imported ' + (card.label ? '"' + card.label + '" · ' : '') +
           stats.added + ' added · ' + stats.merged + ' merged (duplicates) · ' +
           stats.skipped + ' skipped' +
@@ -1546,7 +1546,7 @@
         const c = JSON.parse(sofuu.ai.modelCaps(v.model || '', v.base_url || undefined));
         return (c && c.known) ? c : null;
       }
-    } catch (e) {}
+    } catch (e) { /* no capability report: the model keeps its conservative defaults */ }
     return null;
   }
   /* Evidence-ladder resolve (same native the shipped chat.js uses):
@@ -1568,7 +1568,7 @@
           c.ctx_window_explicit === true));
         if (r && r.window > 0) return r;
       }
-    } catch (e) {}
+    } catch (e) { /* same for the resolve phase; defaults stand */ }
     /* Legacy ladder when the native is absent: config, capped by any
      * caps evidence (registry/discovered), then the per-provider floor.
      * An explicit value keeps the caller's number. */
@@ -1656,12 +1656,12 @@
           if (!r || !r.listing) continue;
           anyOk = true;
           if (sofuu.ml && sofuu.ml.alloc && typeof sofuu.ml.alloc.ingestListing === 'function') {
-            try { sofuu.ml.alloc.ingestListing(r.endpoint, JSON.stringify(r.listing)); } catch (eI) {}
+            try { sofuu.ml.alloc.ingestListing(r.endpoint, JSON.stringify(r.listing)); } catch (eI) { /* allocator feedback is an optimisation of the next plan */ }
           }
         }
         if (anyOk) capsDiscoveredAt = Date.now();
-      }).catch(function () {});
-    } catch (e) {}
+      }).catch (function () { /* the ingest post is fire-and-forget; the local listing is already recorded */ });
+    } catch (e) { /* and a synchronous failure is equally harmless */ }
   }
 
   /* ── F2: detect-on-select ──────────────────────────────────────────
@@ -1711,7 +1711,7 @@
         out('\x1b[33m  ⚠ ' + shown + ' publishes no limits for ' + c.model + ' — using ' + fmtTk(r.window) + ' (set /ctx explicitly if you know better)\x1b[0m\n');
       }
       refreshStatus('');
-    } catch (e) {}
+    } catch (e) { /* capability detection is a warm-up; failing it costs a probe */ }
   }
 
   function ctxBudget() {
@@ -1796,7 +1796,7 @@
   const allocNotedNotes = {};
   function estTok(s) {
     if (sofuu.ai && typeof sofuu.ai.estimateTokens === 'function') {
-      try { return sofuu.ai.estimateTokens(s) | 0; } catch (e) {}
+      try { return sofuu.ai.estimateTokens(s) | 0; } catch (e) { /* no tokenizer: the character heuristic answers instead */ }
     }
     return Math.ceil(String(s).length / 4);
   }
@@ -1840,7 +1840,7 @@
       n += estTok(String(m.content || ''));
       /* Retained transcripts bill their tool_calls JSON too — the provider
        * counts the whole assistant message, not just its (null) content. */
-      if (m.tool_calls) { try { n += estTok(JSON.stringify(m.tool_calls)); } catch (eTC) {} }
+      if (m.tool_calls) { try { n += estTok(JSON.stringify(m.tool_calls)); } catch (eTC) { /* unserialisable tool_calls add nothing to the estimate */ } }
     }
     return n;
   }
@@ -2264,14 +2264,14 @@
    * the cursor, and overlays the result above the input box. A single dim
    * position sweeps left→right and loops — not a fading trail. */
   function tickPhase() {
-    if (!CURRENT_PHASE) { try { __chat_phase(''); } catch (e) {} return; }
+    if (!CURRENT_PHASE) { try { __chat_phase(''); } catch (e) { /* the phase line is a status hint only */ } return; }
     const label = CURRENT_PHASE;
     let line = '';
     for (let i = 0; i < label.length; i++) {
       line += (i === PHASE_FRAME ? '\x1b[2m' + label[i] + '\x1b[0m' : label[i]);
     }
     PHASE_FRAME = (PHASE_FRAME + 1) % label.length;
-    try { __chat_phase('  ' + line); } catch (e) {}
+    try { __chat_phase('  ' + line); } catch (e) { /* the phase line is a status hint only */ }
   }
   let phaseTimer = null;
   const startPhase = () => {
@@ -2283,7 +2283,7 @@
   function stopPhase() {
     if (phaseTimer) { clearInterval(phaseTimer); phaseTimer = null; }
     CURRENT_PHASE = null;
-    if (TTY) { try { __chat_phase(''); } catch (e) {} }
+    if (TTY) { try { __chat_phase(''); } catch (e) { /* the phase line is a status hint only */ } }
   }
 
   async function turn(text, ov, turnNo, attemptNo) {
@@ -2344,13 +2344,13 @@
      * can resolve on the first turn too. */
     if (!agentsDirLoaded) {
       agentsDirLoaded = true;
-      try { if (sofuu.agent && typeof sofuu.agent.loadDir === 'function') await sofuu.agent.loadDir(); } catch (e) {}
+      try { if (sofuu.agent && typeof sofuu.agent.loadDir === 'function') await sofuu.agent.loadDir(); } catch (e) { /* the agent directory is optional; the flag is set first so this is not retried */ }
     }
     var subAgentNames = [];
     try {
       if (sofuu.agent && typeof sofuu.agent.list === 'function')
         subAgentNames = sofuu.agent.list().map(function (a) { return a.name; });
-    } catch (e) {}
+    } catch (e) { /* same, for the listing below the load */ }
     /* ── @agent mentions (both forms) ────────────────────────────────
      * "@name task" or "@agent:name task" runs the named agent DIRECTLY
      * with its own definition (system/tools/memory/model) as a focused
@@ -2382,7 +2382,7 @@
     const manifest = expanded.manifest;
     if (promptLoggedTurn !== archiveTurn) {
       promptLoggedTurn = archiveTurn;
-      try { __chat_log('prompt', String(typed)); } catch (e) {}
+      try { __chat_log('prompt', String(typed)); } catch (e) { /* the transcript log is a convenience; the turn is unaffected */ }
     }
     /* M1: /watch changes surface in chat context ONCE — drained into this
      * turn's ephemeral context note and cleared (hard-capped at the poll
@@ -2470,7 +2470,7 @@
           out('\x1b[90m  ~ alloc · ' + n + '\x1b[0m');
         }
       }
-    } catch (e) {}
+    } catch (e) { /* optional host binding: without it this panel keeps its previous state */ }
     /* Streaming render state — same UX as the pre-migration driver:
      * spinner + growing line in the TUI, plain writes when piped. */
     let acc = '', anim = null, si2 = 0, sawThink = false, capped = false;
@@ -2584,7 +2584,7 @@
           } else if (e.kind === 'recall') {
             /* F1/P2: /why reports exactly what gating let through this turn
              * (hits already thresholded, deduped, budget-cut by agent.js). */
-            try { __chat_set_recall(JSON.stringify(Array.isArray(p.hits) ? p.hits : [])); } catch (e2) {}
+            try { __chat_set_recall(JSON.stringify(Array.isArray(p.hits) ? p.hits : [])); } catch (e2) { /* the recall panel is a display hint only */ }
             /* Brain feedback: one dim line so a recalled context is visible
              * (and the brain being ON is observable), never the contents. */
             if (p && p.count > 0) {
@@ -2788,7 +2788,7 @@
             out('\x1b[90m    ↳ context was at ' + pct + '% — /compact now, or lower /ctx\x1b[0m');
           }
         }
-      } catch (eB) {}
+      } catch (eB) { /* optional host binding: without it this panel keeps its previous state */ }
     } else if (res && res.stopped) {
       /* Unknown stop cause (future agent.js values): still say SOMETHING —
        * a silent stop reads as a dead provider (P3-2). */
@@ -2834,7 +2834,7 @@
     if (ctxTk > 0 || outTk > 0) {
       const cacheR = (res && res.usage && res.usage.cacheReadTokens) || 0;
       const cacheW = (res && res.usage && res.usage.cacheWriteTokens) || 0;
-      try { __chat_report_usage(c.model || '', ctxTk, outTk, cacheR, cacheW); } catch (e) {}
+      try { __chat_report_usage(c.model || '', ctxTk, outTk, cacheR, cacheW); } catch (e) { /* usage reporting is cosmetic */ }
       /* Show running spend in the footer next to tk. */
       let cost;
       try { cost = JSON.parse(__chat_budget_check()); } catch (e) { cost = null; }
@@ -2851,7 +2851,7 @@
      * "(no response)" as if it were the answer. */
     const noResponse = answer === '(no response)' && res && res.stopped;
     if (!noResponse) {
-      try { __chat_log('answer', String(answer)); } catch (e) {}
+      try { __chat_log('answer', String(answer)); } catch (e) { /* the transcript log is a convenience; the turn is unaffected */ }
       /* F3: history stores the manifest only (not full file text). */
       const histText = manifest ? text + ' [' + manifest + ']' : text;
       history.push({ role: 'user', content: histText });
@@ -2879,7 +2879,7 @@
     }
     /* M2: one full GC per completed turn — bounds JS garbage to a single
      * turn's worth instead of accumulating against the heap cap. */
-    try { __chat_gc(); } catch (e) {}
+    try { __chat_gc(); } catch (e) { /* a host without GC keeps running */ }
     /* F9: post-hook — may modify the answer. */
     const finalAnswer = await runHookPost(text, answer, res && res.usage);
     if (finalAnswer !== answer) {
@@ -2997,7 +2997,7 @@
       const h = key ? { Authorization: 'Bearer ' + key } : {};
       let r = await fetchWithTimeout(root + '/models', { headers: h }, 6000);
       if (r && r.status === 404 && !root.endsWith('/v1')) {
-        try { r = await fetchWithTimeout(root + '/v1/models', { headers: h }, 6000); } catch (e) {}
+        try { r = await fetchWithTimeout(root + '/v1/models', { headers: h }, 6000); } catch (e) { /* optional host binding: without it this panel keeps its previous state */ }
       }
       /* text() + JSON.parse — Response.json() truncated some chunked
        * bodies ("unexpected data at the end", e.g. lightning.ai's 53-model
@@ -3106,7 +3106,7 @@
     let bare = base.replace(/\/+$/, '').replace(/\/chat\/completions\/chat\/completions/g, '/chat/completions');
     let hasChatSuffix = bare.endsWith('/chat/completions') || bare.endsWith('/completions') || bare.endsWith('/api/chat');
     let endpoint = hasChatSuffix ? bare : (profile === 'local' ? bare + '/api/chat' : (profile === 'openai' ? bare + '/chat/completions' : bare));
-    try { __chat_apply_provider(name, endpoint, key, model, profile); } catch (e) {}
+    try { __chat_apply_provider(name, endpoint, key, model, profile); } catch (e) { /* a provider switch that throws leaves the current provider in place */ }
     cfg = JSON.parse(__chat_getcfg());
     out('\n  \x1b[32m✓ Provider configured:\x1b[0m ' +
       name +
@@ -3142,18 +3142,18 @@
         if (sofuu.agent && typeof sofuu.agent.rememberGist === 'function' && gistText) {
           await sofuu.agent.rememberGist(brainDef(), gistText);
         }
-      } catch (eG) {}
+      } catch (eG) { /* no gist this turn: the context is compacted without a summary */ }
       refreshStatus(lastChip); /* meter drops visibly right away */
     } catch (e) { out('\x1b[31m  [Compact failed: ' + String(e.message || e) + ']\x1b[0m\n'); }
   }
   // Output routing: in the full-screen TUI everything lands in the
   // conversation area; otherwise plain stdout (piped/REPL stays clean).
   function out(s) {
-    if (TTY) { try { __tui_log(s); } catch (e) {} }
+    if (TTY) { try { __tui_log(s); } catch (e) { /* the TUI bridge is host-provided; a build without it prints through the plain path */ } }
     else { console.log(s); }
   }
   function outLast(s) {
-    if (TTY) { try { __tui_log_last(s); } catch (e) {} }
+    if (TTY) { try { __tui_log_last(s); } catch (e) { /* the TUI bridge is host-provided; a build without it prints through the plain path */ } }
     else { console.log(s); }
   }
   function fmtTk(n) {
@@ -3231,14 +3231,14 @@
           }
         }
       }
-    } catch (e) {}
-    try { __chat_status(s, '/help · ⏎ · esc · ctrl-k copy', ramMet, ctxMet); } catch (e) {}
+    } catch (e) { /* status probing is advisory; the panel keeps the last known values */ }
+    try { __chat_status(s, '/help · ⏎ · esc · ctrl-k copy', ramMet, ctxMet); } catch (e) { /* optional host binding: without it this panel keeps its previous state */ }
   }
   // ── Interactive selector overlay (pickers for /model /provider /effort)
   // C routes keys + draws the overlay rows; ALL state lives here.
   let selectorCtl = null;
   globalThis.__selector_key = function(name, ch) {
-    if (selectorCtl) { try { selectorCtl(name, ch); } catch (e) {} }
+    if (selectorCtl) { try { selectorCtl(name, ch); } catch (e) { /* optional host binding: without it this panel keeps its previous state */ } }
   };
   async function selectMenu(opts) {
     if (typeof __selector_open !== 'function') return null;
@@ -3347,7 +3347,7 @@
     if (!cfg.provider) {
       out('\x1b[90m  No provider configured yet — run /provider first\x1b[0m\n');
       await providerWizard();
-      try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+      try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
       return;
     }
     let provs = (cfg.providers && cfg.providers.length) ? cfg.providers.slice() : [];
@@ -3372,7 +3372,7 @@
         if (Array.isArray(got) && got.length) {
           /* Remember the live listing on the provider entry — an endpoint
            * that is unreachable NEXT time still offers these models. */
-          try { __chat_models_cache(p.name, JSON.stringify(got)); } catch (e) {}
+          try { __chat_models_cache(p.name, JSON.stringify(got)); } catch (e) { /* the model cache is a warm-up; the next resolve refetches */ }
         }
         return Array.isArray(got) ? got : [];
       } catch (e) { return []; }
@@ -3441,11 +3441,11 @@
       const m = it.id.slice(bar + 1);
       /* Model picked on ANOTHER provider's tab → switch provider first. */
       if (provName && provName !== activeName && tabs.indexOf(provName) >= 0) {
-        try { __chat_select_provider(provName); } catch (e) {}
+        try { __chat_select_provider(provName); } catch (e) { /* a provider switch that throws leaves the current provider in place */ }
       }
       __chat_slash('/model ' + m);
     }
-    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     refreshStatus('');
     maybeRefreshPanel();
   }
@@ -3470,8 +3470,8 @@
       await providerWizard();
     } else if (it.id.indexOf('\x00select:') === 0) {
       const name = it.id.slice('\x00select:'.length);
-      try { __chat_select_provider(name); } catch (e) {}
-      try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+      try { __chat_select_provider(name); } catch (e) { /* a provider switch that throws leaves the current provider in place */ }
+      try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
       out('\x1b[32m  ✓ Active provider → ' + name + '\x1b[0m');
     } else if (it.id.indexOf('\x00edit:') === 0) {
       const name = it.id.slice('\x00edit:'.length);
@@ -3481,11 +3481,11 @@
       const name = it.id.slice('\x00remove:'.length);
       const ans = await __readline('  Remove provider "' + name + '"? y/N: ');
       if (ans && String(ans).trim().toLowerCase() === 'y') {
-        try { __chat_remove_provider(name); } catch (e) {}
+        try { __chat_remove_provider(name); } catch (e) { /* a provider switch that throws leaves the current provider in place */ }
         out('\x1b[90m  Removed ' + name + '\x1b[0m');
-      } else { out('\x1b[90m  (unchanged)\x1b[0m'); try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {} refreshStatus(''); maybeRefreshPanel(); return; }
+      } else { out('\x1b[90m  (unchanged)\x1b[0m'); try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ } refreshStatus(''); maybeRefreshPanel(); return; }
     }
-    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     refreshStatus('');
     maybeRefreshPanel();
   }
@@ -3551,7 +3551,7 @@
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
     __chat_slash('/effort ' + it.id);
-    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     refreshStatus('');
     maybeRefreshPanel();
   }
@@ -3560,7 +3560,7 @@
      * Applies through /theme <name> (the Rust side validates + persists)
      * so the picker and the typed command share one code path. */
     let themes = [];
-    try { themes = JSON.parse(__chat_themes()); } catch (e) {}
+    try { themes = JSON.parse(__chat_themes()); } catch (e) { /* no theme table: the built-in palette stays in use */ }
     if (!themes.length) { out('\x1b[90m  No themes available.\x1b[0m\n'); return; }
     const it = await selectMenu({
       title: 'Theme',
@@ -3571,7 +3571,7 @@
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
     __chat_slash('/theme ' + it.id);
-    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     PAL = null;
     maybeRefreshPanel();
   }
@@ -3587,7 +3587,7 @@
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
     __chat_slash('/rlm ' + it.id);
-    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     refreshStatus('');
     maybeRefreshPanel();
   }
@@ -3609,7 +3609,7 @@
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
     __chat_slash('/ctx ' + it.id);
-    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     refreshStatus('');
     maybeRefreshPanel();
   }
@@ -3633,7 +3633,7 @@
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
     __chat_slash('/maxout ' + it.id);
-    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     refreshStatus('');
     maybeRefreshPanel();
   }
@@ -3648,7 +3648,7 @@
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
     __chat_slash('/brain ' + it.id);
-    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     refreshStatus('');
     maybeRefreshPanel();
   }
@@ -3663,7 +3663,7 @@
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
     __chat_slash('/sync ' + it.id);
-    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     refreshStatus('');
     maybeRefreshPanel();
   }
@@ -3674,7 +3674,7 @@
       me = p0.me || '';
       if (p0.shared) lastShared = p0.shared;
       for (const n of (p0.notices || [])) out('\x1b[90m  ⇄ ' + n.id + ' · ' + n.kind + ': ' + n.text + '\x1b[0m');
-    } catch (e) {}
+    } catch (e) { /* the terminal capability probe is best effort; the plain path still prints */ }
     /* MCP is OPTIONAL and LAZY: no connect at startup — a slow/dead server
      * must never delay the prompt. The first /tools (or a tool-using agent
      * turn) connects on demand. */
@@ -3684,15 +3684,15 @@
      * repaint carries lastChip — the per-turn usage chip ("in→out tk · $")
      * must SURVIVE the timer, not vanish 2s after the turn ends. */
     const metricsTimer = setInterval(function() {
-      try { refreshStatus(lastChip); } catch (e) {}
+      try { refreshStatus(lastChip); } catch (e) { /* optional host binding: without it this panel keeps its previous state */ }
     }, 2000);
-    const stopMetrics = () => { try { clearInterval(metricsTimer); } catch (e) {} };
+    const stopMetrics = () => { try { clearInterval(metricsTimer); } catch (e) { /* the timer already fired; clearing it again is harmless */ } };
     globalThis.__metrics_stop = stopMetrics;
     if (TTY) {
       /* Full-screen interface: take over the terminal. */
-      try { __tui_on(); } catch (e) {}
+      try { __tui_on(); } catch (e) { /* the TUI bridge is host-provided; a build without it prints through the plain path */ }
       /* Bordered welcome panel (title + session facts) — built in Rust. */
-      try { __chat_welcome(); } catch (e) {}
+      try { __chat_welcome(); } catch (e) { /* optional host binding: without it this panel keeps its previous state */ }
       /* Re-open the previous transcript (persisted in the session .qtsq). */
       try {
         const past = JSON.parse(__chat_past_turns());
@@ -3701,10 +3701,10 @@
           if (t.answer) out(t.answer);
         }
         if (past.length) out('');
-      } catch (e) {}
+      } catch (e) { /* the first prompt read is best effort too */ }
     } else {
       /* Compact two-line banner (built in Rust, same content as the panel). */
-      try { __chat_welcome(); } catch (e) {}
+      try { __chat_welcome(); } catch (e) { /* optional host binding: without it this panel keeps its previous state */ }
     }
     /* Auto-detect live model for local server if unset or mismatched */
     if (cfg.provider === 'llamacpp' || (cfg.base_url && String(cfg.base_url).includes(':8080'))) {
@@ -3713,12 +3713,12 @@
         if (live && live.length > 0) {
           if (!cfg.model || cfg.model === 'default' || !live.includes(cfg.model)) {
             __chat_slash('/model ' + live[0]);
-            try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+            try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
             refreshStatus('');
             maybeRefreshPanel();
           }
         }
-      } catch (e) {}
+      } catch (e) { /* a selector that throws leaves the previous selection active */ }
     }
     /* ── First-run onboarding: no usable model → force the guided setup
      * wizard (provider → URL → key → model list → pick). The wizard
@@ -3731,9 +3731,9 @@
           const live = await wizardFetchModels(profile, cfg.base_url, cfg.api_key || '');
           if (live && live.length) {
             __chat_slash('/model ' + live[0]);
-            try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+            try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
           }
-        } catch (e) {}
+        } catch (e) { /* the wizard is optional; the prompt loop continues */ }
       }
       if (!usableConfig()) {
         if (!cfg.provider) {
@@ -3743,7 +3743,7 @@
           out('\x1b[90m  No model configured for ' + cfg.provider + ' — please select one.\x1b[0m');
           await pickModel();
         }
-        try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+        try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
         refreshStatus('');
         if (usableConfig()) {
           out('\x1b[32m  ✓ Ready — ' + cfg.provider + ' · ' + cfg.model + '\x1b[0m\n');
@@ -3759,7 +3759,7 @@
         const poll = JSON.parse(__chat_poll());
         notices = poll.notices || [];
         if (poll.shared) lastShared = poll.shared;
-      } catch (e) {}
+      } catch (e) { /* a command that throws is reported by its own handler */ }
       for (const n of notices) out('\x1b[90m  ⇄ ' + n.id + ' · ' + n.kind + ': ' + n.text + '\x1b[0m');
       /* F8: filesystem watcher — poll for changes each tick. */
       try {
@@ -3776,7 +3776,7 @@
             watchChangesPending.splice(0, watchChangesPending.length - 100);
           }
         }
-      } catch (e) {}
+      } catch (e) { /* same for the redraw after it */ }
       const inp = await __readline('\x1b[' + T('accent') + 'm❯\x1b[0m ');
       if (inp === null || inp === undefined) { requestExit(); break; }
       const t = inp.trim();
@@ -3792,7 +3792,7 @@
         const r = __chat_slash(t);
         // Slash commands may have changed provider/model/api_key — re-read
         // the Rust-side config so the live session uses the new values.
-        try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+        try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
         /* A theme switch must recolor the very next paint, not next
          * session: drop the cached palette on every command (re-read is
          * one JSON parse per command — noise). */
@@ -3865,7 +3865,7 @@
           if (TTY) { await pickTheme(); }
           else {
             let themes = [];
-            try { themes = JSON.parse(__chat_themes()); } catch (e) {}
+            try { themes = JSON.parse(__chat_themes()); } catch (e) { /* no theme table: the built-in palette stays in use */ }
             out('\x1b[90m  Usage: /theme <name>  (current: ' + (cfg.theme || 'sofuu') + ')\x1b[0m');
             for (const th of themes) {
               const cur = th.name === cfg.theme ? ' \x1b[32m← current\x1b[0m' : '';
@@ -3974,14 +3974,14 @@
               !noThinkTried[curModel] &&
               !(cfg.no_think_models || []).includes(curModel)) {
             noThinkTried[curModel] = true;
-            try { __chat_no_think(curModel); } catch (eNT) {}
+            try { __chat_no_think(curModel); } catch (eNT) { /* optional host binding: without it this panel keeps its previous state */ }
             /* session-2 e2e catch: __chat_no_think only updates the Rust
              * config — this JS mirror still showed an empty
              * no_think_models, so the "no-effort retry" re-sent
              * reasoning_effort and hit the same rejection (the retry was a
              * no-op on the wire; every later turn repeated it too).
              * Reload the mirror, exactly like the provider wizard does. */
-            try { cfg = JSON.parse(__chat_getcfg()); } catch (eCFG) {}
+            try { cfg = JSON.parse(__chat_getcfg()); } catch (eCFG) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
             out('\x1b[33m  ⓘ ' + curModel + ' rejected thinking (' + msg.slice(0, 160) +
                 ') — disabling effort for this model and retrying.\x1b[0m\n');
             prepareArchiveRecovery(msg);
@@ -4008,12 +4008,12 @@
     /* Brain flush happens per-store inside sofuu.agent.run (agent.js). */
     /* Disconnect every MCP server: their child processes hold ref'd libuv
      * handles, which would pin the event loop and hang the exit. */
-    for (const c of mcpClients) { try { c.client.disconnect(); } catch (e) {} }
+    for (const c of mcpClients) { try { c.client.disconnect(); } catch (e) { /* a client that already disconnected is still removed from the list */ } }
     /* Stop the metrics timer (it would pin the loop). */
-    try { if (globalThis.__metrics_stop) globalThis.__metrics_stop(); } catch (e) {}
+    try { if (globalThis.__metrics_stop) globalThis.__metrics_stop(); } catch (e) { /* optional host binding: without it this panel keeps its previous state */ }
     /* Leave the full-screen interface: restore the previous terminal. */
     if (TTY) {
-      try { __tui_off(); } catch (e) {}
+      try { __tui_off(); } catch (e) { /* the TUI bridge is host-provided; a build without it prints through the plain path */ }
       process.stdout.write('\n');
     }
   }

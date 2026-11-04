@@ -192,7 +192,7 @@ pub fn validate_attn_decode(
             "attn_decode head_dim {head_dim} exceeds the 256-thread block"
         )));
     }
-    if n_heads % n_kv_heads != 0 {
+    if !n_heads.is_multiple_of(n_kv_heads) {
         return Err(CudaError(format!(
             "attn_decode n_heads {n_heads} is not a multiple of n_kv_heads {n_kv_heads}"
         )));

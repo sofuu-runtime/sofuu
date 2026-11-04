@@ -1586,7 +1586,7 @@
       } catch (e0) { /* no environment: no override, so the default MCP config path applies. */ }
     }
     var home = '';
-    try { home = (typeof process !== 'undefined' && process.env && process.env.HOME) || ''; } catch (eH) {}
+    try { home = (typeof process !== 'undefined' && process.env && process.env.HOME) || ''; } catch (eH) { /* no environment: home is empty and the config search falls back to cwd. */ }
     if (!path && home) path = home + '/.sofuu/mcp.json';
     if (!path) return { ok: true, path: '', servers: [] };
 
@@ -2011,7 +2011,7 @@
             try {
               var pol = JSON.parse(sofuu.policy.get());
               if (pol && pol.fs && Array.isArray(pol.fs.roots)) roots = pol.fs.roots;
-            } catch (eR) {}
+            } catch (eR) { /* unreadable policy: default roots are used instead. */ }
             reply.result = { roots: roots.map(function (p) { return { uri: 'file://' + p }; }) };
           } else reply.error = { code: -32601, message: 'Method not found' };
           postMessage(reply).catch(function () {});
@@ -2028,7 +2028,7 @@
         if (status === 202 || status === 204) return;
         if (!res || (!res.ok && status >= 400)) {
           var bodyText = '';
-          try { bodyText = await res.text(); } catch (eT) {}
+          try { bodyText = await res.text(); } catch (eT) { /* the status code alone identifies the failure. */ }
           throw new Error('mcp sse: HTTP ' + status + (bodyText ? (': ' + bodyText.slice(0, 200)) : ''));
         }
         var pct = '';
@@ -2037,7 +2037,7 @@
           throw new Error('mcp sse: the server answered a message POST with an event stream — it is not speaking the legacy SSE transport');
         }
         var text = '';
-        try { text = await res.text(); } catch (eB) {}
+        try { text = await res.text(); } catch (eB) { /* an unreadable body leaves the caller with the status. */ }
         if (!text || !text.trim()) return;
         var one;
         try { one = JSON.parse(text); } catch (eP) { return; }
@@ -2254,7 +2254,7 @@
           }
           try { Object.defineProperty(client, '__paged', { value: true, enumerable: false }); }
           catch (eP) { client.__paged = true; }
-        } catch (eM) {}
+        } catch (eM) { /* a server that will not paginate still works unpaged. */ }
         return client;
       }
       if (useSse) {
@@ -2297,7 +2297,7 @@
         parts.push(String(b.text == null ? '' : b.text));
       } else if (t === 'image' || t === 'audio') {
         var bytes = 0;
-        try { bytes = Math.floor(String(b.data || '').length * 3 / 4); } catch (eB) {}
+        try { bytes = Math.floor(String(b.data || '').length * 3 / 4); } catch (eB) { /* a byte count of 0 is reported for an unreadable payload. */ }
         parts.push('[' + t + ': ' + (b.mimeType || 'unknown') + ', ~' + bytes + ' bytes]');
         images++;
       } else if (t === 'resource') {
@@ -2338,7 +2338,7 @@
    * explicit load() caller (we must not take a driver down over it). */
   try {
     if (sofuu.policy && typeof sofuu.policy.load === 'function') sofuu.policy.load();
-  } catch (ePol) {}
+  } catch (ePol) { /* no policy file: the binary's default posture applies. */ }
 
   /* Domain toolpacks:
    *   - coding (alias code): file, shell, and patch tools
@@ -2520,7 +2520,7 @@
     var n = 0;
     while (LIVE_PROCS.length) {
       var h = LIVE_PROCS.pop();
-      try { h.kill(); n++; } catch (eK) {}
+      try { h.kill(); n++; } catch (eK) { /* the process already exited; it is still removed from the list. */ }
     }
     return n;
   };

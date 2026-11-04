@@ -20,7 +20,7 @@
 
 Pod::Spec.new do |s|
   s.name             = 'Sofuu'
-  s.version          = '0.2.0'
+  s.version          = '0.3.0-beta'
   s.summary          = 'The private, offline AI runtime for apps — 2MB, no JIT, no key to ship.'
 
   s.description      = <<-DESC
@@ -38,7 +38,7 @@ Pod::Spec.new do |s|
   s.license          = { :type => 'MIT', :file => 'LICENSE' }
   s.author           = { 'Haruhito' => 'hello@sofuu.xyz' }
   s.source           = {
-    :http => 'https://github.com/sofuu-runtime/sofuu/releases/download/v0.2.0/libsofuu.xcframework.zip'
+    :http => 'https://github.com/sofuu-runtime/sofuu/releases/download/v0.3.0-beta/libsofuu-xcframework.zip'
   }
 
   s.ios.deployment_target  = '16.0'

@@ -25,13 +25,13 @@ import PackageDescription
 
 // The xcframework zip published on the GitHub release for this version.
 let sofuuXCFrameworkURL =
-    "https://github.com/sofuu-runtime/sofuu/releases/download/v0.2.0/libsofuu.xcframework.zip"
+    "https://github.com/sofuu-runtime/sofuu/releases/download/v0.3.0-beta/libsofuu-xcframework.zip"
 
 // SHA-256 of that zip. `make stamp-swiftpm` (scripts/stamp-swiftpm.sh)
 // recomputes and rewrites this from the built artifact, then verifies the
 // file exists — it is checked in on purpose so a corrupted or swapped
 // download is caught by SwiftPM at resolve time, not at runtime.
-let sofuuXCFrameworkChecksum = "0000000000000000000000000000000000000000000000000000000000000000"
+let sofuuXCFrameworkChecksum = "fef69c5a9785e7ed99d0d8ddb58fcb7f3b1f4a933145726e6dc1ef95c5ab72c0"
 
 let package = Package(
     name: "Sofuu",

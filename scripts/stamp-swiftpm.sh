@@ -17,6 +17,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ZIP="${1:-}"
 
+# The release asset name. CI publishes libsofuu.xcframework.zip, but v0.3.0-beta
+# was published as libsofuu-xcframework.zip - so the name is a variable here, and
+# --from-release discovers the real one instead of assuming it.
+ASSET_NAME="${SOFUU_XCF_ASSET:-libsofuu.xcframework.zip}"
+REPO_SLUG="${SOFUU_REPO_SLUG:-sofuu-runtime/sofuu}"
+
 # --consistency: the two manifests must at least agree with each other.
 #
 # --check answers "is this tree publishable for vX", which needs SOFUU_VERSION and
@@ -99,27 +105,82 @@ if [[ "$ZIP" == "--check" ]]; then
   exit "$fail"
 fi
 
-if [[ -z "$ZIP" ]]; then
+# --from-release <tag>: stamp from the artifact that is actually published.
+#
+# Stamping from a local zip assumes the release will publish those exact bytes,
+# and two builds of this xcframework zip differently (73cd6386... vs 8e685239...
+# on consecutive builds of the same tree). The published artifact is the only thing
+# a consumer can resolve, so this mode reads the release over the API and pins what
+# is there - including the asset NAME, which v0.3.0-beta shipped as
+# libsofuu-xcframework.zip while every script here produces
+# libsofuu.xcframework.zip. A checksum pinned to a 404 resolves nothing.
+RELEASE_TAG=""
+RELEASE_SHA=""
+case "$ZIP" in
+  --from-release)
+    RELEASE_TAG="${2:-}"
+    if [[ -z "$RELEASE_TAG" ]]; then
+      echo "usage: $0 --from-release <tag>" >&2
+      exit 2
+    fi
+    meta_file="$(mktemp)"
+    trap 'rm -f "$meta_file"' EXIT
+    curl -fsSL --max-time 60 \
+      "https://api.github.com/repos/$REPO_SLUG/releases/tags/$RELEASE_TAG" > "$meta_file" || {
+      echo "error: could not read release $RELEASE_TAG from $REPO_SLUG" >&2; exit 1; }
+    python3 - "$meta_file" > "$meta_file.env" <<'PY'
+import json, sys, shlex
+rel = json.load(open(sys.argv[1]))
+tag = rel.get("tag_name") or ""
+assets = [a for a in rel.get("assets", []) if a.get("name", "").endswith("xcframework.zip")]
+if not tag or not assets:
+    sys.exit("error: release has no *xcframework.zip asset")
+a = assets[0]
+digest = (a.get("digest") or "").split(":")[-1]
+if len(digest) != 64:
+    sys.exit("error: asset " + a["name"] + " has no sha256 digest from the API")
+print("RELEASE_TAG=" + shlex.quote(tag))
+print("RELEASE_ASSET=" + shlex.quote(a["name"]))
+print("RELEASE_SHA=" + shlex.quote(digest))
+print("RELEASE_SIZE=" + shlex.quote(str(a.get("size", 0))))
+PY
+    if [[ $? -ne 0 ]]; then
+      echo "error: could not resolve a signed artifact in $RELEASE_TAG" >&2
+      exit 1
+    fi
+    . "$meta_file.env"
+    ASSET_NAME="$RELEASE_ASSET"
+    echo "release $RELEASE_TAG: $RELEASE_ASSET ($RELEASE_SIZE B, sha256 ${RELEASE_SHA:0:12}...)"
+    ;;
+esac
+if [[ -z "$ZIP" && -z "$RELEASE_TAG" ]]; then
   echo "usage: SOFUU_VERSION=<v> $0 <libsofuu.xcframework.zip>" >&2
   echo "       SOFUU_VERSION=<v> $0 --check" >&2
   exit 2
 fi
-if [[ ! -f "$ZIP" ]]; then
+if [[ -z "$RELEASE_TAG" && ! -f "$ZIP" ]]; then
   echo "error: no such file: $ZIP" >&2
   exit 1
 fi
 
-if command -v shasum >/dev/null 2>&1; then
+if [[ -n "$RELEASE_TAG" ]]; then
+  SHA="$RELEASE_SHA"
+elif command -v shasum >/dev/null 2>&1; then
   SHA="$(shasum -a 256 "$ZIP" | awk '{print $1}')"
 else
   SHA="$(sha256sum "$ZIP" | awk '{print $1}')"
 fi
 
-VERSION="${SOFUU_VERSION:-}"
+# The API reports the tag with its leading v; the manifests carry the bare
+# version and the URL template adds the v back. Stripping it here is what keeps
+# `pod 'Sofuu', '~> 0.3'` resolvable - without it the podspec said "v0.3.0-beta"
+# and the asset URL read "vv0.3.0-beta".
+VERSION="${SOFUU_VERSION:-${RELEASE_TAG:-}}"
+VERSION="${VERSION#v}"
 
-python3 - "$REPO_ROOT/Package.swift" "$SHA" "$VERSION" <<'PY'
+python3 - "$REPO_ROOT/Package.swift" "$SHA" "$VERSION" "$ASSET_NAME" "$REPO_SLUG" <<'PY'
 import re, sys
-path, sha, version = sys.argv[1], sys.argv[2], sys.argv[3]
+path, sha, version, asset, repo = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 src = open(path).read()
 
 # Checksum: always rewritten.
@@ -132,7 +193,7 @@ src = new
 # URL: only when a version was supplied.
 if version:
     v = version.lstrip("v")
-    url = f"https://github.com/sofuu-runtime/sofuu/releases/download/v{v}/libsofuu.xcframework.zip"
+    url = "https://github.com/%s/releases/download/v%s/%s" % (repo, v, asset)
     new, n = re.subn(r'(let sofuuXCFrameworkURL\s*=\s*\n?\s*)"[^"]*"',
                      lambda m: m.group(1) + '"' + url + '"', src)
     if n != 1:
@@ -151,13 +212,13 @@ PY
 # Package.swift and before touching the podspec - leaving the SwiftPM checksum
 # updated and CocoaPods still on v0.2.0. The version for this path is $VERSION.
 if [[ -n "$VERSION" && -f "$REPO_ROOT/Sofuu.podspec" ]]; then
-  python3 - "$REPO_ROOT/Sofuu.podspec" "$VERSION" <<'PY'
+  python3 - "$REPO_ROOT/Sofuu.podspec" "$VERSION" "$ASSET_NAME" "$REPO_SLUG" <<'PY'
 import re, sys
-path, version = sys.argv[1], sys.argv[2]
+path, version, asset, repo = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 src = open(path).read()
 src, n1 = re.subn(r"(s\.version\s*=\s*')[^']*(')",
                   lambda m: m.group(1) + version + m.group(2), src, count=1)
-url = f"https://github.com/sofuu-runtime/sofuu/releases/download/v{version}/libsofuu.xcframework.zip"
+url = "https://github.com/%s/releases/download/v%s/%s" % (repo, version, asset)
 src, n2 = re.subn(r"(:http\s*=>\s*')[^']*(')",
                   lambda m: m.group(1) + url + m.group(2), src, count=1)
 if n1 != 1 or n2 != 1:

@@ -259,10 +259,11 @@ void test_tiled_gemv(uint32_t &seed) {
             float got4 = 0.0f, got6 = 0.0f;
             const uint8_t *row4 = w4.data() + (size_t)r * nb * 144;
             const uint8_t *row6 = w6.data() + (size_t)r * nb * 210;
-            for (int tid = 0; tid < 256; ++tid) {
-                int warp = tid >> 5, lane = tid & 31;
+            // One warp owns this row and walks every super-block; the block's
+            // other seven warps are other rows and share x through L1.
+            for (int lane = 0; lane < 32; ++lane) {
                 int sub = lane >> 2, l0 = (lane & 3) << 3;
-                for (int bi = warp; bi < nb; bi += 8) {
+                for (int bi = 0; bi < nb; ++bi) {
                     const auto *b4 = reinterpret_cast<const sofuu_block_q4_K *>(
                         row4 + (size_t)bi * 144);
                     unsigned int sc, mn;
@@ -314,15 +315,16 @@ void test_tiled_gemv(uint32_t &seed) {
         for (int r = 0; r < rows; ++r) {
             float got = 0.0f;
             const uint8_t *row = w.data() + (size_t)r * nb * 34;
-            for (int tid = 0; tid < 256; ++tid) {
-                int lane = tid & 3;
-                for (int bi = tid >> 2; bi < nb; bi += 64) {
+            for (int lane = 0; lane < 32; ++lane) {
+                int lane_in_block = lane & 3;
+                for (int bi = lane >> 2; bi < nb; bi += 8) {
                     const auto *b = reinterpret_cast<const sofuu_block_q8_0 *>(
                         row + (size_t)bi * 34);
                     float d = sofuu_f16_to_f32(b->d);
-                    const float *xb = x.data() + (size_t)bi * 32 + lane * 8;
+                    const float *xb =
+                        x.data() + (size_t)bi * 32 + lane_in_block * 8;
                     for (int k = 0; k < 8; ++k)
-                        got += d * (float)b->qs[lane * 8 + k] * xb[k];
+                        got += d * (float)b->qs[lane_in_block * 8 + k] * xb[k];
                 }
             }
             check_dot(cols == 1024 ? "tiled_q8_0" : "tiled_q8_0_wide",

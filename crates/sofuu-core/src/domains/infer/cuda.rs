@@ -897,7 +897,10 @@ mod imp {
                 &mut r as *mut i32 as *mut c_void,
                 &mut c as *mut i32 as *mut c_void,
             ];
-            self.launch(quant.entry(), (rows as u32, 1, 1), (256, 1, 1), &mut params)
+            // Eight rows per block, one warp per row: the block's warps share
+            // the activation row through L1 instead of re-reading it per row.
+            let grid = ((rows + 7) / 8) as u32;
+            self.launch(quant.entry(), (grid, 1, 1), (256, 1, 1), &mut params)
         }
 
         pub fn rmsnorm(

@@ -162,7 +162,7 @@ void test_gemv_q8_0(void *fn, uint32_t &seed, int cols) {
         return;
     }
     std::vector<void *> params = {&dw, &dx, &dy, (void *)&rows, (void *)&cols};
-    bool ok = launch(fn, (unsigned)rows, 256, params) &&
+    bool ok = launch(fn, (unsigned)((rows + 7) / 8), 256, params) &&
               download(dy, got.data(), (size_t)rows * sizeof(float));
     double max_err = 0.0, bound = 0.0;
     for (int r = 0; r < rows; ++r) {
@@ -197,7 +197,7 @@ void test_gemv_q4_k(void *fn, uint32_t &seed, int cols) {
         return;
     }
     std::vector<void *> params = {&dw, &dx, &dy, (void *)&rows, (void *)&cols};
-    bool ok = launch(fn, (unsigned)rows, 256, params) &&
+    bool ok = launch(fn, (unsigned)((rows + 7) / 8), 256, params) &&
               download(dy, got.data(), (size_t)rows * sizeof(float));
     double max_err = 0.0, bound = 0.0;
     for (int r = 0; r < rows; ++r) {
@@ -232,7 +232,7 @@ void test_gemv_q6_k(void *fn, uint32_t &seed, int cols) {
         return;
     }
     std::vector<void *> params = {&dw, &dx, &dy, (void *)&rows, (void *)&cols};
-    bool ok = launch(fn, (unsigned)rows, 256, params) &&
+    bool ok = launch(fn, (unsigned)((rows + 7) / 8), 256, params) &&
               download(dy, got.data(), (size_t)rows * sizeof(float));
     double max_err = 0.0, bound = 0.0;
     for (int r = 0; r < rows; ++r) {
@@ -265,7 +265,7 @@ void test_gemv_f32(void *fn, uint32_t &seed) {
         return;
     }
     std::vector<void *> params = {&dw, &dx, &dy, (void *)&rows, (void *)&cols};
-    bool ok = launch(fn, (unsigned)rows, 256, params) &&
+    bool ok = launch(fn, (unsigned)((rows + 7) / 8), 256, params) &&
               download(dy, got.data(), (size_t)rows * sizeof(float));
     double max_err = 0.0, bound = 0.0;
     for (int r = 0; r < rows; ++r) {

@@ -75,4 +75,4 @@ module Pod
   end
 end
 
-spec = eval(File.read("Sofuu.podspec"), binding, "Sofuu.podspec")
+spec = eval(File.read("Sofuu.podspec", encoding: "UTF-8"), binding, "Sofuu.podspec")

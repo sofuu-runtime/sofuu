@@ -103,7 +103,7 @@ impl Heap {
         let next = self.used_bytes.saturating_add(bytes);
         if next > self.limit {
             return Err(format!(
-                "the run's collection budget of {} bytes was exceeded (arrays and maps are                  rejected, never clamped)",
+                "the run's collection budget of {} bytes was exceeded (arrays and maps are rejected, never clamped)",
                 self.limit
             ));
         }

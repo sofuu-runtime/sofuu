@@ -113,8 +113,20 @@ print("no" if "qtsq" in (d.get("build", {}).get("missing") or []) else "yes")' 2
     else
         fail "Cargo ($cargo_v) and CLI ($cli_v) versions disagree"
     fi
+    # npm may be AHEAD of the crate. The published wrapper routinely carries a
+    # patch the crate has not tagged yet - 0.3.0-beta.2 is on the registry
+    # against a 0.3.0-beta Cargo.toml - and that is a publish-order fact, not a
+    # defect: the two converge at the next tag. What must never happen is npm
+    # BEHIND Cargo, a wrapper older than the runtime it installs.
     if [ -n "$npm_v" ] && [ -n "$cargo_v" ] && [ "$npm_v" != "$cargo_v" ]; then
-        say "WARN npm version ($npm_v) differs from Cargo ($cargo_v) — align at the publish step"
+        case "$npm_v" in
+            "$cargo_v".*)
+                say "OK  npm $npm_v is ahead of Cargo $cargo_v (a later patch; they converge at the next tag)"
+                ;;
+            *)
+                fail "npm ($npm_v) and Cargo ($cargo_v) diverged — the published wrapper must not trail the runtime"
+                ;;
+        esac
     fi
 
     # ── 5. provenance: build paths + source revision (PC-07) ──────────────
@@ -197,6 +209,21 @@ except Exception:
                 say "WARN no git checkout — cannot compare the stamp against HEAD"
             elif [ "${head_full#"$base"}" != "$head_full" ]; then
                 say "OK  stamp matches HEAD ($head_short)"
+            elif git -C "$ROOT" merge-base --is-ancestor "$base" "$head_full" 2>/dev/null; then
+                # The stamp is an ancestor of HEAD rather than HEAD itself.
+                # That is only stale if a SHIPPED input changed in between: a
+                # docs, CI or test commit does not invalidate a binary, and
+                # failing on one made this check fire after every unrelated
+                # commit on a tree three agents are landing work on - which is
+                # how a gate becomes noise and then gets ignored.
+                shipped=$(git -C "$ROOT" diff --name-only "$base".."$head_full" -- \
+                    crates src Cargo.toml Cargo.lock deps 2>/dev/null | wc -l | tr -d ' ')  
+                behind=$(git -C "$ROOT" rev-list --count "$base".."$head_full" 2>/dev/null || echo '?')
+                if [ "${shipped:-0}" -gt 0 ]; then
+                    fail "stamp ($base) is $behind commit(s) behind HEAD ($head_short) and $shipped shipped file(s) changed — rebuild with make dist"
+                else
+                    say "OK  stamp $base is current: $behind commit(s) since, none touching shipped code"
+                fi
             else
                 fail "stamp ($base) does not match HEAD ($head_short) — the binary is stale, rebuild it"
             fi

@@ -1,3 +1,4 @@
+# encoding: UTF-8
 # Sofuu.podspec — Sofuu as a CocoaPod (iOS + macOS).
 #
 # The other install path alongside SwiftPM, for the many apps that are still

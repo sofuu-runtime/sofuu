@@ -9,6 +9,7 @@
 // Build/run: bash scripts/cuda/kaggle_gpu_check.sh
 // Exit codes: 0 = all pass, 1 = parity failure, 2 = no CUDA driver/device.
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -81,6 +82,19 @@ bool launch(void *fn, unsigned grid, unsigned block,
     }
     if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
         fail_msg("cuStreamSynchronize");
+        return false;
+    }
+    return true;
+}
+
+// Same launch without the per-call sync; the benchmark batches many launches
+// and syncs once, so the number is kernel throughput rather than driver
+// round-trip latency.
+bool launch_async(void *fn, unsigned grid, unsigned block,
+                  std::vector<void *> params) {
+    if (sofuu_cuda_ctx_launch(g_ctx, fn, grid, 1, 1, block, 1, 1, 0,
+                              params.data()) != 0) {
+        fail_msg("cuLaunchKernel");
         return false;
     }
     return true;
@@ -452,6 +466,71 @@ void test_rmsnorm_batch(void *fn, uint32_t &seed) {
     sofuu_cuda_ctx_free(g_ctx, dy);
 }
 
+// A kernel-only bandwidth receipt. The model's end-to-end tok/s mixes this
+// with attention, lm_head and launch gaps; if this number is healthy but the
+// model is slow, the next suspect is phase serialization, not the GEMV.
+void bench_gemv(const char *name, void *fn, int kind, int rows, int cols,
+                int iters, uint32_t &seed) {
+    std::vector<uint8_t> wbytes;
+    std::vector<float> wf;
+    const uint8_t *wdata = nullptr;
+    size_t wsize = 0;
+    if (kind == 0) {
+        fill_q8_0(wbytes, rows, cols, seed);
+        wdata = wbytes.data();
+        wsize = wbytes.size();
+    } else if (kind == 1) {
+        fill_q4_k(wbytes, rows, cols, seed);
+        wdata = wbytes.data();
+        wsize = wbytes.size();
+    } else if (kind == 2) {
+        fill_q6_k(wbytes, rows, cols, seed);
+        wdata = wbytes.data();
+        wsize = wbytes.size();
+    } else {
+        wf = random_vec(rows * cols, seed, -1.0f, 1.0f);
+        wdata = reinterpret_cast<const uint8_t *>(wf.data());
+        wsize = wf.size() * sizeof(float);
+    }
+    std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
+    std::vector<float> y((size_t)rows, 0.0f);
+    unsigned long long dw = 0, dx = 0, dy = 0;
+    if (!alloc_upload(wdata, wsize, &dw) ||
+        !alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
+        !alloc_only((unsigned long long)rows * sizeof(float), &dy)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    std::vector<void *> params = {&dw, &dx, &dy, (void *)&rows, (void *)&cols};
+    unsigned grid = (unsigned)((rows + 7) / 8);
+    for (int i = 0; i < 3; ++i)
+        if (!launch_async(fn, grid, 256, params)) return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
+        fail_msg("warmup sync");
+        return;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i)
+        if (!launch_async(fn, grid, 256, params)) return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
+        fail_msg("bench sync");
+        return;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double sec = std::chrono::duration<double>(t1 - t0).count();
+    double row_bytes = kind == 0 ? (double)(cols / 32) * 34
+                       : kind == 1 ? (double)(cols / 256) * 144
+                       : kind == 2 ? (double)(cols / 256) * 210
+                                   : (double)cols * 4;
+    double bytes = (double)rows * row_bytes * (double)iters;
+    std::printf("[bench] %-10s %dx%d  %.1f GB/s  %.3f ms/launch\n", name, rows,
+                cols, bytes / sec / 1e9, sec * 1000.0 / (double)iters);
+    sofuu_cuda_ctx_free(g_ctx, dw);
+    sofuu_cuda_ctx_free(g_ctx, dx);
+    sofuu_cuda_ctx_free(g_ctx, dy);
+}
+
 // ── Elementwise tests ──────────────────────────────────────────────────────
 void test_rmsnorm(void *fn, uint32_t &seed) {
     const int n = 1024;
@@ -748,6 +827,12 @@ int main(int argc, char **argv) {
     test_gemm_b8(f_b8_f32, seed, 3, 1024);
     test_rmsnorm_batch(f_rms_b, seed);
     test_attn_prefill(f_attn_p, seed);
+
+    // Kernel-only throughput, using the model's 8192x2048 FFN shape.
+    bench_gemv("gemv_q8_0", f_q8, 0, 8192, 2048, 20, seed);
+    bench_gemv("gemv_q4_k", f_q4, 1, 8192, 2048, 40, seed);
+    bench_gemv("gemv_q6_k", f_q6, 2, 8192, 2048, 30, seed);
+    bench_gemv("gemv_f32", f_f32, 3, 8192, 2048, 8, seed);
 
     sofuu_cuda_ctx_destroy(g_ctx);
     sofuu_cuda_driver_close(g_drv);

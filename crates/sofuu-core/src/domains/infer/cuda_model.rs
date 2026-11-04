@@ -520,8 +520,18 @@ impl CudaModel {
         };
         let seq_len = pos + 1;
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        // SOFUU_CUDA_PROFILE=1: one stream sync per phase so the host can time
+        // attention, the output projection, the FFN and lm_head separately.
+        // The syncs inflate each group by the driver round-trip, but at ~18 ms
+        // per token the phase split is still the useful signal.
+        let profile = std::env::var_os("SOFUU_CUDA_PROFILE").is_some();
+        let mut prof_us = [0u128; 4];
+        let mut t_group = std::time::Instant::now();
 
         for (li, l) in self.layers.iter().enumerate() {
+            if profile {
+                t_group = std::time::Instant::now();
+            }
             e.rmsnorm(self.x, l.attn_norm, self.x_norm, self.dim, self.eps)
                 .map_err(|err| format!("layer {li} attn_norm: {err}"))?;
             e.gemv(l.attn_q_quant, l.attn_q, self.x_norm, self.q, self.q_dim, self.dim)
@@ -578,6 +588,12 @@ impl CudaModel {
                 scale,
             )
             .map_err(|err| format!("layer {li} attention: {err}"))?;
+            if profile {
+                e.sync()
+                    .map_err(|err| format!("layer {li} profile sync (attn): {err}"))?;
+                prof_us[0] += t_group.elapsed().as_micros();
+                t_group = std::time::Instant::now();
+            }
             e.gemv(
                 l.attn_output_quant,
                 l.attn_output,
@@ -589,6 +605,12 @@ impl CudaModel {
             .map_err(|err| format!("layer {li} attn_output: {err}"))?;
             e.add(self.x, self.proj, self.x, self.dim)
                 .map_err(|err| format!("layer {li} attn residual: {err}"))?;
+            if profile {
+                e.sync()
+                    .map_err(|err| format!("layer {li} profile sync (o_proj): {err}"))?;
+                prof_us[1] += t_group.elapsed().as_micros();
+                t_group = std::time::Instant::now();
+            }
 
             e.rmsnorm(self.x, l.ffn_norm, self.x_norm, self.dim, self.eps)
                 .map_err(|err| format!("layer {li} ffn_norm: {err}"))?;
@@ -623,6 +645,12 @@ impl CudaModel {
             .map_err(|err| format!("layer {li} ffn_down: {err}"))?;
             e.add(self.x, self.down, self.x, self.dim)
                 .map_err(|err| format!("layer {li} ffn residual: {err}"))?;
+            if profile {
+                e.sync()
+                    .map_err(|err| format!("layer {li} profile sync (ffn): {err}"))?;
+                prof_us[2] += t_group.elapsed().as_micros();
+                t_group = std::time::Instant::now();
+            }
         }
 
         if compute_logits {
@@ -647,6 +675,20 @@ impl CudaModel {
             for (i, c) in self.logit_bytes.chunks_exact(4).enumerate() {
                 self.logits_host[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
             }
+            if profile {
+                prof_us[3] += t_group.elapsed().as_micros();
+            }
+        }
+
+        if profile {
+            eprintln!(
+                "[cuda-profile] attn {:.2}ms  o_proj {:.2}ms  ffn {:.2}ms  lm_head {:.2}ms  total {:.2}ms",
+                prof_us[0] as f64 / 1000.0,
+                prof_us[1] as f64 / 1000.0,
+                prof_us[2] as f64 / 1000.0,
+                prof_us[3] as f64 / 1000.0,
+                (prof_us[0] + prof_us[1] + prof_us[2] + prof_us[3]) as f64 / 1000.0
+            );
         }
 
         self.pos = pos + 1;

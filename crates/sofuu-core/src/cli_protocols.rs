@@ -479,8 +479,204 @@ server.start();
             }
             0
         }
+        "inspect" => {
+            let target = match args.get(3) {
+                Some(t) => t.trim().to_string(),
+                None => {
+                    eprintln!("Usage: sofuu mcp inspect <name | command line | http(s)://url> [--call <tool> [--args <json>]]");
+                    return 1;
+                }
+            };
+            if target.is_empty() {
+                eprintln!("Error: target is required");
+                return 1;
+            }
+            if let Some(p) = policy_arg(args) {
+                if let Err(e) = crate::apply_policy_file(rt, &p) {
+                    eprintln!("Error: {e}");
+                    return 1;
+                }
+            }
+
+            let mut call_tool: Option<String> = None;
+            let mut call_args: String = "{}".to_string();
+            let mut i = 4;
+            while i < args.len() {
+                if args[i] == "--call" {
+                    if let Some(t) = args.get(i + 1) {
+                        call_tool = Some(t.clone());
+                        i += 2;
+                        continue;
+                    }
+                } else if args[i] == "--args" {
+                    if let Some(a) = args.get(i + 1) {
+                        call_args = a.clone();
+                        i += 2;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+
+            let mut resolved_command = target.clone();
+            let mut resolved_args: Option<Vec<String>> = None;
+            let mut resolved_url: Option<String> = None;
+            if let Ok(config_list) = load_mcp_config() {
+                for s in config_list {
+                    if s.get("name").and_then(|v| v.as_str()) == Some(&target) {
+                        if let Some(u) = s.get("url").and_then(|v| v.as_str()) {
+                            resolved_url = Some(u.to_string());
+                        } else if let Some(c) = s.get("command").and_then(|v| v.as_str()) {
+                            resolved_command = c.to_string();
+                            if let Some(av) = s.get("args").and_then(|v| v.as_array()) {
+                                resolved_args = Some(av.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect());
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+
+            let connect_spec = if let Some(u) = resolved_url {
+                serde_json::json!({
+                    "url": u,
+                    "transport": "auto"
+                })
+            } else if let Some(a) = resolved_args {
+                serde_json::json!({
+                    "command": resolved_command,
+                    "args": a
+                })
+            } else if resolved_command.starts_with("http://") || resolved_command.starts_with("https://") {
+                serde_json::json!({
+                    "url": resolved_command,
+                    "transport": "auto"
+                })
+            } else {
+                serde_json::json!({
+                    "command": resolved_command
+                })
+            };
+
+            let connect_spec_json = serde_json::to_string(&connect_spec).unwrap_or_else(|_| "{}".into());
+            let target_display = serde_json::to_string(&target).unwrap_or_else(|_| "\"\"".into());
+            let call_tool_json = serde_json::to_string(&call_tool).unwrap_or_else(|_| "null".into());
+            let call_args_json = serde_json::to_string(&call_args).unwrap_or_else(|_| "\"{}\"".into());
+
+            let script = format!(
+r#"globalThis.__sofuu_cli_rc = 1;
+(async function () {{
+  var spec = {spec};
+  var targetDisp = {target_display};
+  var callTool = {call_tool};
+  var callArgsStr = {call_args};
+  try {{
+    var client = await sofuu.mcp.connect(spec);
+    var pVer = (typeof client.protocolVersion === 'function') ? String(client.protocolVersion() || 'unknown') : 'unknown';
+    var transport = client.transport || (/^https?:\/\//i.test(spec.url || '') ? 'http' : 'stdio');
+    var toolsRes = await client.listTools().catch(function () {{ return {{ tools: [] }}; }});
+    var tools = (toolsRes && toolsRes.tools) || [];
+    var resRes = await client.listResources().catch(function () {{ return null; }});
+    var resources = (resRes && resRes.resources) || null;
+    var promptsRes = await client.call('prompts/list', {{}}).catch(function () {{ return null; }});
+    var prompts = (promptsRes && promptsRes.prompts) || null;
+
+    console.log('\x1b[1;36m┌────────────────────────────────────────────────────────────────────────┐\x1b[0m');
+    console.log('\x1b[1;36m│\x1b[0m \x1b[1mModel Context Protocol (MCP) Server Inspector\x1b[0m');
+    console.log('\x1b[1;36m├────────────────────────────────────────────────────────────────────────┤\x1b[0m');
+    console.log('\x1b[1;36m│\x1b[0m \x1b[33mTarget:\x1b[0m    ' + targetDisp);
+    console.log('\x1b[1;36m│\x1b[0m \x1b[33mTransport:\x1b[0m ' + transport + (client.pid && client.pid() ? ' (PID ' + client.pid() + ')' : ''));
+    console.log('\x1b[1;36m│\x1b[0m \x1b[33mProtocol:\x1b[0m  ' + pVer);
+    console.log('\x1b[1;36m└────────────────────────────────────────────────────────────────────────┘\x1b[0m\n');
+
+    console.log('\x1b[1;32m● Tools (' + tools.length + ')\x1b[0m');
+    if (tools.length === 0) {{
+      console.log('  (no tools exposed)');
+    }} else {{
+      for (var i = 0; i < tools.length; i++) {{
+        var t = tools[i];
+        console.log('  \x1b[1m' + (i + 1) + '. ' + t.name + '\x1b[0m' + (t.description ? ' — ' + t.description : ''));
+        var schema = t.inputSchema || {{}};
+        var props = schema.properties || {{}};
+        var req = schema.required || [];
+        var pKeys = Object.keys(props);
+        if (pKeys.length > 0) {{
+          console.log('     \x1b[2mParameters:\x1b[0m');
+          for (var p = 0; p < pKeys.length; p++) {{
+            var pk = pKeys[p];
+            var pdef = props[pk] || {{}};
+            var isReq = req.indexOf(pk) >= 0;
+            var typeStr = pdef.type || (pdef.enum ? ('enum[' + pdef.enum.join(',') + ']') : 'any');
+            var descStr = pdef.description ? ' (' + pdef.description + ')' : '';
+            var reqMark = isReq ? ' \x1b[31m[required]\x1b[0m' : ' \x1b[2m[optional]\x1b[0m';
+            console.log('       - \x1b[33m' + pk + '\x1b[0m \x1b[35m<' + typeStr + '>\x1b[0m' + reqMark + descStr);
+          }}
+        }} else {{
+          console.log('     \x1b[2mParameters: (none)\x1b[0m');
+        }}
+      }}
+    }}
+    console.log('');
+
+    if (resources !== null) {{
+      console.log('\x1b[1;34m● Resources (' + resources.length + ')\x1b[0m');
+      for (var r = 0; r < resources.length; r++) {{
+        var resObj = resources[r];
+        console.log('  - ' + (resObj.name || resObj.uri) + ' \x1b[2m<' + (resObj.mimeType || 'unknown') + '>\x1b[0m (' + resObj.uri + ')');
+      }}
+      console.log('');
+    }}
+
+    if (prompts !== null) {{
+      console.log('\x1b[1;35m● Prompt Templates (' + prompts.length + ')\x1b[0m');
+      for (var pr = 0; pr < prompts.length; pr++) {{
+        var prObj = prompts[pr];
+        console.log('  - ' + prObj.name + (prObj.description ? ' — ' + prObj.description : ''));
+      }}
+      console.log('');
+    }}
+
+    if (callTool) {{
+      console.log('\x1b[1;33m● Executing Tool Call: ' + callTool + '\x1b[0m');
+      var parsedArgs = {{}};
+      try {{ parsedArgs = JSON.parse(callArgsStr); }} catch (eA) {{
+        console.log('\x1b[31mError: could not parse --args as JSON: ' + (eA.message || eA) + '\x1b[0m');
+        globalThis.__sofuu_cli_rc = 1;
+        try {{ client.disconnect(); }} catch (eD) {{}}
+        return;
+      }}
+      console.log('  Arguments: ' + JSON.stringify(parsedArgs));
+      var startT = Date.now();
+      try {{
+        var callRes = await client.call('tools/call', {{ name: callTool, arguments: parsedArgs }});
+        var dur = Date.now() - startT;
+        console.log('\x1b[32m✓ Completed in ' + dur + 'ms:\x1b[0m');
+        var resMapped = sofuu.tools.mcpResult(callRes);
+        console.log(resMapped);
+      }} catch (eCall) {{
+        var durFail = Date.now() - startT;
+        console.log('\x1b[31m✗ Tool execution failed after ' + durFail + 'ms:\x1b[0m');
+        console.log('  ' + (eCall.message || eCall));
+      }}
+    }}
+
+    globalThis.__sofuu_cli_rc = 0;
+    try {{ client.disconnect(); }} catch (eD2) {{}}
+  }} catch (e) {{
+    console.log('\x1b[31m✗ Failed to inspect MCP server: ' + targetDisp + '\x1b[0m');
+    console.log('  ' + String((e && e.message) || e));
+    globalThis.__sofuu_cli_rc = 1;
+  }}
+}})();"#,
+                spec = connect_spec_json,
+                target_display = target_display,
+                call_tool = call_tool_json,
+                call_args = call_args_json
+            );
+            eval_rc(rt, &script)
+        }
         _ => {
-            eprintln!("Usage: sofuu mcp <list|test <cmd|url>|add <name> <command>|remove <name>|init <name>|link <claude-desktop|cursor>>");
+            eprintln!("Usage: sofuu mcp <list|test <cmd|url>|inspect <cmd|url>|add <name> <command>|remove <name>|init <name>|link <claude-desktop|cursor>>");
             1
         }
     }

@@ -1659,6 +1659,359 @@
    * cannot loop its caller forever. */
   (function () {
     if (!sofuu.mcp || typeof sofuu.mcp.connect !== 'function' || sofuu.mcp.__paged) return;
+
+    /* Wrap sofuu.mcp.serve for In-Memory Direct and Network HTTP transports */
+    if (typeof sofuu.mcp.serve === 'function' && !sofuu.mcp.__serveWrapped) {
+      var realServe = sofuu.mcp.serve;
+      sofuu.mcp.serve = function (opts) {
+        opts = opts || {};
+        var transport = (opts.transport && String(opts.transport).toLowerCase()) || 'stdio';
+        var serverObj = realServe.call(this, opts);
+        serverObj._name = String(opts.name || 'sofuu-mcp-server');
+        serverObj._version = String(opts.version || '1.0.0');
+        serverObj._transport = transport;
+        serverObj._tools = {};
+        serverObj._resources = {};
+        serverObj._prompts = {};
+        serverObj._middlewares = [];
+        serverObj._isDirectServer = true;
+
+        var realTool = serverObj.tool;
+        serverObj.tool = function (name, schema, handler) {
+          if (typeof schema === 'function' && handler === undefined) {
+            handler = schema;
+            schema = { type: 'object', properties: {} };
+          }
+          var desc = (schema && schema.description) || ('Tool ' + name);
+          serverObj._tools[name] = {
+            name: name,
+            description: desc,
+            schema: schema || {},
+            handler: handler
+          };
+          try {
+            return realTool.call(serverObj, name, schema || {}, handler);
+          } catch (eTool) {
+            /* non-fatal fallback if native C tool registration has format differences */
+            return serverObj;
+          }
+        };
+
+        var realResource = serverObj.resource;
+        serverObj.resource = function (uri, meta, handler) {
+          serverObj._resources[uri] = {
+            uri: uri,
+            name: (meta && meta.name) || uri,
+            mimeType: (meta && meta.mimeType) || 'text/plain',
+            handler: handler
+          };
+          if (typeof realResource === 'function') {
+            try { realResource.call(serverObj, uri, meta || {}, handler); }
+            catch (eRes) { /* non-fatal fallback for native resource registration */ }
+          }
+          return serverObj;
+        };
+
+        var realPrompt = serverObj.prompt;
+        serverObj.prompt = function (name, meta, handler) {
+          serverObj._prompts[name] = {
+            name: name,
+            description: (meta && meta.description) || '',
+            arguments: (meta && meta.arguments) || [],
+            handler: handler
+          };
+          if (typeof realPrompt === 'function') {
+            try { realPrompt.call(serverObj, name, meta || {}, handler); }
+            catch (ePr) { /* non-fatal fallback for native prompt registration */ }
+          }
+          return serverObj;
+        };
+
+        serverObj.use = function (fn) {
+          if (typeof fn === 'function') serverObj._middlewares.push(fn);
+          return serverObj;
+        };
+
+        if (transport === 'http') {
+          var port = parseInt(opts.port || 8080, 10);
+          var httpServer = null;
+          var sessions = 0;
+
+          serverObj.start = function (cb) {
+            if (!sofuu.http || typeof sofuu.http.createServer !== 'function') {
+              throw new Error('sofuu.http.createServer is required for transport: "http"');
+            }
+            httpServer = sofuu.http.createServer(async function (req, res) {
+              if (req.method === 'DELETE') {
+                res.writeHead(200);
+                res.end();
+                return;
+              }
+              if (req.method !== 'POST') {
+                res.writeHead(405, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Method Not Allowed' }));
+                return;
+              }
+              var msg = {};
+              try { msg = JSON.parse(req.body || '{}'); } catch (eJson) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' } }));
+                return;
+              }
+              var id = msg.id;
+              var method = msg.method;
+              if (method === 'initialize') {
+                sessions++;
+                var initRes = {
+                  jsonrpc: '2.0',
+                  id: id,
+                  result: {
+                    protocolVersion: '2025-06-18',
+                    capabilities: { tools: { listChanged: true }, resources: {}, prompts: {} },
+                    serverInfo: { name: serverObj._name, version: serverObj._version }
+                  }
+                };
+                res.writeHead(200, {
+                  'Content-Type': 'application/json',
+                  'Mcp-Session-Id': 'sofuu-sess-' + sessions
+                });
+                res.end(JSON.stringify(initRes));
+                return;
+              }
+              if (method === 'notifications/initialized') {
+                res.writeHead(202);
+                res.end();
+                return;
+              }
+              if (method === 'ping') {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: id, result: {} }));
+                return;
+              }
+              if (method === 'tools/list') {
+                var toolList = [];
+                for (var tk in serverObj._tools) {
+                  var t = serverObj._tools[tk];
+                  toolList.push({
+                    name: t.name,
+                    description: t.description,
+                    inputSchema: (t.schema && (t.schema.schema || t.schema.parameters || t.schema)) || { type: 'object', properties: {} }
+                  });
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: id, result: { tools: toolList } }));
+                return;
+              }
+              if (method === 'resources/list') {
+                var resList = [];
+                for (var rk in serverObj._resources) {
+                  var r = serverObj._resources[rk];
+                  resList.push({ uri: r.uri, name: r.name, mimeType: r.mimeType });
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: id, result: { resources: resList } }));
+                return;
+              }
+              if (method === 'prompts/list') {
+                var prList = [];
+                for (var pk in serverObj._prompts) {
+                  var p = serverObj._prompts[pk];
+                  prList.push({ name: p.name, description: p.description, arguments: p.arguments });
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: id, result: { prompts: prList } }));
+                return;
+              }
+              if (method === 'tools/call') {
+                var tName = msg.params && msg.params.name;
+                var tEntry = serverObj._tools && serverObj._tools[tName];
+                if (!tEntry) {
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ jsonrpc: '2.0', id: id, error: { code: -32601, message: 'Tool not found: ' + tName } }));
+                  return;
+                }
+                var tArgs = (msg.params && msg.params.arguments) || {};
+                try {
+                  var mws = serverObj._middlewares || [];
+                  var mIdx = 0;
+                  var callCtx = { toolName: tName, args: tArgs, params: msg.params, server: serverObj, result: null };
+                  async function execPipeline() {
+                    if (mIdx < mws.length) {
+                      var m = mws[mIdx++];
+                      await m(callCtx, execPipeline);
+                    } else {
+                      callCtx.result = await tEntry.handler(callCtx.args);
+                    }
+                  }
+                  await execPipeline();
+                  var callOut = callCtx.result;
+                  var formatted = (callOut && typeof callOut === 'object' && Array.isArray(callOut.content))
+                    ? callOut
+                    : { content: [{ type: 'text', text: typeof callOut === 'string' ? callOut : JSON.stringify(callOut) }] };
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({ jsonrpc: '2.0', id: id, result: formatted }));
+                } catch (eExec) {
+                  res.writeHead(200, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: id,
+                    result: { content: [{ type: 'text', text: String((eExec && eExec.message) || eExec) }], isError: true }
+                  }));
+                }
+                return;
+              }
+
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ jsonrpc: '2.0', id: id, error: { code: -32601, message: 'Method not found: ' + method } }));
+            });
+
+            httpServer.listen(port, function () {
+              if (typeof cb === 'function') cb();
+            });
+            return serverObj;
+          };
+
+          serverObj.stop = function () {
+            if (httpServer) {
+              if (typeof httpServer.close === 'function') {
+                try { httpServer.close(); } catch (eCl) { /* http server close clean up */ }
+              } else if (typeof httpServer.unref === 'function') {
+                try { httpServer.unref(); } catch (eUn) { /* http server unref clean up */ }
+              }
+            }
+            httpServer = null;
+          };
+        }
+
+        return serverObj;
+      };
+      sofuu.mcp.__serveWrapped = true;
+    }
+
+    /* In-Memory Direct MCP Transport client constructor */
+    sofuu.mcp._connectDirect = function (srv) {
+      if (!srv) return Promise.reject(new Error('mcp.connect: target server is required for direct transport'));
+      var disconnected = false;
+
+      var rawClient = {
+        transport: 'direct',
+        state: 'CONNECTED',
+        url: undefined,
+        pid: function () { return (typeof process !== 'undefined' && process.pid) || 0; },
+        protocolVersion: function () { return '2024-11-05'; },
+        endpoint: function () { return 'in-process://' + ((srv && srv._name) || 'mcp'); },
+        sessionId: function () { return 'direct-sess-1'; },
+        onNotification: null,
+        disconnect: function () {
+          disconnected = true;
+        },
+        listTools: async function () {
+          if (disconnected) throw new Error('MCP client is disconnected');
+          var tools = [];
+          if (srv && srv._tools) {
+            for (var k in srv._tools) {
+              var t = srv._tools[k];
+              tools.push({
+                name: t.name,
+                description: t.description || ('Direct tool ' + t.name),
+                inputSchema: (t.schema && (t.schema.schema || t.schema.parameters || t.schema)) || { type: 'object', properties: {} }
+              });
+            }
+          }
+          return { tools: tools };
+        },
+        listResources: async function () {
+          if (disconnected) throw new Error('MCP client is disconnected');
+          var res = [];
+          if (srv && srv._resources) {
+            for (var rk in srv._resources) {
+              var r = srv._resources[rk];
+              res.push({ uri: r.uri, name: r.name, mimeType: r.mimeType });
+            }
+          }
+          return { resources: res };
+        },
+        call: async function (method, params) {
+          if (disconnected) {
+            var discErr = new Error('MCP client is disconnected');
+            discErr.code = 'E_MCP_DISCONNECTED';
+            throw discErr;
+          }
+          params = params || {};
+          if (method === 'initialize') {
+            return {
+              protocolVersion: '2024-11-05',
+              capabilities: { tools: { listChanged: true }, resources: {}, prompts: {} },
+              serverInfo: { name: (srv && srv._name) || 'sofuu-direct', version: (srv && srv._version) || '1.0.0' }
+            };
+          }
+          if (method === 'notifications/initialized' || method === 'ping') {
+            return {};
+          }
+          if (method === 'tools/list') {
+            return rawClient.listTools();
+          }
+          if (method === 'resources/list') {
+            return rawClient.listResources();
+          }
+          if (method === 'prompts/list') {
+            var prs = [];
+            if (srv && srv._prompts) {
+              for (var pk in srv._prompts) {
+                var p = srv._prompts[pk];
+                prs.push({ name: p.name, description: p.description, arguments: p.arguments });
+              }
+            }
+            return { prompts: prs };
+          }
+          if (method === 'tools/call') {
+            var toolName = params.name;
+            var t = srv && srv._tools && srv._tools[toolName];
+            if (!t) {
+              var notFound = new Error("Tool not found: '" + toolName + "'");
+              notFound.code = -32601;
+              throw notFound;
+            }
+
+            var srvMws = (srv && srv._middlewares) || [];
+            var sIdx = 0;
+            var srvCtx = {
+              toolName: toolName,
+              args: params.arguments || {},
+              params: params,
+              server: srv,
+              result: null
+            };
+
+            async function srvNext() {
+              if (sIdx < srvMws.length) {
+                var mw = srvMws[sIdx++];
+                await mw(srvCtx, srvNext);
+              } else {
+                srvCtx.result = await t.handler(srvCtx.args);
+              }
+            }
+
+            await srvNext();
+            var out = srvCtx.result;
+            if (out && typeof out === 'object' && Array.isArray(out.content)) {
+              return out;
+            }
+            var textOut = typeof out === 'string' ? out : JSON.stringify(out);
+            return {
+              content: [
+                { type: 'text', text: textOut }
+              ]
+            };
+          }
+
+          throw new Error("Method not supported on direct transport: '" + method + "'");
+        }
+      };
+
+      return Promise.resolve(rawClient);
+    };
+
     var realConnect = sofuu.mcp.connect;
     function all(client, method, key) {
       var out = [];
@@ -2205,17 +2558,20 @@
       var transport = '';
       if (arg && typeof arg === 'object' && arg.transport) transport = String(arg.transport);
       else if (opts && typeof opts === 'object' && opts.transport) transport = String(opts.transport);
+      var isDirect = (transport === 'direct') ||
+        (arg && (arg._isDirectServer || (typeof arg.tool === 'function' && typeof arg._tools === 'object')));
+      var directServer = isDirect ? ((arg && arg.server) ? arg.server : arg) : null;
       if (transport === 'http' && !cfg.url) {
         return Promise.reject(new Error("mcp.connect: transport 'http' needs a url"));
       }
       /* M3 (2026-10-29): legacy HTTP+SSE is a real transport now. It needs a
        * url (the SSE endpoint) and is never inferred silently — 'http' stays
        * the default for a bare {url}, so existing callers are unchanged. */
-      var useSse = (transport === 'sse' || transport === 'http+sse');
+      var useSse = !isDirect && (transport === 'sse' || transport === 'http+sse');
       if (useSse && !cfg.url) {
         return Promise.reject(new Error("mcp.connect: transport 'sse' needs a url"));
       }
-      var useHttp = (transport === 'http') || (!useSse && transport !== 'stdio' && !!cfg.url);
+      var useHttp = !isDirect && ((transport === 'http') || (!useSse && transport !== 'stdio' && !!cfg.url));
       var server = (opts && opts.server) ? String(opts.server)
         : ((useHttp || useSse) ? (cfg.name || cfg.url) : ((arg && typeof arg === 'object' && arg.server)
           ? String(arg.server) : cfg.command));
@@ -2243,6 +2599,7 @@
       }
 
       function createRawClient() {
+        if (isDirect) return Promise.resolve(sofuu.mcp._connectDirect(directServer, cfg));
         if (useSse) return Promise.resolve(sofuu.mcp._connectSse(cfg));
         if (useHttp) {
           return Promise.resolve(sofuu.mcp._connectHttp(cfg)).catch(function (eHttp) {
@@ -2266,7 +2623,7 @@
         var recCfg = (opts && opts.reconnect) || (arg && arg.reconnect) || {};
         var reconnectEnabled = (recCfg.enabled !== undefined)
           ? Boolean(recCfg.enabled)
-          : (!useHttp && !useSse);
+          : (!useHttp && !useSse && !isDirect);
         var maxRetries = (typeof recCfg.maxRetries === 'number' && recCfg.maxRetries >= 0)
           ? recCfg.maxRetries
           : 3;
@@ -2358,7 +2715,12 @@
           return reconnectingPromise;
         }
 
+        var clientMiddlewares = [];
         var wrapper = {
+          use: function (fn) {
+            if (typeof fn === 'function') clientMiddlewares.push(fn);
+            return wrapper;
+          },
           /* The resilience layer must not swallow the transport surface: the
            * e2e driver and the chat/agent callers read client.transport, call
            * endpoint()/sessionId() to show where a session lives, and set
@@ -2416,99 +2778,130 @@
               return Promise.reject(closedErr);
             }
 
-            /* Remote Circuit Breaker evaluation */
-            if (useHttp || useSse) {
-              var now = Date.now();
-              if (circuitState === 'OPEN') {
-                if (now < circuitTripUntil) {
-                  var cbErr = new Error("MCP circuit breaker is OPEN for server '" + server + "' (cooling down for 15s)");
-                  cbErr.code = 'E_MCP_CIRCUIT_OPEN';
-                  return Promise.reject(cbErr);
-                }
-                circuitState = 'HALF_OPEN';
-              }
-            }
-
-            /* Apply policy default timeout if not set */
-            var defMs = policyCallTimeout();
-            if (defMs > 0) {
-              var hasTo = copts && typeof copts === 'object' && copts.timeoutMs !== undefined;
-              if (!hasTo) {
-                var merged = { timeoutMs: defMs };
-                if (copts && typeof copts === 'object') {
-                  for (var ck in copts) {
-                    if (Object.prototype.hasOwnProperty.call(copts, ck)) merged[ck] = copts[ck];
+            function execCall(m, p, co) {
+              /* Remote Circuit Breaker evaluation */
+              if (useHttp || useSse) {
+                var now = Date.now();
+                if (circuitState === 'OPEN') {
+                  if (now < circuitTripUntil) {
+                    var cbErr = new Error("MCP circuit breaker is OPEN for server '" + server + "' (cooling down for 15s)");
+                    cbErr.code = 'E_MCP_CIRCUIT_OPEN';
+                    return Promise.reject(cbErr);
                   }
+                  circuitState = 'HALF_OPEN';
                 }
-                copts = merged;
               }
-            }
 
-            /* If reconnecting or replaying, queue the request */
-            if (clientState === 'RECONNECTING' || clientState === 'REPLAYING') {
-              if (replayQueue.length >= 64) {
-                var ovfErr = new Error('MCP replay queue overflow (limit 64)');
-                ovfErr.code = 'E_MCP_QUEUE_FULL';
-                return Promise.reject(ovfErr);
+              /* Apply policy default timeout if not set */
+              var defMs = policyCallTimeout();
+              if (defMs > 0) {
+                var hasTo = co && typeof co === 'object' && co.timeoutMs !== undefined;
+                if (!hasTo) {
+                  var merged = { timeoutMs: defMs };
+                  if (co && typeof co === 'object') {
+                    for (var ck in co) {
+                      if (Object.prototype.hasOwnProperty.call(co, ck)) merged[ck] = co[ck];
+                    }
+                  }
+                  co = merged;
+                }
               }
-              return new Promise(function (res, rej) {
-                replayQueue.push({
-                  method: method,
-                  params: params,
-                  copts: copts,
-                  resolve: res,
-                  reject: rej,
-                  enqueuedAt: Date.now()
+
+              /* If reconnecting or replaying, queue the request */
+              if (clientState === 'RECONNECTING' || clientState === 'REPLAYING') {
+                if (replayQueue.length >= 64) {
+                  var ovfErr = new Error('MCP replay queue overflow (limit 64)');
+                  ovfErr.code = 'E_MCP_QUEUE_FULL';
+                  return Promise.reject(ovfErr);
+                }
+                return new Promise(function (res, rej) {
+                  replayQueue.push({
+                    method: m,
+                    params: p,
+                    copts: co,
+                    resolve: res,
+                    reject: rej,
+                    enqueuedAt: Date.now()
+                  });
+                });
+              }
+
+              return new Promise(function (resolve, reject) {
+                Promise.resolve(curClient.call(m, p, co)).then(function (res) {
+                  if (useHttp || useSse) {
+                    circuitFailures = 0;
+                    circuitState = 'CLOSED';
+                  }
+                  resolve(res);
+                }, function (err) {
+                  if (useHttp || useSse) {
+                    var emsg = String((err && err.message) || err || '');
+                    if (/status\s*5\d\d|5\d\d|timeout|ETIMEDOUT/i.test(emsg) || (err && err.code === 'ETIMEDOUT')) {
+                      circuitFailures++;
+                      if (circuitFailures >= 2 || circuitState === 'HALF_OPEN') {
+                        circuitState = 'OPEN';
+                        circuitTripUntil = Date.now() + 15000;
+                        circuitFailures = 0;
+                      }
+                    }
+                    reject(err);
+                    return;
+                  }
+
+                  /* Stdio transport loss check: auto-respawn and replay */
+                  if (isTransportLoss(err) && reconnectEnabled && clientState === 'CONNECTED') {
+                    clientState = 'RECONNECTING';
+                    if (replayQueue.length >= 64) {
+                      var qErr = new Error('MCP replay queue overflow (limit 64)');
+                      qErr.code = 'E_MCP_QUEUE_FULL';
+                      reject(qErr);
+                      return;
+                    }
+                    replayQueue.push({
+                      method: m,
+                      params: p,
+                      copts: co,
+                      resolve: resolve,
+                      reject: reject,
+                      enqueuedAt: Date.now()
+                    });
+                    startReconnectLoop();
+                    return;
+                  }
+
+                  reject(err);
                 });
               });
             }
 
-            return new Promise(function (resolve, reject) {
-              Promise.resolve(curClient.call(method, params, copts)).then(function (res) {
-                if (useHttp || useSse) {
-                  circuitFailures = 0;
-                  circuitState = 'CLOSED';
-                }
-                resolve(res);
-              }, function (err) {
-                if (useHttp || useSse) {
-                  var emsg = String((err && err.message) || err || '');
-                  if (/status\s*5\d\d|5\d\d|timeout|ETIMEDOUT/i.test(emsg) || (err && err.code === 'ETIMEDOUT')) {
-                    circuitFailures++;
-                    if (circuitFailures >= 2 || circuitState === 'HALF_OPEN') {
-                      circuitState = 'OPEN';
-                      circuitTripUntil = Date.now() + 15000;
-                      circuitFailures = 0;
-                    }
+            if (clientMiddlewares.length > 0) {
+              var midIdx = 0;
+              var mwCtx = {
+                method: method,
+                toolName: method === 'tools/call' ? (params && params.name) : undefined,
+                args: method === 'tools/call' ? (params && params.arguments) : undefined,
+                params: params,
+                client: wrapper,
+                result: null
+              };
+              async function runClientMws() {
+                if (midIdx < clientMiddlewares.length) {
+                  var mw = clientMiddlewares[midIdx++];
+                  await mw(mwCtx, runClientMws);
+                } else {
+                  if (mwCtx.params && mwCtx.args && mwCtx.method === 'tools/call') {
+                    mwCtx.params.arguments = mwCtx.args;
                   }
-                  reject(err);
-                  return;
+                  mwCtx.result = await execCall(mwCtx.method, mwCtx.params, copts);
                 }
+              }
+              return (async function () {
+                await runClientMws();
+                return mwCtx.result;
+              })();
+            }
 
-                /* Stdio transport loss check: auto-respawn and replay */
-                if (isTransportLoss(err) && reconnectEnabled && clientState === 'CONNECTED') {
-                  clientState = 'RECONNECTING';
-                  if (replayQueue.length >= 64) {
-                    var qErr = new Error('MCP replay queue overflow (limit 64)');
-                    qErr.code = 'E_MCP_QUEUE_FULL';
-                    reject(qErr);
-                    return;
-                  }
-                  replayQueue.push({
-                    method: method,
-                    params: params,
-                    copts: copts,
-                    resolve: resolve,
-                    reject: reject,
-                    enqueuedAt: Date.now()
-                  });
-                  startReconnectLoop();
-                  return;
-                }
-
-                reject(err);
-              });
-            });
+            return execCall(method, params, copts);
           }
         };
 

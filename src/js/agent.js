@@ -1110,6 +1110,14 @@
           continue;
         }
       }
+      if (t && typeof t === 'object' && typeof t.call === 'function' && typeof t.listTools === 'function') {
+        d.mcpSets.push({ name: t.name || ('mcp' + (d.mcpSets.length + 1)), client: t });
+        continue;
+      }
+      if (t && typeof t === 'object' && t.client && typeof t.client.call === 'function') {
+        d.mcpSets.push({ name: String(t.name || ('mcp' + (d.mcpSets.length + 1))), client: t.client });
+        continue;
+      }
       if (t && typeof t === 'object' && Array.isArray(t.mcp)) {
         for (var j = 0; j < t.mcp.length; j++) {
           var s = t.mcp[j];
@@ -2019,7 +2027,14 @@
     for (var m = 0; m < d.mcpSets.length; m++) {
       var set = d.mcpSets[m];
       var conn;
-      try { conn = await mcpConnect(set); }
+      try {
+        if (set.client) {
+          var clientToolsRes = await set.client.listTools();
+          conn = { client: set.client, tools: (clientToolsRes && clientToolsRes.tools) || [], stale: false, note: '' };
+        } else {
+          conn = await mcpConnect(set);
+        }
+      }
       catch (e) { warn({ mcp: set.name, note: 'unreachable: ' + clip(String(e.message || e), 120) }); continue; }
       if (conn.stale) {
         try {

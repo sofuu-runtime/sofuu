@@ -1422,6 +1422,12 @@ unsafe extern "C" fn js_create_server(
         c"unref".as_ptr(),
         qjs::sofuu_js_new_cfunction(ctx, js_server_unref, c"unref".as_ptr(), 0),
     );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        obj,
+        c"close".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_server_close, c"close".as_ptr(), 1),
+    );
     obj
 }
 
@@ -1458,6 +1464,34 @@ unsafe extern "C" fn js_server_unref(
     }
     if (*srv).listening != 0 {
         uv::uv_unref((*srv).tcp as *mut UvHandle);
+    }
+    qjs::sofuu_js_dup_value(ctx, this_val)
+}
+
+unsafe extern "C" fn js_server_close(
+    ctx: *mut JSContext,
+    this_val: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let srv = qjs::JS_GetOpaque(this_val, SRV_CLASS_ID.load(Ordering::Relaxed)) as *mut Server;
+    if srv.is_null() {
+        return qjs::JS_ThrowTypeError(ctx, c"server.close: bad object".as_ptr());
+    }
+    if (*srv).listening != 0
+        && !(*srv).tcp.is_null()
+        && uv::uv_is_closing((*srv).tcp as *const UvHandle) == 0
+    {
+        uv::uv_close((*srv).tcp as *mut UvHandle, Some(srv_close_cb));
+        (*srv).tcp = ptr::null_mut();
+        (*srv).listening = 0;
+    }
+    if !qjs::is_undefined((*srv).anchor) {
+        qjs::sofuu_js_free_value(ctx, (*srv).anchor);
+        (*srv).anchor = qjs::sofuu_js_undefined();
+    }
+    if argc > 0 && qjs::JS_IsFunction(ctx, *argv) != 0 {
+        let _ = qjs::JS_Call(ctx, *argv, this_val, 0, ptr::null());
     }
     qjs::sofuu_js_dup_value(ctx, this_val)
 }

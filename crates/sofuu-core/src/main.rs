@@ -261,8 +261,10 @@ fn print_subcommand_help(cmd: &str) -> bool {
             "Usage: sofuu mcp list\n\
                     sofuu mcp test <command line | http(s)://url>\n\
                     sofuu mcp add <name> <command> [args…]\n\
-                    sofuu mcp remove <name>\n\n\
-             Manage MCP servers and inspect the tools they expose.\n"
+                    sofuu mcp remove <name>\n\
+                    sofuu mcp init <name>\n\
+                    sofuu mcp link <claude-desktop | cursor>\n\n\
+             Manage MCP servers, scaffold new servers, and link to IDEs.\n"
         ),
         "conformance" => println!(
             "Usage: sofuu conformance [--suite <name>]\n\n\

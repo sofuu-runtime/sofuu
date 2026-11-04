@@ -292,8 +292,195 @@ pub fn mcp(rt: &SofuuRuntime, args: &[String]) -> i32 {
             println!("\x1b[32m✓\x1b[0m removed '{name}' from {}", mcp_config_path().display());
             0
         }
+        "init" => {
+            let name = match args.get(3) {
+                Some(n) => n.trim().to_string(),
+                None => {
+                    eprintln!("Usage: sofuu mcp init <name>");
+                    return 1;
+                }
+            };
+            if name.is_empty() {
+                eprintln!("Error: server name is required");
+                return 1;
+            }
+            let clean_name = name
+                .chars()
+                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+                .collect::<String>();
+            let file_name = if clean_name.ends_with(".ts") || clean_name.ends_with(".js") {
+                clean_name.clone()
+            } else {
+                format!("{clean_name}.ts")
+            };
+            let file_path = std::path::Path::new(&file_name);
+            if file_path.exists() {
+                eprintln!("Error: file '{}' already exists", file_path.display());
+                return 1;
+            }
+            let template = format!(
+r#"import {{ mcp }} from 'sofuu';
+
+// Initialize Model Context Protocol (MCP) server
+const server = mcp.serve({{
+  name: "{clean_name}",
+  version: "1.0.0"
+}});
+
+// Sample tool definition
+server.tool("echo", {{
+  text: "string"
+}}, async ({{ text }}) => {{
+  return "Echo: " + (text || "");
+}});
+
+// Start stdio transport listener
+server.start();
+"#);
+            if let Err(e) = std::fs::write(file_path, template) {
+                eprintln!("Error: cannot write file '{}': {e}", file_path.display());
+                return 1;
+            }
+            println!("\x1b[32m✓\x1b[0m created MCP server scaffold in \x1b[1m{}\x1b[0m", file_path.display());
+            println!("  Run directly:  sofuu run {}", file_path.display());
+            println!("  Add to Sofuu:  sofuu mcp add {} sofuu run {}", clean_name, file_path.display());
+            println!("  Test with MCP: sofuu mcp test \"sofuu run {}\"", file_path.display());
+            0
+        }
+        "link" => {
+            let target = match args.get(3).map(|s| s.as_str()) {
+                Some("claude-desktop" | "claude") => "claude",
+                Some("cursor") => "cursor",
+                _ => {
+                    eprintln!("Usage: sofuu mcp link <claude-desktop|cursor> [--local]");
+                    return 1;
+                }
+            };
+            let is_local = args.iter().any(|a| a == "--local");
+            let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into());
+            let target_path = if target == "claude" {
+                #[cfg(target_os = "macos")]
+                {
+                    std::path::PathBuf::from(&home)
+                        .join("Library/Application Support/Claude/claude_desktop_config.json")
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    std::path::PathBuf::from(&home)
+                        .join(".config/Claude/claude_desktop_config.json")
+                }
+            } else {
+                if is_local || std::path::Path::new(".cursor").is_dir() {
+                    std::path::PathBuf::from(".cursor/mcp.json")
+                } else {
+                    std::path::PathBuf::from(&home).join(".cursor/mcp.json")
+                }
+            };
+
+            let sofuu_servers = match load_mcp_config() {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Error reading Sofuu MCP config: {e}");
+                    return 1;
+                }
+            };
+            if sofuu_servers.is_empty() {
+                eprintln!("Warning: No MCP servers currently configured in ~/.sofuu/mcp.json");
+                eprintln!("Add one first with: sofuu mcp add <name> <command> [args...]");
+            }
+
+            let mut root_val: serde_json::Value = if target_path.exists() {
+                match std::fs::read_to_string(&target_path) {
+                    Ok(content) => {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let backup_path = target_path.with_extension(format!("json.{ts}.backup"));
+                        let _ = std::fs::write(&backup_path, &content);
+                        match serde_json::from_str(&content) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                eprintln!("Error: Existing config at {} is malformed: {e}", target_path.display());
+                                return 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error reading {}: {e}", target_path.display());
+                        return 1;
+                    }
+                }
+            } else {
+                serde_json::json!({})
+            };
+
+            if !root_val.is_object() {
+                root_val = serde_json::json!({});
+            }
+
+            if !root_val.get("mcpServers").map(|v| v.is_object()).unwrap_or(false) {
+                root_val["mcpServers"] = serde_json::json!({});
+            }
+
+            let mcp_map = root_val.get_mut("mcpServers").and_then(|v| v.as_object_mut()).expect("mcpServers is object");
+            let mut linked_count = 0;
+            let mut server_names = Vec::new();
+
+            for srv in &sofuu_servers {
+                let name = match srv.get("name").and_then(|v| v.as_str()) {
+                    Some(n) if !n.trim().is_empty() => n.trim(),
+                    _ => continue,
+                };
+                let cmd = match srv.get("command").and_then(|v| v.as_str()) {
+                    Some(c) if !c.trim().is_empty() => c.trim(),
+                    _ => continue,
+                };
+                let mut entry = serde_json::json!({
+                    "command": cmd
+                });
+                if let Some(args_val) = srv.get("args") {
+                    if args_val.is_array() {
+                        entry["args"] = args_val.clone();
+                    }
+                }
+                if let Some(env_val) = srv.get("env") {
+                    if env_val.is_object() {
+                        entry["env"] = env_val.clone();
+                    }
+                }
+                mcp_map.insert(name.to_string(), entry);
+                linked_count += 1;
+                server_names.push(name.to_string());
+            }
+
+            if let Some(parent) = target_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+
+            let pretty_json = match serde_json::to_string_pretty(&root_val) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("Error serializing updated config: {e}");
+                    return 1;
+                }
+            };
+
+            if let Err(e) = std::fs::write(&target_path, pretty_json) {
+                eprintln!("Error writing {}: {e}", target_path.display());
+                return 1;
+            }
+
+            let ide_display = if target == "claude" { "Claude Desktop" } else { "Cursor" };
+            println!("\x1b[32m✓\x1b[0m Linked {linked_count} Sofuu MCP server(s) to \x1b[1m{ide_display}\x1b[0m");
+            println!("  Config: {}", target_path.display());
+            if !server_names.is_empty() {
+                println!("  Servers: {}", server_names.join(", "));
+            }
+            0
+        }
         _ => {
-            eprintln!("Usage: sofuu mcp <list|test <cmd|url>|add <name> <command>|remove <name>>");
+            eprintln!("Usage: sofuu mcp <list|test <cmd|url>|add <name> <command>|remove <name>|init <name>|link <claude-desktop|cursor>>");
             1
         }
     }

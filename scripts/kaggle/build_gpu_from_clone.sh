@@ -82,6 +82,7 @@ mkdir -p "$NOQTSQ"
 # Drop any cross-build overrides inherited from elsewhere; this is a NATIVE
 # build, so the host cc/ar and system curl are what we want.
 unset SOFUU_UV_DIR SOFUU_CURL_STATIC_DIR SOFUU_QTSQ_LIB SOFUU_ZLIB_DIR
+unset RUSTFLAGS CC CXX AR RANLIB
 export SOFUU_QTSQ_DIR="$NOQTSQ"
 export SOFUU_BUILD="$(git rev-parse --short HEAD)"
 say "building commit $SOFUU_BUILD with the codec-less QTSQ shape"

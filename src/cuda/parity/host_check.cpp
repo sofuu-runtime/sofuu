@@ -242,6 +242,119 @@ void test_add(uint32_t &seed) {
     check_vec("add", got.data(), want.data(), n, 0.0, 0.0);
 }
 
+
+// The GPU GEMV kernels were rewritten from one-thread-per-block to a
+// coalesced lane mapping. These loops mirror that mapping exactly (including
+// the warp stride over super-blocks) and compare against the independent
+// scalar references, so a coverage/indexing bug is caught without a GPU.
+void test_tiled_gemv(uint32_t &seed) {
+    const int rows = 4;
+    for (int cols : {2048, 8192}) {
+        int nb = cols / 256;
+        std::vector<uint8_t> w4, w6;
+        fill_q4_k(w4, rows, cols, seed);
+        fill_q6_k(w6, rows, cols, seed);
+        std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
+        for (int r = 0; r < rows; ++r) {
+            float got4 = 0.0f, got6 = 0.0f;
+            const uint8_t *row4 = w4.data() + (size_t)r * nb * 144;
+            const uint8_t *row6 = w6.data() + (size_t)r * nb * 210;
+            for (int tid = 0; tid < 256; ++tid) {
+                int warp = tid >> 5, lane = tid & 31;
+                int sub = lane >> 2, l0 = (lane & 3) << 3;
+                for (int bi = warp; bi < nb; bi += 8) {
+                    const auto *b4 = reinterpret_cast<const sofuu_block_q4_K *>(
+                        row4 + (size_t)bi * 144);
+                    unsigned int sc, mn;
+                    sofuu_q4k_scale_min(sub, b4->scales, &sc, &mn);
+                    float d4 = sofuu_f16_to_f32(b4->d);
+                    float dm = sofuu_f16_to_f32(b4->dmin);
+                    const uint8_t *qs4 = b4->qs + (sub >> 1) * 32;
+                    unsigned int hi = (unsigned int)(sub & 1);
+                    float s4 = d4 * (float)sc, m4 = dm * (float)mn;
+                    const float *xb4 = x.data() + (size_t)bi * 256 + sub * 32 + l0;
+                    for (int k = 0; k < 8; ++k) {
+                        unsigned int byte = qs4[l0 + k];
+                        unsigned int q = hi ? (byte >> 4) : (byte & 0x0fu);
+                        got4 += (s4 * (float)q - m4) * xb4[k];
+                    }
+
+                    const auto *b6 = reinterpret_cast<const sofuu_block_q6_K *>(
+                        row6 + (size_t)bi * 210);
+                    int n = sub >> 2, rr = sub & 3;
+                    float d6 = sofuu_f16_to_f32(b6->d);
+                    int sb = n * 8 + 2 * rr;
+                    float sc0 = (float)b6->scales[sb];
+                    float sc1 = (float)b6->scales[sb + 1];
+                    int ql_base = n * 64 + ((rr == 1 || rr == 3) ? 32 : 0);
+                    const float *xb6 = x.data() + (size_t)bi * 256 + sub * 32 + l0;
+                    for (int k = 0; k < 8; ++k) {
+                        int l = l0 + k;
+                        unsigned int ql = b6->ql[ql_base + l];
+                        unsigned int nib = (rr < 2) ? (ql & 0x0fu) : (ql >> 4);
+                        unsigned int hi2 = ((unsigned int)b6->qh[n * 32 + l] >> (2 * rr)) & 3u;
+                        int q = (int)(nib | (hi2 << 4)) - 32;
+                        float sc = (l >= 16) ? sc1 : sc0;
+                        got6 += d6 * sc * (float)q * xb6[k];
+                    }
+                }
+            }
+            check_dot(cols == 2048 ? "tiled_q4_k" : "tiled_q4_k_wide",
+                      got4, sofuu_ref::dot_q4_k(row4, x.data(), cols));
+            check_dot(cols == 2048 ? "tiled_q6_k" : "tiled_q6_k_wide",
+                      got6, sofuu_ref::dot_q6_k(row6, x.data(), cols));
+        }
+    }
+
+    for (int cols : {1024, 4096}) {
+        int nb = cols / 32;
+        std::vector<uint8_t> w;
+        fill_q8_0(w, rows, cols, seed);
+        std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
+        for (int r = 0; r < rows; ++r) {
+            float got = 0.0f;
+            const uint8_t *row = w.data() + (size_t)r * nb * 34;
+            for (int tid = 0; tid < 256; ++tid) {
+                int lane = tid & 3;
+                for (int bi = tid >> 2; bi < nb; bi += 64) {
+                    const auto *b = reinterpret_cast<const sofuu_block_q8_0 *>(
+                        row + (size_t)bi * 34);
+                    float d = sofuu_f16_to_f32(b->d);
+                    const float *xb = x.data() + (size_t)bi * 32 + lane * 8;
+                    for (int k = 0; k < 8; ++k)
+                        got += d * (float)b->qs[lane * 8 + k] * xb[k];
+                }
+            }
+            check_dot(cols == 1024 ? "tiled_q8_0" : "tiled_q8_0_wide",
+                      got, sofuu_ref::dot_q8_0(row, x.data(), cols));
+        }
+    }
+}
+
+
+// The q4_K kernel reads eight qs bytes as one little-endian uint64. Verify the
+// shift/nibble extraction against the per-byte definition on the host.
+void test_q4_vector_extract(uint32_t &seed) {
+    std::vector<uint8_t> w;
+    fill_q4_k(w, 1, 256, seed);
+    const auto *b = reinterpret_cast<const sofuu_block_q4_K *>(w.data());
+    int bad = 0;
+    for (int sub = 0; sub < 8; ++sub) {
+        for (int l0 = 0; l0 < 32; l0 += 8) {
+            unsigned long long qv = 0;
+            std::memcpy(&qv, b->qs + (sub >> 1) * 32 + l0, 8);
+            for (int k = 0; k < 8; ++k) {
+                unsigned int byte = (unsigned int)((qv >> (8 * k)) & 0xffu);
+                unsigned int q = (sub & 1) ? (byte >> 4) : (byte & 0x0fu);
+                unsigned int ref_byte = b->qs[(sub >> 1) * 32 + l0 + k];
+                unsigned int ref = (sub & 1) ? (ref_byte >> 4) : (ref_byte & 0x0fu);
+                if (q != ref) ++bad;
+            }
+        }
+    }
+    report("q4_vector_extract", bad == 0, (double)bad, 0.0, 0.0);
+}
+
 } // namespace
 
 int main(void) {
@@ -257,6 +370,8 @@ int main(void) {
     test_kv_write(seed);
     test_attn_decode(seed);
     test_add(seed);
+    test_tiled_gemv(seed);
+    test_q4_vector_extract(seed);
     if (g_failures == 0) {
         std::printf("RESULT: PASS (all host kernel references match)\n");
         return 0;

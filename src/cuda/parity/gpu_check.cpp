@@ -146,8 +146,8 @@ bool get_function(const char *name, void **out) {
 }
 
 // ── GEMV tests ─────────────────────────────────────────────────────────────
-void test_gemv_q8_0(void *fn, uint32_t &seed) {
-    const int rows = 8, cols = 1024;
+void test_gemv_q8_0(void *fn, uint32_t &seed, int cols) {
+    const int rows = 8;
     std::vector<uint8_t> w;
     fill_q8_0(w, rows, cols, seed);
     std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
@@ -174,15 +174,15 @@ void test_gemv_q8_0(void *fn, uint32_t &seed) {
         if (e > max_err) max_err = e;
         if (b > bound) bound = b;
     }
-    report("gemv_q8_0", ok && max_err <= bound, max_err, bound,
+    report(cols == 1024 ? "gemv_q8_0" : "gemv_q8_0_wide", ok && max_err <= bound, max_err, bound,
            (double)want[0]);
     sofuu_cuda_ctx_free(g_ctx, dw);
     sofuu_cuda_ctx_free(g_ctx, dx);
     sofuu_cuda_ctx_free(g_ctx, dy);
 }
 
-void test_gemv_q4_k(void *fn, uint32_t &seed) {
-    const int rows = 8, cols = 2048;
+void test_gemv_q4_k(void *fn, uint32_t &seed, int cols) {
+    const int rows = 8;
     std::vector<uint8_t> w;
     fill_q4_k(w, rows, cols, seed);
     std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
@@ -209,15 +209,15 @@ void test_gemv_q4_k(void *fn, uint32_t &seed) {
         if (e > max_err) max_err = e;
         if (b > bound) bound = b;
     }
-    report("gemv_q4_k", ok && max_err <= bound, max_err, bound,
+    report(cols == 2048 ? "gemv_q4_k" : "gemv_q4_k_wide", ok && max_err <= bound, max_err, bound,
            (double)want[0]);
     sofuu_cuda_ctx_free(g_ctx, dw);
     sofuu_cuda_ctx_free(g_ctx, dx);
     sofuu_cuda_ctx_free(g_ctx, dy);
 }
 
-void test_gemv_q6_k(void *fn, uint32_t &seed) {
-    const int rows = 8, cols = 2048;
+void test_gemv_q6_k(void *fn, uint32_t &seed, int cols) {
+    const int rows = 8;
     std::vector<uint8_t> w;
     fill_q6_k(w, rows, cols, seed);
     std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
@@ -244,7 +244,7 @@ void test_gemv_q6_k(void *fn, uint32_t &seed) {
         if (e > max_err) max_err = e;
         if (b > bound) bound = b;
     }
-    report("gemv_q6_k", ok && max_err <= bound, max_err, bound,
+    report(cols == 2048 ? "gemv_q6_k" : "gemv_q6_k_wide", ok && max_err <= bound, max_err, bound,
            (double)want[0]);
     sofuu_cuda_ctx_free(g_ctx, dw);
     sofuu_cuda_ctx_free(g_ctx, dx);
@@ -555,9 +555,11 @@ int main(int argc, char **argv) {
     }
 
     uint32_t seed = 0x5eed1234u;
-    test_gemv_q8_0(f_q8, seed);
-    test_gemv_q4_k(f_q4, seed);
-    test_gemv_q6_k(f_q6, seed);
+    for (int cols : {1024, 4096}) test_gemv_q8_0(f_q8, seed, cols);
+    for (int cols : {2048, 8192}) {
+        test_gemv_q4_k(f_q4, seed, cols);
+        test_gemv_q6_k(f_q6, seed, cols);
+    }
     test_gemv_f32(f_f32, seed);
     test_rmsnorm(f_rms, seed);
     test_swiglu(f_swi, seed);

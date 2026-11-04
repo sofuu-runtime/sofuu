@@ -58,6 +58,12 @@ typedef struct {
 } sofuu_block_q6_K;
 #pragma pack(pop)
 
+// No CUDA headers here, so float4 is not declared. 16-byte alignment is what
+// lets the compiler emit one vector load for four activations.
+typedef struct __attribute__((aligned(16))) {
+    float x, y, z, w;
+} sofuu_float4;
+
 #define SOFUU_QK_Q8_0 32
 #define SOFUU_QK_K 256
 #define SOFUU_Q4_K_BYTES 144
@@ -236,8 +242,24 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_block_reduce(float v,
 #endif
 
 // ── GEMV kernels ───────────────────────────────────────────────────────────
-// q8_0: one thread owns one 32-value block.
+// Decode is a pure DRAM stream: each token reads every weight once. The old
+// layout gave one thread a whole 256-value q4_K super-block, so a 2048-wide
+// row used 64 of 256 threads and issued 144-byte strided loads. These kernels
+// instead keep every lane busy on contiguous 32-byte groups, which is what
+// turns ~15 GB/s into the T4's memory-controller range.
 #if !defined(SOFUU_CUDA_HOST)
+static SOFUU_DEVICE SOFUU_INLINE float sofuu_warp_sum(float v) {
+    v += sofuu_shfl_down(v, 16, 0xffffffffu);
+    v += sofuu_shfl_down(v, 8, 0xffffffffu);
+    v += sofuu_shfl_down(v, 4, 0xffffffffu);
+    v += sofuu_shfl_down(v, 2, 0xffffffffu);
+    v += sofuu_shfl_down(v, 1, 0xffffffffu);
+    return v;
+}
+
+// q8_0: 4 threads per 32-value block; each owns 8 consecutive values. At a
+// fixed k the four lanes read qs[0+k], qs[4+k], qs[8+k], qs[12+k] of one 34 B
+// block, so a warp's 8 blocks cover a contiguous 272 B span.
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q8_0(const unsigned char *w,
                                              const float *x, float *y,
                                              int rows, int cols) {
@@ -246,22 +268,30 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q8_0(const unsi
     int nb = cols / SOFUU_QK_Q8_0;
     const unsigned char *roww =
         w + (unsigned long long)row * (unsigned long long)nb * SOFUU_Q8_0_BYTES;
+    int lane = (int)(tid & 3u);
     float acc = 0.0f;
-    for (int bi = (int)tid; bi < nb; bi += (int)sofuu_ntid_x()) {
+    for (int bi = (int)(tid >> 2); bi < nb; bi += 64) {
         const sofuu_block_q8_0 *b =
             (const sofuu_block_q8_0 *)(roww + (unsigned long long)bi * 34);
-        const float *xb = x + (unsigned long long)bi * 32;
-        for (int l = 0; l < 32; ++l) {
-            acc += sofuu_q8_0_value(b, l, xb[l]);
+        float d = sofuu_f16_to_f32(b->d);
+        const float *xb = x + (unsigned long long)bi * 32 +
+                          (unsigned long long)(lane * 8);
+        // q8_0's qs starts at byte 2 of a 34-byte block, so a 64-bit or
+        // 32-bit vector load is not naturally aligned. Scalar bytes stay
+        // correct; the warp still covers a contiguous 272-byte span.
+        for (int k = 0; k < 8; ++k) {
+            acc += d * (float)b->qs[lane * 8 + k] * xb[k];
         }
     }
     SOFUU_SHARED float smem[8];
     float total = sofuu_block_reduce(acc, smem);
-    if (sofuu_tid_x() == 0u) y[row] = total;
+    if (tid == 0u) y[row] = total;
 }
 
-// q4_K: eight threads own one 256-value super-block, one 32-value sub-block
-// each; 256 threads cover 32 super-blocks per iteration.
+// q4_K: one warp per 256-value super-block; lane l owns 8 consecutive values
+// of sub-block l/4. The eight lanes of a sub-block pair read the same 32 qs
+// bytes (low/high nibble), which the coalescer merges into one 32 B sector.
+// The scale/min pair is expanded once per lane, not once per value.
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q4_k(const unsigned char *w,
                                              const float *x, float *y,
                                              int rows, int cols) {
@@ -270,23 +300,51 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q4_k(const unsi
     int nb = cols / SOFUU_QK_K;
     const unsigned char *roww =
         w + (unsigned long long)row * (unsigned long long)nb * SOFUU_Q4_K_BYTES;
-    int sub = (int)(tid & 7u);
-    int slot = (int)(tid >> 3);
+    int warp = (int)(tid >> 5);
+    int lane = (int)(tid & 31u);
+    int sub = lane >> 2;
+    int l0 = (lane & 3) << 3;
     float acc = 0.0f;
-    for (int bi = slot; bi < nb; bi += 32) {
+    for (int bi = warp; bi < nb; bi += 8) {
         const sofuu_block_q4_K *b =
             (const sofuu_block_q4_K *)(roww + (unsigned long long)bi * 144);
-        const float *xb = x + (unsigned long long)bi * 256 + (unsigned long long)sub * 32;
-        for (int l = 0; l < 32; ++l) {
-            acc += sofuu_q4k_value(b, sub, l, xb[l]);
-        }
+        unsigned int sc, mn;
+        sofuu_q4k_scale_min(sub, b->scales, &sc, &mn);
+        float d = sofuu_f16_to_f32(b->d);
+        float dmin = sofuu_f16_to_f32(b->dmin);
+        const unsigned char *qs = b->qs + (sub >> 1) * 32;
+        const float *xb = x + (unsigned long long)bi * 256 +
+                          (unsigned long long)(sub * 32 + l0);
+        unsigned int high = (unsigned int)(sub & 1);
+        float s = d * (float)sc;
+        float m = dmin * (float)mn;
+        unsigned long long qv =
+            *reinterpret_cast<const unsigned long long *>(qs + l0);
+        sofuu_float4 xa = *reinterpret_cast<const sofuu_float4 *>(xb);
+        sofuu_float4 xc = *reinterpret_cast<const sofuu_float4 *>(xb + 4);
+        acc += (s * (float)(high ? ((qv >> 4) & 0x0fu) : (qv & 0x0fu)) - m) * xa.x;
+        acc += (s * (float)(high ? ((qv >> 12) & 0x0fu) : ((qv >> 8) & 0x0fu)) - m) * xa.y;
+        acc += (s * (float)(high ? ((qv >> 20) & 0x0fu) : ((qv >> 16) & 0x0fu)) - m) * xa.z;
+        acc += (s * (float)(high ? ((qv >> 28) & 0x0fu) : ((qv >> 24) & 0x0fu)) - m) * xa.w;
+        acc += (s * (float)(high ? ((qv >> 36) & 0x0fu) : ((qv >> 32) & 0x0fu)) - m) * xc.x;
+        acc += (s * (float)(high ? ((qv >> 44) & 0x0fu) : ((qv >> 40) & 0x0fu)) - m) * xc.y;
+        acc += (s * (float)(high ? ((qv >> 52) & 0x0fu) : ((qv >> 48) & 0x0fu)) - m) * xc.z;
+        acc += (s * (float)(high ? ((qv >> 60) & 0x0fu) : ((qv >> 56) & 0x0fu)) - m) * xc.w;
     }
-    SOFUU_SHARED float smem[8];
-    float total = sofuu_block_reduce(acc, smem);
-    if (sofuu_tid_x() == 0u) y[row] = total;
+    float wsum = sofuu_warp_sum(acc);
+    SOFUU_SHARED float sums[8];
+    if (lane == 0) sums[warp] = wsum;
+    sofuu_bar_sync();
+    if (tid == 0u) {
+        float total = 0.0f;
+        for (int i = 0; i < 8; ++i) total += sums[i];
+        y[row] = total;
+    }
 }
 
-// q6_K: eight threads own one 256-value super-block, one 32-value run each.
+// q6_K: same warp/lane mapping as q4_K. ql is read at the run's 64-byte base,
+// qh at n*32+l; the two scale slots a lane can touch (l < 16 / >= 16) are
+// loaded once per super-block.
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q6_k(const unsigned char *w,
                                              const float *x, float *y,
                                              int rows, int cols) {
@@ -295,20 +353,47 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q6_k(const unsi
     int nb = cols / SOFUU_QK_K;
     const unsigned char *roww =
         w + (unsigned long long)row * (unsigned long long)nb * SOFUU_Q6_K_BYTES;
-    int run = (int)(tid & 7u);
-    int slot = (int)(tid >> 3);
+    int warp = (int)(tid >> 5);
+    int lane = (int)(tid & 31u);
+    int sub = lane >> 2;
+    int l0 = (lane & 3) << 3;
     float acc = 0.0f;
-    for (int bi = slot; bi < nb; bi += 32) {
+    for (int bi = warp; bi < nb; bi += 8) {
         const sofuu_block_q6_K *b =
             (const sofuu_block_q6_K *)(roww + (unsigned long long)bi * 210);
-        const float *xb = x + (unsigned long long)bi * 256 + (unsigned long long)run * 32;
-        for (int l = 0; l < 32; ++l) {
-            acc += sofuu_q6k_value(b, run, l, xb[l]);
+        int n = sub >> 2;
+        int r = sub & 3;
+        float d = sofuu_f16_to_f32(b->d);
+        int sbase = n * 8 + 2 * r;
+        float sc0 = (float)b->scales[sbase];
+        float sc1 = (float)b->scales[sbase + 1];
+        int ql_base = n * 64 + ((r == 1 || r == 3) ? 32 : 0);
+        const unsigned char *qh = b->qh + n * 32;
+        const float *xb = x + (unsigned long long)bi * 256 +
+                          (unsigned long long)(sub * 32 + l0);
+        // l0 is a multiple of 8, so all eight values share one scale slot.
+        // The 210-byte block stride is only 2-byte aligned on odd blocks, so
+        // these stay scalar byte loads rather than an unaligned 64-bit load.
+        float s = (l0 >= 16) ? sc1 : sc0;
+        float ds = d * s;
+        for (int k = 0; k < 8; ++k) {
+            int l = l0 + k;
+            unsigned int ql_byte = (unsigned int)b->ql[ql_base + l];
+            unsigned int nib = (r < 2) ? (ql_byte & 0x0fu) : (ql_byte >> 4);
+            unsigned int hi2 = ((unsigned int)qh[l] >> (2 * r)) & 3u;
+            int q = (int)(nib | (hi2 << 4)) - 32;
+            acc += ds * (float)q * xb[k];
         }
     }
-    SOFUU_SHARED float smem[8];
-    float total = sofuu_block_reduce(acc, smem);
-    if (sofuu_tid_x() == 0u) y[row] = total;
+    float wsum = sofuu_warp_sum(acc);
+    SOFUU_SHARED float sums[8];
+    if (lane == 0) sums[warp] = wsum;
+    sofuu_bar_sync();
+    if (tid == 0u) {
+        float total = 0.0f;
+        for (int i = 0; i < 8; ++i) total += sums[i];
+        y[row] = total;
+    }
 }
 
 // f32 reference GEMV (also the C1 correctness floor).

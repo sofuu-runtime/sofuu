@@ -588,6 +588,11 @@ impl CudaModel {
                 self.dim,
             )
             .map_err(|err| format!("lm_head: {err}"))?;
+            // The launches above are asynchronous. Synchronize once per token,
+            // where the host actually consumes the result; this also surfaces
+            // any deferred kernel fault with the position that caused it.
+            e.sync()
+                .map_err(|err| format!("sync before logits: {err}"))?;
             e.download(&mut self.logit_bytes, self.logits_dev)
                 .map_err(|err| format!("download logits: {err}"))?;
             for (i, c) in self.logit_bytes.chunks_exact(4).enumerate() {

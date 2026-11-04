@@ -656,7 +656,11 @@ mod imp {
             if rc != 0 {
                 return Err(take_error(name));
             }
-            self.sync()
+            // No cuStreamSynchronize here. Every launch is on the same stream,
+            // so order is guaranteed; a sync after each of ~240 launches per
+            // token only added driver latency. The one place the host needs
+            // the result is the logits download, which syncs explicitly.
+            Ok(())
         }
 
         /// Row-major GEMV: y[r] = dot(weights[r], x). `weights` holds

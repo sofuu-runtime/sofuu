@@ -474,9 +474,10 @@ fn print_infer_help() {
     println!(
         "\x1b[1mUsage:\x1b[0m sofuu infer <model.gguf> \"<prompt>\" [options]\n\
                  sofuu infer <model.gguf> --score <file> [options]\n\n\
-         On-device inference over a local GGUF file. All eleven-plus flags the\n\
-         parser accepts are documented here; anything else is left to the prompt.\n\n\
+         On-device inference over a local GGUF file. The prompt is the positional\n\
+         argument; -p/--prompt is an alias. Unknown flags are reported, not dropped.\n\n\
          \x1b[1mGeneration:\x1b[0m\n\
+               -p, --prompt <text>         prompt (same as the positional argument)\n\
            -n, --max-tokens <n>        tokens to generate (default: 256)\n\
                --temp, --temperature <f>  sampling temperature (default: 0.7)\n\
            -t, --threads <n>           worker threads (0 = auto)\n\
@@ -3142,7 +3143,17 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
             let model_path = &args[2];
-            let prompt = args[3].clone();
+            // The prompt is positional (args[3]); `-p/--prompt` is accepted
+            // too because a leading `-p` used to become the prompt itself —
+            // the model then answered a two-token "-p" and the run looked
+            // like a GPU bug. Both forms are honoured, and the alias is
+            // documented in --help.
+            let mut prompt = args[3].clone();
+            let mut i = 4;
+            if (prompt == "-p" || prompt == "--prompt") && i < args.len() {
+                prompt = args[i].clone();
+                i += 1;
+            }
 
             let mut max_tokens = 256;
             let mut temperature = 0.7f32;
@@ -3168,7 +3179,6 @@ fn main() -> ExitCode {
             let mut score_window = 0usize;
             let mut trace_path: Option<String> = None;
 
-            let mut i = 4;
             while i < args.len() {
                 /* (the --score-after-model form is handled before the loop) */
                 if (args[i] == "--max-tokens" || args[i] == "-n") && i + 1 < args.len() {
@@ -3292,6 +3302,9 @@ fn main() -> ExitCode {
                     // §8 P3 surface: per-token forward timing + top logprob
                     // as JSONL (one line per generated token).
                     trace_path = Some(args[i + 1].clone());
+                    i += 2;
+                } else if (args[i] == "--prompt" || args[i] == "-p") && i + 1 < args.len() {
+                    prompt = args[i + 1].clone();
                     i += 2;
                 } else if args[i].starts_with('-') && args[i] != "-" {
                     // A silently-dropped flag is a correctness hazard: e.g.

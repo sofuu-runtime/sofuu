@@ -58,12 +58,12 @@ rm -f "$CPU_LOG" "$GPU_LOG"
 echo ""
 echo "-- CPU reference (f32 KV, 1 token)"
 SOFUU_CUDA=0 SOFUU_KV_F16=0 SOFUU_DUMP_LOGITS="$CPU_LOG" \
-    "$BIN" infer "$MODEL" -p "$PROMPT" -n 1 -t 4 \
+    "$BIN" infer "$MODEL" "$PROMPT" -n 1 -t 4 \
     >"$WORK/cpu.stdout" 2>"$CPU_ERR"
 
 echo "-- GPU decoder (1 token)"
 SOFUU_CUDA=1 SOFUU_CUDA_DEBUG=1 SOFUU_DUMP_LOGITS="$GPU_LOG" \
-    "$BIN" infer "$MODEL" -p "$PROMPT" -n 1 -t 4 \
+    "$BIN" infer "$MODEL" "$PROMPT" -n 1 -t 4 \
     >"$WORK/gpu.stdout" 2>"$GPU_ERR"
 
 if ! grep -q "GPU decoder armed" "$GPU_ERR"; then
@@ -108,7 +108,7 @@ cmp_rc=$?
 
 echo ""
 echo "-- GPU decode rate (32 tokens)"
-SOFUU_CUDA=1 "$BIN" infer "$MODEL" -p "$PROMPT" -n 32 -t 4 \
+SOFUU_CUDA=1 "$BIN" infer "$MODEL" "$PROMPT" -n 32 -t 4 \
     >"$WORK/gpu32.stdout" 2>"$WORK/gpu32.stderr" || true
 grep -E "prefill:|decode:" "$WORK/gpu32.stderr" | tail -2 || tail -10 "$WORK/gpu32.stderr"
 grep -q "GPU decoder armed" "$WORK/gpu32.stderr" || {

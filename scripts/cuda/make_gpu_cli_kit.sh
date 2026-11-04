@@ -86,7 +86,7 @@ decode. Exit 0 is the gate. On failure it prints where the receipts are.
 ```bash
 SOFUU_CUDA=1 SOFUU_CUDA_DEBUG=1 \
   /kaggle/working/sofuu/sofuu infer "$MODEL" \
-  -p "The capital of France is" -n 32 -t 4
+  "The capital of France is" -n 32 -t 4
 ```
 
 What to look for on stderr:
@@ -107,10 +107,10 @@ Run the same prompt twice:
 
 ```bash
 SOFUU_CUDA=0 SOFUU_KV_F16=0 SOFUU_DUMP_LOGITS=/kaggle/working/cpu.sflog \
-  /kaggle/working/sofuu/sofuu infer "$MODEL" -p "The capital of France is" -n 1 -t 4
+  /kaggle/working/sofuu/sofuu infer "$MODEL" "The capital of France is" -n 1 -t 4
 
 SOFUU_CUDA=1 SOFUU_DUMP_LOGITS=/kaggle/working/gpu.sflog \
-  /kaggle/working/sofuu/sofuu infer "$MODEL" -p "The capital of France is" -n 1 -t 4
+  /kaggle/working/sofuu/sofuu infer "$MODEL" "The capital of France is" -n 1 -t 4
 ```
 
 Then:

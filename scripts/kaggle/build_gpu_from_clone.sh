@@ -110,6 +110,6 @@ printf '\n'
 say "next:"
 printf '  MODEL=$(find /kaggle/input -name "*.gguf" | head -1)\n'
 printf '  SOFUU_BIN="%s" bash scripts/cuda/kaggle_infer_check.sh "$MODEL" "The capital of France is"\n' "$BIN"
-printf '  # manual: SOFUU_CUDA=1 %s infer "$MODEL" -p "The capital of France is" -n 32 -t 4\n\n' "$BIN"
+printf '  # manual: SOFUU_CUDA=1 %s infer "$MODEL" "The capital of France is" -n 32 -t 4\n\n' "$BIN"
 say "kernel-only gate (no build needed): bash scripts/cuda/kaggle_gpu_check.sh"
 say "doctor will report QTSQ missing in this codec-less build — expected, not a GPU failure"

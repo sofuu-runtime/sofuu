@@ -664,7 +664,7 @@
               S.mcpStale = true;
             }
           };
-        } catch (eN) {}
+        } catch (eN) { /* the notify channel is optional; the session works without a dashboard. */ }
         return { name: srv.name, client: client, tools: arr, filter: t };
       }));
       var connected = 0, failed = 0;
@@ -1101,7 +1101,7 @@
   function ensureDir(dir) {
     try {
       if (typeof __session_write_file === 'function') __session_write_file(dir + '/.keep', '');
-    } catch (e) {}
+    } catch (e) { /* marking a fresh session directory is best effort; the directory already exists. */ }
   }
   function sessionsDir(project) { return project + '/.sofuu/sessions'; }
   function sessionDir(project, id) { return sessionsDir(project) + '/' + id; }
@@ -1122,7 +1122,7 @@
           if (j && Array.isArray(j.sessions)) reg = j;
         }
       }
-    } catch (e) {}
+    } catch (e) { /* session bookkeeping that cannot be written is recovered on the next save. */ }
     /* Legacy plaintext registry merged in (read-only): sessions written
      * before this layout, and TUI sessions. An entry is included ONLY
      * when its transcript file still exists — deleted sessions must not
@@ -1149,7 +1149,7 @@
           }
         }
       }
-    } catch (e) {}
+    } catch (e) { /* same: the in-memory index stays authoritative for this process. */ }
     return reg || { sessions: [] };
   }
   function registryUpsert(project, info) {
@@ -1167,7 +1167,7 @@
       if (typeof __qtsq_session_save === 'function') {
         __qtsq_session_save(registryPath(project), JSON.stringify(reg), sessionPassword(project));
       }
-    } catch (e) {}
+    } catch (e) { /* registry persistence is retried on the next session write. */ }
   }
   /* The index: metadata + one line per event, never the texts. Small
    * enough to rewrite on every event. */
@@ -1181,7 +1181,7 @@
       if (typeof __qtsq_session_save === 'function') {
         __qtsq_session_save(sessionIndexPath(S.project, d.id), JSON.stringify(d), sessionPassword(S.project));
       }
-    } catch (e) {}
+    } catch (e) { /* a session whose index entry cannot be saved still runs; it is just not resumable. */ }
   }
   /* QTSQ Structured Storage Driver handle (CMA v2 Phase 3/4) */
   var _projectDb = null;
@@ -1198,7 +1198,7 @@
         _projectDbPath = dbPath;
         return _projectDb;
       }
-    } catch (eDb) {}
+    } catch (eDb) { /* no project store: the caller falls back to the flat session layout. */ }
     return null;
   }
 
@@ -1247,7 +1247,7 @@
           });
         }
       }
-    } catch (eStorage) {}
+    } catch (eStorage) { /* no storage backend: history lives in memory for this run. */ }
 
     /* 2. Legacy per-event file backup for crash-proof compatibility */
     try {
@@ -1259,7 +1259,7 @@
           text: String(text == null ? '' : text),
         }), sessionPassword(S.project));
       }
-    } catch (e) {}
+    } catch (e) { /* the save is retried on the next turn; the transcript in memory is complete. */ }
 
     /* 3. R6 (SPEC §7.2): the session's events.ndjson — the substrate the
      * conformance suite reconstructs turns from. Additive to the QTSQ
@@ -1314,10 +1314,10 @@
                 provider: String((S.info && S.info.provider) || ''),
               },
             }));
-          } catch (eSync6) {}
+          } catch (eSync6) { /* one session that will not sync must not abort the sweep. */ }
         }
       }
-    } catch (eEv6) {}
+    } catch (eEv6) { /* the sweep is maintenance; a failure leaves the previous index. */ }
     sessionPersist();
   }
   /* Per-workspace chat cap (user rule): the strip holds at most 7 — a new
@@ -1331,7 +1331,7 @@
     }
     var id = genSessionId();
     var cwd = '';
-    try { cwd = process.cwd(); } catch (e) {}
+    try { cwd = process.cwd(); } catch (e) { /* no cwd: the session records an empty one and says so. */ }
     S.info = {
       id: id, pid: pid(), host: 'desktop', cwd: cwd,
       model: model || '', provider: provider || '',
@@ -1372,7 +1372,7 @@
         files: ['brain.qtsq'],
         updated: now(),
       }), sessionPassword(project));
-    } catch (e) {}
+    } catch (e) { /* same: the turn is already answered; the save retries next turn. */ }
   }
   /* ── debug / issues / audits records ───────────────────────────────
    * One qtsq file per record under <project>/.sofuu/<folder>/, each with
@@ -1407,12 +1407,12 @@
       try {
         var iraw = __qtsq_session_load(dir + '/index.qtsq', sessionPassword(S.project));
         if (iraw) { var ij = JSON.parse(iraw); if (Array.isArray(ij.entries)) idx = ij.entries; }
-      } catch (eI) {}
+      } catch (eI) { /* a corrupt index starts a fresh one; the session files themselves are intact. */ }
       idx.push({ id: id, session: rec.session, t: t,
                  kind: String(payload && payload.type || kind), desc: rec.desc });
       if (idx.length > 500) idx.splice(0, idx.length - 500);
       __qtsq_session_save(dir + '/index.qtsq', JSON.stringify({ id: folder + '-index', desc: folder + ' records, newest last', entries: idx }), sessionPassword(S.project));
-    } catch (e) {}
+    } catch (e) { /* the index is a lookup cache: rebuilding it costs a scan, not data. */ }
   }
 
   function sessionEnd() {
@@ -1421,7 +1421,7 @@
       sessionLog('end', 'session ended');
       S.info.ended = true;
       registryUpsert(S.project, S.info);
-    } catch (e) {}
+    } catch (e) { /* registry persistence is retried on the next session write. */ }
     S.session = null;
     S.info = null;
   }
@@ -1474,11 +1474,11 @@
                     try {
                       var m = JSON.parse(r.meta);
                       if (m && m.seq) sdbMap.set(m.seq, r.content);
-                    } catch (eM) {}
+                    } catch (eM) { /* a record with unparseable metadata is skipped, not fatal. */ }
                   }
                 }
               }
-            } catch (eSdb) {}
+            } catch (eSdb) { /* no session store: the turn cache stays empty. */ }
           }
 
           for (var i = fetchFrom; i < evs.length; i++) {
@@ -1498,13 +1498,13 @@
                   ev.text = String((eobj && eobj.text) || '');
                   ev.file = f;
                 }
-              } catch (eE) {}
+              } catch (eE) { /* one unreadable event is skipped; the rest of the session still replays. */ }
             }
           }
           return d;
         }
       }
-    } catch (e) {}
+    } catch (e) { /* replay is best effort: a failed event file leaves the transcript short, never wrong. */ }
     /* Legacy: one flat <sid>.qtsq with texts inline. */
     try {
       var lraw = __qtsq_session_load(legacySessionFile(project, id), pw);
@@ -1523,9 +1523,9 @@
       if (ev.kind === 'prompt') out.push({ prompt: String(ev.text || ''), answer: '' });
       else if (ev.kind === 'answer' && out.length) out[out.length - 1].answer = String(ev.text || '');
       else if (ev.kind === 'tools' && out.length) {
-        try { out[out.length - 1].tools = JSON.parse(ev.text || '[]'); } catch (eT) {}
+        try { out[out.length - 1].tools = JSON.parse(ev.text || '[]'); } catch (eT) { /* a malformed tool list is shown as none rather than breaking the replay. */ }
       } else if (ev.kind === 'usage' && out.length) {
-        try { out[out.length - 1].usage = JSON.parse(ev.text || '{}'); } catch (eU) {}
+        try { out[out.length - 1].usage = JSON.parse(ev.text || '{}'); } catch (eU) { /* same for the usage counters. */ }
       } else if (ev.kind === 'served' && out.length) {
         out[out.length - 1].servedBy = String(ev.text || '');
       }
@@ -1627,7 +1627,7 @@
       if (typeof sofuu.agent.list === 'function') {
         subAgentNames = sofuu.agent.list().map(function (a) { return a.name; });
       }
-    } catch (e) {}
+    } catch (e) { /* agent directory listing is optional: the sub-agent menu is simply empty. */ }
     /* @agent mention: "@name task" or "@agent:name task" runs the named
      * agent directly. Chat history IS injected (runOpts.history below;
      * agent.js concatenates it into the request) — the named agent sees
@@ -1881,7 +1881,7 @@
         try {
           var bHandle = globalThis.sofuu.brain && typeof globalThis.sofuu.brain.open === 'function' ? globalThis.sofuu.brain.open(bPath, 64) : null;
           globalThis.sofuu.extractor.processTurnAsync(txt, answer, { model: extModel, brain: bHandle });
-        } catch (eExt) {}
+        } catch (eExt) { /* extraction runs after the answer is delivered; a failure costs a memory, not a turn. */ }
       }
     }
     /* Keep the brain manifest's `updated` fresh after a turn that may

@@ -383,8 +383,9 @@ impl CudaModel {
         let rope_b = alloc_f32!(PREFILL_BATCH * cfg.head_dim, "rope_batch");
 
         eprintln!(
-            "[cuda] {} cc{}.{} · {:.2} GiB VRAM · weights {:.2} GiB · KV {} rows ({:.0} MiB x2)",
+            "[cuda] {} rev {} cc{}.{} · {:.2} GiB VRAM · weights {:.2} GiB · KV {} rows ({:.0} MiB x2)",
             info.name,
+            env!("SOFUU_BUILD"),
             info.cc_major,
             info.cc_minor,
             vram as f64 / (1024.0 * 1024.0 * 1024.0),

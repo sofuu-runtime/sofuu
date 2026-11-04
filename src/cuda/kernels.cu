@@ -263,8 +263,8 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_warp_sum(float v) {
 
 // q8_0: 4 lanes per 32-value block, each owns 8 values. A warp covers eight
 // blocks (256 values) per iteration, so a 1024-wide row is four iterations.
-extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q8_0(const unsigned char *w,
-                                             const float *x, float *y,
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q8_0(const unsigned char *__restrict__ w,
+                                             const float *__restrict__ x, float *__restrict__ y,
                                              int rows, int cols) {
     unsigned int tid = sofuu_tid_x();
     int warp = (int)(tid >> 5);
@@ -277,6 +277,7 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q8_0(const unsi
     int lane_in_block = lane & 3;
     int block_in_warp = lane >> 2;
     float acc = 0.0f;
+#pragma unroll 2
     for (int bi = block_in_warp; bi < nb; bi += 8) {
         const sofuu_block_q8_0 *b =
             (const sofuu_block_q8_0 *)(roww + (unsigned long long)bi * 34);
@@ -297,8 +298,8 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q8_0(const unsi
 // q4_K: a warp covers one 256-value super-block per iteration; lane l owns the
 // eight values of sub-block l/4 at offset (l%4)*8. Lanes 0-3 and 4-7 read the
 // same 32 qs bytes (low/high nibble), which the coalescer merges.
-extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q4_k(const unsigned char *w,
-                                             const float *x, float *y,
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q4_k(const unsigned char *__restrict__ w,
+                                             const float *__restrict__ x, float *__restrict__ y,
                                              int rows, int cols) {
     unsigned int tid = sofuu_tid_x();
     int warp = (int)(tid >> 5);
@@ -311,6 +312,9 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q4_k(const unsi
     int sub = lane >> 2;
     int l0 = (lane & 3) << 3;
     float acc = 0.0f;
+    // Two iterations in flight: one 128 B weight sector per warp was not
+    // enough memory-level parallelism to cover DRAM latency.
+#pragma unroll 2
     for (int bi = 0; bi < nb; ++bi) {
         const sofuu_block_q4_K *b =
             (const sofuu_block_q4_K *)(roww + (unsigned long long)bi * 144);
@@ -344,8 +348,8 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q4_k(const unsi
 // q6_K: same warp/lane mapping as q4_K; ql at the run's 64-byte base, qh at
 // n*32+l. The 210-byte block stride is not 8-byte aligned on odd blocks, so
 // these stay scalar byte loads.
-extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q6_k(const unsigned char *w,
-                                             const float *x, float *y,
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q6_k(const unsigned char *__restrict__ w,
+                                             const float *__restrict__ x, float *__restrict__ y,
                                              int rows, int cols) {
     unsigned int tid = sofuu_tid_x();
     int warp = (int)(tid >> 5);
@@ -358,6 +362,7 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q6_k(const unsi
     int sub = lane >> 2;
     int l0 = (lane & 3) << 3;
     float acc = 0.0f;
+#pragma unroll 2
     for (int bi = 0; bi < nb; ++bi) {
         const sofuu_block_q6_K *b =
             (const sofuu_block_q6_K *)(roww + (unsigned long long)bi * 210);
@@ -390,8 +395,8 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_q6_k(const unsi
 // f32 reference GEMV (also the C1 correctness floor). Values are 4 B, so the
 // activation row is only as large as the weight row; the eight-row block still
 // saves the L2 re-reads.
-extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_f32(const float *w, const float *x,
-                                            float *y, int rows, int cols) {
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_f32(const float *__restrict__ w, const float *__restrict__ x,
+                                            float *__restrict__ y, int rows, int cols) {
     unsigned int tid = sofuu_tid_x();
     int warp = (int)(tid >> 5);
     int lane = (int)(tid & 31u);
@@ -399,6 +404,7 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256) void sofuu_gemv_f32(const float
     if (row >= rows) return;
     const float *roww = w + (unsigned long long)row * (unsigned long long)cols;
     float acc = 0.0f;
+#pragma unroll 2
     for (int bi = 0; bi < cols; bi += 256) {
         int c = bi + lane * 8;
         if (c + 8 <= cols) {
@@ -688,7 +694,7 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_f32_dot8(const float *row,
 
 // One block = eight warps = eight tokens, `row_tile` output rows.
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
-void sofuu_gemm_q4_k_b8(const unsigned char *w, const float *x, float *y,
+void sofuu_gemm_q4_k_b8(const unsigned char *__restrict__ w, const float *__restrict__ x, float *__restrict__ y,
                         int rows, int cols, int n_tokens, int row_tile) {
     unsigned int tid = sofuu_tid_x();
     int warp = (int)(tid >> 5);
@@ -733,7 +739,7 @@ void sofuu_gemm_q4_k_b8(const unsigned char *w, const float *x, float *y,
 }
 
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
-void sofuu_gemm_q6_k_b8(const unsigned char *w, const float *x, float *y,
+void sofuu_gemm_q6_k_b8(const unsigned char *__restrict__ w, const float *__restrict__ x, float *__restrict__ y,
                         int rows, int cols, int n_tokens, int row_tile) {
     unsigned int tid = sofuu_tid_x();
     int warp = (int)(tid >> 5);
@@ -778,7 +784,7 @@ void sofuu_gemm_q6_k_b8(const unsigned char *w, const float *x, float *y,
 }
 
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
-void sofuu_gemm_q8_0_b8(const unsigned char *w, const float *x, float *y,
+void sofuu_gemm_q8_0_b8(const unsigned char *__restrict__ w, const float *__restrict__ x, float *__restrict__ y,
                         int rows, int cols, int n_tokens, int row_tile) {
     unsigned int tid = sofuu_tid_x();
     int warp = (int)(tid >> 5);
@@ -823,7 +829,7 @@ void sofuu_gemm_q8_0_b8(const unsigned char *w, const float *x, float *y,
 }
 
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
-void sofuu_gemm_f32_b8(const float *w, const float *x, float *y, int rows,
+void sofuu_gemm_f32_b8(const float *__restrict__ w, const float *__restrict__ x, float *__restrict__ y, int rows,
                        int cols, int n_tokens, int row_tile) {
     unsigned int tid = sofuu_tid_x();
     int warp = (int)(tid >> 5);

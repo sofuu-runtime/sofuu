@@ -1835,7 +1835,7 @@
           return;
         }
         if (msg.method && noteCb) {
-          try { noteCb(String(msg.method), JSON.stringify(msg.params === undefined ? null : msg.params)); } catch (eN) {}
+          try { noteCb(String(msg.method), JSON.stringify(msg.params === undefined ? null : msg.params)); } catch (eN) { /* the notify callback is a host hook; a throw must not abort the message loop. */ }
         }
       }
       async function consumeResponse(res) {
@@ -1850,7 +1850,7 @@
           throw new Error('mcp http: HTTP ' + res.status + (bodyText ? (': ' + bodyText.slice(0, 200)) : ''));
         }
         var ct = '';
-        try { ct = String((res.headers && res.headers.get && res.headers.get('content-type')) || ''); } catch (eC) {}
+        try { ct = String((res.headers && res.headers.get && res.headers.get('content-type')) || ''); } catch (eC) { /* no headers object: an empty content-type selects the JSON parser. */ }
         if (ct.indexOf('text/event-stream') >= 0) { await readSseStream(res); return; }
         var text = await res.text();
         if (!text || !text.trim()) return;
@@ -1929,7 +1929,7 @@
           var sids = Object.keys(pending);
           for (var i = 0; i < sids.length; i++) settle(Number(sids[i]), false, new Error('mcp: disconnected'));
           if (sessionId) {
-            try { mcpFetch(url, { method: 'DELETE', headers: wireHeaders() }).catch(function () {}); } catch (e) {}
+            try { mcpFetch(url, { method: 'DELETE', headers: wireHeaders() }).catch(function () { /* a server that refuses the session delete is allowed to. */ }); } catch (e) { /* and a fetch that throws synchronously is equally harmless here. */ }
           }
         },
       };
@@ -2014,11 +2014,11 @@
             } catch (eR) { /* unreadable policy: default roots are used instead. */ }
             reply.result = { roots: roots.map(function (p) { return { uri: 'file://' + p }; }) };
           } else reply.error = { code: -32601, message: 'Method not found' };
-          postMessage(reply).catch(function () {});
+          postMessage(reply).catch(function () { /* the client may be gone; a reply nobody reads is not an error. */ });
           return;
         }
         if (msg.method && noteCb) {
-          try { noteCb(String(msg.method), JSON.stringify(msg.params === undefined ? null : msg.params)); } catch (eN) {}
+          try { noteCb(String(msg.method), JSON.stringify(msg.params === undefined ? null : msg.params)); } catch (eN) { /* same host hook contract as the HTTP path above. */ }
         }
       }
       async function postMessage(msg) {
@@ -2032,7 +2032,7 @@
           throw new Error('mcp sse: HTTP ' + status + (bodyText ? (': ' + bodyText.slice(0, 200)) : ''));
         }
         var pct = '';
-        try { pct = String((res.headers && res.headers.get && res.headers.get('content-type')) || ''); } catch (eC) {}
+        try { pct = String((res.headers && res.headers.get && res.headers.get('content-type')) || ''); } catch (eC) { /* no headers: an empty content-type falls back to the SSE parser. */ }
         if (pct.indexOf('text/event-stream') >= 0) {
           throw new Error('mcp sse: the server answered a message POST with an event stream — it is not speaking the legacy SSE transport');
         }
@@ -2138,7 +2138,7 @@
           if (endpoint) {
             /* Legacy SSE has no delete verb; a cooperating server drops the
              * session, a spec-only one answers 404/405. Best effort only. */
-            try { mcpFetch(endpoint, { method: 'DELETE', headers: postHeaders }).catch(function () {}); } catch (eD2) {}
+            try { mcpFetch(endpoint, { method: 'DELETE', headers: postHeaders }).catch(function () { /* legacy SSE has no delete verb; 404/405 is a valid answer. */ }); } catch (eD2) { /* same for a synchronous fetch failure. */ }
           }
         },
       };
@@ -2156,7 +2156,7 @@
           throw err0;
         }
         var ct = '';
-        try { ct = String((res.headers && res.headers.get && res.headers.get('content-type')) || ''); } catch (eC0) {}
+        try { ct = String((res.headers && res.headers.get && res.headers.get('content-type')) || ''); } catch (eC0) { /* no headers: the JSON parser is the fallback. */ }
         if (ct && ct.indexOf('text/event-stream') < 0) {
           closed = true;
           var err1 = new Error('mcp sse: ' + url + ' answered Content-Type "' + ct + '", not text/event-stream');
@@ -2174,7 +2174,7 @@
             clientInfo: { name: 'sofuu', version: '0.1.0' },
           }, 30000);
           if (init && typeof init.protocolVersion === 'string' && init.protocolVersion) protocol = init.protocolVersion;
-          try { await postMessage({ jsonrpc: '2.0', method: 'notifications/initialized' }); } catch (eAck) {}
+          try { await postMessage({ jsonrpc: '2.0', method: 'notifications/initialized' }); } catch (eAck) { /* a server that does not implement this notification still serves the session. */ }
           return client;
         } catch (eConn) {
           closed = true;

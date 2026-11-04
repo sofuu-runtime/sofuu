@@ -995,7 +995,7 @@
     var keep = [];
     for (var i = 0; i < wdPending.length; i++) {
       var e = wdPending[i];
-      if (now >= e.deadline) { try { e.fire(); } catch (eF) {} }
+      if (now >= e.deadline) { try { e.fire(); } catch (eF) { /* a watchdog callback that throws must not stop the remaining deadlines. */ } }
       else keep.push(e);
     }
     wdPending = keep;
@@ -1108,7 +1108,7 @@
     handled(cancelPromise);
     var unlink = linkAbort(outerSignal, function () {
       aborted = true;
-      if (ctrl) { try { ctrl.abort(); } catch (eA) {} }
+      if (ctrl) { try { ctrl.abort(); } catch (eA) { /* aborting a request that already settled is a no-op. */ } }
       if (cancelReject) cancelReject(makeError('E_TIMEOUT', label + ' aborted by caller'));
     });
 
@@ -1117,7 +1117,7 @@
         deadline: Date.now() + ms,
         fire: function () {
           timedOut = true;
-          if (ctrl) { try { ctrl.abort(); } catch (eT) {} }
+          if (ctrl) { try { ctrl.abort(); } catch (eT) { /* same: the timeout is what we wanted anyway. */ } }
           rej(makeError('E_TIMEOUT', label + ' exceeded deadline of ' + ms + 'ms'));
         }
       });
@@ -1154,7 +1154,7 @@
        * running at that moment. */
       hostDisarmFor(entry);
       unlink();
-      if (ctrl) { try { ctrl.abort(); } catch (eB) {} }
+      if (ctrl) { try { ctrl.abort(); } catch (eB) { /* same, on the user-cancel path. */ } }
       var code = (err && err.code) || 'E_TOOL';
       var message = String((err && err.message) || err);
       if (timedOut || aborted || isInterrupt(err)) {
@@ -2018,7 +2018,7 @@
       try {
         seq++;
         var id = meta.id;
-        if (id === undefined || id === null || id === '') { id = name + ':' + seq; try { meta.id = id; } catch (eId) {} }
+        if (id === undefined || id === null || id === '') { id = name + ':' + seq; try { meta.id = id; } catch (eId) { /* a frozen metadata object keeps an unlabelled record, which the queue still accepts. */ } }
         enqueueQueue(rec, { id: id, vector: vec, text: txt, metadata: meta });
       } catch (eEnq) {
         rec.failed++;
@@ -3325,7 +3325,7 @@
       var parts = String(items[i]).split(':');
       var reg = registryFor(parts[0]);
       var nm = parts.slice(1).join(':');
-      if (reg && reg[nm]) { try { reg[nm]._origin = origin; } catch (eT) {} }
+      if (reg && reg[nm]) { try { reg[nm]._origin = origin; } catch (eT) { /* a frozen tool descriptor only loses provenance metadata. */ } }
     }
   }
   function registryDiff(before) {
@@ -3415,7 +3415,7 @@
     var results = { local: null, global: null, manifest: null };
     try { results.local = await P.discover('./plugins'); } catch (e1) { /* no local plugin directory is the normal case; discoverAll reports null for it. */ }
     var home = envOf().HOME || envOf().USERPROFILE || '';
-    if (home) { try { results.global = await P.discover(home + '/.sofuu/plugins'); } catch (e2) {} }
+    if (home) { try { results.global = await P.discover(home + '/.sofuu/plugins'); } catch (e2) { /* no global plugin directory is the normal case. */ } }
     try { results.manifest = await P.loadManifest('./sofuu.json'); } catch (e3) { /* a project without sofuu.json simply has no plugin manifest. */ }
     return results;
   };
@@ -3781,7 +3781,7 @@
         return cliExit(1);
       }
       var dir = './plugins';
-      if (sofuu.fs && sofuu.fs.mkdir) { try { await sofuu.fs.mkdir(dir, { recursive: true }); } catch (eMk) {} }
+      if (sofuu.fs && sofuu.fs.mkdir) { try { await sofuu.fs.mkdir(dir, { recursive: true }); } catch (eMk) { /* the directory usually exists already; the write below reports a real failure. */ } }
       var safe = String(name || '').replace(/[^A-Za-z0-9_-]+/g, '_');
       if (!safe) { console.error('plugin init requires a name'); return cliExit(1); }
       var file = dir + '/' + safe + '.ts';
@@ -3841,7 +3841,7 @@ export default defineProvider({\n\
         var ch = JSON.parse(l.slice(5).trim());\n\
         var d = (ch.choices && ch.choices[0] && ch.choices[0].delta) || {};\n\
         if (d.content) { acc.text += d.content; onEvent({ type: 'text', text: d.content }); }\n\
-      } catch (e) {}\n\
+      } catch (e) { /* a keep-alive comment that will not parse is skipped. */ }\n\
     }\n\
     onEvent({ type: 'done' });\n\
     return acc;\n\
@@ -3893,7 +3893,7 @@ export default defineProvider({\n\
       try {\n\
         var ch = JSON.parse(l);\n\
         if (ch.message && ch.message.content) { acc.text += ch.message.content; onEvent({ type: 'text', text: ch.message.content }); }\n\
-      } catch (e) {}\n\
+      } catch (e) { /* a keep-alive comment that will not parse is skipped. */ }\n\
     }\n\
     onEvent({ type: 'done' });\n\
     return acc;\n\

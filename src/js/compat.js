@@ -1490,7 +1490,7 @@ if (typeof globalThis.ReadableStream === "undefined") {
         this._resolveClosed = resolve;
         this._rejectClosed = reject;
       });
-      this._closedPromise.catch(function () {});
+      this._closedPromise.catch(function () { /* same: the close signal may have no waiter. */ });
       this._readyPromise = Promise.resolve();
       this._controller = { error: (e) => this._error(e) };
       try {

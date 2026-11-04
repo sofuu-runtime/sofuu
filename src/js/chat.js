@@ -118,7 +118,7 @@
       }
     }
     if (typeof S.onEvent === 'function') {
-      try { S.onEvent(ev); } catch (e) {} /* a dead sink never kills a turn */
+      try { S.onEvent(ev); } catch (e) { /* a dead sink never kills a turn. */ }
     }
   }
 
@@ -2040,7 +2040,7 @@
         for (var oi = 0; oi < oks.length; oi++) {
           if (oks[oi]) { capsDiscoveredAt = Date.now(); break; }
         }
-      }).catch(function () {});
+      }).catch(function () { /* capability discovery is a warm-up; losing it costs a probe, not a turn. */ });
     } catch (e) { /* best-effort */ }
     return capsHarvest;
   }
@@ -2162,7 +2162,7 @@
     if (!(resolveCaps().known)) {
       var t0 = Date.now();
       while (capsHarvest && Date.now() - t0 < 4000) {
-        try { await Promise.race([capsHarvest, new Promise(function (r4) { setTimeout(r4, 250); })]); } catch (eH) {}
+        try { await Promise.race([capsHarvest, new Promise(function (r4) { setTimeout(r4, 250); })]); } catch (eH) { /* the 250ms tick resuming the loop is the point; there is nothing to recover. */ }
         if (resolveCaps().known) break;
         if (!(capsHarvest && Date.now() - t0 < 4000)) break;
       }

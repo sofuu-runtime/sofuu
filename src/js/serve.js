@@ -1080,7 +1080,7 @@
       if (sofuu.policy && typeof sofuu.policy.set === 'function' &&
           typeof __session_read_file === 'function') {
         var praw = __session_read_file('.sofuu/policy.json');
-        if (praw) { try { sofuu.policy.set(String(praw)); } catch (ePol) {} }
+        if (praw) { try { sofuu.policy.set(String(praw)); } catch (ePol) { /* an invalid policy file leaves the previous posture in force. */ } }
       }
     } catch (ePl) { /* loading the session policy is best effort: without it the default policy stays in force. */ }
     var auth = authMode();

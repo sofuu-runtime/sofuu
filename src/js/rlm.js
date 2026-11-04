@@ -175,7 +175,7 @@
     var o = allocFit(completeOpts(opts, messages));
     if (sofuu.ai && typeof sofuu.ai.stream === 'function') {
       var st = sofuu.ai.stream(o);
-      var entry = { abort: function () { try { st.abort(); } catch (eA) {} }, episode: ep };
+      var entry = { abort: function () { try { st.abort(); } catch (eA) { /* aborting a finished stream is a no-op. */ } }, episode: ep };
       ACTIVE_ASKS.push(entry);
       var text = '';
       try {

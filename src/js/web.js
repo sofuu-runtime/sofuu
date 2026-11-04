@@ -60,7 +60,7 @@
       timer = setTimeout(function () { rej(new Error('timeout after ' + limit + 'ms')); }, limit);
     });
     return Promise.race([fetch(url, o), to]).finally(function () {
-      if (timer) { try { clearTimeout(timer); } catch (e) {} }
+      if (timer) { try { clearTimeout(timer); } catch (e) { /* the timer already fired; clearing it again is harmless. */ } }
     });
   }
 

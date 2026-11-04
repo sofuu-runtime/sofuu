@@ -124,7 +124,7 @@ found&Validation failed: Ë registered nothing: export a defineTool/defineProvid
 rKeysrk{}>Error: invalid JSON arguments: ok=false code= latency=Tool Error [ tool call failed  at path: 0ok=true code=OK latency=:ok=false code=E_TOOL latency=eRc// plugins/R.ts -- an action tool with the 5 shields.L// Run: sofuu plugin validate plugins/Limport { defineTool, z } from 'sofuu';6export default defineTool({  name: x  description: 'Describe what this tool does for the model',(  schema: z.object({d    query: z.string().describe('What to look up'),
   }),&  timeoutMs: 10000,0  async run(args, ctx) {    ctx.log(< + " received " + args.query);V    return { ok: true, query: args.query };  }});J.ts -- an inference provider adapter.Nimport { defineProvider } from 'sofuu';>export default defineProvider({"  kind: 'custom',Ä  baseUrl: process.env.MY_MODEL_HOST || 'http://127.0.0.1:8080',8  async complete(req, ctx) {|    const body = { model: req.model, messages: req.messages };ê    const res = await ctx.fetch(this.baseUrl + '/v1/chat/completions', {*      method: 'POST',l      headers: { 'Content-Type': 'application/json' },B      body: JSON.stringify(body),    });D    const json = await res.json();v    const choice = (json.choices && json.choices[0]) || {};    return {z      text: (choice.message && choice.message.content) || '',J      model: json.model || req.model,      usage: {à        promptTokens: (json.usage && json.usage.prompt_tokens) || 0,ò        completionTokens: (json.usage && json.usage.completion_tokens) || 0,      },    };h.ts -- an external vector store (dual-write mirror).Timport { defineVectorStore } from 'sofuu';Dexport default defineVectorStore({*  async init(cfg) {},,  async upsert(item) {V    // item: { id, vector, text, metadata }  },$  async query(q) {    return [];,  async delete(id) {},:  async count() { return 0; }F.ts -- a key/value storage adapter.Limport { defineStorage } from 'sofuu';<export default defineStorage({D  async get(key) { return null; },6  async set(key, value) {},.  async delete(key) {},:  async keys() { return []; }b.ts -- a lifecycle service (hooks + interceptor).Limport { defineService } from 'sofuu';<export default defineService({>  async onStart(ctx) { ctx.log($ + " started"); },6  async onTurnStart(turn) {     return turn;4  async onToolCall(call) {v    // Throw an Error with code E_DENIED to block the call.:  async onToolResult(res) {},6  async onTurnEnd(turn) {},&  async onStop() {}f.ts -- bridge a REST API from its OpenAPI document.ê// Replace SPEC with your own OpenAPI 3.0/3.1 (or Swagger 2.0) document:X// a URL, a local path, or an inline object.Fimport { useOpenAPI } from 'sofuu';const SPEC = {&  openapi: '3.0.3',"  info: { title: *, version: '1.0.0' },\  servers: [{ url: 'http://127.0.0.1:8080' }],  paths: {    '/ping': {      get: {8        operationId: 'ping',@        summary: 'Health probe',f        responses: { '200': { description: 'ok' } }      }
     }};Texport default async function register() {N  return useOpenAPI(SPEC, { namespace:  });cateMksafeeExvector_store$unknown category "z" (tool | provider | store | vectorstore | service | openapi)
-mkdirrecursive6plugin init requires a name>refusing to overwrite existing scaffolded 8next: sofuu plugin validate û'import { defineProvider } from 'sofuu';
+mkdirrecursive6plugin init requires a name>refusing to overwrite existing scaffolded 8next: sofuu plugin validate ñ(import { defineProvider } from 'sofuu';
 export default defineProvider({
   name: 'llamacpp',
   kind: 'llamacpp',
@@ -164,7 +164,7 @@ export default defineProvider({
         var ch = JSON.parse(l.slice(5).trim());
         var d = (ch.choices && ch.choices[0] && ch.choices[0].delta) || {};
         if (d.content) { acc.text += d.content; onEvent({ type: 'text', text: d.content }); }
-      } catch (e) {}
+      } catch (e) { /* a keep-alive comment that will not parse is skipped. */ }
     }
     onEvent({ type: 'done' });
     return acc;
@@ -174,7 +174,7 @@ export default defineProvider({
     catch (e) { return { ok: false, error: String(e) }; }
   }
 });
-¬"import { defineProvider } from 'sofuu';
+∫#import { defineProvider } from 'sofuu';
 export default defineProvider({
   name: 'ollama',
   kind: 'ollama',
@@ -211,7 +211,7 @@ export default defineProvider({
       try {
         var ch = JSON.parse(l);
         if (ch.message && ch.message.content) { acc.text += ch.message.content; onEvent({ type: 'text', text: ch.message.content }); }
-      } catch (e) {}
+      } catch (e) { /* a keep-alive comment that will not parse is skipped. */ }
     }
     onEvent({ type: 'done' });
     return acc;

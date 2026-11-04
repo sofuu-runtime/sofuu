@@ -264,7 +264,7 @@ pub fn validate_gemm_b8(
     }
     // Activations are loaded as aligned float4s; a row width that is not a
     // multiple of four would misalign every token row after the first.
-    if cols % 4 != 0 {
+    if !cols.is_multiple_of(4) {
         return Err(CudaError(format!(
             "gemm_b8 cols {cols} is not a multiple of 4 (aligned float4 rows)"
         )));
@@ -274,7 +274,7 @@ pub fn validate_gemm_b8(
             "gemm_b8 n_tokens {n_tokens} is outside 1..=8 (one warp per token)"
         )));
     }
-    if row_tile == 0 || row_tile > 32 || row_tile % 8 != 0 {
+    if row_tile == 0 || row_tile > 32 || !row_tile.is_multiple_of(8) {
         return Err(CudaError(format!(
             "gemm_b8 row_tile {row_tile} must be a multiple of 8 in 8..=32"
         )));

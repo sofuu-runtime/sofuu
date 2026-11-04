@@ -117,6 +117,16 @@ fn js_error(probe_out: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// Is this refusal "someone else is using the brain" rather than "the brain is
+/// broken"?
+///
+/// The code is the literal "E_LOCKED" rather than the crate constant: that
+/// lives in the private impl_qtsq module. The message fallback covers a
+/// refusal whose code did not survive the probe's candidate loop.
+fn is_busy_refusal(code: &str, message: &str) -> bool {
+    code == "E_LOCKED" || message.contains("could not be locked")
+}
+
 /// The brain path the runtime actually uses: config override, else the
 /// project-local default (<cwd>/.sofuu/brain/brain.qtsq).
 fn brain_path(cfg: &ChatConfig) -> PathBuf {
@@ -163,6 +173,10 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
         cfg.model = m;
     }
     let mut failures = 0usize;
+    // Checks that could not run because something else was using the machine
+    // (a locked brain, a busy port). Reported, but not counted against the
+    // build: a release gate must not go red because a chat is open.
+    let mut skipped = 0usize;
 
     let header = format!(
         "sofuu doctor — v{} · {}",
@@ -492,16 +506,25 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
   var out = {{}};
   try {{
     var cands = {cands};
-    var b = null, used = null, lastErr = "";
+    var b = null, used = null, lastErr = "", lastCode = "";
     for (var ci = 0; ci < cands.length && !b; ci++) {{
       try {{
         b = cands[ci].space
           ? sofuu.memory.open("{p}", cands[ci].dim, cands[ci].space)
           : sofuu.memory.open("{p}", cands[ci].dim);
         used = cands[ci];
-      }} catch (eC) {{ lastErr = String((eC && eC.message) || eC); }}
+      }} catch (eC) {{
+        lastErr = String((eC && eC.message) || eC);
+        /* The refusal's code decides whether this is a broken brain or a
+         * busy one, and rethrowing a bare Error used to throw it away. */
+        lastCode = String((eC && eC.code) || "");
+      }}
     }}
-    if (!b) throw new Error(lastErr || "sofuu.memory.open refused every known shape");
+    if (!b) {{
+      var eNo = new Error(lastErr || "sofuu.memory.open refused every known shape");
+      if (lastCode) eNo.code = lastCode;
+      throw eNo;
+    }}
     out.shape = (used && used.space ? used.space : "inferred") + "@" + (used && used.dim);
     var s = JSON.parse(b.stats());
     out.records = s.records;
@@ -518,6 +541,7 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
     }}
   }} catch (e) {{
     out.error = String((e && e.message) || e);
+    out.code = String((e && e.code) || "");
   }}
   return JSON.stringify(out);
 }})()"#,
@@ -552,8 +576,21 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
             serde_json::from_str(rest[..end].trim_end_matches(',')).ok()
         };
         if let Some(err) = out.as_deref().and_then(js_error) {
-            warn(&format!("brain store probe failed: {err}"));
-            failures += 1;
+            /* E_LOCKED means another process is using the brain right now —
+             * a chat session, a serve, a second agent. The build is fine; the
+             * store is busy. Counting it as a failure made `sofuu doctor`
+             * (and therefore scripts/verify-dist.sh) red for anyone with a
+             * chat open, which is a false alarm about the artifact. */
+            let code = parse("code")
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            if is_busy_refusal(&code, &err) {
+                warn(&format!("brain store busy, persistence not probed: {err}"));
+                skipped += 1;
+            } else {
+                warn(&format!("brain store probe failed: {err}"));
+                failures += 1;
+            }
         } else if out.is_some() {
             let records = parse("records").and_then(|v| v.as_i64()).unwrap_or(0);
             let working = parse("working").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -765,7 +802,11 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
 
     // ── verdict ─────────────────────────────────────────────────────
     section("verdict");
-    if failures == 0 {
+    if failures == 0 && skipped > 0 {
+        ok(&format!(
+            "healthy — caps resolution and the protocol floors are operational; {skipped} check(s) could not run because the resource was in use"
+        ));
+    } else if failures == 0 {
         ok("healthy — brain persistence, caps resolution and the protocol floors are operational");
     } else {
         bad(&format!("{failures} problem(s) found — see the ⚠/✗ lines above"));
@@ -925,4 +966,34 @@ fn protocol_probes(rt: &sofuu_ffi::SofuuRuntime, failures: &mut usize) -> bool {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_file(&outside);
     jail_ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_busy_refusal;
+
+    /* A chat session, a serve, or a second agent holding the store must not
+     * make `sofuu doctor` - and therefore the release gate - red. */
+    #[test]
+    fn locked_brain_is_busy_not_broken() {
+        assert!(is_busy_refusal(
+            "E_LOCKED",
+            "memory.open: the brain could not be locked - another handle or process holds a conflicting lock"
+        ));
+        // The code can be lost on the way out of the probe; the message is
+        // generated in exactly one place, so it is a safe fallback.
+        assert!(is_busy_refusal(
+            "",
+            "memory.open: the brain could not be locked on /x/brain.qtsq"
+        ));
+    }
+
+    #[test]
+    fn broken_brain_is_still_a_failure() {
+        assert!(!is_busy_refusal(
+            "E_CORRUPT",
+            "memory.open: the brain is corrupt (bad magic)"
+        ));
+        assert!(!is_busy_refusal("", "unexpected token in brain header"));
+    }
 }

@@ -26,6 +26,12 @@ if [[ -f "$ROOT/docs/CUDA-KAGGLE.md" ]]; then
     cp "$ROOT/docs/CUDA-KAGGLE.md" "$STAGE/docs/CUDA-KAGGLE.md"
 fi
 
+# LICENSE + NOTICE travel with every archive that leaves this repository, and
+# scripts/verify-dist.sh enforces it on all of dist/sofuu-*.tar.gz. This bundle
+# is a source drop rather than a binary, but it is redistributed the same way,
+# so it gets the same treatment instead of an exemption.
+bash "$ROOT/scripts/pack/stage_legal.sh" "$STAGE" "$ROOT" >/dev/null 2>&1 || true
+
 mkdir -p "$(dirname "$OUT")"
 tar -czf "$OUT" -C "$STAGE" .
 bytes=$(wc -c < "$OUT" | tr -d ' ')

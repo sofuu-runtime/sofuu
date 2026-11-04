@@ -4,6 +4,48 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Full Source Audit Remediation, Zero-Catch Retiring & Linux Binary Cap Compliance — 2026-11-04
+
+[`docs/PLAN-AUDIT-REMEDIATION-2026-11-02.md`](docs/PLAN-AUDIT-REMEDIATION-2026-11-02.md) is fully implemented and verified across all 7 phases, remediating all 16 findings from the 2026-11-02 independent source audit:
+
+**Phase 1: Physical safety gates & resource bounding.**
+- **H-4 Drone Goto Altitude Range Gate (`domains/robotics/hardware.rs`):** Switched coordinate checking to arity-based selection (index 2 for 3-argument `goto(lat, lon, alt)`, index 1 for 2-argument). Western-hemisphere negative longitudes are now correctly accepted, and altitudes exceeding 500m are refused with typed `E_KAZE_RANGE` (reject-never-clamp).
+- **Fail-Closed Policy Firewall:** In `hardware.rs`, unreadable or missing policy verdicts fail closed with `E_CAP_DENIED`. The `"ask"` verdict explicitly fails closed with `E_CAP_APPROVAL_REQUIRED` to prevent headless autonomous control loops from executing without human approval.
+- **H-4 Non-Numeric Argument Rejection:** `range()` rejects missing or non-float arguments with `E_KAZE_RANGE` instead of passing.
+- **Bounded Kaze Collection Memory (`domains/kaze/value.rs`):** Introduced metered `Heap` with a 4 MiB default limit (`Limits.heap_bytes`, CLI `--heap-kb`, `RunOptions.heap_bytes`). Allocations in `push_array` and `push_map` charge 16 bytes per `Value` plus `Vec` overhead, returning typed `E_KAZE_MEMORY` when the budget is crossed. Documented in `KAZE-SPEC.md` and `README.md`.
+- **Wholesale Deallocation & Equality:** `free_wholesale` is now invoked at run completion to reset both arena and collection heap meters. Array and map comparison (`==`) is now structural (recursive content equality up to depth 64), matching string equality semantics.
+
+**Phase 2: Kaze engine reconciliation & drift prevention.**
+- Shipped `scripts/kaze-drift-check.sh` (`make kaze-drift-check`, wired into `make test`) detecting drift between `domains/kaze/` and the prototype `kaze/`.
+- Ported `device.set_duty` (PWM) into the core checker, `SimHost`, and `rt/hardware.rs` with 0..100% duty cycle validation.
+
+**Phase 3 & 6: Tooling health, clippy unblock & robustness.**
+- **Clippy Gate Unblocked:** Fixed all 5 `.unwrap()` calls in `crates/sofuu-ffi/src/qtsq_table.rs` with typed `Result` error mapping, satisfying `#![deny(clippy::unwrap_used)]`.
+- **CI Ratchet:** Shipped `scripts/check-clippy-ratchet.sh` enforcing that warnings never exceed the committed baseline (`.ci/clippy-baseline.txt`).
+- **Events FFI Guard:** Added `argc < 1 || argv.is_null()` validation to all QuickJS event callbacks in `rt/events.rs`.
+- **Zero-Crash Hardening Scope:** Refined roadmap language to clarify that promise rejections and event-loop unhandled errors are hardened, while Rust runtime panics deliberately retain `panic = "abort"` semantics. Hostile zip archives in `zip_reader.rs` now return typed `Err` instead of aborting.
+
+**Phase 4: CUDA kernel launch hardening.**
+- Declared `.maxntid 256,1,1` launch bounds across CUDA reduction, RMSNorm, and quantization kernels in `kernels.cu`.
+- Guarded `kv_write` with pre-launch buffer capacity checks (`pos + n_tokens <= cap`) in Rust (`validate_kv_write`) and CUDA.
+- Fixed driver table leak on failed initialization in `cuda_loader.c`. Added Valgrind leak check script `scripts/cuda/check-leaks.sh`.
+- Aligned documentation (`SOFUU_CUDA` is documented as a kill-switch, not an enable flag; unified `SOFUU_CUDA_DEBUG`).
+
+**Phase 5: Hygiene sweep & zero-catch backlog retirement.**
+- **Zero-Catch Backlog Retired (337 $\rightarrow$ 0):** Every catch block across all JavaScript runtime files (`src/js/*.js`) that previously swallowed errors now explicitly comments what error is ignored and why nothing depends on it. CI ratchet `scripts/check-js-swallow.py` enforces zero undocumented swallows.
+- **Dead Code Cleanup:** Triaged all 33 unused functions/constants and 10 unused struct fields with explicit dispositions. Removed redundant `unsafe` blocks.
+- **Stale Knobs Frozen:** Frozen documented-only environment variables under `scripts/check-env-knobs.py`.
+
+**Phase 7: Linux binary size compliance under 5.5 MiB.**
+- Closed the multi-megabyte Linux binary overage without raising the 5.5 MiB (5,767,168 B) ceiling.
+- Enabled `-Z build-std` with `panic=immediate-abort` in cross-compile scripts (-1.16 MB) and optimized C dependencies (libuv `MinSizeRel`, QTSQ `-Oz`, kernels `-Oz`).
+- **macOS arm64:** 5,595,072 B ($\le 5,767,168$ B, 172 KB headroom).
+- **Linux arm64:** 5,094,896 B ($\le 5,767,168$ B, 672 KB headroom).
+- **Linux x86_64:** 5,726,720 B ($\le 5,767,168$ B, 40 KB headroom).
+- Verified execution under QEMU Alpine VM (`scripts/cross/vm-smoke.sh`); documented x86_64 AVX2 baseline requirement.
+- Fixed SwiftPM and CocoaPods release manifest URL formatting (`libsofuu-xcframework.zip`) and checksum pinning.
+
+
 ## Zero-Risk Codebase Decoupling & In-Tree Capsule Modularization — 2026-11-02
 
 [`PLAN-ZERO-RISK-MODULARIZATION.md`](docs/PLAN-ZERO-RISK-MODULARIZATION.md) is implemented and verified end to end: encapsulates core systems substrate and domain expansions into isolated capsules with zero binary size inflation and zero linker churn.

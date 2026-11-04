@@ -138,6 +138,18 @@ impl CudaModel {
                 cfg.head_dim
             ));
         }
+        // The KV cache is sized from key_length. A checkpoint whose value
+        // width differs would need a second geometry; refusing is cheaper than
+        // silently reading V rows at the wrong stride.
+        if let Some(vlen) = gguf.get_u32(&format!("{arch}.attention.value_length")) {
+            if vlen as usize != cfg.head_dim {
+                return Err(format!(
+                    "value_length {vlen} differs from key_length/head_dim {}; \
+                     the CUDA KV cache assumes they are equal",
+                    cfg.head_dim
+                ));
+            }
+        }
         let n_rot = effective_n_rot(cfg);
         if n_rot % 2 != 0 {
             return Err(format!("RoPE width {n_rot} is not an even number of dims"));

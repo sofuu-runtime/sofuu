@@ -1620,7 +1620,7 @@
     /* Sub-agents from ~/.sofuu/agents/*.js (loaded once per session). */
     if (!S.agentsDirLoaded) {
       S.agentsDirLoaded = true;
-      try { if (typeof sofuu.agent.loadDir === 'function') await sofuu.agent.loadDir(); } catch (e) {}
+      try { if (typeof sofuu.agent.loadDir === 'function') await sofuu.agent.loadDir(); } catch (e) { /* the flag is set first, so a failed load is not retried in a loop. */ }
     }
     var subAgentNames = [];
     try {
@@ -1888,7 +1888,7 @@
      * have written memories (consolidation/remember). */
     brainIndexTouch(S.project);
     /* One full GC per completed turn (bounds JS garbage per turn). */
-    try { if (typeof __sofuu_gc === 'function') __sofuu_gc(); } catch (e) {}
+    try { if (typeof __sofuu_gc === 'function') __sofuu_gc(); } catch (e) { /* a host without GC keeps running; the bound is a courtesy. */ }
     S.providerOverride = null;
     return {
       answer: answer,
@@ -1911,12 +1911,12 @@
      * each other's .qtsq files. One-sided JS-side canonicalization is
      * exactly the divergence this must avoid. */
     var chdirOk = false;
-    try { process.chdir(project); chdirOk = true; } catch (e) {}
+    try { process.chdir(project); chdirOk = true; } catch (e) { /* the caller branches on chdirOk, which stays false. */ }
     var root = null;
     if (chdirOk) {
       try {
         if (typeof __session_project_root === 'function') root = __session_project_root();
-      } catch (e) {}
+      } catch (e) { /* no project root binding: the caller keeps its own path. */ }
     }
     if (!root || typeof root !== 'string') {
       /* chdir failed (dir missing) or no native — best effort: the literal
@@ -2024,7 +2024,7 @@
             /* sofuu.ml.alloc.ingestListing(root, rawJson) — returns how many
              * entries carried caps; harmless (and silent) when nothing does. */
             if (sofuu.ml && sofuu.ml.alloc && typeof sofuu.ml.alloc.ingestListing === 'function') {
-              try { sofuu.ml.alloc.ingestListing(endpoint, JSON.stringify(j)); } catch (eI) {}
+              try { sofuu.ml.alloc.ingestListing(endpoint, JSON.stringify(j)); } catch (eI) { /* allocator feedback is an optimisation of the next plan. */ }
             }
             return true;
           }).catch(function () { /* best-effort — never block chat */ return false; });
@@ -2237,7 +2237,7 @@
               S.noThink.indexOf(cA.model) < 0 &&
               (cA.no_think_models || []).indexOf(cA.model) < 0) {
             S.noThink.push(cA.model);
-            try { if (typeof __chat_note_no_think === 'function') __chat_note_no_think(cA.model); } catch (eNt) {}
+            try { if (typeof __chat_note_no_think === 'function') __chat_note_no_think(cA.model); } catch (eNT) { /* the UI hint is optional; S.noThink is already updated. */ }
             emit({ kind: 'warn', payload: { message: cA.model + ' rejected thinking (' +
                    clip(msg, 160) + ') — retrying without effort' } });
             /* js-2 (AUDIT-2026-09-07): the retry runs INSIDE this catch,
@@ -2318,9 +2318,9 @@
 
   function cancel() {
     /* Abort an in-flight RLM episode (rlm.js checks this between rounds). */
-    try { globalThis.__rlm_aborted = true; } catch (e) {}
+    try { globalThis.__rlm_aborted = true; } catch (e) { /* a frozen global loses the cooperative cancel, which the agent.cancel below still delivers. */ }
     if (sofuu.agent && typeof sofuu.agent.cancel === 'function') {
-      try { sofuu.agent.cancel('chat'); } catch (e) {}
+      try { sofuu.agent.cancel('chat'); } catch (e) { /* nothing running to cancel is the common case. */ }
     }
     /* Unblock any pending approval waits — the run is being aborted. */
     for (var id in S.pendingApprovals) {
@@ -2328,7 +2328,7 @@
       delete S.pendingApprovals[id];
       try { if (p.timer) clearTimeout(p.timer); } catch (eT) {}
       emit({ kind: 'approval_resolved', payload: { id: id } });
-      try { p.resolve(false); } catch (e) {}
+      try { p.resolve(false); } catch (e) { /* a promise already settled ignores the second resolve. */ }
     }
     return { ok: true };
   }
@@ -2360,7 +2360,7 @@
             embedding: gc.memory_backend || undefined },
           gistText);
       }
-    } catch (eG) {}
+    } catch (eG) { /* no gist this turn: the session continues without a summary. */ }
     return { ok: true, savedTokens: Math.max(0, before - historyTokens()) };
   }
 
@@ -2555,8 +2555,8 @@
             }
           }
         }
-      } catch (eL) {}
-    } catch (e) {}
+      } catch (eL) { /* one unreadable session record is skipped in the listing. */ }
+    } catch (e) { /* no registry: the listing is empty rather than failing the command. */ }
     return { ok: true, wasActive: wasActive };
   }
 
@@ -2583,7 +2583,7 @@
       if (typeof __qtsq_session_save === 'function') {
         __qtsq_session_save(registryPath(S.project), JSON.stringify({ sessions: [] }), sessionPassword(S.project));
       }
-    } catch (e) {}
+    } catch (e) { /* clearing the registry is retried on the next prune. */ }
     /* The legacy plaintext registry must go empty too, or its surviving
      * entries (whose flat files the host is about to remove) would
      * resurrect through the read-time merge. */
@@ -2593,7 +2593,7 @@
           __session_write_file(legacyRegistryPath(S.project), JSON.stringify({ sessions: [] }, null, 2));
         }
       }
-    } catch (eL) {}
+      } catch (eL) { /* same per-record skip as the listing above. */ }
     return { ok: true, ids: ids, cleared: ids.length, wasActive: wasActive };
   }
 
@@ -2631,9 +2631,9 @@
             rec.t = ev.t | 0;
             out.push(rec);
           }
-        } catch (eE) {}
+        } catch (eE) { /* one event that will not parse is skipped; the rest of the export stands. */ }
       }
-    } catch (e) {}
+    } catch (e) { /* an export that fails leaves the session files untouched. */ }
     return out;
   }
 

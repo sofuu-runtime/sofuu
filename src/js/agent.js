@@ -4932,8 +4932,8 @@
             if (ld && ld.name === name && typeof ld.diff === 'string' && ld.diff.length > 0) {
               stashedDiff = ld.diff;
             }
-          } catch (eD) {}
-          try { globalThis.__sofuu_last_diff = null; } catch (eD2) {}
+          } catch (eD) { /* the diff preview is cosmetic; the tool result already carries it. */ }
+          try { globalThis.__sofuu_last_diff = null; } catch (eD2) { /* a frozen global keeps the previous preview; nothing reads it as truth. */ }
         }
         var trPayload = { name: name, result: clip(cappedR.text, 200),
                           chars: cappedR.chars, kept: cappedR.text.length,
@@ -4958,7 +4958,7 @@
             var todoKey = '__sofuu_todos:' + String(runId).replace(/[^A-Za-z0-9_-]/g, '');
             var todosArr = JSON.parse(String(globalThis[todoKey] || '[]'));
             if (Array.isArray(todosArr)) trPayload.todos = todosArr;
-          } catch (eT) {}
+          } catch (eT) { /* a todo list that will not parse is omitted from the trace record. */ }
         }
         emit('tool_result', trPayload);
         /* PLAN-PLUGIN Category 4: observers see the settled result (trace,
@@ -4970,7 +4970,7 @@
               tool: name, args: args, result: trPayload, ok: toolOk,
               durationMs: Date.now() - toolStartedAt, agent: d.name, turnId: runId });
             if (trHook && typeof trHook.then === 'function') trHook.then(null, function () {});
-          } catch (eTrHook) {}
+          } catch (eTrHook) { /* trace hooks are best effort and already given a null rejection handler. */ }
         }
         /* Supervisor checkpoint 2 — AFTER the result returns: account the
          * outcome in the working set (trajectory + write tracking for the
@@ -4980,7 +4980,7 @@
           try { sofuu.ml.track(JSON.stringify({ kind: 'tool_result', run: String(runId),
                                                 step: own.toolCalls, tool: name, target: mlTarget(args),
                                                 chars: cappedR.chars, error: errored })); }
-          catch (eMl2) {}
+          catch (eMl2) { /* ml.track telemetry: one lost record, never a failed tool. */ }
           if (mlVerdict && sofuu.ml.feedback && typeof sofuu.ml.feedback === 'function') {
             /* Outcome label for online learning (§13) — confidence-banded
              * proxies, with abstention in the ambiguous middle: a wrong
@@ -4997,7 +4997,7 @@
               try { sofuu.ml.feedback(JSON.stringify({ kind: 'outcome', model: 'supervisor',
                                                        run: String(runId), step: own.toolCalls,
                                                        wasted: mlWasted, conf: mlConf })); }
-              catch (eMl3) {}
+              catch (eMl3) { /* same for the waste record. */ }
             }
           }
         }
@@ -5521,7 +5521,7 @@
               if (opts.onStep) {
                 try { opts.onStep({ runId: runId, name: d.name, depth: depth,
                                     t: Date.now() - started, kind: 'answer_delta', payload: tx }); }
-                catch (e2) {}
+                catch (e2) { /* onStep is a display hook; a host callback that throws is not a run failure. */ }
               }
             });
         } catch (eS) {
@@ -5897,7 +5897,7 @@
                                score: (typeof lv.score === 'number') ? lv.score : 0,
                                nudge: clip(loopNotice, 160) });
             }
-          } catch (eMlL) {}
+          } catch (eMlL) { /* telemetry again: the loop decision has already been made. */ }
         }
         if (stopped) break;
       }
@@ -6073,7 +6073,7 @@
           if (opts.onStep) {
             try { opts.onStep({ runId: runId, name: d.name, depth: depth,
                                 t: Date.now() - started, kind: 'answer_delta', payload: tx }); }
-            catch (e2) {}
+            catch (e2) { /* same display hook, same contract. */ }
           }
         };
         /* alloc gate Layer 1 — error learning (same as the tool loop):
@@ -6194,10 +6194,10 @@
            * in both carries its hash id → reinforced on hash only (the
            * sem store is advisory here, by design). */
           if (recalledIds.length && ansText.trim()) {
-            try { cma.markPositive(recalledIds); } catch (e) {}
+            try { cma.markPositive(recalledIds); } catch (e) { /* reinforcement is advisory here, by design. */ }
           }
           if (semCma && recalledSemIds.length && ansText.trim()) {
-            try { semCma.markPositive(recalledSemIds); } catch (e) {}
+            try { semCma.markPositive(recalledSemIds); } catch (e) { /* same for the semantic store. */ }
           }
           /* P1 (audit 2026-10-14): reinforcement and the recall counters
            * are DIRTY state written after this turn's flushes — the
@@ -6205,7 +6205,7 @@
            * so a session that ended here lost every mark. Flush both
            * stores; a clean store's flush is a no-op. */
           if ((recalledIds.length || (semCma && recalledSemIds.length)) && ansText.trim()) {
-            try { cma.flush(); } catch (eF1) {}
+            try { cma.flush(); } catch (eF1) { /* a clean store flush is a no-op; a failed one waits for the next open. */ }
             if (semCma) { try { semCma.flush(); } catch (eF2) {} }
           }
           /* P4.4 learnings harvest (def learn:true): ONE ≤200-char playbook
@@ -6226,10 +6226,10 @@
                 }
                 emit('learned', { key: pbKey, line: clip(pb, 200) });
               }
-            } catch (eL) {}
+            } catch (eL) { /* the learned-event emit is diagnostic; the fact is already stored. */ }
           }
           emit('stored', { scope: d.memory });
-        } catch (e) {}
+        } catch (e) { /* memory storage is best effort: the answer is delivered either way. */ }
       }
     } catch (e) {
       /* SPEC §3 fatal path: fatal_error -> halt -> crash card, then the
@@ -6244,14 +6244,14 @@
         } else {
           obsFatal(runId, obsPath, (typeof stepsTotal === 'number' ? stepsTotal : 0), e, obsCtx());
         }
-      } catch (eObs) {}
+      } catch (eObs) { /* observability is telemetry by definition - obsFatal already recorded it. */ }
       try { if (sofuu.tools && sofuu.tools.endRunScope) sofuu.tools.endRunScope(String(runId)); } catch (eSc) {}
       delete ACTIVE[runId];
       delete SIGNALS[cancelId];
       ACTIVE_COUNT--;
       if (ACTIVE_COUNT === 0) runTick(mcpIdleDisconnect);
       if (traceStorage && traceStorage.db && typeof traceStorage.db.flush === 'function') {
-        try { traceStorage.db.flush(); } catch (eFl) {}
+        try { traceStorage.db.flush(); } catch (eFl) { /* the run is over; a failed flush retries on the next open. */ }
       }
       throw e;
     }
@@ -6270,7 +6270,7 @@
         if (typeof sofuu !== 'undefined' && sofuu.storage && typeof sofuu.storage.open === 'function') {
           store = sofuu.storage.open(p).traces;
         }
-      } catch (e) {}
+      } catch (e) { /* no trace store: the run proceeds without trace replay. */ }
     }
     if (!store) return [];
     var q = {
@@ -6288,7 +6288,7 @@
       var row = rows[i];
       var inObj = row.input;
       if (typeof inObj === 'string') {
-        try { inObj = JSON.parse(inObj); } catch (e) {}
+        try { inObj = JSON.parse(inObj); } catch (e) { /* a string input that is not JSON is kept verbatim. */ }
       }
       var kind = (inObj && inObj.kind) || row.tool_name || 'step';
       var payload = (inObj && inObj.payload !== undefined) ? inObj.payload : (inObj || null);

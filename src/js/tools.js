@@ -2359,6 +2359,26 @@
         }
 
         var wrapper = {
+          /* The resilience layer must not swallow the transport surface: the
+           * e2e driver and the chat/agent callers read client.transport, call
+           * endpoint()/sessionId() to show where a session lives, and set
+           * onNotification to receive server push. Reconnecting replaces
+           * curClient underneath, so these forward on every read instead of
+           * being copied once at connect time. */
+          get transport() { return curClient ? curClient.transport : undefined; },
+          get url() { return curClient ? curClient.url : undefined; },
+          endpoint: function () {
+            return (curClient && typeof curClient.endpoint === 'function') ? curClient.endpoint() : '';
+          },
+          sessionId: function () {
+            return (curClient && typeof curClient.sessionId === 'function') ? curClient.sessionId() : '';
+          },
+          set onNotification(fn) {
+            if (curClient) curClient.onNotification = fn;
+          },
+          get onNotification() {
+            return curClient ? curClient.onNotification : null;
+          },
           get state() { return clientState; },
           get circuitState() { return circuitState; },
           get reconnect() { return { enabled: reconnectEnabled, maxRetries: maxRetries, initialBackoffMs: initialBackoffMs, maxBackoffMs: maxBackoffMs }; },
@@ -2382,16 +2402,16 @@
             }
           },
           listTools: function () {
-            if (clientState === 'CLOSED') return Promise.reject(new Error('MCP client is closed'));
+            if (clientState === 'CLOSED') return Promise.reject(new Error('MCP client is disconnected'));
             return all(wrapper, 'tools/list', 'tools');
           },
           listResources: function () {
-            if (clientState === 'CLOSED') return Promise.reject(new Error('MCP client is closed'));
+            if (clientState === 'CLOSED') return Promise.reject(new Error('MCP client is disconnected'));
             return all(wrapper, 'resources/list', 'resources');
           },
           call: function (method, params, copts) {
             if (clientState === 'CLOSED') {
-              var closedErr = new Error('MCP client is closed');
+              var closedErr = new Error('MCP client is disconnected');
               closedErr.code = 'E_MCP_DISCONNECTED';
               return Promise.reject(closedErr);
             }

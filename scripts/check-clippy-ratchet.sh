@@ -29,6 +29,14 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 cd "$ROOT" || exit 2
 
 echo "clippy-ratchet: running clippy over $PKGS (this takes a minute)"
+# Force a fresh compile of the measured crates first. Cargo only prints the
+# "generated N warnings" summary for crates it actually rebuilt, so an
+# incremental run after some other target already compiled them reports a
+# DIFFERENT number than a cold one - this gate flapped between 619 and 620 all
+# afternoon depending on what `make` happened to build first. A ratchet whose
+# number depends on build order is not a ratchet.
+# shellcheck disable=SC2086
+cargo clean $(for p in $PKGS; do printf -- '-p %s ' "$p"; done) >/dev/null 2>&1 || true
 # shellcheck disable=SC2086
 cargo clippy $(for p in $PKGS; do printf -- '-p %s ' "$p"; done) --lib --bins 2>&1 \
     | grep -E 'generated [0-9]+ warning' \

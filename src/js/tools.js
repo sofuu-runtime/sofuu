@@ -81,7 +81,7 @@
   var SHELL_DISABLED = false;
   try {
     SHELL_DISABLED = !!(typeof process !== 'undefined' && process.env && process.env.SOFUU_NO_SHELL);
-  } catch (eSh) {}
+  } catch (eSh) { /* no process object: shell tools stay enabled unless a host disables them explicitly. */ }
 
   /* R2.3 (SPEC T2.3): live tool subprocess registry. bash/code_eval register
    * their spawn handle here so a run cancel can kill an in-flight tool —
@@ -220,7 +220,7 @@
   var TOOL_ACTIVE = 0;
   function toolDispatchBegin() {
     TOOL_ACTIVE++;
-    try { globalThis.__sofuu_tool_active = TOOL_ACTIVE; } catch (e) {}
+    try { globalThis.__sofuu_tool_active = TOOL_ACTIVE; } catch (e) { /* a frozen global only loses the TUI activity hint. */ }
   }
   function toolDispatchEnd() {
     TOOL_ACTIVE = TOOL_ACTIVE > 0 ? TOOL_ACTIVE - 1 : 0;
@@ -345,7 +345,7 @@
     }
     if (sofuu.fs && typeof sofuu.fs.realpath === 'function') {
       var rootReal = null;
-      try { rootReal = await sofuu.fs.realpath('.'); } catch (eR) {}
+      try { rootReal = await sofuu.fs.realpath('.'); } catch (eR) { /* no realpath: containment checks fall back to the lexical path. */ }
       if (rootReal) {
         /* Canonicalize the deepest EXISTING ancestor of the target: walk
          * up until realpath succeeds, then re-attach the missing tail. */
@@ -561,7 +561,7 @@
    * stale diff can never attach to the wrong event. */
   function setLastDiff(name, diff) {
     try { globalThis.__sofuu_last_diff = { name: name, diff: String(diff || '') }; }
-    catch (e) {}
+    catch (e) { /* a frozen global loses the diff preview; the tool result itself is unaffected. */ }
   }
   /* Bounded unified diff of one replacement. first = byte offset of the
    * (first) match in text. Context lines come from the ORIGINAL text;
@@ -933,7 +933,7 @@
         /* Anchor against the FRESH on-disk bytes, not the in-memory splice
          * - the rider's whole point is independent proof of what happened. */
         res += anchorRider(await sofuu.fs.readFile(p, 'utf8'), Math.min(first, updated.length), 2);
-      } catch (eE) {}
+      } catch (eE) { /* the file may have been deleted between write and read; the rider is optional context. */ }
       return res + gateWarn;
     },
   };
@@ -1091,7 +1091,7 @@
           if (typeof sofuu !== 'undefined' && sofuu.fs && !sofuu.fs.exists('/bin/sh') && sofuu.fs.exists('/system/bin/sh')) {
             shCmd = '/system/bin/sh';
           }
-        } catch (_) {}
+        } catch (_) { /* no /system/bin/sh probe: the caller keeps the default shell. */ }
         var proc;
         try {
           proc = trackProc(sofuu.spawn({
@@ -1118,7 +1118,7 @@
           return;
         }
         tid = setTimeout(function () {
-          try { proc.kill(); } catch (e) {}
+          try { proc.kill(); } catch (e) { /* the process may have exited on its own between the check and the kill. */ }
           finish('\n[killed: timed out after ' + timeout + 'ms]\n');
         }, timeout);
       });
@@ -1282,7 +1282,7 @@
       /* Post-edit context for the first updated/added file (T3.1 rider). */
       for (i = 0; i < planned.length; i++) {
         if (planned[i].kind === 'update') {
-          try { res += anchorRider(planned[i].after, 0, 2); } catch (eR) {}
+          try { res += anchorRider(planned[i].after, 0, 2); } catch (eR) { /* rider context is optional in the diff summary. */ }
           break;
         }
       }
@@ -1311,13 +1311,13 @@
     var prefix = 'run:' + sc.replace(/[^A-Za-z0-9_-]/g, '');
     Object.keys(CODE_SESSIONS).forEach(function (k) {
       if (k === prefix) {
-        try { CODE_SESSIONS[k].close(); } catch (e) {}
+        try { CODE_SESSIONS[k].close(); } catch (e) { /* an already-closed session is not an error here. */ }
         delete CODE_SESSIONS[k];
       }
     });
     try {
       delete globalThis['__sofuu_todos:' + sc.replace(/[^A-Za-z0-9_-]/g, '')];
-    } catch (e2) {}
+    } catch (e2) { /* deleting a key a frozen global never had is a no-op. */ }
   };
 
   TOOLS.code_eval = {
@@ -1373,7 +1373,7 @@
       var res;
       if (key) {
         if (args && args.reset === true && CODE_SESSIONS[key]) {
-          try { CODE_SESSIONS[key].close(); } catch (eRst) {}
+          try { CODE_SESSIONS[key].close(); } catch (eRst) { /* same: closing a session twice is harmless. */ }
           delete CODE_SESSIONS[key];
         }
         var sess = CODE_SESSIONS[key];
@@ -1472,7 +1472,7 @@
        * that never writes a checklist cannot inherit the previous one. */
       var scope = (a && typeof a.__scope === 'string' && a.__scope)
         ? ':' + a.__scope.replace(/[^A-Za-z0-9_-]/g, '') : '';
-      try { globalThis['__sofuu_todos' + scope] = JSON.stringify(clean); } catch (eG) {}
+      try { globalThis['__sofuu_todos' + scope] = JSON.stringify(clean); } catch (eG) { /* a frozen global loses the TUI mirror; the tool result still carries the list. */ }
       return 'checklist updated (' + clean.length + ' step' + (clean.length === 1 ? '' : 's') + ')';
     },
   };
@@ -1491,18 +1491,18 @@
         if (typeof sofuu.capabilities === 'function') {
           caps = JSON.parse(sofuu.capabilities());
         }
-      } catch (eCaps) {}
+      } catch (eCaps) { /* no capabilities report: the platform probes below answer instead. */ }
       var plat = 'unknown';
       try {
         plat = (typeof process !== 'undefined' && process.platform) || 'unknown';
-      } catch (ePlat) {}
+      } catch (ePlat) { /* platform stays 'unknown', which the report already distinguishes. */ }
       var memInfo = null;
       try {
         if (typeof process !== 'undefined' && typeof process.memoryUsage === 'function') {
           var mu = process.memoryUsage();
           memInfo = { rss_mb: Math.round(mu.rss / 1048576) };
         }
-      } catch (eMem) {}
+      } catch (eMem) { /* memory stats are best effort; the report omits the field. */ }
       var info = {
         runtime: 'sofuu',
         version: (sofuu.VERSION || '0.3.0-beta'),
@@ -1583,7 +1583,7 @@
     if (!path) {
       try {
         path = (typeof process !== 'undefined' && process.env && process.env.SOFUU_MCP_CONFIG) || '';
-      } catch (e0) {}
+      } catch (e0) { /* no environment: no override, so the default MCP config path applies. */ }
     }
     var home = '';
     try { home = (typeof process !== 'undefined' && process.env && process.env.HOME) || ''; } catch (eH) {}
@@ -1710,7 +1710,7 @@
         var p = JSON.parse(sofuu.policy.get());
         var ms = p && p.mcp && p.mcp.callTimeoutMs;
         if (typeof ms === 'number' && ms > 0) return Math.min(600000, Math.max(50, ms));
-      } catch (e) {}
+      } catch (e) { /* no per-server timeout configured: the default ceiling stands. */ }
       return 0;
     }
     /* ── M2 (2026-10-23): Streamable HTTP transport (JS) ─────────────
@@ -1828,7 +1828,7 @@
             try {
               var pol = JSON.parse(sofuu.policy.get());
               if (pol && pol.fs && Array.isArray(pol.fs.roots)) roots = pol.fs.roots;
-            } catch (eR) {}
+            } catch (eR) { /* unreadable policy: default roots are used instead. */ }
             reply.result = { roots: roots.map(function (p) { return { uri: 'file://' + p }; }) };
           } else reply.error = { code: -32601, message: 'Method not found' };
           postMessage(reply).then(consumeResponse, function () {});
@@ -1842,11 +1842,11 @@
         try {
           var sid = res.headers && res.headers.get ? res.headers.get('mcp-session-id') : '';
           if (sid) sessionId = String(sid);
-        } catch (eH) {}
+        } catch (eH) { /* a response without readable headers simply carries no session id. */ }
         if (res.status === 202 || res.status === 204) return;
         if (!res.ok && res.status >= 400) {
           var bodyText = '';
-          try { bodyText = await res.text(); } catch (eT) {}
+          try { bodyText = await res.text(); } catch (eT) { /* the status code alone identifies the failure. */ }
           throw new Error('mcp http: HTTP ' + res.status + (bodyText ? (': ' + bodyText.slice(0, 200)) : ''));
         }
         var ct = '';
@@ -1942,7 +1942,7 @@
         try {
           var ack = await postMessage({ jsonrpc: '2.0', method: 'notifications/initialized' });
           await consumeResponse(ack);
-        } catch (eAck) {}
+        } catch (eAck) { /* the server may not implement the initialized notification; the session still works. */ }
         return client;
       })();
     };

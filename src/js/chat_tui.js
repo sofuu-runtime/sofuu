@@ -204,10 +204,17 @@
     if (!sofuu.mcp || !sofuu.mcp.connect) { out('\x1b[33m  ⚠ sofuu.mcp unavailable — tools off\x1b[0m'); return; }
     mcpConnecting = (async () => {
       const results = await Promise.allSettled(list.map(async (srv) => {
-        const client = await sofuu.mcp.connect(srv.command);
-        const res = await client.listTools();
-        const arr = (res && res.tools) || [];
-        return { name: srv.name, client, tools: arr };
+        const spec = (srv.args && srv.args.length) ? { command: srv.command, args: srv.args } : srv.command;
+        const connectTask = async () => {
+          const client = await sofuu.mcp.connect(spec);
+          const res = await client.listTools();
+          const arr = (res && res.tools) || [];
+          return { name: srv.name, client, tools: arr };
+        };
+        const timeoutTask = new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('MCP server "' + srv.name + '" connection timed out')), 5000);
+        });
+        return await Promise.race([connectTask(), timeoutTask]);
       }));
       for (const r of results) {
         if (r.status === 'fulfilled' && r.value) {
@@ -250,6 +257,21 @@
       out('    • ' + t.name + (t.description ? ' — ' + String(t.description).slice(0, 80) : ''));
     }
     out('');
+  }
+  function chatMcpToolDefs() {
+    const defs = [];
+    const names = {};
+    for (const t of mcpTools) {
+      if (names[t.name]) continue;
+      defs.push({
+        name: t.name,
+        description: t.description || ('MCP tool from ' + t.server),
+        parameters: t.schema || { type: 'object', properties: {} },
+        execute: (args) => callMcpTool(t.name, args),
+      });
+      names[t.name] = 1;
+    }
+    return defs;
   }
   /* /agents — list the agent registry (PLAN-AGENTS A8.3). Definitions
    * load lazily from ~/.sofuu/agents/*.js on first use; a broken file is
@@ -2061,7 +2083,7 @@
   function usableConfig(view) {
     const v = view || cfg;
     if (!v.provider || !v.model) return false;
-    if (v.provider === 'llamacpp' && v.model === 'default') return false;
+    if (v.provider === 'llamacpp' && (v.model === 'default' || v.model.startsWith('zai-org/') || v.model.startsWith('anthropic/') || v.model.startsWith('openai/') || v.model.startsWith('google/'))) return false;
     if (v.provider === 'local') return true;
     return true;
   }
@@ -2307,6 +2329,10 @@
       stopPhase();
       return;
     }
+    const typed = text;
+    if (TTY) out('\x1b[' + T('accent') + 'm  ⏺ you\x1b[0m \x1b[2m·\x1b[0m ' + typed);
+    CURRENT_PHASE = 'Thinking';
+    startPhase();
     /* MCP is lazy: connect on demand only when a tool-using turn starts. */
     if (mcpTools.length === 0 && mcpServersList().length > 0) {
       await connectMcpServers();
@@ -2331,7 +2357,6 @@
      * run — no chat history injected. Agents win over same-named files;
      * unknown names fall through to the @file path below. Esc cancels
      * via signal:'chat' like any turn. */
-    const typed = text;
     let agentMention = null;
     {
       const t = text.trim();
@@ -2359,10 +2384,6 @@
       promptLoggedTurn = archiveTurn;
       try { __chat_log('prompt', String(typed)); } catch (e) {}
     }
-    /* The turn starts in Thinking, including while lazy MCP/agent setup runs. */
-    CURRENT_PHASE = 'Thinking';
-    startPhase();
-    if (TTY) out('\x1b[' + T('accent') + 'm  ⏺ you\x1b[0m \x1b[2m·\x1b[0m ' + typed);
     /* M1: /watch changes surface in chat context ONCE — drained into this
      * turn's ephemeral context note and cleared (hard-capped at the poll
      * site too, so an idle session can't accumulate). */
@@ -2386,7 +2407,7 @@
       /* P1: the byte-stable shared core prompt. For local models, keep
        * it lean so CPU prefill latency matches direct `sofuu infer`. */
       system: isLocal ? 'You are a helpful AI assistant.' : sofuu.agent.CORE_PROMPT,
-      tools: isLocal ? [] : chatToolDefs(),
+      tools: isLocal ? (mcpTools.length ? chatMcpToolDefs() : []) : chatToolDefs(),
       agents: (isLocal || !subAgentNames.length) ? undefined : subAgentNames,
       provider: c.provider, model: c.model,
       /* strict: only what the user selected, never more; off → undefined */
@@ -3002,7 +3023,7 @@
           }
         }
       }
-      if (prov === 'llamacpp' || (base && String(base).includes(':8080'))) {
+      if ((prov === 'llamacpp' || (base && String(base).includes(':8080'))) && out.length === 0) {
         if (!seen['default']) { seen['default'] = 1; out.push('default'); }
       }
       return out;
@@ -3684,6 +3705,20 @@
     } else {
       /* Compact two-line banner (built in Rust, same content as the panel). */
       try { __chat_welcome(); } catch (e) {}
+    }
+    /* Auto-detect live model for local server if unset or mismatched */
+    if (cfg.provider === 'llamacpp' || (cfg.base_url && String(cfg.base_url).includes(':8080'))) {
+      try {
+        const live = await wizardFetchModels('openai', cfg.base_url || 'http://127.0.0.1:8080/v1', cfg.api_key || '');
+        if (live && live.length > 0) {
+          if (!cfg.model || cfg.model === 'default' || !live.includes(cfg.model)) {
+            __chat_slash('/model ' + live[0]);
+            try { cfg = JSON.parse(__chat_getcfg()); } catch (e) {}
+            refreshStatus('');
+            maybeRefreshPanel();
+          }
+        }
+      } catch (e) {}
     }
     /* ── First-run onboarding: no usable model → force the guided setup
      * wizard (provider → URL → key → model list → pick). The wizard

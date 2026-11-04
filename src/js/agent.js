@@ -1594,7 +1594,7 @@
       try {
         if (dropped > 0 || consolidated > 0) {
           var pruned = entry.sem.retainAgainst(entry.cma) || 0;
-          if (pruned > 0) { try { entry.sem.flush(); } catch (e3) {} }
+          if (pruned > 0) { try { entry.sem.flush(); } catch (e3) { /* a failed flush only delays durability to the next open. */ } }
         }
       } catch (e) { /* flush after pruning: the entries are already gone from the
          in-memory index, and a failed flush only costs a re-parse. */ }
@@ -1617,7 +1617,7 @@
       if (entry.cma.count() < CONSOLIDATE_MIN_RECORDS) return 0;
       entry.lastConsolidate = now;
       var n = entry.cma.consolidate() || 0;
-      if (n > 0) { try { entry.cma.flush(); } catch (e2) {} }
+      if (n > 0) { try { entry.cma.flush(); } catch (e2) { /* same: the consolidation is already in memory. */ } }
       return n;
     } catch (e) { return 0; }
   }
@@ -1792,7 +1792,7 @@
     } else if (ansVec) {
       cma.remember(ansVec, clip(answer, STORE_CAP_CHARS), 'assistant', 0, 'chat');
     }
-    if (promotedHash > 0) { try { cma.flush(); } catch (e) {} }
+    if (promotedHash > 0) { try { cma.flush(); } catch (e) { /* the promotion stands; only its persistence is deferred. */ } }
     if (entry.sem) {
       try {
         var promotedSem = 0;
@@ -1888,7 +1888,7 @@
     if (ACTIVE_COUNT > 0) return;
     var pool = MCP_POOL; MCP_POOL = {};
     Object.keys(pool).forEach(function (k) {
-      pool[k].then(function (c) { try { c.client.disconnect(); } catch (e) {} },
+      pool[k].then(function (c) { try { c.client.disconnect(); } catch (e) { /* the server may already have dropped the connection. */ } },
                     function () {});
     });
   }
@@ -3516,7 +3516,7 @@
         var t = 0;
         for (var i = 0; i < ms.length; i++) {
           t += estTok(String(ms[i].content || ''));
-          if (ms[i].tool_calls) { try { t += estTok(JSON.stringify(ms[i].tool_calls)); } catch (eP) {} }
+          if (ms[i].tool_calls) { try { t += estTok(JSON.stringify(ms[i].tool_calls)); } catch (eP) { /* unserialisable tool_calls add no tokens to the estimate. */ } }
         }
         return t;
       }
@@ -3792,7 +3792,7 @@
         var isCont = continued > 0;
         var stPp = pluginProviderFor(ro);
         var st = stPp ? pluginStreamFor(stPp, ro) : sofuu.ai.stream(ro);
-        state.aborts.push(function () { try { st.abort(); } catch (e) {} });
+        state.aborts.push(function () { try { st.abort(); } catch (e) { /* aborting a finished stream is a no-op. */ } });
         var parts = [];
         var thinkParts = [];
         var forwarded = false;
@@ -4430,7 +4430,7 @@
             }
             /* Cancel must also stop the episode between rounds (the
              * driver checks __rlm_aborted at every action). */
-            state.aborts.push(function () { try { g.__rlm_aborted = true; } catch (eAb) {} });
+            state.aborts.push(function () { try { g.__rlm_aborted = true; } catch (eAb) { /* a frozen global only loses the between-round cancel. */ } });
             var res = await withCancelGuard(state, sofuu.rlm.query(ctxText, String(task), ro));
             /* The episode's real usage (every ask, llm() sub-call and
              * recurseVia child) lands in own + tree here — P1-2-style:
@@ -6206,7 +6206,7 @@
            * stores; a clean store's flush is a no-op. */
           if ((recalledIds.length || (semCma && recalledSemIds.length)) && ansText.trim()) {
             try { cma.flush(); } catch (eF1) { /* a clean store flush is a no-op; a failed one waits for the next open. */ }
-            if (semCma) { try { semCma.flush(); } catch (eF2) {} }
+            if (semCma) { try { semCma.flush(); } catch (eF2) { /* same contract as the store above. */ } }
           }
           /* P4.4 learnings harvest (def learn:true): ONE ≤200-char playbook
            * line per successful multi-step run, written into this agent's
@@ -6245,7 +6245,7 @@
           obsFatal(runId, obsPath, (typeof stepsTotal === 'number' ? stepsTotal : 0), e, obsCtx());
         }
       } catch (eObs) { /* observability is telemetry by definition - obsFatal already recorded it. */ }
-      try { if (sofuu.tools && sofuu.tools.endRunScope) sofuu.tools.endRunScope(String(runId)); } catch (eSc) {}
+      try { if (sofuu.tools && sofuu.tools.endRunScope) sofuu.tools.endRunScope(String(runId)); } catch (eSc) { /* the run scope is a bookkeeping optimisation; the run is already finished. */ }
       delete ACTIVE[runId];
       delete SIGNALS[cancelId];
       ACTIVE_COUNT--;
@@ -6342,7 +6342,7 @@
         var callId = 'call_' + runId + '_' + (ev.step || 0) + '_' + (ev.payload.name || 'tool');
         var args = ev.payload.args;
         if (typeof args === 'string') {
-          try { args = JSON.parse(args); } catch (e) {}
+          try { args = JSON.parse(args); } catch (e) { /* a string that is not JSON is passed through as the raw argument. */ }
         }
         toolCallsPending.push({
           id: callId,
@@ -6449,7 +6449,7 @@
     /* M2: fan-outs allocate N runs' worth of streams/traces at once — one
      * full GC after the batch bounds the garbage (mapContext rides through
      * here too). The bridge is host-provided; missing = no-op. */
-    try { if (typeof __sofuu_gc === 'function') __sofuu_gc(); } catch (e) {}
+    try { if (typeof __sofuu_gc === 'function') __sofuu_gc(); } catch (e) { /* a host without GC still runs; the bound is a courtesy. */ }
     return results;
   }
 
@@ -6537,7 +6537,7 @@
     if (!st) return false;
     st.cancelled = true;
     for (var i = 0; i < st.aborts.length; i++) {
-      try { st.aborts[i](); } catch (e) {}
+      try { st.aborts[i](); } catch (e) { /* one abort handler throwing must not stop the others. */ }
     }
     return true;
   }
@@ -6575,7 +6575,7 @@
      * only ever drops .js files in. Best-effort - a read-only home falls
      * through to the readdir below and yields an empty registry. */
     if (sofuu.fs.mkdir) {
-      try { await sofuu.fs.mkdir(dir, { recursive: true }); } catch (e) {}
+      try { await sofuu.fs.mkdir(dir, { recursive: true }); } catch (e) { /* read-only home: the readdir below returns an empty registry. */ }
     }
     var names;
     try { names = await sofuu.fs.readdir(dir); } catch (e) { return out; }
@@ -6658,7 +6658,7 @@
   async function logRun(res, task, wall) {
     try {
       var dir = sofuuDir() + '/logs';
-      try { await sofuu.fs.mkdir(dir); } catch (e2) {} /* exists = fine */
+      try { await sofuu.fs.mkdir(dir); } catch (e2) { /* already exists, which is the common case. */ }
       var path = dir + '/agent_runs.jsonl';
       try {
         var prev = await sofuu.fs.readFile(path);
@@ -6791,7 +6791,7 @@
       } else {
         gist = entry.cma.remember(qemb.vec, text, 'user', 0, 'compact');
       }
-      try { entry.cma.flush(); } catch (eF) {}
+      try { entry.cma.flush(); } catch (eF) { /* the compacted memory is in memory; a failed flush retries on the next open. */ }
       if (entry.sem) {
         try {
           var sv = embedSemV2(text);

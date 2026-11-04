@@ -1,8 +1,7 @@
 # Un-commented empty catch blocks in src/js. A ratchet, not a target:
 # lower this whenever a swallow is fixed or explained. The per-file counts
 # exist so one file cannot gain a swallow while another retires one.
-total: 138
-src/js/agent.js: 15
+total: 123
 src/js/chat.js: 4
 src/js/chat_tui.js: 91
 src/js/compat.js: 4

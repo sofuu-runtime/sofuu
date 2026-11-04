@@ -28,6 +28,8 @@ ENTRIES=(
     sofuu_swiglu
     sofuu_rope_f32
     sofuu_kv_write_f32
+    sofuu_attn_decode_f32
+    sofuu_add_f32
 )
 
 find_clang() {

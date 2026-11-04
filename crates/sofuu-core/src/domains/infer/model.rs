@@ -382,6 +382,13 @@ pub struct TransformerModel {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub gpu: Option<GgufGpu>,
 
+    /// Native CUDA decoder (Linux + NVIDIA, SOFUU_CUDA=1). When present, every
+    /// token of the forward pass runs on the device: weights and KV are VRAM
+    /// resident, the host only supplies the embedding row and receives logits.
+    /// `None` means the CPU path below owns the forward.
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+    pub cuda: Option<super::cuda_model::CudaModel>,
+
     // Batched working state buffers for prompt prefill
     pub x_batch: Vec<f32>,
     pub x_norm_batch: Vec<f32>,
@@ -1300,6 +1307,36 @@ impl TransformerModel {
             );
         }
 
+        #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+        let cuda = if gpu_allowed && super::cuda::requested() {
+            match super::cuda_model::CudaModel::from_gguf(
+                &gguf,
+                &config,
+                &token_embd,
+                &output_norm,
+                &output,
+                &layers,
+                &rope_freq_adjust,
+            ) {
+                Ok(m) => {
+                    eprintln!(
+                        "[cuda] GPU decoder armed: {} layers, {} KV rows (SOFUU_CUDA=0 or --cpu forces CPU)",
+                        config.n_layers,
+                        m.cap()
+                    );
+                    Some(m)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[cuda] GPU decoder NOT armed: {e} — this model runs on the CPU"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let model = Self {
             config,
             rope_freq_adjust,
@@ -1310,6 +1347,8 @@ impl TransformerModel {
             layers,
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             gpu,
+            #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+            cuda,
 
             x: vec![0.0f32; dim],
             x_norm: vec![0.0f32; dim],
@@ -1385,6 +1424,10 @@ impl TransformerModel {
     /// into greedy output through draft acceptance — so the tree is refused.
     #[inline]
     pub fn spec_decode_supported(&self) -> bool {
+        #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+        if self.cuda.is_some() {
+            return false;
+        }
         !self.config.rope_custom
     }
 
@@ -1564,10 +1607,18 @@ impl TransformerModel {
     /// The context bound every position-taking route must respect. With KV4
     /// armed the CACHE row count is the residual ring, not the context.
     pub fn logical_ctx(&self) -> usize {
+        #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+        if let Some(cuda) = self.cuda.as_ref() {
+            return cuda.cap();
+        }
         self.config.logical_max_seq_len
     }
 
     pub fn reset_cache(&mut self) {
+        #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+        if let Some(cuda) = self.cuda.as_mut() {
+            cuda.reset();
+        }
         static ZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let zero = *ZERO.get_or_init(|| super::quant::env_flag("SOFUU_KV_ZERO"));
         if zero {
@@ -1600,6 +1651,14 @@ impl TransformerModel {
 
     /// (n_layers * n_kv_heads, head_dim, max_seq_len) of the KV caches.
     pub fn kv_geom(&self) -> (usize, usize, usize) {
+        #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+        if let Some(cuda) = self.cuda.as_ref() {
+            return (
+                self.config.n_layers * self.config.n_kv_heads,
+                self.config.head_dim,
+                cuda.cap(),
+            );
+        }
         (
             self.config.n_layers * self.config.n_kv_heads,
             self.config.head_dim,
@@ -1613,6 +1672,13 @@ impl TransformerModel {
     /// armed on the CPU-only f16 lanes, where a restore would have to write both
     /// stores).
     pub fn kv_shadowed(&self) -> bool {
+        // CUDA owns a separate KV cache; the host arrays are not the history.
+        // Reporting "shadowed" makes prefix_cache refuse to snapshot/restore
+        // rows that the GPU attention never reads.
+        #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+        if self.cuda.is_some() {
+            return true;
+        }
         self.kv_f16 || self.k16_prefill
     }
 
@@ -1830,6 +1896,23 @@ impl TransformerModel {
         sink_tokens: usize,
         drop_tokens: usize,
     ) -> usize {
+        #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+        if self.cuda.is_some() {
+            // Real compaction means re-roping every surviving key on the
+            // device; v1 does not implement it. The one thing it must NOT do
+            // is return the input unchanged when the caller actually needs to
+            // drop rows: the caller's `while cur_pos >= window { compact }`
+            // loop would then spin forever at the cap. Say so and stop.
+            if drop_tokens == 0 || current_seq_len <= sink_tokens + drop_tokens {
+                return current_seq_len;
+            }
+            eprintln!(
+                "\x1b[31m[cuda] the {}-row device KV window is full and GPU compaction is not implemented; \
+                 raise --ctx (and SOFUU_CUDA_CTX) or start a new session\x1b[0m",
+                self.cuda.as_ref().map(|c| c.cap()).unwrap_or(0)
+            );
+            panic!("CUDA KV compaction is not implemented");
+        }
         if drop_tokens == 0 || current_seq_len <= sink_tokens + drop_tokens {
             return current_seq_len;
         }
@@ -1989,6 +2072,17 @@ impl TransformerModel {
         if tokens.is_empty() {
             return;
         }
+        #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+        if self.cuda.is_some() {
+            // The CUDA path is one token at a time for v1: a prompt token
+            // still runs the whole block stack on the device, so the KV is
+            // built exactly as decode expects it. Batched GEMM prefill is C3.
+            for &tok in tokens {
+                self.forward_impl(tok, start_pos, false);
+                start_pos += 1;
+            }
+            return;
+        }
         if tokens.len() == 1 {
             self.forward_prefill(tokens[0], start_pos);
             return;
@@ -2018,6 +2112,14 @@ impl TransformerModel {
                 }
             }
         }        if tokens.is_empty() {
+            return &self.logits;
+        }
+        #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+        if self.cuda.is_some() {
+            let last = tokens.len() - 1;
+            for (i, &tok) in tokens.iter().enumerate() {
+                self.forward_impl(tok, start_pos + i, i == last);
+            }
             return &self.logits;
         }
         if tokens.len() == 1 {
@@ -8110,6 +8212,23 @@ impl TransformerModel {
 
         // 1. Embedding lookup
         Self::lookup_embedding(&self.gguf, &self.token_embd, token_id, dim, &mut self.x);
+
+        // C2: when the CUDA decoder is armed it owns the whole block stack,
+        // including the KV cache. There is no partial fallback: the host KV is
+        // not being written, so a mid-generation switch to the CPU path would
+        // attend over an empty history. A device error is therefore fatal and
+        // says so instead of emitting plausible-looking logits.
+        #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+        if let Some(cuda) = self.cuda.as_mut() {
+            if let Err(e) = cuda.forward(&self.x, pos, compute_logits) {
+                eprintln!("\x1b[31m[cuda] forward failed at pos {pos}: {e}\x1b[0m");
+                panic!("CUDA forward failed");
+            }
+            if compute_logits {
+                self.logits.copy_from_slice(cuda.logits());
+            }
+            return;
+        }
 
         // 2. Transformer layers
         let __lt = if std::env::var_os("SOFUU_DEC_PROFILE").is_some() {

@@ -1531,7 +1531,15 @@ fn infer_gpu_backend_available() -> bool {
         // device exists.
         unsafe { sofuu_metal_available() }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+    {
+        // CUDA is opt-in (SOFUU_CUDA=1): a driver being present is not enough
+        // to change what an existing Linux+NVIDIA run does. The probe only
+        // dlopens libcuda and reads device 0; the model load does the real
+        // context/JIT work.
+        sofuu_core::infer::cuda::requested() && sofuu_core::infer::cuda::driver_present()
+    }
+    #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", not(target_os = "android")))))]
     {
         false
     }
@@ -1554,9 +1562,20 @@ fn infer_gpu_backend_available() -> bool {
 fn warn_gpu_layers_unavailable(requested: usize) {
     static WARNED: std::sync::Once = std::sync::Once::new();
     WARNED.call_once(|| {
+        let why = if cfg!(target_env = "musl")
+            && cfg!(target_os = "linux")
+            && !cfg!(target_os = "android")
+        {
+            "this Linux artifact is static musl and musl's dlopen is a stub, so libcuda.so.1 \
+             cannot be loaded — use the glibc GPU build (dist/kaggle/sofuu-linux-x86_64-gnu) for CUDA"
+        } else if cfg!(target_os = "linux") && !cfg!(target_os = "android") {
+            "CUDA was not requested or no NVIDIA driver/device is visible (set SOFUU_CUDA=1 to opt in)"
+        } else {
+            "the whole-layer GPU client is macOS/Metal only"
+        };
         eprintln!(
             "[sofuu] --gpu-layers {requested}: this build has no GPU backend for {} \
-             (the whole-layer GPU client is macOS/Metal only), so the request cannot be \
+             ({why}), so the request cannot be \
              honoured — using the CPU instead. Pass --cpu (or --gpu-layers 0) to make \
              that explicit and silence this warning.",
             std::env::consts::OS

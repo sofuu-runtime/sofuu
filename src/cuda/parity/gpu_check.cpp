@@ -420,6 +420,70 @@ void test_kv_write(void *fn, uint32_t &seed) {
     sofuu_cuda_ctx_free(g_ctx, dl);
 }
 
+void test_attn_decode(void *fn, uint32_t &seed) {
+    const int n_heads = 8, n_kv = 2, hd = 64, cap = 32, seq = 17;
+    const int cache_n = n_kv * cap * hd;
+    std::vector<float> q = random_vec(n_heads * hd, seed, -1.0f, 1.0f);
+    std::vector<float> k = random_vec(cache_n, seed, -1.0f, 1.0f);
+    std::vector<float> v = random_vec(cache_n, seed, -1.0f, 1.0f);
+    std::vector<float> got((size_t)(n_heads * hd), 0.0f);
+    std::vector<float> want((size_t)(n_heads * hd), 0.0f);
+    float scale = 1.0f / std::sqrt((float)hd);
+    sofuu_ref::attn_decode_ref(q.data(), k.data(), v.data(), want.data(),
+                               n_heads, n_kv, hd, seq, cap, scale);
+    unsigned long long dq = 0, dk = 0, dv = 0, dout = 0;
+    if (!alloc_upload(q.data(), q.size() * sizeof(float), &dq) ||
+        !alloc_upload(k.data(), k.size() * sizeof(float), &dk) ||
+        !alloc_upload(v.data(), v.size() * sizeof(float), &dv) ||
+        !alloc_only((unsigned long long)got.size() * sizeof(float), &dout)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    std::vector<void *> params = {&dq, &dk, &dv, &dout, (void *)&n_heads,
+                                  (void *)&n_kv, (void *)&hd, (void *)&seq,
+                                  (void *)&cap, (void *)&scale};
+    bool ok = launch(fn, (unsigned)n_heads, 256, params) &&
+              download(dout, got.data(), got.size() * sizeof(float));
+    double max_err = 0.0;
+    for (size_t i = 0; i < got.size(); ++i)
+        max_err = std::fmax(max_err,
+                            std::fabs((double)got[i] - (double)want[i]));
+    report("attn_decode", ok && max_err <= 5e-5, max_err, 5e-5,
+           (double)want[0]);
+    sofuu_cuda_ctx_free(g_ctx, dq);
+    sofuu_cuda_ctx_free(g_ctx, dk);
+    sofuu_cuda_ctx_free(g_ctx, dv);
+    sofuu_cuda_ctx_free(g_ctx, dout);
+}
+
+void test_add(void *fn, uint32_t &seed) {
+    const int n = 4096;
+    std::vector<float> a = random_vec(n, seed, -2.0f, 2.0f);
+    std::vector<float> b = random_vec(n, seed, -2.0f, 2.0f);
+    std::vector<float> got((size_t)n, 0.0f), want((size_t)n, 0.0f);
+    sofuu_ref::add_ref(a.data(), b.data(), want.data(), n);
+    unsigned long long da = 0, db = 0, dy = 0;
+    if (!alloc_upload(a.data(), a.size() * sizeof(float), &da) ||
+        !alloc_upload(b.data(), b.size() * sizeof(float), &db) ||
+        !alloc_only((unsigned long long)n * sizeof(float), &dy)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    std::vector<void *> params = {&da, &db, &dy, (void *)&n};
+    bool ok = launch(fn, (unsigned)((n + 255) / 256), 256, params) &&
+              download(dy, got.data(), got.size() * sizeof(float));
+    double max_err = 0.0;
+    for (int i = 0; i < n; ++i)
+        max_err = std::fmax(max_err,
+                            std::fabs((double)got[(size_t)i] - (double)want[(size_t)i]));
+    report("add", ok && max_err == 0.0, max_err, 0.0, (double)want[0]);
+    sofuu_cuda_ctx_free(g_ctx, da);
+    sofuu_cuda_ctx_free(g_ctx, db);
+    sofuu_cuda_ctx_free(g_ctx, dy);
+}
+
 std::string read_file(const char *path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return std::string();
@@ -476,6 +540,7 @@ int main(int argc, char **argv) {
 
     void *f_q8 = nullptr, *f_q4 = nullptr, *f_q6 = nullptr, *f_f32 = nullptr;
     void *f_rms = nullptr, *f_swi = nullptr, *f_rope = nullptr, *f_kv = nullptr;
+    void *f_attn = nullptr, *f_add = nullptr;
     if (!get_function("sofuu_gemv_q8_0", &f_q8) ||
         !get_function("sofuu_gemv_q4_k", &f_q4) ||
         !get_function("sofuu_gemv_q6_k", &f_q6) ||
@@ -483,7 +548,9 @@ int main(int argc, char **argv) {
         !get_function("sofuu_rmsnorm", &f_rms) ||
         !get_function("sofuu_swiglu", &f_swi) ||
         !get_function("sofuu_rope_f32", &f_rope) ||
-        !get_function("sofuu_kv_write_f32", &f_kv)) {
+        !get_function("sofuu_kv_write_f32", &f_kv) ||
+        !get_function("sofuu_attn_decode_f32", &f_attn) ||
+        !get_function("sofuu_add_f32", &f_add)) {
         return 1;
     }
 
@@ -496,6 +563,8 @@ int main(int argc, char **argv) {
     test_swiglu(f_swi, seed);
     test_rope(f_rope, seed);
     test_kv_write(f_kv, seed);
+    test_attn_decode(f_attn, seed);
+    test_add(f_add, seed);
 
     sofuu_cuda_ctx_destroy(g_ctx);
     sofuu_cuda_driver_close(g_drv);

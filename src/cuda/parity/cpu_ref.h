@@ -217,6 +217,57 @@ inline void kv_write_ref(float *k_cache, float *v_cache, const float *k,
     }
 }
 
+// Decode attention for one token: softmax(q·K^T * scale) · V.
+// GQA maps query head h to KV head h / (n_heads / n_kv_heads). Scores and the
+// accumulator are double so this is a numerical reference, not a mirror.
+inline void attn_decode_ref(const float *q, const float *k_cache,
+                            const float *v_cache, float *out, int n_heads,
+                            int n_kv_heads, int head_dim, int seq_len, int cap,
+                            float scale) {
+    if (n_kv_heads <= 0 || head_dim <= 0 || head_dim > 256 || seq_len <= 0 ||
+        seq_len > cap || (n_heads % n_kv_heads) != 0) {
+        return;
+    }
+    const int group = n_heads / n_kv_heads;
+    for (int h = 0; h < n_heads; ++h) {
+        const int kvh = h / group;
+        const float *qv = q + (size_t)h * (size_t)head_dim;
+        const float *kb =
+            k_cache + (size_t)kvh * (size_t)cap * (size_t)head_dim;
+        const float *vb =
+            v_cache + (size_t)kvh * (size_t)cap * (size_t)head_dim;
+        double mx = -1e300;
+        for (int p = 0; p < seq_len; ++p) {
+            double dot = 0.0;
+            for (int d = 0; d < head_dim; ++d)
+                dot += (double)qv[d] *
+                       (double)kb[(size_t)p * (size_t)head_dim + (size_t)d];
+            double score = dot * (double)scale;
+            if (score > mx) mx = score;
+        }
+        double acc[256] = {0.0};
+        double sum = 0.0;
+        for (int p = 0; p < seq_len; ++p) {
+            double dot = 0.0;
+            for (int d = 0; d < head_dim; ++d)
+                dot += (double)qv[d] *
+                       (double)kb[(size_t)p * (size_t)head_dim + (size_t)d];
+            double w = std::exp(dot * (double)scale - mx);
+            sum += w;
+            for (int d = 0; d < head_dim; ++d)
+                acc[d] += w * (double)vb[(size_t)p * (size_t)head_dim +
+                                         (size_t)d];
+        }
+        for (int d = 0; d < head_dim; ++d)
+            out[(size_t)h * (size_t)head_dim + (size_t)d] =
+                (float)(sum > 0.0 ? acc[d] / sum : 0.0);
+    }
+}
+
+inline void add_ref(const float *a, const float *b, float *y, int n) {
+    for (int i = 0; i < n; ++i) y[i] = a[i] + b[i];
+}
+
 // Deterministic fixture generation shared by both harnesses.
 inline uint32_t lcg_next(uint32_t &state) {
     state = state * 1664525u + 1013904223u;

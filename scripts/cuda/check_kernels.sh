@@ -55,14 +55,15 @@ fi
 # 3. Entry manifest on the artifact that actually ships.
 missing=0
 for k in sofuu_gemv_q8_0 sofuu_gemv_q4_k sofuu_gemv_q6_k sofuu_gemv_f32 \
-         sofuu_rmsnorm sofuu_swiglu sofuu_rope_f32 sofuu_kv_write_f32; do
+         sofuu_rmsnorm sofuu_swiglu sofuu_rope_f32 sofuu_kv_write_f32 \
+         sofuu_attn_decode_f32 sofuu_add_f32; do
     grep -Eq "\.entry[[:space:]]+$k\(" "$CUDA/kernels.ptx" || {
         echo "[FAIL] missing PTX entry $k" >&2
         missing=1
     }
 done
 if [[ "$missing" -eq 0 ]]; then
-    echo "[PASS] 8 kernel entries present in kernels.ptx"
+    echo "[PASS] 10 kernel entries present in kernels.ptx"
     pass=$((pass + 1))
 else
     exit 1

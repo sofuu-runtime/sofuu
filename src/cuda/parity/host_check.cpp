@@ -217,6 +217,31 @@ void test_kv_write(uint32_t &seed) {
     report("kv_write", err == 0.0, err, 0.0, 0.0);
 }
 
+void test_attn_decode(uint32_t &seed) {
+    const int n_heads = 8, n_kv = 2, hd = 64, cap = 32, seq = 17;
+    const int cache_n = n_kv * cap * hd;
+    std::vector<float> q = random_vec(n_heads * hd, seed, -1.0f, 1.0f);
+    std::vector<float> k = random_vec(cache_n, seed, -1.0f, 1.0f);
+    std::vector<float> v = random_vec(cache_n, seed, -1.0f, 1.0f);
+    std::vector<float> got((size_t)(n_heads * hd)), want((size_t)(n_heads * hd));
+    float scale = 1.0f / std::sqrt((float)hd);
+    sofuu_host_attn_decode(q.data(), k.data(), v.data(), got.data(), n_heads,
+                           n_kv, hd, seq, cap, scale);
+    sofuu_ref::attn_decode_ref(q.data(), k.data(), v.data(), want.data(),
+                               n_heads, n_kv, hd, seq, cap, scale);
+    check_vec("attn_decode", got.data(), want.data(), n_heads * hd, 2e-5, 2e-6);
+}
+
+void test_add(uint32_t &seed) {
+    const int n = 4096;
+    std::vector<float> a = random_vec(n, seed, -2.0f, 2.0f);
+    std::vector<float> b = random_vec(n, seed, -2.0f, 2.0f);
+    std::vector<float> got((size_t)n), want((size_t)n);
+    sofuu_host_add(a.data(), b.data(), got.data(), n);
+    sofuu_ref::add_ref(a.data(), b.data(), want.data(), n);
+    check_vec("add", got.data(), want.data(), n, 0.0, 0.0);
+}
+
 } // namespace
 
 int main(void) {
@@ -230,6 +255,8 @@ int main(void) {
     test_swiglu(seed);
     test_rope(seed);
     test_kv_write(seed);
+    test_attn_decode(seed);
+    test_add(seed);
     if (g_failures == 0) {
         std::printf("RESULT: PASS (all host kernel references match)\n");
         return 0;

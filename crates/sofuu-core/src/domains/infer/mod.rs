@@ -6,6 +6,8 @@
 pub mod block_graph;
 pub mod continuous;
 pub mod cuda;
+#[cfg(all(target_os = "linux", target_env = "gnu", not(target_os = "android")))]
+pub mod cuda_model;
 pub mod dynamic_ffn;
 pub mod gguf;
 pub mod gptx3;

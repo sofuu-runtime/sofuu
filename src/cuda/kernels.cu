@@ -377,6 +377,110 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(128) void sofuu_rope_f32(float *x, c
     }
 }
 
+// ── Decode attention (f32, GQA, one block per query head) ─────────────────
+//
+// Two passes over the cached keys: the first finds the max score, the second
+// accumulates exp(score-max)*V. That is one extra dot product per position and
+// no per-step rescaling of the accumulator, which keeps the numerics a plain
+// softmax instead of an online one. `seq_len` is the number of cached rows
+// (pos+1); the kernel never reads past it.
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
+void sofuu_attn_decode_f32(const float *q, const float *k_cache,
+                           const float *v_cache, float *out, int n_heads,
+                           int n_kv_heads, int head_dim, int seq_len, int cap,
+                           float scale) {
+    int h = (int)sofuu_ctaid_x();
+    unsigned int tid = sofuu_tid_x();
+    unsigned int stride = sofuu_ntid_x();
+    if (h >= n_heads || n_kv_heads <= 0 || head_dim <= 0 || head_dim > 256 ||
+        seq_len <= 0 || seq_len > cap || (n_heads % n_kv_heads) != 0) {
+        return;
+    }
+    int group = n_heads / n_kv_heads;
+    int kvh = h / group;
+    if (kvh >= n_kv_heads) return;
+
+    const float *qv = q + (unsigned long long)h * (unsigned long long)head_dim;
+    const float *kbase =
+        k_cache + (unsigned long long)kvh * (unsigned long long)cap *
+                      (unsigned long long)head_dim;
+    const float *vbase =
+        v_cache + (unsigned long long)kvh * (unsigned long long)cap *
+                      (unsigned long long)head_dim;
+
+    SOFUU_SHARED float red[8];
+    SOFUU_SHARED float acc[256];
+    SOFUU_SHARED float s_max;
+    SOFUU_SHARED float s_w;
+    SOFUU_SHARED float s_sum;
+
+    if (tid == 0u) s_max = -3.402823466e38f;
+    for (int d = (int)tid; d < head_dim; d += (int)stride) acc[d] = 0.0f;
+    sofuu_bar_sync();
+
+    // Pass 1: max score.
+    for (int p = 0; p < seq_len; ++p) {
+        float part = 0.0f;
+        if ((int)tid < head_dim) {
+            part = qv[tid] *
+                   kbase[(unsigned long long)p * (unsigned long long)head_dim +
+                         (unsigned long long)tid];
+        }
+        float sum = sofuu_block_reduce(part, red);
+        if (tid == 0u) {
+            float score = sum * scale;
+            if (score > s_max) s_max = score;
+        }
+        // The reducer reuses `red`; a second barrier keeps the next iteration
+        // from overwriting it while warp 0 is still reducing.
+        sofuu_bar_sync();
+    }
+
+    // Pass 2: sum(exp(score-max) * V).
+    if (tid == 0u) s_sum = 0.0f;
+    sofuu_bar_sync();
+    for (int p = 0; p < seq_len; ++p) {
+        float part = 0.0f;
+        if ((int)tid < head_dim) {
+            part = qv[tid] *
+                   kbase[(unsigned long long)p * (unsigned long long)head_dim +
+                         (unsigned long long)tid];
+        }
+        float sum = sofuu_block_reduce(part, red);
+        if (tid == 0u) {
+            float w = sofuu_exp(sum * scale - s_max);
+            s_sum += w;
+            s_w = w;
+        }
+        sofuu_bar_sync();
+        float w = s_w;
+        for (int d = (int)tid; d < head_dim; d += (int)stride) {
+            acc[d] += w * vbase[(unsigned long long)p *
+                                    (unsigned long long)head_dim +
+                                (unsigned long long)d];
+        }
+        sofuu_bar_sync();
+    }
+
+    if (tid == 0u) s_w = (s_sum > 0.0f) ? 1.0f / s_sum : 0.0f;
+    sofuu_bar_sync();
+    float inv = s_w;
+    for (int d = (int)tid; d < head_dim; d += (int)stride) {
+        out[(unsigned long long)h * (unsigned long long)head_dim +
+            (unsigned long long)d] = acc[d] * inv;
+    }
+}
+
+// ── Residual add: y = a + b (in-place when y == a) ─────────────────────────
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
+void sofuu_add_f32(const float *a, const float *b, float *y, int n) {
+    unsigned int tid = sofuu_tid_x();
+    unsigned int stride = sofuu_ntid_x();
+    int base = (int)sofuu_ctaid_x() * (int)stride;
+    int i = base + (int)tid;
+    if (i < n) y[i] = a[i] + b[i];
+}
+
 // ── KV cache write (f32), one block per KV head ────────────────────────────
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(128) void sofuu_kv_write_f32(float *k_cache, float *v_cache,
                                                 const float *k, const float *v,
@@ -497,5 +601,61 @@ extern "C" void sofuu_host_kv_write(float *k_cache, float *v_cache,
             v_cache[slot + (unsigned long long)d] = vrow[d];
         }
     }
+}
+
+extern "C" void sofuu_host_attn_decode(const float *q, const float *k_cache,
+                                       const float *v_cache, float *out,
+                                       int n_heads, int n_kv_heads, int head_dim,
+                                       int seq_len, int cap, float scale) {
+    if (n_kv_heads <= 0 || head_dim <= 0 || head_dim > 256 || seq_len <= 0 ||
+        seq_len > cap || (n_heads % n_kv_heads) != 0) {
+        return;
+    }
+    int group = n_heads / n_kv_heads;
+    for (int h = 0; h < n_heads; ++h) {
+        int kvh = h / group;
+        const float *qv = q + (unsigned long long)h * (unsigned long long)head_dim;
+        const float *kb = k_cache + (unsigned long long)kvh *
+                                        (unsigned long long)cap *
+                                        (unsigned long long)head_dim;
+        const float *vb = v_cache + (unsigned long long)kvh *
+                                        (unsigned long long)cap *
+                                        (unsigned long long)head_dim;
+        double mx = -1e300;
+        for (int p = 0; p < seq_len; ++p) {
+            double dot = 0.0;
+            for (int d = 0; d < head_dim; ++d)
+                dot += (double)qv[d] * (double)kb[(unsigned long long)p *
+                                                      (unsigned long long)head_dim +
+                                                  (unsigned long long)d];
+            double score = dot * (double)scale;
+            if (score > mx) mx = score;
+        }
+        double acc[256];
+        for (int d = 0; d < head_dim; ++d) acc[d] = 0.0;
+        double sum = 0.0;
+        for (int p = 0; p < seq_len; ++p) {
+            double dot = 0.0;
+            for (int d = 0; d < head_dim; ++d)
+                dot += (double)qv[d] * (double)kb[(unsigned long long)p *
+                                                      (unsigned long long)head_dim +
+                                                  (unsigned long long)d];
+            double w = exp(dot * (double)scale - mx);
+            sum += w;
+            for (int d = 0; d < head_dim; ++d)
+                acc[d] += w * (double)vb[(unsigned long long)p *
+                                              (unsigned long long)head_dim +
+                                          (unsigned long long)d];
+        }
+        for (int d = 0; d < head_dim; ++d)
+            out[(unsigned long long)h * (unsigned long long)head_dim +
+                (unsigned long long)d] =
+                (float)(sum > 0.0 ? acc[d] / sum : 0.0);
+    }
+}
+
+extern "C" void sofuu_host_add(const float *a, const float *b, float *y,
+                               int n) {
+    for (int i = 0; i < n; ++i) y[i] = a[i] + b[i];
 }
 #endif // SOFUU_CUDA_HOST

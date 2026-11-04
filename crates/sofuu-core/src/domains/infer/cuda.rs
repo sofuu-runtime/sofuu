@@ -21,7 +21,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 /// Every kernel name the checked-in PTX must export. Kept in one place so the
 /// generator script, the Rust init check and the tests cannot drift.
-pub const PTX_ENTRIES: [&str; 8] = [
+pub const PTX_ENTRIES: [&str; 10] = [
     "sofuu_gemv_q8_0",
     "sofuu_gemv_q4_k",
     "sofuu_gemv_q6_k",
@@ -30,6 +30,8 @@ pub const PTX_ENTRIES: [&str; 8] = [
     "sofuu_swiglu",
     "sofuu_rope_f32",
     "sofuu_kv_write_f32",
+    "sofuu_attn_decode_f32",
+    "sofuu_add_f32",
 ];
 
 /// Weight layouts the C1 kernels cover. `block_bytes` is the GGML on-disk
@@ -160,6 +162,64 @@ pub fn validate_kv_write(
     if k_bytes < src || v_bytes < src {
         return Err(CudaError(format!(
             "kv_write needs {src} bytes per source row set, got {k_bytes} and {v_bytes}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a decode-attention launch. The kernel returns early on bad shapes
+/// (leaving `out` untouched), so a caller that skips this check gets stale
+/// activations rather than an error — check here, where the shapes are known.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_attn_decode(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    cap: usize,
+    q_bytes: usize,
+    k_bytes: usize,
+    v_bytes: usize,
+    out_bytes: usize,
+) -> Result<(), CudaError> {
+    if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 || cap == 0 {
+        return Err(CudaError(
+            "attn_decode needs non-zero n_heads, n_kv_heads, head_dim and cap".into(),
+        ));
+    }
+    if head_dim > 256 {
+        return Err(CudaError(format!(
+            "attn_decode head_dim {head_dim} exceeds the 256-thread block"
+        )));
+    }
+    if n_heads % n_kv_heads != 0 {
+        return Err(CudaError(format!(
+            "attn_decode n_heads {n_heads} is not a multiple of n_kv_heads {n_kv_heads}"
+        )));
+    }
+    if seq_len == 0 || seq_len > cap {
+        return Err(CudaError(format!(
+            "attn_decode seq_len {seq_len} is outside a cache of {cap} rows"
+        )));
+    }
+    let f32b = std::mem::size_of::<f32>();
+    let q_need = n_heads
+        .checked_mul(head_dim)
+        .and_then(|v| v.checked_mul(f32b))
+        .ok_or_else(|| CudaError("attn_decode q shape overflow".into()))?;
+    let cache_need = n_kv_heads
+        .checked_mul(cap)
+        .and_then(|v| v.checked_mul(head_dim))
+        .and_then(|v| v.checked_mul(f32b))
+        .ok_or_else(|| CudaError("attn_decode cache shape overflow".into()))?;
+    if q_bytes < q_need || out_bytes < q_need {
+        return Err(CudaError(format!(
+            "attn_decode needs {q_need} bytes for q/out, got {q_bytes} and {out_bytes}"
+        )));
+    }
+    if k_bytes < cache_need || v_bytes < cache_need {
+        return Err(CudaError(format!(
+            "attn_decode needs {cache_need} bytes per KV cache, got {k_bytes} and {v_bytes}"
         )));
     }
     Ok(())
@@ -397,6 +457,15 @@ mod imp {
         funcs: HashMap<&'static str, *mut c_void>,
         info: DeviceInfo,
     }
+
+    // SAFETY: the handle is a driver context plus a function table, both
+    // immutable after try_init. CUDA contexts are current per-thread, so the
+    // only safe way to use this from another thread is to make the context
+    // current there first — the engine has no cuCtxSetCurrent call. CudaModel
+    // records its owner thread and refuses a forward elsewhere; model load and
+    // generation run on one thread in every CLI path. The impl exists because
+    // InferEngine is moved as a value, not because cross-thread use is allowed.
+    unsafe impl Send for CudaEngine {}
 
     impl CudaEngine {
         /// Initialise driver → device → context → PTX module → entry points.
@@ -751,6 +820,93 @@ mod imp {
             )
         }
 
+        /// Decode attention for one token over `seq_len` cached rows.
+        /// `q` is [n_heads, head_dim], `k_cache`/`v_cache` are
+        /// [n_kv_heads, cap, head_dim], `out` is [n_heads, head_dim].
+        #[allow(clippy::too_many_arguments)]
+        pub fn attn_decode(
+            &self,
+            q: DeviceBuf,
+            k_cache: DeviceBuf,
+            v_cache: DeviceBuf,
+            out: DeviceBuf,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            seq_len: usize,
+            cap: usize,
+            scale: f32,
+        ) -> Result<(), CudaError> {
+            validate_attn_decode(
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len,
+                cap,
+                q.bytes,
+                k_cache.bytes,
+                v_cache.bytes,
+                out.bytes,
+            )?;
+            let mut qp = q.ptr;
+            let mut kc = k_cache.ptr;
+            let mut vc = v_cache.ptr;
+            let mut op = out.ptr;
+            let mut nh = n_heads as i32;
+            let mut nk = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut sl = seq_len as i32;
+            let mut c = cap as i32;
+            let mut s = scale;
+            let mut params: [*mut c_void; 10] = [
+                &mut qp as *mut u64 as *mut c_void,
+                &mut kc as *mut u64 as *mut c_void,
+                &mut vc as *mut u64 as *mut c_void,
+                &mut op as *mut u64 as *mut c_void,
+                &mut nh as *mut i32 as *mut c_void,
+                &mut nk as *mut i32 as *mut c_void,
+                &mut hd as *mut i32 as *mut c_void,
+                &mut sl as *mut i32 as *mut c_void,
+                &mut c as *mut i32 as *mut c_void,
+                &mut s as *mut f32 as *mut c_void,
+            ];
+            self.launch(
+                "sofuu_attn_decode_f32",
+                (n_heads as u32, 1, 1),
+                (256, 1, 1),
+                &mut params,
+            )
+        }
+
+        /// y = a + b, elementwise (in-place when `y` aliases `a`).
+        pub fn add(&self, a: DeviceBuf, b: DeviceBuf, y: DeviceBuf, n: usize) -> Result<(), CudaError> {
+            let need = n
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| CudaError("add length overflow".into()))?;
+            if a.bytes < need || b.bytes < need || y.bytes < need {
+                return Err(CudaError(format!(
+                    "add buffers too small for {n} floats: a {} b {} y {}",
+                    a.bytes, b.bytes, y.bytes
+                )));
+            }
+            let mut ap = a.ptr;
+            let mut bp = b.ptr;
+            let mut yp = y.ptr;
+            let mut nn = n as i32;
+            let mut params: [*mut c_void; 4] = [
+                &mut ap as *mut u64 as *mut c_void,
+                &mut bp as *mut u64 as *mut c_void,
+                &mut yp as *mut u64 as *mut c_void,
+                &mut nn as *mut i32 as *mut c_void,
+            ];
+            self.launch(
+                "sofuu_add_f32",
+                (((n + 255) / 256) as u32, 1, 1),
+                (256, 1, 1),
+                &mut params,
+            )
+        }
+
         /// Host-side convenience used by integration tests: upload, run, read
         /// back. Not on the model's hot path.
         pub fn gemv_host(
@@ -917,6 +1073,33 @@ mod imp {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }
 
+        #[allow(clippy::too_many_arguments)]
+        pub fn attn_decode(
+            &self,
+            _q: DeviceBuf,
+            _kc: DeviceBuf,
+            _vc: DeviceBuf,
+            _out: DeviceBuf,
+            _n_heads: usize,
+            _n_kv_heads: usize,
+            _head_dim: usize,
+            _seq_len: usize,
+            _cap: usize,
+            _scale: f32,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn add(
+            &self,
+            _a: DeviceBuf,
+            _b: DeviceBuf,
+            _y: DeviceBuf,
+            _n: usize,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
         pub fn gemv_host(
             &self,
             _quant: Quant,
@@ -927,6 +1110,22 @@ mod imp {
         ) -> Result<Vec<f32>, CudaError> {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }
+    }
+}
+
+/// True when the operator asked for CUDA (`SOFUU_CUDA=1|true|on|yes`).
+///
+/// This is the opt-in, not the availability probe: unset means "leave the
+/// model on the CPU", which keeps a new backend from silently changing what
+/// every existing Linux+NVIDIA run does. `SOFUU_CUDA=0` stays the explicit
+/// kill switch. `driver_present()` answers the other half (is there a device).
+pub fn requested() -> bool {
+    match std::env::var("SOFUU_CUDA") {
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            !matches!(t.as_str(), "0" | "false" | "off" | "no" | "")
+        }
+        Err(_) => false,
     }
 }
 
@@ -1038,6 +1237,30 @@ mod tests {
         assert!(validate_kv_write(0, 0, 4, 8, 256, 256, 64, 64).is_err());
         assert!(validate_kv_write(0, 2, 0, 8, 256, 256, 64, 64).is_err());
         assert!(validate_kv_write(0, 2, 4, 0, 256, 256, 64, 64).is_err());
+    }
+
+    #[test]
+    fn attn_decode_bounds_are_refused_before_the_driver() {
+        // 8 query heads, 2 KV heads, head_dim 64, seq 32 of a 32-row cache.
+        let q = 8 * 64 * 4;
+        let cache = 2 * 32 * 64 * 4;
+        assert!(validate_attn_decode(8, 2, 64, 32, 32, q, cache, cache, q).is_ok());
+
+        // A sequence longer than the cache would read rows that were never written.
+        let e = validate_attn_decode(8, 2, 64, 33, 32, q, cache, cache, q).unwrap_err();
+        assert!(e.0.contains("outside a cache"), "{}", e.0);
+
+        // GQA must divide evenly or head -> kv-head mapping is undefined.
+        let e = validate_attn_decode(8, 3, 64, 32, 32, q, cache, cache, q).unwrap_err();
+        assert!(e.0.contains("not a multiple"), "{}", e.0);
+
+        // The block is 256 threads; a wider head would index past its shared array.
+        let e = validate_attn_decode(8, 2, 512, 32, 32, q, cache, cache, q).unwrap_err();
+        assert!(e.0.contains("head_dim"), "{}", e.0);
+
+        // Short KV buffers are caught here, not by the kernel's early return.
+        let e = validate_attn_decode(8, 2, 64, 32, 32, q, cache - 4, cache, q).unwrap_err();
+        assert!(e.0.contains("KV cache"), "{}", e.0);
     }
 
     #[test]

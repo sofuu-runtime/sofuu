@@ -531,6 +531,45 @@ void bench_gemv(const char *name, void *fn, int kind, int rows, int cols,
     sofuu_cuda_ctx_free(g_ctx, dy);
 }
 
+// Raw device-memory control: c = a + b reads 8 B and writes 4 B per element.
+// If this is also ~50 GB/s, the instance's memory subsystem is capped and the
+// GEMV numbers cannot be blamed on kernel layout.
+void bench_add(void *fn, int n, int iters, uint32_t &seed) {
+    std::vector<float> a = random_vec(n, seed, -1.0f, 1.0f);
+    std::vector<float> b = random_vec(n, seed, -1.0f, 1.0f);
+    unsigned long long da = 0, db = 0, dy = 0;
+    if (!alloc_upload(a.data(), a.size() * sizeof(float), &da) ||
+        !alloc_upload(b.data(), b.size() * sizeof(float), &db) ||
+        !alloc_only((unsigned long long)n * sizeof(float), &dy)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    std::vector<void *> params = {&da, &db, &dy, (void *)&n};
+    unsigned grid = (unsigned)((n + 255) / 256);
+    for (int i = 0; i < 2; ++i)
+        if (!launch_async(fn, grid, 256, params)) return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
+        fail_msg("add warmup sync");
+        return;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i)
+        if (!launch_async(fn, grid, 256, params)) return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
+        fail_msg("add bench sync");
+        return;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double sec = std::chrono::duration<double>(t1 - t0).count();
+    double bytes = (double)n * 12.0 * (double)iters;
+    std::printf("[bench] add_f32   %d floats  %.1f GB/s  %.3f ms/launch\n", n,
+                bytes / sec / 1e9, sec * 1000.0 / (double)iters);
+    sofuu_cuda_ctx_free(g_ctx, da);
+    sofuu_cuda_ctx_free(g_ctx, db);
+    sofuu_cuda_ctx_free(g_ctx, dy);
+}
+
 // ── Elementwise tests ──────────────────────────────────────────────────────
 void test_rmsnorm(void *fn, uint32_t &seed) {
     const int n = 1024;
@@ -833,6 +872,7 @@ int main(int argc, char **argv) {
     bench_gemv("gemv_q4_k", f_q4, 1, 8192, 2048, 40, seed);
     bench_gemv("gemv_q6_k", f_q6, 2, 8192, 2048, 30, seed);
     bench_gemv("gemv_f32", f_f32, 3, 8192, 2048, 8, seed);
+    bench_add(f_add, 64 * 1024 * 1024, 5, seed);
 
     sofuu_cuda_ctx_destroy(g_ctx);
     sofuu_cuda_driver_close(g_drv);

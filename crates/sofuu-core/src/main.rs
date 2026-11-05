@@ -3394,7 +3394,12 @@ fn main() -> ExitCode {
             } else {
                 "⚡ Sofuu CPU Inference Engine"
             };
-            eprintln!("\x1b[36m{}\x1b[0m — loading {}...", engine_type, model_path);
+            eprintln!(
+                "\x1b[36m{}\x1b[0m rev {} — loading {}...",
+                engine_type,
+                env!("SOFUU_BUILD"),
+                model_path
+            );
             let t0 = std::time::Instant::now();
             // P7 ring-KV (long-context §8): --kivi loads the CPU engine with
             // a ringed f32 KV cache — the quantized streams carry positions

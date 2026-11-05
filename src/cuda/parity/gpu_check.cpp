@@ -867,12 +867,15 @@ int main(int argc, char **argv) {
     test_rmsnorm_batch(f_rms_b, seed);
     test_attn_prefill(f_attn_p, seed);
 
+    // The idle T4 sits at 300 MHz SM / 405 MHz memory; a 15 ms benchmark
+    // measures the ramp, not the kernel. Hold a sustained 64M-float add for
+    // ~0.6 s first, then benchmark at boost clocks.
+    bench_add(f_add, 64 * 1024 * 1024, 200, seed);
     // Kernel-only throughput, using the model's 8192x2048 FFN shape.
-    bench_gemv("gemv_q8_0", f_q8, 0, 8192, 2048, 20, seed);
-    bench_gemv("gemv_q4_k", f_q4, 1, 8192, 2048, 40, seed);
-    bench_gemv("gemv_q6_k", f_q6, 2, 8192, 2048, 30, seed);
-    bench_gemv("gemv_f32", f_f32, 3, 8192, 2048, 8, seed);
-    bench_add(f_add, 64 * 1024 * 1024, 5, seed);
+    bench_gemv("gemv_q8_0", f_q8, 0, 8192, 2048, 200, seed);
+    bench_gemv("gemv_q4_k", f_q4, 1, 8192, 2048, 400, seed);
+    bench_gemv("gemv_q6_k", f_q6, 2, 8192, 2048, 300, seed);
+    bench_gemv("gemv_f32", f_f32, 3, 8192, 2048, 80, seed);
 
     sofuu_cuda_ctx_destroy(g_ctx);
     sofuu_cuda_driver_close(g_drv);

@@ -1864,8 +1864,10 @@ mod tests {
         }
     }
 
-    /// The eight GEMV/prefill kernels declare a four-block occupancy floor.
-    /// If the PTX loses it, the launch-bounds edit that put it there was
+    /// The GEMV/prefill kernels declare an occupancy floor. The decode q4_K
+    /// and q6_K kernels ask for six resident blocks (they pinned the
+    /// four-block cap with a deeper unroll); the rest ask for four. If the PTX
+    /// loses a directive, the launch-bounds edit that put it there was
     /// silently dropped and the JIT is free to choose a register count that
     /// leaves the SMs under-occupied.
     #[test]
@@ -1873,15 +1875,15 @@ mod tests {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src/cuda/kernels.ptx");
         let ptx = std::fs::read_to_string(&path).expect("read kernels.ptx");
-        for name in [
-            "sofuu_gemv_q8_0",
-            "sofuu_gemv_q4_k",
-            "sofuu_gemv_q6_k",
-            "sofuu_gemv_f32",
-            "sofuu_gemm_q4_k_b8",
-            "sofuu_gemm_q6_k_b8",
-            "sofuu_gemm_q8_0_b8",
-            "sofuu_gemm_f32_b8",
+        for (name, floor) in [
+            ("sofuu_gemv_q8_0", 4),
+            ("sofuu_gemv_q4_k", 6),
+            ("sofuu_gemv_q6_k", 6),
+            ("sofuu_gemv_f32", 4),
+            ("sofuu_gemm_q4_k_b8", 4),
+            ("sofuu_gemm_q6_k_b8", 4),
+            ("sofuu_gemm_q8_0_b8", 4),
+            ("sofuu_gemm_f32_b8", 4),
         ] {
             let start = ptx
                 .find(&format!(".entry {name}("))
@@ -1889,9 +1891,9 @@ mod tests {
             let body = ptx[start..].find('{').map(|i| start + i).unwrap_or(start);
             let window = &ptx[start..(body + 200).min(ptx.len())];
             assert!(
-                window.contains(".minnctapersm 4"),
-                "{name} has no .minnctapersm 4: regenerate with scripts/cuda/gen_ptx.sh \
-                 after giving the kernel a SOFUU_LAUNCH_BOUNDS_MIN(256, 4)"
+                window.contains(&format!(".minnctapersm {floor}")),
+                "{name} has no .minnctapersm {floor}: regenerate with scripts/cuda/gen_ptx.sh \
+                 after giving the kernel a SOFUU_LAUNCH_BOUNDS_MIN(256, {floor})"
             );
         }
     }

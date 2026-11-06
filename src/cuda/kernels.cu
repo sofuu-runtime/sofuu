@@ -393,7 +393,11 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4) void sofuu_gemv_q8_0(con
 // q4_K: a warp covers one 256-value super-block per iteration; lane l owns the
 // eight values of sub-block l/4 at offset (l%4)*8. Lanes 0-3 and 4-7 read the
 // same 32 qs bytes (low/high nibble), which the coalescer merges.
-extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4) void sofuu_gemv_q4_k(const unsigned char *__restrict__ w,
+//
+// Two super-blocks in flight, not four: the T4 gate measured 64 registers
+// (the four-block cap) with four, and both q4_K and q6_K pinned that cap.
+// Halving the live activation set trades per-warp ILP for resident warps.
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 6) void sofuu_gemv_q4_k(const unsigned char *__restrict__ w,
                                              const float *__restrict__ x, float *__restrict__ y,
                                              int rows, int cols) {
     unsigned int tid = sofuu_tid_x();
@@ -408,27 +412,19 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4) void sofuu_gemv_q4_k(con
     int l0 = (lane & 3) << 3;
     float acc = 0.0f;
     int bi = 0;
-    // Four independent super-blocks in flight. qs is 16-byte aligned inside
-    // every 144-byte block, so each lane's 8-byte load is naturally aligned;
-    // the scale/min bytes share one 32-byte sector with d/dmin.
-    for (; bi + 4 <= nb; bi += 4) {
+    // qs is 16-byte aligned inside every 144-byte block, so each lane's
+    // 8-byte load is naturally aligned; the scale/min bytes share one 32-byte
+    // sector with d/dmin.
+    for (; bi + 2 <= nb; bi += 2) {
         const sofuu_block_q4_K *b0 =
             (const sofuu_block_q4_K *)(roww + (unsigned long long)(bi + 0) * 144);
         const sofuu_block_q4_K *b1 =
             (const sofuu_block_q4_K *)(roww + (unsigned long long)(bi + 1) * 144);
-        const sofuu_block_q4_K *b2 =
-            (const sofuu_block_q4_K *)(roww + (unsigned long long)(bi + 2) * 144);
-        const sofuu_block_q4_K *b3 =
-            (const sofuu_block_q4_K *)(roww + (unsigned long long)(bi + 3) * 144);
-        float xr0[8], xr1[8], xr2[8], xr3[8];
+        float xr0[8], xr1[8];
         sofuu_load8(x + (bi + 0) * 256 + lane * 8, xr0);
         sofuu_load8(x + (bi + 1) * 256 + lane * 8, xr1);
-        sofuu_load8(x + (bi + 2) * 256 + lane * 8, xr2);
-        sofuu_load8(x + (bi + 3) * 256 + lane * 8, xr3);
         acc += sofuu_q4k_dot8(b0, sub, l0, xr0);
         acc += sofuu_q4k_dot8(b1, sub, l0, xr1);
-        acc += sofuu_q4k_dot8(b2, sub, l0, xr2);
-        acc += sofuu_q4k_dot8(b3, sub, l0, xr3);
     }
     for (; bi < nb; ++bi) {
         float xr[8];
@@ -443,8 +439,8 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4) void sofuu_gemv_q4_k(con
 
 // q6_K: same warp/lane mapping as q4_K; ql at the run's 64-byte base, qh at
 // n*32+l. The 210-byte block stride is not 8-byte aligned on odd blocks, so
-// these stay scalar byte loads (the upload path repacks before wide loads).
-extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4) void sofuu_gemv_q6_k(const unsigned char *__restrict__ w,
+// these stay scalar byte loads.
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 6) void sofuu_gemv_q6_k(const unsigned char *__restrict__ w,
                                              const float *__restrict__ x, float *__restrict__ y,
                                              int rows, int cols) {
     unsigned int tid = sofuu_tid_x();
@@ -459,24 +455,16 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4) void sofuu_gemv_q6_k(con
     int l0 = (lane & 3) << 3;
     float acc = 0.0f;
     int bi = 0;
-    for (; bi + 4 <= nb; bi += 4) {
+    for (; bi + 2 <= nb; bi += 2) {
         const sofuu_block_q6_K *b0 =
             (const sofuu_block_q6_K *)(roww + (unsigned long long)(bi + 0) * 210);
         const sofuu_block_q6_K *b1 =
             (const sofuu_block_q6_K *)(roww + (unsigned long long)(bi + 1) * 210);
-        const sofuu_block_q6_K *b2 =
-            (const sofuu_block_q6_K *)(roww + (unsigned long long)(bi + 2) * 210);
-        const sofuu_block_q6_K *b3 =
-            (const sofuu_block_q6_K *)(roww + (unsigned long long)(bi + 3) * 210);
-        float xr0[8], xr1[8], xr2[8], xr3[8];
+        float xr0[8], xr1[8];
         sofuu_load8(x + (bi + 0) * 256 + lane * 8, xr0);
         sofuu_load8(x + (bi + 1) * 256 + lane * 8, xr1);
-        sofuu_load8(x + (bi + 2) * 256 + lane * 8, xr2);
-        sofuu_load8(x + (bi + 3) * 256 + lane * 8, xr3);
         acc += sofuu_q6k_dot8(b0, sub, l0, xr0);
         acc += sofuu_q6k_dot8(b1, sub, l0, xr1);
-        acc += sofuu_q6k_dot8(b2, sub, l0, xr2);
-        acc += sofuu_q6k_dot8(b3, sub, l0, xr3);
     }
     for (; bi < nb; ++bi) {
         float xr[8];

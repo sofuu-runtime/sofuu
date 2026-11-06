@@ -62,15 +62,25 @@ pub const ERR_NOT_CONTAINER: c_int = -1001;
 /// Codec tensor-compression level: 0 = full contest (see rt/memory.rs).
 ///
 /// COST, measured (SOFUU_PROFILE=1, 256x64 segment): compress ≈ 2.5 ms,
-/// pack 0.0 ms, write 0.5 ms — and **encrypt ≈ 26 ms**. `encrypt` is
-/// `qtsq_vault_encrypt_password`, which runs Argon2id at m_cost = 64 MB on
-/// EVERY call, and the store has no derived-key API to share that work.
-/// A flush touches three containers (read manifest, write segment, write
-/// manifest) = ~78 ms of key derivation before anything else happens, and a
-/// 100k-record open reads 391 of them = ~11 s. That, not the codec, is the
-/// floor under the plan's "flush P99 < 50 ms" and "open < 1 s" gates; the fix
-/// is a key-derivation cache or a derived-key entry point in the vault.
+/// pack 0.0 ms, write 0.5 ms. Encryption used to dominate at **≈ 26 ms per
+/// container** because every `qtsq_vault_encrypt_password` call ran
+/// Argon2id at m_cost = 64 MiB. As of QTSQ KDF v2 the expensive stretch
+/// runs ONCE per (process, password); every later call derives the file key
+/// with a SHA3 PRF over the cached master + the file's own salt. A flush
+/// still touches three containers, but only the first pays the 64 MiB
+/// allocation, and v2 files no longer repeat it on open. Legacy v1 files
+/// keep the per-container derivation (they are read with their recorded
+/// version), which is why a first open of a pre-v2 store can still take
+/// seconds — a one-time migration, not the steady state.
+///
+/// `security_version()` on the QTSQ context exposes which KDF wrote a file;
+/// `vault_containers_use_the_process_wide_master_kdf` below pins that new
+/// writes are v2.
 pub const QTSQ_LEVEL_FULL: c_int = 0;
+
+/// The KDF generation new vault containers must declare (QTSQ v2). Exposed
+/// so the regression test can name the invariant instead of hard-coding 2.
+pub const KDF_VERSION_MASTER: u8 = qtsq::QTSQ_KDF_VERSION_MASTER;
 /// 1 = fast, 2 = store (no compression). See qtc_level_opts in the C codec.
 pub const QTSQ_LEVEL_FAST: c_int = 1;
 pub const QTSQ_LEVEL_STORE: c_int = 2;
@@ -341,6 +351,14 @@ pub struct Manifest {
     /// back to `total_versions()`.
     #[serde(default)]
     pub records: u64,
+    /// The stabilization freeze's zero-KDF mode: this store's manifest and
+    /// segments are written through the codec's plaintext streaming writer
+    /// and never enter the password vault. Persisted so a later open (which
+    /// may not repeat the option) keeps writing the same way instead of
+    /// silently re-encrypting half the store. Absent on every pre-existing
+    /// manifest → false.
+    #[serde(default)]
+    pub plaintext: bool,
 }
 
 impl Manifest {
@@ -355,6 +373,7 @@ impl Manifest {
             decay_tag: None,
             decay_seconds: None,
             records: 0,
+            plaintext: false,
         }
     }
 
@@ -493,6 +512,29 @@ unsafe fn decrypt_with_fallback(ctx: *mut qtsq::QtsqContext) -> Result<bool, c_i
 /// Build a container from `streams`, pack → encrypt → write to `path`.
 /// Empty streams are skipped (the codec rejects a zero-length payload).
 pub unsafe fn container_write(path: &str, streams: &[Stream]) -> Result<(), c_int> {
+    container_write_mode(path, streams, false)
+}
+
+/// `container_write` with an explicit at-rest protection mode.
+///
+/// `plaintext = true` writes the container through the codec's plaintext
+/// streaming writer and never invokes the password vault at all. That is
+/// the zero-KDF mode the stabilization freeze specifies for
+/// memory-constrained edge devices whose storage already has hardware-level
+/// protection: it removes both the first-call 64 MiB Argon2id allocation and
+/// every subsequent KDF call. Reads need no counterpart — `qtsq_read`
+/// reports the file as unencrypted and `decrypt_with_fallback` returns
+/// immediately.
+///
+/// # Safety
+/// `path` must be a valid filesystem path and every `Stream` must borrow
+/// live data for the duration of the call; the values are handed to the C
+/// codec.
+pub unsafe fn container_write_mode(
+    path: &str,
+    streams: &[Stream],
+    plaintext: bool,
+) -> Result<(), c_int> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -564,20 +606,34 @@ pub unsafe fn container_write(path: &str, streams: &[Stream]) -> Result<(), c_in
     let prof = std::env::var_os("SOFUU_PROFILE").is_some();
     let mut t = std::time::Instant::now();
     if r == qtsq::QTSQ_OK {
-        r = qtsq::qtsq_container_pack(container);
+        if plaintext {
+            /* `qtsq_container_pack` installs a security salt, after which
+             * `qtsq_write_plaintext` refuses the context (QTSQ_ERR_ENCRYPTED).
+             * The codec's own plaintext entry point is the streaming
+             * `qtsq_container_pack_write`, which requires that unsalted stub
+             * and emits byte-identical bytes without the pack buffer. */
+            let cpath = CString::new(path).unwrap_or_default();
+            r = qtsq::qtsq_container_pack_write(container, cpath.as_ptr(), 1);
+        } else {
+            r = qtsq::qtsq_container_pack(container);
+        }
     }
     if prof {
-        eprintln!("[prof] pack {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        eprintln!(
+            "[prof] {} {:.1} ms",
+            if plaintext { "pack(write)" } else { "pack" },
+            t.elapsed().as_secs_f64() * 1000.0
+        );
         t = std::time::Instant::now();
     }
-    if r == qtsq::QTSQ_OK {
+    if r == qtsq::QTSQ_OK && !plaintext {
         r = encrypt(container);
     }
-    if prof {
+    if prof && !plaintext {
         eprintln!("[prof] encrypt {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
         t = std::time::Instant::now();
     }
-    if r == qtsq::QTSQ_OK {
+    if r == qtsq::QTSQ_OK && !plaintext {
         let cpath = CString::new(path).unwrap_or_default();
         r = qtsq::qtsq_write(container, cpath.as_ptr());
     }
@@ -637,6 +693,36 @@ pub unsafe fn container_open_ex(
 pub unsafe fn container_free(container: *mut qtsq::QtsqContext) {
     qtsq::qtsq_free(container);
     qtsq::qtsq_ctx_free(container);
+}
+
+/// The on-disk security facts of a container, read BEFORE any decryption.
+///
+/// `container_open` decrypts, and a successful decrypt clears the codec's
+/// `is_encrypted` flag — so asking an opened context "was this file
+/// encrypted?" always answers false. This helper reads the header only and
+/// reports `(encrypted, security_version)`.
+///
+/// # Safety
+/// `path` must be a valid filesystem path; the read is performed on a
+/// freshly allocated QTSQ context owned by this function.
+pub unsafe fn container_security_info(path: &str) -> Result<(bool, u8), c_int> {
+    let cpath = CString::new(path).unwrap_or_default();
+    let container = qtsq::qtsq_ctx_alloc();
+    if container.is_null() {
+        return Err(qtsq::QTSQ_ERR_ALLOC);
+    }
+    let mut r = qtsq::qtsq_init(container);
+    if r == qtsq::QTSQ_OK {
+        r = qtsq::qtsq_read(container, cpath.as_ptr());
+    }
+    let info = if r == qtsq::QTSQ_OK {
+        Ok(((*container).is_encrypted(), (*container).security_version()))
+    } else {
+        Err(r)
+    };
+    qtsq::qtsq_free(container);
+    qtsq::qtsq_ctx_free(container);
+    info
 }
 
 /// Read one named stream as JSON text.
@@ -798,9 +884,10 @@ unsafe fn pack_segment(
     recs: &[SegRecord],
     crcs: Option<&[u32]>,
     flags: u32,
+    plaintext: bool,
 ) -> Result<(), c_int> {
     let (flat, dims, meta_json) = segment_image(dim, recs, crcs, flags)?;
-    write_segment_image(path, &flat, &dims, &meta_json, flags)
+    write_segment_image(path, &flat, &dims, &meta_json, flags, plaintext)
 }
 
 /// The three things a segment is made of: the flat tensor, its shape, and the
@@ -861,11 +948,12 @@ unsafe fn write_segment_image(
     dims: &[u32],
     meta_json: &str,
     flags: u32,
+    plaintext: bool,
 ) -> Result<(), c_int> {
     /* A re-pack in place (the two-phase write below) must not inherit a
      * longer previous image: the trailer records the exact length. */
     let _ = std::fs::remove_file(path);
-    container_write(
+    container_write_mode(
         path,
         &[
             Stream::Tensor {
@@ -878,6 +966,7 @@ unsafe fn write_segment_image(
                 body: meta_json,
             },
         ],
+        plaintext,
     )?;
     if flags & SEG_FLAG_PER_RECORD_CRC != 0 {
         append_trailer(path, flags)?;
@@ -898,7 +987,12 @@ unsafe fn write_segment_image(
 ///
 /// Probing a tensor-only container answers the same question for the price of
 /// one 64 KB write, so the real segment is packed exactly once.
-unsafe fn probe_decoded_tensor(dim: usize, n: usize, flat: &[f32]) -> Option<Vec<f32>> {
+unsafe fn probe_decoded_tensor(
+    dim: usize,
+    n: usize,
+    flat: &[f32],
+    plaintext: bool,
+) -> Option<Vec<f32>> {
     if flat.len() != n * dim || dim == 0 || n == 0 {
         return None;
     }
@@ -915,13 +1009,14 @@ unsafe fn probe_decoded_tensor(dim: usize, n: usize, flat: &[f32]) -> Option<Vec
     let path_s = path.to_string_lossy().to_string();
     let _ = std::fs::remove_file(&path);
     let dims: [u32; 2] = [n as u32, dim as u32];
-    let wrote = container_write(
+    let wrote = container_write_mode(
         &path_s,
         &[Stream::Tensor {
             name: SEGMENT_TENSOR_STREAM,
             data: flat,
             dims: &dims,
         }],
+        plaintext,
     )
     .is_ok();
     let decoded = if wrote {
@@ -962,6 +1057,23 @@ pub unsafe fn write_segment(
     dim: usize,
     recs: &[SegRecord],
 ) -> Result<(), c_int> {
+    write_segment_mode(path, dim, recs, false)
+}
+
+/// `write_segment` with an explicit at-rest protection mode (see
+/// [`container_write_mode`]). The probe container and every fallback write
+/// use the SAME mode, so a plaintext store never touches the vault — not
+/// even for the throwaway read-back probe.
+///
+/// # Safety
+/// `path` must be a valid filesystem path and `recs` must borrow live
+/// records for the duration of the call.
+pub unsafe fn write_segment_mode(
+    path: &str,
+    dim: usize,
+    recs: &[SegRecord],
+    plaintext: bool,
+) -> Result<(), c_int> {
     /* Ask the codec what a reader will decode BEFORE writing the segment, so
      * the CRCs are right the first time. This is the difference between one
      * encode and two. If the probe fails we fall back to the CRCs of the input
@@ -970,6 +1082,7 @@ pub unsafe fn write_segment(
         dim,
         recs.len(),
         &recs.iter().flat_map(|r| r.vec.iter().copied()).collect::<Vec<f32>>(),
+        plaintext,
     );
     let crcs: Vec<u32> = match probe.as_deref() {
         Some(decoded) => recs
@@ -983,7 +1096,14 @@ pub unsafe fn write_segment(
             .collect(),
     };
     let (flat, dims, meta_json) = segment_image(dim, recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC)?;
-    write_segment_image(path, &flat, &dims, &meta_json, SEG_FLAG_PER_RECORD_CRC)?;
+    write_segment_image(
+        path,
+        &flat,
+        &dims,
+        &meta_json,
+        SEG_FLAG_PER_RECORD_CRC,
+        plaintext,
+    )?;
 
     /* Learn what a reader will actually decode — but compare the STREAMS, not
      * decoded records. This used to re-open the file, decompress both streams,
@@ -1000,7 +1120,14 @@ pub unsafe fn write_segment(
             .iter()
             .map(|r| record_crc(r.id, &r.meta, &r.vec))
             .collect();
-        return pack_segment(path, dim, recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC);
+        return pack_segment(
+            path,
+            dim,
+            recs,
+            Some(&crcs),
+            SEG_FLAG_PER_RECORD_CRC,
+            plaintext,
+        );
     };
     let meta_exact = decoded_meta.as_bytes() == meta_json.as_bytes();
     let tensor_exact = decoded_flat.len() == flat.len()
@@ -1028,7 +1155,14 @@ pub unsafe fn write_segment(
             .iter()
             .map(|r| record_crc(r.id, &r.meta, &r.vec))
             .collect();
-        return pack_segment(path, dim, recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC);
+        return pack_segment(
+            path,
+            dim,
+            recs,
+            Some(&crcs),
+            SEG_FLAG_PER_RECORD_CRC,
+            plaintext,
+        );
     }
     /* The tensor transform biased some components. Re-derive the CRCs from
      * what a reader will hash — the DECODED vectors — and repack. The tensor
@@ -1043,7 +1177,14 @@ pub unsafe fn write_segment(
         })
         .collect();
     let (flat, dims, meta_json) = segment_image(dim, recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC)?;
-    write_segment_image(path, &flat, &dims, &meta_json, SEG_FLAG_PER_RECORD_CRC)
+    write_segment_image(
+        path,
+        &flat,
+        &dims,
+        &meta_json,
+        SEG_FLAG_PER_RECORD_CRC,
+        plaintext,
+    )
 }
 
 /// Re-open a segment the writer just staged and return its two streams
@@ -1252,13 +1393,29 @@ pub unsafe fn read_segment_report(
 
 /// Write the manifest container (caller publishes it atomically).
 pub unsafe fn write_manifest(path: &str, m: &Manifest) -> Result<(), c_int> {
+    write_manifest_mode(path, m, m.plaintext)
+}
+
+/// `write_manifest` with an explicit at-rest protection mode. The default
+/// wrapper follows `m.plaintext` so a store's manifest can never disagree
+/// with the segments it describes.
+///
+/// # Safety
+/// `path` must be a valid filesystem path; `m` is serialized before the
+/// call and the borrowed data does not outlive it.
+pub unsafe fn write_manifest_mode(
+    path: &str,
+    m: &Manifest,
+    plaintext: bool,
+) -> Result<(), c_int> {
     let body = serde_json::to_string(m).map_err(|_| qtsq::QTSQ_ERR_FORMAT)?;
-    container_write(
+    container_write_mode(
         path,
         &[Stream::Json {
             name: MANIFEST_STREAM,
             body: &body,
         }],
+        plaintext,
     )
 }
 
@@ -1476,6 +1633,69 @@ mod tests {
         }
     }
 
+    /// Stabilization Freeze Pass 2.1: new vault containers must declare the
+    /// master KDF (security_version 2), not the old per-container Argon2id
+    /// (1). That version byte is what makes the "64 MiB on every segment"
+    /// regression visible: if the codec ever regresses, this test fails
+    /// before anyone measures RAM.
+    #[test]
+    fn vault_containers_use_the_process_wide_master_kdf() {
+        let dir = tmpdir("kdf-v2");
+        let path = dir.join("manifest.qtsq");
+        let m = Manifest::new(serde_json::json!({"id": "hash-v1", "dimension": 8}));
+        unsafe {
+            write_manifest(&path.to_string_lossy(), &m).expect("write manifest");
+            let (encrypted, version) =
+                container_security_info(&path.to_string_lossy()).expect("read header");
+            assert!(encrypted, "the default mode must encrypt");
+            assert_eq!(
+                version,
+                crate::rt::brain_store::KDF_VERSION_MASTER,
+                "new containers must use the cached master KDF, not per-container Argon2id"
+            );
+        }
+    }
+
+    /// Stabilization Freeze Pass 2.2: the zero-KDF mode writes readable
+    /// containers that never enter the password vault. Both a segment and a
+    /// manifest must round-trip, and neither may report `is_encrypted`.
+    #[test]
+    fn plaintext_segments_and_manifest_round_trip_without_the_vault() {
+        let dir = tmpdir("plaintext");
+        let seg = dir.join("seg-000001-000001.qtsq");
+        let manifest = dir.join("brain.qtsq");
+        let recs = vec![rec(0, 8, "edge alpha"), rec(1, 8, "edge beta")];
+        let mut m = Manifest::new(serde_json::json!({"id": "hash-v1", "dimension": 8}));
+        m.plaintext = true;
+        m.records = 2;
+        m.segments.push(SegmentMeta {
+            file: "seg-000001-000001.qtsq".into(),
+            records: 2,
+            sha256: String::new(),
+        });
+        unsafe {
+            write_segment_mode(&seg.to_string_lossy(), 8, &recs, true).expect("write plain segment");
+            write_manifest_mode(&manifest.to_string_lossy(), &m, true).expect("write plain manifest");
+
+            let (encrypted, version) =
+                container_security_info(&seg.to_string_lossy()).expect("read plain segment header");
+            assert!(!encrypted, "plaintext segment must not be encrypted");
+            assert_eq!(version, 0, "no KDF block for plaintext");
+
+            let back = read_segment(&seg.to_string_lossy()).expect("read plain segment");
+            assert_eq!(back.len(), 2);
+            assert_eq!(back[1].meta["text"], "edge beta");
+
+            let mback = read_manifest(&manifest.to_string_lossy()).expect("read plain manifest");
+            assert!(mback.plaintext, "the mode must be persisted for the next open");
+            assert_eq!(mback.records, 2);
+
+            let (encrypted, _) = container_security_info(&manifest.to_string_lossy())
+                .expect("read plain manifest header");
+            assert!(!encrypted, "plaintext manifest must not be encrypted");
+        }
+    }
+
     /// A manifest written before `records` existed (no such key on disk)
     /// must still load — the field defaults to 0 and callers fall back to
     /// `total_versions()`.
@@ -1672,7 +1892,7 @@ mod tests {
                     o.insert("text".into(), serde_json::json!("rEcord with one flipped byte"));
                 }
             }
-            pack_segment(path, dim, &recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC)
+            pack_segment(path, dim, &recs, Some(&crcs), SEG_FLAG_PER_RECORD_CRC, false)
                 .expect("repack the damaged segment");
             /* The damage must be confined to that one record after the codec
              * round trip, or the test would be measuring nothing (or
@@ -1841,7 +2061,7 @@ mod tests {
             let crcs = raw.crcs.clone().expect("per-record CRCs");
             let mut damaged = recs.clone();
             damaged[100].vec[3] = f32::from_bits(damaged[100].vec[3].to_bits() ^ (1 << 9));
-            pack_segment(&path, dim, &damaged, Some(&crcs), SEG_FLAG_PER_RECORD_CRC)
+            pack_segment(&path, dim, &damaged, Some(&crcs), SEG_FLAG_PER_RECORD_CRC, false)
                 .expect("repack");
             let after = open_segment_raw(&path).expect("decode");
             let changed = after
@@ -1913,7 +2133,7 @@ mod tests {
         let recs: Vec<SegRecord> = (0..SEGMENT_CAP as u32).map(|i| rec_emb(i, dim)).collect();
         unsafe {
             /* flags == 0 is byte-for-byte the pre-W3.5 layout. */
-            pack_segment(&path, dim, &recs, None, 0).expect("write old layout");
+            pack_segment(&path, dim, &recs, None, 0, false).expect("write old layout");
             let (read, _) = read_segment_report(&path).expect("an old segment must load");
             assert_eq!(read.records.len(), SEGMENT_CAP, "every old record loads");
             assert_eq!(read.dropped, 0, "nothing to verify, nothing dropped");
@@ -2059,6 +2279,7 @@ mod tests {
             records: records as u64,
             decay_tag: None,
             decay_seconds: None,
+            plaintext: false,
         };
         let tmp = format!("{path}.tmp");
         unsafe { write_manifest(&tmp, &m).expect("write manifest") };

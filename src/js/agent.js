@@ -43,6 +43,42 @@
   var sofuu = g.sofuu;
   if (!sofuu.agent) sofuu.agent = {};
   var A = sofuu.agent;
+
+  /* Stabilization Freeze Pass 2.3 — bounded streaming text buffer.
+   *
+   * Token streams arrive one small string at a time. Appending every token to
+   * one growing string allocates a new, larger string per token (the saw-tooth
+   * the freeze measured). This coalesces tokens into ~64 KiB chunks and joins
+   * once at the end, so the heap holds bounded partial chunks instead of
+   * thousands of die-young strings. A token bigger than the cap is kept whole:
+   * slicing it would allocate per character and buy nothing. */
+  function textChunkBuffer(capBytes) {
+    var cap = capBytes > 0 ? capBytes : 64 * 1024;
+    var chunks = [];
+    var current = '';
+    var size = 0;
+    return {
+      push: function (s) {
+        if (s === undefined || s === null || s === '') return;
+        s = String(s);
+        size += s.length;
+        if (current && current.length + s.length >= cap) {
+          chunks.push(current);
+          current = s;
+        } else {
+          current += s;
+        }
+      },
+      length: function () { return size; },
+      text: function () {
+        if (current) {
+          chunks.push(current);
+          current = '';
+        }
+        return chunks.join('');
+      },
+    };
+  }
   if (A._agents_loaded) return;
 
   var VERSION = '0.1.0';
@@ -3398,6 +3434,16 @@
       if (traceStorage && traceStorage.db && typeof traceStorage.db.flush === 'function') {
         try { traceStorage.db.flush(); } catch (eFl) { /* trace persistence is diagnostic; the run result is already assembled. */ }
       }
+      /* Stabilization Freeze Pass 2.4 — turn-boundary reclamation.
+       * The root run is the turn boundary (sub-runs share it; runMany adds
+       * one batch GC because a fan-out allocates N runs' worth of streams at
+       * once). The result object is already assembled, so a collection here
+       * cannot change what the caller sees — it only returns the transient
+       * transcript/stream garbage before the next turn. */
+      if (depth === 0) {
+        try { if (typeof __sofuu_gc === 'function') __sofuu_gc(); }
+        catch (eGc) { /* a host without GC still runs; the bound is a courtesy. */ }
+      }
       return res;
     }
 
@@ -3849,8 +3895,8 @@
         var stPp = pluginProviderFor(ro);
         var st = stPp ? pluginStreamFor(stPp, ro) : sofuu.ai.stream(ro);
         state.aborts.push(function () { try { st.abort(); } catch (e) { /* aborting a finished stream is a no-op. */ } });
-        var parts = [];
-        var thinkParts = [];
+        var parts = textChunkBuffer(64 * 1024);
+        var thinkParts = textChunkBuffer(64 * 1024);
         var forwarded = false;
         try {
           for await (var chunk of st) {
@@ -3858,9 +3904,9 @@
             if (chunk.think) { forwarded = true; thinkParts.push(chunk.think); if (onThink) onThink(chunk.think); continue; }
             if (chunk.text) { forwarded = true; parts.push(chunk.text); if (onText && !isCont) onText(chunk.text); }
           }
-          var add = parts.join('');
-          if (!add.trim() && thinkParts.length) {
-            add = thinkParts.join('').trim();
+          var add = parts.text();
+          if (!add.trim() && thinkParts.length()) {
+            add = thinkParts.text().trim();
           }
           if (isCont) {
             add = trimOverlap(acc, add);
@@ -3908,10 +3954,10 @@
            * gets a FRESH backoff ladder of its own. When the allowance
            * is exhausted the original transport error is rethrown — the
            * caller surfaces it (P1-17: loud ✗ beats silent death). */
-          if (forwarded && continued < retryMaxCont() && parts.length && isTransientProviderError(msg)) {
+          if (forwarded && continued < retryMaxCont() && parts.length() > 0 && isTransientProviderError(msg)) {
             continued++;
             absorbUsage(st); /* P1-2: the cut stream's partial usage counts */
-            acc += parts.join('');
+            acc += parts.text();
             emit('tool_result', { name: 'system',
                                   result: 'connection cut mid-answer (' + clip(msg, 90) +
                                           ') — continuing from ' + acc.length + ' chars' +

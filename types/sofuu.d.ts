@@ -1012,6 +1012,16 @@ export interface MemoryOpenOptions {
   uri?: string;
   /** Vector width. Required by the built-in vector backends. */
   dimensions?: number;
+  /** Shared-lock, write-nothing open (no repair, backup or manifest publish). */
+  readonly?: boolean;
+  /** Read and digest every segment at open instead of deferring the load. */
+  verifyFull?: boolean;
+  verify_full?: boolean;
+  /** Zero-KDF plaintext store for edge/IoT storage with hardware protection.
+   *  Persisted in the manifest; skips the 64 MiB Argon2id derivation. */
+  plaintext?: boolean;
+  directKey?: boolean;
+  direct_key?: boolean;
   /** Inline key (harnesses). Prefer apiKeyEnv/apiKeySecret under R7. */
   apiKey?: string;
   /** Secret NAME, resolved through `sofuu.policy.secret()` then process.env. */

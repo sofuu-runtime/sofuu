@@ -49,6 +49,46 @@
     sessions: Object.create(null),
   };
 
+  /* Stabilization Freeze Pass 2.3 — bounded streaming text buffer.
+   * SSE responses write each delta straight to the socket, but the
+   * non-streaming JSON path must assemble the whole answer. Appending each
+   * token to one growing string allocates a larger string per token; this
+   * coalesces into ~64 KiB chunks and joins once. */
+  function textChunkBuffer(capBytes) {
+    var cap = capBytes > 0 ? capBytes : 64 * 1024;
+    var chunks = [];
+    var current = '';
+    var size = 0;
+    return {
+      push: function (s) {
+        if (s === undefined || s === null || s === '') return;
+        s = String(s);
+        size += s.length;
+        if (current && current.length + s.length >= cap) {
+          chunks.push(current);
+          current = s;
+        } else {
+          current += s;
+        }
+      },
+      length: function () { return size; },
+      text: function () {
+        if (current) {
+          chunks.push(current);
+          current = '';
+        }
+        return chunks.join('');
+      },
+    };
+  }
+
+  /* Pass 2.4 — one collection at a completed request boundary. The response
+   * has already been written, so this can only release transient buffers. */
+  function reclaimRequestMemory() {
+    try { if (typeof __sofuu_gc === 'function') __sofuu_gc(); }
+    catch (eGc) { /* a host without GC still serves; the bound is a courtesy. */ }
+  }
+
   /* ── config ──────────────────────────────────────────────────── */
 
   function str(v, dflt) { return typeof v === 'string' ? v : (dflt || ''); }
@@ -473,16 +513,14 @@
           choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
         });
       });
-      var thinkSeen = '';
       while (true) {
         var n = await iter.next();
         if (n.done) break;
         var chunk = n.value || {};
-        if (chunk.think) {
-          /* Thinking stays off the content channel (OpenAI has no field
-           * for it); the final message does not include it either. */
-          thinkSeen += chunk.think;
-        }
+        /* Thinking stays off the content channel (OpenAI has no field for
+         * it) and the final message does not include it either. It used to
+         * accumulate into a growing string for no reader; not accumulating
+         * it is the Pass 2.3 bound. */
         if (chunk.text && sf.push(chunk.text)) break;
       }
       sf.flush();
@@ -512,8 +550,8 @@
     }
 
     /* JSON response */
-    var text = '';
-    var sf2 = stopFilter(stops, function (t) { text += t; });
+    var textBuf = textChunkBuffer(64 * 1024);
+    var sf2 = stopFilter(stops, function (t) { textBuf.push(t); });
     while (true) {
       var n2 = await iter.next();
       if (n2.done) break;
@@ -521,6 +559,7 @@
       if (ch.text && sf2.push(ch.text)) break;
     }
     sf2.flush();
+    var text = textBuf.text();
     var usage2 = usageOf(iter, sofuu.ai.estimateTokens(prepared.messages));
     var calls2 = openaiToolCalls(iter.toolCalls);
     var fr2 = finishReason(calls2, sf2.hit, usage2, maxTokens);
@@ -583,14 +622,15 @@
       return;
     }
 
-    var text = '';
-    var sf2 = stopFilter(stops, function (t) { text += t; });
+    var textBuf = textChunkBuffer(64 * 1024);
+    var sf2 = stopFilter(stops, function (t) { textBuf.push(t); });
     while (true) {
       var n2 = await iter.next();
       if (n2.done) break;
       if (n2.value && n2.value.text && sf2.push(n2.value.text)) break;
     }
     sf2.flush();
+    var text = textBuf.text();
     var usage2 = usageOf(iter, sofuu.ai.estimateTokens(prompt));
     send(res, 200, {
       id: id, object: 'text_completion', created: created, model: modelName,
@@ -754,9 +794,16 @@
     var cfg = normalize(opts);
 
     return async function handler(req, res) {
+      /* Pass 2.4: only routes that can allocate turn-sized state reclaim at
+       * their boundary. Health probes must stay allocation-free and fast. */
+      var heavy = false;
       try {
         var path = String(req.url || '/').split('?')[0];
         var method = String(req.method || 'GET').toUpperCase();
+        heavy = path.indexOf('/v1/') === 0
+          || path === '/chat/completions' || path === '/completions'
+          || path === '/infer' || path === '/remember' || path === '/recall'
+          || path === '/memories' || path === '/forget' || path === '/share';
 
         /* Liveness. /healthz and /livez are the probe endpoints: public and
          * data-free (no version, no uptime, no counts).
@@ -1064,6 +1111,8 @@
         try {
           fail(res, 500, String(e && e.message || e), 'server_error', 'internal_error');
         } catch (e2) { /* headers already sent mid-stream — nothing to add */ }
+      } finally {
+        if (heavy) reclaimRequestMemory();
       }
     };
   }

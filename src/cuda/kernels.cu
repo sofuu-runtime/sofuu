@@ -78,6 +78,17 @@ typedef struct __attribute__((aligned(16))) {
 #define SOFUU_GEMV_THREADS 256
 
 // ── Portable half -> float (exact for every finite binary16 value) ─────────
+#if !defined(SOFUU_CUDA_HOST)
+static SOFUU_DEVICE SOFUU_INLINE float sofuu_f16_to_f32(unsigned short h) {
+    // The hardware widening is one instruction; the software decode below is
+    // ~8 instructions per scale and twice per q4_K block, which is a
+    // measurable share of a decode row-dot. Exact for every binary16 value,
+    // including subnormals and inf.
+    float v;
+    __asm__("cvt.f32.f16 %0, %1;" : "=f"(v) : "h"(h));
+    return v;
+}
+#else
 static SOFUU_DEVICE SOFUU_INLINE float sofuu_f16_to_f32(unsigned short h) {
     unsigned int sign = (unsigned int)(h >> 15) & 1u;
     unsigned int exp = (unsigned int)(h >> 10) & 0x1fu;
@@ -103,6 +114,7 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_f16_to_f32(unsigned short h) {
         return c.f;
     }
 }
+#endif
 
 // ── q4_K scale/min expansion (bit-identical to src/simd/infer_kernels.cpp) ─
 static SOFUU_DEVICE SOFUU_INLINE void sofuu_q4k_scale_min(

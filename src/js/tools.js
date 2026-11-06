@@ -28,6 +28,14 @@
   sofuu.tools = sofuu.tools || {};
   if (sofuu.tools._loaded) return;
 
+  /* Stabilization Freeze Pass 2.4: expose the engine's turn-boundary
+   * reclamation as `sofuu.gc()` for hosts that want an explicit boundary
+   * (a long-running serve loop, an embedded host between turns). The
+   * driver-internal `__sofuu_gc` stays the fast path used by agent/chat. */
+  if (typeof __sofuu_gc === 'function' && typeof sofuu.gc !== 'function') {
+    sofuu.gc = function () { __sofuu_gc(); return { ok: true }; };
+  }
+
   if (typeof sofuu.tools.define !== 'function') {
     sofuu.tools.define = function (spec) {
       if (sofuu.plugins && typeof sofuu.plugins.defineTool === 'function') {

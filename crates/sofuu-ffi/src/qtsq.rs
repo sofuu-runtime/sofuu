@@ -48,6 +48,13 @@ pub const QTSQ_TYPE_CONTAINER: u8 = 0xF0;
 pub const QTSQ_CODEC_ZLIB: u8 = 0; // legacy — read path only
 pub const QTSQ_CODEC_QTC: u8 = 1; // the compressor/ rANS+LZ77 core
 
+/// `qtsq_security_block_t.security_version` values (qtsq_vault.c).
+pub const QTSQ_KDF_VERSION_PER_CONTAINER: u8 = 1;
+/// The process-wide master KDF: Argon2id runs once per (process, password),
+/// then per-file keys are SHA3(master || "kdf2" || salt). This is what
+/// removes the 64 MiB-per-container spike the stabilization freeze targets.
+pub const QTSQ_KDF_VERSION_MASTER: u8 = 2;
+
 static QTSQ_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// qtsq_tensor_precision_t (qtsq.h).
@@ -82,6 +89,12 @@ const OFF_SCHEMA: usize = 112; // qtsq_schema_t (after the packed header)
 const OFF_SCHEMA_DIMENSIONS: usize = 68; // qtsq_schema_t.dimensions[8]
 const OFF_SCHEMA_NUM_DIMS: usize = 100; // qtsq_schema_t.num_dims
 const OFF_IS_ENCRYPTED: usize = 4908; // qtsq_context_t.is_encrypted (int)
+/// `qtsq_context_t.security.security_version` (uint8). Version 1 is the
+/// per-container Argon2id KDF; version 2 is the process-wide master KDF
+/// (`master = Argon2id(password, domain)`, then a cheap per-file PRF).
+/// Pinned by an offsetof probe against qtsq_format.h and asserted in the
+/// layout test below.
+const OFF_SECURITY_VERSION: usize = 400;
 const OFF_CODEC: usize = 5016; // qtsq_context_t.codec (uint8, Phase 6a)
 // Consumed only by the layout drift test below; in a release build the assert
 // is compiled out, so the constant has no reader and must not read as rot.
@@ -112,6 +125,22 @@ impl QtsqContext {
     pub unsafe fn is_encrypted(&self) -> bool {
         let base = self as *const QtsqContext as *const u8;
         std::ptr::read_unaligned(base.add(OFF_IS_ENCRYPTED) as *const c_int) != 0
+    }
+
+    /// The QTSQ on-disk KDF generation this container declares.
+    ///
+    /// 0 = no security block (plaintext), 1 = Argon2id per container, 2 =
+    /// the process-wide master KDF. New writes are 2: the 64 MiB Argon2id
+    /// stretching runs once per process/password, and every later container
+    /// key is a SHA3 PRF over that master plus its own random salt. This
+    /// accessor exists so the runtime can PIN that behaviour in a test
+    /// instead of trusting a source comment.
+    ///
+    /// # Safety
+    /// `self` must be a live context initialized by `qtsq_init`/`qtsq_read`.
+    pub unsafe fn security_version(&self) -> u8 {
+        let base = self as *const QtsqContext as *const u8;
+        std::ptr::read_unaligned(base.add(OFF_SECURITY_VERSION))
     }
 
     /// # Safety
@@ -184,6 +213,17 @@ extern "C" {
         stream_name: *const c_char,
     ) -> c_int;
     pub fn qtsq_container_pack(ctx: *mut QtsqContext) -> c_int;
+    /// Phase-1 plaintext streaming write: header + TOC + stream payloads,
+    /// byte-identical to `qtsq_container_pack` + `qtsq_write_plaintext`,
+    /// but it requires an unsalted (zeroed) security stub. This is the only
+    /// way to emit a multi-stream container without the vault: `pack` itself
+    /// installs a salt and `qtsq_write_plaintext` then refuses the context
+    /// with QTSQ_ERR_ENCRYPTED.
+    pub fn qtsq_container_pack_write(
+        ctx: *mut QtsqContext,
+        filename: *const c_char,
+        durable: c_int,
+    ) -> c_int;
     pub fn qtsq_container_get_count(ctx: *const QtsqContext, out_count: *mut c_uint) -> c_int;
     pub fn qtsq_container_get_stream(
         ctx: *const QtsqContext,
@@ -587,7 +627,8 @@ mod tests {
     #[test]
     fn context_layout_offsets_match_vendored_header() {
         // (the header probe printed: data_type=10, schema=112,
-        //  schema.dimensions=68, schema.num_dims=100, is_encrypted=4908,
+        //  schema.dimensions=68, schema.num_dims=100,
+        //  security.security_version=400, is_encrypted=4908,
         //  codec=5016, quality=5020, sizeof=5032 align=8 — a future
         //  checkout may change these)
         assert_eq!(OFF_HEADER_DATA_TYPE, 10);
@@ -595,6 +636,7 @@ mod tests {
         assert_eq!(OFF_SCHEMA, 112);
         assert_eq!(OFF_SCHEMA_DIMENSIONS, 68);
         assert_eq!(OFF_SCHEMA_NUM_DIMS, 100);
+        assert_eq!(OFF_SECURITY_VERSION, 400);
         assert_eq!(OFF_IS_ENCRYPTED, 4908);
         assert_eq!(OFF_CODEC, 5016);
         assert_eq!(OFF_QUALITY, 5020);

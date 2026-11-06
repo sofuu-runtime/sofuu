@@ -450,7 +450,14 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
     /* M2 (PLAN-MEMORY-TOKENS): a global GC bridge so JS drivers can bound
      * garbage after heavy fan-outs (agent.js runMany/mapContext) — the
      * chat driver has its own __chat_gc alias; this one serves every host
-     * (sofuu run, headless, chat). */
+     * (sofuu run, headless, chat).
+     *
+     * Stabilization Freeze Pass 2.4: this is also the turn-boundary
+     * reclamation entry (agent.js finish() and serve.js's request finally
+     * call it). `JS_RunGC` collects the JS heap; on glibc the allocator's
+     * free pages are returned with `malloc_trim` so the RSS curve actually
+     * comes down instead of only the QuickJS object graph shrinking. (musl
+     * has no trimming entry point — the JSGC still runs there.) */
     unsafe extern "C" fn js_sofuu_gc(
         ctx: *mut qjs::JSContext,
         _this: qjs::JSValueConst,
@@ -460,6 +467,10 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         let rt = qjs::JS_GetRuntime(ctx);
         if !rt.is_null() {
             qjs::JS_RunGC(rt);
+        }
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        unsafe {
+            libc::malloc_trim(0);
         }
         qjs::sofuu_js_undefined()
     }

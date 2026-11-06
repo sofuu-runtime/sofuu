@@ -12,35 +12,59 @@
 | **v0.1 – Foundation** | QuickJS + libuv Event Loop & Embedded C ABI | 🟢 **Completed** | Q2 2026 |
 | **v0.2 – Cognitive Memory** | Continuous Memory Architecture (QTSQ v1) & SIMD | 🟢 **Completed** | Q3 2026 |
 | **v0.3 – Autonomous Agent Core** | Sandbox v2, MCP Client/Server, Session Mesh, CMA v2 | 🟢 **Completed (Shipped)** | Oct 2026 |
-| **v0.3.5 – Hardening & DX** | Zero-Crash Fuzzing, Global `sofuu.z` Schemas, `sofuu compile` | 🟡 **In Progress (Active Sprint)** | Nov 2026 |
+| **v0.3.5 – Hardening & DX** | Zero-Crash Fuzzing, Global `sofuu.z` Schemas, `sofuu compile`, **Stabilization Freeze** | 🟢 **Completed** (Stabilization Freeze landed 2026-11-05) | Nov 2026 |
 | **v0.4 – Enterprise & Edge** | Production llama.cpp Plugin Bridge, Enterprise Blueprints | 🔵 **Planned** | Nov/Dec 2026 |
 | **v1.0 – Ecosystem Expansion** | Standalone Agent Ecosystem, WinterCG Edge Standard | 🟣 **Future Vision** | Q1 2027 |
 
 ---
 
-## 🟢 1. Completed & Shipped (Production Ready)
+## 🟢 1. Completed & Shipped (Production Ready Core vs. Experimental Preview)
 
-### ⚡ Runtime Substrate & Event Loop
-- [x] **QuickJS (ES2023) + libuv core**: JIT-free, lightweight JS execution; measured 22.5 ms median cold start wall-clock incl. process spawn (Apple M2 Pro, 2026-10-31 — see BENCHMARKS.md; the 3.8 ms figure from an earlier methodology is historical).
+> **Launch Scope Alignment:** To provide maximum enterprise reliability for our Hacker News launch, Sofuu divides its delivered features into **Production-Ready Core** (gated, mathematically stable, zero-leak) and **Experimental Preview Modules** (specialized hardware/swarms).
+
+### ⚡ Production-Ready Core Subsystems
+
+#### Runtime Substrate & Event Loop
+- [x] **QuickJS (ES2023) + libuv core**: JIT-free, lightweight JS execution; measured **14.58 ms p50 / 15.33 ms p95** cold start wall-clock incl. process spawn over 500 runs (Apple M2 Pro, 2026-11-06 — see BENCHMARKS.md; the 22.5 ms and 3.8 ms figures from earlier methodologies are historical).
 - [x] **Cooperative Task Scheduler**: Microtask starvation protection with `scheduler.yield()`.
 - [x] **Zero-Dependency TypeScript**: In-memory lexical type-stripping (`ts.rs`) running `.ts` files with no build step.
 - [x] **ESM Tree-Shaking Bundler**: Fast pure-Rust bundler (`bundler.rs`) emitting self-contained JavaScript files.
-- [x] **Binary Size Strict Discipline**: Hard $\le 5.5\text{ MiB}$ cap, enforced by `make size-check` — macOS arm64 build is 5.30 MiB (5,559,904 B, 202 KB headroom); Linux arm64/x86_64 remain over the cap and are tracked release work.
+- [x] **Binary Size Strict Discipline**: Hard $\le 5.5\text{ MiB}$ cap, enforced by `make size-check` — macOS arm64 **5.37 MiB (5,628,208 B, 138,960 B headroom)**; rebuilt Linux arm64 **5,117,296 B** and x86_64 **5,751,616 B** both pass.
 
-### 🧠 Cognitive Vector Memory (CMA v2)
+#### 🧠 Cognitive Vector Memory (CMA v2)
 - [x] **Encrypted `.qtsq` Containers**: On-device vector storage with zero external database dependencies.
+- [x] **Cached KDF v2 Master Key**: Derived key cached in memory, eliminating historical 64 MB Argon2id spikes on segment access.
+- [x] **Zero-KDF Plaintext Mode**: `{ plaintext: true }` open for hardware-protected edge storage (12.63 MB peak RSS).
 - [x] **Hardware SIMD Acceleration**: ARM NEON and x86 AVX2 vector math for sub-2ms top-$K$ cosine similarity.
 - [x] **Cross-Session Recall**: Automatic memory persistence across runs with `/remember` and `/recall`.
 - [x] **Portable Brain Cards**: Shareable vector cards (`/share` and `/import`) with cryptographic checksums.
 
-### 🤖 Autonomous Agents & Security
+#### 🤖 Autonomous Agents & Sandboxed Toolpacks
 - [x] **Autonomous Agent Loops**: Multi-step reasoning loops with prompt sovereignty and budget limits.
 - [x] **Model Context Protocol (MCP)**: Native zero-dependency client and server implementation over `stdio` and `SSE`.
+- [x] **Deterministic Sandboxed Tools**: `sofuu.tools.PACKS` (`coding`, `web`, `memory`, `system`) with single-instruction fuel metering.
+- [x] **Resilient File Editing**: `smart_edit` with whitespace tolerance and AST syntax dry-runs (`JS_DetectScriptOrModule`).
 - [x] **Sandbox v2 (R7 Policy)**: Strict filesystem jailing, domain network allowlisting, credential shielding (`.ssh`, `.aws`, `.env`), and instruction fuel metering.
 - [x] **Multi-Terminal Session Mesh**: Local IPC task synchronization (`/work`, `/done`) across simultaneous developer terminals.
 - [x] **Observability Stream**: Structured `.jsonl` audit logging with crash-resilient write-ahead logging (WAL).
 
-### 🛸 Robotics, Autonomous Drones & Ambient Computing
+#### ⚡ The "Killer Wedge": Standalone Agent Compiler (`sofuu compile`)
+- [x] **Trailer Format Implementation**: 32-byte `SOFUU_BIN_V1` binary trailer with CRC32 verification.
+- [x] **Fast-Path Boot Detection**: Single-seek payload inspection (< 0.1 ms overhead).
+- [x] **AOT Bytecode Bundler**: Bundling TypeScript + QuickJS bytecode into a single standalone native binary.
+- [x] **Apple Silicon Ad-Hoc Code Signing**: Automated `codesign -s - --force` for macOS Gatekeeper compatibility.
+- [x] **Embedded Vector Memory**: Direct embedding of `.qtsq` containers inside the binary (`--embed-brain`).
+
+#### 💨 Kaze (風) Zero-GC Deterministic Guardrail Engine
+- [x] **Small Typed Language**: Fixed-size arena allocation, zero-GC pauses in the hot path, bytecode compilation.
+- [x] **Capability Gates**: Fail-closed access-control policies enforcing declared hardware/system permissions.
+
+---
+
+### 🧪 Experimental Preview Subsystems (Decoupled from Launch Gate)
+
+#### 🛸 Robotics, Autonomous Drones & MAVLink [Experimental - Preview]
+> *Note: Fully functional in simulation (ArduPilot SITL), but maintained as an experimental preview track decoupled from the core production release gate.*
 - [x] **Zero-Dependency MAVLink v2 Codec**: Pure-Rust streaming parser and serializer with CRC-16/MCRF4XX, pinned CRC_EXTRA table, and sliding-window resync.
 - [x] **R7 Hardware Safety Gate**: 6-layer veto chain with reject-never-clamp bounds, dynamic geofencing, rate limiting, and fail-closed GPS dropout protection (`E_NO_GPS_FIX`).
 - [x] **Autonomous Dead-Man Switch**: Runtime-scheduled 1 Hz heartbeat triggering ArduPilot native GCS failsafes upon interruption.
@@ -49,7 +73,12 @@
 - [x] **Kaze Live Hardware Bridge**: Direct coupling between Kaze natural scripting and active flight links/GPIO buses.
 - [x] **Field CLI Toolchain**: `sofuu drone observe / status / send / mission / why / init`.
 
-### 🌐 Ecosystem & Public Launch
+#### 🧠 Built-in Local Inference Engine [Experimental - Preview]
+> *Note: Early-stage custom GGUF/SafeTensors engine. For production inference workloads, users leverage the `sofuu-plugin-llamacpp` bridge or remote streaming providers.*
+- [x] **Multi-Format Parsing**: GGUF v2/v3, SafeTensors, PyTorch checkpoints on CPU SIMD (NEON/AVX2) and Apple Metal.
+- [x] **KIVI & Paged KV-Cache**: Asymmetric 2-bit/4-bit quantization and zero-copy prefix reuse.
+
+#### 🌐 Ecosystem & Public Launch
 - [x] **Official Documentation & Website**: Live at [sofuu.xyz](https://sofuu.xyz) and [sofuu.xyz/docs](https://sofuu.xyz/docs).
 - [x] **Official AI Coding Skill**: Machine-readable agent guide deployed at [sofuu.xyz/SKILL.md](https://sofuu.xyz/SKILL.md).
 - [x] **Multi-Provider BYOK Streaming**: Unified streaming for OpenAI, Anthropic, Gemini, Groq, and custom endpoints.
@@ -94,6 +123,17 @@ Rust panic is survivable — see the open item below.
 - [x] **In-Tree Domain Capsules**: Reorganized `crates/sofuu-core/src/domains/` (`kaze/`, `robotics/`, `memory/`, `infer/`) with strict visibility boundaries and backward-compatible re-exports.
 - [x] **Subsystem Registration Trait**: Standardized `Subsystem` trait (`name()`, `register_js()`, `health_check()`) decoupling domain initialization from `rt/engine.rs`.
 - [x] **Local Invariant Preflight Gate (`scripts/preflight.sh`)**: Automated gate verifying domain boundary isolation, bytecode sync, size cap ($\le 5.5\text{ MiB}$), and unit test suites.
+
+### 🧊 Stabilization Freeze — Runtime Precision, RAM & Concurrency [COMPLETED 2026-11-05]
+*See [`docs/PLAN-STABILIZATION-FREEZE.md`](docs/PLAN-STABILIZATION-FREEZE.md) and the CHANGELOG entry for full receipts.*
+- [x] **Pass 1 — safety & error precision**: F-01 drone goto arity/altitude, F-03 fail-closed policy, F-04 strict hardware args, F-02 bounded Kaze heap (landed with the 2026-11-02 audit remediation).
+- [x] **Pass 2.1 — KDF de-bloat**: QTSQ KDF v2 pinned from Rust (`security_version()` + regression test). Argon2id runs **once per process/password** (34.1 ms first, 0.0 ms after), not per container.
+- [x] **Pass 2.2 — zero-KDF plaintext store**: `memory.open(..., { plaintext: true })` skips the vault entirely (79.84 MB → **12.63 MB** peak RSS), persists the mode in the manifest, and covers segments, manifests and legacy single-file saves.
+- [x] **Pass 2.3 — bounded streaming**: 64 KiB chunk buffers in `agent.js` / `serve.js`; serve no longer accumulates thinking text nobody reads.
+- [x] **Pass 2.4 — turn-boundary reclamation**: root-run GC in `agent.js`, per-request GC for alloc-heavy serve routes, `malloc_trim` on glibc, and `sofuu.gc()`.
+- [x] **Pass 3 — concurrency**: `make event-loop-check` drives the shipped serve handler; **1 ms max lag** at 64 concurrent turns × 256 chunks (16 ms ceiling).
+- [x] **Pass 4 — binary budget**: macOS **5,628,208 B**, Linux arm64 **5,117,296 B**, Linux x86_64 **5,751,616 B** — all under 5,767,168 B.
+- [x] **Extreme cold start**: 500 engine boots, 1,000-run spawn floor, bursts to 200 processes — **14.58 ms p50 / 15.33 ms p95**, statistically identical to the pre-freeze artifact. Reproduce: `make cold-start-bench`.
 
 ---
 

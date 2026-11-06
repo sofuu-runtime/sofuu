@@ -24,15 +24,40 @@ Sofuu is **a general-purpose runtime for AI — built to run anywhere from serve
 Sofuu is **not just a terminal coding agent or a desktop model runner**; the terminal assistant (`sofuu chat`) is merely one first-party demonstration application running on the engine. Sofuu is the foundational systems substrate engineered to collapse the fragmented AI stack (Python/Node + LangChain + Chroma + Ollama + FastAPI) into a single in-process, self-contained runtime.
 
 While TypeScript and JavaScript serve as the ergonomic high-level orchestration surface, the engine itself is an ultra-lean systems core (Rust + C) with a clean C ABI. Everything AI applications require is built directly into the single native binary — no npm packages, no Python environments, and no background daemons required:
-- **In-process local LLM inference** (**experimental** — built-in engine is early stage; for production use llama.cpp or another backend via the plugin system) (GGUF, SafeTensors, PyTorch, NumPy on Metal / NEON / AVX2) and cloud streaming
-- **Autonomous agent loops** with native tools, prompt sovereignty, and sandboxed execution
-- **Continuous Memory Architecture (CMA v2)** — on-device encrypted vector brain in `.qtsq` containers (bundled on macOS and Linux)
-- **Model Context Protocol (MCP)** — first-class client and server support
+- **Autonomous agent loops & tool orchestration** with native tools, prompt sovereignty, cooperative scheduling, and sandboxed execution
+- **Continuous Memory Architecture (CMA v2)** — on-device encrypted vector brain in `.qtsq` containers (bundled on macOS and Linux) with cached KDF v2 and zero-KDF plaintext options
+- **Standalone Agent Compiler (`sofuu compile`)** — turn any agent into a single native executable with zero external dependencies
+- **Model Context Protocol (MCP)** — first-class client and server support (stdio, SSE, direct in-process)
+- **Kaze (風) Zero-GC Guardrails** — deterministic typed physical scripting with single-instruction fuel metering
 - **Unified R7 Security Policy** — deterministic firewall for tools, shell, filesystem, network, and MCP
 - **Async HTTP server & SIMD vector mathematics**
+- **In-process local LLM inference** — **[Experimental - Preview]** (built-in engine is early stage; for production use `sofuu-plugin-llamacpp` or remote providers) (GGUF, SafeTensors, PyTorch, NumPy on Metal / NEON / AVX2) and cloud streaming
+- **MAVLink robotics & drone companion brain** — **[Experimental - Preview]** (zero-dependency codec, GPIO pulse timers, and hardware safety gate)
+
+---
+
+## Production Core vs. Experimental Preview Status
+
+To ensure absolute reliability for developer adoption and production deployments (including our Hacker News launch gate), Sofuu enforces a strict demarcation between its **Production-Ready Core** and its specialized **Experimental Preview Modules**:
+
+| Subsystem | Readiness Tier | Scope & Standards |
+| :--- | :---: | :--- |
+| **Autonomous Agent Loop** | 🟢 **Production Ready** | `sofuu.agent`, cooperative scheduling (`scheduler.yield()`), step budgets, resilient editing (`smart_edit`), AST syntax dry-runs, real-time QTSQ trace streaming. |
+| **Deterministic Toolpacks** | 🟢 **Production Ready** | `sofuu.tools.PACKS` (`coding`, `web`, `memory`, `system`), single-instruction fuel sandbox (`code_eval`), numbered unified diffs. |
+| **Standalone Compiler** | 🟢 **Production Ready** | `sofuu compile`: single-file zero-dependency native executables with 32-byte `SOFUU_BIN_V1` trailer, CRC32 verification, ad-hoc signing, sub-15ms cold start. |
+| **Continuous Memory (CMA v2)** | 🟢 **Production Ready** | On-device `.qtsq` vector brain, cached KDF v2 master key (no 64 MB Argon2 spikes), zero-KDF plaintext mode, hardware SIMD search. |
+| **Model Context Protocol (MCP)** | 🟢 **Production Ready** | Full JSON-RPC 2.0 client/server over stdio, SSE, and direct in-process transports; dynamic tool discovery and execution. |
+| **Kaze (風) Guardrail Engine** | 🟢 **Production Ready** | Small typed scripting language with zero-GC hot path, capability access-control lists, and bounded arena allocation. |
+| **Unified R7 Security Firewall** | 🟢 **Production Ready** | Fail-closed path traversal blocking, private CIDR SSRF filtering, credential shielding (`.env`, `id_rsa`), and approval escalation. |
+| **Built-in Local Inference Engine** | 🧪 **[Experimental - Preview]** | Early-stage custom GGUF/SafeTensors engine. For production inference workloads, use `sofuu-plugin-llamacpp` or remote LLMs. |
+| **Robotics, Drones & MAVLink** | 🧪 **[Experimental - Preview]** | `sofuu drone`, MAVLink v2 codec, and GPIO line timers. Preview hardware track decoupled from the production launch gate. |
+| **Native Frontend Engine** | 🧪 **[Experimental - Preview]** | `sofuu dev` streaming JSX/TSX transpiler and reactive micro-runtime. |
+| **Custom CUDA PTX Kernels** | 🧪 **[Experimental - Preview]** | Hand-tuned Linux GPU decoder kernels and shader dispatch. |
+| **Speculative Swarm Mesh** | 🧪 **[Experimental - Preview]** | Multi-terminal local task synchronization and speculative swarm decoding. |
+| **Cloud REST Fallback Adapters** | 🧪 **[Experimental - Preview]** | Direct provider REST fallback bridges. |
 
 ### Where Sofuu Runs
-Sofuu is built from first principles with a hard **$\le 5.5\text{ MiB}$ binary cap**, a **22.5 ms median cold start** (`sofuu eval "1+1"`, wall clock including process spawn — see [BENCHMARKS.md](BENCHMARKS.md)), and **zero-JIT execution** (making it 100% compliant with strict platform policies like the iOS App Store and RTOS environments). This enables it to run identically across diverse hardware form factors:
+Sofuu is built from first principles with a hard **$\le 5.5\text{ MiB}$ binary cap**, a **14.6 ms median cold start** (500 runs, warm cache, `sofuu eval "1+1"`, wall clock including process spawn, Apple M2 Pro, 2026-11-06 — see [BENCHMARKS.md](BENCHMARKS.md); the 22.5 ms figure from the 2026-10-31 methodology is historical), and **zero-JIT execution** (making it 100% compliant with strict platform policies like the iOS App Store and RTOS environments). This enables it to run identically across diverse hardware form factors:
 - **Cloud & Edge Servers:** Headless microservices, streaming LLM proxies, and containerized autonomous agents with microsecond warm-up.
 - **Developer Workstations:** High-throughput local agent workspaces, standalone compiled CLI tools (`sofuu compile`), and zero-config desktop tools.
 - **Mobile Devices (iOS & Android):** Shipped as an embeddable C ABI library (`libsofuu`) with Swift and Kotlin bindings.
@@ -42,16 +67,16 @@ Sofuu is built from first principles with a hard **$\le 5.5\text{ MiB}$ binary c
 
 ## Features
 
-- **Universal runtime with TS/JS orchestration** — QuickJS (ES2023) + libuv event loop with cooperative scheduler (W3C `scheduler.yield()`, microtask starvation protection), AOT bytecode snapshotting, zero-copy TypedArray SIMD memory bridge, native `AsyncLocalStorage` context propagation, deterministic instruction-metered sandboxing, a 22.5 ms startup median on an Apple M2 Pro (wall clock incl. process spawn, 31 runs — see [BENCHMARKS.md](BENCHMARKS.md); the older 3.8 ms table row is historical), TypeScript runs with no compiler step, and `sofuu bundle` ships one self-contained file
-- **Local edge inference** (**experimental** — built-in engine; production use: llama.cpp or another backend via plugin) — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), up to ~195 tok/s prefill and ~69 tok/s decode on this battery's hardware, in-place KV cache compaction & sliding-window attention past context limits
+- **Universal runtime with TS/JS orchestration** — QuickJS (ES2023) + libuv event loop with cooperative scheduler (W3C `scheduler.yield()`, microtask starvation protection), AOT bytecode snapshotting, zero-copy TypedArray SIMD memory bridge, native `AsyncLocalStorage` context propagation, deterministic instruction-metered sandboxing, a **14.6 ms startup median** on an Apple M2 Pro (500 runs, warm cache, wall clock incl. process spawn, 2026-11-06 — see [BENCHMARKS.md](BENCHMARKS.md); the 22.5 ms and 3.8 ms rows are historical), TypeScript runs with no compiler step, and `sofuu bundle` ships one self-contained file
+- **Local edge inference** — **[Experimental - Preview]** (built-in engine is early stage; for production use `sofuu-plugin-llamacpp` or another backend via plugin) — `sofuu infer`, `sofuu.ai.streamLocal()`, `sofuu chat -m <model>`; multi-format (GGUF, SafeTensors, PyTorch `.pt`, NumPy `.npy`/`.npz`), up to ~195 tok/s prefill and ~69 tok/s decode on this battery's hardware, in-place KV cache compaction & sliding-window attention past context limits
 - **Cloud LLM streaming** — `sofuu.ai.stream` / `complete` over OpenAI, Anthropic, or any OpenAI-compatible endpoint (BYO key); per-model context/effort registry, no default model
 - **Agents + workflows** — `sofuu.agent.define/run`, modular domain toolpacks (`coding`, `web`, `memory`, `system`), prompt sovereignty, tool-aware task-gate, budgets, cancel, trace rendering; generalized session documents (`chat`, `agent`, `workflow`, `pipeline`) with state container
-- **Encrypted local brain** — `sofuu.memory` over `.qtsq` files: recall across sessions, `/remember` pins facts, portable brain cards (`/share` + `/import`), optional HTTP serving, now fully bundled on Linux and macOS
+- **Encrypted local brain** — `sofuu.memory` over `.qtsq` files: recall across sessions, `/remember` pins facts, portable brain cards (`/share` + `/import`), optional HTTP serving, fully bundled on Linux and macOS; an explicit `{ plaintext: true }` open gives edge/IoT stores a zero-KDF mode (no Argon2id, no 64 MiB spike) whose choice is persisted in the manifest
 - **Offline embeddings** — `ai.embed` (768-dim, zero-byte model), `ai.embedImage` (joint text/image space), SIMD `similarity`/`dot`/`l2`
 - **Speech in/out** — `ai.transcribe` / `ai.speak` via provider endpoints or on-device OS engines
 - **Long-context Q&A** — `sofuu.rlm.query` answers over contexts far larger than any model window via a sandboxed reader loop
 - **Kaze device scripting** — `sofuu script run|check|compile|repl`: a small typed language for drones, rovers and edge devices, with declared capabilities, a fuel meter and bytecode from day one. Additive to JS, never a replacement — [spec](docs/KAZE-SPEC.md)
-- **Robotics, Autonomous Drones & MAVLink** — `sofuu drone observe|status|send|mission|why|init`, `sofuu.mavlink`, and `sofuu.drone`: zero-dependency MAVLink v2 codec, deterministic R7 hardware safety gate (reject-never-clamp, geofences, fail-closed GPS dropouts), 1 Hz autonomous dead-man heartbeat, PreArm diagnostics, Linux GPIO/pulse timers, and ground rover pre-flight verification — [plan](docs/PLAN-DRONES-MAVLINK.md)
+- **Robotics, Autonomous Drones & MAVLink** — **[Experimental - Preview]** — `sofuu drone observe|status|send|mission|why|init`, `sofuu.mavlink`, and `sofuu.drone`: zero-dependency MAVLink v2 codec, deterministic R7 hardware safety gate (reject-never-clamp, geofences, fail-closed GPS dropouts), 1 Hz autonomous dead-man heartbeat, PreArm diagnostics, Linux GPIO/pulse timers, and ground rover pre-flight verification — [plan](docs/PLAN-DRONES-MAVLINK.md)
 - **Context-economy gates** — `sofuu.ml` freshness/supervisor/compaction/relevance models (~8k params each) advise the loop to cut token waste; hard off via `/ml off` or `SOFUU_NO_ML=1`
 - **MCP + HTTP + web** — `sofuu.mcp.connect/serve`, `sofuu.http.createServer`, keyless `sofuu.web.search/open`
 - **Modern npm + Web Streams** — conditional `package.json#exports` (subpaths, `./*` wildcards, `import`/`require` conditions), and `Response.body` as a real `ReadableStream` (`getReader`, `pipeThrough(new TextDecoderStream())`, `for await`), so official AI SDK streaming loops run unmodified; unsupported packages fail with a coded, actionable diagnostic instead of a cryptic error
@@ -88,24 +113,32 @@ security scope — what R7 guarantees and what residual risks you accept.
 
 ---
 
-## Release status (2026-10-31)
+## Release status (2026-11-06)
 
 `sofuu version` prints the build revision next to the semver, so a binary can be
 traced to the commit that produced it:
 
 ```
 sofuu 0.3.0-beta
-revision 98eb89352
+revision e5142fb02
 quickjs 2024-01-13
 platform: macOS arm64
 ```
 
 | Artifact | Size | vs. the 5.5 MiB (5,767,168 B) cap |
 | --- | --- | --- |
-| macOS arm64 — this tree | 5,595,072 B (5.34 MiB) | passes, 172,096 B headroom |
-| macOS arm64 — `dist/sofuu-darwin-arm64` | 5,755,312 B (5.49 MiB) | passes, 11,856 B headroom |
-| Linux arm64 — `scripts/cross/build_linux_arm64.sh` | 5,091,760 B (4.86 MiB) | passes, 675,408 B headroom |
-| Linux x86_64 — `scripts/cross/build_linux_x86_64.sh` | 5,723,504 B (5.46 MiB) | passes, 43,664 B headroom |
+| macOS arm64 — this tree | 5,628,208 B (5.37 MiB) | passes, 138,960 B headroom |
+| macOS arm64 — `dist/sofuu-darwin-arm64` | 5,628,208 B (5.37 MiB) | passes (revision `51fa5a23f`; re-cut with the next release) |
+| Linux arm64 — rebuilt `dist/` | 5,117,296 B (4.88 MiB) | passes, 649,872 B headroom |
+| Linux x86_64 — rebuilt `dist/` | 5,751,616 B (5.49 MiB) | passes, 15,552 B headroom |
+
+The 2026-11-05 **Stabilization Freeze** landed the zero-KDF plaintext store,
+turn-boundary reclamation, bounded streaming buffers, and the 16 ms event-loop
+gate (see CHANGELOG). Measured on the same tree: idle boot **11.78 MB**, first
+encrypted brain flush **79.84 MB** (once per process; 0.0 ms on later flushes),
+plaintext brain flush **12.63 MB**, and **1 ms** maximum event-loop lag under
+64 concurrent serve turns. Reproduce with `make cold-start-bench` and
+`make event-loop-check`.
 
 The cap is enforced rather than asserted: `make size-check` fails the build over
 it, and `scripts/verify-dist.sh` fails a release that ships an artifact over the
@@ -123,7 +156,7 @@ bash scripts/cross/vm-smoke.sh dist/sofuu-linux-x86_64 dist/sofuu-linux-arm64
 - **Linux x86_64 builds require AVX2.** The SIMD kernels are compiled with
   `-mavx2 -mfma`, so the binary takes SIGILL on a CPU older than roughly
   Haswell (2013) — under qemu's default `qemu64` model it dies before printing
-  anything, and runs fine under `-cpu max`. x86_64 has 43,664 B of headroom, so
+  anything, and runs fine under `-cpu max`. x86_64 has 15,552 B of headroom, so
   a runtime dispatch to a portable kernel path would need to fit in that, or the
   floor needs to be documented as a requirement rather than a surprise.
 - **Every shipped artifact is now under the cap**; the Linux archives on the
@@ -176,6 +209,21 @@ console.log("Recalled from vector brain:", match.text);
 Recalled from vector brain: Sofuu boots in 2ms with zero daemons.
 # Completed in 2ms · 0 background daemons · 0 cloud API calls
 ```
+
+On storage that already has hardware-level protection (an encrypted flash
+partition, a TEE-backed filesystem), `memory.open` also accepts a zero-KDF
+mode:
+
+```js
+const brain = sofuu.memory.open("./brain.qtsq", 768, { plaintext: true });
+```
+
+It skips the password vault entirely — no Argon2id, no 64 MiB key-derivation
+spike — and persists the choice in the manifest so a later open without the
+option keeps the store plaintext. The default remains encrypted with the
+machine-local key.
+
+
 
 Or write a 4-line script `hello.js` and run `$ sofuu run hello.js`:
 
@@ -562,13 +610,13 @@ into an agent tool with `import { defineTool, sfs } from "sofuu"`.
 ```bash
 sofuu                        # Interactive AI chat
 sofuu chat [-m <model.gguf>] # Chat (cloud API or local model)
-sofuu dev [dir]              # AI-native full-stack dev server (--port, --host, --model)
-sofuu infer <model> "<p>"    # Pure CPU LLM inference (GGUF, zero deps, experimental)
+sofuu dev [dir]              # [Experimental - Preview] AI-native full-stack dev server (--port, --host, --model)
+sofuu infer <model> "<p>"    # [Experimental - Preview] In-process local LLM inference (GGUF, zero deps)
 sofuu repl                   # JavaScript evaluation REPL
 sofuu run <file.js|ts>       # Run a JavaScript/TypeScript file
 sofuu eval "<code>"          # Evaluate a JS expression inline
 sofuu script run|check|compile|repl <file.kaze> # Kaze device scripting (--cap drone=sim --fuel 200000)
-sofuu drone observe|status|send|mission|why|init # Fly vehicle through R7 hardware safety gate
+sofuu drone observe|status|send|mission|why|init # [Experimental - Preview] Fly vehicle through R7 hardware safety gate
 sofuu bundle <entry.js> [-o <out.js>]  # Bundle into one file
 sofuu compile <entry.ts> [-o <out>]    # Standalone single-file binary (--embed-brain, --no-strip)
 sofuu install / add <package>          # npm packages
@@ -588,7 +636,7 @@ sofuu version / help
 
 ---
 
-## Native Frontend & Full-Stack Engine (`sofuu dev`) — experimental
+## Native Frontend & Full-Stack Engine (`sofuu dev`) — [Experimental - Preview]
 
 Sofuu embeds an experimental streaming JSX/TSX transpiler, file-based router, and React-API-compatible reactive micro-runtime (nominative reference; not affiliated with the React project) directly into the native binary. Develop full-stack reactive web applications with zero npm dependencies and zero background daemons.
 

@@ -36,7 +36,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: js-swallow-check env-knobs-check swiftpm-consistency-check all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
+.PHONY: js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check cold-start-bench all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
 	kaze-drift-check kaze-drift-strict clippy-ratchet \
 	observability-stress asan fuzz-simd policy-dx modern-npm sbom sign-dist \
         deps scoreboard scoreboard-check cuda-check \
@@ -334,7 +334,7 @@ clean:
 	rm -f $(TARGET)
 	cargo clean 2>/dev/null || true
 
-test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check env-knobs-check swiftpm-consistency-check
+test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check
 	@echo ""
 	@echo "\033[1m=== Sofuu Test Suite ===\033[0m"
 	@echo ""
@@ -377,6 +377,20 @@ kaze-drift-strict:
 # fall, never rise; the baseline in .ci/clippy-baseline.txt is the number to beat.
 clippy-ratchet:
 	@scripts/check-clippy-ratchet.sh
+
+# Stabilization Freeze Pass 3.1: concurrent serve turns must not block the
+# primary QuickJS+libuv loop beyond the 16 ms hard-realtime ceiling
+# (RULES.md §3.6). The inference seam is faked; the handler is the shipped
+# one. Knobs: SOFUU_LOOP_CONCURRENCY / _CHUNKS / _CHUNK_MS / _BUDGET_MS.
+event-loop-check: $(TARGET)
+	@$(TARGET) run scripts/bench/event_loop_latency.js
+
+# Extreme cold-start characterization (standalone; ~7k process launches).
+# Percentiles over 500 engine boots, spawn floor, env variants, and
+# concurrent bursts to 200 simultaneous processes. Warm page cache on
+# macOS unless run as root.
+cold-start-bench: $(TARGET)
+	@python3 -I scripts/bench/extreme_cold_start.py
 
 # ─── Workstream 6 conformance (protocols/sandbox/tooling) ─────────
 # Local-only runner (tests/ is gitignored). Not wired into CI yet: KNOWN-GAP

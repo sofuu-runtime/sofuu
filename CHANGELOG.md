@@ -4,6 +4,43 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Stabilization Freeze — RAM, Concurrency & Error-Precision Closeout — 2026-11-05
+
+[`docs/PLAN-STABILIZATION-FREEZE.md`](docs/PLAN-STABILIZATION-FREEZE.md) is implemented and verified pass by pass. Pass 1 (F-01…F-04) was already landed in the audit remediation; this entry covers the remaining work.
+
+**Pass 2.1 — the 64 MiB Argon2id spike is verified gone from steady state.**
+- QTSQ KDF v2 (process-wide master derivation + per-file SHA3 PRF) is what the linked `libqtsq.a` already ships; the runtime now **pins** it. `sofuu-ffi` gained `security_version()` (offset 400, header-probed) and `KDF_VERSION_MASTER`; `vault_containers_use_the_process_wide_master_kdf` fails if a new container regresses to per-container Argon2id.
+- The stale `brain_store.rs` cost comment now describes the real behaviour: the 64 MiB stretch runs once per process/password; legacy v1 files keep their per-file derivation as a one-time migration.
+
+**Pass 2.2 — explicit zero-KDF plaintext mode for edge devices.**
+- `sofuu.memory.open(path, dim, { plaintext: true })` (aliases `directKey` / `direct_key`) writes segments, manifests and legacy single-file saves through the codec's plaintext streaming writer. No password vault, no Argon2, no KDF.
+- The mode is persisted as `Manifest.plaintext`; a later open without the option adopts it instead of half-rekeying the store. An explicit plaintext open of an encrypted store marks the next flush as a full rewrite.
+- Measured on macOS arm64: first encrypted flush peaks at **79,839,232 B** RSS; the same plaintext flush peaks at **12,632,064 B** — the 64 MiB transient is gone.
+- New tests: `plaintext_segments_and_manifest_round_trip_without_the_vault`, `plaintext_open_writes_unencrypted_files_and_a_silent_reopen_adopts_it`, `legacy_single_file_plaintext_save_round_trips`, plus a JS end-to-end open/flush/reopen check.
+
+**Pass 2.3 — bounded streaming text buffers.**
+- `agent.js` and `serve.js` coalesce token streams into ~64 KiB chunks (`textChunkBuffer`) instead of growing one string per token; `serve.js` also stopped accumulating thinking text that no reader consumed.
+- The agent's mid-stream continuation path now reads the same buffer (`parts.text()`), so a cut answer still resumes exactly once with overlap trimmed.
+
+**Pass 2.4 — turn-boundary reclamation.**
+- `agent.js finish()` runs one full collection at the root turn boundary; `serve.js` runs one in the request `finally` for alloc-heavy routes only (health probes stay allocation-free); `runMany` keeps its batch collection.
+- `rt/engine.rs`'s GC bridge now also calls `malloc_trim(0)` on glibc, so the RSS curve follows the JS heap down. `sofuu.gc()` is exposed for hosts that want an explicit boundary.
+
+**Pass 3.1 — concurrency ceiling measured, not assumed.**
+- `scripts/bench/event_loop_latency.js` (`make event-loop-check`, wired into `make test`) drives the shipped `sofuu.serve` handler with a macrotask-yielding fake stream: 32 concurrent turns × 128 chunks measured **max loop lag 1 ms**, p95 1 ms, against the 16 ms hard-realtime ceiling. The 64×256 stress row is also 1 ms.
+
+**Extreme cold-start characterization.**
+- `scripts/bench/extreme_cold_start.py` (`make cold-start-bench`) runs ~7,000 process launches: 1,000 spawn-floor runs, 500 engine boots, 300-run env variants, and concurrent bursts to 200 processes.
+- Current build: **14.58 ms p50 / 15.33 ms p95 / 15.53 ms p99** for `sofuu eval "1+1"`; spawn floor 1.48 ms; CLI-only 4.35 ms; idle RSS 10.91 MB.
+- Pre-stabilization artifact `51fa5a23f`: 14.47 ms p50 — **no regression**. `SOFUU_NO_ML` and `SOFUU_NO_TOOLS` do not move boot. `capabilities` pays a deliberate Metal probe (~31.9 ms).
+- Concurrent throughput saturates at **~400 process starts/s** on 10 cores; beyond one process per core, latency rises with queuing (documented in BENCHMARKS.md §2). Warm page cache only: macOS `purge` requires root.
+
+**Pass 3.2 / 4.1 — gates.**
+- Clippy ratchet green (619 / 6 / 51, at baseline).
+- Both Linux artifacts rebuilt from this tree and under the cap: arm64 **5,117,296 B**, x86_64 **5,751,616 B** (≤ 5,767,168 B).
+
+**Verification receipts:** 1,154 lib tests passed / 0 failed / 47 ignored · `bash scripts/preflight.sh` green · `make test` green (full JS suite 72 passed / 0 failed / 1 skipped) · `make bc-check` 11/11 · `make plugin-check` 5/5 · `make size-check` 5,628,208 B · `make cold-start-bench` 14.58 ms p50 · `make event-loop-check` 1 ms max lag · serve suite 34/34 · agent suite all passed · memory JS suites 101/30/22/40/69 assertions passed · clippy ratchet 619/6/51 at baseline. `verify-dist` remains red only on release hygiene (dirty tree; the darwin dist archive predates this HEAD), not on size.
+
 ## Full Source Audit Remediation, Zero-Catch Retiring & Linux Binary Cap Compliance — 2026-11-04
 
 [`docs/PLAN-AUDIT-REMEDIATION-2026-11-02.md`](docs/PLAN-AUDIT-REMEDIATION-2026-11-02.md) is fully implemented and verified across all 7 phases, remediating all 16 findings from the 2026-11-02 independent source audit:

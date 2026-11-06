@@ -133,7 +133,8 @@
        * instead of deferring the load to first row access. */
       opts = {
         readonly: !!a.readonly,
-        verify_full: !!(a.verifyFull || a.verify_full)
+        verify_full: !!(a.verifyFull || a.verify_full),
+        plaintext: !!(a.plaintext || a.directKey || a.direct_key)
       };
     } else {
       path = a;
@@ -145,11 +146,12 @@
         sid = spaceId.embed_id !== undefined ? spaceId.embed_id : spaceId.space;
         opts = {
           readonly: !!spaceId.readonly,
-          verify_full: !!(spaceId.verifyFull || spaceId.verify_full)
+          verify_full: !!(spaceId.verifyFull || spaceId.verify_full),
+          plaintext: !!(spaceId.plaintext || spaceId.directKey || spaceId.direct_key)
         };
       } else {
         sid = spaceId;
-        opts = { readonly: false, verify_full: false };
+        opts = { readonly: false, verify_full: false, plaintext: false };
       }
     }
     var inst = (sid === undefined || sid === null)

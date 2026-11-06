@@ -54,6 +54,14 @@ static PINNED: OnceLock<String> = OnceLock::new();
 /// Cached for the process: the file is read (or created) once, so a brain
 /// flush never pays a syscall for it and cannot observe a half-written key.
 ///
+/// Stabilization Freeze Pass 2.1: this caches the PASSWORD, not the derived
+/// key. The expensive Argon2id stretch is cached one layer down, in the
+/// QTSQ vault (KDF v2: `master = Argon2id(password, domain)` once per
+/// process, then `SHA3(master || "kdf2" || salt)` per container). Keeping the
+/// cache there means every writer (brain, session, KV) shares it; the
+/// plaintext open mode skips it entirely. See `rt/brain_store.rs` for the
+/// measured numbers and the regression test that pins the version byte.
+///
 /// PC-06 (audit 2026-10-29, Pi 5): a pinned password wins over the cache,
 /// because the one caller that pins (`sofuu doctor`) must be able to say
 /// "read THIS key, and create nothing" before its first brain open.

@@ -130,12 +130,32 @@ mod impl_qtsq {
 
     /// cma_qtsq_save — write the "memories" f32 tensor + "metadata" JSON
     /// streams, then pack → encrypt → fail-closed write.
+    ///
+    /// Retained as the encrypted default for tests and diagnostic callers;
+    /// the runtime always picks a mode explicitly (`_mode`), because the
+    /// handle may have been opened plaintext (Pass 2.2).
+    #[allow(dead_code)]
     unsafe fn cma_qtsq_save(
         path: &str,
         vecs: Option<&[f32]>,
         n_memories: usize,
         vec_dim: usize,
         metadata_json: &str,
+    ) -> c_int {
+        cma_qtsq_save_mode(path, vecs, n_memories, vec_dim, metadata_json, false)
+    }
+
+    /// `cma_qtsq_save` with the Stabilization Freeze's zero-KDF mode. The
+    /// legacy single-file brain path uses this when the handle was opened
+    /// plaintext, so a store never silently flips back to the vault on its
+    /// first migration flush.
+    unsafe fn cma_qtsq_save_mode(
+        path: &str,
+        vecs: Option<&[f32]>,
+        n_memories: usize,
+        vec_dim: usize,
+        metadata_json: &str,
+        plaintext: bool,
     ) -> c_int {
         let ctmp = CString::new(format!("{path}.tmp")).unwrap_or_default();
         /* The brain lives at <project>/.sofuu/brain/brain.qtsq now — make
@@ -225,12 +245,21 @@ mod impl_qtsq {
             /* Pack → encrypt → fail-closed write. Write to a .tmp sibling
              * and atomically rename over the real path so a crash mid-write
              * can never corrupt the existing brain file. */
-            r = qtsq::qtsq_container_pack(container);
-            if r == QTSQ_OK {
-                r = qtsq_adapter_encrypt(container);
-            }
-            if r == QTSQ_OK {
-                r = qtsq::qtsq_write(container, ctmp.as_ptr());
+            if plaintext {
+                /* `qtsq_container_pack` installs a security salt, and
+                 * `qtsq_write_plaintext` then refuses the context with
+                 * QTSQ_ERR_ENCRYPTED. The codec's plaintext entry point is
+                 * the streaming pack_write, which requires the unsalted stub
+                 * this handler still has. */
+                r = qtsq::qtsq_container_pack_write(container, ctmp.as_ptr(), 1);
+            } else {
+                r = qtsq::qtsq_container_pack(container);
+                if r == QTSQ_OK {
+                    r = qtsq_adapter_encrypt(container);
+                }
+                if r == QTSQ_OK {
+                    r = qtsq::qtsq_write(container, ctmp.as_ptr());
+                }
             }
         }
         qtsq::qtsq_free(container);
@@ -695,6 +724,10 @@ mod impl_qtsq {
         /// W2.2: this handle may NOT write anything. Every repair/heal/
         /// backup/manifest-publish path checks it, and `flush` refuses.
         readonly: bool,
+        /// Stabilization Freeze Pass 2.2: every container this handle writes
+        /// (segments, manifest, legacy single-file saves) uses the
+        /// zero-KDF plaintext mode. Adopted from the manifest on reopen.
+        plaintext: bool,
         /// W3.3: whether the payloads have been read yet. A normal open
         /// reads the MANIFEST only and leaves `pending` set; the first row
         /// access (see `materialize`) replays the exact loader an eager
@@ -1246,6 +1279,14 @@ mod impl_qtsq {
         /// W3.3: read + digest every segment payload at open (the pre-W3.3
         /// paranoid behaviour) instead of on first row access.
         verify_full: bool,
+        /// Stabilization Freeze Pass 2.2: write this store through the
+        /// codec's plaintext writer and never enter the password vault. Intended
+        /// for edge/IoT devices whose storage already has hardware-level
+        /// protection and where the 64 MiB Argon2id allocation is an OOM
+        /// risk. Reads are unaffected (the codec reports plaintext files as
+        /// unencrypted). Persisted in the manifest, so a later open without
+        /// this option keeps the store plaintext rather than half-rekeying it.
+        plaintext: bool,
     }
 
     /// Why an open was refused. `Corrupt` is exactly what the old
@@ -1346,6 +1387,7 @@ mod impl_qtsq {
             last_outcome: None,
             lock: Some(lock),
             readonly: opts.readonly,
+            plaintext: opts.plaintext,
             loaded: false,
             pending: None,
             graph_snapshot_epoch: 0,
@@ -1446,6 +1488,14 @@ mod impl_qtsq {
                 return Err(OpenError::Corrupt);
             }
             shell.legacy_encryption = manifest_legacy;
+            /* Pass 2.2: a store that says it is plaintext stays plaintext on
+             * a silent reopen. An explicit `plaintext: true` on an encrypted
+             * store is a one-way rekey: the next flush rewrites every live
+             * record through the zero-KDF writer, and the manifest records
+             * the mode so the choice survives. The old generation remains on
+             * disk until the age-guarded sweep, which is the rollback copy. */
+            let rekey_to_plaintext = opts.plaintext && !m.plaintext;
+            shell.plaintext = opts.plaintext || m.plaintext;
             shell.layout = Some(BrainLayout {
                 dir: crate::rt::brain_store::segments_dir(path),
                 segments: m.segments.clone(),
@@ -1462,7 +1512,7 @@ mod impl_qtsq {
                 decay_tag: m.decay_tag,
                 decay_seconds: m.decay_seconds,
                 evicted_total: m.evicted_total,
-                needs_compaction: manifest_legacy,
+                needs_compaction: manifest_legacy || rekey_to_plaintext,
                 recovery: Recovery::default(),
             });
             shell.loaded = false;
@@ -1628,7 +1678,7 @@ mod impl_qtsq {
         }
         let vecs = if n == 0 { None } else { Some(flat.as_slice()) };
         let meta = metadata_with_embedding(shell);
-        let r = cma_qtsq_save(path, vecs, n, dim, &meta);
+        let r = cma_qtsq_save_mode(path, vecs, n, dim, &meta, shell.plaintext);
         if r == QTSQ_OK {
             0
         } else {
@@ -1999,6 +2049,7 @@ mod impl_qtsq {
         path: &str,
         m: &crate::rt::brain_store::Manifest,
         scan: &SegScan,
+        plaintext: bool,
     ) -> (Vec<crate::rt::brain_store::SegmentMeta>, u64, bool) {
         let dir = crate::rt::brain_store::segments_dir(path);
         let mut segments = scan.segments.clone();
@@ -2006,7 +2057,7 @@ mod impl_qtsq {
         if scan.renumbered && !scan.recs.is_empty() {
             let dim = scan.recs[0].vec.len();
             epoch += 1;
-            match write_segment_chunks(&dir, epoch, 1, dim, &scan.recs) {
+            match write_segment_chunks(&dir, epoch, 1, dim, &scan.recs, plaintext) {
                 Ok(segs) => segments = segs,
                 Err(_) => {
                     eprintln!(
@@ -2026,9 +2077,10 @@ mod impl_qtsq {
             records: scan.recs.len() as u64,
             decay_tag: m.decay_tag,
             decay_seconds: m.decay_seconds,
+            plaintext,
         };
         let tmp = format!("{path}.tmp");
-        if crate::rt::brain_store::write_manifest(&tmp, &manifest).is_err() {
+        if crate::rt::brain_store::write_manifest_mode(&tmp, &manifest, plaintext).is_err() {
             let _ = std::fs::remove_file(&tmp);
             return (m.segments.clone(), m.epoch.max(1), false);
         }
@@ -2077,7 +2129,7 @@ mod impl_qtsq {
         path: &str,
         m: &crate::rt::brain_store::Manifest,
     ) -> Result<(BrainData, BrainLayout), c_int> {
-        load_segmented_opts(path, m, false)
+        load_segmented_opts(path, m, false, m.plaintext)
     }
 
     /// `load_segmented`, told whether this handle may write. W2.3: in
@@ -2088,6 +2140,7 @@ mod impl_qtsq {
         path: &str,
         m: &crate::rt::brain_store::Manifest,
         readonly: bool,
+        plaintext: bool,
     ) -> Result<(BrainData, BrainLayout), c_int> {
         let dir = crate::rt::brain_store::segments_dir(path);
         let mut scan = scan_segments_opts(path, m, readonly);
@@ -2097,7 +2150,7 @@ mod impl_qtsq {
                  * file, and this handle must not pretend it owns the store. */
                 (scan.segments.clone(), m.epoch.max(1), false)
             } else {
-                heal_store(path, m, &scan)
+                heal_store(path, m, &scan, plaintext)
             }
         } else {
             (m.segments.clone(), m.epoch.max(1), true)
@@ -2213,7 +2266,7 @@ mod impl_qtsq {
         };
         let path = shell.mind_path.clone();
         let readonly = shell.readonly;
-        let (mut brain, layout) = load_segmented_opts(&path, &m, readonly)?;
+        let (mut brain, layout) = load_segmented_opts(&path, &m, readonly, shell.plaintext)?;
         /* The manifest's dimension is the one the space check already
          * agreed with; `hydrate` needs it and the segment reader leaves
          * it at 0 for the caller to fill. */
@@ -2329,7 +2382,7 @@ mod impl_qtsq {
             report.missing = scan.missing.clone();
             report.records_dropped = scan.dropped_versions;
             let (segments, _epoch, healed) = if scan.damaged() {
-                heal_store(path, &manifest, &scan)
+                heal_store(path, &manifest, &scan, manifest.plaintext)
             } else {
                 (manifest.segments.clone(), manifest.epoch.max(1), true)
             };
@@ -2368,13 +2421,14 @@ mod impl_qtsq {
         start_seq: u64,
         dim: usize,
         recs: &[crate::rt::brain_store::SegRecord],
+        plaintext: bool,
     ) -> Result<Vec<crate::rt::brain_store::SegmentMeta>, c_int> {
         let mut out = Vec::new();
         for (i, chunk) in recs.chunks(crate::rt::brain_store::SEGMENT_CAP).enumerate() {
             let name = crate::rt::brain_store::segment_file(epoch, start_seq + i as u64);
             let final_path = format!("{dir}/{name}");
             let tmp = format!("{final_path}.tmp");
-            crate::rt::brain_store::write_segment(&tmp, dim, chunk)?;
+            crate::rt::brain_store::write_segment_mode(&tmp, dim, chunk, plaintext)?;
             /* Digest the staged file (the bytes that will be renamed in). */
             let sha256 = crate::rt::brain_store::file_digest(&tmp).unwrap_or_default();
             if !crate::rt::wal::publish(&tmp, &final_path) {
@@ -2455,7 +2509,7 @@ mod impl_qtsq {
             .map(|id| seg_record(shell, id))
             .collect();
         layout.epoch += 1;
-        match write_segment_chunks(&layout.dir, layout.epoch, 1, dim, &recs) {
+        match write_segment_chunks(&layout.dir, layout.epoch, 1, dim, &recs, shell.plaintext) {
             Ok(segs) => {
                 let stats = FlushStats {
                     records_written: recs.len(),
@@ -2533,7 +2587,7 @@ mod impl_qtsq {
         let fresh: Vec<crate::rt::brain_store::SegRecord> =
             ids.iter().map(|id| seg_record(shell, *id)).collect();
         let seq = next_segment_seq(&layout.dir, &layout.segments);
-        match write_segment_chunks(&layout.dir, layout.epoch, seq, dim, &fresh) {
+        match write_segment_chunks(&layout.dir, layout.epoch, seq, dim, &fresh, shell.plaintext) {
             Ok(segs) => {
                 let stats = FlushStats {
                     records_written: fresh.len(),
@@ -2739,9 +2793,12 @@ mod impl_qtsq {
             /* The live row count (tombstones included) — the number a
              * fresh open's count() reports, not total_versions(). */
             records: live as u64,
+            /* Pass 2.2: persist the at-rest mode so the next open (which may
+             * not repeat the option) keeps writing the same way. */
+            plaintext: shell.plaintext,
         };
         let tmp = format!("{path}.tmp");
-        if crate::rt::brain_store::write_manifest(&tmp, &manifest).is_err() {
+        if crate::rt::brain_store::write_manifest_mode(&tmp, &manifest, shell.plaintext).is_err() {
             let _ = std::fs::remove_file(&tmp);
             shell.note_flush_failure(
                 E_ENOSPC,
@@ -3543,13 +3600,22 @@ mod impl_qtsq {
         /* W2.2/W3.3: optional 4th arg — an options object
          * `{readonly, verify_full|verifyFull}` (memory_api.js forwards the
          * object form's flags here). Anything else, or nothing, keeps the
-         * pre-W2/W3 behaviour exactly. */
+         * pre-W2/W3 behaviour exactly.
+         *
+         * Pass 2.2 adds `plaintext` (aliases `directKey`/`direct_key`, the
+         * wording the stabilization freeze uses): write with the zero-KDF
+         * codec path. It is spelled three ways because the plan, the JS
+         * docs and existing option naming each say it differently; all three
+         * mean the same single flag. */
         let mut open_opts = OpenOpts::default();
         if argc >= 4 && qjs::is_object(*argv.add(3)) {
             let obj = *argv.add(3);
             open_opts.readonly = js_object_flag(ctx, obj, c"readonly");
             open_opts.verify_full = js_object_flag(ctx, obj, c"verify_full")
                 || js_object_flag(ctx, obj, c"verifyFull");
+            open_opts.plaintext = js_object_flag(ctx, obj, c"plaintext")
+                || js_object_flag(ctx, obj, c"directKey")
+                || js_object_flag(ctx, obj, c"direct_key");
         }
 
         let path_owned = cstr_opt(path);
@@ -5157,6 +5223,7 @@ mod impl_qtsq {
              * write (it is the migration writer); nothing reads lazily. */
             lock: None,
             readonly: false,
+            plaintext: false,
             loaded: true,
             pending: None,
             graph_snapshot_epoch: 0,
@@ -7621,6 +7688,111 @@ mod impl_qtsq {
             expected,
             "every record must survive the reload"
         );
+    }
+
+    /// Stabilization Freeze Pass 2.2 (end to end): an open with
+    /// `plaintext: true` writes segments and the manifest through the
+    /// zero-KDF codec path, persists the mode, and a later silent open
+    /// adopts it. Every file on disk must report `is_encrypted() == false`.
+    #[test]
+    fn plaintext_open_writes_unencrypted_files_and_a_silent_reopen_adopts_it() {
+        let dir = fresh_test_dir("plaintext-open");
+        let p = dir.join("brain.qtsq").to_string_lossy().to_string();
+        let dim = 16;
+
+        let mut shell = unsafe {
+            cma_open_ex(
+                &p,
+                dim,
+                None,
+                OpenOpts {
+                    plaintext: true,
+                    ..OpenOpts::default()
+                },
+            )
+        }
+        .expect("plaintext open");
+        assert!(shell.plaintext, "the handle must carry the requested mode");
+        assert!(unsafe { materialize(&mut shell) }.is_ok());
+
+        for i in 0..3 {
+            let v = crate::embedding::hash_features_at(&format!("edge {i}"), dim);
+            assert!(
+                unsafe {
+                    cma_remember(
+                        &mut shell,
+                        &v,
+                        Some(&format!("edge {i}")),
+                        Some("user"),
+                        0,
+                        None,
+                    )
+                } >= 0
+            );
+        }
+        assert_eq!(unsafe { cma_flush(&mut shell) }, 0, "plaintext flush");
+
+        let manifest =
+            unsafe { crate::rt::brain_store::read_manifest(&p) }.expect("manifest");
+        assert!(manifest.plaintext, "the mode must be persisted");
+        assert_eq!(manifest.records, 3);
+
+        let seg_dir = crate::rt::brain_store::segments_dir(&p);
+        let files = crate::rt::brain_store::list_segment_files(&seg_dir);
+        assert!(!files.is_empty(), "the flush must seal at least one segment");
+        for name in &files {
+            let file = format!("{seg_dir}/{name}");
+            let (encrypted, version) =
+                unsafe { crate::rt::brain_store::container_security_info(&file) }
+                    .expect("read plaintext segment header");
+            assert!(
+                !encrypted,
+                "{name} must be plaintext (no vault, no KDF)"
+            );
+            assert_eq!(version, 0, "{name} must carry no KDF block");
+        }
+
+        drop(shell);
+        let mut reopened =
+            unsafe { cma_open_ex(&p, dim, None, OpenOpts::default()) }.expect("silent reopen");
+        assert!(
+            reopened.plaintext,
+            "a manifest that says plaintext must keep the store plaintext"
+        );
+        assert!(unsafe { materialize(&mut reopened) }.is_ok());
+        assert_eq!(reopened.cma.len(), 3, "records survive the reopen");
+    }
+
+    /// Pass 2.2 also covers the legacy single-file path: `cma_qtsq_save_mode`
+    /// must use the codec's plaintext streaming writer (the same one the
+    /// segmented path uses) rather than pack+`qtsq_write_plaintext`, which
+    /// would refuse the salted container.
+    #[test]
+    fn legacy_single_file_plaintext_save_round_trips() {
+        let dir = fresh_test_dir("plaintext-legacy");
+        let p = dir.join("brain.qtsq").to_string_lossy().to_string();
+        let dim = 8;
+        let vecs: Vec<f32> = (0..dim).map(|i| i as f32 / dim as f32).collect();
+        let meta = serde_json::json!({
+            "schema": "sofuu-cma@2",
+            "embedding": {"id": "hash-v1", "input": "hash-v1", "dimension": dim},
+            "records": [],
+        })
+        .to_string();
+        assert_eq!(
+            unsafe { cma_qtsq_save_mode(&p, Some(&vecs), 1, dim, &meta, true) },
+            0,
+            "plaintext legacy save"
+        );
+        let (encrypted, version) =
+            unsafe { crate::rt::brain_store::container_security_info(&p) }
+                .expect("read single-file header");
+        assert!(!encrypted, "the legacy plaintext file must not be encrypted");
+        assert_eq!(version, 0, "no KDF block");
+
+        let loaded = unsafe { cma_qtsq_load_opts(&p, true) }.expect("reload plaintext brain");
+        assert_eq!(loaded.n, 1, "the vector survives the round trip");
+        assert_eq!(loaded.dim, dim);
     }
 
     /// P1 (audit 2026-10-14): the flush stamps the LIVE record-row count

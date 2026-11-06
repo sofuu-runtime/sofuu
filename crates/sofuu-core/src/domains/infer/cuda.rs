@@ -254,7 +254,6 @@ pub fn validate_gemm_b8(
     rows: usize,
     cols: usize,
     n_tokens: usize,
-    row_tile: usize,
     w_bytes: usize,
     x_bytes: usize,
     y_bytes: usize,
@@ -262,21 +261,17 @@ pub fn validate_gemm_b8(
     if rows == 0 || cols == 0 {
         return Err(CudaError("gemm_b8 needs non-zero rows and cols".into()));
     }
-    // Activations are loaded as aligned float4s; a row width that is not a
-    // multiple of four would misalign every token row after the first.
-    if !cols.is_multiple_of(4) {
+    // Each warp iteration loads one aligned 256-value chunk from the token
+    // row (`sofuu_load8(xrow + cg + lane*8)`), so a row width that is not a
+    // whole number of chunks would read across the row boundary.
+    if !cols.is_multiple_of(256) {
         return Err(CudaError(format!(
-            "gemm_b8 cols {cols} is not a multiple of 4 (aligned float4 rows)"
+            "gemm_b8 cols {cols} is not a multiple of 256 (one warp chunk)"
         )));
     }
     if n_tokens == 0 || n_tokens > 8 {
         return Err(CudaError(format!(
-            "gemm_b8 n_tokens {n_tokens} is outside 1..=8 (one warp per token)"
-        )));
-    }
-    if row_tile == 0 || row_tile > 32 || !row_tile.is_multiple_of(8) {
-        return Err(CudaError(format!(
-            "gemm_b8 row_tile {row_tile} must be a multiple of 8 in 8..=32"
+            "gemm_b8 n_tokens {n_tokens} is outside 1..=8 (one warp per token,row)"
         )));
     }
     let Some(row_bytes) = quant.row_bytes(cols) else {
@@ -482,6 +477,12 @@ mod sys {
             ctx: *mut c_void,
             name: *const c_char,
             out: *mut *mut c_void,
+        ) -> c_int;
+        pub fn sofuu_cuda_ctx_function_attr(
+            ctx: *mut c_void,
+            function: *mut c_void,
+            attrib: c_int,
+            out: *mut c_int,
         ) -> c_int;
         pub fn sofuu_cuda_ctx_alloc(ctx: *mut c_void, bytes: u64, out: *mut u64) -> c_int;
         pub fn sofuu_cuda_ctx_free(ctx: *mut c_void, ptr: u64) -> c_int;
@@ -732,6 +733,22 @@ mod imp {
                     "initialised {} cc{}.{} on {}",
                     info.name, info.cc_major, info.cc_minor, info.library
                 ));
+                // Occupancy receipt: a GEMV that looks memory-bound is often
+                // register-bound. print the JIT's register count per kernel so
+                // the "8 blocks per SM" assumption can be checked against the
+                // hardware instead of inferred from tok/s.
+                if debug_on() {
+                    for (name, f) in &funcs {
+                        let (mut regs, mut threads) = (0 as c_int, 0 as c_int);
+                        let r1 =
+                            sys::sofuu_cuda_ctx_function_attr(ctx, *f, 4, &mut regs);
+                        let r2 =
+                            sys::sofuu_cuda_ctx_function_attr(ctx, *f, 0, &mut threads);
+                        if r1 == 0 && r2 == 0 {
+                            debug(format!("{name}: regs={regs} max_threads={threads}"));
+                        }
+                    }
+                }
                 Some(CudaEngine {
                     driver,
                     ctx,
@@ -1108,9 +1125,10 @@ mod imp {
             )
         }
 
-        /// Batched prefill GEMV: one warp per token, `row_tile` output rows per
-        /// block. `x` is [n_tokens, cols] and `y` is [n_tokens, rows], both
-        /// token-major; the weight is read once and reused across the chunk.
+        /// Batched prefill GEMV: one warp per (token, row) dot. `x` is
+        /// [n_tokens, cols] and `y` is [n_tokens, rows], both token-major; a
+        /// block of eight warps covers one row for eight tokens, so the weight
+        /// row is read once and reused across the chunk.
         #[allow(clippy::too_many_arguments)]
         pub fn gemm_b8(
             &self,
@@ -1121,28 +1139,29 @@ mod imp {
             rows: usize,
             cols: usize,
             n_tokens: usize,
-            row_tile: usize,
         ) -> Result<(), CudaError> {
-            validate_gemm_b8(
-                quant, rows, cols, n_tokens, row_tile, weights.bytes, x.bytes, y.bytes,
-            )?;
+            validate_gemm_b8(quant, rows, cols, n_tokens, weights.bytes, x.bytes, y.bytes)?;
             let mut wp = weights.ptr;
             let mut xp = x.ptr;
             let mut yp = y.ptr;
             let mut r = rows as i32;
             let mut c = cols as i32;
             let mut n = n_tokens as i32;
-            let mut rt = row_tile as i32;
-            let mut params: [*mut c_void; 7] = [
+            let mut params: [*mut c_void; 6] = [
                 &mut wp as *mut u64 as *mut c_void,
                 &mut xp as *mut u64 as *mut c_void,
                 &mut yp as *mut u64 as *mut c_void,
                 &mut r as *mut i32 as *mut c_void,
                 &mut c as *mut i32 as *mut c_void,
                 &mut n as *mut i32 as *mut c_void,
-                &mut rt as *mut i32 as *mut c_void,
             ];
-            let grid = ((rows + row_tile - 1) / row_tile) as u32;
+            let blocks = n_tokens
+                .checked_mul(rows)
+                .and_then(|v| v.checked_add(7))
+                .map(|v| v / 8)
+                .ok_or_else(|| CudaError("gemm_b8 grid overflow".into()))?;
+            let grid = u32::try_from(blocks)
+                .map_err(|_| CudaError(format!("gemm_b8 grid {blocks} exceeds u32")))?;
             self.launch(quant.batch_entry(), (grid, 1, 1), (256, 1, 1), &mut params)
         }
 
@@ -1552,7 +1571,6 @@ mod imp {
             _rows: usize,
             _cols: usize,
             _n_tokens: usize,
-            _row_tile: usize,
         ) -> Result<(), CudaError> {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }
@@ -1759,31 +1777,31 @@ mod tests {
 
     #[test]
     fn gemm_b8_bounds_are_refused_before_the_driver() {
-        // q4_K, 8 rows x 256 cols, eight tokens, eight-row tiles.
+        // q4_K, 8 rows x 256 cols, eight tokens (one warp per token,row).
         let w = 8 * 144;
         let x = 8 * 256 * 4;
         let y = 8 * 8 * 4;
-        assert!(validate_gemm_b8(Quant::Q4K, 8, 256, 8, 8, w, x, y).is_ok());
+        assert!(validate_gemm_b8(Quant::Q4K, 8, 256, 8, w, x, y).is_ok());
 
-        // The kernels are one warp per token and cannot take a ninth.
-        let e = validate_gemm_b8(Quant::Q4K, 8, 256, 9, 8, w, x, y).unwrap_err();
+        // The block has eight warps, so it cannot take a ninth token.
+        let e = validate_gemm_b8(Quant::Q4K, 8, 256, 9, w, x, y).unwrap_err();
         assert!(e.0.contains("outside 1..=8"), "{}", e.0);
-        assert!(validate_gemm_b8(Quant::Q4K, 8, 256, 0, 8, w, x, y).is_err());
+        assert!(validate_gemm_b8(Quant::Q4K, 8, 256, 0, w, x, y).is_err());
 
-        // Row tiles are the 8-row accumulator groups.
-        assert!(validate_gemm_b8(Quant::Q4K, 8, 256, 8, 7, w, x, y).is_err());
-        assert!(validate_gemm_b8(Quant::Q4K, 8, 256, 8, 40, w, x, y).is_err());
+        // A warp iteration loads one aligned 256-value chunk; a narrower row
+        // would read across the boundary.
+        let e = validate_gemm_b8(Quant::F32, 8, 260, 1, 8 * 260 * 4, 260 * 4, 8 * 4)
+            .unwrap_err();
+        assert!(e.0.contains("multiple of 256"), "{}", e.0);
+        let e = validate_gemm_b8(Quant::F32, 8, 6, 1, 8 * 6 * 4, 6 * 4, 8 * 4)
+            .unwrap_err();
+        assert!(e.0.contains("multiple of 256"), "{}", e.0);
 
         // A short activation or output buffer would read/write out of bounds.
-        let e = validate_gemm_b8(Quant::Q4K, 8, 256, 8, 8, w, x - 4, y).unwrap_err();
+        let e = validate_gemm_b8(Quant::Q4K, 8, 256, 8, w, x - 4, y).unwrap_err();
         assert!(e.0.contains("buffers too small"), "{}", e.0);
-        let e = validate_gemm_b8(Quant::Q4K, 8, 256, 8, 8, w, x, y - 4).unwrap_err();
+        let e = validate_gemm_b8(Quant::Q4K, 8, 256, 8, w, x, y - 4).unwrap_err();
         assert!(e.0.contains("buffers too small"), "{}", e.0);
-
-        // f32 rows still need the aligned float4 width.
-        let e = validate_gemm_b8(Quant::F32, 8, 6, 1, 8, 8 * 6 * 4, 6 * 4, 8 * 4)
-            .unwrap_err();
-        assert!(e.0.contains("multiple of 4"), "{}", e.0);
     }
 
     #[test]
@@ -1842,6 +1860,38 @@ mod tests {
                 window.contains(".maxntid"),
                 "{name} has no .maxntid: regenerate with scripts/cuda/gen_ptx.sh \
                  after giving the kernel a SOFUU_LAUNCH_BOUNDS in kernels.cu"
+            );
+        }
+    }
+
+    /// The eight GEMV/prefill kernels declare a four-block occupancy floor.
+    /// If the PTX loses it, the launch-bounds edit that put it there was
+    /// silently dropped and the JIT is free to choose a register count that
+    /// leaves the SMs under-occupied.
+    #[test]
+    fn gemv_kernels_declare_their_occupancy_floor() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../src/cuda/kernels.ptx");
+        let ptx = std::fs::read_to_string(&path).expect("read kernels.ptx");
+        for name in [
+            "sofuu_gemv_q8_0",
+            "sofuu_gemv_q4_k",
+            "sofuu_gemv_q6_k",
+            "sofuu_gemv_f32",
+            "sofuu_gemm_q4_k_b8",
+            "sofuu_gemm_q6_k_b8",
+            "sofuu_gemm_q8_0_b8",
+            "sofuu_gemm_f32_b8",
+        ] {
+            let start = ptx
+                .find(&format!(".entry {name}("))
+                .unwrap_or_else(|| panic!("kernels.ptx is missing {name}"));
+            let body = ptx[start..].find('{').map(|i| start + i).unwrap_or(start);
+            let window = &ptx[start..(body + 200).min(ptx.len())];
+            assert!(
+                window.contains(".minnctapersm 4"),
+                "{name} has no .minnctapersm 4: regenerate with scripts/cuda/gen_ptx.sh \
+                 after giving the kernel a SOFUU_LAUNCH_BOUNDS_MIN(256, 4)"
             );
         }
     }

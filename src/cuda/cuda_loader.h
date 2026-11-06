@@ -92,6 +92,18 @@ int sofuu_cuda_ctx_load_ptx(sofuu_cuda_ctx *ctx, const char *ptx);
 int sofuu_cuda_ctx_function(sofuu_cuda_ctx *ctx, const char *name,
                             void **out_function);
 
+// Function attributes (the two values the occupancy arithmetic needs).
+// Values from the public cuda.h CUfunction_attribute enum.
+#define SOFUU_CUDA_FUNC_ATTR_MAX_THREADS 0
+#define SOFUU_CUDA_FUNC_ATTR_NUM_REGS 4
+
+// Query one attribute of a resolved kernel. `function` is the value returned by
+// sofuu_cuda_ctx_function. Returns SOFUU_CUDA_ERR_LOAD when the driver does not
+// export cuFuncGetAttribute (older drivers), so callers can treat the value as
+// unknown rather than as zero.
+int sofuu_cuda_ctx_function_attr(sofuu_cuda_ctx *ctx, void *function,
+                                 int attrib, int *out_value);
+
 // Device memory. `bytes` must be non-zero; cuMemAlloc returns 256-byte aligned
 // addresses. Freeing 0 is a no-op.
 int sofuu_cuda_ctx_alloc(sofuu_cuda_ctx *ctx, unsigned long long bytes,

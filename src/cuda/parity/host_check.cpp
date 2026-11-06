@@ -334,10 +334,9 @@ void test_tiled_gemv(uint32_t &seed) {
 }
 
 
-// The batched prefill kernels give one warp one token: lane l owns eight
-// consecutive values at cg + l*8, and each block covers `row_tile` rows. These
-// loops mirror that indexing for eight tokens at once, which is where a
-// token/row/column mix-up would live.
+// The batched prefill kernels give one warp one (token, row) dot: lane l owns
+// eight consecutive values at cg + l*8. These loops mirror that indexing for
+// eight tokens at once, which is where a token/row/column mix-up would live.
 void check_dots(const char *name, const std::vector<float> &got,
                 const std::vector<sofuu_ref::Dot> &want) {
     double worst_ratio = 0.0, worst_err = 0.0, worst_bound = 0.0;

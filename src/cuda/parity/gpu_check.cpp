@@ -302,10 +302,10 @@ void test_gemv_f32(void *fn, uint32_t &seed) {
 }
 
 // ── Batched prefill ───────────────────────────────────────────────────────
-// The b8 kernels are one warp per token. Verify every (token, row) pair, not
+// The b8 kernels are one warp per (token, row) dot. Verify every pair, not
 // just row 0, because a token/row mix-up would still produce plausible values.
 void test_gemm_b8(void *fn, uint32_t &seed, int kind, int cols) {
-    const int rows = 20, tokens = 8, tile = 8;
+    const int rows = 20, tokens = 8;
     std::vector<uint8_t> wbytes;
     std::vector<float> wf;
     const uint8_t *wdata = nullptr;
@@ -339,8 +339,8 @@ void test_gemm_b8(void *fn, uint32_t &seed, int kind, int cols) {
         return;
     }
     std::vector<void *> params = {&dw, &dx, &dy, (void *)&rows, (void *)&cols,
-                                  (void *)&tokens, (void *)&tile};
-    bool ok = launch(fn, (unsigned)((rows + tile - 1) / tile), 256, params) &&
+                                  (void *)&tokens};
+    bool ok = launch(fn, (unsigned)((tokens * rows + 7) / 8), 256, params) &&
               download(dy, got.data(), (size_t)tokens * rows * sizeof(float));
 
     double worst_ratio = 0.0, worst_err = 0.0, worst_bound = 0.0;
@@ -876,6 +876,12 @@ int main(int argc, char **argv) {
     bench_gemv("gemv_q4_k", f_q4, 1, 8192, 2048, 400, seed);
     bench_gemv("gemv_q6_k", f_q6, 2, 8192, 2048, 300, seed);
     bench_gemv("gemv_f32", f_f32, 3, 8192, 2048, 80, seed);
+    // The other two shapes that matter per token: q/o projections
+    // (2048x2048) and lm_head (128256x2048, the single largest matrix).
+    bench_gemv("qo_q4_k", f_q4, 1, 2048, 2048, 600, seed);
+    bench_gemv("qo_q6_k", f_q6, 2, 2048, 2048, 600, seed);
+    bench_gemv("lm_head_q4_k", f_q4, 1, 128256, 2048, 60, seed);
+    bench_gemv("lm_head_q6_k", f_q6, 2, 128256, 2048, 60, seed);
 
     sofuu_cuda_ctx_destroy(g_ctx);
     sofuu_cuda_driver_close(g_drv);

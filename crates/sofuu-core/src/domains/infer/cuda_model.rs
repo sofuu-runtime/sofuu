@@ -204,6 +204,28 @@ impl CudaModel {
         })?;
         let info = engine.device_info().clone();
 
+        // Layout split for the arming receipt: with Q4_K_M checkpoints the
+        // output/lm_head matrix is conventionally Q6_K, which is both larger
+        // per value and slower per byte than the Q4_K block stack.
+        let mut quant_bytes = [0usize; 4];
+        add_quant_bytes(&mut quant_bytes, output);
+        add_quant_bytes(&mut quant_bytes, output_norm);
+        for l in layers.iter() {
+            for tv in [
+                &l.attn_norm,
+                &l.attn_q,
+                &l.attn_k,
+                &l.attn_v,
+                &l.attn_output,
+                &l.ffn_norm,
+                &l.ffn_gate,
+                &l.ffn_up,
+                &l.ffn_down,
+            ] {
+                add_quant_bytes(&mut quant_bytes, tv);
+            }
+        }
+
         let dim = cfg.dim;
         let q_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.n_kv_heads * cfg.head_dim;
@@ -383,13 +405,18 @@ impl CudaModel {
         let rope_b = alloc_f32!(PREFILL_BATCH * cfg.head_dim, "rope_batch");
 
         eprintln!(
-            "[cuda] {} rev {} cc{}.{} · {:.2} GiB VRAM · weights {:.2} GiB · KV {} rows ({:.0} MiB x2)",
+            "[cuda] {} rev {} cc{}.{} · {:.2} GiB VRAM · weights {:.2} GiB \
+             (f32 {:.1}, q8_0 {:.1}, q4_K {:.1}, q6_K {:.1} MiB) · KV {} rows ({:.0} MiB x2)",
             info.name,
             env!("SOFUU_BUILD"),
             info.cc_major,
             info.cc_minor,
             vram as f64 / (1024.0 * 1024.0 * 1024.0),
             weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            quant_bytes[0] as f64 / (1024.0 * 1024.0),
+            quant_bytes[1] as f64 / (1024.0 * 1024.0),
+            quant_bytes[2] as f64 / (1024.0 * 1024.0),
+            quant_bytes[3] as f64 / (1024.0 * 1024.0),
             cap,
             (kv_total * 4) as f64 / (1024.0 * 1024.0)
         );
@@ -786,7 +813,6 @@ impl CudaModel {
                 self.q_dim,
                 self.dim,
                 n,
-                row_tile(self.q_dim),
             )
             .map_err(|err| format!("layer {li} attn_q batch: {err}"))?;
             e.gemm_b8(
@@ -797,7 +823,6 @@ impl CudaModel {
                 self.kv_dim,
                 self.dim,
                 n,
-                row_tile(self.kv_dim),
             )
             .map_err(|err| format!("layer {li} attn_k batch: {err}"))?;
             e.gemm_b8(
@@ -808,7 +833,6 @@ impl CudaModel {
                 self.kv_dim,
                 self.dim,
                 n,
-                row_tile(self.kv_dim),
             )
             .map_err(|err| format!("layer {li} attn_v batch: {err}"))?;
 
@@ -869,7 +893,6 @@ impl CudaModel {
                 self.dim,
                 self.q_dim,
                 n,
-                row_tile(self.dim),
             )
             .map_err(|err| format!("layer {li} attn_output batch: {err}"))?;
             e.add(self.xb, self.proj_b, self.xb, n * self.dim)
@@ -892,7 +915,6 @@ impl CudaModel {
                 self.hidden_dim,
                 self.dim,
                 n,
-                row_tile(self.hidden_dim),
             )
             .map_err(|err| format!("layer {li} ffn_gate batch: {err}"))?;
             e.gemm_b8(
@@ -903,7 +925,6 @@ impl CudaModel {
                 self.hidden_dim,
                 self.dim,
                 n,
-                row_tile(self.hidden_dim),
             )
             .map_err(|err| format!("layer {li} ffn_up batch: {err}"))?;
             e.swiglu(
@@ -921,7 +942,6 @@ impl CudaModel {
                 self.dim,
                 self.hidden_dim,
                 n,
-                row_tile(self.dim),
             )
             .map_err(|err| format!("layer {li} ffn_down batch: {err}"))?;
             e.add(self.xb, self.down_b, self.xb, n * self.dim)
@@ -966,12 +986,6 @@ impl CudaModel {
     }
 }
 
-/// Rows per b8 block. Small projections use eight rows so the 40-SM T4 still
-/// gets enough blocks; wide FFN rows use 32 so the x tile is reloaded less.
-fn row_tile(rows: usize) -> usize {
-    if rows >= 4096 { 32 } else { 8 }
-}
-
 fn effective_n_rot(cfg: &ModelConfig) -> usize {
     if cfg.rope_n_rot == 0 || cfg.rope_n_rot > cfg.head_dim {
         cfg.head_dim
@@ -1002,8 +1016,21 @@ fn f32_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
 
-fn tensor_quant(tv: &TensorView, rows: usize, cols: usize) -> Result<Quant, String> {
-    let q = match tv.tensor_type {
+/// Bytes uploaded per layout, for the load receipt. The decode cost of a
+/// checkpoint is a function of which layouts its matrices use, so the line
+/// that arms the decoder reports the split instead of one total.
+fn add_quant_bytes(totals: &mut [usize; 4], tv: &TensorView) {
+    let slot = match tv.tensor_type {
+        GGML_TYPE_F32 => 0,
+        GGML_TYPE_Q8_0 => 1,
+        GGML_TYPE_Q4_K => 2,
+        GGML_TYPE_Q6_K => 3,
+        _ => return,
+    };
+    totals[slot] += tv.size_bytes;
+}
+
+fn tensor_quant(tv: &TensorView, rows: usize, cols: usize) -> Result<Quant, String> {    let q = match tv.tensor_type {
         GGML_TYPE_F32 => Quant::F32,
         GGML_TYPE_Q8_0 => Quant::Q8_0,
         GGML_TYPE_Q4_K => Quant::Q4K,

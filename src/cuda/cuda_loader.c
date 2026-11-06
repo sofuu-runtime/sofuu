@@ -53,6 +53,11 @@ int sofuu_cuda_ctx_function(sofuu_cuda_ctx *ctx, const char *name, void **out) {
     (void)ctx; (void)name; (void)out;
     return SOFUU_CUDA_ERR_CONTEXT;
 }
+int sofuu_cuda_ctx_function_attr(sofuu_cuda_ctx *ctx, void *function,
+                                 int attrib, int *out_value) {
+    (void)ctx; (void)function; (void)attrib; (void)out_value;
+    return SOFUU_CUDA_ERR_LOAD;
+}
 int sofuu_cuda_ctx_alloc(sofuu_cuda_ctx *ctx, unsigned long long bytes,
                          unsigned long long *out) {
     (void)ctx; (void)bytes; (void)out;
@@ -146,6 +151,7 @@ struct sofuu_cuda_driver {
     CUresult (*cuModuleLoadData)(CUmodule *, const void *);
     CUresult (*cuModuleGetFunction)(CUfunction *, CUmodule, const char *);
     CUresult (*cuModuleUnload)(CUmodule);
+    CUresult (*cuFuncGetAttribute)(int *, int, CUfunction);
     CUresult (*cuMemAlloc)(CUdeviceptr *, size_t);
     CUresult (*cuMemFree)(CUdeviceptr);
     CUresult (*cuMemcpyHtoD)(CUdeviceptr, const void *, size_t);
@@ -339,6 +345,9 @@ sofuu_cuda_driver *sofuu_cuda_driver_open(const char *path) {
 
     LOAD_OPTIONAL(cuGetErrorString, "cuGetErrorString", NULL);
     LOAD_OPTIONAL(cuGetErrorName, "cuGetErrorName", NULL);
+    // Diagnostic only: NUM_REGS/MAX_THREADS tell the occupancy arithmetic
+    // whether a kernel change actually bought anything. Absence is not fatal.
+    LOAD_OPTIONAL(cuFuncGetAttribute, "cuFuncGetAttribute", NULL);
     LOAD_OPTIONAL(cuMemHostRegister, "cuMemHostRegister_v2", "cuMemHostRegister");
     LOAD_OPTIONAL(cuMemHostUnregister, "cuMemHostUnregister", NULL);
     LOAD_OPTIONAL(cuMemHostGetDevicePointer, "cuMemHostGetDevicePointer_v2",
@@ -531,6 +540,29 @@ int sofuu_cuda_ctx_function(sofuu_cuda_ctx *ctx, const char *name,
         return SOFUU_CUDA_ERR_CONTEXT;
     }
     *out_function = (void *)fn;
+    return SOFUU_CUDA_OK;
+}
+
+int sofuu_cuda_ctx_function_attr(sofuu_cuda_ctx *ctx, void *function,
+                                 int attrib, int *out_value) {
+    if (!ctx || !function || !out_value) {
+        set_error("cuFuncGetAttribute: invalid argument");
+        return SOFUU_CUDA_ERR_ARG;
+    }
+    if (!ctx->driver->cuFuncGetAttribute) {
+        set_error("cuFuncGetAttribute is not exported by this driver");
+        return SOFUU_CUDA_ERR_LOAD;
+    }
+    int value = 0;
+    CUresult r = ctx->driver->cuFuncGetAttribute(&value, attrib,
+                                                 (CUfunction)function);
+    if (r != SOFUU_CUDA_SUCCESS) {
+        char eb[256];
+        set_error("cuFuncGetAttribute(%d) failed: %s", attrib,
+                  driver_error(ctx->driver, r, eb, sizeof(eb)));
+        return SOFUU_CUDA_ERR_CONTEXT;
+    }
+    *out_value = value;
     return SOFUU_CUDA_OK;
 }
 

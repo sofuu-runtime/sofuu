@@ -36,21 +36,21 @@ While TypeScript and JavaScript serve as the ergonomic high-level orchestration 
 
 ---
 
-## Production Core vs. Experimental Preview Status
+## Core Runtime vs. Experimental Preview Status
 
-To ensure absolute reliability for developer adoption and production deployments (including our Hacker News launch gate), Sofuu enforces a strict demarcation between its **Production-Ready Core** and its specialized **Experimental Preview Modules**:
+To ensure absolute clarity for developer adoption (including our Hacker News launch gate), Sofuu enforces a strict demarcation between its core runtime and its specialized **Experimental Preview Modules**:
 
 | Subsystem | Readiness Tier | Scope & Standards |
 | :--- | :---: | :--- |
-| **Autonomous Agent Loop** | 🟢 **Production Ready** | `sofuu.agent`, cooperative scheduling (`scheduler.yield()`), step budgets, resilient editing (`smart_edit`), AST syntax dry-runs, real-time QTSQ trace streaming. |
-| **Deterministic Toolpacks** | 🟢 **Production Ready** | `sofuu.tools.PACKS` (`coding`, `web`, `memory`, `system`), single-instruction fuel sandbox (`code_eval`), numbered unified diffs. |
-| **Standalone Compiler** | 🟢 **Production Ready** | `sofuu compile`: single-file zero-dependency native executables with 32-byte `SOFUU_BIN_V1` trailer, CRC32 verification, ad-hoc signing, sub-15ms cold start. |
-| **Continuous Memory (CMA v2)** | 🟢 **Production Ready** | On-device `.qtsq` vector brain, cached KDF v2 master key (no 64 MB Argon2 spikes), zero-KDF plaintext mode, hardware SIMD search. |
-| **Model Context Protocol (MCP)** | 🟢 **Production Ready** | Full JSON-RPC 2.0 client/server over stdio, SSE, and direct in-process transports; dynamic tool discovery and execution. |
-| **Kaze (風) Guardrail Engine** | 🟢 **Production Ready** | Small typed scripting language with zero-GC hot path, capability access-control lists, and bounded arena allocation. |
-| **Unified R7 Security Firewall** | 🟢 **Production Ready** | Fail-closed path traversal blocking, private CIDR SSRF filtering, credential shielding (`.env`, `id_rsa`), and approval escalation. |
-| **Built-in Local Inference Engine** | 🧪 **[Experimental - Preview]** | Early-stage custom GGUF/SafeTensors engine. For production inference workloads, use `sofuu-plugin-llamacpp` or remote LLMs. |
-| **Robotics, Drones & MAVLink** | 🧪 **[Experimental - Preview]** | `sofuu drone`, MAVLink v2 codec, and GPIO line timers. Preview hardware track decoupled from the production launch gate. |
+| **Autonomous Agent Loop** | 🟢 **Core** | `sofuu.agent`, cooperative scheduling (`scheduler.yield()`), step budgets, resilient editing (`smart_edit`), AST syntax dry-runs, real-time QTSQ trace streaming. |
+| **Deterministic Toolpacks** | 🟢 **Core** | `sofuu.tools.PACKS` (`coding`, `web`, `memory`, `system`), single-instruction fuel sandbox (`code_eval`), numbered unified diffs. |
+| **Standalone Compiler** | 🟢 **Core** | `sofuu compile`: single-file zero-dependency native executables with 32-byte `SOFUU_BIN_V1` trailer, CRC32 verification, ad-hoc signing, sub-15ms cold start. |
+| **Continuous Memory (CMA v2)** | 🟢 **Core** | On-device `.qtsq` vector brain, cached KDF v2 master key (no 64 MB Argon2 spikes), zero-KDF plaintext mode, hardware SIMD search. |
+| **Model Context Protocol (MCP)** | 🟢 **Core** | Full JSON-RPC 2.0 client/server over stdio, SSE, and direct in-process transports; dynamic tool discovery and execution. |
+| **Kaze (風) Guardrail Engine** | 🟢 **Core** | Small typed scripting language with zero-GC hot path, capability access-control lists, and bounded arena allocation. |
+| **Unified R7 Security Firewall** | 🟢 **Core** | Fail-closed path traversal blocking, private CIDR SSRF filtering, credential shielding (`.env`, `id_rsa`), and approval escalation. |
+| **Built-in Local Inference Engine** | 🧪 **[Experimental - Preview]** | Early-stage custom GGUF/SafeTensors engine. For deployed inference workloads, use `sofuu-plugin-llamacpp` or remote LLMs. |
+| **Robotics, Drones & MAVLink** | 🧪 **[Experimental - Preview]** | `sofuu drone`, MAVLink v2 codec, and GPIO line timers. Preview hardware track decoupled from the core launch gate. |
 | **Native Frontend Engine** | 🧪 **[Experimental - Preview]** | `sofuu dev` streaming JSX/TSX transpiler and reactive micro-runtime. |
 | **Custom CUDA PTX Kernels** | 🧪 **[Experimental - Preview]** | Hand-tuned Linux GPU decoder kernels and shader dispatch. |
 | **Speculative Swarm Mesh** | 🧪 **[Experimental - Preview]** | Multi-terminal local task synchronization and speculative swarm decoding. |

@@ -1020,15 +1020,14 @@ fn f32_bytes(v: &[f32]) -> &[u8] {
 /// checkpoint is a function of which layouts its matrices use, so the line
 /// that arms the decoder reports the split instead of one total.
 fn add_quant_bytes(totals: &mut [usize; 4], tv: &TensorView) {
-    let (slot, device_bytes) = match tv.tensor_type {
-        GGML_TYPE_F32 => (0, tv.size_bytes),
-        GGML_TYPE_Q8_0 => (1, tv.size_bytes),
-        GGML_TYPE_Q4_K => (2, tv.size_bytes),
-        // Uploaded padded: 210-byte disk blocks become 216-byte device blocks.
-        GGML_TYPE_Q6_K => (3, tv.size_bytes / 210 * 216),
+    let slot = match tv.tensor_type {
+        GGML_TYPE_F32 => 0,
+        GGML_TYPE_Q8_0 => 1,
+        GGML_TYPE_Q4_K => 2,
+        GGML_TYPE_Q6_K => 3,
         _ => return,
     };
-    totals[slot] += device_bytes;
+    totals[slot] += tv.size_bytes;
 }
 
 fn tensor_quant(tv: &TensorView, rows: usize, cols: usize) -> Result<Quant, String> {    let q = match tv.tensor_type {
@@ -1095,25 +1094,12 @@ fn upload_weight(
         ));
     }
     let data = raw_tensor(gguf, tv, what)?;
-    // Q6_K is padded from 210- to 216-byte blocks on upload so the kernel's
-    // ql/qh loads are 8-byte aligned; every other layout uploads verbatim.
-    let device_row = q.device_row_bytes(cols).unwrap();
-    let device_bytes = device_row
-        .checked_mul(rows)
-        .ok_or_else(|| format!("{what}: {rows} rows x {device_row} B overflows"))?;
     let buf = engine
-        .alloc(device_bytes)
-        .map_err(|e| format!("{what}: allocate {device_bytes} B: {e}"))?;
-    if q.device_block_bytes() != q.block_bytes() {
-        let padded = super::cuda::pad_q6_k_blocks(data).map_err(|e| format!("{what}: {e}"))?;
-        engine
-            .upload(buf, &padded)
-            .map_err(|e| format!("{what}: upload {device_bytes} B: {e}"))?;
-    } else {
-        engine
-            .upload(buf, data)
-            .map_err(|e| format!("{what}: upload {device_bytes} B: {e}"))?;
-    }
+        .alloc(want)
+        .map_err(|e| format!("{what}: allocate {want} B: {e}"))?;
+    engine
+        .upload(buf, data)
+        .map_err(|e| format!("{what}: upload {want} B: {e}"))?;
     Ok(buf)
 }
 

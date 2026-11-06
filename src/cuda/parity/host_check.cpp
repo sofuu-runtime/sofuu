@@ -138,32 +138,6 @@ void test_q6_k(uint32_t &seed) {
     }
 }
 
-// The GPU path uploads q6_K padded to 216-byte blocks so ql/qh start on
-// 8-byte boundaries. Verify the padded layout and the kernel's 64-bit
-// extraction against the on-disk reference, lane by lane.
-void test_q6_device_layout(uint32_t &seed) {
-    const int cols = 256;
-    std::vector<uint8_t> disk;
-    fill_q6_k(disk, 1, cols, seed);
-    const auto *src = reinterpret_cast<const sofuu_block_q6_K *>(disk.data());
-    std::vector<uint8_t> dev(216, 0);
-    auto *d = reinterpret_cast<sofuu_block_q6_K_dev *>(dev.data());
-    std::memcpy(d->ql, src->ql, 128);
-    std::memcpy(d->qh, src->qh, 64);
-    std::memcpy(d->scales, src->scales, 16);
-    d->d = src->d;
-
-    std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
-    float got = 0.0f;
-    for (int lane = 0; lane < 32; ++lane) {
-        int sub = lane >> 2;
-        int l0 = (lane & 3) << 3;
-        got += sofuu_q6k_dot8(d, sub, l0, &x[(size_t)sub * 32 + l0]);
-    }
-    check_dot("q6_device_layout", got,
-              sofuu_ref::dot_q6_k(disk.data(), x.data(), cols));
-}
-
 void test_zero_scale(uint32_t &seed) {
     // A zero f16 scale must produce an exact zero, never NaN/Inf.
     const int cols = 512;
@@ -651,7 +625,6 @@ int main(void) {
     test_q8_0(seed);
     test_q4_k(seed);
     test_q6_k(seed);
-    test_q6_device_layout(seed);
     test_zero_scale(seed);
     test_rmsnorm(seed);
     test_swiglu(seed);

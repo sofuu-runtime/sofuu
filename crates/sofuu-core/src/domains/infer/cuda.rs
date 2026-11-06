@@ -93,64 +93,17 @@ impl Quant {
         }
     }
 
-    /// Bytes per block as uploaded to the device. Q6_K is padded from 210 to
-    /// 216 bytes on upload so ql/qh start on 8-byte boundaries in every block
-    /// and the kernel can use 64-bit loads; every other layout is unchanged.
-    pub fn device_block_bytes(self) -> usize {
-        match self {
-            Quant::Q6K => 216,
-            other => other.block_bytes(),
-        }
-    }
-
     /// True when `cols` is a legal row width for this layout.
     pub fn accepts_cols(self, cols: usize) -> bool {
         cols != 0 && cols % self.qk() == 0
     }
 
-    /// Bytes of one row as stored in the GGUF file.
     pub fn row_bytes(self, cols: usize) -> Option<usize> {
         if !self.accepts_cols(cols) {
             return None;
         }
         Some((cols / self.qk()) * self.block_bytes())
     }
-
-    /// Bytes of one row as uploaded to the device (the size the GEMV buffer
-    /// checks must use).
-    pub fn device_row_bytes(self, cols: usize) -> Option<usize> {
-        if !self.accepts_cols(cols) {
-            return None;
-        }
-        Some((cols / self.qk()) * self.device_block_bytes())
-    }
-}
-
-/// Pad every on-disk 210-byte Q6_K block into the 216-byte device block.
-/// The values are copied verbatim and the six pad bytes stay zero; the
-/// 0/128/192/208 offsets are the GGML block layout and match
-/// `sofuu_block_q6_K_dev` in src/cuda/kernels.cu. Padding is what makes ql
-/// and qh 8-byte aligned in every block, so the kernel can use 64-bit loads.
-pub fn pad_q6_k_blocks(src: &[u8]) -> Result<Vec<u8>, CudaError> {
-    const IN: usize = 210;
-    const OUT: usize = 216;
-    if src.is_empty() || !src.len().is_multiple_of(IN) {
-        return Err(CudaError(format!(
-            "Q6_K repack: {} bytes is not a whole number of {IN}-byte blocks",
-            src.len()
-        )));
-    }
-    let blocks = src.len() / IN;
-    let mut out = vec![0u8; blocks * OUT];
-    for b in 0..blocks {
-        let s = &src[b * IN..(b + 1) * IN];
-        let d = &mut out[b * OUT..(b + 1) * OUT];
-        d[..128].copy_from_slice(&s[..128]); // ql
-        d[128..192].copy_from_slice(&s[128..192]); // qh
-        d[192..208].copy_from_slice(&s[192..208]); // scales
-        d[208..210].copy_from_slice(&s[208..210]); // d (f16)
-    }
-    Ok(out)
 }
 
 #[derive(Clone, Debug)]
@@ -321,7 +274,7 @@ pub fn validate_gemm_b8(
             "gemm_b8 n_tokens {n_tokens} is outside 1..=8 (one warp per token,row)"
         )));
     }
-    let Some(row_bytes) = quant.device_row_bytes(cols) else {
+    let Some(row_bytes) = quant.row_bytes(cols) else {
         return Err(CudaError(format!(
             "{} does not accept cols={cols}",
             quant.batch_entry()
@@ -922,8 +875,7 @@ mod imp {
         }
 
         /// Row-major GEMV: y[r] = dot(weights[r], x). `weights` holds
-        /// `rows * device_row_bytes(cols)` bytes in the uploaded layout for
-        /// `quant` (Q6_K is padded on upload).
+        /// `rows * row_bytes(cols)` bytes in GGML layout for `quant`.
         pub fn gemv(
             &self,
             quant: Quant,
@@ -933,7 +885,7 @@ mod imp {
             rows: usize,
             cols: usize,
         ) -> Result<(), CudaError> {
-            let Some(row_bytes) = quant.device_row_bytes(cols) else {
+            let Some(row_bytes) = quant.row_bytes(cols) else {
                 return Err(CudaError(format!(
                     "{} does not accept cols={cols}",
                     quant.entry()
@@ -1417,8 +1369,7 @@ mod imp {
         }
 
         /// Host-side convenience used by integration tests: upload, run, read
-        /// back. Not on the model's hot path. `weights` is the on-disk layout;
-        /// Q6_K is padded here the same way the model uploader pads it.
+        /// back. Not on the model's hot path.
         pub fn gemv_host(
             &self,
             quant: Quant,
@@ -1430,28 +1381,17 @@ mod imp {
             let row_bytes = quant
                 .row_bytes(cols)
                 .ok_or_else(|| CudaError("bad cols".into()))?;
-            let device_row_bytes = quant
-                .device_row_bytes(cols)
-                .ok_or_else(|| CudaError("bad cols".into()))?;
             if weights.len() < row_bytes * rows {
                 return Err(CudaError("weights slice too short".into()));
             }
             if x.len() < cols {
                 return Err(CudaError("x slice too short".into()));
             }
-            let disk = &weights[..row_bytes * rows];
-            let padded;
-            let (payload, payload_row_bytes) = if quant.device_block_bytes() != quant.block_bytes() {
-                padded = pad_q6_k_blocks(disk)?;
-                (padded.as_slice(), device_row_bytes)
-            } else {
-                (disk, device_row_bytes)
-            };
-            let dw = self.alloc(payload_row_bytes * rows)?;
+            let dw = self.alloc(row_bytes * rows)?;
             let dx = self.alloc(cols * 4)?;
             let dy = self.alloc(rows * 4)?;
             let result = (|| {
-                self.upload(dw, payload)?;
+                self.upload(dw, &weights[..row_bytes * rows])?;
                 self.upload(dx, bytemuck_view(x))?;
                 self.gemv(quant, dw, dx, dy, rows, cols)?;
                 let mut out = vec![0f32; rows];
@@ -1974,39 +1914,9 @@ mod tests {
         assert_eq!(Quant::Q8_0.block_bytes(), 34);
         assert_eq!(Quant::Q4K.block_bytes(), 144);
         assert_eq!(Quant::Q6K.block_bytes(), 210);
-        // The device copy of Q6_K is padded so ql/qh land on 8-byte
-        // boundaries in every block; nothing else changes size.
-        assert_eq!(Quant::Q6K.device_block_bytes(), 216);
-        assert_eq!(Quant::Q6K.device_row_bytes(4096), Some(16 * 216));
-        assert_eq!(Quant::Q4K.device_block_bytes(), 144);
-        assert_eq!(Quant::Q4K.device_row_bytes(4096), Some(16 * 144));
         assert_eq!(Quant::Q4K.row_bytes(4096), Some(16 * 144));
         assert_eq!(Quant::Q4K.row_bytes(1000), None);
         assert_eq!(Quant::Q8_0.row_bytes(1024), Some(32 * 34));
         assert_eq!(Quant::F32.row_bytes(7), Some(28));
-    }
-
-    #[test]
-    fn q6_k_upload_pads_to_216_byte_blocks() {
-        let mut src = vec![0u8; 2 * 210];
-        for (i, b) in src.iter_mut().enumerate() {
-            *b = (i % 251) as u8;
-        }
-        let out = pad_q6_k_blocks(&src).expect("repack");
-        assert_eq!(out.len(), 2 * 216);
-        assert_eq!(&out[0..128], &src[0..128], "ql");
-        assert_eq!(&out[128..192], &src[128..192], "qh");
-        assert_eq!(&out[192..208], &src[192..208], "scales");
-        assert_eq!(&out[208..210], &src[208..210], "d");
-        assert_eq!(&out[210..216], &[0u8; 6], "padding");
-        assert_eq!(&out[216..216 + 128], &src[210..210 + 128], "block 1 ql");
-        assert_eq!(
-            &out[216 + 208..216 + 210],
-            &src[210 + 208..210 + 210],
-            "block 1 d"
-        );
-        // A truncated block must be refused: silently rounding down would
-        // shift every later block by six bytes.
-        assert!(pad_q6_k_blocks(&src[..209]).is_err());
     }
 }

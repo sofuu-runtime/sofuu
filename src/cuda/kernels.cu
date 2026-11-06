@@ -62,6 +62,20 @@ typedef struct {
     signed char scales[16];    // int8 block scales
     unsigned short d;          // f16 super-block scale
 } sofuu_block_q6_K;
+
+// q6_K as uploaded to the GPU. The on-disk block is 210 bytes, so on odd
+// blocks every ql/qh access sits at a 2-byte offset and the kernel has to
+// issue 16 scalar byte loads per eight values. The upload path pads each
+// block to 216 bytes; ql (0) and qh (128) then start on 8-byte boundaries for
+// every block, so one 64-bit load covers each eight-value group. The values,
+// scales and ordering are unchanged.
+typedef struct {
+    unsigned char ql[128];
+    unsigned char qh[64];
+    signed char scales[16];
+    unsigned short d;
+    unsigned char pad[6];
+} sofuu_block_q6_K_dev;
 #pragma pack(pop)
 
 // No CUDA headers here, so float4 is not declared. 16-byte alignment is what
@@ -74,6 +88,7 @@ typedef struct __attribute__((aligned(16))) {
 #define SOFUU_QK_K 256
 #define SOFUU_Q4_K_BYTES 144
 #define SOFUU_Q6_K_BYTES 210
+#define SOFUU_Q6_K_DEV_BYTES 216
 #define SOFUU_Q8_0_BYTES 34
 #define SOFUU_GEMV_THREADS 256
 
@@ -276,7 +291,7 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_q4k_dot8(
 }
 
 static SOFUU_DEVICE SOFUU_INLINE float sofuu_q6k_dot8(
-    const sofuu_block_q6_K *b, int sub, int l0, const float *xr) {
+    const sofuu_block_q6_K_dev *b, int sub, int l0, const float *xr) {
     int n = sub >> 2;
     int r = sub & 3;
     float d = sofuu_f16_to_f32(b->d);
@@ -286,13 +301,20 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_q6k_dot8(
     float ds = d * s;
     int ql_base = n * 64 + ((r == 1 || r == 3) ? 32 : 0);
     const unsigned char *qh = b->qh + n * 32;
+    // ql and qh start on 8-byte boundaries in every 216-byte device block, so
+    // one eight-value group costs two 64-bit loads instead of sixteen byte
+    // loads. The bit extraction below is the on-disk formula unchanged.
+    unsigned long long qlv = *reinterpret_cast<const unsigned long long *>(
+        b->ql + ql_base + l0);
+    unsigned long long qhv = *reinterpret_cast<const unsigned long long *>(
+        qh + l0);
     float acc = 0.0f;
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
-        int l = l0 + k;
-        unsigned int ql_byte = (unsigned int)b->ql[ql_base + l];
+        unsigned int ql_byte = (unsigned int)((qlv >> (8 * k)) & 0xffu);
         unsigned int nib = (r < 2) ? (ql_byte & 0x0fu) : (ql_byte >> 4);
-        unsigned int hi2 = ((unsigned int)qh[l] >> (2 * r)) & 3u;
+        unsigned int qh_byte = (unsigned int)((qhv >> (8 * k)) & 0xffu);
+        unsigned int hi2 = (qh_byte >> (2 * r)) & 3u;
         int q = (int)(nib | (hi2 << 4)) - 32;
         acc += ds * (float)q * xr[k];
     }
@@ -442,8 +464,9 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4) void sofuu_gemv_q4_k(con
 }
 
 // q6_K: same warp/lane mapping as q4_K; ql at the run's 64-byte base, qh at
-// n*32+l. The 210-byte block stride is not 8-byte aligned on odd blocks, so
-// these stay scalar byte loads (the upload path repacks before wide loads).
+// n*32+l. The upload path pads each 210-byte on-disk block to 216 bytes, so
+// both arrays are 8-byte aligned in every block and the dot uses two 64-bit
+// loads instead of sixteen byte loads.
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4) void sofuu_gemv_q6_k(const unsigned char *__restrict__ w,
                                              const float *__restrict__ x, float *__restrict__ y,
                                              int rows, int cols) {
@@ -454,20 +477,20 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4) void sofuu_gemv_q6_k(con
     if (row >= rows) return;
     int nb = cols / SOFUU_QK_K;
     const unsigned char *roww = w + (unsigned long long)row *
-                                     (unsigned long long)nb * SOFUU_Q6_K_BYTES;
+                                     (unsigned long long)nb * SOFUU_Q6_K_DEV_BYTES;
     int sub = lane >> 2;
     int l0 = (lane & 3) << 3;
     float acc = 0.0f;
     int bi = 0;
     for (; bi + 4 <= nb; bi += 4) {
-        const sofuu_block_q6_K *b0 =
-            (const sofuu_block_q6_K *)(roww + (unsigned long long)(bi + 0) * 210);
-        const sofuu_block_q6_K *b1 =
-            (const sofuu_block_q6_K *)(roww + (unsigned long long)(bi + 1) * 210);
-        const sofuu_block_q6_K *b2 =
-            (const sofuu_block_q6_K *)(roww + (unsigned long long)(bi + 2) * 210);
-        const sofuu_block_q6_K *b3 =
-            (const sofuu_block_q6_K *)(roww + (unsigned long long)(bi + 3) * 210);
+        const sofuu_block_q6_K_dev *b0 =
+            (const sofuu_block_q6_K_dev *)(roww + (unsigned long long)(bi + 0) * SOFUU_Q6_K_DEV_BYTES);
+        const sofuu_block_q6_K_dev *b1 =
+            (const sofuu_block_q6_K_dev *)(roww + (unsigned long long)(bi + 1) * SOFUU_Q6_K_DEV_BYTES);
+        const sofuu_block_q6_K_dev *b2 =
+            (const sofuu_block_q6_K_dev *)(roww + (unsigned long long)(bi + 2) * SOFUU_Q6_K_DEV_BYTES);
+        const sofuu_block_q6_K_dev *b3 =
+            (const sofuu_block_q6_K_dev *)(roww + (unsigned long long)(bi + 3) * SOFUU_Q6_K_DEV_BYTES);
         float xr0[8], xr1[8], xr2[8], xr3[8];
         sofuu_load8(x + (bi + 0) * 256 + lane * 8, xr0);
         sofuu_load8(x + (bi + 1) * 256 + lane * 8, xr1);
@@ -481,8 +504,8 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4) void sofuu_gemv_q6_k(con
     for (; bi < nb; ++bi) {
         float xr[8];
         sofuu_load8(x + bi * 256 + lane * 8, xr);
-        const sofuu_block_q6_K *b =
-            (const sofuu_block_q6_K *)(roww + (unsigned long long)bi * 210);
+        const sofuu_block_q6_K_dev *b =
+            (const sofuu_block_q6_K_dev *)(roww + (unsigned long long)bi * SOFUU_Q6_K_DEV_BYTES);
         acc += sofuu_q6k_dot8(b, sub, l0, xr);
     }
     float total = sofuu_warp_sum(acc);
@@ -774,13 +797,13 @@ void sofuu_gemm_q6_k_b8(const unsigned char *__restrict__ w, const float *__rest
     int nb = cols / SOFUU_QK_K;
     const float *xrow = x + (unsigned long long)token * (unsigned long long)cols;
     const unsigned char *roww = w + (unsigned long long)row *
-                                     (unsigned long long)nb * SOFUU_Q6_K_BYTES;
+                                     (unsigned long long)nb * SOFUU_Q6_K_DEV_BYTES;
     float acc = 0.0f;
     for (int bi = 0; bi < nb; ++bi) {
         float xr[8];
         sofuu_load8(xrow + bi * 256 + lane * 8, xr);
-        const sofuu_block_q6_K *b =
-            (const sofuu_block_q6_K *)(roww + (unsigned long long)bi * 210);
+        const sofuu_block_q6_K_dev *b =
+            (const sofuu_block_q6_K_dev *)(roww + (unsigned long long)bi * SOFUU_Q6_K_DEV_BYTES);
         acc += sofuu_q6k_dot8(b, sub, l0, xr);
     }
     float total = sofuu_warp_sum(acc);

@@ -151,8 +151,24 @@ void fill_q6_k(std::vector<uint8_t> &w, int rows, int cols, uint32_t &seed) {
         }
 }
 
-bool get_function(const char *name, void **out) {
-    if (sofuu_cuda_ctx_function(g_ctx, name, out) != 0) {
+// Q6_K is uploaded in a padded 216-byte block layout so ql/qh are 8-byte
+// aligned in every block; the on-disk fixture (and the scalar reference) stays
+// 210 bytes. This is the same transform the model upload applies.
+std::vector<uint8_t> q6_k_device_copy(const std::vector<uint8_t> &w) {
+    const size_t blocks = w.size() / 210;
+    std::vector<uint8_t> out(blocks * 216, 0);
+    for (size_t b = 0; b < blocks; ++b) {
+        const uint8_t *s = w.data() + b * 210;
+        uint8_t *d = out.data() + b * 216;
+        std::memcpy(d, s, 128);          // ql
+        std::memcpy(d + 128, s + 128, 64);  // qh
+        std::memcpy(d + 192, s + 192, 16);  // scales
+        std::memcpy(d + 208, s + 208, 2);   // d
+    }
+    return out;
+}
+
+bool get_function(const char *name, void **out) {    if (sofuu_cuda_ctx_function(g_ctx, name, out) != 0) {
         fail_msg(name);
         return false;
     }
@@ -234,11 +250,12 @@ void test_gemv_q6_k(void *fn, uint32_t &seed, int cols) {
     const int rows = 8;
     std::vector<uint8_t> w;
     fill_q6_k(w, rows, cols, seed);
+    std::vector<uint8_t> wdev = q6_k_device_copy(w);
     std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
     std::vector<float> got((size_t)rows, 0.0f), want((size_t)rows, 0.0f);
 
     unsigned long long dw = 0, dx = 0, dy = 0;
-    if (!alloc_upload(w.data(), w.size(), &dw) ||
+    if (!alloc_upload(wdev.data(), wdev.size(), &dw) ||
         !alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
         !alloc_only((unsigned long long)rows * sizeof(float), &dy)) {
         fail_msg("alloc");
@@ -307,6 +324,7 @@ void test_gemv_f32(void *fn, uint32_t &seed) {
 void test_gemm_b8(void *fn, uint32_t &seed, int kind, int cols) {
     const int rows = 20, tokens = 8;
     std::vector<uint8_t> wbytes;
+    std::vector<uint8_t> wdev; // padded Q6_K copy for the device
     std::vector<float> wf;
     const uint8_t *wdata = nullptr;
     size_t wsize = 0;
@@ -322,6 +340,7 @@ void test_gemm_b8(void *fn, uint32_t &seed, int kind, int cols) {
         fill_q6_k(wbytes, rows, cols, seed);
         wdata = wbytes.data();
         wsize = wbytes.size();
+        wdev = q6_k_device_copy(wbytes);
     } else {
         wf = random_vec(rows * cols, seed, -1.0f, 1.0f);
         wdata = reinterpret_cast<const uint8_t *>(wf.data());
@@ -331,7 +350,8 @@ void test_gemm_b8(void *fn, uint32_t &seed, int kind, int cols) {
     std::vector<float> got((size_t)tokens * rows, 0.0f);
 
     unsigned long long dw = 0, dx = 0, dy = 0;
-    if (!alloc_upload(wdata, wsize, &dw) ||
+    const bool q6 = kind == 2;
+    if (!alloc_upload(q6 ? wdev.data() : wdata, q6 ? wdev.size() : wsize, &dw) ||
         !alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
         !alloc_only((unsigned long long)tokens * rows * sizeof(float), &dy)) {
         fail_msg("alloc");
@@ -485,6 +505,9 @@ void bench_gemv(const char *name, void *fn, int kind, int rows, int cols,
         wsize = wbytes.size();
     } else if (kind == 2) {
         fill_q6_k(wbytes, rows, cols, seed);
+        // Benchmark the bytes that actually cross the bus: the padded device
+        // copy, not the 210-byte on-disk fixture.
+        wbytes = q6_k_device_copy(wbytes);
         wdata = wbytes.data();
         wsize = wbytes.size();
     } else {
@@ -521,7 +544,7 @@ void bench_gemv(const char *name, void *fn, int kind, int rows, int cols,
     double sec = std::chrono::duration<double>(t1 - t0).count();
     double row_bytes = kind == 0 ? (double)(cols / 32) * 34
                        : kind == 1 ? (double)(cols / 256) * 144
-                       : kind == 2 ? (double)(cols / 256) * 210
+                       : kind == 2 ? (double)(cols / 256) * 216
                                    : (double)cols * 4;
     double bytes = (double)rows * row_bytes * (double)iters;
     std::printf("[bench] %-10s %dx%d  %.1f GB/s  %.3f ms/launch\n", name, rows,

@@ -44,6 +44,15 @@
   if (!sofuu.agent) sofuu.agent = {};
   var A = sofuu.agent;
 
+  function makeError(code, msg, details) {
+    var err = new Error(msg);
+    err.name = 'SofuuError';
+    err.code = code || 'ERR_AGENT';
+    err.rule = 'RULES.md §3.5';
+    if (details) err.details = details;
+    return err;
+  }
+
   /* Stabilization Freeze Pass 2.3 — bounded streaming text buffer.
    *
    * Token streams arrive one small string at a time. Appending every token to
@@ -933,7 +942,7 @@
   /* ── Definitions ───────────────────────────────────────────────── */
 
   function normalizeDef(def, opts) {
-    if (!def || typeof def !== 'object') throw new Error('agent: definition object required');
+    if (!def || typeof def !== 'object') throw makeError('E_INVALID_ARGS', 'agent: definition object required');
     /* E2 (PLAN-EMBED-SDK): an embedded host registers native tools AFTER the
      * runtime exists, so an agent supplied through the C `agents` config can
      * name a tool that is not registered yet. Only that path defers (the
@@ -941,7 +950,7 @@
      * and a name that never arrives is reported when the agent runs. */
     var allowHostTools = !!(opts && opts.allowHostTools);
     var name = String(def.name || '').trim();
-    if (!name) throw new Error('agent.define: name is required');
+    if (!name) throw makeError('E_INVALID_ARGS', 'agent.define: name is required');
     var d = {
       _sofuu_agent: true,
       name: name,
@@ -1086,7 +1095,7 @@
     } : null;
 
     var tools = def.tools || [];
-    if (!Array.isArray(tools)) throw new Error('agent.define: tools must be an array');
+    if (!Array.isArray(tools)) throw makeError('E_INVALID_ARGS', 'agent.define: tools must be an array');
     for (var i = 0; i < tools.length; i++) {
       var t = tools[i];
       if (t === 'web') { d.webTools = ['web_search', 'web_open']; continue; }
@@ -1157,7 +1166,7 @@
       if (t && typeof t === 'object' && Array.isArray(t.mcp)) {
         for (var j = 0; j < t.mcp.length; j++) {
           var s = t.mcp[j];
-          if (!s || !s.command) throw new Error('agent.define: mcp set entry needs {name, command}');
+          if (!s || !s.command) throw makeError('E_INVALID_ARGS', 'agent.define: mcp set entry needs {name, command}');
           /* S6 (2026-10-23): v2 fields carry through to the child spawn and
            * the per-server tool filter. */
           var mset = { name: String(s.name || ('mcp' + (j + 1))), command: String(s.command) };
@@ -1189,7 +1198,7 @@
         } else if (allowHostTools) {
           if (d.hostTools.indexOf(bn) < 0) d.hostTools.push(bn);
         } else {
-          throw new Error("agent.define: unknown builtin tool '" + bn + "'");
+          throw makeError('E_UNKNOWN_TOOL', "agent.define: unknown builtin tool '" + bn + "'");
         }
         continue;
       }
@@ -1212,7 +1221,7 @@
         });
         continue;
       }
-      throw new Error('agent.define: bad tools[' + i + '] (need tool name, toolpack ["coding", "web", "memory", "system"], {builtin}, or {name,…})');
+      throw makeError('E_INVALID_ARGS', 'agent.define: bad tools[' + i + '] (need tool name, toolpack ["coding", "web", "memory", "system"], {builtin}, or {name,…})');
     }
     Object.freeze(d.budget);
     Object.freeze(d.identity || {});
@@ -1222,7 +1231,7 @@
 
   function define(def, opts) {
     var d = normalizeDef(def, opts);
-    if (REGISTRY[d.name]) throw new Error("agent.define: duplicate name '" + d.name + "'");
+    if (REGISTRY[d.name]) throw makeError('E_DUPLICATE_NAME', "agent.define: duplicate name '" + d.name + "'");
     REGISTRY[d.name] = d;
     return { name: d.name, _def: d };
   }
@@ -1230,13 +1239,13 @@
   function resolveDef(target) {
     if (typeof target === 'string') {
       var d = REGISTRY[target];
-      if (!d) throw new Error("agent: unknown agent '" + target + "'");
+      if (!d) throw makeError('E_UNKNOWN_AGENT', "agent: unknown agent '" + target + "'");
       return d;
     }
     if (target && target._def) return target._def;
     if (target && target._sofuu_agent) return target;
     if (target && typeof target === 'object') return normalizeDef(target); // transient def (e.g. chat)
-    throw new Error('agent: target must be a name, handle, or definition');
+    throw makeError('E_INVALID_TARGET', 'agent: target must be a name, handle, or definition');
   }
 
   /* ── Memory scopes (A3) ──────────────────────────────────────────
@@ -1522,7 +1531,7 @@
    * padding/truncating would corrupt the index it lands in. */
   function mustF32(vec, dim) {
     var n = (vec && vec.length) ? vec.length : 0;
-    if (n !== dim) throw new Error('embedding space mismatch (got ' + n + ' dims, brain uses ' + dim + ')');
+    if (n !== dim) throw makeError('E_DIM_MISMATCH', 'embedding space mismatch (got ' + n + ' dims, brain uses ' + dim + ')');
     if (vec instanceof Float32Array) return vec;
     return new Float32Array(vec);
   }
@@ -3942,7 +3951,7 @@
                       code: classifyError(msg).code, op: 'provider' }, false);
             await new Promise(function (r) { setTimeout(r, delays[attempt]); });
             attempt++;
-            if (state.cancelled) throw new Error('cancelled');
+            if (state.cancelled) throw makeError('E_CANCELLED', 'cancelled');
             continue;
           }
           /* Transport cut with text already on screen: surface nothing,
@@ -3970,7 +3979,7 @@
             ]);
             ro = Object.assign({}, ro, { messages: msgs });
             attempt = 0; /* the continuation is a new request: fresh ladder */
-            if (state.cancelled) throw new Error('cancelled');
+            if (state.cancelled) throw makeError('E_CANCELLED', 'cancelled');
             continue;
           }
           throw e;
@@ -4830,7 +4839,7 @@
             result = await execMapContext(args);
           } else {
             var fn = toolset.exec[name];
-            if (!fn) throw new Error('no such tool: ' + name);
+            if (!fn) throw makeError('E_UNKNOWN_TOOL', 'no such tool: ' + name);
             /* LONG-HORIZON: self-timed tools (bash) police their own
              * timeout internally — wrapping them in the outer 30s
              * withTimeout would kill every legitimate multi-minute
@@ -5838,7 +5847,7 @@
                                     maxOutput: taught, after: 'empty-exhausted' });
               }
             }
-            throw new Error('provider returned an empty stream' +
+            throw makeError('E_EMPTY_STREAM', 'provider returned an empty stream' +
               (fr ? ' (finish_reason: ' + fr + ')' : ' (no finish_reason reported)') +
               ' — check the model on this endpoint, or lower /maxout (an output cap above the model\'s real max empties some gateways)');
           }
@@ -6267,7 +6276,7 @@
             }
             frF = String((r2.st && r2.st.usage && r2.st.usage.finishReason) || frF || '');
           }
-          throw new Error('provider returned an empty stream' +
+          throw makeError('E_EMPTY_STREAM', 'provider returned an empty stream' +
             (frF ? ' (finish_reason: ' + frF + ')' : ' (no finish_reason reported)') +
             ' — check the model on this endpoint, or lower /maxout');
         }
@@ -6410,14 +6419,14 @@
     opts = opts || {};
     var trace = await getTrace(runId, opts);
     if (!trace || trace.length === 0) {
-      throw new Error('No trace found for run: ' + runId);
+      throw makeError('E_TRACE_NOT_FOUND', 'No trace found for run: ' + runId);
     }
     var startEv = trace.find(function (e) { return e.kind === 'start'; });
     var startPayload = (startEv && startEv.payload) || {};
     var agentName = opts.agent || startPayload.agentName || startPayload.name;
     var task = (opts.task !== undefined) ? opts.task : (startPayload.fullTask || startPayload.task);
     if (!agentName) {
-      throw new Error('Trace missing agentName for run: ' + runId);
+      throw makeError('E_TRACE_INVALID', 'Trace missing agentName for run: ' + runId);
     }
 
     var isDone = trace.some(function (e) { return e.kind === 'answer' || e.kind === 'done'; });
@@ -6525,7 +6534,7 @@
 
   async function runMany(items, opts) {
     opts = opts || {};
-    if (!Array.isArray(items)) throw new Error('agent.runMany: items array required');
+    if (!Array.isArray(items)) throw makeError('E_INVALID_ARGS', 'agent.runMany: items array required');
     var conc = Math.max(1, (opts.concurrency | 0) || 4);
     var results = new Array(items.length);
     var next = 0;
@@ -6582,11 +6591,11 @@
   async function mapContext(context, task, opts) {
     opts = opts || {};
     if (!opts.agent || !REGISTRY[opts.agent]) {
-      throw new Error('agent.mapContext: opts.agent must name a defined agent');
+      throw makeError('E_INVALID_ARGS', 'agent.mapContext: opts.agent must name a defined agent');
     }
     var chunkChars = (opts.chunkChars | 0) || 16000;
     var chunks = chunkText(String(context == null ? '' : context), chunkChars);
-    if (!chunks.length) throw new Error('agent.mapContext: empty context');
+    if (!chunks.length) throw makeError('E_INVALID_ARGS', 'agent.mapContext: empty context');
     /* Blast-radius guard (2026-10-15): the model-callable tool path hard-
      * caps the fan-out (MAP_CONTEXT_MAX_CHUNKS); the host API was
      * unbounded — a multi-MB string queued thousands of full agent runs.
@@ -6594,7 +6603,7 @@
      * explicit opts.maxChunks lifts it for genuinely huge jobs. */
     var mCap = (opts.maxChunks | 0) > 0 ? (opts.maxChunks | 0) : 256;
     if (chunks.length > mCap) {
-      throw new Error('agent.mapContext: ' + chunks.length + ' chunks exceeds the ' + mCap +
+      throw makeError('E_CONTEXT_CAP', 'agent.mapContext: ' + chunks.length + ' chunks exceeds the ' + mCap +
         '-chunk fan-out cap — raise chunkChars (currently ' + chunkChars + ') or pass opts.maxChunks');
     }
     /* Orchestration threading (PLAN-DELEGATE-AWARENESS Move 3): when the
@@ -6706,7 +6715,7 @@
         if (aotStatus === 'hit') out.aotHits++;
         else if (aotStatus === 'compiled') out.compiled++;
         else if (aotStatus === 'threw') {
-          throw new Error(aot.error || 'bytecode run threw');
+          throw makeError('E_BYTECODE_ERROR', aot.error || 'bytecode run threw');
         } else {
           (0, eval)(src); /* indirect eval -> global scope */
         }

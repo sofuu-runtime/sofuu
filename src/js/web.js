@@ -34,6 +34,15 @@
   if (typeof sofuu.web !== 'undefined' && sofuu.web && sofuu.web._loaded) return;
   if (!sofuu.web) sofuu.web = {};
 
+  function makeError(code, msg, details) {
+    var err = new Error(msg);
+    err.name = 'SofuuError';
+    err.code = code || 'ERR_WEB';
+    err.rule = 'RULES.md §3.5';
+    if (details) err.details = details;
+    return err;
+  }
+
   function env(name) {
     try { return (typeof process !== 'undefined' && process.env && process.env[name]) || ''; }
     catch (e) { return ''; }
@@ -172,7 +181,7 @@
     var u = String(url == null ? '' : url);
     var schemeM = u.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\//);
     if (schemeM && !/^https?$/i.test(schemeM[1])) {
-      throw new Error('web: refused non-http(s) URL: ' + u.slice(0, 120));
+      throw makeError('ERR_INVALID_PROTOCOL', 'web: refused non-http(s) URL: ' + u.slice(0, 120));
     }
     var hostM = u.match(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^\/?#]+)/);
     if (!hostM) return; /* relative — resolves against nothing out there; let fetch fail */
@@ -192,7 +201,7 @@
       host = hostport.replace(/:\d+$/, '');
     }
     if (isInternalHost(host)) {
-      throw new Error('web: refused internal/private address (SSRF guard): ' + host +
+      throw makeError('ERR_SSRF_INTERNAL_REJECTED', 'web: refused internal/private address (SSRF guard): ' + host +
         ' — set SOFUU_WEB_ALLOW_INTERNAL=1 to override');
     }
   }
@@ -283,13 +292,13 @@
       headers: { 'User-Agent': UA, 'Accept': 'text/html' },
     }, opts.timeoutMs, opEndpoint);
     if (r.status !== 200) {
-      throw new Error('duckduckgo returned HTTP ' + r.status +
+      throw makeError('ERR_WEB_SEARCH_HTTP', 'duckduckgo returned HTTP ' + r.status +
         ' — the keyless endpoint may be rate-limiting; set SOFUU_WEB_ENGINE=brave|tavily with an API key');
     }
     var html = await r.text();
     var results = ddgParse(html).slice(0, opts.count);
     if (results.length === 0) {
-      throw new Error('duckduckgo returned no parsable results (markup change or block) — try SOFUU_WEB_ENGINE=brave|tavily');
+      throw makeError('ERR_WEB_SEARCH_EMPTY', 'duckduckgo returned no parsable results (markup change or block) — try SOFUU_WEB_ENGINE=brave|tavily');
     }
     return { results: results, note: 'keyless duckduckgo endpoint' };
   }
@@ -297,7 +306,7 @@
   async function engineBrave(query, opts) {
     var key = opts.api_key || env('BRAVE_API_KEY');
     if (!key) {
-      throw new Error("engine 'brave' needs an API key — pass opts.api_key or set BRAVE_API_KEY (the default engine 'duckduckgo' needs no key)");
+      throw makeError('ERR_WEB_AUTH_REQUIRED', "engine 'brave' needs an API key — pass opts.api_key or set BRAVE_API_KEY (the default engine 'duckduckgo' needs no key)");
     }
     var base = opts.endpoint || 'https://api.search.brave.com/res/v1/web/search';
     var url = base + (base.indexOf('?') >= 0 ? '&' : '?') +
@@ -306,8 +315,8 @@
       method: 'GET',
       headers: { 'Accept': 'application/json', 'X-Subscription-Token': key },
     }, opts.timeoutMs, !!opts.endpoint);
-    if (r.status === 401 || r.status === 403) throw new Error('brave: invalid API key (HTTP ' + r.status + ')');
-    if (r.status !== 200) throw new Error('brave returned HTTP ' + r.status);
+    if (r.status === 401 || r.status === 403) throw makeError('ERR_WEB_AUTH_INVALID', 'brave: invalid API key (HTTP ' + r.status + ')');
+    if (r.status !== 200) throw makeError('ERR_WEB_SEARCH_HTTP', 'brave returned HTTP ' + r.status);
     var j = await r.json();
     var raw = (j && j.web && j.web.results) || [];
     var results = [];
@@ -322,7 +331,7 @@
   async function engineTavily(query, opts) {
     var key = opts.api_key || env('TAVILY_API_KEY');
     if (!key) {
-      throw new Error("engine 'tavily' needs an API key — pass opts.api_key or set TAVILY_API_KEY (the default engine 'duckduckgo' needs no key)");
+      throw makeError('ERR_WEB_AUTH_REQUIRED', "engine 'tavily' needs an API key — pass opts.api_key or set TAVILY_API_KEY (the default engine 'duckduckgo' needs no key)");
     }
     var base = opts.endpoint || 'https://api.tavily.com/search';
     var r = await fetchWithTimeout(base, {
@@ -335,8 +344,8 @@
         search_depth: opts.depth || 'basic',
       }),
     }, opts.timeoutMs, !!opts.endpoint);
-    if (r.status === 401 || r.status === 403) throw new Error('tavily: invalid API key (HTTP ' + r.status + ')');
-    if (r.status !== 200) throw new Error('tavily returned HTTP ' + r.status);
+    if (r.status === 401 || r.status === 403) throw makeError('ERR_WEB_AUTH_INVALID', 'tavily: invalid API key (HTTP ' + r.status + ')');
+    if (r.status !== 200) throw makeError('ERR_WEB_SEARCH_HTTP', 'tavily returned HTTP ' + r.status);
     var j = await r.json();
     var raw = (j && j.results) || [];
     var results = [];
@@ -364,12 +373,12 @@
   async function search(query, opts) {
     opts = opts || {};
     var q = String(query == null ? '' : query).trim();
-    if (!q) throw new Error('web.search: query required');
+    if (!q) throw makeError('ERR_INVALID_ARGS', 'web.search: query required');
     var count = Math.max(1, Math.min(20, (opts.count | 0) || 8));
     var engineName = (opts.engine || env('SOFUU_WEB_ENGINE') || 'duckduckgo').toLowerCase();
     var fn = ENGINES[engineName];
     if (!fn) {
-      throw new Error("web.search: unknown engine '" + engineName + "' (duckduckgo | brave | tavily)");
+      throw makeError('ERR_UNKNOWN_ENGINE', "web.search: unknown engine '" + engineName + "' (duckduckgo | brave | tavily)");
     }
     var o = {
       count: count,
@@ -402,7 +411,7 @@
     opts = opts || {};
     var u = String(url == null ? '' : url).trim();
     if (!/^https?:\/\//i.test(u)) {
-      throw new Error('web.open: only http(s) URLs are supported');
+      throw makeError('ERR_INVALID_PROTOCOL', 'web.open: only http(s) URLs are supported');
     }
     var maxChars = (opts.maxChars | 0) || 20000;
     /* js-9 (AUDIT-2026-09-07): fetch buffers the WHOLE body before

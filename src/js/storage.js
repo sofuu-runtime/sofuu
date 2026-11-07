@@ -9,6 +9,15 @@
   const global = globalThis;
   if (!global.sofuu) global.sofuu = {};
 
+  function makeError(code, msg, details) {
+    var err = new Error(msg);
+    err.name = 'SofuuError';
+    err.code = code || 'ERR_STORAGE';
+    err.rule = 'RULES.md §3.5';
+    if (details) err.details = details;
+    return err;
+  }
+
   class TableHandle {
     constructor(db, name) {
       this.db = db;
@@ -127,14 +136,14 @@
     }
 
     insert(table, row) {
-      if (!this.handle) throw new Error('Database is closed');
+      if (!this.handle) throw makeError('ERR_DB_CLOSED', 'Database is closed');
       const id = global.__sofuu_storage_insert(this.handle, table, JSON.stringify(row));
       this._scheduleDebouncedFlush();
       return id;
     }
 
     query(table, options = {}) {
-      if (!this.handle) throw new Error('Database is closed');
+      if (!this.handle) throw makeError('ERR_DB_CLOSED', 'Database is closed');
       return global.__sofuu_storage_query(this.handle, table, JSON.stringify(options));
     }
 

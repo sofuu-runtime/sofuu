@@ -37,6 +37,15 @@
   'use strict';
   if (!globalThis.sofuu) return;
 
+  function makeError(code, msg, details) {
+    var err = new Error(msg);
+    err.name = 'SofuuError';
+    err.code = code || 'ERR_SERVE';
+    err.rule = 'RULES.md §3.5';
+    if (details) err.details = details;
+    return err;
+  }
+
   sofuu.serve = sofuu.serve || {};
 
   var S = {
@@ -1134,7 +1143,7 @@
     } catch (ePl) { /* loading the session policy is best effort: without it the default policy stays in force. */ }
     var auth = authMode();
     if (auth !== 'none' && !cfg.token) {
-      throw new Error('serve: a bearer token is required (set --token / SOFUU_SERVE_TOKEN, or policy http.auth:"none" explicitly)');
+      throw makeError('ERR_AUTH_REQUIRED', 'serve: a bearer token is required (set --token / SOFUU_SERVE_TOKEN, or policy http.auth:"none" explicitly)');
     }
     if (auth === 'none') {
       console.error('\x1b[33m  ⚠ policy http.auth is "none": every /v1/* request is unauthenticated\x1b[0m');

@@ -2846,6 +2846,15 @@ fn main() -> ExitCode {
 
     // Bare `sofuu` → chat.
     if args.len() < 2 {
+        let prog = std::path::Path::new(&args[0])
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let is_sofuu = prog == "sofuu" || prog == "sofuu-core" || prog.starts_with("sofuu.") || prog.is_empty();
+        if !is_sofuu {
+            eprintln!("\x1b[31mError:\x1b[0m ERR_BINARY_CORRUPTED: executable '{prog}' has no valid agent payload");
+            return ExitCode::FAILURE;
+        }
         let rt = match SofuuRuntime::init() {
             Some(rt) => rt,
             None => {

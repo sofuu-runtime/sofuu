@@ -10,6 +10,14 @@
  */
 
 (function() {
+  function makeError(code, msg, details) {
+    var err = new Error(msg);
+    err.name = 'SofuuError';
+    err.code = code || 'ERR_CHAT_TUI';
+    err.rule = 'RULES.md §3.5';
+    if (details) err.details = details;
+    return err;
+  }
   let cfg = JSON.parse(__chat_getcfg());
   /* Permission mode: cfg.permissions is the persisted source of truth
    * (/mode, /plan, /edit, /full write it via Rust). The runtime gate is
@@ -369,14 +377,14 @@
      * (two servers exposing the same tool name = silent cross-calls). */
     let owner = null;
     for (const t of mcpTools) { if (t.name === name) { owner = t.server; break; } }
-    if (!owner) throw new Error('tool ' + name + ' not found on any MCP server');
+    if (!owner) throw makeError('ERR_MCP_TOOL_NOT_FOUND', 'tool ' + name + ' not found on any MCP server');
     for (const c of mcpClients) {
       if (c.name !== owner) continue;
       const res = await c.client.call('tools/call', { name: name, arguments: args || {} });
       const text = res && res.content && res.content[0] && res.content[0].text;
       return (typeof text === 'string') ? text : JSON.stringify(text);
     }
-    throw new Error('tool ' + name + ': owning server "' + owner + '" is not connected');
+    throw makeError('ERR_MCP_NOT_CONNECTED', 'tool ' + name + ': owning server "' + owner + '" is not connected');
   }
   /* Tool set handed to sofuu.agent.run each turn (A1.5): built-in web
    * tools (keyless by default) + the MCP tools as inline specs whose

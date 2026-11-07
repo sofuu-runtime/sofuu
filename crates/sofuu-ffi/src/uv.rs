@@ -524,6 +524,7 @@ pub const UV_IGNORE: c_int = 0x00;
 pub const UV_CREATE_PIPE: c_int = 0x01;
 pub const UV_WRITABLE_PIPE: c_int = 0x20; // uv.h: WRITABLE=0x20, READABLE=0x10
 pub const UV_READABLE_PIPE: c_int = 0x10;
+pub const UV_PROCESS_DETACHED: u32 = 1 << 3;
 
 // `uv_poll_t`/`uv_tcp_t`/`uv_tty_t` — same leading `data` field pattern;
 // the runtime mostly uses pipe/timer/fs/process/signal/check, so those are

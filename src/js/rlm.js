@@ -21,11 +21,20 @@
   if (typeof g.sofuu === 'undefined' || g.sofuu === null) g.sofuu = {};
   var sofuu = g.sofuu;
 
+  function makeError(code, msg, details) {
+    var err = new Error(msg);
+    err.name = 'SofuuError';
+    err.code = code || 'ERR_RLM';
+    err.rule = 'RULES.md §3.5';
+    if (details) err.details = details;
+    return err;
+  }
+
   function parseHostJson(raw, what) {
     var a;
     try { a = JSON.parse(raw); }
-    catch (e) { throw new Error('rlm: bad ' + what + ' JSON from host: ' + e); }
-    if (a && a.error) throw new Error('rlm: ' + a.error);
+    catch (e) { throw makeError('ERR_JSON_PARSE', 'rlm: bad ' + what + ' JSON from host: ' + e); }
+    if (a && a.error) throw makeError('ERR_RLM_HOST', 'rlm: ' + a.error);
     return a;
   }
 
@@ -221,9 +230,9 @@
   async function query(context, question, opts) {
     opts = opts || {};
     if (typeof __rlm_new !== 'function')
-      throw new Error('rlm: host functions not registered');
+      throw makeError('ERR_RLM_UNAVAILABLE', 'rlm: host functions not registered');
     if (!sofuu.ai || typeof sofuu.ai.complete !== 'function')
-      throw new Error('rlm: sofuu.ai.complete unavailable');
+      throw makeError('ERR_AI_UNAVAILABLE', 'rlm: sofuu.ai.complete unavailable');
 
     /* Tool specs are schema-only (G3: no executors cross into Rust — they
      * would be meaningless there; the host only needs names/schemas for
@@ -345,7 +354,7 @@
           if (r.trace !== undefined) out.trace = r.trace;
           return out;
         } else {
-          throw new Error('rlm: unknown action kind ' + JSON.stringify(action.kind));
+          throw makeError('ERR_UNKNOWN_ACTION', 'rlm: unknown action kind ' + JSON.stringify(action.kind));
         }
       }
     } finally {

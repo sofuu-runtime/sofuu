@@ -408,6 +408,7 @@ pub fn cli_install_sigint_stop() {
                     // _exit, not exit: atexit handlers would run concurrently
                     // with the blocked JS thread. The kernel closes every fd
                     // (listeners included), so nothing is left half-open.
+                    crate::rt::process_spawn::kill_all_live_children();
                     unsafe { libc::_exit(130) };
                 }
             } else {
@@ -440,6 +441,7 @@ pub unsafe extern "C" fn process_dispatch_pending_signals() {
                 embed_config::log("warn", "SIGINT received (no handler); ignoring in embedded mode");
             } else {
                 eprintln!();
+                crate::rt::process_spawn::kill_all_live_children();
                 libc::exit(130);
             }
         }
@@ -455,6 +457,7 @@ pub unsafe extern "C" fn process_dispatch_pending_signals() {
                 /* Host owns the process — never libc::exit (H2.1). */
                 embed_config::log("warn", "SIGTERM received (no handler); ignoring in embedded mode");
             } else {
+                crate::rt::process_spawn::kill_all_live_children();
                 libc::exit(143);
             }
         }
@@ -3640,6 +3643,7 @@ unsafe extern "C" fn js_process_exit(
         return qjs::sofuu_js_exception();
     }
 
+    crate::rt::process_spawn::kill_all_live_children();
     libc::exit(code);
 }
 

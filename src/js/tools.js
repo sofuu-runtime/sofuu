@@ -36,6 +36,15 @@
     sofuu.gc = function () { __sofuu_gc(); return { ok: true }; };
   }
 
+  function makeError(code, msg, details) {
+    var err = new Error(msg);
+    err.name = 'SofuuError';
+    err.code = code || 'ERR_TOOL_ERROR';
+    err.rule = 'RULES.md §3.5';
+    if (details) err.details = details;
+    return err;
+  }
+
   if (typeof sofuu.tools.define !== 'function') {
     sofuu.tools.define = function (spec) {
       if (sofuu.plugins && typeof sofuu.plugins.defineTool === 'function') {
@@ -44,7 +53,7 @@
       if (typeof globalThis.defineTool === 'function') {
         return globalThis.defineTool(spec);
       }
-      throw new Error('defineTool is not available');
+      throw makeError('E_TOOL_DEFINE', 'defineTool is not available');
     };
   }
 
@@ -127,7 +136,11 @@
   function policyCheck(op, fields) {
     var d = policyDecision(op, fields);
     if (d && d.decision === 'deny') {
-      throw new Error(op + ': denied by policy (' + d.rule + '): ' + (d.reason || ''));
+      var err = makeError('E_POLICY_DENIED', op + ': denied by policy (' + d.rule + '): ' + (d.reason || ''));
+      err.rule = d.rule || 'RULES.md §3.5';
+      err.decision = 'deny';
+      if (d.reason) err.policy_reason = d.reason;
+      throw err;
     }
   }
 
@@ -309,10 +322,21 @@
    * the read cannot be redirected by a swapped symlink afterwards. */
   async function readInRoot(p, label) {
     var who = label || 'read';
+    if (typeof p === 'string' && (p.indexOf('\0') !== -1 || p.indexOf('%00') !== -1)) {
+      var errNull = new Error(who + ': null byte in path is rejected: ' + JSON.stringify(p));
+      errNull.name = 'SofuuError';
+      errNull.code = 'ERR_PATH_TRAVERSAL';
+      errNull.rule = 'RULES.md §3.5';
+      throw errNull;
+    }
     var abs = lexNorm(p);
     var root = lexNorm('.');
     if (abs !== root && abs.indexOf(root + '/') !== 0) {
-      throw new Error(who + ': path escapes the project directory (reads are jailed to cwd): ' + p);
+      var errEsc = new Error(who + ': path escapes the project directory (reads are jailed to cwd): ' + p);
+      errEsc.name = 'SofuuError';
+      errEsc.code = 'E_PATH_OUTSIDE';
+      errEsc.rule = 'RULES.md §3.5';
+      throw errEsc;
     }
     var rootRealPath = await rootReal();
     if (rootRealPath) {
@@ -324,8 +348,12 @@
         return abs;
       }
       if (targetReal !== rootRealPath && targetReal.indexOf(rootRealPath + '/') !== 0) {
-        throw new Error(who + ': path resolves (via symlink) outside the project directory: ' + p +
+        var errSym = new Error(who + ': path resolves (via symlink) outside the project directory: ' + p +
           ' → ' + targetReal);
+        errSym.name = 'SofuuError';
+        errSym.code = 'E_PATH_OUTSIDE';
+        errSym.rule = 'RULES.md §3.5';
+        throw errSym;
       }
       policyCheck('fs.read', { path: targetReal });
       return targetReal;
@@ -346,10 +374,21 @@
    * symlinked ancestors falls back to the lexical check, which is exact
    * in that case. */
   async function mustBeInRoot(p) {
+    if (typeof p === 'string' && (p.indexOf('\0') !== -1 || p.indexOf('%00') !== -1)) {
+      var errNull = new Error('write: null byte in path is rejected: ' + JSON.stringify(p));
+      errNull.name = 'SofuuError';
+      errNull.code = 'ERR_PATH_TRAVERSAL';
+      errNull.rule = 'RULES.md §3.5';
+      throw errNull;
+    }
     var abs = lexNorm(p);
     var root = lexNorm('.');
     if (abs !== root && abs.indexOf(root + '/') !== 0) {
-      throw new Error('path escapes the project directory (writes are jailed to cwd): ' + p);
+      var errEsc = new Error('path escapes the project directory (writes are jailed to cwd): ' + p);
+      errEsc.name = 'SofuuError';
+      errEsc.code = 'E_PATH_OUTSIDE';
+      errEsc.rule = 'RULES.md §3.5';
+      throw errEsc;
     }
     if (sofuu.fs && typeof sofuu.fs.realpath === 'function') {
       var rootReal = null;
@@ -373,8 +412,12 @@
         if (targetReal) {
           var canonical = tail ? (targetReal.replace(/\/+$/, '') + '/' + tail) : targetReal;
           if (canonical !== rootReal && canonical.indexOf(rootReal + '/') !== 0) {
-            throw new Error('path resolves (via symlink) outside the project directory: ' + p +
+            var errSym = new Error('path resolves (via symlink) outside the project directory: ' + p +
               ' → ' + canonical);
+            errSym.name = 'SofuuError';
+            errSym.code = 'E_PATH_OUTSIDE';
+            errSym.rule = 'RULES.md §3.5';
+            throw errSym;
           }
           /* P1-12 (AUDIT-2026-09-07): hand the write the CANONICAL path we
            * just vetted, not the lexical one — the native open adds
@@ -496,6 +539,12 @@
     if (/(^|\/)\.sofuu\/config\.json$/.test(abs)) {
       return 'holds API keys — ask the user to provide what you need';
     }
+    if (/(^|\/)\.git(\/|$)/.test(abs)) {
+      return 'git repository metadata and configuration are off-limits';
+    }
+    if (/^\.env(\.[a-zA-Z0-9_.-]+)?$/i.test(base) || /(^|\/)\.env(\.[a-zA-Z0-9_.-]+)?$/i.test(abs)) {
+      return 'environment credential files are off-limits';
+    }
     if (/(^|\/)\.ssh\//.test(abs + '/')) {
       return 'SSH keys are off-limits';
     }
@@ -513,7 +562,14 @@
 
   function assertNotSensitive(p) {
     var why = sensitiveReason(p);
-    if (why) throw new Error('refusing to read ' + p + ' (' + why + ')');
+    if (why) {
+      var err = new Error('refusing to read ' + p + ' (' + why + ')');
+      err.name = 'SofuuError';
+      err.code = 'E_SECURITY';
+      err.rule = 'RULES.md §3.5';
+      err.path = p;
+      throw err;
+    }
   }
 
   var TOOLS = {};
@@ -539,7 +595,21 @@
        * guard landed. */
       var p = await readInRoot(a && a.path, 'read_file');
       assertNotSensitive(p);
-      var text = await sofuu.fs.readFile(p, 'utf8');
+      var text;
+      try {
+        text = await sofuu.fs.readFile(p, 'utf8');
+      } catch (eFs) {
+        if (!eFs.code) {
+          if (String(eFs.message || eFs).indexOf('no such file') >= 0) {
+            eFs.code = 'ENOENT';
+          } else {
+            eFs.code = 'E_FS_ERROR';
+          }
+        }
+        eFs.name = 'SofuuError';
+        eFs.rule = eFs.rule || 'RULES.md §3.5';
+        throw eFs;
+      }
       var lines = text.split('\n');
       if (lines.length && lines[lines.length - 1] === '') lines.pop();
       var s = Math.max(1, ((a && a.start) | 0) || 1);
@@ -696,8 +766,9 @@
       required: ['path', 'content'],
     },
     execute: async function (a) {
-      if (!a || typeof a.content !== 'string') throw new Error('write_file: content must be a string');
+      if (!a || typeof a.content !== 'string') throw makeError('E_INVALID_ARGS', 'write_file: content must be a string');
       var p = await mustBeInRoot(a.path);
+      assertNotSensitive(p);
       await mkdirp(parentDir(p));
       var existed = await sofuu.fs.exists(p);
       await sofuu.fs.writeFile(p, a.content);
@@ -798,7 +869,7 @@
         ') - the file was already broken before this edit.';
     }
     if (!orig) return '';
-    throw new Error('edit_file: syntax dry-run rejected the edit in ' + where + ': ' +
+    throw makeError('E_SYNTAX_REJECTED', 'edit_file: syntax dry-run rejected the edit in ' + where + ': ' +
       cand.error + ' - nothing was written to disk; fix the syntax and retry.');
   }
 
@@ -864,15 +935,16 @@
     },
     execute: async function (a) {
       var p = await mustBeInRoot(a && a.path);
+      assertNotSensitive(p);
       var oldS = String((a && a.old_string) == null ? '' : a.old_string);
-      if (!oldS) throw new Error('edit_file: old_string is required (quote it exactly from read_file)');
+      if (!oldS) throw makeError('E_INVALID_ARGS', 'edit_file: old_string is required (quote it exactly from read_file)');
       var newS = String((a && a.new_string) == null ? '' : a.new_string);
       var replaceAll = !!(a && a.replace_all);
       var text = await sofuu.fs.readFile(p, 'utf8');
       var count = 0, idx = 0, first = -1;
       while ((idx = text.indexOf(oldS, idx)) >= 0) { count++; if (first < 0) first = idx; idx += oldS.length; }
       if (count > 1 && !replaceAll) {
-        throw new Error('edit_file: old_string matches ' + count + ' places in ' + rel(p) +
+        throw makeError('E_NOT_UNIQUE', 'edit_file: old_string matches ' + count + ' places in ' + rel(p) +
           ' - include more surrounding context to make it unique, or pass replace_all:true');
       }
       /* removed is what the diff shows as the OLD side: oldS on the literal
@@ -899,11 +971,11 @@
       } else {
         var hits = tolerantMatches(text, oldS);
         if (!hits.length) {
-          throw new Error('edit_file: old_string not found in ' + rel(p) +
+          throw makeError('E_NOT_FOUND', 'edit_file: old_string not found in ' + rel(p) +
             ' - read_file it and copy the exact text (no line block matched either, ignoring indentation)');
         }
         if (hits.length > 1 && !replaceAll) {
-          throw new Error('edit_file: old_string matches ' + hits.length + ' places in ' + rel(p) +
+          throw makeError('E_NOT_UNIQUE', 'edit_file: old_string matches ' + hits.length + ' places in ' + rel(p) +
             ' ignoring indentation (lines ' + hits.map(function (h) { return h.line; }).join(', ') +
             ') - include more surrounding context to make it unique, or pass replace_all:true');
         }
@@ -959,7 +1031,7 @@
     },
     execute: async function (a) {
       var re;
-      try { re = new RegExp(a && a.pattern); } catch (e) { throw new Error('grep: invalid pattern: ' + String(e.message || e)); }
+      try { re = new RegExp(a && a.pattern); } catch (e) { throw makeError('E_INVALID_PATTERN', 'grep: invalid pattern: ' + String(e.message || e)); }
       var root = await readInRoot((a && a.path) || '.', 'grep');
       var gfilter = a && a.glob ? globToRe(a.glob) : null;
       var state = { files: 0, done: false };
@@ -997,7 +1069,7 @@
     },
     execute: async function (a) {
       var re;
-      try { re = globToRe((a && a.pattern) || ''); } catch (e) { throw new Error('glob: invalid pattern'); }
+      try { re = globToRe((a && a.pattern) || ''); } catch (e) { throw makeError('E_INVALID_PATTERN', 'glob: invalid pattern'); }
       var root = await readInRoot((a && a.path) || '.', 'glob');
       var state = { files: 0, done: false };
       var found = [];
@@ -1044,7 +1116,9 @@
       type: 'object',
       properties: {
         command: { type: 'string', description: 'The shell command to run' },
-        timeout_ms: { type: 'number', description: 'Kill after this many ms (1000-600000, default 60000)' },
+        timeout_ms: { type: 'number', description: 'Kill after this many ms (10-600000, default 60000)' },
+        timeoutMs: { type: 'number', description: 'Kill after this many ms (alias)' },
+        timeout: { type: 'number', description: 'Kill after this many ms (alias)' },
       },
       required: ['command'],
     },
@@ -1061,7 +1135,7 @@
         throw eNoShell;
       }
       var cmd = String((a && a.command) || '');
-      if (!cmd.trim()) throw new Error('bash: command required');
+      if (!cmd.trim()) throw makeError('E_INVALID_ARGS', 'bash: command required');
       /* S4/H-01: the policy check for this call now runs in the wrapper
        * (executeWithPolicy) that every executor sits behind, with the same
        * request `{op:'tool.run', tool:'bash', command}`. Keeping a second
@@ -1074,11 +1148,15 @@
        * catches the classics before they run. */
       for (var d = 0; d < BASH_DENY.length; d++) {
         if (BASH_DENY[d].test(cmd)) {
-          throw new Error('bash: refused — the command matches a catastrophic ' +
+          throw makeError('E_SECURITY', 'bash: refused — the command matches a catastrophic ' +
             'pattern (deny-list ' + d + '). If you truly need this, run it yourself in a terminal.');
         }
       }
-      var timeout = Math.min(BASH_MAX_TIMEOUT_MS, Math.max(1000, ((a && a.timeout_ms) | 0) || BASH_DEFAULT_TIMEOUT_MS));
+      var rawTimeout = (a && (a.timeout_ms !== undefined ? a.timeout_ms : (a.timeoutMs !== undefined ? a.timeoutMs : a.timeout)));
+      var timeoutVal = typeof rawTimeout === 'number' ? Math.floor(rawTimeout) : parseInt(rawTimeout, 10);
+      var timeout = (!isNaN(timeoutVal) && timeoutVal > 0)
+        ? Math.min(BASH_MAX_TIMEOUT_MS, Math.max(10, timeoutVal))
+        : BASH_DEFAULT_TIMEOUT_MS;
       return await new Promise(function (resolve, rejectP) {
         var out = '', errOut = '', done = false, code = -1, tid = null;
         function capAdd(s) { if (out.length < BASH_OUT_CAP) out += s.slice(0, BASH_OUT_CAP - out.length); }
@@ -1126,7 +1204,14 @@
           return;
         }
         tid = setTimeout(function () {
-          try { proc.kill(); } catch (e) { /* the process may have exited on its own between the check and the kill. */ }
+          try {
+            proc.kill('SIGTERM');
+          } catch (e) { /* the process may have exited on its own between the check and the kill. */ }
+          setTimeout(function () {
+            try {
+              proc.kill('SIGKILL');
+            } catch (eK) {}
+          }, 200);
           finish('\n[killed: timed out after ' + timeout + 'ms]\n');
         }, timeout);
       });
@@ -1145,7 +1230,7 @@
     var i = 0;
     while (i < lines.length && lines[i].trim() === '') i++;
     if (!/^\*\*\* Begin Patch\s*$/.test(lines[i] || '')) {
-      throw new Error('apply_patch: missing "*** Begin Patch"');
+      throw makeError('E_PATCH_FORMAT', 'apply_patch: missing "*** Begin Patch"');
     }
     i++;
     var ops = [];
@@ -1160,7 +1245,7 @@
         var content = [];
         while (i < lines.length && !/^\*\*\* /.test(lines[i])) {
           if (lines[i].charAt(0) !== '+') {
-            throw new Error('apply_patch: add-file lines must start with "+" (got "' + lines[i].slice(0, 40) + '")');
+            throw makeError('E_PATCH_FORMAT', 'apply_patch: add-file lines must start with "+" (got "' + lines[i].slice(0, 40) + '")');
           }
           content.push(lines[i].slice(1));
           i++;
@@ -1186,25 +1271,25 @@
           if (c === '-') h.old.push(ln.slice(1));
           else if (c === '+') h.new.push(ln.slice(1));
           else if (c === ' ' || ln === '') { h.old.push(ln.slice(1)); h.new.push(ln.slice(1)); }
-          else throw new Error('apply_patch: unexpected hunk line "' + ln.slice(0, 40) + '"');
+          else throw makeError('E_PATCH_FORMAT', 'apply_patch: unexpected hunk line "' + ln.slice(0, 40) + '"');
           i++;
         }
         if (h && (h.old.length || h.new.length)) hunks.push(h);
-        if (!hunks.length) throw new Error('apply_patch: update for ' + mUpd[1].trim() + ' has no hunks');
+        if (!hunks.length) throw makeError('E_PATCH_FORMAT', 'apply_patch: update for ' + mUpd[1].trim() + ' has no hunks');
         ops.push({ kind: 'update', path: mUpd[1].trim(), hunks: hunks });
         continue;
       }
       if (l.trim() === '') { i++; continue; }
-      throw new Error('apply_patch: unexpected line "' + l.slice(0, 60) + '"');
+      throw makeError('E_PATCH_FORMAT', 'apply_patch: unexpected line "' + l.slice(0, 60) + '"');
     }
-    throw new Error('apply_patch: missing "*** End Patch"');
+    throw makeError('E_PATCH_FORMAT', 'apply_patch: missing "*** End Patch"');
   }
   function applyPatchHunks(text, hunks) {
     var lines = String(text).split('\n');
     for (var h = 0; h < hunks.length; h++) {
       var want = hunks[h].old;
       if (!want.length) {
-        throw new Error('apply_patch: hunk ' + (h + 1) + ' has no context; include surrounding lines');
+        throw makeError('E_PATCH_CONTEXT', 'apply_patch: hunk ' + (h + 1) + ' has no context; include surrounding lines');
       }
       var hits = [];
       for (var st = 0; st + want.length <= lines.length; st++) {
@@ -1215,7 +1300,7 @@
         if (ok) hits.push(st);
       }
       if (hits.length !== 1) {
-        throw new Error('apply_patch: hunk ' + (h + 1) + ' context matched ' + hits.length +
+        throw makeError('E_NOT_UNIQUE', 'apply_patch: hunk ' + (h + 1) + ' context matched ' + hits.length +
                         ' place' + (hits.length === 1 ? '' : 's') + ' (must be unique)');
       }
       lines.splice.apply(lines, [hits[0], want.length].concat(hunks[h].new));
@@ -1235,22 +1320,23 @@
     },
     execute: async function (a) {
       var text = (a && typeof a.patch === 'string') ? a.patch : '';
-      if (!text.trim()) throw new Error('apply_patch: patch text required');
+      if (!text.trim()) throw makeError('E_INVALID_ARGS', 'apply_patch: patch text required');
       var ops = parseApplyPatch(text);
-      if (!ops.length) throw new Error('apply_patch: no file operations in the patch');
+      if (!ops.length) throw makeError('E_PATCH_FORMAT', 'apply_patch: no file operations in the patch');
       var planned = [], i;
       /* Plan phase: resolve every path, apply every hunk in memory, gate the
        * syntax. Nothing touches disk until the whole patch is valid. */
       for (i = 0; i < ops.length; i++) {
         var op = ops[i];
         var p = await mustBeInRoot(op.path);
+        assertNotSensitive(p);
         if (op.kind === 'add') {
           if (await sofuu.fs.exists(p)) {
-            throw new Error('apply_patch: add file already exists: ' + op.path);
+            throw makeError('E_FILE_EXISTS', 'apply_patch: add file already exists: ' + op.path);
           }
           var gateA = syntaxVerdict(op.content, p);
           if (gateA && gateA.ok === false) {
-            throw new Error('apply_patch: syntax rejected ' + rel(p) +
+            throw makeError('E_SYNTAX_REJECTED', 'apply_patch: syntax rejected ' + rel(p) +
               (gateA.line > 0 ? ':' + gateA.line : '') + ': ' + gateA.error + ' — nothing was written');
           }
           planned.push({ kind: 'add', path: p, content: op.content });
@@ -1261,7 +1347,7 @@
           var beforeU = await sofuu.fs.readFile(p, 'utf8');
           var afterU = applyPatchHunks(beforeU, op.hunks);
           try { syntaxGate(beforeU, afterU, p); } catch (eG) {
-            throw new Error(String(eG.message || eG).replace(/^edit_file:/, 'apply_patch:') + ' (nothing was written)');
+            throw makeError('E_SYNTAX_REJECTED', String(eG.message || eG).replace(/^edit_file:/, 'apply_patch:') + ' (nothing was written)');
           }
           planned.push({ kind: 'update', path: p, after: afterU, hunks: op.hunks.length });
         }
@@ -1363,7 +1449,7 @@
     },
     execute: async function (args) {
       var code = (args && typeof args.code === 'string') ? args.code : '';
-      if (!code.trim()) throw new Error('code_eval: code string required');
+      if (!code.trim()) throw makeError('E_INVALID_ARGS', 'code_eval: code string required');
       var timeout = 2000;
       if (args && typeof args.timeout_ms === 'number' && args.timeout_ms > 0) {
         timeout = Math.min(10000, Math.floor(args.timeout_ms));
@@ -1374,7 +1460,7 @@
       }
 
       if (typeof sofuu === 'undefined' || !sofuu.sandbox || typeof sofuu.sandbox.run !== 'function') {
-        throw new Error('code_eval: sofuu.sandbox runtime substrate not available');
+        throw makeError('E_SUBSTRATE_UNAVAILABLE', 'code_eval: sofuu.sandbox runtime substrate not available');
       }
 
       var key = codeSessionKey(args);
@@ -1429,9 +1515,25 @@
       } else {
         var errType = res.errorType || (res.interrupted ? 'interrupted' : 'error');
         var errDesc = res.error || 'Evaluation failed';
-        out.push('=== Execution Failed [' + errType + '] ===\n' + errDesc);
-        out.push('(fuel consumed: ' + (res.fuelUsed || 0) + ' ops, ' + (res.elapsedMs ? res.elapsedMs.toFixed(2) : 0) + 'ms)');
-        return out.join('\n\n');
+        var eCode = 'ERR_TOOL_ERROR';
+        if (errType === 'fuel' || /fuel/i.test(errDesc)) {
+          eCode = 'ERR_FUEL_EXHAUSTED';
+        } else if (errType === 'timeout' || res.timedOut || /timed? ?out/i.test(errDesc)) {
+          eCode = 'ERR_TIMEOUT';
+        } else if (errType === 'oom' || /memory|out of memory/i.test(errDesc)) {
+          eCode = 'ERR_OOM';
+        } else if (errType === 'interrupted') {
+          eCode = 'ERR_INTERRUPTED';
+        }
+        var msg = '=== Execution Failed [' + errType + '] ===\n' + errDesc +
+          '\n(fuel consumed: ' + (res.fuelUsed || 0) + ' ops, ' + (res.elapsedMs ? res.elapsedMs.toFixed(2) : 0) + 'ms)';
+        var cErr = new Error(msg);
+        cErr.name = 'SofuuError';
+        cErr.code = eCode;
+        cErr.rule = 'RULES.md §3.5';
+        cErr.fuelUsed = res.fuelUsed || 0;
+        cErr.elapsedMs = res.elapsedMs || 0;
+        throw cErr;
       }
     },
   };
@@ -1465,8 +1567,8 @@
     },
     execute: async function (a) {
       var list = (a && Array.isArray(a.todos)) ? a.todos : null;
-      if (!list) throw new Error('todo_write: todos array required');
-      if (list.length > 50) throw new Error('todo_write: max 50 items');
+      if (!list) throw makeError('E_INVALID_ARGS', 'todo_write: todos array required');
+      if (list.length > 50) throw makeError('E_INVALID_ARGS', 'todo_write: max 50 items');
       var clean = [];
       for (var i = 0; i < list.length; i++) {
         var it = list[i] || {};
@@ -1475,7 +1577,7 @@
         var c = String(it.content || '').trim();
         if (c) clean.push({ content: c.slice(0, 200), status: st });
       }
-      if (!clean.length) throw new Error('todo_write: at least one non-empty item');
+      if (!clean.length) throw makeError('E_INVALID_ARGS', 'todo_write: at least one non-empty item');
       /* T4: state is per run (the shared loop injects __scope), so a run
        * that never writes a checklist cannot inherit the previous one. */
       var scope = (a && typeof a.__scope === 'string' && a.__scope)
@@ -1747,7 +1849,7 @@
 
           serverObj.start = function (cb) {
             if (!sofuu.http || typeof sofuu.http.createServer !== 'function') {
-              throw new Error('sofuu.http.createServer is required for transport: "http"');
+              throw makeError('E_MCP_HTTP_SERVER_UNAVAILABLE', 'sofuu.http.createServer is required for transport: "http"');
             }
             httpServer = sofuu.http.createServer(async function (req, res) {
               if (req.method === 'DELETE') {
@@ -1914,7 +2016,7 @@
           disconnected = true;
         },
         listTools: async function () {
-          if (disconnected) throw new Error('MCP client is disconnected');
+          if (disconnected) throw makeError('E_MCP_DISCONNECTED', 'MCP client is disconnected');
           var tools = [];
           if (srv && srv._tools) {
             for (var k in srv._tools) {
@@ -1929,7 +2031,7 @@
           return { tools: tools };
         },
         listResources: async function () {
-          if (disconnected) throw new Error('MCP client is disconnected');
+          if (disconnected) throw makeError('E_MCP_DISCONNECTED', 'MCP client is disconnected');
           var res = [];
           if (srv && srv._resources) {
             for (var rk in srv._resources) {
@@ -2013,7 +2115,7 @@
             };
           }
 
-          throw new Error("Method not supported on direct transport: '" + method + "'");
+          throw makeError('E_MCP_METHOD_NOT_SUPPORTED', "Method not supported on direct transport: '" + method + "'");
         }
       };
 
@@ -2057,7 +2159,7 @@
         var m = (typeof v === 'string') ? /^\$\{secret:([A-Za-z0-9_.-]+)\}$/.exec(v) : null;
         if (!m) { out[k] = String(v); continue; }
         if (!sofuu.policy || typeof sofuu.policy.secret !== 'function') {
-          throw new Error('mcp.connect: env ' + k + ' needs a secret but sofuu.policy.secret is unavailable');
+          throw makeError('E_MCP_SECRET_UNAVAILABLE', 'mcp.connect: env ' + k + ' needs a secret but sofuu.policy.secret is unavailable');
         }
         out[k] = sofuu.policy.secret(m[1]);
       }
@@ -2130,7 +2232,7 @@
     }
     function mcpFetch(url, init) {
       var f = (typeof fetch === 'function') ? fetch : (sofuu.fetch || null);
-      if (!f) throw new Error('mcp http: fetch is unavailable in this build');
+      if (!f) throw makeError('E_MCP_FETCH_UNAVAILABLE', 'mcp http: fetch is unavailable in this build');
       return f(url, init);
     }
     sofuu.mcp._connectHttp = function (cfg) {
@@ -2208,7 +2310,7 @@
         if (!res.ok && res.status >= 400) {
           var bodyText = '';
           try { bodyText = await res.text(); } catch (eT) { /* the status code alone identifies the failure. */ }
-          throw new Error('mcp http: HTTP ' + res.status + (bodyText ? (': ' + bodyText.slice(0, 200)) : ''));
+          throw makeError('E_MCP_HTTP_ERROR', 'mcp http: HTTP ' + res.status + (bodyText ? (': ' + bodyText.slice(0, 200)) : ''));
         }
         var ct = '';
         try { ct = String((res.headers && res.headers.get && res.headers.get('content-type')) || ''); } catch (eC) { /* no headers object: an empty content-type selects the JSON parser. */ }
@@ -2216,7 +2318,7 @@
         var text = await res.text();
         if (!text || !text.trim()) return;
         var one;
-        try { one = JSON.parse(text); } catch (eP) { throw new Error('mcp http: response is not JSON'); }
+        try { one = JSON.parse(text); } catch (eP) { throw makeError('E_MCP_JSON_ERROR', 'mcp http: response is not JSON'); }
         if (Array.isArray(one)) { for (var i = 0; i < one.length; i++) handleMessage(one[i]); }
         else handleMessage(one);
       }
@@ -2383,19 +2485,19 @@
         }
       }
       async function postMessage(msg) {
-        if (closed) throw new Error('mcp: disconnected');
+        if (closed) throw makeError('E_MCP_DISCONNECTED', 'mcp: disconnected');
         var res = await mcpFetch(endpoint, { method: 'POST', headers: postHeaders, body: JSON.stringify(msg) });
         var status = res ? res.status : 0;
         if (status === 202 || status === 204) return;
         if (!res || (!res.ok && status >= 400)) {
           var bodyText = '';
           try { bodyText = await res.text(); } catch (eT) { /* the status code alone identifies the failure. */ }
-          throw new Error('mcp sse: HTTP ' + status + (bodyText ? (': ' + bodyText.slice(0, 200)) : ''));
+          throw makeError('E_MCP_HTTP_ERROR', 'mcp sse: HTTP ' + status + (bodyText ? (': ' + bodyText.slice(0, 200)) : ''));
         }
         var pct = '';
         try { pct = String((res.headers && res.headers.get && res.headers.get('content-type')) || ''); } catch (eC) { /* no headers: an empty content-type falls back to the SSE parser. */ }
         if (pct.indexOf('text/event-stream') >= 0) {
-          throw new Error('mcp sse: the server answered a message POST with an event stream — it is not speaking the legacy SSE transport');
+          throw makeError('E_MCP_PROTOCOL_ERROR', 'mcp sse: the server answered a message POST with an event stream — it is not speaking the legacy SSE transport');
         }
         var text = '';
         try { text = await res.text(); } catch (eB) { /* an unreadable body leaves the caller with the status. */ }
@@ -2422,7 +2524,7 @@
       async function readStream(res) {
         var body = res && res.body;
         if (!body || typeof body[Symbol.asyncIterator] !== 'function') {
-          throw new Error('mcp sse: response body is not streamable in this build');
+          throw makeError('E_MCP_STREAM_ERROR', 'mcp sse: response body is not streamable in this build');
         }
         var it = body[Symbol.asyncIterator]();
         var carry = [], buf = '', evName = '', dataLines = [];
@@ -2470,7 +2572,7 @@
           }
           if (closed) break;
         }
-        throw new Error('mcp sse: event stream closed');
+        throw makeError('E_MCP_STREAM_CLOSED', 'mcp sse: event stream closed');
       }
       var client = {
         transport: 'sse',
@@ -2508,7 +2610,7 @@
         try { res = await mcpFetch(url, { method: 'GET', headers: streamHeaders }); }
         catch (eGet) {
           closed = true;
-          throw new Error('mcp sse: cannot open ' + url + ': ' + ((eGet && eGet.message) || eGet));
+          throw makeError('E_MCP_OPEN_ERROR', 'mcp sse: cannot open ' + url + ': ' + ((eGet && eGet.message) || eGet));
         }
         if (!res || res.status !== 200) {
           closed = true;

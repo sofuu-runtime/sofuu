@@ -345,6 +345,8 @@ unsafe extern "C" fn on_process_exit(
         return;
     }
     (*req).done = 1;
+    let pid = uv::uv_process_get_pid(process as *const uv::UvProcess);
+    untrack_child_pid(pid as libc::pid_t);
 
     uv::uv_read_stop((*req).stdout_pipe as *mut UvStream);
     uv::uv_read_stop((*req).stderr_pipe as *mut UvStream);
@@ -403,18 +405,85 @@ unsafe extern "C" fn js_subprocess_finalizer(_rt: *mut qjs::JSRuntime, val: JSVa
     }
 }
 
+static LIVE_CHILD_PIDS: std::sync::Mutex<Vec<libc::pid_t>> = std::sync::Mutex::new(Vec::new());
+
+pub fn track_child_pid(pid: libc::pid_t) {
+    if pid > 1 {
+        if let Ok(mut lock) = LIVE_CHILD_PIDS.lock() {
+            if !lock.contains(&pid) {
+                lock.push(pid);
+            }
+        }
+    }
+}
+
+pub fn untrack_child_pid(pid: libc::pid_t) {
+    if pid > 1 {
+        if let Ok(mut lock) = LIVE_CHILD_PIDS.lock() {
+            lock.retain(|&p| p != pid);
+        }
+    }
+}
+
+pub fn kill_all_live_children() {
+    #[cfg(unix)]
+    if let Ok(mut lock) = LIVE_CHILD_PIDS.lock() {
+        for &pid in lock.iter() {
+            if pid > 1 {
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+        lock.clear();
+    }
+}
+
 unsafe extern "C" fn js_subprocess_kill(
     ctx: *mut JSContext,
     this_val: JSValueConst,
-    _argc: c_int,
-    _argv: *const JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
 ) -> JSValue {
     let req = qjs::JS_GetOpaque(this_val, SUBPROCESS_CLASS_ID.load(Ordering::Relaxed));
     if req.is_null() {
         return qjs::JS_ThrowTypeError(ctx, c"process already exited".as_ptr());
     }
     let req = req as *mut SpawnReq;
-    uv::uv_process_kill((*req).process, 15); /* SIGTERM */
+    let mut sig: c_int = 15; /* SIGTERM */
+    if argc > 0 && !argv.is_null() {
+        let arg0 = *argv;
+        if qjs::is_string(arg0) {
+            let s_ptr = qjs::sofuu_js_to_cstring(ctx, arg0);
+            if !s_ptr.is_null() {
+                let s = CStr::from_ptr(s_ptr).to_string_lossy();
+                match s.as_ref() {
+                    "SIGKILL" | "KILL" | "9" => sig = 9,
+                    "SIGTERM" | "TERM" | "15" => sig = 15,
+                    "SIGINT" | "INT" | "2" => sig = 2,
+                    "SIGHUP" | "HUP" | "1" => sig = 1,
+                    "SIGQUIT" | "QUIT" | "3" => sig = 3,
+                    _ => {}
+                }
+                qjs::sofuu_js_free_cstring(ctx, s_ptr);
+            }
+        } else if qjs::is_number(arg0) {
+            let mut num: i32 = 0;
+            if qjs::JS_ToInt32(ctx, &mut num, arg0) == 0 && num > 0 {
+                sig = num as c_int;
+            }
+        }
+    }
+    let pid = uv::uv_process_get_pid((*req).process as *const uv::UvProcess);
+    #[cfg(unix)]
+    {
+        if pid > 1 {
+            libc::kill(-pid, sig);
+            libc::kill(pid, sig);
+        }
+    }
+    uv::uv_process_kill((*req).process, sig);
     qjs::sofuu_js_undefined()
 }
 
@@ -679,7 +748,7 @@ unsafe extern "C" fn js_sofuu_spawn(
     req.env_ptr = req.env.iter().map(|e| e.as_ptr() as *mut c_char).collect();
     req.env_ptr.push(ptr::null_mut());
     req.opts.env = req.env_ptr.as_mut_ptr();
-    req.opts.flags = 0;
+    req.opts.flags = uv::UV_PROCESS_DETACHED;
     req.opts.uid = 0;
     req.opts.gid = 0;
 
@@ -746,6 +815,8 @@ unsafe extern "C" fn js_sofuu_spawn(
     }
 
     (*req_ptr).process = process;
+    let pid = uv::uv_process_get_pid(process as *const uv::UvProcess);
+    track_child_pid(pid as libc::pid_t);
     /* The process handle's data field must point back at the req too —
      * on_process_exit reads it (same as C's req->process.data = req). */
     *(process as *mut *mut SpawnReq) = req_ptr;

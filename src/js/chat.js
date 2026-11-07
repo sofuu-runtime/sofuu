@@ -51,6 +51,15 @@
   'use strict';
   if (!globalThis.sofuu) return; /* no engine namespace — nothing to do */
 
+  function makeError(code, msg, details) {
+    var err = new Error(msg);
+    err.name = 'SofuuError';
+    err.code = code || 'ERR_CHAT';
+    err.rule = 'RULES.md §3.5';
+    if (details) err.details = details;
+    return err;
+  }
+
   /* ── Module state (threaded through every helper instead of the TUI
    * driver's closures, so the host can inspect/reset it). */
   var S = {
@@ -743,7 +752,7 @@
     for (var i = 0; i < S.mcpTools.length; i++) {
       if (S.mcpTools[i].name === name) { owner = S.mcpTools[i].server; break; }
     }
-    if (!owner) throw new Error('tool ' + name + ' not found on any MCP server');
+    if (!owner) throw makeError('ERR_MCP_TOOL_NOT_FOUND', 'tool ' + name + ' not found on any MCP server');
     for (var j = 0; j < S.mcpClients.length; j++) {
       var c = S.mcpClients[j];
       if (c.name !== owner) continue;
@@ -760,7 +769,7 @@
        * own MCP adapter. */
       return mapped;
     }
-    throw new Error('tool ' + name + ': owning server "' + owner + '" is not connected');
+    throw makeError('ERR_MCP_NOT_CONNECTED', 'tool ' + name + ': owning server "' + owner + '" is not connected');
   }
 
   /* ── Permission gate (PLAN-DESKTOP C) ──────────────────────────────
@@ -1345,7 +1354,7 @@
   function sessionJoin(project, model, provider) {
     var regC = registryRead(project);
     if (regC.sessions.length >= SESSIONS_MAX) {
-      throw new Error('chat limit reached (' + SESSIONS_MAX + ' per workspace) — delete a chat (the x on a pill) to add a new one');
+      throw makeError('ERR_CHAT_LIMIT', 'chat limit reached (' + SESSIONS_MAX + ' per workspace) — delete a chat (the x on a pill) to add a new one');
     }
     var id = genSessionId();
     var cwd = '';
@@ -1607,7 +1616,7 @@
     S.providerOverride = providerOverride || null;
     var c = activeCfg();
     if (!usableConfig()) {
-      throw new Error('No usable model configured — open Settings → Providers to set one up');
+      throw makeError('ERR_NO_MODEL', 'No usable model configured — open Settings → Providers to set one up');
     }
     /* Sessionless submit (empty workspace): mint the chat now — the turn
      * itself is the user's explicit act. Folder switches never get here. */
@@ -1617,12 +1626,12 @@
     }
     /* Budget preflight (F6): block once session spend reaches the cap. */
     if (c.budget_usd > 0 && (c.spend_total_usd || 0) + S.sessionSpendUsd >= c.budget_usd) {
-      throw new Error('Budget cap reached ($' +
+      throw makeError('ERR_BUDGET_CAP', 'Budget cap reached ($' +
         ((c.spend_total_usd || 0) + S.sessionSpendUsd).toFixed(4) +
         ' / $' + Number(c.budget_usd).toFixed(2) + ')');
     }
     if (!sofuu.agent || typeof sofuu.agent.run !== 'function') {
-      throw new Error('agent runtime unavailable (src/js/agent.js failed to load)');
+      throw makeError('ERR_AGENT_UNAVAILABLE', 'agent runtime unavailable (src/js/agent.js failed to load)');
     }
     /* MCP is lazy: connect on demand only when a tool-using turn starts
      * (pure chat turns never invoke tools, so skip the handshake). The
@@ -2171,7 +2180,7 @@
 
   async function submit(text, opts) {
     opts = opts || {};
-    if (S.streaming) throw new Error('a turn is already running');
+    if (S.streaming) throw makeError('ERR_CONCURRENT_TURN', 'a turn is already running');
     if (!S.initialized) init({});
     loadConfig(); /* pick up settings changed in the host UI */
     S.promptLoggedThisSubmit = false; /* session-2: dedupe the prompt log across failover/think retries */

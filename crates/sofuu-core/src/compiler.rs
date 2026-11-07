@@ -154,12 +154,12 @@ fn encode_payload(
 /// this runs on bytes that came off disk, on every boot.
 fn decode_payload(p: &[u8], crc32: u32) -> Result<EmbeddedPayload, String> {
     if p.len() < PAYLOAD_HEADER_LEN || &p[..8] != PAYLOAD_MAGIC {
-        return Err("the embedded payload is not a Sofuu payload (bad magic)".to_string());
+        return Err("ERR_BINARY_CORRUPTED: the embedded payload is not a Sofuu payload (bad magic)".to_string());
     }
     let ver = u16::from_le_bytes([p[8], p[9]]);
     if ver != PAYLOAD_VERSION {
         return Err(format!(
-            "the embedded payload speaks format v{ver}; this runtime speaks v{PAYLOAD_VERSION} \
+            "ERR_BINARY_CORRUPTED: the embedded payload speaks format v{ver}; this runtime speaks v{PAYLOAD_VERSION} \
              — recompile the agent with this binary"
         ));
     }
@@ -172,23 +172,23 @@ fn decode_payload(p: &[u8], crc32: u32) -> Result<EmbeddedPayload, String> {
     let name_start = PAYLOAD_HEADER_LEN;
     let bc_start = name_start
         .checked_add(name_len)
-        .ok_or_else(|| "the embedded payload has a corrupt header".to_string())?;
+        .ok_or_else(|| "ERR_BINARY_CORRUPTED: the embedded payload has a corrupt header".to_string())?;
     let brain_start = bc_start
         .checked_add(bc_len)
-        .ok_or_else(|| "the embedded payload has a corrupt header".to_string())?;
+        .ok_or_else(|| "ERR_BINARY_CORRUPTED: the embedded payload has a corrupt header".to_string())?;
     let end = brain_start
         .checked_add(brain_len)
-        .ok_or_else(|| "the embedded payload has a corrupt header".to_string())?;
+        .ok_or_else(|| "ERR_BINARY_CORRUPTED: the embedded payload has a corrupt header".to_string())?;
     if end > p.len() {
         return Err(format!(
-            "the embedded payload is truncated (header claims {end} bytes, {} present)",
+            "ERR_BINARY_CORRUPTED: the embedded payload is truncated (header claims {end} bytes, {} present)",
             p.len()
         ));
     }
     let entry = String::from_utf8_lossy(&p[name_start..bc_start]).into_owned();
     let bytecode = p[bc_start..brain_start].to_vec();
     if bytecode.is_empty() {
-        return Err("the embedded payload carries no bytecode".to_string());
+        return Err("ERR_BINARY_CORRUPTED: the embedded payload carries no bytecode".to_string());
     }
     let brain = if brain_len > 0 {
         Some(p[brain_start..end].to_vec())
@@ -333,14 +333,14 @@ pub fn embedded_payload(bytes: &[u8]) -> Result<Option<EmbeddedPayload>, String>
     let t = f.trailer;
     if t.version != TRAILER_VERSION {
         return Err(format!(
-            "this executable carries trailer v{}; this runtime speaks v{TRAILER_VERSION} — \
+            "ERR_BINARY_CORRUPTED: this executable carries trailer v{}; this runtime speaks v{TRAILER_VERSION} — \
              rebuild it with this binary",
             t.version
         ));
     }
     if t.payload_len > f.trailer_at as u64 {
         return Err(format!(
-            "the embedded payload is truncated (trailer claims {} bytes, file holds {})",
+            "ERR_BINARY_CORRUPTED: the embedded payload is truncated (trailer claims {} bytes, file holds {})",
             t.payload_len, f.trailer_at
         ));
     }
@@ -348,7 +348,7 @@ pub fn embedded_payload(bytes: &[u8]) -> Result<Option<EmbeddedPayload>, String>
     let body = &bytes[start..f.trailer_at];
     if crc32(body) != t.crc32 {
         return Err(
-            "the embedded payload is corrupt (CRC32 mismatch) — rebuild the agent".to_string(),
+            "ERR_BINARY_CORRUPTED: the embedded payload is corrupt (CRC32 mismatch) — rebuild the agent".to_string(),
         );
     }
     decode_payload(body, t.crc32).map(Some)
@@ -430,14 +430,14 @@ pub fn detect_embedded_payload() -> Result<Option<EmbeddedPayload>, String> {
     let t = found.trailer;
     if t.version != TRAILER_VERSION {
         return Err(format!(
-            "this executable carries trailer v{}; this runtime speaks v{TRAILER_VERSION} — \
+            "ERR_BINARY_CORRUPTED: this executable carries trailer v{}; this runtime speaks v{TRAILER_VERSION} — \
              rebuild it with this binary",
             t.version
         ));
     }
     if t.payload_len > found.trailer_at as u64 {
         return Err(format!(
-            "the embedded payload is truncated (trailer claims {} bytes, file holds {})",
+            "ERR_BINARY_CORRUPTED: the embedded payload is truncated (trailer claims {} bytes, file holds {})",
             t.payload_len, found.trailer_at
         ));
     }
@@ -449,7 +449,7 @@ pub fn detect_embedded_payload() -> Result<Option<EmbeddedPayload>, String> {
         .map_err(|e| format!("cannot read the payload of {}: {e}", exe.display()))?;
     if crc32(&body) != t.crc32 {
         return Err(
-            "the embedded payload is corrupt (CRC32 mismatch) — rebuild the agent".to_string(),
+            "ERR_BINARY_CORRUPTED: the embedded payload is corrupt (CRC32 mismatch) — rebuild the agent".to_string(),
         );
     }
     decode_payload(&body, t.crc32).map(Some)
@@ -718,29 +718,44 @@ pub fn compile(entry: &str, opts: &CompileOptions) -> Result<CompileReport, Comp
     let output = resolve_output(entry_path, opts.output.as_deref())?;
     let output_str = output.to_string_lossy().into_owned();
 
-    /* 1. Bundle: one self-contained script, TypeScript stripped per module. */
-    let source = crate::bundler::bundle(entry_path, &crate::npm::npm_resolve)
-        .map_err(|e| err("E_BUNDLE", format!("{entry}: {e}")))?;
+    let entry_bytes = std::fs::read(entry_path)
+        .map_err(|e| err("E_ENTRY", format!("cannot read {entry}: {e}")))?;
 
-    /* 2. Compile the bundle. A bare QuickJS runtime is enough: this only has
-     *    to parse, so booting the engine here would buy nothing. */
-    let bytecode = unsafe { compile_source(&source, entry) }
-        .map_err(|m| err("E_COMPILE", m))?;
-    let bytecode_raw = bytecode.len() as u64;
-
-    /* 3. Store the bytecode compressed when that actually saves bytes.
-     *    `eval_compiled_and_run` sniffs the gzip magic, and the driver
-     *    snapshots use the same convention (`.bc.gz`). */
-    let (bytecode_stored, gzipped) = maybe_gzip(&bytecode);
-
-    /* 4. Optional brain. Refuse early rather than emit an artifact that
-     *    cannot open it. */
-    let (brain, brain_dim) = match opts.embed_brain.as_deref() {
-        Some(b) => {
-            let (bytes, dim) = read_brain(b)?;
+    let (bytecode_stored, gzipped, bytecode_raw, brain, brain_dim) = if let Ok(Some(existing)) = embedded_payload(&entry_bytes) {
+        let (br, dim) = if opts.embed_brain.is_some() {
+            let (bytes, dim) = read_brain(opts.embed_brain.as_deref().unwrap())?;
             (Some(bytes), dim)
-        }
-        None => (None, 0),
+        } else {
+            (existing.brain, existing.brain_dim)
+        };
+        let raw_len = existing.bytecode.len() as u64;
+        (existing.bytecode, existing.gzipped, raw_len, br, dim)
+    } else {
+        /* 1. Bundle: one self-contained script, TypeScript stripped per module. */
+        let source = crate::bundler::bundle(entry_path, &crate::npm::npm_resolve)
+            .map_err(|e| err("E_BUNDLE", format!("{entry}: {e}")))?;
+
+        /* 2. Compile the bundle. A bare QuickJS runtime is enough: this only has
+         *    to parse, so booting the engine here would buy nothing. */
+        let bytecode = unsafe { compile_source(&source, entry) }
+            .map_err(|m| err("E_COMPILE", m))?;
+        let bytecode_raw = bytecode.len() as u64;
+
+        /* 3. Store the bytecode compressed when that actually saves bytes.
+         *    `eval_compiled_and_run` sniffs the gzip magic, and the driver
+         *    snapshots use the same convention (`.bc.gz`). */
+        let (bc_stored, gz) = maybe_gzip(&bytecode);
+
+        /* 4. Optional brain. Refuse early rather than emit an artifact that
+         *    cannot open it. */
+        let (br, dim) = match opts.embed_brain.as_deref() {
+            Some(b) => {
+                let (bytes, dim) = read_brain(b)?;
+                (Some(bytes), dim)
+            }
+            None => (None, 0),
+        };
+        (bc_stored, gz, bytecode_raw, br, dim)
     };
 
     /* 5. The base is this executable without its code signature and without
@@ -844,9 +859,13 @@ pub fn compile(entry: &str, opts: &CompileOptions) -> Result<CompileReport, Comp
         return Err(err("E_OUTPUT", format!("cannot publish {output_str}: {e}")));
     }
 
+    let total_on_disk = std::fs::metadata(&output)
+        .map(|m| m.len())
+        .unwrap_or(artifact.len() as u64);
+
     Ok(CompileReport {
         output: output_str,
-        total: artifact.len() as u64,
+        total: total_on_disk,
         base: base.len() as u64,
         payload: payload.len() as u64,
         bytecode_raw,

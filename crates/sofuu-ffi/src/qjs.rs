@@ -947,6 +947,13 @@ pub unsafe fn is_object(v: JSValueConst) -> bool {
 
 /// # Safety
 /// `v` must be a valid JSValue.
+pub unsafe fn is_string(v: JSValueConst) -> bool {
+    // SAFETY: shim.
+    sofuu_js_is_string(v) != 0
+}
+
+/// # Safety
+/// `v` must be a valid JSValue.
 pub unsafe fn is_number(v: JSValueConst) -> bool {
     // SAFETY: shim.
     sofuu_js_is_number(v) != 0

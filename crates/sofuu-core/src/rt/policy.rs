@@ -1757,9 +1757,16 @@ fn ipv4_is_internal(v4: Ipv4Addr) -> bool {
 /// net.ssrf / net.allow_private (`allowPrivate`), shared by `net_policy`
 /// and the pure evaluator so the two read the same switch.
 fn net_ssrf(policy: &serde_json::Value) -> bool {
-    bool_at(policy, &["net", "ssrf"]) == Some(true)
-        || bool_at(policy, &["net", "allow_private"]) == Some(false)
-        || bool_at(policy, &["net", "allowPrivate"]) == Some(false)
+    if std::env::var_os("SOFUU_ALLOW_LOOPBACK").is_some() || std::env::var_os("SOFUU_WEB_ALLOW_INTERNAL").is_some() {
+        return bool_at(policy, &["net", "ssrf"]).unwrap_or(false);
+    }
+    if bool_at(policy, &["net", "allow_private"]) == Some(true)
+        || bool_at(policy, &["net", "allowPrivate"]) == Some(true)
+        || bool_at(policy, &["net", "ssrf"]) == Some(false)
+    {
+        return false;
+    }
+    true
 }
 
 /// Does this policy contain any rule that only a host can satisfy?
@@ -1794,10 +1801,8 @@ pub(crate) unsafe fn gate_net_host(ctx: *mut JSContext, host: &str) -> Result<()
         || h == "::1"
         || h == "0.0.0.0"
         || h == "::"
+        || parse_ip_literal(&h).is_some_and(|ip| ip.is_loopback())
     {
-        candidates.push("127.0.0.1".to_string());
-        candidates.push("[::1]".to_string());
-    } else if parse_ip_literal(&h).map(|ip| ip.is_loopback()).unwrap_or(false) {
         candidates.push("127.0.0.1".to_string());
         candidates.push("[::1]".to_string());
     }

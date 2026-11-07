@@ -1749,14 +1749,29 @@ unsafe extern "C" fn start_timeout(_multi: *mut CurlM, timeout_ms: c_long, _user
 
 // ── SSRF guards + manual redirect machinery (net-4 / net-5 / net-6 / P1-3) ──
 
-/// Entry-level URL guard: the cloud-metadata IP is never a legitimate fetch
-/// target. Some(reason) = reject the fetch with that message.
+/// Entry-level URL guard: loopback, RFC 1918 private subnets, and cloud-metadata
+/// IPs are refused by default unless loopback is allowed explicitly.
 fn ssrf_url_reject(url: &str) -> Option<&'static str> {
-    if url.to_ascii_lowercase().contains("169.254.169.254") {
-        Some("fetch blocked: cloud metadata IP")
-    } else {
-        None
+    if std::env::var_os("SOFUU_ALLOW_LOOPBACK").is_some() || std::env::var_os("SOFUU_WEB_ALLOW_INTERNAL").is_some() {
+        return None;
     }
+    let low = url.to_ascii_lowercase();
+    if low.contains("169.254.169.254") {
+        return Some("fetch blocked: cloud metadata IP");
+    }
+    if let Some((_scheme, authority, _path)) = url_parts(url) {
+        let host = authority.split('@').last().unwrap_or(authority);
+        let host_no_port = host.split(':').next().unwrap_or(host).trim_matches('[').trim_matches(']');
+        if host_no_port == "localhost" || host_no_port == "127.0.0.1" || host_no_port == "::1" || host_no_port == "0.0.0.0" {
+            return Some("fetch blocked: loopback address refused");
+        }
+        if let Ok(ip) = host_no_port.parse::<std::net::IpAddr>() {
+            if crate::rt::policy::ip_is_internal(ip) {
+                return Some("fetch blocked: private/loopback network address refused");
+            }
+        }
+    }
+    None
 }
 
 /// fetch only speaks http(s) (web.js's own guard mirrors this).

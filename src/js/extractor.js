@@ -24,6 +24,15 @@
   var S = globalThis.sofuu;
   if (!S) return;
 
+  function makeError(code, msg, details) {
+    var err = new Error(msg);
+    err.name = 'SofuuError';
+    err.code = code || 'ERR_EXTRACTOR';
+    err.rule = 'RULES.md §3.5';
+    if (details) err.details = details;
+    return err;
+  }
+
   var E = S.extractor || {};
 
   // Heuristic indicator: does this message likely contain personal user facts/updates?
@@ -171,7 +180,7 @@
       return text;
     }
 
-    throw new Error('No inference engine available for extraction');
+    throw makeError('ERR_NO_INFERENCE_ENGINE', 'No inference engine available for extraction');
   }
 
   async function extract(userText, options) {

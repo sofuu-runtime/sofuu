@@ -75,7 +75,7 @@ Sofuu is built from first principles with a hard **$\le 5.5\text{ MiB}$ binary c
 - **Offline embeddings** — `ai.embed` (768-dim, zero-byte model), `ai.embedImage` (joint text/image space), SIMD `similarity`/`dot`/`l2`
 - **Speech in/out** — `ai.transcribe` / `ai.speak` via provider endpoints or on-device OS engines
 - **Long-context Q&A** — `sofuu.rlm.query` answers over contexts far larger than any model window via a sandboxed reader loop
-- **Kaze device scripting** — `sofuu script run|check|compile|repl`: a small typed language for drones, rovers and edge devices, with declared capabilities, a fuel meter and bytecode from day one. Additive to JS, never a replacement — [spec](docs/KAZE-SPEC.md)
+- **Kaze device & guardrail scripting** — `sofuu script run|check|compile|repl`: a small typed scripting language for AI agents, guardrails, and edge devices, with declared capabilities, a fuel meter and bytecode from day one. Additive to JS, never a replacement — [spec](docs/KAZE-SPEC.md)
 - **Robotics, Autonomous Drones & MAVLink** — **[Experimental - Preview]** — `sofuu drone observe|status|send|mission|why|init`, `sofuu.mavlink`, and `sofuu.drone`: zero-dependency MAVLink v2 codec, deterministic R7 hardware safety gate (reject-never-clamp, geofences, fail-closed GPS dropouts), 1 Hz autonomous dead-man heartbeat, PreArm diagnostics, Linux GPIO/pulse timers, and ground rover pre-flight verification — [plan](docs/PLAN-DRONES-MAVLINK.md)
 - **Context-economy gates** — `sofuu.ml` freshness/supervisor/compaction/relevance models (~8k params each) advise the loop to cut token waste; hard off via `/ml off` or `SOFUU_NO_ML=1`
 - **MCP + HTTP + web** — `sofuu.mcp.connect/serve`, `sofuu.http.createServer`, keyless `sofuu.web.search/open`
@@ -555,53 +555,50 @@ Full guide: [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) · specification: [do
 
 ---
 
-## Kaze (風) — Device Scripting
+## Kaze (風) — Scripting Language & Guardrails
 
-Kaze is a small language for the work a general-purpose runtime is bad at: a
-patrol loop, a sensor threshold, a relay schedule. It has no ambient I/O — a
-script declares what it needs and the host grants a backend per device family,
+Kaze is a small typed scripting language for the work a general-purpose runtime is bad at:
+deterministic guardrails, secret leak filtering, prompt constraints, and physical robotics loops. It has zero GC pauses, bounded arena memory, and no ambient I/O — a
+script declares what it needs and the host grants a backend per capability family,
 so the whole permission story fits on line one.
 
 ```kaze
-needs: drone, log
+# Prompt Guardrail — filter returns allow or reject
+needs: memory, policy
 
-action patrol(points):
-    log "Starting automated perimeter patrol"
-    arm drone
-    takeoff to 15 meters
-    for each point in points:
-        fly to point at 15 meters
-    return to launch
-
-when battery < 20%:
-    log warning "Battery critical!"
-    return to launch
+filter user_prompt(prompt):
+    if length of prompt > 2000:
+        reject with "Prompt exceeds maximum allowed length"
+    if policy detects secrets in prompt:
+        reject with "Prompt contains private API keys"
+    remember prompt as "last_valid_query"
+    allow prompt
 ```
 
 ```bash
-sofuu script check examples/kaze/patrol.kaze          # parse + check, no execution
-sofuu script run   examples/kaze/patrol.kaze \
-    --cap drone=sim --arg 'points=[1,2,3]' --ticks 3   # deterministic trace
-sofuu script run   examples/kaze/hello.kaze --plain      # canonical text trace
-sofuu script compile examples/kaze/patrol.kaze -o patrol.kazebc --disasm
-sofuu script run   patrol.kazebc --cap drone=sim        # runs the artifact, no front end
-sofuu script repl                                       # define routines, then .run
+sofuu script check examples/kaze/guardrail.kaze        # parse + check, no execution
+sofuu script run   examples/kaze/guardrail.kaze \
+    --arg 'prompt="Analyze this repo"'                 # deterministic zero-GC execution
+sofuu script compile examples/kaze/guardrail.kaze -o guardrail.kazebc --disasm
+sofuu script repl                                      # define routines, then .run
 ```
 
-Records arrive as JSON arguments and are read with `record.field`; the
-capability surface is the one the spec lists, including `drone.goto(lat, lon,
-alt)`, `sensor.read(pin)` and `device.read_gpio(pin)`.
+Agents invoke Kaze directly from JavaScript and TypeScript with zero serialization overhead:
 
-Every instruction costs fuel, so a runaway loop stops with `E_TIMEOUT` instead of
-hanging the robot; every capability call passes the R7 hardware gate, so an
-undeclared or ungranted family is refused *before* an actuator moves, and an
-out-of-range argument is rejected rather than clamped. The same script, inputs
-and simulated state always produce the same trace and the same compiled bytes.
+```typescript
+import sofuu, { kaze } from "sofuu";
 
-Language reference: [docs/KAZE-SPEC.md](docs/KAZE-SPEC.md) · examples:
-[`examples/kaze/`](examples/kaze/) — the five scripts, plus
+// Execute in-process with deterministic fuel meters and zero GC allocations
+const report = sofuu.kaze.run("guardrail.kaze", { prompt: userInput });
+if (!report.verdict.allow) {
+  throw new Error(`Guardrail rejected: ${report.verdict.reason}`);
+}
+```
+
+Scripting language reference: [docs/KAZE-SPEC.md](docs/KAZE-SPEC.md) · examples:
+[`examples/kaze/`](examples/kaze/) — the shipped scripts, plus
 [`patrol_tool.mjs`](examples/kaze/patrol_tool.mjs), which wires a Kaze script
-into an agent tool with `import { defineTool, sfs } from "sofuu"`.
+into an agent tool with `import { defineTool, kaze } from "sofuu"`.
 
 ---
 
@@ -626,6 +623,7 @@ sofuu agent run <name> "task" [--json] # Run one agent headless
 sofuu brain verify|repair|stats|backup <path> # Segmented QTSQ cognitive memory maintenance
 sofuu session list|show|inspect <id>   # Multi-turn project session inspection & pruning
 sofuu plugin list|validate|test|init|add   # Manage and test 5-shield plugins (add llamacpp, ollama)
+sofuu mcp list|test|inspect|add|remove|init|link # Manage, test, inspect, scaffold MCP servers and link to IDEs
 sofuu logs [--last-error]    # Inspect runs and crash post-mortem cards
 sofuu logs show <run_id>     # Step-by-step trace transcript
 sofuu resume <run_id>        # Resume execution from last checkpoint
@@ -762,15 +760,15 @@ res.answer; res.calls; res.rounds; res.stopped; res.trace;
 sofuu.rlm.route(ctxTokens, windowTokens, question)  // → "rlm" | "plain"
 ```
 
-### `sofuu.sfs` — Kaze device scripts
+### `sofuu.kaze` (and `sofuu.sfs`) — Kaze scripting language & guardrails
 
-Run a Kaze program from JS and read back what it did. The device families the
+Run a Kaze script from JS and read back what it did. The device families the
 script declares must be granted a backend here; `log`, `memory` and `policy`
 are in-process and need no grant. Both surfaces are the same object:
 
 ```js
-import { sfs } from "sofuu";        // module form
-const run = sfs.run("./patrol.kaze", { points: [1, 2, 3] }, {
+import { kaze } from "sofuu";        // module form (also aliased as { sfs })
+const run = kaze.run("./patrol.kaze", { points: [1, 2, 3] }, {
   caps: { drone: "sim" },       // grant a backend per family
   ticks: 3, tickMs: 100,        // virtual supervisor clock
   fuel: 200000,                 // instruction budget
@@ -781,12 +779,12 @@ run.result;        // the routine's return value, rendered
 run.verdict;       // filters: { allow: true|false, reason }
 run.fuel;          // instructions actually spent
 
-sfs.check(srcOrPath);          // { ok: true } or { ok: false, code, error }
-sfs.compile(srcOrPath);        // { ok, bytes, items, caps, consts }
-sfs.version;                   // "0.1"
+kaze.check(srcOrPath);          // { ok: true } or { ok: false, code, error }
+kaze.compile(srcOrPath);        // { ok, bytes, items, caps, consts }
+kaze.version;                   // "0.1"
 ```
 
-The global `sofuu.sfs` is the same object, so `await` works on either: a run is
+The global `sofuu.kaze` (and legacy alias `sofuu.sfs`) is the same object, so `await` works on either: a run is
 synchronous by design, and `await` on a non-promise resolves to the report.
 
 A run never throws: a failure comes back with its code (`E_CAP_MISSING`,
@@ -816,14 +814,24 @@ page.text;
 ### `sofuu.mcp` — Model Context Protocol
 
 ```js
+// 1. External Stdio / HTTP / SSE Client
 const client = await sofuu.mcp.connect("npx @modelcontextprotocol/server-filesystem /tmp");
 await client.listTools();
 await client.call("read_file", { path: "/tmp/notes.txt" });
 client.disconnect();
 
-const server = sofuu.mcp.serve();
-server.tool("get_weather", { description: "…", schema: { … } }, async ({ city }) => { … });
-server.start();   // stdio — works with any MCP client
+// 2. In-Memory Direct Server & Onion Middleware (zero IPC overhead)
+const server = sofuu.mcp.serve({ name: "math-service", version: "1.0.0" });
+server.tool("fibonacci", { description: "nth fibonacci", schema: { type: "object", properties: { n: { type: "number" } }, required: ["n"] } }, async ({ n }) => ({ result: 55 }));
+server.use(async (ctx, next) => { console.log("Calling", ctx.toolName); await next(); });
+
+// 3. Direct Transport & Agent Integration
+const directClient = await sofuu.mcp.connect(server, { transport: "direct" });
+const agent = sofuu.agent.define({ name: "solver", tools: [directClient] });
+
+// 4. Stdio or Network HTTP Server Mode
+server.start();                         // stdio — works with any MCP client
+// const net = sofuu.mcp.serve({ transport: "http", port: 19842 }); // Standalone HTTP server
 ```
 
 ### `sofuu.http` · `sofuu.fs` · `sofuu.spawn` · Globals

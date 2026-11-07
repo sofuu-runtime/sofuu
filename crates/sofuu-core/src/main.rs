@@ -138,8 +138,8 @@ fn print_help() {
     println!("  capabilities             Print the runtime capability manifest as JSON");
     println!("  tools list               List the tools the active policy allows (--json)");
     println!("  policy init|check|dry-run|why  Write a profile, audit a script, explain a rule");
-    println!("  mcp list|test|add|remove Manage MCP servers and inspect their tools");
-    println!("  script run|check|compile|repl  Kaze: capability-gated device scripting");
+    println!("  mcp list|test|inspect|add|remove|init|link Manage MCP servers and inspect their tools");
+    println!("  script run|check|compile|repl  Kaze: capability-gated scripting language for agents & devices");
     println!("\n\x1b[1mChat commands (inside the chat UI):\x1b[0m");
     /* P3 (AUDIT-2026-09-07): /models was deliberately removed (unknown
      * command — the model list lives in /provider) — stop advertising it. */

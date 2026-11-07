@@ -34,7 +34,6 @@ use sofuu_ffi::bridge::{
     js_new_bool, js_new_string, js_to_string, register_global_fn, JSCFunction, JSContext,
     JSValue, JSValueConst,
 };
-use sofuu_ffi::qjs;
 
 use super::episode::{Episode, EpisodeAction};
 use super::router::{self, Route};
@@ -614,6 +613,7 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sofuu_ffi::qjs;
 
     #[test]
     fn request_json_maps_camelcase_opts() {

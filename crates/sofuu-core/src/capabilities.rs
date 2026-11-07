@@ -450,7 +450,6 @@ fn gguf_file_type_name(t: u32) -> String {
 /// Parse the GGUF header far enough to describe the model. Reads KVs and
 /// tensor infos only — never tensor data.
 fn read_gguf_summary(path: &str) -> Result<Value, String> {
-    use std::io::Read;
     let f = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
     let mut r = std::io::BufReader::new(f);
 

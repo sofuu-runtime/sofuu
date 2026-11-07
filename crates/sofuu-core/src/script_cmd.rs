@@ -22,9 +22,9 @@ use crate::sfs::{self, isa, RunOptions, RunReport};
 pub fn print_help() {
     println!(
         "Usage: sofuu script <command> [options]\n\n\
-         Kaze ({}) — the capability-gated scripting language for robots, drones\n\
-         and edge devices. A Kaze script declares what it needs (needs: drone, log)\n\
-         and the host grants a backend for each device family.\n\n\
+         Kaze ({}) — the capability-gated scripting language for AI agents,\n\
+         guardrails, robots, drones, and edge devices. A Kaze script declares\n\
+         what it needs (needs: policy, log) and the host grants a backend.\n\n\
          Commands:\n\
          \x20 run <file.kaze>      Check, compile and run a script\n\
          \x20 check <file.kaze>    Front end only: parse + check, no execution\n\

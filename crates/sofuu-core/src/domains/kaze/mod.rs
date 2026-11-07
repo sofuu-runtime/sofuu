@@ -620,7 +620,8 @@ pub unsafe fn mod_sfs_register(ctx: *mut JSContext) {
         qjs::sofuu_js_set_property_str(ctx, ns, c"compile".as_ptr(), compile);
         let version = qjs::sofuu_js_new_string(ctx, c"0.1".as_ptr());
         qjs::sofuu_js_set_property_str(ctx, ns, c"version".as_ptr(), version);
-        qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"sfs".as_ptr(), ns);
+        qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"sfs".as_ptr(), qjs::sofuu_js_dup_value(ctx, ns));
+        qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"kaze".as_ptr(), ns);
         qjs::sofuu_js_free_value(ctx, sofuu_obj);
         qjs::sofuu_js_free_value(ctx, global);
     }

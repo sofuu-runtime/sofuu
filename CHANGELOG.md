@@ -4,6 +4,28 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## MCP Tooling, In-Memory Direct Transport, Middleware & Bundler Hardening — 2026-11-07
+
+Post-stabilization freeze enhancements across Model Context Protocol (MCP), standalone bundler resolution, cross-compilation tooling, and CUDA kernel decoders:
+
+**MCP Pillar 3 — In-Memory Direct Transport & Middleware Onion Pipeline (`51fa5a23f`).**
+- **In-Memory Direct Transport (`transport: "direct"`):** Connect in-process MCP servers directly to runtime clients (`sofuu.mcp.connect(server, { transport: 'direct' })`) with zero IPC overhead, eliminating process-spawn and JSON serialization bottlenecks (sub-millisecond invocation latency). Directly accepted by `sofuu.agent.define({ tools: [directClient] })`.
+- **Middleware Onion Pipeline (`client.use` / `server.use`):** Added composable async middleware interceptors (`(ctx, next) => { await next(); }`) executing in standard onion order across both client and server lifecycles, enabling cross-cutting concerns (tool call tracing, validation, authorization, retries).
+- **Standalone HTTP MCP Server:** Added HTTP server mode (`sofuu.mcp.serve({ transport: 'http', port })`) with graceful connection teardown (`server.close()`).
+- **MCP CLI Inspection:** Added `sofuu mcp inspect <name | command line | http(s)://url> [--call <tool> [--args <json>]]` to introspect server capabilities, list tools/resources, and invoke tools directly from the command line.
+
+**MCP Tooling, Scaffolding & IDE Integration (`8514a2f76`).**
+- **Server Scaffolding (`sofuu mcp init <name>`):** Scaffolds new MCP servers with idiomatic schemas, tools, and entrypoints.
+- **IDE Linking (`sofuu mcp link <claude-desktop | cursor>`):** Automatically provisions runtime server entries and configurations into Claude Desktop (`claude_desktop_config.json`) and Cursor (`cursor_settings.json`).
+- **Module Exports:** Shipped top-level `mcp` export in the `sofuu` module interface (`import { mcp } from 'sofuu'`).
+
+**Bundler Built-in Virtual Module Resolution (`e64344b7c`).**
+- Resolved virtual module identifiers (`sofuu`, `@sofuu/*`, and built-in modules) during bundling and standalone compilation (`sofuu bundle`, `sofuu compile`), preventing erroneous external-resolution fallbacks when packaging self-contained agents.
+
+**Cross-Compilation Tooling & Release Hygiene (`592dec45c`, `9adbb511e`).**
+- Replaced invalid `git diff --untracked-files=no` option in `scripts/cross/build_linux_arm64.sh`, `build_linux_x86_64.sh`, and `build_linux_gnu_cli.sh` with `git status --porcelain --untracked-files=no`, stopping spurious `-dirty` suffixes on clean cross-builds.
+- Fixed UTF-8 default reading in `scripts/check_podspec.rb`, whitespace formatting in `E_KAZE_MEMORY`, and directional npm/Cargo version check in `scripts/verify-dist.sh`.
+
 ## Stabilization Freeze — RAM, Concurrency & Error-Precision Closeout — 2026-11-05
 
 [`docs/PLAN-STABILIZATION-FREEZE.md`](docs/PLAN-STABILIZATION-FREEZE.md) is implemented and verified pass by pass. Pass 1 (F-01…F-04) was already landed in the audit remediation; this entry covers the remaining work.

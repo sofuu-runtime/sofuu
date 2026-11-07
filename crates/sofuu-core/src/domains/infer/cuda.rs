@@ -21,13 +21,14 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 /// Every kernel name the checked-in PTX must export. Kept in one place so the
 /// generator script, the Rust init check and the tests cannot drift.
-pub const PTX_ENTRIES: [&str; 20] = [
+pub const PTX_ENTRIES: [&str; 21] = [
     "sofuu_gemv_q8_0",
     "sofuu_gemv_q4_k",
     "sofuu_gemv_q6_k",
     "sofuu_gemv_f32",
     "sofuu_quantize_q8_1",
     "sofuu_gemv_q4_k_q8",
+    "sofuu_gemv_q4_k_q8_r2",
     "sofuu_rmsnorm",
     "sofuu_swiglu",
     "sofuu_rope_f32",
@@ -967,6 +968,8 @@ mod imp {
         }
 
         /// q4_K weights against q8_1 activations: y[r] = dot(w[r], xd*xq).
+        /// `rows_per_warp` 2 selects the row-paired variant, which streams two
+        /// contiguous rows per warp and reads the activation once for both.
         pub fn gemv_q4_k_q8(
             &self,
             weights: DeviceBuf,
@@ -976,6 +979,7 @@ mod imp {
             y: DeviceBuf,
             rows: usize,
             cols: usize,
+            rows_per_warp: usize,
         ) -> Result<(), CudaError> {
             let Some(row_bytes) = Quant::Q4K.row_bytes(cols) else {
                 return Err(CudaError(format!("q4_K does not accept cols={cols}")));
@@ -1017,8 +1021,12 @@ mod imp {
                 &mut r as *mut i32 as *mut c_void,
                 &mut c as *mut i32 as *mut c_void,
             ];
-            let grid = ((rows + 7) / 8) as u32;
-            self.launch("sofuu_gemv_q4_k_q8", (grid, 1, 1), (256, 1, 1), &mut params)
+            let (name, rpw) = match rows_per_warp {
+                2 => ("sofuu_gemv_q4_k_q8_r2", 2usize),
+                _ => ("sofuu_gemv_q4_k_q8", 1usize),
+            };
+            let grid = ((rows + 8 * rpw - 1) / (8 * rpw)) as u32;
+            self.launch(name, (grid, 1, 1), (256, 1, 1), &mut params)
         }
 
         pub fn rmsnorm(
@@ -1618,6 +1626,7 @@ mod imp {
             _y: DeviceBuf,
             _rows: usize,
             _cols: usize,
+            _rows_per_warp: usize,
         ) -> Result<(), CudaError> {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }
@@ -2006,6 +2015,7 @@ mod tests {
             ("sofuu_gemv_q6_k", 6),
             ("sofuu_gemv_f32", 4),
             ("sofuu_gemv_q4_k_q8", 4),
+            ("sofuu_gemv_q4_k_q8_r2", 3),
             ("sofuu_gemm_q4_k_b8", 4),
             ("sofuu_gemm_q6_k_b8", 4),
             ("sofuu_gemm_q8_0_b8", 4),

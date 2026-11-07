@@ -541,7 +541,7 @@ impl CudaModel {
         cols: usize,
     ) -> Result<(), String> {
         if quant == Quant::Q4K {
-            e.gemv_q4_k_q8(w, self.xq, self.xd, self.xsum, y, rows, cols)
+            e.gemv_q4_k_q8(w, self.xq, self.xd, self.xsum, y, rows, cols, 2)
                 .map_err(|err| format!("gemv q4_K x q8_1: {err}"))
         } else {
             e.gemv(quant, w, x, y, rows, cols)

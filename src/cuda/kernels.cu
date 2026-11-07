@@ -391,13 +391,27 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_q4k_dot8(
 // and their own q8_1 scale and 32-value (here: 16-value) integer sum. The min
 // term no longer needs a designated lane: every lane owns whole halves, so the
 // corrections partition the row exactly once.
+static SOFUU_DEVICE SOFUU_INLINE void sofuu_q4k_x_load(
+    const signed char *xq, int b, int chunk, sofuu_u128 *xlo,
+    sofuu_u128 *xhi) {
+    const int k = chunk >> 1, h = chunk & 1;
+    const unsigned long long base =
+        (unsigned long long)b * 256 + (unsigned long long)(64 * k + 16 * h);
+    *xlo = sofuu_load_u128(xq + base);
+    *xhi = sofuu_load_u128(xq + base + 32);
+}
+
+static SOFUU_DEVICE SOFUU_INLINE void sofuu_q4k_w_load(
+    const sofuu_block_q4_K *blk, int chunk, sofuu_u128 *q) {
+    const int k = chunk >> 1, h = chunk & 1;
+    *q = sofuu_load_u128(blk->qs + 32 * k + 16 * h);
+}
+
 static SOFUU_DEVICE SOFUU_INLINE void sofuu_q4k_chunk32_load(
     const sofuu_block_q4_K *blk, const signed char *xrow, int chunk,
     sofuu_u128 *q, sofuu_u128 *xlo, sofuu_u128 *xhi) {
-    const int k = chunk >> 1, h = chunk & 1;
-    *q = sofuu_load_u128(blk->qs + 32 * k + 16 * h);
-    *xlo = sofuu_load_u128(xrow + 64 * k + 16 * h);
-    *xhi = sofuu_load_u128(xrow + 64 * k + 32 + 16 * h);
+    sofuu_q4k_w_load(blk, chunk, q);
+    sofuu_q4k_x_load(xrow, 0, chunk, xlo, xhi);
 }
 
 static SOFUU_DEVICE SOFUU_INLINE float sofuu_q4k_chunk32_compute(
@@ -681,6 +695,86 @@ void sofuu_gemv_q4_k_q8(const unsigned char *__restrict__ w,
     float total = sofuu_warp_sum(acc);
     if (lane == 0) y[row] = total;
 }
+
+// q4_K x q8_1, two consecutive rows per warp. Both rows share the same
+// quantized activation, so the two activation loads per four-block group are
+// issued once and consumed twice, and every warp streams 2 x 1152 = 2304
+// contiguous weight bytes instead of 1152. That is the lever the benches point
+// at: the f32 row-dot (8192 contiguous bytes per warp, 32-byte per-lane loads)
+// reaches 271 GB/s while one-row quantized kernels stall at 95-140 GB/s, and
+// the difference is bytes per warp per DRAM latency, not arithmetic.
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 3)
+void sofuu_gemv_q4_k_q8_r2(const unsigned char *__restrict__ w,
+                           const signed char *__restrict__ xq,
+                           const float *__restrict__ xd,
+                           const int *__restrict__ xs,
+                           float *__restrict__ y, int rows, int cols) {
+    unsigned int tid = sofuu_tid_x();
+    int warp = (int)(tid >> 5);
+    int lane = (int)(tid & 31u);
+    int row0 = ((int)sofuu_ctaid_x() * 8 + warp) * 2;
+    if (row0 >= rows) return;
+    int nb = cols / SOFUU_QK_K;
+    const int chunk = lane & 7;
+    const int bgrp = lane >> 3;
+    const int k = chunk >> 1;
+    unsigned long long row_bytes = (unsigned long long)nb * SOFUU_Q4_K_BYTES;
+    const unsigned char *ra = w + (unsigned long long)row0 * row_bytes;
+    const int has_b = (row0 + 1) < rows;
+    // Keep the second row's pointer inside the buffer even when it is absent;
+    // its result is simply not written.
+    const unsigned char *rb = has_b ? ra + row_bytes : ra;
+    float acc_a = 0.0f, acc_b = 0.0f;
+    int b = bgrp;
+    for (; b + 4 < nb; b += 8) {
+        const sofuu_block_q4_K *pa0 = (const sofuu_block_q4_K *)(
+            ra + (unsigned long long)b * SOFUU_Q4_K_BYTES);
+        const sofuu_block_q4_K *pa1 = (const sofuu_block_q4_K *)(
+            ra + (unsigned long long)(b + 4) * SOFUU_Q4_K_BYTES);
+        const sofuu_block_q4_K *pb0 = (const sofuu_block_q4_K *)(
+            rb + (unsigned long long)b * SOFUU_Q4_K_BYTES);
+        const sofuu_block_q4_K *pb1 = (const sofuu_block_q4_K *)(
+            rb + (unsigned long long)(b + 4) * SOFUU_Q4_K_BYTES);
+        sofuu_u128 la0, ha0, la1, ha1, qa0, qa1, qb0, qb1;
+        sofuu_q4k_x_load(xq, b, chunk, &la0, &ha0);
+        sofuu_q4k_x_load(xq, b + 4, chunk, &la1, &ha1);
+        sofuu_q4k_w_load(pa0, chunk, &qa0);
+        sofuu_q4k_w_load(pa1, chunk, &qa1);
+        sofuu_q4k_w_load(pb0, chunk, &qb0);
+        sofuu_q4k_w_load(pb1, chunk, &qb1);
+        int i0 = b * 8 + 2 * k, i1 = (b + 4) * 8 + 2 * k;
+        acc_a += sofuu_q4k_chunk32_compute(qa0, la0, ha0, pa0, chunk, xd[i0],
+                                           xs[i0], xd[i0 + 1], xs[i0 + 1]);
+        acc_b += sofuu_q4k_chunk32_compute(qb0, la0, ha0, pb0, chunk, xd[i0],
+                                           xs[i0], xd[i0 + 1], xs[i0 + 1]);
+        acc_a += sofuu_q4k_chunk32_compute(qa1, la1, ha1, pa1, chunk, xd[i1],
+                                           xs[i1], xd[i1 + 1], xs[i1 + 1]);
+        acc_b += sofuu_q4k_chunk32_compute(qb1, la1, ha1, pb1, chunk, xd[i1],
+                                           xs[i1], xd[i1 + 1], xs[i1 + 1]);
+    }
+    for (; b < nb; b += 4) {
+        sofuu_u128 q, l, h;
+        sofuu_q4k_x_load(xq, b, chunk, &l, &h);
+        int i0 = b * 8 + 2 * k;
+        const sofuu_block_q4_K *pa = (const sofuu_block_q4_K *)(
+            ra + (unsigned long long)b * SOFUU_Q4_K_BYTES);
+        sofuu_q4k_w_load(pa, chunk, &q);
+        acc_a += sofuu_q4k_chunk32_compute(q, l, h, pa, chunk, xd[i0], xs[i0],
+                                           xd[i0 + 1], xs[i0 + 1]);
+        const sofuu_block_q4_K *pb = (const sofuu_block_q4_K *)(
+            rb + (unsigned long long)b * SOFUU_Q4_K_BYTES);
+        sofuu_q4k_w_load(pb, chunk, &q);
+        acc_b += sofuu_q4k_chunk32_compute(q, l, h, pb, chunk, xd[i0], xs[i0],
+                                           xd[i0 + 1], xs[i0 + 1]);
+    }
+    float ta = sofuu_warp_sum(acc_a);
+    float tb = sofuu_warp_sum(acc_b);
+    if (lane == 0) {
+        y[row0] = ta;
+        if (has_b) y[row0 + 1] = tb;
+    }
+}
+
 
 // q6_K: same warp/lane mapping as q4_K; ql at the run's 64-byte base, qh at
 // n*32+l. The 210-byte block stride is not 8-byte aligned on odd blocks, so

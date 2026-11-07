@@ -28,7 +28,7 @@ While TypeScript and JavaScript serve as the ergonomic high-level orchestration 
 - **Continuous Memory Architecture (CMA v2)** — on-device encrypted vector brain in `.qtsq` containers (bundled on macOS and Linux) with cached KDF v2 and zero-KDF plaintext options
 - **Standalone Agent Compiler (`sofuu compile`)** — turn any agent into a single native executable with zero external dependencies
 - **Model Context Protocol (MCP)** — first-class client and server support (stdio, SSE, direct in-process)
-- **Kaze (風) Zero-GC Guardrails** — deterministic typed physical scripting with single-instruction fuel metering
+- **Kaze (風) Scripting Language** — deterministic typed scripting language with single-instruction fuel metering, zero-GC hot path, and capability-gated safety
 - **Unified R7 Security Policy** — deterministic firewall for tools, shell, filesystem, network, and MCP
 - **Async HTTP server & SIMD vector mathematics**
 - **In-process local LLM inference** — **[Experimental - Preview]** (built-in engine is early stage; for production use `sofuu-plugin-llamacpp` or remote providers) (GGUF, SafeTensors, PyTorch, NumPy on Metal / NEON / AVX2) and cloud streaming
@@ -47,7 +47,7 @@ To ensure absolute clarity for developer adoption (including our Hacker News lau
 | **Standalone Compiler** | 🟢 **Core** | `sofuu compile`: single-file zero-dependency native executables with 32-byte `SOFUU_BIN_V1` trailer, CRC32 verification, ad-hoc signing, sub-15ms cold start. |
 | **Continuous Memory (CMA v2)** | 🟢 **Core** | On-device `.qtsq` vector brain, cached KDF v2 master key (no 64 MB Argon2 spikes), zero-KDF plaintext mode, hardware SIMD search. |
 | **Model Context Protocol (MCP)** | 🟢 **Core** | Full JSON-RPC 2.0 client/server over stdio, SSE, and direct in-process transports; dynamic tool discovery and execution. |
-| **Kaze (風) Guardrail Engine** | 🟢 **Core** | Small typed scripting language with zero-GC hot path, capability access-control lists, and bounded arena allocation. |
+| **Kaze (風) Scripting Language** | 🟢 **Core** | Small typed scripting language with zero-GC hot path, capability access-control lists, and bounded arena allocation for AI agents, guardrails, and devices. |
 | **Unified R7 Security Firewall** | 🟢 **Core** | Fail-closed path traversal blocking, private CIDR SSRF filtering, credential shielding (`.env`, `id_rsa`), and approval escalation. |
 | **Built-in Local Inference Engine** | 🧪 **[Experimental - Preview]** | Early-stage custom GGUF/SafeTensors engine. For deployed inference workloads, use `sofuu-plugin-llamacpp` or remote LLMs. |
 | **Robotics, Drones & MAVLink** | 🧪 **[Experimental - Preview]** | `sofuu drone`, MAVLink v2 codec, and GPIO line timers. Preview hardware track decoupled from the core launch gate. |
@@ -75,7 +75,7 @@ Sofuu is built from first principles with a hard **$\le 5.5\text{ MiB}$ binary c
 - **Offline embeddings** — `ai.embed` (768-dim, zero-byte model), `ai.embedImage` (joint text/image space), SIMD `similarity`/`dot`/`l2`
 - **Speech in/out** — `ai.transcribe` / `ai.speak` via provider endpoints or on-device OS engines
 - **Long-context Q&A** — `sofuu.rlm.query` answers over contexts far larger than any model window via a sandboxed reader loop
-- **Kaze device & guardrail scripting** — `sofuu script run|check|compile|repl`: a small typed scripting language for AI agents, guardrails, and edge devices, with declared capabilities, a fuel meter and bytecode from day one. Additive to JS, never a replacement — [spec](docs/KAZE-SPEC.md)
+- **Kaze scripting language** — `sofuu script run|check|compile|repl`: a small typed scripting language for AI agents, guardrails, and edge devices, with declared capabilities, a fuel meter and bytecode from day one. Additive to JS, never a replacement — [spec](docs/KAZE-SPEC.md)
 - **Robotics, Autonomous Drones & MAVLink** — **[Experimental - Preview]** — `sofuu drone observe|status|send|mission|why|init`, `sofuu.mavlink`, and `sofuu.drone`: zero-dependency MAVLink v2 codec, deterministic R7 hardware safety gate (reject-never-clamp, geofences, fail-closed GPS dropouts), 1 Hz autonomous dead-man heartbeat, PreArm diagnostics, Linux GPIO/pulse timers, and ground rover pre-flight verification — [plan](docs/PLAN-DRONES-MAVLINK.md)
 - **Context-economy gates** — `sofuu.ml` freshness/supervisor/compaction/relevance models (~8k params each) advise the loop to cut token waste; hard off via `/ml off` or `SOFUU_NO_ML=1`
 - **MCP + HTTP + web** — `sofuu.mcp.connect/serve`, `sofuu.http.createServer`, keyless `sofuu.web.search/open`
@@ -555,7 +555,7 @@ Full guide: [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md) · specification: [do
 
 ---
 
-## Kaze (風) — Scripting Language & Guardrails
+## Kaze (風) — Scripting Language
 
 Kaze is a small typed scripting language for the work a general-purpose runtime is bad at:
 deterministic guardrails, secret leak filtering, prompt constraints, and physical robotics loops. It has zero GC pauses, bounded arena memory, and no ambient I/O — a
@@ -760,7 +760,7 @@ res.answer; res.calls; res.rounds; res.stopped; res.trace;
 sofuu.rlm.route(ctxTokens, windowTokens, question)  // → "rlm" | "plain"
 ```
 
-### `sofuu.kaze` (and `sofuu.sfs`) — Kaze scripting language & guardrails
+### `sofuu.kaze` (and `sofuu.sfs`) — Kaze scripting language
 
 Run a Kaze script from JS and read back what it did. The device families the
 script declares must be granted a backend here; `log`, `memory` and `policy`

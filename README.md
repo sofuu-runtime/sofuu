@@ -44,7 +44,7 @@ To ensure absolute clarity for developer adoption (including our Hacker News lau
 | :--- | :---: | :--- |
 | **Autonomous Agent Loop** | 🟢 **Core** | `sofuu.agent`, cooperative scheduling (`scheduler.yield()`), step budgets, resilient editing (`smart_edit`), AST syntax dry-runs, real-time QTSQ trace streaming. |
 | **Deterministic Toolpacks** | 🟢 **Core** | `sofuu.tools.PACKS` (`coding`, `web`, `memory`, `system`), single-instruction fuel sandbox (`code_eval`), numbered unified diffs. |
-| **Standalone Compiler** | 🟢 **Core** | `sofuu compile`: single-file zero-dependency native executables with 32-byte `SOFUU_BIN_V1` trailer, CRC32 verification, ad-hoc signing, sub-15ms cold start. |
+| **Standalone Compiler** | 🟢 **Core** | `sofuu compile`: single-file zero-dependency native executables with 32-byte `SOFUU_BIN_V1` trailer, CRC32 verification, ad-hoc signing, sub-15ms cold start. Smallest lean base by default (~4.5 MiB), with `--lean`, `--full`, `--micro`, and `--base <path>` profiles. |
 | **Continuous Memory (CMA v2)** | 🟢 **Core** | On-device `.qtsq` vector brain, cached KDF v2 master key (no 64 MB Argon2 spikes), zero-KDF plaintext mode, hardware SIMD search. |
 | **Model Context Protocol (MCP)** | 🟢 **Core** | Full JSON-RPC 2.0 client/server over stdio, SSE, and direct in-process transports; dynamic tool discovery and execution. |
 | **Kaze (風) Scripting Language** | 🟢 **Core** | Small typed scripting language with zero-GC hot path, capability access-control lists, and bounded arena allocation for AI agents, guardrails, and devices. |
@@ -615,7 +615,7 @@ sofuu eval "<code>"          # Evaluate a JS expression inline
 sofuu script run|check|compile|repl <file.kaze> # Kaze device scripting (--cap drone=sim --fuel 200000)
 sofuu drone observe|status|send|mission|why|init # [Experimental - Preview] Fly vehicle through R7 hardware safety gate
 sofuu bundle <entry.js> [-o <out.js>]  # Bundle into one file
-sofuu compile <entry.ts> [-o <out>]    # Standalone single-file binary (--embed-brain, --no-strip)
+sofuu compile <entry.ts> [-o <out>]    # Standalone single-file binary (--lean [default], --full, --base <path>, --embed-brain)
 sofuu install / add <package>          # npm packages
 sofuu agent init <name> | validate <f> # Scaffold and dry-run validate agent definitions
 sofuu agent list                       # List agent definitions (~/.sofuu/agents/*.js)
@@ -623,7 +623,7 @@ sofuu agent run <name> "task" [--json] # Run one agent headless
 sofuu brain verify|repair|stats|backup <path> # Segmented QTSQ cognitive memory maintenance
 sofuu session list|show|inspect <id>   # Multi-turn project session inspection & pruning
 sofuu plugin list|validate|test|init|add   # Manage and test 5-shield plugins (add llamacpp, ollama)
-sofuu mcp list|test|inspect|add|remove|init|link # Manage, test, inspect, scaffold MCP servers and link to IDEs
+sofuu mcp list|test|inspect|add|remove|init|build|link # Manage, test, inspect, scaffold, build standalone micro-servers, and link to IDEs
 sofuu logs [--last-error]    # Inspect runs and crash post-mortem cards
 sofuu logs show <run_id>     # Step-by-step trace transcript
 sofuu resume <run_id>        # Resume execution from last checkpoint

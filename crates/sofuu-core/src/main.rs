@@ -1742,6 +1742,18 @@ fn parse_compile_args(rest: &[String]) -> Result<CompileArgs, String> {
                 options.base = Some(a["--base=".len()..].to_string());
                 i += 1;
             }
+            "--profile" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| "--profile requires a profile name (micro, mcp, lean, full)".to_string())?;
+                match v.as_str() {
+                    "lean" => options.profile = sofuu_core::compiler::CompileProfile::Lean,
+                    "full" => options.profile = sofuu_core::compiler::CompileProfile::Full,
+                    "micro" | "mcp" => options.profile = sofuu_core::compiler::CompileProfile::Micro,
+                    other => return Err(format!("unknown profile '{other}' (expected 'lean', 'full', or 'micro'/'mcp')")),
+                }
+                i += 2;
+            }
             _ if a.starts_with("--profile=") => {
                 let p = &a["--profile=".len()..];
                 match p {

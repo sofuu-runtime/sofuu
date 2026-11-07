@@ -36,6 +36,11 @@ struct BlockQ6_K {
     int8_t scales[16];
     uint16_t d;
 };
+// The kernels consume the *device* layout: the same block, padded from 210 to
+// 224 bytes (14 x 16) so ql, qh and scales are 16-byte aligned and the stride
+// itself keeps that alignment. References below walk it with this stride; the
+// harnesses build fixtures in it directly.
+constexpr int Q6K_STRIDE = 224;
 #pragma pack(pop)
 
 // Exact IEEE binary16 -> float, written independently of kernels.cu.
@@ -131,7 +136,7 @@ inline Dot dot_q4_k(const uint8_t *w, const float *x, int cols) {
 // q8_1 activation quantization: one scale and one integer sum per 32 values.
 // d = amax/127, q = round(x/d) clamped to [-127, 127].
 inline void quantize_q8_1(const float *x, int8_t *q, float *d, int32_t *s,
-                          int n) {
+                          int32_t *s16, int n) {
     for (int b = 0; b < n / 32; ++b) {
         float amax = 0.0f;
         for (int i = 0; i < 32; ++i) {
@@ -140,15 +145,18 @@ inline void quantize_q8_1(const float *x, int8_t *q, float *d, int32_t *s,
         }
         float scale = amax > 0.0f ? amax / 127.0f : 0.0f;
         float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
-        int32_t sum = 0;
+        int32_t sum = 0, lo = 0;
         for (int i = 0; i < 32; ++i) {
             int qi = (int)std::lrint(x[b * 32 + i] * inv);
             qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
             q[b * 32 + i] = (int8_t)qi;
             sum += qi;
+            if (i < 16) lo += qi;
         }
         d[b] = scale;
         s[b] = sum;
+        s16[b * 2] = lo;
+        s16[b * 2 + 1] = sum - lo;
     }
 }
 
@@ -184,14 +192,15 @@ inline Dot dot_q4_k_q8(const uint8_t *w, const int8_t *xq, const float *xd,
 }
 
 inline Dot dot_q6_k(const uint8_t *w, const float *x, int cols) {
-    const BlockQ6_K *blocks = reinterpret_cast<const BlockQ6_K *>(w);
     int nb = cols / 256;
     double sum = 0.0, l1 = 0.0;
     for (int b = 0; b < nb; ++b) {
-        double d = f16_to_f32(blocks[b].d);
-        const uint8_t *ql = blocks[b].ql;
-        const uint8_t *qh = blocks[b].qh;
-        const int8_t *sc = blocks[b].scales;
+        const BlockQ6_K *blocks =
+            reinterpret_cast<const BlockQ6_K *>(w + (size_t)b * Q6K_STRIDE);
+        double d = f16_to_f32(blocks->d);
+        const uint8_t *ql = blocks->ql;
+        const uint8_t *qh = blocks->qh;
+        const int8_t *sc = blocks->scales;
         const float *xb = x + (size_t)b * 256;
         for (int n = 0; n < 2; ++n) {
             for (int l = 0; l < 32; ++l) {
@@ -213,6 +222,44 @@ inline Dot dot_q6_k(const uint8_t *w, const float *x, int cols) {
             ql += 64;
             qh += 32;
             sc += 8;
+        }
+    }
+    return {sum, l1};
+}
+
+// q6_K on q8_1 activations, in double. The six-bit values enter biased (+32),
+// so each 16-value half subtracts 32 * sum(x) before its own scale applies:
+// that is the algebra the dp4a kernel reproduces.
+inline Dot dot_q6_k_q8(const uint8_t *w, const int8_t *xq, const float *xd,
+                       int cols) {
+    int nb = cols / 256;
+    double sum = 0.0, l1 = 0.0;
+    for (int b = 0; b < nb; ++b) {
+        const BlockQ6_K *blocks =
+            reinterpret_cast<const BlockQ6_K *>(w + (size_t)b * Q6K_STRIDE);
+        double d = f16_to_f32(blocks->d);
+        const int base = b * 256;
+        for (int n = 0; n < 2; ++n) {
+            for (int r = 0; r < 4; ++r) {
+                const int off = n * 128 + r * 32;
+                for (int l = 0; l < 32; ++l) {
+                    const int half = l / 16;
+                    const int slot = n * 8 + 2 * r + half;
+                    const uint8_t qlb =
+                        blocks->ql[n * 64 + ((r & 1) ? l + 32 : l)];
+                    const uint8_t qh = blocks->qh[n * 32 + l];
+                    const int nib = (r < 2) ? (qlb & 0x0f) : (qlb >> 4);
+                    // Stored biased (+32); the kernel removes the bias as
+                    // 32 * sum(x) per 16-value half, which is the same value.
+                    const int q = (nib | (((qh >> (2 * r)) & 3) << 4)) - 32;
+                    const int gi = base + off + l;
+                    const double wv = (double)xd[gi / 32] * d *
+                                      (double)blocks->scales[slot] *
+                                      (double)q * (double)xq[gi];
+                    sum += wv;
+                    l1 += std::fabs(wv);
+                }
+            }
         }
     }
     return {sum, l1};

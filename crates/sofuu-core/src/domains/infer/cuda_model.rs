@@ -98,6 +98,7 @@ pub struct CudaModel {
     xq: DeviceBuf,
     xd: DeviceBuf,
     xsum: DeviceBuf,
+    xsum16: DeviceBuf,
 
     logits_host: Vec<f32>,
     logit_bytes: Vec<u8>,
@@ -358,9 +359,8 @@ impl CudaModel {
         // Scratch: the single-token row set plus the eight-row prefill set,
         // plus the q8_1 activation set (hidden int8 + two hidden/32 vectors).
         let single = 4 * dim + 2 * q_dim + 2 * kv_dim + 3 * cfg.hidden_dim;
-        let q8_scratch =
-            cfg.hidden_dim.max(dim).max(cfg.n_heads * cfg.head_dim) / 4
-                + cfg.hidden_dim.max(dim).max(cfg.n_heads * cfg.head_dim) / 16;
+        let q8_vals = cfg.hidden_dim.max(dim).max(cfg.n_heads * cfg.head_dim);
+        let q8_scratch = q8_vals / 4 + q8_vals / 16 + q8_vals / 16;
         let scratch = single + cfg.vocab_size + cfg.head_dim + q8_scratch
             + PREFILL_BATCH * (single + cfg.head_dim);
         let need = weight_bytes
@@ -411,6 +411,7 @@ impl CudaModel {
             .map_err(|e| format!("q8 activations: allocate {q8_values} B: {e}"))?;
         let xd = alloc_f32!(q8_blocks, "q8 scales");
         let xsum = alloc_f32!(q8_blocks, "q8 sums");
+        let xsum16 = alloc_f32!(q8_blocks * 2, "q8 half sums");
 
         let xb = alloc_f32!(PREFILL_BATCH * dim, "x_batch");
         let x_norm_b = alloc_f32!(PREFILL_BATCH * dim, "x_norm_batch");
@@ -523,7 +524,7 @@ impl CudaModel {
         if !n.is_multiple_of(32) {
             return Ok(());
         }
-        e.quantize_q8_1(src, self.xq, self.xd, self.xsum, n)
+        e.quantize_q8_1(src, self.xq, self.xd, self.xsum, self.xsum16, n)
             .map_err(|err| format!("quantize q8_1 ({n} values): {err}"))
     }
 
@@ -541,8 +542,11 @@ impl CudaModel {
         cols: usize,
     ) -> Result<(), String> {
         if quant == Quant::Q4K {
-            e.gemv_q4_k_q8(w, self.xq, self.xd, self.xsum, y, rows, cols, 2)
+            e.gemv_q4_k_q8(w, self.xq, self.xd, self.xsum, y, rows, cols)
                 .map_err(|err| format!("gemv q4_K x q8_1: {err}"))
+        } else if quant == Quant::Q6K {
+            e.gemv_q6_k_q8(w, self.xq, self.xd, self.xsum, self.xsum16, y, rows, cols)
+                .map_err(|err| format!("gemv q6_K x q8_1: {err}"))
         } else {
             e.gemv(quant, w, x, y, rows, cols)
                 .map_err(|err| format!("gemv: {err}"))
@@ -778,7 +782,7 @@ impl CudaModel {
         if compute_logits {
             e.rmsnorm(self.x, self.output_norm, self.x_norm, self.dim, self.eps)
                 .map_err(|err| format!("output_norm: {err}"))?;
-            if self.output_quant == Quant::Q4K {
+            if matches!(self.output_quant, Quant::Q4K | Quant::Q6K) {
                 self.quantize_act(e, self.x_norm, self.dim)
                     .map_err(|err| format!("lm_head: {err}"))?;
             }
@@ -1193,12 +1197,25 @@ fn upload_weight(
         ));
     }
     let data = raw_tensor(gguf, tv, what)?;
+    let device_bytes = q
+        .device_row_bytes(cols)
+        .and_then(|b| b.checked_mul(rows))
+        .ok_or_else(|| format!("{what}: {rows} rows x {cols} cols overflows"))?;
     let buf = engine
-        .alloc(want)
-        .map_err(|e| format!("{what}: allocate {want} B: {e}"))?;
-    engine
-        .upload(buf, data)
-        .map_err(|e| format!("{what}: upload {want} B: {e}"))?;
+        .alloc(device_bytes)
+        .map_err(|e| format!("{what}: allocate {device_bytes} B: {e}"))?;
+    if q == Quant::Q6K {
+        // Padded 224-byte blocks (16-byte aligned ql/qh/scales); the on-disk
+        // blocks are copied verbatim into every wider slot.
+        let packed = crate::domains::infer::cuda::repack_q6_k_device(data, rows, cols);
+        engine
+            .upload(buf, &packed)
+            .map_err(|e| format!("{what}: upload {device_bytes} B: {e}"))?;
+    } else {
+        engine
+            .upload(buf, data)
+            .map_err(|e| format!("{what}: upload {device_bytes} B: {e}"))?;
+    }
     Ok(buf)
 }
 

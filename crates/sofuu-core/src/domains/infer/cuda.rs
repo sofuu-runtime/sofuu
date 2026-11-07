@@ -28,7 +28,7 @@ pub const PTX_ENTRIES: [&str; 21] = [
     "sofuu_gemv_f32",
     "sofuu_quantize_q8_1",
     "sofuu_gemv_q4_k_q8",
-    "sofuu_gemv_q4_k_q8_r2",
+    "sofuu_gemv_q6_k_q8",
     "sofuu_rmsnorm",
     "sofuu_swiglu",
     "sofuu_rope_f32",
@@ -47,6 +47,25 @@ pub const PTX_ENTRIES: [&str; 21] = [
 
 /// Weight layouts the C1 kernels cover. `block_bytes` is the GGML on-disk
 /// block size; `qk` is the number of values per block.
+/// Device stride for q6_K: the GGML block is 210 bytes, padded to 224 so the
+/// ql/qh/scales runs are 16-byte aligned inside every block (see
+/// src/cuda/kernels.cu: SOFUU_Q6_K_BYTES).
+pub const Q6K_DEVICE_BYTES: usize = 224;
+
+/// Copy `rows * nb` q6_K blocks from the 210-byte on-disk stride into the padded
+/// device stride. The block's own field order is unchanged, so this is a
+/// per-block copy into a wider slot; the pad bytes stay zero.
+pub fn repack_q6_k_device(src: &[u8], rows: usize, cols: usize) -> Vec<u8> {
+    let nb = cols / 256;
+    let mut out = vec![0u8; rows * nb * Q6K_DEVICE_BYTES];
+    for i in 0..rows * nb {
+        let from = i * 210;
+        let to = i * Q6K_DEVICE_BYTES;
+        out[to..to + 210].copy_from_slice(&src[from..from + 210]);
+    }
+    out
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quant {
     F32,
@@ -106,6 +125,19 @@ impl Quant {
             return None;
         }
         Some((cols / self.qk()) * self.block_bytes())
+    }
+
+    /// Bytes per row in *device* memory. q6_K is uploaded with every 210-byte
+    /// block padded to 224 so ql, qh and the scales are 16-byte aligned and the
+    /// stride keeps that alignment; every other layout is uploaded verbatim.
+    pub fn device_row_bytes(self, cols: usize) -> Option<usize> {
+        if self == Quant::Q6K {
+            if !self.accepts_cols(cols) {
+                return None;
+            }
+            return Some((cols / 256) * Q6K_DEVICE_BYTES);
+        }
+        self.row_bytes(cols)
     }
 }
 
@@ -277,7 +309,7 @@ pub fn validate_gemm_b8(
             "gemm_b8 n_tokens {n_tokens} is outside 1..=8 (one warp per token,row)"
         )));
     }
-    let Some(row_bytes) = quant.row_bytes(cols) else {
+    let Some(row_bytes) = quant.device_row_bytes(cols) else {
         return Err(CudaError(format!(
             "{} does not accept cols={cols}",
             quant.batch_entry()
@@ -888,7 +920,7 @@ mod imp {
             rows: usize,
             cols: usize,
         ) -> Result<(), CudaError> {
-            let Some(row_bytes) = quant.row_bytes(cols) else {
+            let Some(row_bytes) = quant.device_row_bytes(cols) else {
                 return Err(CudaError(format!(
                     "{} does not accept cols={cols}",
                     quant.entry()
@@ -931,6 +963,7 @@ mod imp {
             q: DeviceBuf,
             d: DeviceBuf,
             s: DeviceBuf,
+            s16: DeviceBuf,
             n: usize,
         ) -> Result<(), CudaError> {
             if n == 0 || !n.is_multiple_of(32) {
@@ -945,22 +978,32 @@ mod imp {
             let need_s = blocks
                 .checked_mul(std::mem::size_of::<f32>())
                 .ok_or_else(|| CudaError("quantize_q8_1 scale size overflow".into()))?;
-            if x.bytes < need_x || q.bytes < n || d.bytes < need_s || s.bytes < need_s {
+            let need_s16 = blocks
+                .checked_mul(2 * std::mem::size_of::<i32>())
+                .ok_or_else(|| CudaError("quantize_q8_1 half-sum size overflow".into()))?;
+            if x.bytes < need_x
+                || q.bytes < n
+                || d.bytes < need_s
+                || s.bytes < need_s
+                || s16.bytes < need_s16
+            {
                 return Err(CudaError(format!(
-                    "quantize_q8_1 buffers too small: x {}<{need_x}, q {}<{n}, d {}<{need_s}, s {}<{need_s}",
-                    x.bytes, q.bytes, d.bytes, s.bytes
+                    "quantize_q8_1 buffers too small: x {}<{need_x}, q {}<{n}, d {}<{need_s}, s {}<{need_s}, s16 {}<{need_s16}",
+                    x.bytes, q.bytes, d.bytes, s.bytes, s16.bytes
                 )));
             }
             let mut xp = x.ptr;
             let mut qp = q.ptr;
             let mut dp = d.ptr;
             let mut sp = s.ptr;
+            let mut s16p = s16.ptr;
             let mut nn = n as i32;
-            let mut params: [*mut c_void; 5] = [
+            let mut params: [*mut c_void; 6] = [
                 &mut xp as *mut u64 as *mut c_void,
                 &mut qp as *mut u64 as *mut c_void,
                 &mut dp as *mut u64 as *mut c_void,
                 &mut sp as *mut u64 as *mut c_void,
+                &mut s16p as *mut u64 as *mut c_void,
                 &mut nn as *mut i32 as *mut c_void,
             ];
             let grid = ((blocks + 7) / 8) as u32;
@@ -968,8 +1011,6 @@ mod imp {
         }
 
         /// q4_K weights against q8_1 activations: y[r] = dot(w[r], xd*xq).
-        /// `rows_per_warp` 2 selects the row-paired variant, which streams two
-        /// contiguous rows per warp and reads the activation once for both.
         pub fn gemv_q4_k_q8(
             &self,
             weights: DeviceBuf,
@@ -979,7 +1020,6 @@ mod imp {
             y: DeviceBuf,
             rows: usize,
             cols: usize,
-            rows_per_warp: usize,
         ) -> Result<(), CudaError> {
             let Some(row_bytes) = Quant::Q4K.row_bytes(cols) else {
                 return Err(CudaError(format!("q4_K does not accept cols={cols}")));
@@ -1021,12 +1061,72 @@ mod imp {
                 &mut r as *mut i32 as *mut c_void,
                 &mut c as *mut i32 as *mut c_void,
             ];
-            let (name, rpw) = match rows_per_warp {
-                2 => ("sofuu_gemv_q4_k_q8_r2", 2usize),
-                _ => ("sofuu_gemv_q4_k_q8", 1usize),
+            let grid = ((rows + 7) / 8) as u32;
+            self.launch("sofuu_gemv_q4_k_q8", (grid, 1, 1), (256, 1, 1), &mut params)
+        }
+
+        /// q6_K weights against q8_1 activations: y[r] = dot(w[r], xd*xq).
+        /// `xs16` holds the per-16-value activation sums the 6-bit bias
+        /// correction needs (two per 32-value block).
+        pub fn gemv_q6_k_q8(
+            &self,
+            weights: DeviceBuf,
+            xq: DeviceBuf,
+            xd: DeviceBuf,
+            xs: DeviceBuf,
+            xs16: DeviceBuf,
+            y: DeviceBuf,
+            rows: usize,
+            cols: usize,
+        ) -> Result<(), CudaError> {
+            let Some(row_bytes) = Quant::Q6K.device_row_bytes(cols) else {
+                return Err(CudaError(format!("q6_K does not accept cols={cols}")));
             };
-            let grid = ((rows + 8 * rpw - 1) / (8 * rpw)) as u32;
-            self.launch(name, (grid, 1, 1), (256, 1, 1), &mut params)
+            let need_w = row_bytes
+                .checked_mul(rows)
+                .ok_or_else(|| CudaError("gemv_q6_k_q8 weight size overflow".into()))?;
+            let blocks = cols / 32;
+            let need_s = blocks
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| CudaError("gemv_q6_k_q8 scale size overflow".into()))?;
+            let need_s16 = blocks
+                .checked_mul(2 * std::mem::size_of::<i32>())
+                .ok_or_else(|| CudaError("gemv_q6_k_q8 half-sum size overflow".into()))?;
+            let need_y = rows
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| CudaError("gemv_q6_k_q8 y size overflow".into()))?;
+            if weights.bytes < need_w
+                || xq.bytes < cols
+                || xd.bytes < need_s
+                || xs.bytes < need_s
+                || xs16.bytes < need_s16
+                || y.bytes < need_y
+            {
+                return Err(CudaError(format!(
+                    "gemv_q6_k_q8 buffers too small: w {}<{need_w}, xq {}<{cols}, xd {}<{need_s}, xs {}<{need_s}, xs16 {}<{need_s16}, y {}<{need_y}",
+                    weights.bytes, xq.bytes, xd.bytes, xs.bytes, xs16.bytes, y.bytes
+                )));
+            }
+            let mut wp = weights.ptr;
+            let mut xqp = xq.ptr;
+            let mut xdp = xd.ptr;
+            let mut xsp = xs.ptr;
+            let mut s16p = xs16.ptr;
+            let mut yp = y.ptr;
+            let mut r = rows as i32;
+            let mut c = cols as i32;
+            let mut params: [*mut c_void; 8] = [
+                &mut wp as *mut u64 as *mut c_void,
+                &mut xqp as *mut u64 as *mut c_void,
+                &mut xdp as *mut u64 as *mut c_void,
+                &mut xsp as *mut u64 as *mut c_void,
+                &mut s16p as *mut u64 as *mut c_void,
+                &mut yp as *mut u64 as *mut c_void,
+                &mut r as *mut i32 as *mut c_void,
+                &mut c as *mut i32 as *mut c_void,
+            ];
+            let grid = ((rows + 7) / 8) as u32;
+            self.launch("sofuu_gemv_q6_k_q8", (grid, 1, 1), (256, 1, 1), &mut params)
         }
 
         pub fn rmsnorm(
@@ -1595,6 +1695,20 @@ mod imp {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }
 
+        pub fn gemv_q6_k_q8(
+            &self,
+            _weights: DeviceBuf,
+            _xq: DeviceBuf,
+            _xd: DeviceBuf,
+            _xs: DeviceBuf,
+            _xs16: DeviceBuf,
+            _y: DeviceBuf,
+            _rows: usize,
+            _cols: usize,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
         pub fn rmsnorm(
             &self,
             _x: DeviceBuf,
@@ -1612,6 +1726,7 @@ mod imp {
             _q: DeviceBuf,
             _d: DeviceBuf,
             _s: DeviceBuf,
+            _s16: DeviceBuf,
             _n: usize,
         ) -> Result<(), CudaError> {
             Err(CudaError("CUDA backend is Linux-only".into()))
@@ -1626,7 +1741,6 @@ mod imp {
             _y: DeviceBuf,
             _rows: usize,
             _cols: usize,
-            _rows_per_warp: usize,
         ) -> Result<(), CudaError> {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }
@@ -2015,7 +2129,6 @@ mod tests {
             ("sofuu_gemv_q6_k", 6),
             ("sofuu_gemv_f32", 4),
             ("sofuu_gemv_q4_k_q8", 4),
-            ("sofuu_gemv_q4_k_q8_r2", 3),
             ("sofuu_gemm_q4_k_b8", 4),
             ("sofuu_gemm_q6_k_b8", 4),
             ("sofuu_gemm_q8_0_b8", 4),

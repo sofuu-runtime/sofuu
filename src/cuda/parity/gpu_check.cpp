@@ -139,11 +139,13 @@ void fill_q4_k(std::vector<uint8_t> &w, int rows, int cols, uint32_t &seed) {
 
 void fill_q6_k(std::vector<uint8_t> &w, int rows, int cols, uint32_t &seed) {
     int nb = cols / 256;
-    w.assign((size_t)rows * (size_t)nb * 210, 0);
+    // Device layout: 224-byte blocks, so ql/qh/scales are 16-byte aligned.
+    w.assign((size_t)rows * (size_t)nb * sofuu_ref::Q6K_STRIDE, 0);
     for (int r = 0; r < rows; ++r)
         for (int b = 0; b < nb; ++b) {
             sofuu_ref::BlockQ6_K *blk = reinterpret_cast<sofuu_ref::BlockQ6_K *>(
-                w.data() + ((size_t)r * (size_t)nb + (size_t)b) * 210);
+                w.data() + ((size_t)r * (size_t)nb + (size_t)b) *
+                               sofuu_ref::Q6K_STRIDE);
             blk->d = sofuu_ref::F16_0625;
             fill_bytes(blk->ql, 128, seed);
             fill_bytes(blk->qh, 64, seed);
@@ -250,7 +252,8 @@ void test_gemv_q6_k(void *fn, uint32_t &seed, int cols) {
               download(dy, got.data(), (size_t)rows * sizeof(float));
     double max_err = 0.0, bound = 0.0;
     for (int r = 0; r < rows; ++r) {
-        const uint8_t *row = w.data() + (size_t)r * (cols / 256) * 210;
+        const uint8_t *row =
+            w.data() + (size_t)r * (cols / 256) * sofuu_ref::Q6K_STRIDE;
         sofuu_ref::Dot want_d = sofuu_ref::dot_q6_k(row, x.data(), cols);
         want[(size_t)r] = (float)want_d.value;
         double e = std::fabs((double)got[(size_t)r] - want_d.value);
@@ -265,29 +268,30 @@ void test_gemv_q6_k(void *fn, uint32_t &seed, int cols) {
     sofuu_cuda_ctx_free(g_ctx, dy);
 }
 
-// q4_K against q8_1 activations. Three things are checked:
+// q4_K / q6_K against q8_1 activations. Three things are checked:
 //   1. the quantize kernel reproduces the host quantizer byte-for-byte
-//      (q, scale, integer sum),
+//      (q, per-32 scale, per-32 sum, per-16 sums),
 //   2. the dp4a dot matches the exact dot on those same quantized values,
 //   3. the quantized dot stays inside the full-precision tolerance.
-void test_gemv_q4_k_q8(void *fn_quant, void *fn_gemv, const char *label,
-                       int rows, int rows_per_warp, uint32_t &seed) {
-    const int cols = 2048;
+void test_gemv_q4_k_q8(void *fn_quant, void *fn_gemv, uint32_t &seed) {
+    const int rows = 8, cols = 2048;
     const int nblk = cols / 32;
     std::vector<uint8_t> w;
     fill_q4_k(w, rows, cols, seed);
     std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
     std::vector<int8_t> xq(cols);
     std::vector<float> xd(nblk);
-    std::vector<int32_t> xs(nblk);
-    sofuu_ref::quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(), cols);
+    std::vector<int32_t> xs(nblk), xs16(nblk * 2);
+    sofuu_ref::quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(),
+                             xs16.data(), cols);
 
-    unsigned long long dw = 0, dx = 0, dq = 0, dd = 0, ds = 0, dy = 0;
+    unsigned long long dw = 0, dx = 0, dq = 0, dd = 0, ds = 0, d16 = 0, dy = 0;
     if (!alloc_upload(w.data(), w.size(), &dw) ||
         !alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
         !alloc_only((unsigned long long)cols, &dq) ||
         !alloc_only((unsigned long long)nblk * 4, &dd) ||
         !alloc_only((unsigned long long)nblk * 4, &ds) ||
+        !alloc_only((unsigned long long)nblk * 8, &d16) ||
         !alloc_only((unsigned long long)rows * sizeof(float), &dy)) {
         fail_msg("alloc");
         ++g_failures;
@@ -295,23 +299,27 @@ void test_gemv_q4_k_q8(void *fn_quant, void *fn_gemv, const char *label,
     }
     {
         int n = cols;
-        std::vector<void *> params = {&dx, &dq, &dd, &ds, (void *)&n};
+        std::vector<void *> params = {&dx, &dq, &dd, &ds, &d16, (void *)&n};
         if (!launch(fn_quant, (unsigned)((nblk + 7) / 8), 256, params)) return;
     }
     std::vector<int8_t> q_dev(cols);
     std::vector<float> d_dev(nblk);
-    std::vector<int32_t> s_dev(nblk);
+    std::vector<int32_t> s_dev(nblk), s16_dev(nblk * 2);
     if (!download(dq, q_dev.data(), cols) ||
         !download(dd, d_dev.data(), (size_t)nblk * 4) ||
-        !download(ds, s_dev.data(), (size_t)nblk * 4)) {
+        !download(ds, s_dev.data(), (size_t)nblk * 4) ||
+        !download(d16, s16_dev.data(), (size_t)nblk * 8)) {
         return;
     }
-    int q_bad = 0, d_bad = 0, s_bad = 0;
+    int q_bad = 0, d_bad = 0, s_bad = 0, s16_bad = 0;
     for (int i = 0; i < cols; ++i)
         if (q_dev[(size_t)i] != xq[(size_t)i]) ++q_bad;
     for (int b = 0; b < nblk; ++b) {
         if (d_dev[(size_t)b] != xd[(size_t)b]) ++d_bad;
         if (s_dev[(size_t)b] != xs[(size_t)b]) ++s_bad;
+        for (int h = 0; h < 2; ++h)
+            if (s16_dev[(size_t)(b * 2 + h)] != xs16[(size_t)(b * 2 + h)])
+                ++s16_bad;
     }
 
     std::vector<float> got((size_t)rows, 0.0f);
@@ -319,9 +327,7 @@ void test_gemv_q4_k_q8(void *fn_quant, void *fn_gemv, const char *label,
         int r = rows, c = cols;
         std::vector<void *> params = {&dw, &dq, &dd, &ds, &dy, (void *)&r,
                                       (void *)&c};
-        unsigned grid = (unsigned)((rows + 8 * rows_per_warp - 1) /
-                                   (8 * rows_per_warp));
-        if (!launch(fn_gemv, grid, 256, params) ||
+        if (!launch(fn_gemv, (unsigned)((rows + 7) / 8), 256, params) ||
             !download(dy, got.data(), (size_t)rows * sizeof(float))) {
             return;
         }
@@ -336,17 +342,78 @@ void test_gemv_q4_k_q8(void *fn_quant, void *fn_gemv, const char *label,
         if (e > worst) { worst = e; worst_ref = want.value; }
         if (b > bound) bound = b;
     }
-    bool ok = q_bad == 0 && d_bad == 0 && s_bad == 0 && worst <= bound;
-    report(label, ok, worst, bound, worst_ref);
-    if (q_bad || d_bad || s_bad) {
-        std::printf("      quantize mismatch: q=%d d=%d sum=%d\n", q_bad, d_bad,
-                    s_bad);
+    bool ok = q_bad == 0 && d_bad == 0 && s_bad == 0 && s16_bad == 0 &&
+              worst <= bound;
+    report("gemv_q4_k_x_q8", ok, worst, bound, worst_ref);
+    if (q_bad || d_bad || s_bad || s16_bad) {
+        std::printf("      quantize mismatch: q=%d d=%d sum=%d sum16=%d\n",
+                    q_bad, d_bad, s_bad, s16_bad);
     }
     sofuu_cuda_ctx_free(g_ctx, dw);
     sofuu_cuda_ctx_free(g_ctx, dx);
     sofuu_cuda_ctx_free(g_ctx, dq);
     sofuu_cuda_ctx_free(g_ctx, dd);
     sofuu_cuda_ctx_free(g_ctx, ds);
+    sofuu_cuda_ctx_free(g_ctx, d16);
+    sofuu_cuda_ctx_free(g_ctx, dy);
+}
+
+void test_gemv_q6_k_q8(void *fn_quant, void *fn_gemv, uint32_t &seed) {
+    const int rows = 8, cols = 2048;
+    const int nblk = cols / 32;
+    std::vector<uint8_t> w;
+    fill_q6_k(w, rows, cols, seed);
+    std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
+    std::vector<int8_t> xq(cols);
+    std::vector<float> xd(nblk);
+    std::vector<int32_t> xs(nblk), xs16(nblk * 2);
+    sofuu_ref::quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(),
+                             xs16.data(), cols);
+    unsigned long long dw = 0, dx = 0, dq = 0, dd = 0, ds = 0, d16 = 0, dy = 0;
+    if (!alloc_upload(w.data(), w.size(), &dw) ||
+        !alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
+        !alloc_only((unsigned long long)cols, &dq) ||
+        !alloc_only((unsigned long long)nblk * 4, &dd) ||
+        !alloc_only((unsigned long long)nblk * 4, &ds) ||
+        !alloc_only((unsigned long long)nblk * 8, &d16) ||
+        !alloc_only((unsigned long long)rows * sizeof(float), &dy)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    {
+        int n = cols;
+        std::vector<void *> params = {&dx, &dq, &dd, &ds, &d16, (void *)&n};
+        if (!launch(fn_quant, (unsigned)((nblk + 7) / 8), 256, params)) return;
+    }
+    std::vector<float> got((size_t)rows, 0.0f);
+    {
+        int r = rows, c = cols;
+        std::vector<void *> params = {&dw, &dq, &dd, &ds, &d16, &dy, (void *)&r,
+                                      (void *)&c};
+        if (!launch(fn_gemv, (unsigned)((rows + 7) / 8), 256, params) ||
+            !download(dy, got.data(), (size_t)rows * sizeof(float))) {
+            return;
+        }
+    }
+    double worst = 0.0, bound = 0.0, worst_ref = 0.0;
+    for (int r = 0; r < rows; ++r) {
+        const uint8_t *row =
+            w.data() + (size_t)r * (cols / 256) * sofuu_ref::Q6K_STRIDE;
+        sofuu_ref::Dot want =
+            sofuu_ref::dot_q6_k_q8(row, xq.data(), xd.data(), cols);
+        double e = std::fabs((double)got[(size_t)r] - want.value);
+        double b = 1e-5 * (want.l1 > 1.0 ? want.l1 : 1.0) + 1e-6;
+        if (e > worst) { worst = e; worst_ref = want.value; }
+        if (b > bound) bound = b;
+    }
+    report("gemv_q6_k_x_q8", worst <= bound, worst, bound, worst_ref);
+    sofuu_cuda_ctx_free(g_ctx, dw);
+    sofuu_cuda_ctx_free(g_ctx, dx);
+    sofuu_cuda_ctx_free(g_ctx, dq);
+    sofuu_cuda_ctx_free(g_ctx, dd);
+    sofuu_cuda_ctx_free(g_ctx, ds);
+    sofuu_cuda_ctx_free(g_ctx, d16);
     sofuu_cuda_ctx_free(g_ctx, dy);
 }
 
@@ -436,7 +503,7 @@ void test_gemm_b8(void *fn, uint32_t &seed, int kind, int cols) {
             const uint8_t *roww = wdata + (size_t)row *
                                              (size_t)(kind == 0 ? (cols / 32) * 34
                                                     : kind == 1 ? (cols / 256) * 144
-                                                    : kind == 2 ? (cols / 256) * 210
+                                                    : kind == 2 ? (cols / 256) * sofuu_ref::Q6K_STRIDE
                                                                 : (size_t)cols * 4);
             sofuu_ref::Dot want;
             if (kind == 0) want = sofuu_ref::dot_q8_0(roww, xrow, cols);
@@ -606,7 +673,7 @@ void bench_gemv(const char *name, void *fn, int kind, int rows, int cols,
     double sec = std::chrono::duration<double>(t1 - t0).count();
     double row_bytes = kind == 0 ? (double)(cols / 32) * 34
                        : kind == 1 ? (double)(cols / 256) * 144
-                       : kind == 2 ? (double)(cols / 256) * 210
+                       : kind == 2 ? (double)(cols / 256) * sofuu_ref::Q6K_STRIDE
                                    : (double)cols * 4;
     double bytes = (double)rows * row_bytes * (double)iters;
     std::printf("[bench] %-10s %dx%d  %.1f GB/s  %.3f ms/launch\n", name, rows,
@@ -616,34 +683,36 @@ void bench_gemv(const char *name, void *fn, int kind, int rows, int cols,
     sofuu_cuda_ctx_free(g_ctx, dy);
 }
 
-// q4_K GEMV against q8_1 activations, timed with the weights already
-// quantized. Without this row the dp4a kernels are only measurable end to end,
-// which is how the first version hid a 3x gap to the f32 row-dot.
-void bench_gemv_q8(const char *name, void *fn, int rows, int cols,
-                   int rows_per_warp, int iters, uint32_t &seed) {
+// q4_K / q6_K GEMV against q8_1 activations, timed with the weights already
+// quantized. Without these rows the dp4a kernels are only measurable end to
+// end, which is how the first version hid a 3x gap to the f32 row-dot.
+void bench_gemv_q8(const char *name, void *fn, int kind, int rows, int cols,
+                   int iters, uint32_t &seed) {
     std::vector<uint8_t> w;
-    fill_q4_k(w, rows, cols, seed);
+    if (kind == 1) fill_q4_k(w, rows, cols, seed);
+    else fill_q6_k(w, rows, cols, seed);
     const int nblk = cols / 32;
     std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
     std::vector<int8_t> xq(cols);
     std::vector<float> xd(nblk);
-    std::vector<int32_t> xs(nblk);
-    sofuu_ref::quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(), cols);
+    std::vector<int32_t> xs(nblk), xs16(nblk * 2);
+    sofuu_ref::quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(),
+                             xs16.data(), cols);
     std::vector<float> y((size_t)rows, 0.0f);
-    unsigned long long dw = 0, dq = 0, dd = 0, ds = 0, dy = 0;
+    unsigned long long dw = 0, dq = 0, dd = 0, ds = 0, d16 = 0, dy = 0;
     if (!alloc_upload(w.data(), w.size(), &dw) ||
         !alloc_upload(xq.data(), xq.size(), &dq) ||
         !alloc_upload(xd.data(), (size_t)nblk * 4, &dd) ||
         !alloc_upload(xs.data(), (size_t)nblk * 4, &ds) ||
+        !alloc_upload(xs16.data(), (size_t)nblk * 8, &d16) ||
         !alloc_only((unsigned long long)rows * sizeof(float), &dy)) {
         fail_msg("alloc");
         ++g_failures;
         return;
     }
-    std::vector<void *> params = {&dw, &dq, &dd, &ds, &dy, (void *)&rows,
+    std::vector<void *> params = {&dw, &dq, &dd, &ds, &d16, &dy, (void *)&rows,
                                   (void *)&cols};
-    unsigned grid = (unsigned)((rows + 8 * rows_per_warp - 1) /
-                               (8 * rows_per_warp));
+    unsigned grid = (unsigned)((rows + 7) / 8);
     for (int i = 0; i < 3; ++i)
         if (!launch_async(fn, grid, 256, params)) return;
     if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
@@ -659,13 +728,56 @@ void bench_gemv_q8(const char *name, void *fn, int rows, int cols,
     }
     auto t1 = std::chrono::steady_clock::now();
     double sec = std::chrono::duration<double>(t1 - t0).count();
-    double bytes = (double)rows * (double)(cols / 256) * 144.0 * (double)iters;
+    double row_bytes = kind == 1 ? (double)(cols / 256) * 144.0
+                                 : (double)(cols / 256) * sofuu_ref::Q6K_STRIDE;
+    double bytes = (double)rows * row_bytes * (double)iters;
     std::printf("[bench] %-10s %dx%d  %.1f GB/s  %.3f ms/launch\n", name, rows,
                 cols, bytes / sec / 1e9, sec * 1000.0 / (double)iters);
     sofuu_cuda_ctx_free(g_ctx, dw);
     sofuu_cuda_ctx_free(g_ctx, dq);
     sofuu_cuda_ctx_free(g_ctx, dd);
     sofuu_cuda_ctx_free(g_ctx, ds);
+    sofuu_cuda_ctx_free(g_ctx, d16);
+    sofuu_cuda_ctx_free(g_ctx, dy);
+}
+
+// Empty-launch cost on the GPU timeline. A decode step issues ~290 kernels, so
+// any fixed per-launch gap is multiplied by 290: this row decides whether the
+// next step is more kernel work or CUDA graphs.
+void bench_launch(void *fn, int n, int iters, const char *label) {
+    uint32_t seed = 0x51ed1u;
+    std::vector<float> x = random_vec(n, seed, -1.0f, 1.0f);
+    std::vector<float> w(n, 1.0f);
+    unsigned long long dx = 0, dw = 0, dy = 0;
+    if (!alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
+        !alloc_upload(w.data(), w.size() * sizeof(float), &dw) ||
+        !alloc_only((unsigned long long)n * sizeof(float), &dy)) {
+        fail_msg("launch bench alloc");
+        ++g_failures;
+        return;
+    }
+    int nn = n;
+    float eps = 1e-5f;
+    std::vector<void *> params = {&dx, &dw, &dy, &nn, &eps};
+    unsigned grid = (unsigned)((n + 255) / 256);
+    if (!launch_async(fn, grid, 256, params) || sofuu_cuda_ctx_sync(g_ctx) != 0) {
+        fail_msg("launch bench warmup");
+        return;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i)
+        if (!launch_async(fn, grid, 256, params)) return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
+        fail_msg("launch bench sync");
+        return;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double us =
+        std::chrono::duration<double>(t1 - t0).count() * 1e6 / (double)iters;
+    std::printf("[bench] launch_%s  n=%d grid=%u  %.2f us/launch\n", label, n,
+                grid, us);
+    sofuu_cuda_ctx_free(g_ctx, dx);
+    sofuu_cuda_ctx_free(g_ctx, dw);
     sofuu_cuda_ctx_free(g_ctx, dy);
 }
 
@@ -960,7 +1072,7 @@ int main(int argc, char **argv) {
     }
 
     void *f_q8 = nullptr, *f_q4 = nullptr, *f_q6 = nullptr, *f_f32 = nullptr;
-    void *f_quant = nullptr, *f_q4q8 = nullptr, *f_q4q8r2 = nullptr;
+    void *f_quant = nullptr, *f_q4q8 = nullptr, *f_q6q8 = nullptr;
     void *f_rms = nullptr, *f_swi = nullptr, *f_rope = nullptr, *f_kv = nullptr;
     void *f_attn = nullptr, *f_add = nullptr;
     void *f_b8_q4 = nullptr, *f_b8_q6 = nullptr, *f_b8_q8 = nullptr;
@@ -971,7 +1083,7 @@ int main(int argc, char **argv) {
         !get_function("sofuu_gemv_f32", &f_f32) ||
         !get_function("sofuu_quantize_q8_1", &f_quant) ||
         !get_function("sofuu_gemv_q4_k_q8", &f_q4q8) ||
-        !get_function("sofuu_gemv_q4_k_q8_r2", &f_q4q8r2) ||
+        !get_function("sofuu_gemv_q6_k_q8", &f_q6q8) ||
         !get_function("sofuu_rmsnorm", &f_rms) ||
         !get_function("sofuu_swiglu", &f_swi) ||
         !get_function("sofuu_rope_f32", &f_rope) ||
@@ -993,13 +1105,12 @@ int main(int argc, char **argv) {
         test_gemv_q4_k(f_q4, seed, cols);
         test_gemv_q6_k(f_q6, seed, cols);
     }
-    test_gemv_q4_k_q8(f_quant, f_q4q8, "gemv_q4_k_x_q8", 8, 1, seed);
-    test_gemv_q4_k_q8(f_quant, f_q4q8r2, "gemv_q4_k_x_q8_r2", 16, 2, seed);
-    // 9 rows: the last warp owns rows 8 and 9, so the paired kernel's
-    // "second row is past the end" path is exercised, not just compiled.
-    test_gemv_q4_k_q8(f_quant, f_q4q8r2, "gemv_q4_k_x_q8_r2_tail", 9, 2, seed);
+    test_gemv_q4_k_q8(f_quant, f_q4q8, seed);
+    test_gemv_q6_k_q8(f_quant, f_q6q8, seed);
     test_gemv_f32(f_f32, seed);
     test_rmsnorm(f_rms, seed);
+    bench_launch(f_rms, 2048, 4000, "tiny");
+    bench_launch(f_rms, 1 << 20, 2000, "big");
     test_swiglu(f_swi, seed);
     test_rope(f_rope, seed);
     test_kv_write(f_kv, seed);
@@ -1029,10 +1140,10 @@ int main(int argc, char **argv) {
     bench_gemv("qo_q6_k", f_q6, 2, 2048, 2048, 600, seed);
     bench_gemv("lm_head_q4_k", f_q4, 1, 128256, 2048, 60, seed);
     bench_gemv("lm_head_q6_k", f_q6, 2, 128256, 2048, 60, seed);
-    bench_gemv_q8("x_q8_1row", f_q4q8, 8192, 2048, 1, 400, seed);
-    bench_gemv_q8("x_q8_2row", f_q4q8r2, 8192, 2048, 2, 400, seed);
-    bench_gemv_q8("x_q8_1row_lm", f_q4q8, 128256, 2048, 1, 60, seed);
-    bench_gemv_q8("x_q8_2row_lm", f_q4q8r2, 128256, 2048, 2, 60, seed);
+    bench_gemv_q8("x_q8_1row", f_q4q8, 1, 8192, 2048, 400, seed);
+    bench_gemv_q8("x_q8_1row_lm", f_q4q8, 1, 128256, 2048, 60, seed);
+    bench_gemv_q8("q6k_x_q8", f_q6q8, 2, 8192, 2048, 400, seed);
+    bench_gemv_q8("q6k_x_q8_lm", f_q6q8, 2, 128256, 2048, 60, seed);
 
     sofuu_cuda_ctx_destroy(g_ctx);
     sofuu_cuda_driver_close(g_drv);

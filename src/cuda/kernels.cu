@@ -82,7 +82,12 @@ typedef struct __attribute__((aligned(16))) {
 #define SOFUU_QK_Q8_0 32
 #define SOFUU_QK_K 256
 #define SOFUU_Q4_K_BYTES 144
-#define SOFUU_Q6_K_BYTES 210
+// Device-side q6_K stride. The on-disk GGML block is 210 bytes; upload pads
+// every block to 224 (14 x 16) so ql (+0), qh (+128), scales (+192) and the
+// super-block scale (+208) are all reachable with 16-byte vector loads and the
+// stride itself is 16-byte aligned. The first 210 bytes of a block are
+// untouched, so the padding is the only layout difference.
+#define SOFUU_Q6_K_BYTES 224
 #define SOFUU_Q8_0_BYTES 34
 #define SOFUU_GEMV_THREADS 256
 
@@ -323,6 +328,15 @@ static SOFUU_DEVICE SOFUU_INLINE int sofuu_warp_sum_i(int v) {
     v += sofuu_shfl_xor_i(v, 1);
     return v;
 }
+// Sum within each 16-lane half. q6_K scales change every 16 values, so its
+// bias correction needs the half sums, not just the 32-value total.
+static SOFUU_DEVICE SOFUU_INLINE int sofuu_warp_sum16_i(int v) {
+    v += sofuu_shfl_xor_i(v, 8);
+    v += sofuu_shfl_xor_i(v, 4);
+    v += sofuu_shfl_xor_i(v, 2);
+    v += sofuu_shfl_xor_i(v, 1);
+    return v;
+}
 static SOFUU_DEVICE SOFUU_INLINE void sofuu_bar_sync(void) {
     __asm__ volatile("bar.sync 0;");
 }
@@ -477,6 +491,30 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_q6k_dot8(
     return acc;
 }
 
+static SOFUU_DEVICE SOFUU_INLINE int sofuu_q6k_val_q8(unsigned int ql,
+                                                      unsigned int qh, int high,
+                                                      int sh) {
+    unsigned int nib = high ? ((ql >> 4) & 0x0f0f0f0fu) : (ql & 0x0f0f0f0fu);
+    unsigned int hi = (sh < 4) ? ((qh << (4 - sh)) & 0x30303030u)
+                               : ((qh >> (sh - 4)) & 0x30303030u);
+    return (int)(nib | hi);
+}
+
+// Sixteen values of one run: 16 ql bytes, 16 qh bytes, 16 activation bytes.
+static SOFUU_DEVICE SOFUU_INLINE int sofuu_q6k_dot16_q8(
+    const sofuu_u128 ql, const sofuu_u128 qh, const sofuu_u128 x, int high,
+    int sh) {
+    int a = sofuu_dp4a(sofuu_q6k_val_q8(ql.w[0], qh.w[0], high, sh), (int)x.w[0], 0);
+    a = sofuu_dp4a(sofuu_q6k_val_q8(ql.w[1], qh.w[1], high, sh), (int)x.w[1], a);
+    int b = sofuu_dp4a(sofuu_q6k_val_q8(ql.w[2], qh.w[2], high, sh), (int)x.w[2], 0);
+    b = sofuu_dp4a(sofuu_q6k_val_q8(ql.w[3], qh.w[3], high, sh), (int)x.w[3], b);
+    return a + b;
+}
+
+static SOFUU_DEVICE SOFUU_INLINE int sofuu_i8_at(const sofuu_u128 v, int s) {
+    return (int)(signed char)((v.w[s >> 2] >> (8 * (s & 3))) & 0xffu);
+}
+
 static SOFUU_DEVICE SOFUU_INLINE float sofuu_q8_0_dot8(
     const sofuu_block_q8_0 *b, int lane_in_block, const float *xr) {
     float d = sofuu_f16_to_f32(b->d);
@@ -622,7 +660,8 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 6) void sofuu_gemv_q4_k(con
 // broadcast.
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
 void sofuu_quantize_q8_1(const float *__restrict__ x, signed char *__restrict__ q,
-                         float *__restrict__ d, int *__restrict__ s, int n) {
+                         float *__restrict__ d, int *__restrict__ s,
+                         int *__restrict__ s16, int n) {
     unsigned int tid = sofuu_tid_x();
     int warp = (int)(tid >> 5);
     int lane = (int)(tid & 31u);
@@ -637,6 +676,8 @@ void sofuu_quantize_q8_1(const float *__restrict__ x, signed char *__restrict__ 
     qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
     q[base + lane] = (signed char)qi;
     int sum = sofuu_warp_sum_i(qi);
+    int half = sofuu_warp_sum16_i(qi);
+    if ((lane & 15u) == 0u) s16[block * 2 + (lane >> 4)] = half;
     if (lane == 0) {
         d[block] = scale;
         s[block] = sum;
@@ -696,85 +737,69 @@ void sofuu_gemv_q4_k_q8(const unsigned char *__restrict__ w,
     if (lane == 0) y[row] = total;
 }
 
-// q4_K x q8_1, two consecutive rows per warp. Both rows share the same
-// quantized activation, so the two activation loads per four-block group are
-// issued once and consumed twice, and every warp streams 2 x 1152 = 2304
-// contiguous weight bytes instead of 1152. That is the lever the benches point
-// at: the f32 row-dot (8192 contiguous bytes per warp, 32-byte per-lane loads)
-// reaches 271 GB/s while one-row quantized kernels stall at 95-140 GB/s, and
-// the difference is bytes per warp per DRAM latency, not arithmetic.
-extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 3)
-void sofuu_gemv_q4_k_q8_r2(const unsigned char *__restrict__ w,
-                           const signed char *__restrict__ xq,
-                           const float *__restrict__ xd,
-                           const int *__restrict__ xs,
-                           float *__restrict__ y, int rows, int cols) {
+// Four lanes per block, 64 values each, so a warp covers eight blocks and a
+// 2048-column row is a single iteration of four 128-bit weight loads. Every
+// lane covers runs (r, r+2) of one 128-value half, which share one 32-byte ql
+// run and one 32-byte qh run: the low nibbles feed the first run, the high
+// nibbles the second, and the qh bit pair is 2r and 2r+4.
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
+void sofuu_gemv_q6_k_q8(const unsigned char *__restrict__ w,
+                        const signed char *__restrict__ xq,
+                        const float *__restrict__ xd,
+                        const int *__restrict__ xs,
+                        const int *__restrict__ xs16,
+                        float *__restrict__ y, int rows, int cols) {
+    (void)xs;
     unsigned int tid = sofuu_tid_x();
     int warp = (int)(tid >> 5);
     int lane = (int)(tid & 31u);
-    int row0 = ((int)sofuu_ctaid_x() * 8 + warp) * 2;
-    if (row0 >= rows) return;
+    int row = (int)sofuu_ctaid_x() * 8 + warp;
+    if (row >= rows) return;
     int nb = cols / SOFUU_QK_K;
-    const int chunk = lane & 7;
-    const int bgrp = lane >> 3;
-    const int k = chunk >> 1;
-    unsigned long long row_bytes = (unsigned long long)nb * SOFUU_Q4_K_BYTES;
-    const unsigned char *ra = w + (unsigned long long)row0 * row_bytes;
-    const int has_b = (row0 + 1) < rows;
-    // Keep the second row's pointer inside the buffer even when it is absent;
-    // its result is simply not written.
-    const unsigned char *rb = has_b ? ra + row_bytes : ra;
-    float acc_a = 0.0f, acc_b = 0.0f;
-    int b = bgrp;
-    for (; b + 4 < nb; b += 8) {
-        const sofuu_block_q4_K *pa0 = (const sofuu_block_q4_K *)(
-            ra + (unsigned long long)b * SOFUU_Q4_K_BYTES);
-        const sofuu_block_q4_K *pa1 = (const sofuu_block_q4_K *)(
-            ra + (unsigned long long)(b + 4) * SOFUU_Q4_K_BYTES);
-        const sofuu_block_q4_K *pb0 = (const sofuu_block_q4_K *)(
-            rb + (unsigned long long)b * SOFUU_Q4_K_BYTES);
-        const sofuu_block_q4_K *pb1 = (const sofuu_block_q4_K *)(
-            rb + (unsigned long long)(b + 4) * SOFUU_Q4_K_BYTES);
-        sofuu_u128 la0, ha0, la1, ha1, qa0, qa1, qb0, qb1;
-        sofuu_q4k_x_load(xq, b, chunk, &la0, &ha0);
-        sofuu_q4k_x_load(xq, b + 4, chunk, &la1, &ha1);
-        sofuu_q4k_w_load(pa0, chunk, &qa0);
-        sofuu_q4k_w_load(pa1, chunk, &qa1);
-        sofuu_q4k_w_load(pb0, chunk, &qb0);
-        sofuu_q4k_w_load(pb1, chunk, &qb1);
-        int i0 = b * 8 + 2 * k, i1 = (b + 4) * 8 + 2 * k;
-        acc_a += sofuu_q4k_chunk32_compute(qa0, la0, ha0, pa0, chunk, xd[i0],
-                                           xs[i0], xd[i0 + 1], xs[i0 + 1]);
-        acc_b += sofuu_q4k_chunk32_compute(qb0, la0, ha0, pb0, chunk, xd[i0],
-                                           xs[i0], xd[i0 + 1], xs[i0 + 1]);
-        acc_a += sofuu_q4k_chunk32_compute(qa1, la1, ha1, pa1, chunk, xd[i1],
-                                           xs[i1], xd[i1 + 1], xs[i1 + 1]);
-        acc_b += sofuu_q4k_chunk32_compute(qb1, la1, ha1, pb1, chunk, xd[i1],
-                                           xs[i1], xd[i1 + 1], xs[i1 + 1]);
+    const unsigned char *roww = w + (unsigned long long)row *
+                                     (unsigned long long)nb * SOFUU_Q6_K_BYTES;
+    const int chunk = lane & 3;  // 64 values of a block
+    const int bgrp = lane >> 2;  // one of eight blocks per warp
+    const int n = chunk >> 1, j = chunk & 1;
+    const int sh_a = 2 * j, sh_b = sh_a + 4;
+    const int slot = n * 8 + 2 * j;
+    float acc = 0.0f;
+    for (int b = bgrp; b < nb; b += 8) {
+        const unsigned char *blk =
+            roww + (unsigned long long)b * SOFUU_Q6_K_BYTES;
+        sofuu_u128 ql0, ql1, qh0, qh1;
+        ql0 = sofuu_load_u128(blk + 64 * n + 32 * j);
+        ql1 = sofuu_load_u128(blk + 64 * n + 32 * j + 16);
+        qh0 = sofuu_load_u128(blk + 128 + 32 * n);
+        qh1 = sofuu_load_u128(blk + 128 + 32 * n + 16);
+        const int ia = b * 8 + n * 4 + j;  // q8_1 block of the first run
+        const int ib = ia + 2;             // second run, two runs later
+        sofuu_u128 xa0, xa1, xb0, xb1;
+        xa0 = sofuu_load_u128(xq + (unsigned long long)ia * 32);
+        xa1 = sofuu_load_u128(xq + (unsigned long long)ia * 32 + 16);
+        xb0 = sofuu_load_u128(xq + (unsigned long long)ib * 32);
+        xb1 = sofuu_load_u128(xq + (unsigned long long)ib * 32 + 16);
+        sofuu_u128 scv = sofuu_load_u128(blk + 192);
+        float d = sofuu_f16_to_f32((unsigned short)(
+            sofuu_load_u128(blk + 208).w[0] & 0xffffu));
+        float ca_lo = xd[ia] * d * (float)sofuu_i8_at(scv, slot);
+        float ca_hi = xd[ia] * d * (float)sofuu_i8_at(scv, slot + 1);
+        float cb_lo = xd[ib] * d * (float)sofuu_i8_at(scv, slot + 4);
+        float cb_hi = xd[ib] * d * (float)sofuu_i8_at(scv, slot + 5);
+        int ka = sofuu_q6k_dot16_q8(ql0, qh0, xa0, 0, sh_a);
+        int kb = sofuu_q6k_dot16_q8(ql1, qh1, xa1, 0, sh_a);
+        int kc = sofuu_q6k_dot16_q8(ql0, qh0, xb0, 1, sh_b);
+        int kd = sofuu_q6k_dot16_q8(ql1, qh1, xb1, 1, sh_b);
+        // Six-bit values are stored biased (+32) so they stay positive for
+        // dp4a; each 16-value half removes 32 * sum(x) before its scale.
+        acc += ca_lo * (float)(ka - 32 * xs16[2 * ia]);
+        acc += ca_hi * (float)(kb - 32 * xs16[2 * ia + 1]);
+        acc += cb_lo * (float)(kc - 32 * xs16[2 * ib]);
+        acc += cb_hi * (float)(kd - 32 * xs16[2 * ib + 1]);
     }
-    for (; b < nb; b += 4) {
-        sofuu_u128 q, l, h;
-        sofuu_q4k_x_load(xq, b, chunk, &l, &h);
-        int i0 = b * 8 + 2 * k;
-        const sofuu_block_q4_K *pa = (const sofuu_block_q4_K *)(
-            ra + (unsigned long long)b * SOFUU_Q4_K_BYTES);
-        sofuu_q4k_w_load(pa, chunk, &q);
-        acc_a += sofuu_q4k_chunk32_compute(q, l, h, pa, chunk, xd[i0], xs[i0],
-                                           xd[i0 + 1], xs[i0 + 1]);
-        const sofuu_block_q4_K *pb = (const sofuu_block_q4_K *)(
-            rb + (unsigned long long)b * SOFUU_Q4_K_BYTES);
-        sofuu_q4k_w_load(pb, chunk, &q);
-        acc_b += sofuu_q4k_chunk32_compute(q, l, h, pb, chunk, xd[i0], xs[i0],
-                                           xd[i0 + 1], xs[i0 + 1]);
-    }
-    float ta = sofuu_warp_sum(acc_a);
-    float tb = sofuu_warp_sum(acc_b);
-    if (lane == 0) {
-        y[row0] = ta;
-        if (has_b) y[row0 + 1] = tb;
-    }
+    float total = sofuu_warp_sum(acc);
+    if (lane == 0) y[row] = total;
 }
-
 
 // q6_K: same warp/lane mapping as q4_K; ql at the run's 64-byte base, qh at
 // n*32+l. The 210-byte block stride is not 8-byte aligned on odd blocks, so
@@ -796,9 +821,9 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 6) void sofuu_gemv_q6_k(con
     int bi = 0;
     for (; bi + 2 <= nb; bi += 2) {
         const sofuu_block_q6_K *b0 =
-            (const sofuu_block_q6_K *)(roww + (unsigned long long)(bi + 0) * 210);
+            (const sofuu_block_q6_K *)(roww + (unsigned long long)(bi + 0) * SOFUU_Q6_K_BYTES);
         const sofuu_block_q6_K *b1 =
-            (const sofuu_block_q6_K *)(roww + (unsigned long long)(bi + 1) * 210);
+            (const sofuu_block_q6_K *)(roww + (unsigned long long)(bi + 1) * SOFUU_Q6_K_BYTES);
         float xr0[8], xr1[8];
         sofuu_load8(x + (bi + 0) * 256 + lane * 8, xr0);
         sofuu_load8(x + (bi + 1) * 256 + lane * 8, xr1);
@@ -809,7 +834,7 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 6) void sofuu_gemv_q6_k(con
         float xr[8];
         sofuu_load8(x + bi * 256 + lane * 8, xr);
         const sofuu_block_q6_K *b =
-            (const sofuu_block_q6_K *)(roww + (unsigned long long)bi * 210);
+            (const sofuu_block_q6_K *)(roww + (unsigned long long)bi * SOFUU_Q6_K_BYTES);
         acc += sofuu_q6k_dot8(b, sub, l0, xr);
     }
     float total = sofuu_warp_sum(acc);
@@ -1107,7 +1132,7 @@ void sofuu_gemm_q6_k_b8(const unsigned char *__restrict__ w, const float *__rest
         float xr[8];
         sofuu_load8(xrow + bi * 256 + lane * 8, xr);
         const sofuu_block_q6_K *b =
-            (const sofuu_block_q6_K *)(roww + (unsigned long long)bi * 210);
+            (const sofuu_block_q6_K *)(roww + (unsigned long long)bi * SOFUU_Q6_K_BYTES);
         acc += sofuu_q6k_dot8(b, sub, l0, xr);
     }
     float total = sofuu_warp_sum(acc);
@@ -1380,7 +1405,7 @@ extern "C" float sofuu_host_q4_k_dot(const void *w, const float *x, int cols) {
 }
 
 extern "C" void sofuu_host_quantize_q8_1(const float *x, signed char *q,
-                                         float *d, int *s, int n) {
+                                         float *d, int *s, int *s16, int n) {
     for (int b = 0; b < n / 32; ++b) {
         float amax = 0.0f;
         for (int i = 0; i < 32; ++i) {
@@ -1389,15 +1414,18 @@ extern "C" void sofuu_host_quantize_q8_1(const float *x, signed char *q,
         }
         float scale = amax > 0.0f ? amax / 127.0f : 0.0f;
         float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
-        int sum = 0;
+        int sum = 0, lo = 0;
         for (int i = 0; i < 32; ++i) {
             int qi = sofuu_round_int(x[b * 32 + i] * inv);
             qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
             q[b * 32 + i] = (signed char)qi;
             sum += qi;
+            if (i < 16) lo += qi;
         }
         d[b] = scale;
         s[b] = sum;
+        s16[b * 2] = lo;
+        s16[b * 2 + 1] = sum - lo;
     }
 }
 
@@ -1417,13 +1445,54 @@ extern "C" float sofuu_host_q4_k_dot_q8(const void *w, const signed char *xq,
     return total;
 }
 
+extern "C" float sofuu_host_q6_k_dot_q8(const void *w, const signed char *xq,
+                                        const float *xd, const int *xs16,
+                                        int cols) {
+    const unsigned char *p = (const unsigned char *)w;
+    int nb = cols / 256;
+    float total = 0.0f;
+    for (int bi = 0; bi < nb; ++bi) {
+        const unsigned char *blk = p + (unsigned long long)bi * SOFUU_Q6_K_BYTES;
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            const int n = chunk >> 1, j = chunk & 1;
+            const int sh_a = 2 * j, sh_b = sh_a + 4;
+            const int slot = n * 8 + 2 * j;
+            sofuu_u128 ql0 = sofuu_load_u128(blk + 64 * n + 32 * j);
+            sofuu_u128 ql1 = sofuu_load_u128(blk + 64 * n + 32 * j + 16);
+            sofuu_u128 qh0 = sofuu_load_u128(blk + 128 + 32 * n);
+            sofuu_u128 qh1 = sofuu_load_u128(blk + 128 + 32 * n + 16);
+            const int ia = bi * 8 + n * 4 + j, ib = ia + 2;
+            sofuu_u128 xa0 = sofuu_load_u128(xq + (unsigned long long)ia * 32);
+            sofuu_u128 xa1 = sofuu_load_u128(xq + (unsigned long long)ia * 32 + 16);
+            sofuu_u128 xb0 = sofuu_load_u128(xq + (unsigned long long)ib * 32);
+            sofuu_u128 xb1 = sofuu_load_u128(xq + (unsigned long long)ib * 32 + 16);
+            sofuu_u128 scv = sofuu_load_u128(blk + 192);
+            float d = sofuu_f16_to_f32((unsigned short)(
+                sofuu_load_u128(blk + 208).w[0] & 0xffffu));
+            float ca_lo = xd[ia] * d * (float)sofuu_i8_at(scv, slot);
+            float ca_hi = xd[ia] * d * (float)sofuu_i8_at(scv, slot + 1);
+            float cb_lo = xd[ib] * d * (float)sofuu_i8_at(scv, slot + 4);
+            float cb_hi = xd[ib] * d * (float)sofuu_i8_at(scv, slot + 5);
+            total += ca_lo * (float)(sofuu_q6k_dot16_q8(ql0, qh0, xa0, 0, sh_a) -
+                                     32 * xs16[2 * ia]);
+            total += ca_hi * (float)(sofuu_q6k_dot16_q8(ql1, qh1, xa1, 0, sh_a) -
+                                     32 * xs16[2 * ia + 1]);
+            total += cb_lo * (float)(sofuu_q6k_dot16_q8(ql0, qh0, xb0, 1, sh_b) -
+                                     32 * xs16[2 * ib]);
+            total += cb_hi * (float)(sofuu_q6k_dot16_q8(ql1, qh1, xb1, 1, sh_b) -
+                                     32 * xs16[2 * ib + 1]);
+        }
+    }
+    return total;
+}
+
 extern "C" float sofuu_host_q6_k_dot(const void *w, const float *x, int cols) {
     const unsigned char *p = (const unsigned char *)w;
     int nb = cols / 256;
     float total = 0.0f;
     for (int bi = 0; bi < nb; ++bi) {
         const sofuu_block_q6_K *b =
-            (const sofuu_block_q6_K *)(p + (unsigned long long)bi * 210);
+            (const sofuu_block_q6_K *)(p + (unsigned long long)bi * SOFUU_Q6_K_BYTES);
         const float *xb = x + (unsigned long long)bi * 256;
         for (int run = 0; run < 8; ++run)
             for (int l = 0; l < 32; ++l)

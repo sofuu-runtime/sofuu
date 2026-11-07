@@ -68,11 +68,13 @@ void fill_q4_k(std::vector<uint8_t> &w, int rows, int cols, uint32_t &seed) {
 
 void fill_q6_k(std::vector<uint8_t> &w, int rows, int cols, uint32_t &seed) {
     int nb = cols / 256;
-    w.assign((size_t)rows * (size_t)nb * 210, 0);
+    // Device layout: 224-byte blocks (see SOFUU_Q6_K_BYTES).
+    w.assign((size_t)rows * (size_t)nb * sofuu_ref::Q6K_STRIDE, 0);
     for (int r = 0; r < rows; ++r)
         for (int b = 0; b < nb; ++b) {
             sofuu_ref::BlockQ6_K *blk = reinterpret_cast<sofuu_ref::BlockQ6_K *>(
-                w.data() + ((size_t)r * (size_t)nb + (size_t)b) * 210);
+                w.data() + ((size_t)r * (size_t)nb + (size_t)b) *
+                               sofuu_ref::Q6K_STRIDE);
             blk->d = sofuu_ref::F16_0625;
             fill_bytes(blk->ql, 128, seed);
             fill_bytes(blk->qh, 64, seed);
@@ -137,7 +139,9 @@ void test_q4_k_q8(uint32_t &seed) {
     std::vector<signed char> xq(cols);
     std::vector<float> xd(cols / 32);
     std::vector<int> xs(cols / 32);
-    sofuu_host_quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(), cols);
+    std::vector<int> xs16(cols / 16);
+    sofuu_host_quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(),
+                             xs16.data(), cols);
     for (int r = 0; r < rows; ++r) {
         const uint8_t *row = w.data() + (size_t)r * (cols / 256) * 144;
         float got = sofuu_host_q4_k_dot_q8(row, xq.data(), xd.data(), xs.data(), cols);
@@ -152,9 +156,38 @@ void test_q6_k(uint32_t &seed) {
     fill_q6_k(w, rows, cols, seed);
     std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
     for (int r = 0; r < rows; ++r) {
-        const uint8_t *row = w.data() + (size_t)r * (cols / 256) * 210;
+        const uint8_t *row =
+            w.data() + (size_t)r * (cols / 256) * sofuu_ref::Q6K_STRIDE;
         float got = sofuu_host_q6_k_dot(row, x.data(), cols);
         check_dot("gemv_q6_k", got, sofuu_ref::dot_q6_k(row, x.data(), cols));
+    }
+}
+
+// q6_K against q8_1 activations: the same three-way check as q4_K, plus the
+// per-16 sums the 6-bit bias correction depends on. The kernel enters the
+// 6-bit values biased (+32) and removes 32 * sum(x) per 16-value half, so a
+// half-sum that is off by one shifts the whole half's contribution.
+void test_q6_k_q8(uint32_t &seed) {
+    const int cols = 2048, rows = 4;
+    std::vector<uint8_t> w;
+    fill_q6_k(w, rows, cols, seed);
+    std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
+    std::vector<signed char> xq(cols);
+    std::vector<float> xd(cols / 32);
+    std::vector<int> xs(cols / 32), xs16(cols / 16);
+    sofuu_host_quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(),
+                             xs16.data(), cols);
+    int bad = 0;
+    for (int b = 0; b < cols / 32; ++b)
+        if (xs16[b * 2] + xs16[b * 2 + 1] != xs[b]) ++bad;
+    if (bad) std::printf("      half-sum mismatch in %d blocks\n", bad);
+    for (int r = 0; r < rows; ++r) {
+        const uint8_t *row =
+            w.data() + (size_t)r * (cols / 256) * sofuu_ref::Q6K_STRIDE;
+        float got =
+            sofuu_host_q6_k_dot_q8(row, xq.data(), xd.data(), xs16.data(), cols);
+        check_dot("q6_k_x_q8", got,
+                  sofuu_ref::dot_q6_k_q8(row, xq.data(), xd.data(), cols));
     }
 }
 
@@ -278,7 +311,7 @@ void test_tiled_gemv(uint32_t &seed) {
         for (int r = 0; r < rows; ++r) {
             float got4 = 0.0f, got6 = 0.0f;
             const uint8_t *row4 = w4.data() + (size_t)r * nb * 144;
-            const uint8_t *row6 = w6.data() + (size_t)r * nb * 210;
+            const uint8_t *row6 = w6.data() + (size_t)r * nb * sofuu_ref::Q6K_STRIDE;
             // One warp owns this row and walks every super-block; the block's
             // other seven warps are other rows and share x through L1.
             for (int lane = 0; lane < 32; ++lane) {
@@ -301,7 +334,7 @@ void test_tiled_gemv(uint32_t &seed) {
                     }
 
                     const auto *b6 = reinterpret_cast<const sofuu_block_q6_K *>(
-                        row6 + (size_t)bi * 210);
+                        row6 + (size_t)bi * sofuu_ref::Q6K_STRIDE);
                     int n = sub >> 2, rr = sub & 3;
                     float d6 = sofuu_f16_to_f32(b6->d);
                     int sb = n * 8 + 2 * rr;
@@ -392,14 +425,14 @@ void test_b8_gemm(uint32_t &seed) {
             const float *xrow = x.data() + (size_t)t * cols;
             for (int row = 0; row < rows; ++row) {
                 const uint8_t *row4 = w4.data() + (size_t)row * nb * 144;
-                const uint8_t *row6 = w6.data() + (size_t)row * nb * 210;
+                const uint8_t *row6 = w6.data() + (size_t)row * nb * sofuu_ref::Q6K_STRIDE;
                 float a4 = 0.0f, a6 = 0.0f;
                 for (int cg = 0; cg < cols; cg += 256) {
                     int bi = cg >> 8;
                     const auto *b4 = reinterpret_cast<const sofuu_block_q4_K *>(
                         row4 + (size_t)bi * 144);
                     const auto *b6 = reinterpret_cast<const sofuu_block_q6_K *>(
-                        row6 + (size_t)bi * 210);
+                        row6 + (size_t)bi * sofuu_ref::Q6K_STRIDE);
                     for (int lane = 0; lane < 32; ++lane) {
                         int sub = lane >> 2, l0 = (lane & 3) << 3;
                         unsigned int sc, mn;
@@ -646,6 +679,7 @@ int main(void) {
     test_q4_k(seed);
     test_q4_k_q8(seed);
     test_q6_k(seed);
+    test_q6_k_q8(seed);
     test_zero_scale(seed);
     test_rmsnorm(seed);
     test_swiglu(seed);

@@ -42,7 +42,7 @@ To ensure absolute clarity for developer adoption (including our Hacker News lau
 
 | Subsystem | Readiness Tier | Scope & Standards |
 | :--- | :---: | :--- |
-| **Autonomous Agent Loop** | 🟢 **Core** | `sofuu.agent`, cooperative scheduling (`scheduler.yield()`), step budgets, resilient editing (`smart_edit`), AST syntax dry-runs, real-time QTSQ trace streaming. |
+| **Autonomous Agent Loop** | 🟢 **Core** | `sofuu.agent`, cooperative scheduling (`scheduler.yield()`), step budgets, resilient editing (`smart_edit`), AST syntax dry-runs, real-time QTSQ trace streaming, and focused Agent Interaction TUI (`sofuu.agent.interact`) with HITL approval. |
 | **Deterministic Toolpacks** | 🟢 **Core** | `sofuu.tools.PACKS` (`coding`, `web`, `memory`, `system`), single-instruction fuel sandbox (`code_eval`), numbered unified diffs. |
 | **Standalone Compiler** | 🟢 **Core** | `sofuu compile`: single-file zero-dependency native executables with 32-byte `SOFUU_BIN_V1` trailer, CRC32 verification, ad-hoc signing, sub-15ms cold start. Smallest lean base by default (~4.5 MiB), with `--lean`, `--full`, `--micro`, and `--base <path>` profiles. |
 | **Continuous Memory (CMA v2)** | 🟢 **Core** | On-device `.qtsq` vector brain, cached KDF v2 master key (no 64 MB Argon2 spikes), zero-KDF plaintext mode, hardware SIMD search. |

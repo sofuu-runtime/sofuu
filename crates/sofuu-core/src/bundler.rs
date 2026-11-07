@@ -1083,9 +1083,23 @@ var __f={};\n\
 function __d(id,factory){__f[id]=factory;}\n\
 function __r(id){\n\
   if(Object.prototype.hasOwnProperty.call(__m,id))return __m[id];\n\
+  if(!__f[id]){\n\
+    var clean=(typeof id==='string'&&id.indexOf('node:')===0)?id.slice(5):id;\n\
+    if(typeof require==='function'){\n\
+      try{return (__m[id]=require(id));}catch(e){}\n\
+      if(clean!==id){try{return (__m[id]=require(clean));}catch(e){}}\n\
+    }\n\
+    var nmods=(typeof globalThis!=='undefined'&&globalThis.__sofuu_node_modules);\n\
+    if(nmods&&nmods[clean])return (__m[id]=nmods[clean]);\n\
+    if(clean==='sofuu'&&typeof globalThis!=='undefined'&&globalThis.sofuu)return (__m[id]=globalThis.sofuu);\n\
+    if(clean==='zod'&&typeof globalThis!=='undefined'&&globalThis.sofuu&&globalThis.sofuu.plugins)return (__m[id]=globalThis.sofuu.plugins.z);\n\
+    var exp={};\n\
+    __m[id]=exp;\n\
+    console.error('[sofuu bundle] missing module:',id);\n\
+    return exp;\n\
+  }\n\
   var exp={};\n\
   __m[id]=exp;\n\
-  if(!__f[id]){console.error('[sofuu bundle] missing module:',id);return exp;}\n\
   __f[id](exp,__r);\n\
   return __m[id];\n\
 }\n";

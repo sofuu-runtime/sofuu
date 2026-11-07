@@ -73,8 +73,8 @@ verbs() {
 # Name@index from the Op enum, so a renumbered opcode is drift too.
 opcodes() {
     awk '/pub enum Op \{/,/^\}/' "$1" \
-        | grep -oE '^[[:space:]]+[A-Za-z]+ = [0-9]+' \
-        | sed -E 's/^[[:space:]]+([A-Za-z]+) = ([0-9]+)/\1@\2/' \
+        | grep -oE '^[[:space:]]+[A-Za-z][A-Za-z0-9]* = [0-9]+' \
+        | sed -E 's/^[[:space:]]+([A-Za-z][A-Za-z0-9]*) = ([0-9]+)/\1@\2/' \
         | sort
 }
 

@@ -1210,7 +1210,7 @@
           setTimeout(function () {
             try {
               proc.kill('SIGKILL');
-            } catch (eK) {}
+            } catch (eK) { /* already terminated by SIGTERM; ignore */ }
           }, 200);
           finish('\n[killed: timed out after ' + timeout + 'ms]\n');
         }, timeout);

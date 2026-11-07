@@ -675,8 +675,48 @@ r#"globalThis.__sofuu_cli_rc = 1;
             );
             eval_rc(rt, &script)
         }
+        "build" => {
+            let entry = match args.get(3) {
+                Some(e) => e.clone(),
+                None => {
+                    eprintln!("Usage: sofuu mcp build <entry.ts|js> [-o <output>]");
+                    return 1;
+                }
+            };
+            let mut opts = sofuu_core::compiler::CompileOptions::default();
+            opts.profile = sofuu_core::compiler::CompileProfile::Micro;
+            let mut i = 4;
+            while i < args.len() {
+                if (args[i] == "-o" || args[i] == "--output") && i + 1 < args.len() {
+                    opts.output = Some(args[i + 1].clone());
+                    i += 2;
+                } else if args[i].starts_with("--output=") {
+                    opts.output = Some(args[i]["--output=".len()..].to_string());
+                    i += 1;
+                } else if args[i] == "--no-strip" {
+                    opts.no_strip = true;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            }
+            match sofuu_core::compiler::compile(&entry, &opts) {
+                Ok(report) => {
+                    println!("\x1b[32m✓\x1b[0m Compiled standalone MCP micro-server: \x1b[1m{}\x1b[0m", report.output);
+                    println!("  Size:    {} B ({:.2} MiB)", report.total, report.total as f64 / (1024.0 * 1024.0));
+                    println!("  Base:    {} (profile: {})", report.base_source, report.profile);
+                    println!("  Payload: {} B (bytecode {} B)", report.payload, report.bytecode_stored);
+                    println!("Run with:  {}", report.output);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31mError:\x1b[0m {e}");
+                    1
+                }
+            }
+        }
         _ => {
-            eprintln!("Usage: sofuu mcp <list|test <cmd|url>|inspect <cmd|url>|add <name> <command>|remove <name>|init <name>|link <claude-desktop|cursor>>");
+            eprintln!("Usage: sofuu mcp <list|test|inspect|add|remove|init|build|link>");
             1
         }
     }

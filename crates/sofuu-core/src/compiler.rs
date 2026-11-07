@@ -681,6 +681,27 @@ fn err(code: &'static str, message: impl Into<String>) -> CompileError {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CompileProfile {
+    /// Lean agent base: smallest possible binary, excludes local GGUF inference & full CLI commands.
+    #[default]
+    Lean,
+    /// Full base: includes local inference engine, robotics, and full CLI subcommands.
+    Full,
+    /// Micro base: ultra-lean MCP server / single-tool runtime.
+    Micro,
+}
+
+impl CompileProfile {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Lean => "lean",
+            Self::Full => "full",
+            Self::Micro => "micro",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CompileOptions {
     /// `-o` — defaults to the entry's stem in the current directory.
@@ -689,6 +710,10 @@ pub struct CompileOptions {
     pub embed_brain: Option<String>,
     /// `--no-strip` — keep the base binary's symbols.
     pub no_strip: bool,
+    /// Compilation profile: Lean (default, smallest possible) vs Full.
+    pub profile: CompileProfile,
+    /// Custom base executable path to append the payload to.
+    pub base: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -703,6 +728,84 @@ pub struct CompileReport {
     pub brain: Option<u64>,
     pub signed: bool,
     pub stripped: bool,
+    pub profile: &'static str,
+    pub base_source: String,
+}
+
+fn resolve_base_binary(
+    opts: &CompileOptions,
+    self_path: &Path,
+    self_bytes: &[u8],
+) -> (Vec<u8>, &'static str, String) {
+    if let Some(custom) = &opts.base {
+        let p = Path::new(custom);
+        if let Ok(bytes) = std::fs::read(p) {
+            return (bytes, "custom", p.to_string_lossy().into_owned());
+        }
+    }
+
+    if opts.profile == CompileProfile::Micro {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+
+        // 1. Same directory as the running binary
+        if let Some(parent) = self_path.parent() {
+            candidates.push(parent.join("sofuu-micro"));
+            candidates.push(parent.join("sofuu-mcp"));
+        }
+        // 2. target/release in workspace
+        candidates.push(PathBuf::from("target/release/sofuu-micro"));
+        candidates.push(PathBuf::from("target/release/sofuu-mcp"));
+        // 3. Current working directory
+        candidates.push(PathBuf::from("./sofuu-micro"));
+        candidates.push(PathBuf::from("./sofuu-mcp"));
+        // 4. ~/.sofuu/bin/sofuu-micro
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(PathBuf::from(home).join(".sofuu/bin/sofuu-micro"));
+        }
+        // 5. Fallback candidates to lean agent base if micro not yet built
+        if let Some(parent) = self_path.parent() {
+            candidates.push(parent.join("sofuu-agent"));
+        }
+        candidates.push(PathBuf::from("target/release/sofuu-agent"));
+        candidates.push(PathBuf::from("./sofuu-agent"));
+
+        for candidate in candidates {
+            if candidate.is_file() {
+                if let Ok(bytes) = std::fs::read(&candidate) {
+                    return (bytes, "micro", candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+
+    if opts.profile == CompileProfile::Lean {
+        // Search candidates for sofuu-agent lean runtime base
+        let mut candidates: Vec<PathBuf> = Vec::new();
+
+        // 1. Same directory as the running binary
+        if let Some(parent) = self_path.parent() {
+            candidates.push(parent.join("sofuu-agent"));
+            candidates.push(parent.join("sofuu-lean"));
+        }
+        // 2. target/release in workspace
+        candidates.push(PathBuf::from("target/release/sofuu-agent"));
+        // 3. Current working directory
+        candidates.push(PathBuf::from("./sofuu-agent"));
+        // 4. ~/.sofuu/bin/sofuu-agent
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(PathBuf::from(home).join(".sofuu/bin/sofuu-agent"));
+        }
+
+        for candidate in candidates {
+            if candidate.is_file() {
+                if let Ok(bytes) = std::fs::read(&candidate) {
+                    return (bytes, "lean", candidate.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+
+    (self_bytes.to_vec(), opts.profile.as_str(), self_path.to_string_lossy().into_owned())
 }
 
 /// Compile `entry` into a standalone executable.
@@ -758,22 +861,26 @@ pub fn compile(entry: &str, opts: &CompileOptions) -> Result<CompileReport, Comp
         (bc_stored, gz, bytecode_raw, br, dim)
     };
 
-    /* 5. The base is this executable without its code signature and without
-     *    any payload an earlier compile appended. On Mach-O the two are tied
-     *    together — a signature covers the whole file and __LINKEDIT must
-     *    cover EOF — so the staging pass runs on disk, where `codesign` can do
-     *    its own load-command surgery. */
+    /* 5. Base binary resolution:
+     *    By default (CompileProfile::Lean), the compiler selects the leanest
+     *    standalone agent base (`sofuu-agent`), dropping interactive TUI chat,
+     *    developer CLI subcommands, and heavy inference engines.
+     *    If `--full` / `--with-inference` is selected, or if a custom `--base`
+     *    is provided, it uses that binary instead. */
     let self_path = std::env::current_exe()
         .map_err(|e| err("E_SELF", format!("cannot locate this executable: {e}")))?;
     let self_bytes = std::fs::read(&self_path)
         .map_err(|e| err("E_SELF", format!("cannot read {}: {e}", self_path.display())))?;
 
+    let (base_source_bytes, profile_str, base_source_desc) =
+        resolve_base_binary(opts, &self_path, &self_bytes);
+
     /* Refuse to clobber the binary we are running from: the rename would
      * succeed on Unix and leave the process mapped to a replaced inode. */
-    if same_file(&output, &self_path) {
+    if same_file(&output, &self_path) || opts.base.as_deref().is_some_and(|b| same_file(&output, Path::new(b))) {
         return Err(err(
             "E_OUTPUT",
-            format!("{output_str} is the running binary — choose another output path"),
+            format!("{output_str} is the running or base binary — choose another output path"),
         ));
     }
     if let Some(parent) = output.parent() {
@@ -785,7 +892,7 @@ pub fn compile(entry: &str, opts: &CompileOptions) -> Result<CompileReport, Comp
     }
 
     let tmp = format!("{output_str}.tmp-{}", std::process::id());
-    let staged = match stage_base(&tmp, &self_bytes) {
+    let staged = match stage_base(&tmp, &base_source_bytes) {
         Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
@@ -874,6 +981,8 @@ pub fn compile(entry: &str, opts: &CompileOptions) -> Result<CompileReport, Comp
         brain: brain.as_ref().map(|b| b.len() as u64),
         signed,
         stripped,
+        profile: profile_str,
+        base_source: base_source_desc,
     })
 }
 

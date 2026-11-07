@@ -83,6 +83,16 @@ $(TARGET): cargo-build
 	@rm -f $(TARGET) && cp target/release/$(TARGET) $(TARGET)
 	@if [ "$$(uname -s)" = "Darwin" ]; then strip $(TARGET) 2>/dev/null || true; codesign --force --sign - $(TARGET) 2>/dev/null || true; fi
 	@echo "  \033[32mBuilt:\033[0m ./$(TARGET) ($(shell du -sh $(TARGET) | cut -f1))"
+	@if [ -f target/release/sofuu-agent ]; then \
+		rm -f sofuu-agent && cp target/release/sofuu-agent sofuu-agent; \
+		if [ "$$(uname -s)" = "Darwin" ]; then strip sofuu-agent 2>/dev/null || true; codesign --force --sign - sofuu-agent 2>/dev/null || true; fi; \
+		echo "  \033[32mBuilt:\033[0m ./sofuu-agent ($$(du -sh sofuu-agent | cut -f1))"; \
+	fi
+	@if [ -f target/release/sofuu-micro ]; then \
+		rm -f sofuu-micro && cp target/release/sofuu-micro sofuu-micro; \
+		if [ "$$(uname -s)" = "Darwin" ]; then strip sofuu-micro 2>/dev/null || true; codesign --force --sign - sofuu-micro 2>/dev/null || true; fi; \
+		echo "  \033[32mBuilt:\033[0m ./sofuu-micro ($$(du -sh sofuu-micro | cut -f1))"; \
+	fi
 
 # ── Legacy pure-C build ─────────────────────────────────────────
 # REMOVED in M10: every src/*.c glue file is retired (the runtime is Rust
@@ -331,7 +341,7 @@ install: $(TARGET)
 
 clean:
 	@echo "  Cleaning..."
-	rm -f $(TARGET)
+	rm -f $(TARGET) sofuu-agent sofuu-micro
 	cargo clean 2>/dev/null || true
 
 test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check

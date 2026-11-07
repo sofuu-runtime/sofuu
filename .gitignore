@@ -6,6 +6,8 @@
 # bindings/android/sofuu/src/main/cpp/jni_bridge.c". Root-anchored, and
 # trailing-slashed directories, so only build output is ignored.
 /sofuu
+/sofuu-agent
+/sofuu-micro
 /dist/
 /build/
 bin/

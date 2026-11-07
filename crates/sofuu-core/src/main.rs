@@ -138,7 +138,7 @@ fn print_help() {
     println!("  capabilities             Print the runtime capability manifest as JSON");
     println!("  tools list               List the tools the active policy allows (--json)");
     println!("  policy init|check|dry-run|why  Write a profile, audit a script, explain a rule");
-    println!("  mcp list|test|inspect|add|remove|init|link Manage MCP servers and inspect their tools");
+    println!("  mcp list|test|inspect|add|remove|init|link|build Manage MCP servers and compile micro-binaries");
     println!("  script run|check|compile|repl  Kaze: capability-gated scripting language for agents & devices");
     println!("\n\x1b[1mChat commands (inside the chat UI):\x1b[0m");
     /* P3 (AUDIT-2026-09-07): /models was deliberately removed (unknown
@@ -205,11 +205,15 @@ fn print_subcommand_help(cmd: &str) -> bool {
              any network or disk work).\n"
         ),
         "compile" => println!(
-            "Usage: sofuu compile <entry.ts|js> [-o <out>] [--embed-brain <file.qtsq>] [--no-strip]\n\n\
-             Compile an agent into a standalone executable: this `sofuu` binary plus\n\
-             the entry's bundled bytecode and, optionally, a `.qtsq` brain appended\n\
-             behind a 32-byte trailer. The result runs on a machine with no Sofuu.\n\
+            "Usage: sofuu compile <entry.ts|js> [-o <out>] [--lean] [--full] [--with-inference] [--base <path>] [--embed-brain <file.qtsq>] [--no-strip]\n\n\
+             Compile an agent into a standalone executable: an ultra-lean runtime base\n\
+             plus the entry's bundled bytecode and, optionally, a `.qtsq` brain appended\n\
+             behind a 32-byte trailer. The result runs on any host with zero dependencies.\n\
                -o, --output <file>      output path (default: the entry's stem)\n\
+               --lean                   compile smallest possible binary (default, drops heavy GGUF/chat engines)\n\
+               --full                   compile with all engines included (same as --with-inference)\n\
+               --with-inference         bundle full local inference engine inside binary\n\
+               --base <path>            use a custom base executable binary\n\
                --embed-brain <file>     carry a brain; `sofuu.memory.embedded` opens it\n\
                --no-strip               keep the base binary's symbols\n\n\
              The artifact is tied to the QuickJS build that produced it, so recompile\n\
@@ -264,8 +268,9 @@ fn print_subcommand_help(cmd: &str) -> bool {
                     sofuu mcp add <name> <command> [args…]\n\
                     sofuu mcp remove <name>\n\
                     sofuu mcp init <name>\n\
+                    sofuu mcp build <entry.ts|js> [-o <out>]\n\
                     sofuu mcp link <claude-desktop | cursor>\n\n\
-             Manage MCP servers, scaffold new servers, inspect tools, and link to IDEs.\n"
+             Manage MCP servers, scaffold new servers, inspect tools, compile micro-binaries, and link to IDEs.\n"
         ),
         "conformance" => println!(
             "Usage: sofuu conformance [--suite <name>]\n\n\
@@ -1714,6 +1719,39 @@ fn parse_compile_args(rest: &[String]) -> Result<CompileArgs, String> {
                 options.output = Some(v.clone());
                 i += 2;
             }
+            "--lean" => {
+                options.profile = sofuu_core::compiler::CompileProfile::Lean;
+                i += 1;
+            }
+            "--full" | "--with-inference" => {
+                options.profile = sofuu_core::compiler::CompileProfile::Full;
+                i += 1;
+            }
+            "--micro" | "--mcp" => {
+                options.profile = sofuu_core::compiler::CompileProfile::Micro;
+                i += 1;
+            }
+            "--base" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| "--base requires a binary path".to_string())?;
+                options.base = Some(v.clone());
+                i += 2;
+            }
+            _ if a.starts_with("--base=") => {
+                options.base = Some(a["--base=".len()..].to_string());
+                i += 1;
+            }
+            _ if a.starts_with("--profile=") => {
+                let p = &a["--profile=".len()..];
+                match p {
+                    "lean" => options.profile = sofuu_core::compiler::CompileProfile::Lean,
+                    "full" => options.profile = sofuu_core::compiler::CompileProfile::Full,
+                    "micro" | "mcp" => options.profile = sofuu_core::compiler::CompileProfile::Micro,
+                    other => return Err(format!("unknown profile '{other}' (expected 'lean', 'full', or 'micro'/'mcp')")),
+                }
+                i += 1;
+            }
             "--embed-brain" => {
                 let v = rest
                     .get(i + 1)
@@ -1748,17 +1786,18 @@ fn parse_compile_args(rest: &[String]) -> Result<CompileArgs, String> {
         }
     }
     let Some(entry) = entry else {
-        return Err("'sofuu compile' requires an entry file\nUsage: sofuu compile <entry.ts|js> [-o <out>]".to_string());
+        return Err("'sofuu compile' requires an entry file\nUsage: sofuu compile <entry.ts|js> [-o <out>] [--lean] [--full]".to_string());
     };
     Ok(CompileArgs { entry, options })
 }
 
 fn print_compile_report(r: &sofuu_core::compiler::CompileReport) {
     println!("\x1b[1m⚡ sofuu compile\x1b[0m");
-    println!("  Output: \x1b[1m{}\x1b[0m", r.output);
+    println!("  Output:  \x1b[1m{}\x1b[0m", r.output);
+    println!("  Profile: \x1b[32m{}\x1b[0m ({})", r.profile, r.base_source);
     match r.brain {
         Some(brain) => println!(
-            "  Size:   {} B total ({} B base + {} B payload; bytecode {} B in, {} B stored{}; brain {} B)",
+            "  Size:    {} B total ({} B base + {} B payload; bytecode {} B in, {} B stored{}; brain {} B)",
             r.total,
             r.base,
             r.payload,
@@ -1768,7 +1807,7 @@ fn print_compile_report(r: &sofuu_core::compiler::CompileReport) {
             brain
         ),
         None => println!(
-            "  Size:   {} B total ({} B base + {} B payload; bytecode {} B in, {} B stored{})",
+            "  Size:    {} B total ({} B base + {} B payload; bytecode {} B in, {} B stored{})",
             r.total,
             r.base,
             r.payload,
@@ -1778,7 +1817,7 @@ fn print_compile_report(r: &sofuu_core::compiler::CompileReport) {
         ),
     }
     println!(
-        "  Flags:  {}{}",
+        "  Flags:   {}{}",
         if r.stripped { "stripped " } else { "unstripped " },
         if r.signed { "ad-hoc signed" } else { "unsigned" }
     );

@@ -835,8 +835,12 @@ pub fn compile(entry: &str, opts: &CompileOptions) -> Result<CompileReport, Comp
         (existing.bytecode, existing.gzipped, raw_len, br, dim)
     } else {
         /* 1. Bundle: one self-contained script, TypeScript stripped per module. */
-        let source = crate::bundler::bundle(entry_path, &crate::npm::npm_resolve)
-            .map_err(|e| err("E_BUNDLE", format!("{entry}: {e}")))?;
+        let source = if entry_path.extension().is_some_and(|ext| ext == "kaze") {
+            generate_kaze_agent_bootstrap(entry_path, &entry_bytes)?
+        } else {
+            crate::bundler::bundle(entry_path, &crate::npm::npm_resolve)
+                .map_err(|e| err("E_BUNDLE", format!("{entry}: {e}")))?
+        };
 
         /* 2. Compile the bundle. A bare QuickJS runtime is enough: this only has
          *    to parse, so booting the engine here would buy nothing. */
@@ -1330,6 +1334,197 @@ fn adhoc_sign(path: &str) -> Result<bool, CompileError> {
             format!("cannot run codesign ({e}) — the artifact would be killed on launch"),
         )),
     }
+}
+
+fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result<String, CompileError> {
+    let kaze_src = String::from_utf8(kaze_bytes.to_vec())
+        .map_err(|e| err("E_KAZE_SRC", format!("{}: not valid UTF-8: {e}", entry_path.display())))?;
+
+    crate::sfs::check_source(&kaze_src, &entry_path.to_string_lossy())
+        .map_err(|e| err("E_KAZE_CHECK", e.render()))?;
+
+    let file_stem = entry_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("agent");
+
+    let declared_grants: Vec<String> = kaze_src
+        .lines()
+        .find(|l| l.trim_start().starts_with("needs:"))
+        .map(|l| {
+            l.trim_start()["needs:".len()..]
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let grants_json = serde_json::to_string(&declared_grants).unwrap_or_else(|_| "[]".to_string());
+
+    let kaze_source_json = serde_json::to_string(&kaze_src).unwrap_or_else(|_| "\"\"".to_string());
+    let kaze_name_json = serde_json::to_string(file_stem).unwrap_or_else(|_| "\"agent\"".to_string());
+
+    let bootstrap = format!(r#"
+(function() {{
+    var kazeSource = {kaze_source_json};
+    var kazeName = {kaze_name_json};
+    var defaultGrants = {grants_json};
+
+    var argv = (typeof process !== 'undefined' && process.argv) ? process.argv.slice(2) : [];
+    if (argv.indexOf('--help') !== -1 || argv.indexOf('-h') !== -1) {{
+        console.log("Usage: " + kazeName + " [options] [query]\n\nAutonomous AI Agent powered by Kaze & Sofuu.\n\nOptions:\n  -i, --interactive    Launch interactive Agent TUI shell\n  --arg key=val        Pass named argument\n  --cap <name>         Grant capability backend\n  --entry <name>       Routine to execute\n  --fuel <n>           Instruction budget\n  -h, --help           Show help\n");
+        return;
+    }}
+
+    var isInteractive = argv.indexOf('--interactive') !== -1 || argv.indexOf('-i') !== -1;
+    var entryRoutine = null;
+    var fuel = 200000;
+    var args = {{}};
+    var positionals = [];
+
+    for (var i = 0; i < argv.length; i++) {{
+        var a = argv[i];
+        if (a === '--interactive' || a === '-i') continue;
+        if (a === '--entry' && i + 1 < argv.length) {{
+            entryRoutine = argv[++i];
+        }} else if (a.startsWith('--cap')) {{
+            var capVal = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
+            if (capVal) defaultGrants.push(capVal.split('=')[0].trim());
+        }} else if (a.startsWith('--arg')) {{
+            var pair = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
+            if (pair) {{
+                var eq = pair.indexOf('=');
+                if (eq > 0) {{
+                    var k = pair.slice(0, eq).trim();
+                    var v = pair.slice(eq + 1).trim();
+                    try {{ args[k] = JSON.parse(v); }} catch (_) {{ args[k] = v; }}
+                }}
+            }}
+        }} else if (a.startsWith('--fuel=') || (a === '--fuel' && i + 1 < argv.length)) {{
+            fuel = parseInt(a.indexOf('=') !== -1 ? a.slice(7) : argv[++i], 10) || 200000;
+        }} else if (!a.startsWith('-')) {{
+            positionals.push(a);
+        }}
+    }}
+
+    var isTTY = typeof process !== 'undefined' && process.stdout && process.stdout.isTTY;
+    if (isInteractive || (positionals.length === 0 && Object.keys(args).length === 0 && isTTY)) {{
+        launchInteractiveTUI();
+    }} else {{
+        runHeadless();
+    }}
+
+    function badge(type, text) {{
+        var colorMap = {{
+            'AGENT': '\x1b[36m',
+            'AI': '\x1b[35m',
+            'TOOL': '\x1b[33m',
+            'POLICY': '\x1b[34m',
+            'MEMORY': '\x1b[36m',
+            'STEP': '\x1b[90m',
+            'VERDICT': '\x1b[1m',
+            'RESULT': '\x1b[32m',
+            'STATUS': '\x1b[90m',
+            'INFO': '\x1b[36m',
+            'WARN': '\x1b[33m',
+            'ERROR': '\x1b[31m'
+        }};
+        var col = colorMap[type] || '\x1b[1m';
+        console.log(col + '[' + type + ']\x1b[0m ' + text);
+    }}
+
+    function runHeadless() {{
+        if (positionals.length > 0 && Object.keys(args).length === 0) {{
+            var combined = positionals.join(' ');
+            args['query'] = combined;
+            args['prompt'] = combined;
+            args['input'] = combined;
+            args['ticker'] = positionals[0];
+            if (positionals.length > 1) {{
+                args['signal'] = positionals[1];
+            }}
+        }}
+
+        var opts = {{ fuel: fuel, grants: defaultGrants }};
+        if (entryRoutine) opts.entry = entryRoutine;
+
+        var res = sofuu.kaze.run(kazeSource, args, opts);
+        if (!res.ok) {{
+            console.error("\x1b[31m[Agent Error]\x1b[0m " + (res.error || res.code));
+            if (typeof process !== 'undefined' && process.exit) process.exit(1);
+            return;
+        }}
+
+        badge('AGENT', kazeName + " :: " + res.entry);
+        if (res.actions && res.actions.length > 0) {{
+            for (var j = 0; j < res.actions.length; j++) {{
+                var act = res.actions[j];
+                if (act.indexOf('ai.') !== -1) badge('AI', act);
+                else if (act.indexOf('tool.') !== -1) badge('TOOL', act);
+                else if (act.indexOf('policy.') !== -1) badge('POLICY', act);
+                else if (act.indexOf('memory.') !== -1) badge('MEMORY', act);
+                else badge('STEP', act);
+            }}
+        }}
+        if (res.logs && res.logs.length > 0) {{
+            for (var k = 0; k < res.logs.length; k++) {{
+                var l = res.logs[k];
+                badge(l.level.toUpperCase(), l.message);
+            }}
+        }}
+        if (res.verdict) {{
+            if (res.verdict.allow) {{
+                badge('VERDICT', "\x1b[32mALLOW\x1b[0m " + res.verdict.reason);
+            }} else {{
+                badge('VERDICT', "\x1b[31mREJECT\x1b[0m " + res.verdict.reason);
+            }}
+        }} else if (res.value && res.value !== 'nothing') {{
+            badge('RESULT', res.value);
+        }}
+        console.log("\x1b[90m" + (res.instructions || 0) + " instructions · " + (res.fuelUsed || 0) + " fuel\x1b[0m");
+    }}
+
+    function launchInteractiveTUI() {{
+        badge('AGENT', "Online: " + kazeName);
+        badge('STATUS', "Ready for multi-turn task input. Type a prompt or 'exit'.");
+
+        if (typeof sofuu !== 'undefined' && sofuu.agent && sofuu.agent.interact) {{
+            var agentProxy = {{
+                name: kazeName,
+                run: async function(prompt) {{
+                    var runArgs = Object.assign({{}}, args);
+                    runArgs['prompt'] = prompt;
+                    runArgs['query'] = prompt;
+                    runArgs['input'] = prompt;
+                    var opts = {{ fuel: fuel, grants: defaultGrants }};
+                    if (entryRoutine) opts.entry = entryRoutine;
+                    var res = sofuu.kaze.run(kazeSource, runArgs, opts);
+                    if (!res.ok) throw new Error(res.error || res.code);
+                    if (res.actions) {{
+                        for (var a = 0; a < res.actions.length; a++) {{
+                            var act = res.actions[a];
+                            if (act.indexOf('ai.') !== -1) badge('AI', act);
+                            else if (act.indexOf('tool.') !== -1) badge('TOOL', act);
+                            else if (act.indexOf('policy.') !== -1) badge('POLICY', act);
+                        }}
+                    }}
+                    if (res.verdict) {{
+                        return (res.verdict.allow ? "VERDICT ALLOW: " : "VERDICT REJECT: ") + res.verdict.reason;
+                    }}
+                    return res.value;
+                }}
+            }};
+            sofuu.agent.interact(agentProxy, {{ title: kazeName }}).catch(function(err) {{
+                console.error(err);
+            }});
+        }} else {{
+            runHeadless();
+        }}
+    }}
+}})();
+"#);
+
+    Ok(bootstrap)
 }
 
 /* ------------------------------------------------------------------ */

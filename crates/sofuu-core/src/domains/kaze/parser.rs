@@ -432,7 +432,7 @@ impl Parser {
             _ => return self.expr(),
         };
         match word.as_str() {
-            "log" => {
+            "log" if !matches!(self.peek_at(1), Tok::Punct('.')) => {
                 self.bump();
                 let level = match self.peek().clone() {
                     Tok::Ident(w) if ["info", "warn", "warning", "error", "debug"].contains(&w.as_str()) => {
@@ -464,7 +464,9 @@ impl Parser {
             }
             "reject" => {
                 self.bump();
-                self.expect_word("with")?;
+                if matches!(self.peek(), Tok::Ident(w) if w == "with") {
+                    self.bump();
+                }
                 let reason = self.expr()?;
                 Ok(Expr::Call { recv: "policy".into(), op: "reject".into(), args: vec![reason], line })
             }

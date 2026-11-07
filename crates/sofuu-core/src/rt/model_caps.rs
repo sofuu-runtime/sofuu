@@ -150,7 +150,7 @@ fn inspect_gguf_caps(path: &str) -> Option<ModelCaps> {
         .or_else(|| gguf.get_u32("context_length"))
         .or_else(|| gguf.get_u32("context_window"));
     if ctx_u32.is_none() {
-        for (k, _) in &gguf.metadata {
+        for k in gguf.metadata.keys() {
             if k.ends_with(".context_length") || k.ends_with(".context_window") {
                 if let Some(val) = gguf.get_u32(k) {
                     ctx_u32 = Some(val);
@@ -206,7 +206,7 @@ pub fn lookup(model: Option<&str>) -> ModelCaps {
         return NO_CAPS;
     }
     let cleaned = crate::infer::clean_model_path(raw);
-    let is_gguf = cleaned.extension().map_or(false, |e| e == "gguf")
+    let is_gguf = cleaned.extension().is_some_and(|e| e == "gguf")
         || raw.ends_with(".gguf");
     if is_gguf {
         if let Some(caps) = inspect_gguf_caps(raw) {
@@ -244,7 +244,7 @@ pub fn lookup(model: Option<&str>) -> ModelCaps {
 /// provider-agnostic and strips completion suffixes.
 pub fn lookup_for(model: Option<&str>, base_url: Option<&str>) -> ModelCaps {
     let reg = lookup(model);
-    if model.map_or(false, |m| m.contains(".gguf")) {
+    if model.is_some_and(|m| m.contains(".gguf")) {
         return reg;
     }
     let Some(url) = base_url else { return reg };

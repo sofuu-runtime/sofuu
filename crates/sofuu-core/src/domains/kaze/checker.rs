@@ -321,7 +321,7 @@ fn known_ops(family: &str) -> String {
         "arm", "takeoff", "land", "rtl", "hold", "goto", "stop", "telemetry", "forward", "backward",
         "turn_left", "turn_right", "temperature", "humidity", "distance", "front_distance", "read",
         "set_relay", "set_duty", "pulse", "read_gpio", "save", "recall", "detects", "allow", "reject", "info",
-        "warn", "error", "debug", "send",
+        "warn", "error", "debug", "send", "prompt", "complete", "classify", "call", "run",
     ] {
         if caps::known_op(family, op) {
             names.push(op);
@@ -332,6 +332,8 @@ fn known_ops(family: &str) -> String {
 
 fn capability_result(family: &str, op: &str) -> Ty {
     match (family, op) {
+        ("ai", "prompt") | ("ai", "complete") | ("ai", "classify") => Ty::Str,
+        ("tool", "call") | ("tool", "run") => Ty::Str,
         ("policy", "detects") | ("policy", "detect") => Ty::Bool,
         ("memory", "recall") => Ty::List,
         ("sensor", "temperature")
@@ -353,7 +355,7 @@ fn bin_result(op: BinOp, lt: Ty, rt: Ty) -> Ty {
     use BinOp::*;
     match op {
         Add | Sub | Mul | Div | Mod => {
-            if lt == Ty::Str && rt == Ty::Str && op == Add {
+            if (lt == Ty::Str || rt == Ty::Str) && op == Add {
                 return Ty::Str;
             }
             let unit = match (lt, rt) {

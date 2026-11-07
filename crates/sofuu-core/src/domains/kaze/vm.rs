@@ -16,7 +16,7 @@
 // controller, a silently-wrong number is worse than a stopped run.
 
 use crate::sfs::arena::{fmt_num, Arena};
-use crate::sfs::caps::CapHost;
+use crate::sfs::caps::{self, CapHost};
 use crate::sfs::isa::{field_a, opcode, Const, ItemCode, Module, Op};
 use crate::sfs::value::{Heap, Value};
 
@@ -387,6 +387,24 @@ impl<'a> Vm<'a> {
                 })?;
                 Ok(Value::Str(r))
             }
+            (Value::Str(x), other) => {
+                let text = format!("{}{}", self.arena.get(x), caps::render_value(other, &self.arena, &self.heap));
+                let r = self.arena.alloc(&text).map_err(|e| VmError {
+                    code: "E_KAZE_MEMORY",
+                    msg: e,
+                    line,
+                })?;
+                Ok(Value::Str(r))
+            }
+            (other, Value::Str(y)) => {
+                let text = format!("{}{}", caps::render_value(other, &self.arena, &self.heap), self.arena.get(y));
+                let r = self.arena.alloc(&text).map_err(|e| VmError {
+                    code: "E_KAZE_MEMORY",
+                    msg: e,
+                    line,
+                })?;
+                Ok(Value::Str(r))
+            }
             (a, b) => Err(VmError {
                 code: "E_KAZE_TYPE",
                 msg: format!("cannot add {} to {}", a.type_name(), b.type_name()),
@@ -588,7 +606,7 @@ impl<'a> Vm<'a> {
         if cap.family == "policy" && cap.op == "reject" {
             let reason = match args.first() {
                 Some(Value::Str(s)) => self.arena.get(*s).to_string(),
-                other => other.map(|v| render(&v, &self.arena, &self.heap)).unwrap_or_default(),
+                other => other.map(|v| render(v, &self.arena, &self.heap)).unwrap_or_default(),
             };
             self.verdict = Some(Verdict::Reject(reason));
             self.push(Value::Unit, line)?;

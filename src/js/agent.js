@@ -6935,11 +6935,32 @@
       console.log('\n' + c.dim + '─── ' + steps + ' steps · ' + tools + ' tool calls · ' + tokens + ' tokens' + stopped + ' ───' + c.reset);
     }
 
+    function badge(type, text) {
+      if (quiet || isJson) return;
+      var colorMap = {
+        'AGENT': c.cyan,
+        'AI': c.magenta,
+        'TOOL': c.yellow,
+        'POLICY': c.blue,
+        'MEMORY': c.cyan,
+        'STEP': c.dim,
+        'VERDICT': c.bold,
+        'RESULT': c.green,
+        'STATUS': c.dim,
+        'INFO': c.cyan,
+        'WARN': c.yellow,
+        'ERROR': c.red,
+      };
+      var col = colorMap[type] || c.bold;
+      console.log(col + '[' + type + ']' + c.reset + ' ' + text);
+    }
+
     return {
       onStep: onStep,
       onApproval: onApproval,
       renderAnswer: renderAnswer,
       renderSummary: renderSummary,
+      badge: badge,
       colors: c,
     };
   }

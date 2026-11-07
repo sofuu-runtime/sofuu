@@ -856,4 +856,41 @@ mod tests {
         let out = vm.run_item(item, &[]).unwrap();
         assert_eq!(out, value::Value::Num(10.0));
     }
+
+    #[test]
+    fn a_pure_kaze_ai_agent_executes_end_to_end() {
+        let src = r#"needs: ai, tool, memory, policy, log
+
+filter evaluate_trade(ticker, signal, leverage, price):
+    log.info("Analyzing signal for " + ticker)
+    if policy detects secrets in ticker:
+        reject "leaked secrets in ticker symbol"
+    if leverage > 3:
+        reject "excessive leverage"
+    let reasoning = ai.prompt("Evaluate " + ticker + " with signal=" + signal)
+    remember ticker + "_eval" as reasoning
+    let order_status = tool.call("execute", ticker + ":" + signal)
+    log.info("Tool output: " + order_status)
+    allow reasoning
+"#;
+        let mut sim = SimState::default();
+        sim.ai_responses.push(("NVDA".to_string(), "Bullish momentum: target $160".to_string()));
+        sim.tool_responses.push(("execute".to_string(), "FILLED at $145.20".to_string()));
+
+        let mut args = serde_json::Map::new();
+        args.insert("ticker".into(), serde_json::json!("NVDA"));
+        args.insert("signal".into(), serde_json::json!("BUY"));
+        args.insert("leverage".into(), serde_json::json!(2));
+        args.insert("price".into(), serde_json::json!(145));
+
+        let opts = RunOptions { args, sim, ..Default::default() };
+        let report = run_source(src, "<test_agent>", &opts).expect("agent runs cleanly");
+
+        assert_eq!(report.entry, "evaluate_trade");
+        assert_eq!(report.verdict, Some(Verdict::Allow("\"Bullish momentum: target $160\"".to_string())));
+        assert!(report.actions.iter().any(|a| a.contains("ai.prompt")));
+        assert!(report.actions.iter().any(|a| a.contains("tool.call")));
+        assert!(report.actions.iter().any(|a| a.contains("memory.save")));
+        assert_eq!(report.logs.len(), 2);
+    }
 }

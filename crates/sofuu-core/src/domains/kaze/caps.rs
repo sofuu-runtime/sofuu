@@ -16,11 +16,17 @@ use crate::sfs::value::{Heap, Value};
 
 /// Capability families the language knows. Anything else written in `needs:`
 /// or before a dot is a **device instance name** (`fan`, `mister`, `lidar`).
-pub const FAMILIES: &[&str] = &["drone", "rover", "sensor", "device", "memory", "policy", "log", "alert"];
+pub const FAMILIES: &[&str] = &[
+    "drone", "rover", "sensor", "device", "memory", "policy", "log", "alert", "ai", "tool",
+];
 
 /// Instance names that are common enough to be worth resolving to a family
 /// instead of falling back to `device`.
 pub const ALIASES: &[(&str, &str)] = &[
+    ("tools", "tool"),
+    ("agent", "ai"),
+    ("model", "ai"),
+    ("llm", "ai"),
     ("lidar", "sensor"),
     ("camera", "sensor"),
     ("thermostat", "sensor"),
@@ -88,6 +94,9 @@ pub fn op_arity(family: &str, op: &str) -> Option<(usize, usize)> {
         ("policy", "reject") => Some((1, 1)),
         ("log", "info" | "warn" | "error" | "debug") => Some((1, 1)),
         ("alert", "send") => Some((1, 1)),
+        ("ai", "prompt" | "complete") => Some((1, 1)),
+        ("ai", "classify") => Some((2, 2)),
+        ("tool", "call" | "run") => Some((1, 2)),
         _ => None,
     }
 }
@@ -140,6 +149,8 @@ pub struct SimState {
     /// pretending a duty cycle was written.
     pub duties: Vec<(String, f64)>,
     pub memory: Vec<(String, String)>,
+    pub ai_responses: Vec<(String, String)>,
+    pub tool_responses: Vec<(String, String)>,
 }
 
 impl Default for SimState {
@@ -159,6 +170,8 @@ impl Default for SimState {
             relays: Vec::new(),
             duties: Vec::new(),
             memory: Vec::new(),
+            ai_responses: Vec::new(),
+            tool_responses: Vec::new(),
         }
     }
 }
@@ -177,6 +190,16 @@ impl SimState {
                 .ok_or_else(|| format!("--sim expects key=value, got '{}'", pair))?;
             let key = k.trim();
             let raw = v.trim();
+            if key == "ai" || key.starts_with("ai:") {
+                let pat = if key == "ai" { "*" } else { key.strip_prefix("ai:").unwrap_or("*") };
+                self.ai_responses.push((pat.to_string(), raw.to_string()));
+                continue;
+            }
+            if key == "tool" || key.starts_with("tool:") {
+                let pat = if key == "tool" { "*" } else { key.strip_prefix("tool:").unwrap_or("*") };
+                self.tool_responses.push((pat.to_string(), raw.to_string()));
+                continue;
+            }
             let numeric = |raw: &str| -> Result<f64, String> {
                 raw.parse::<f64>()
                     .map_err(|_| format!("--sim {}: '{}' is not a number", key, raw))
@@ -197,6 +220,29 @@ impl SimState {
             }
         }
         Ok(())
+    }
+
+    pub fn ai_reply(&self, prompt: &str) -> String {
+        for (pattern, resp) in &self.ai_responses {
+            if pattern == "*" || prompt.to_lowercase().contains(&pattern.to_lowercase()) {
+                return resp.clone();
+            }
+        }
+        let brief = if prompt.len() > 60 {
+            format!("{}...", &prompt[..60])
+        } else {
+            prompt.to_string()
+        };
+        format!("Synthesized autonomous decision for: \"{}\"", brief)
+    }
+
+    pub fn tool_exec(&self, name: &str, arg: &str) -> String {
+        for (n, resp) in &self.tool_responses {
+            if n == "*" || n.eq_ignore_ascii_case(name) {
+                return resp.clone();
+            }
+        }
+        format!("OK: tool '{}' executed ({})", name, arg)
     }
 
     fn drain(&mut self, amount: f64) {
@@ -484,6 +530,38 @@ impl CapHost for SimHost {
                 Ok(Value::Unit)
             }
             ("alert", "send") => Ok(Value::Unit),
+            ("ai", "prompt") | ("ai", "complete") => {
+                let prompt = str_at(args, 0, arena);
+                let reply = self.state.ai_reply(&prompt);
+                let r = arena.alloc(&reply).map_err(|e| format!("E_KAZE_MEMORY: {}", e))?;
+                Ok(Value::Str(r))
+            }
+            ("ai", "classify") => {
+                let text = str_at(args, 0, arena);
+                let mut best = "general".to_string();
+                if let Some(Value::Arr(arr_idx)) = args.get(1) {
+                    if let Some(items) = heap.array(*arr_idx) {
+                        for item in items {
+                            if let Value::Str(s) = item {
+                                let cat = arena.get(*s);
+                                if text.to_lowercase().contains(&cat.to_lowercase()) {
+                                    best = cat.to_string();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                let r = arena.alloc(&best).map_err(|e| format!("E_KAZE_MEMORY: {}", e))?;
+                Ok(Value::Str(r))
+            }
+            ("tool", "call") | ("tool", "run") => {
+                let name = str_at(args, 0, arena);
+                let arg_str = args.get(1).map(|v| render_value(*v, arena, heap)).unwrap_or_default();
+                let output = self.state.tool_exec(&name, &arg_str);
+                let r = arena.alloc(&output).map_err(|e| format!("E_KAZE_MEMORY: {}", e))?;
+                Ok(Value::Str(r))
+            }
             _ => Err(format!("{} is not a capability this host knows", family)),
         };
         let rendered = match &result {

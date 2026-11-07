@@ -595,10 +595,40 @@ if (!report.verdict.allow) {
 }
 ```
 
-Scripting language reference: [docs/KAZE-SPEC.md](docs/KAZE-SPEC.md) · examples:
-[`examples/kaze/`](examples/kaze/) — the shipped scripts, plus
-[`patrol_tool.mjs`](examples/kaze/patrol_tool.mjs), which wires a Kaze script
-into an agent tool with `import { defineTool, kaze } from "sofuu"`.
+### Pure Kaze AI Agents & Direct Native Compilation
+
+You can also program entire autonomous AI agents **100% in pure Kaze** without writing any JavaScript or TypeScript, and compile them directly into standalone native binaries:
+
+```kaze
+# quant_sentinel.kaze — Autonomous High-Frequency Trading Risk Agent
+needs: ai, tool, memory, policy, alert, log
+
+filter pre_trade_risk(leverage, target_asset):
+    if leverage > 3:
+        reject "Hard Risk Breach: leverage exceeds 3x cap"
+    if policy detects secrets in target_asset:
+        reject "Data Leak: asset identifier contains sensitive key"
+    allow target_asset
+
+action run_market_sentinel(query):
+    remember query as "current_regime"
+    let thesis = ai.prompt("Generate macro trade thesis for: " + query)
+    log.info("AI Thesis: " + thesis)
+    let book = tool.call("orderbook", "fetch")
+    let decision = ai.complete("Synthesize execution advice: " + book)
+    send alert "Sentinel cycle complete"
+    return decision
+```
+
+Compile directly into a standalone single-file binary with live TUI badges:
+
+```bash
+sofuu compile quant_sentinel.kaze -o dist/quant-sentinel
+./dist/quant-sentinel "Analyze morning liquidity shift"
+```
+
+Scripting language reference: [docs/KAZE-SPEC.md](docs/KAZE-SPEC.md) · standalone compiler: [docs/COMPILER.md](docs/COMPILER.md) · examples:
+[`examples/kaze/`](examples/kaze/) and [`examples/agents/`](examples/agents/) (Fintech `quant_sentinel`, Healthcare `med_protocol`, Agri-Tech `agri_sentinel`).
 
 ---
 
@@ -615,7 +645,7 @@ sofuu eval "<code>"          # Evaluate a JS expression inline
 sofuu script run|check|compile|repl <file.kaze> # Kaze device scripting (--cap drone=sim --fuel 200000)
 sofuu drone observe|status|send|mission|why|init # [Experimental - Preview] Fly vehicle through R7 hardware safety gate
 sofuu bundle <entry.js> [-o <out.js>]  # Bundle into one file
-sofuu compile <entry.ts> [-o <out>]    # Standalone single-file binary (--lean [default ~4.5M], --micro/--mcp [~2.05M], --full, --base <path>, --embed-brain)
+sofuu compile <entry.ts|kaze> [-o <out>] # Standalone single-file binary (--lean [default ~4.5M], --micro/--mcp [~2.05M], --full, --base <path>, --embed-brain)
 sofuu install / add <package>          # npm packages
 sofuu agent init <name> | validate <f> # Scaffold and dry-run validate agent definitions
 sofuu agent list                       # List agent definitions (~/.sofuu/agents/*.js)

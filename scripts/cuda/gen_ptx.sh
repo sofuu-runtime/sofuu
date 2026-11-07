@@ -24,6 +24,8 @@ ENTRIES=(
     sofuu_gemv_q4_k
     sofuu_gemv_q6_k
     sofuu_gemv_f32
+    sofuu_quantize_q8_1
+    sofuu_gemv_q4_k_q8
     sofuu_rmsnorm
     sofuu_swiglu
     sofuu_rope_f32

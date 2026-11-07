@@ -116,6 +116,48 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_f16_to_f32(unsigned short h) {
 }
 #endif
 
+// ── Quantized-activation dot primitives ────────────────────────────────────
+// The weights are int4/int6 and the activations are int8 (q8_1: one scale and
+// one integer sum per 32 values). dp4a accumulates four int8 products into an
+// int32 in one instruction, which replaces the per-value convert + FMA chain.
+// The host build emulates it so the CPU parity gate covers the same algebra.
+static SOFUU_DEVICE SOFUU_INLINE int sofuu_dp4a(int a, int b, int c) {
+#if defined(SOFUU_CUDA_HOST)
+    int sum = c;
+    for (int k = 0; k < 4; ++k) {
+        int av = (int)(signed char)((a >> (8 * k)) & 0xff);
+        int bv = (int)(signed char)((b >> (8 * k)) & 0xff);
+        sum += av * bv;
+    }
+    return sum;
+#else
+    int r;
+    __asm__("dp4a.s32.s32 %0, %1, %2, %3;"
+            : "=r"(r)
+            : "r"(a), "r"(b), "r"(c));
+    return r;
+#endif
+}
+
+// Round to nearest even, the same mode the activation quantizer relies on.
+static SOFUU_DEVICE SOFUU_INLINE int sofuu_round_int(float v) {
+#if defined(SOFUU_CUDA_HOST)
+    return (int)lrintf(v);
+#else
+    int r;
+    __asm__("cvt.rni.s32.f32 %0, %1;" : "=r"(r) : "f"(v));
+    return r;
+#endif
+}
+
+static SOFUU_DEVICE SOFUU_INLINE float sofuu_absf(float v) {
+    return v < 0.0f ? -v : v;
+}
+
+static SOFUU_DEVICE SOFUU_INLINE float sofuu_maxf(float a, float b) {
+    return a > b ? a : b;
+}
+
 // ── q4_K scale/min expansion (bit-identical to src/simd/infer_kernels.cpp) ─
 static SOFUU_DEVICE SOFUU_INLINE void sofuu_q4k_scale_min(
     int j, const unsigned char *q, unsigned int *sc, unsigned int *mn) {
@@ -225,6 +267,38 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_shfl_down(float v, int delta,
                      : "f"(v), "r"(delta), "r"(mask));
     return r;
 }
+// Butterfly shuffle: every lane converges on the same reduction, which is what
+// the q8_1 quantizer needs (each lane scales and rounds its own value).
+static SOFUU_DEVICE SOFUU_INLINE float sofuu_shfl_xor_f(float v, int lanemask) {
+    float r;
+    __asm__ volatile("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;"
+                     : "=f"(r)
+                     : "f"(v), "r"(lanemask));
+    return r;
+}
+static SOFUU_DEVICE SOFUU_INLINE int sofuu_shfl_xor_i(int v, int lanemask) {
+    int r;
+    __asm__ volatile("shfl.sync.bfly.b32 %0, %1, %2, 0x1f, 0xffffffff;"
+                     : "=r"(r)
+                     : "r"(v), "r"(lanemask));
+    return r;
+}
+static SOFUU_DEVICE SOFUU_INLINE float sofuu_warp_max_f(float v) {
+    v = sofuu_maxf(v, sofuu_shfl_xor_f(v, 16));
+    v = sofuu_maxf(v, sofuu_shfl_xor_f(v, 8));
+    v = sofuu_maxf(v, sofuu_shfl_xor_f(v, 4));
+    v = sofuu_maxf(v, sofuu_shfl_xor_f(v, 2));
+    v = sofuu_maxf(v, sofuu_shfl_xor_f(v, 1));
+    return v;
+}
+static SOFUU_DEVICE SOFUU_INLINE int sofuu_warp_sum_i(int v) {
+    v += sofuu_shfl_xor_i(v, 16);
+    v += sofuu_shfl_xor_i(v, 8);
+    v += sofuu_shfl_xor_i(v, 4);
+    v += sofuu_shfl_xor_i(v, 2);
+    v += sofuu_shfl_xor_i(v, 1);
+    return v;
+}
 static SOFUU_DEVICE SOFUU_INLINE void sofuu_bar_sync(void) {
     __asm__ volatile("bar.sync 0;");
 }
@@ -287,9 +361,34 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_q4k_dot8(
     return acc;
 }
 
+// q4_K sub-block dot against q8_1 activations. `xrow` is the token's q8 row
+// (int8), `sx`/`isum` are that q8 block's scale and integer sum. The min term
+// is contributed by one lane per sub-block (l0 == 0) from the precomputed
+// 32-value sum, so the four lanes of a sub-block do not each need it.
+static SOFUU_DEVICE SOFUU_INLINE float sofuu_q4k_dot8_q8(
+    const sofuu_block_q4_K *blk, const signed char *xrow, int sub, int l0,
+    float sx, int isum) {
+    unsigned int sc, mn;
+    sofuu_q4k_scale_min(sub, blk->scales, &sc, &mn);
+    float s = sofuu_f16_to_f32(blk->d) * (float)sc;
+    float m = sofuu_f16_to_f32(blk->dmin) * (float)mn;
+    unsigned long long qv = *reinterpret_cast<const unsigned long long *>(
+        blk->qs + (sub >> 1) * 32 + l0);
+    unsigned long long xv = *reinterpret_cast<const unsigned long long *>(
+        xrow + sub * 32 + l0);
+    const unsigned int mask = 0x0f0f0f0fu;
+    unsigned int q0 = (unsigned int)qv, q1 = (unsigned int)(qv >> 32);
+    unsigned int a0 = (sub & 1) ? ((q0 >> 4) & mask) : (q0 & mask);
+    unsigned int a1 = (sub & 1) ? ((q1 >> 4) & mask) : (q1 & mask);
+    unsigned int x0 = (unsigned int)xv, x1 = (unsigned int)(xv >> 32);
+    int dot = sofuu_dp4a(a0, x0, sofuu_dp4a(a1, x1, 0));
+    float part = sx * s * (float)dot;
+    if (l0 == 0) part -= sx * m * (float)isum;
+    return part;
+}
+
 static SOFUU_DEVICE SOFUU_INLINE float sofuu_q6k_dot8(
-    const sofuu_block_q6_K *b, int sub, int l0, const float *xr) {
-    int n = sub >> 2;
+    const sofuu_block_q6_K *b, int sub, int l0, const float *xr) {    int n = sub >> 2;
     int r = sub & 3;
     float d = sofuu_f16_to_f32(b->d);
     int sbase = n * 8 + 2 * r;
@@ -444,6 +543,74 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 6) void sofuu_gemv_q4_k(con
         const sofuu_block_q4_K *b =
             (const sofuu_block_q4_K *)(roww + (unsigned long long)bi * 144);
         acc += sofuu_q4k_dot8(b, sub, l0, xr);
+    }
+    float total = sofuu_warp_sum(acc);
+    if (lane == 0) y[row] = total;
+}
+
+// ── q8_1 activation quantization ───────────────────────────────────────────
+// One warp per 32-value block: amax -> d = amax/127, q = round(x/d), and the
+// integer sum the q4_K min term needs. The butterfly reduction leaves every
+// lane with the block max, so each lane rounds its own value without a
+// broadcast.
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
+void sofuu_quantize_q8_1(const float *__restrict__ x, signed char *__restrict__ q,
+                         float *__restrict__ d, int *__restrict__ s, int n) {
+    unsigned int tid = sofuu_tid_x();
+    int warp = (int)(tid >> 5);
+    int lane = (int)(tid & 31u);
+    int block = (int)sofuu_ctaid_x() * 8 + warp;
+    int base = block * 32;
+    if (base >= n) return;
+    float v = x[base + lane];
+    float amax = sofuu_warp_max_f(sofuu_absf(v));
+    float scale = amax > 0.0f ? amax / 127.0f : 0.0f;
+    float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    int qi = sofuu_round_int(v * inv);
+    qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
+    q[base + lane] = (signed char)qi;
+    int sum = sofuu_warp_sum_i(qi);
+    if (lane == 0) {
+        d[block] = scale;
+        s[block] = sum;
+    }
+}
+
+// q4_K x q8_1: the decode row/lane mapping with the per-value convert + FMA
+// chain replaced by two dp4a per eight values. Two super-blocks stay in flight.
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 6)
+void sofuu_gemv_q4_k_q8(const unsigned char *__restrict__ w,
+                        const signed char *__restrict__ xq,
+                        const float *__restrict__ xd,
+                        const int *__restrict__ xs,
+                        float *__restrict__ y, int rows, int cols) {
+    unsigned int tid = sofuu_tid_x();
+    int warp = (int)(tid >> 5);
+    int lane = (int)(tid & 31u);
+    int row = (int)sofuu_ctaid_x() * 8 + warp;
+    if (row >= rows) return;
+    int nb = cols / SOFUU_QK_K;
+    const unsigned char *roww = w + (unsigned long long)row *
+                                     (unsigned long long)nb * SOFUU_Q4_K_BYTES;
+    int sub = lane >> 2;
+    int l0 = (lane & 3) << 3;
+    float acc = 0.0f;
+    int bi = 0;
+    for (; bi + 2 <= nb; bi += 2) {
+        const sofuu_block_q4_K *b0 =
+            (const sofuu_block_q4_K *)(roww + (unsigned long long)(bi + 0) * 144);
+        const sofuu_block_q4_K *b1 =
+            (const sofuu_block_q4_K *)(roww + (unsigned long long)(bi + 1) * 144);
+        int i0 = (bi + 0) * 8 + sub;
+        int i1 = (bi + 1) * 8 + sub;
+        acc += sofuu_q4k_dot8_q8(b0, xq + (bi + 0) * 256, sub, l0, xd[i0], xs[i0]);
+        acc += sofuu_q4k_dot8_q8(b1, xq + (bi + 1) * 256, sub, l0, xd[i1], xs[i1]);
+    }
+    for (; bi < nb; ++bi) {
+        const sofuu_block_q4_K *b =
+            (const sofuu_block_q4_K *)(roww + (unsigned long long)bi * 144);
+        int i0 = bi * 8 + sub;
+        acc += sofuu_q4k_dot8_q8(b, xq + bi * 256, sub, l0, xd[i0], xs[i0]);
     }
     float total = sofuu_warp_sum(acc);
     if (lane == 0) y[row] = total;
@@ -1048,6 +1215,47 @@ extern "C" float sofuu_host_q4_k_dot(const void *w, const float *x, int cols) {
         for (int sub = 0; sub < 8; ++sub)
             for (int l = 0; l < 32; ++l)
                 total += sofuu_q4k_value(b, sub, l, xb[sub * 32 + l]);
+    }
+    return total;
+}
+
+extern "C" void sofuu_host_quantize_q8_1(const float *x, signed char *q,
+                                         float *d, int *s, int n) {
+    for (int b = 0; b < n / 32; ++b) {
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            float a = sofuu_absf(x[b * 32 + i]);
+            if (a > amax) amax = a;
+        }
+        float scale = amax > 0.0f ? amax / 127.0f : 0.0f;
+        float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int sum = 0;
+        for (int i = 0; i < 32; ++i) {
+            int qi = sofuu_round_int(x[b * 32 + i] * inv);
+            qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
+            q[b * 32 + i] = (signed char)qi;
+            sum += qi;
+        }
+        d[b] = scale;
+        s[b] = sum;
+    }
+}
+
+extern "C" float sofuu_host_q4_k_dot_q8(const void *w, const signed char *xq,
+                                        const float *xd, const int *xs,
+                                        int cols) {
+    const unsigned char *p = (const unsigned char *)w;
+    int nb = cols / 256;
+    float total = 0.0f;
+    for (int bi = 0; bi < nb; ++bi) {
+        const sofuu_block_q4_K *b =
+            (const sofuu_block_q4_K *)(p + (unsigned long long)bi * 144);
+        for (int lane = 0; lane < 32; ++lane) {
+            int sub = lane >> 2;
+            int l0 = (lane & 3) << 3;
+            int i0 = bi * 8 + sub;
+            total += sofuu_q4k_dot8_q8(b, xq + bi * 256, sub, l0, xd[i0], xs[i0]);
+        }
     }
     return total;
 }

@@ -93,6 +93,12 @@ pub struct CudaModel {
     logits_dev: DeviceBuf,
     rope_dev: DeviceBuf,
 
+    // q8_1 activations for the dp4a GEMV path, sized for hidden_dim (the
+    // widest activation vector any q4_K projection consumes).
+    xq: DeviceBuf,
+    xd: DeviceBuf,
+    xsum: DeviceBuf,
+
     logits_host: Vec<f32>,
     logit_bytes: Vec<u8>,
     rope_host: Vec<f32>,
@@ -349,9 +355,13 @@ impl CudaModel {
             .n_layers
             .checked_mul(per_layer_kv)
             .ok_or_else(|| "KV layer total overflows".to_string())?;
-        // Scratch: the single-token row set plus the eight-row prefill set.
+        // Scratch: the single-token row set plus the eight-row prefill set,
+        // plus the q8_1 activation set (hidden int8 + two hidden/32 vectors).
         let single = 4 * dim + 2 * q_dim + 2 * kv_dim + 3 * cfg.hidden_dim;
-        let scratch = single + cfg.vocab_size + cfg.head_dim
+        let q8_scratch =
+            cfg.hidden_dim.max(dim).max(cfg.n_heads * cfg.head_dim) / 4
+                + cfg.hidden_dim.max(dim).max(cfg.n_heads * cfg.head_dim) / 16;
+        let scratch = single + cfg.vocab_size + cfg.head_dim + q8_scratch
             + PREFILL_BATCH * (single + cfg.head_dim);
         let need = weight_bytes
             .checked_add(2 * kv_total * 4)
@@ -390,6 +400,17 @@ impl CudaModel {
         let down = alloc_f32!(dim, "down");
         let logits_dev = alloc_f32!(cfg.vocab_size, "logits");
         let rope_dev = alloc_f32!(cfg.head_dim, "rope_table");
+
+        // q8_1 activation set: one int8 per value, one f32 scale and one i32
+        // integer sum per 32 values. Sized for the widest vector that any
+        // q4_K projection consumes.
+        let q8_values = cfg.hidden_dim.max(dim).max(q_dim);
+        let q8_blocks = q8_values / 32;
+        let xq = engine
+            .alloc(q8_values)
+            .map_err(|e| format!("q8 activations: allocate {q8_values} B: {e}"))?;
+        let xd = alloc_f32!(q8_blocks, "q8 scales");
+        let xsum = alloc_f32!(q8_blocks, "q8 sums");
 
         let xb = alloc_f32!(PREFILL_BATCH * dim, "x_batch");
         let x_norm_b = alloc_f32!(PREFILL_BATCH * dim, "x_norm_batch");
@@ -460,6 +481,9 @@ impl CudaModel {
             down,
             logits_dev,
             rope_dev,
+            xq,
+            xd,
+            xsum,
             logits_host: vec![0.0; cfg.vocab_size],
             logit_bytes: vec![0u8; cfg.vocab_size * 4],
             rope_host: vec![0.0; cfg.head_dim],
@@ -490,6 +514,39 @@ impl CudaModel {
     pub fn reset(&mut self) {
         // Every read is bounded by the next pos+1, so stale rows are invisible.
         self.pos = 0;
+    }
+
+    /// Quantize the activation set the dp4a GEMV path consumes. Lengths that
+    /// are not a multiple of 32 belong to non-q4_K consumers, which read the
+    /// f32 buffer instead, so they are a no-op here.
+    fn quantize_act(&self, e: &CudaEngine, src: DeviceBuf, n: usize) -> Result<(), String> {
+        if !n.is_multiple_of(32) {
+            return Ok(());
+        }
+        e.quantize_q8_1(src, self.xq, self.xd, self.xsum, n)
+            .map_err(|err| format!("quantize q8_1 ({n} values): {err}"))
+    }
+
+    /// GEMV that reads the q8_1 activations when the weight layout has a dp4a
+    /// kernel, and the f32-activation kernel otherwise. `x` is ignored on the
+    /// dp4a path, so the caller must quantize the matching buffer first.
+    fn gemv_act(
+        &self,
+        e: &CudaEngine,
+        quant: Quant,
+        w: DeviceBuf,
+        x: DeviceBuf,
+        y: DeviceBuf,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), String> {
+        if quant == Quant::Q4K {
+            e.gemv_q4_k_q8(w, self.xq, self.xd, self.xsum, y, rows, cols)
+                .map_err(|err| format!("gemv q4_K x q8_1: {err}"))
+        } else {
+            e.gemv(quant, w, x, y, rows, cols)
+                .map_err(|err| format!("gemv: {err}"))
+        }
     }
 
     /// Run one token. `x_host` is the embedding row (dim f32); `pos` is the
@@ -562,12 +619,39 @@ impl CudaModel {
             }
             e.rmsnorm(self.x, l.attn_norm, self.x_norm, self.dim, self.eps)
                 .map_err(|err| format!("layer {li} attn_norm: {err}"))?;
-            e.gemv(l.attn_q_quant, l.attn_q, self.x_norm, self.q, self.q_dim, self.dim)
-                .map_err(|err| format!("layer {li} attn_q: {err}"))?;
-            e.gemv(l.attn_k_quant, l.attn_k, self.x_norm, self.k, self.kv_dim, self.dim)
-                .map_err(|err| format!("layer {li} attn_k: {err}"))?;
-            e.gemv(l.attn_v_quant, l.attn_v, self.x_norm, self.v, self.kv_dim, self.dim)
-                .map_err(|err| format!("layer {li} attn_v: {err}"))?;
+            // q/k/v all read the same normed row, so quantize it once.
+            self.quantize_act(e, self.x_norm, self.dim)
+                .map_err(|err| format!("layer {li}: {err}"))?;
+            self.gemv_act(
+                e,
+                l.attn_q_quant,
+                l.attn_q,
+                self.x_norm,
+                self.q,
+                self.q_dim,
+                self.dim,
+            )
+            .map_err(|err| format!("layer {li} attn_q: {err}"))?;
+            self.gemv_act(
+                e,
+                l.attn_k_quant,
+                l.attn_k,
+                self.x_norm,
+                self.k,
+                self.kv_dim,
+                self.dim,
+            )
+            .map_err(|err| format!("layer {li} attn_k: {err}"))?;
+            self.gemv_act(
+                e,
+                l.attn_v_quant,
+                l.attn_v,
+                self.x_norm,
+                self.v,
+                self.kv_dim,
+                self.dim,
+            )
+            .map_err(|err| format!("layer {li} attn_v: {err}"))?;
 
             e.rope(
                 self.q,
@@ -622,7 +706,10 @@ impl CudaModel {
                 prof_us[0] += t_group.elapsed().as_micros();
                 t_group = std::time::Instant::now();
             }
-            e.gemv(
+            self.quantize_act(e, self.attn_out, self.q_dim)
+                .map_err(|err| format!("layer {li}: {err}"))?;
+            self.gemv_act(
+                e,
                 l.attn_output_quant,
                 l.attn_output,
                 self.attn_out,
@@ -642,7 +729,10 @@ impl CudaModel {
 
             e.rmsnorm(self.x, l.ffn_norm, self.x_norm, self.dim, self.eps)
                 .map_err(|err| format!("layer {li} ffn_norm: {err}"))?;
-            e.gemv(
+            self.quantize_act(e, self.x_norm, self.dim)
+                .map_err(|err| format!("layer {li}: {err}"))?;
+            self.gemv_act(
+                e,
                 l.ffn_gate_quant,
                 l.ffn_gate,
                 self.x_norm,
@@ -651,7 +741,8 @@ impl CudaModel {
                 self.dim,
             )
             .map_err(|err| format!("layer {li} ffn_gate: {err}"))?;
-            e.gemv(
+            self.gemv_act(
+                e,
                 l.ffn_up_quant,
                 l.ffn_up,
                 self.x_norm,
@@ -662,7 +753,10 @@ impl CudaModel {
             .map_err(|err| format!("layer {li} ffn_up: {err}"))?;
             e.swiglu(self.gate, self.up, self.act, self.hidden_dim)
                 .map_err(|err| format!("layer {li} swiglu: {err}"))?;
-            e.gemv(
+            self.quantize_act(e, self.act, self.hidden_dim)
+                .map_err(|err| format!("layer {li}: {err}"))?;
+            self.gemv_act(
+                e,
                 l.ffn_down_quant,
                 l.ffn_down,
                 self.act,
@@ -684,7 +778,12 @@ impl CudaModel {
         if compute_logits {
             e.rmsnorm(self.x, self.output_norm, self.x_norm, self.dim, self.eps)
                 .map_err(|err| format!("output_norm: {err}"))?;
-            e.gemv(
+            if self.output_quant == Quant::Q4K {
+                self.quantize_act(e, self.x_norm, self.dim)
+                    .map_err(|err| format!("lm_head: {err}"))?;
+            }
+            self.gemv_act(
+                e,
                 self.output_quant,
                 self.output,
                 self.x_norm,

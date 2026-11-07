@@ -126,6 +126,26 @@ void test_q4_k(uint32_t &seed) {
     }
 }
 
+// q4_K against q8_1 activations: the dp4a algebra must reproduce the exact
+// dot on the SAME quantized values (xd*xq). The reference dequantizes the
+// activation from q8 and accumulates in double.
+void test_q4_k_q8(uint32_t &seed) {
+    const int cols = 2048, rows = 4;
+    std::vector<uint8_t> w;
+    fill_q4_k(w, rows, cols, seed);
+    std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
+    std::vector<signed char> xq(cols);
+    std::vector<float> xd(cols / 32);
+    std::vector<int> xs(cols / 32);
+    sofuu_host_quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(), cols);
+    for (int r = 0; r < rows; ++r) {
+        const uint8_t *row = w.data() + (size_t)r * (cols / 256) * 144;
+        float got = sofuu_host_q4_k_dot_q8(row, xq.data(), xd.data(), xs.data(), cols);
+        check_dot("q4_k_x_q8", got,
+                  sofuu_ref::dot_q4_k_q8(row, xq.data(), xd.data(), xs.data(), cols));
+    }
+}
+
 void test_q6_k(uint32_t &seed) {
     const int cols = 2048, rows = 4;
     std::vector<uint8_t> w;
@@ -624,6 +644,7 @@ int main(void) {
     std::printf("Sofuu CUDA host kernel parity (SOFUU_CUDA_HOST)\n");
     test_q8_0(seed);
     test_q4_k(seed);
+    test_q4_k_q8(seed);
     test_q6_k(seed);
     test_zero_scale(seed);
     test_rmsnorm(seed);

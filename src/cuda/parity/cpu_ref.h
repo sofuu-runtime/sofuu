@@ -128,6 +128,61 @@ inline Dot dot_q4_k(const uint8_t *w, const float *x, int cols) {
     return {sum, l1};
 }
 
+// q8_1 activation quantization: one scale and one integer sum per 32 values.
+// d = amax/127, q = round(x/d) clamped to [-127, 127].
+inline void quantize_q8_1(const float *x, int8_t *q, float *d, int32_t *s,
+                          int n) {
+    for (int b = 0; b < n / 32; ++b) {
+        float amax = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            float a = std::fabs(x[b * 32 + i]);
+            if (a > amax) amax = a;
+        }
+        float scale = amax > 0.0f ? amax / 127.0f : 0.0f;
+        float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int32_t sum = 0;
+        for (int i = 0; i < 32; ++i) {
+            int qi = (int)std::lrint(x[b * 32 + i] * inv);
+            qi = qi > 127 ? 127 : (qi < -127 ? -127 : qi);
+            q[b * 32 + i] = (int8_t)qi;
+            sum += qi;
+        }
+        d[b] = scale;
+        s[b] = sum;
+    }
+}
+
+// The q4_K dot evaluated on the q8_1 activations (xd*xq), in double. This is
+// the algebra the dp4a kernel must reproduce; `xs` is part of the layout the
+// kernel consumes but not of the value.
+inline Dot dot_q4_k_q8(const uint8_t *w, const int8_t *xq, const float *xd,
+                       const int32_t *xs, int cols) {
+    (void)xs;
+    const BlockQ4_K *blocks = reinterpret_cast<const BlockQ4_K *>(w);
+    int nb = cols / 256;
+    double sum = 0.0, l1 = 0.0;
+    for (int b = 0; b < nb; ++b) {
+        double d = f16_to_f32(blocks[b].d);
+        double dmin = f16_to_f32(blocks[b].dmin);
+        for (int sub = 0; sub < 8; ++sub) {
+            uint8_t sc, mn;
+            get_scale_min_k4(sub, blocks[b].scales, &sc, &mn);
+            double s = d * (double)sc, m = dmin * (double)mn;
+            const uint8_t *qs = blocks[b].qs + (sub / 2) * 32;
+            int base = b * 256 + sub * 32;
+            double sx = (double)xd[base / 32];
+            for (int l = 0; l < 32; ++l) {
+                int qi = (sub & 1) ? (qs[l] >> 4) : (qs[l] & 0x0f);
+                double xv = sx * (double)xq[base + l];
+                double wv = s * (double)qi - m;
+                sum += wv * xv;
+                l1 += std::fabs(wv * xv);
+            }
+        }
+    }
+    return {sum, l1};
+}
+
 inline Dot dot_q6_k(const uint8_t *w, const float *x, int cols) {
     const BlockQ6_K *blocks = reinterpret_cast<const BlockQ6_K *>(w);
     int nb = cols / 256;

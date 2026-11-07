@@ -710,8 +710,14 @@ void bench_gemv_q8(const char *name, void *fn, int kind, int rows, int cols,
         ++g_failures;
         return;
     }
-    std::vector<void *> params = {&dw, &dq, &dd, &ds, &d16, &dy, (void *)&rows,
-                                  (void *)&cols};
+    // q4_K takes (w, xq, xd, xs, y, rows, cols) and q6_K adds xs16 before y --
+    // one parameter list cannot serve both, and getting it wrong writes through
+    // a misaligned argument (an illegal address, seen on the T4).
+    std::vector<void *> params = kind == 2
+        ? std::vector<void *>{&dw, &dq, &dd, &ds, &d16, &dy, (void *)&rows,
+                              (void *)&cols}
+        : std::vector<void *>{&dw, &dq, &dd, &ds, &dy, (void *)&rows,
+                              (void *)&cols};
     unsigned grid = (unsigned)((rows + 7) / 8);
     for (int i = 0; i < 3; ++i)
         if (!launch_async(fn, grid, 256, params)) return;
@@ -765,8 +771,15 @@ void bench_launch(void *fn, int n, int iters, const char *label) {
         return;
     }
     auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < iters; ++i)
+    for (int i = 0; i < iters; ++i) {
         if (!launch_async(fn, grid, 256, params)) return;
+        // Drain periodically: a full launch queue blocks cuLaunchKernel, which
+        // would time the driver's queue depth instead of the launch itself.
+        if ((i & 63) == 63 && sofuu_cuda_ctx_sync(g_ctx) != 0) {
+            fail_msg("launch bench sync");
+            return;
+        }
+    }
     if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
         fail_msg("launch bench sync");
         return;

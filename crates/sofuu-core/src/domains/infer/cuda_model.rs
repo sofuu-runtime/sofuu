@@ -485,6 +485,7 @@ impl CudaModel {
             xq,
             xd,
             xsum,
+            xsum16,
             logits_host: vec![0.0; cfg.vocab_size],
             logit_bytes: vec![0u8; cfg.vocab_size * 4],
             rope_host: vec![0.0; cfg.head_dim],

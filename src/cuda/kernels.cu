@@ -70,6 +70,15 @@ typedef struct __attribute__((aligned(16))) {
     float x, y, z, w;
 } sofuu_float4;
 
+// Four words, 16-byte aligned: the quantized-weight stream reads whole 128-bit
+// sectors, so one lane load is one `ld.global.v4.u32` instead of four 32-bit
+// loads or eight byte loads. A q4_K block is exactly 144 = 9 x 16 bytes, and
+// its 128-byte qs run starts at block+16, so every chunk of every block is
+// 16-byte aligned in the GGUF's native layout (no repacking needed).
+typedef struct __attribute__((aligned(16))) {
+    unsigned int w[4];
+} sofuu_u128;
+
 #define SOFUU_QK_Q8_0 32
 #define SOFUU_QK_K 256
 #define SOFUU_Q4_K_BYTES 144
@@ -156,6 +165,21 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_absf(float v) {
 
 static SOFUU_DEVICE SOFUU_INLINE float sofuu_maxf(float a, float b) {
     return a > b ? a : b;
+}
+
+static SOFUU_DEVICE SOFUU_INLINE sofuu_u128 sofuu_load_u128(const void *p) {
+    return *reinterpret_cast<const sofuu_u128 *>(p);
+}
+
+// Sixteen int8 values dotted against sixteen int8 weights: two independent
+// dp4a chains joined by an add, so the chain depth is two, not four.
+static SOFUU_DEVICE SOFUU_INLINE int sofuu_dot16(const unsigned int w[4],
+                                                 const unsigned int x[4]) {
+    int a = sofuu_dp4a((int)w[0], (int)x[0], 0);
+    a = sofuu_dp4a((int)w[1], (int)x[1], a);
+    int b = sofuu_dp4a((int)w[2], (int)x[2], 0);
+    b = sofuu_dp4a((int)w[3], (int)x[3], b);
+    return a + b;
 }
 
 // ── q4_K scale/min expansion (bit-identical to src/simd/infer_kernels.cpp) ─
@@ -361,30 +385,59 @@ static SOFUU_DEVICE SOFUU_INLINE float sofuu_q4k_dot8(
     return acc;
 }
 
-// q4_K sub-block dot against q8_1 activations. `xrow` is the token's q8 row
-// (int8), `sx`/`isum` are that q8 block's scale and integer sum. The min term
-// is contributed by one lane per sub-block (l0 == 0) from the precomputed
-// 32-value sum, so the four lanes of a sub-block do not each need it.
-static SOFUU_DEVICE SOFUU_INLINE float sofuu_q4k_dot8_q8(
-    const sofuu_block_q4_K *blk, const signed char *xrow, int sub, int l0,
-    float sx, int isum) {
-    unsigned int sc, mn;
-    sofuu_q4k_scale_min(sub, blk->scales, &sc, &mn);
-    float s = sofuu_f16_to_f32(blk->d) * (float)sc;
-    float m = sofuu_f16_to_f32(blk->dmin) * (float)mn;
-    unsigned long long qv = *reinterpret_cast<const unsigned long long *>(
-        blk->qs + (sub >> 1) * 32 + l0);
-    unsigned long long xv = *reinterpret_cast<const unsigned long long *>(
-        xrow + sub * 32 + l0);
-    const unsigned int mask = 0x0f0f0f0fu;
-    unsigned int q0 = (unsigned int)qv, q1 = (unsigned int)(qv >> 32);
-    unsigned int a0 = (sub & 1) ? ((q0 >> 4) & mask) : (q0 & mask);
-    unsigned int a1 = (sub & 1) ? ((q1 >> 4) & mask) : (q1 & mask);
-    unsigned int x0 = (unsigned int)xv, x1 = (unsigned int)(xv >> 32);
-    int dot = sofuu_dp4a(a0, x0, sofuu_dp4a(a1, x1, 0));
-    float part = sx * s * (float)dot;
-    if (l0 == 0) part -= sx * m * (float)isum;
-    return part;
+// q4_K x q8_1, one lane's 32 values held in a single 16-byte qs chunk. The
+// low nibbles are 16 values of sub-block 2k, the high nibbles the same 16
+// positions of sub-block 2k+1, so the two halves have their own scale/min pair
+// and their own q8_1 scale and 32-value (here: 16-value) integer sum. The min
+// term no longer needs a designated lane: every lane owns whole halves, so the
+// corrections partition the row exactly once.
+static SOFUU_DEVICE SOFUU_INLINE void sofuu_q4k_chunk32_load(
+    const sofuu_block_q4_K *blk, const signed char *xrow, int chunk,
+    sofuu_u128 *q, sofuu_u128 *xlo, sofuu_u128 *xhi) {
+    const int k = chunk >> 1, h = chunk & 1;
+    *q = sofuu_load_u128(blk->qs + 32 * k + 16 * h);
+    *xlo = sofuu_load_u128(xrow + 64 * k + 16 * h);
+    *xhi = sofuu_load_u128(xrow + 64 * k + 32 + 16 * h);
+}
+
+static SOFUU_DEVICE SOFUU_INLINE float sofuu_q4k_chunk32_compute(
+    const sofuu_u128 q, const sofuu_u128 xlo, const sofuu_u128 xhi,
+    const sofuu_block_q4_K *blk, int chunk, float sx_lo, int isum_lo,
+    float sx_hi, int isum_hi) {
+    const int k = chunk >> 1, h = chunk & 1;
+    const unsigned int M4 = 0x0f0f0f0fu;
+    unsigned int qlo[4], qhi[4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+        qlo[t] = q.w[t] & M4;
+        qhi[t] = (q.w[t] >> 4) & M4;
+    }
+    unsigned int sc_lo, mn_lo, sc_hi, mn_hi;
+    sofuu_q4k_scale_min(2 * k, blk->scales, &sc_lo, &mn_lo);
+    sofuu_q4k_scale_min(2 * k + 1, blk->scales, &sc_hi, &mn_hi);
+    float d = sofuu_f16_to_f32(blk->d);
+    float lo = (d * (float)sc_lo) * (float)sofuu_dot16(qlo, xlo.w);
+    float hi = (d * (float)sc_hi) * (float)sofuu_dot16(qhi, xhi.w);
+    // The min term needs the sum over all 32 values of a sub-block; a chunk
+    // holds only one of its two 16-value halves, so the h == 0 lane of each
+    // (block, k) applies it once for both sub-blocks and nothing double-counts.
+    if (h == 0) {
+        float dmin = sofuu_f16_to_f32(blk->dmin);
+        lo -= (dmin * (float)mn_lo) * (float)isum_lo;
+        hi -= (dmin * (float)mn_hi) * (float)isum_hi;
+    }
+    return sx_lo * lo + sx_hi * hi;
+}
+
+// Load-then-compute for callers that do not prefetch (the CPU mirror).
+static SOFUU_DEVICE SOFUU_INLINE float sofuu_q4k_chunk32_q8(
+    const sofuu_block_q4_K *blk, const signed char *xrow, int chunk, int b,
+    const float *xd, const int *xs) {
+    sofuu_u128 q, xlo, xhi;
+    sofuu_q4k_chunk32_load(blk, xrow, chunk, &q, &xlo, &xhi);
+    const int ilo = b * 8 + 2 * (chunk >> 1);
+    return sofuu_q4k_chunk32_compute(q, xlo, xhi, blk, chunk, xd[ilo], xs[ilo],
+                                     xd[ilo + 1], xs[ilo + 1]);
 }
 
 static SOFUU_DEVICE SOFUU_INLINE float sofuu_q6k_dot8(
@@ -576,9 +629,13 @@ void sofuu_quantize_q8_1(const float *__restrict__ x, signed char *__restrict__ 
     }
 }
 
-// q4_K x q8_1: the decode row/lane mapping with the per-value convert + FMA
-// chain replaced by two dp4a per eight values. Two super-blocks stay in flight.
-extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 6)
+// q4_K x q8_1: eight lanes cover one block (each holds a 16-byte qs chunk), so
+// a warp spans four blocks per instruction and a 2048-column row is two
+// iterations whose six 128-bit loads all issue before the first dp4a. That is
+// the difference to the earlier 8-byte version: same arithmetic, 4x the weight
+// bytes per load instruction and 6x the bytes in flight, which is what a decode
+// row-dot needs to cover DRAM latency.
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4)
 void sofuu_gemv_q4_k_q8(const unsigned char *__restrict__ w,
                         const signed char *__restrict__ xq,
                         const float *__restrict__ xd,
@@ -592,25 +649,34 @@ void sofuu_gemv_q4_k_q8(const unsigned char *__restrict__ w,
     int nb = cols / SOFUU_QK_K;
     const unsigned char *roww = w + (unsigned long long)row *
                                      (unsigned long long)nb * SOFUU_Q4_K_BYTES;
-    int sub = lane >> 2;
-    int l0 = (lane & 3) << 3;
+    const int chunk = lane & 7;  // 16-byte qs chunk inside a block
+    const int bgrp = lane >> 3;  // which of four blocks this lane feeds
+    const int k = chunk >> 1;
     float acc = 0.0f;
-    int bi = 0;
-    for (; bi + 2 <= nb; bi += 2) {
-        const sofuu_block_q4_K *b0 =
-            (const sofuu_block_q4_K *)(roww + (unsigned long long)(bi + 0) * 144);
-        const sofuu_block_q4_K *b1 =
-            (const sofuu_block_q4_K *)(roww + (unsigned long long)(bi + 1) * 144);
-        int i0 = (bi + 0) * 8 + sub;
-        int i1 = (bi + 1) * 8 + sub;
-        acc += sofuu_q4k_dot8_q8(b0, xq + (bi + 0) * 256, sub, l0, xd[i0], xs[i0]);
-        acc += sofuu_q4k_dot8_q8(b1, xq + (bi + 1) * 256, sub, l0, xd[i1], xs[i1]);
+    int b = bgrp;
+    // Pairs of four-block groups: both groups' weight and activation loads are
+    // signed to this warp, issued back to back, then consumed.
+    for (; b + 4 < nb; b += 8) {
+        const sofuu_block_q4_K *p0 = (const sofuu_block_q4_K *)(
+            roww + (unsigned long long)b * SOFUU_Q4_K_BYTES);
+        const sofuu_block_q4_K *p1 = (const sofuu_block_q4_K *)(
+            roww + (unsigned long long)(b + 4) * SOFUU_Q4_K_BYTES);
+        sofuu_u128 q0, l0, h0, q1, l1, h1;
+        sofuu_q4k_chunk32_load(p0, xq + (unsigned long long)b * 256, chunk, &q0,
+                               &l0, &h0);
+        sofuu_q4k_chunk32_load(p1, xq + (unsigned long long)(b + 4) * 256, chunk,
+                               &q1, &l1, &h1);
+        int i0 = b * 8 + 2 * k, i1 = (b + 4) * 8 + 2 * k;
+        acc += sofuu_q4k_chunk32_compute(q0, l0, h0, p0, chunk, xd[i0], xs[i0],
+                                         xd[i0 + 1], xs[i0 + 1]);
+        acc += sofuu_q4k_chunk32_compute(q1, l1, h1, p1, chunk, xd[i1], xs[i1],
+                                         xd[i1 + 1], xs[i1 + 1]);
     }
-    for (; bi < nb; ++bi) {
-        const sofuu_block_q4_K *b =
-            (const sofuu_block_q4_K *)(roww + (unsigned long long)bi * 144);
-        int i0 = bi * 8 + sub;
-        acc += sofuu_q4k_dot8_q8(b, xq + bi * 256, sub, l0, xd[i0], xs[i0]);
+    for (; b < nb; b += 4) {
+        const sofuu_block_q4_K *p = (const sofuu_block_q4_K *)(
+            roww + (unsigned long long)b * SOFUU_Q4_K_BYTES);
+        acc += sofuu_q4k_chunk32_q8(p, xq + (unsigned long long)b * 256, chunk,
+                                   b, xd, xs);
     }
     float total = sofuu_warp_sum(acc);
     if (lane == 0) y[row] = total;
@@ -1250,11 +1316,8 @@ extern "C" float sofuu_host_q4_k_dot_q8(const void *w, const signed char *xq,
     for (int bi = 0; bi < nb; ++bi) {
         const sofuu_block_q4_K *b =
             (const sofuu_block_q4_K *)(p + (unsigned long long)bi * 144);
-        for (int lane = 0; lane < 32; ++lane) {
-            int sub = lane >> 2;
-            int l0 = (lane & 3) << 3;
-            int i0 = bi * 8 + sub;
-            total += sofuu_q4k_dot8_q8(b, xq + bi * 256, sub, l0, xd[i0], xs[i0]);
+        for (int chunk = 0; chunk < 8; ++chunk) {
+            total += sofuu_q4k_chunk32_q8(b, xq + bi * 256, chunk, bi, xd, xs);
         }
     }
     return total;

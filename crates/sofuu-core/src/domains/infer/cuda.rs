@@ -2005,7 +2005,7 @@ mod tests {
             ("sofuu_gemv_q4_k", 6),
             ("sofuu_gemv_q6_k", 6),
             ("sofuu_gemv_f32", 4),
-            ("sofuu_gemv_q4_k_q8", 6),
+            ("sofuu_gemv_q4_k_q8", 4),
             ("sofuu_gemm_q4_k_b8", 4),
             ("sofuu_gemm_q6_k_b8", 4),
             ("sofuu_gemm_q8_0_b8", 4),

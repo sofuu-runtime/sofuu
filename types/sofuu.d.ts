@@ -1443,10 +1443,41 @@ export interface SofuuClassifiedError {
  * ship with the agent driver's observability refresh (OBSERVABILITY-SPEC §3)
  * - until then they are absent, which is why they are declared optional.
  */
+export interface AgentTuiOptions {
+  color?: boolean;
+  quiet?: boolean;
+  json?: boolean;
+  headless?: boolean;
+}
+
+export interface AgentTui {
+  onStep(event: { kind: string; payload?: Record<string, unknown>; [k: string]: unknown }): void;
+  onApproval(name: string, args: unknown, apId?: string): boolean | { allow: boolean; always: boolean };
+  renderAnswer(answer?: string): void;
+  renderSummary(res?: unknown): void;
+  colors: Record<string, string>;
+}
+
+export interface AgentInteractOptions extends AgentTuiOptions {
+  task?: string;
+  initialTask?: string;
+  model?: string;
+  provider?: string;
+  memory?: 'on' | 'off' | 'agent' | 'user';
+  budget?: { maxSteps?: number; maxDepth?: number; maxTokens?: number; maxWallMs?: number };
+  [k: string]: unknown;
+}
+
 export interface SofuuAgent {
   classifyError?(err: unknown): SofuuClassifiedError;
   /** The mode a run defaults to: interactive on a TTY, auto-retry otherwise. */
   onErrorMode?(opts?: { tty?: boolean }): OnErrorMode;
+  /** Create a focused Agent Interaction TUI handler. */
+  createTUI?(opts?: AgentTuiOptions): AgentTui;
+  /** Alias for createTUI. */
+  tui?(opts?: AgentTuiOptions): AgentTui;
+  /** Execute an interactive multi-turn terminal shell or single-task agent run. */
+  interact?(target: unknown, opts?: AgentInteractOptions): Promise<any>;
   [extension: string]: unknown;
 }
 

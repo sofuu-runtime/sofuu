@@ -39,6 +39,7 @@ struct CSofuuRuntime {
 
 extern "C" {
     fn sofuu_init() -> *mut CSofuuRuntime;
+    fn sofuu_init_micro() -> *mut CSofuuRuntime;
     fn sofuu_eval_file(rt: *mut CSofuuRuntime, path: *const c_char) -> c_int;
     fn sofuu_eval_string(rt: *mut CSofuuRuntime, source: *const c_char, filename: *const c_char) -> c_int;
     fn sofuu_run_jobs(rt: *mut CSofuuRuntime);
@@ -142,6 +143,16 @@ impl SofuuRuntime {
     pub fn init() -> Option<Self> {
         // SAFETY: sofuu_init returns a heap-allocated runtime or NULL.
         let ptr = unsafe { sofuu_init() };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self { engine: ptr })
+        }
+    }
+
+    /// Initialize the ultra-lean micro-runtime (QuickJS context + MCP + core builtins only).
+    pub fn init_micro() -> Option<Self> {
+        let ptr = unsafe { sofuu_init_micro() };
         if ptr.is_null() {
             None
         } else {

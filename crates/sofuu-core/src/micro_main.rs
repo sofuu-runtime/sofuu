@@ -34,7 +34,7 @@ fn install_micro_prelude(rt: &SofuuRuntime) {
 }
 
 fn run_compiled_payload(payload: &sofuu_core::compiler::EmbeddedPayload) -> ExitCode {
-    let rt = match SofuuRuntime::init() {
+    let rt = match SofuuRuntime::init_micro() {
         Some(rt) => rt,
         None => {
             eprintln!("\x1b[31mFatal:\x1b[0m sofuu-micro runtime init failed");
@@ -94,7 +94,7 @@ fn main() -> ExitCode {
     }
 
     let script = &args[1];
-    let rt = match SofuuRuntime::init() {
+    let rt = match SofuuRuntime::init_micro() {
         Some(rt) => rt,
         None => {
             eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");

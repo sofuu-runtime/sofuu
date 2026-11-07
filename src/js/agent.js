@@ -6794,6 +6794,229 @@
        outer guard is deliberate silence, not a forgotten handler. */ }
   }
 
+  /* ── Focused Agent Interaction TUI ─────────────────────────────── */
+  function createTUI(opts) {
+    opts = opts || {};
+    var isTTY = (typeof process !== 'undefined' && process.stdout && process.stdout.isTTY) || false;
+    var useColor = opts.color !== undefined ? !!opts.color : isTTY;
+    var isJson = !!opts.json;
+    var quiet = !!opts.quiet;
+
+    var c = useColor ? {
+      reset: '\x1b[0m',
+      bold: '\x1b[1m',
+      dim: '\x1b[2m',
+      cyan: '\x1b[36m',
+      green: '\x1b[32m',
+      yellow: '\x1b[33m',
+      magenta: '\x1b[35m',
+      blue: '\x1b[34m',
+      red: '\x1b[31m',
+      gray: '\x1b[90m',
+    } : {
+      reset: '', bold: '', dim: '', cyan: '', green: '', yellow: '',
+      magenta: '', blue: '', red: '', gray: '',
+    };
+
+    function formatToolArgs(raw) {
+      if (!raw) return '';
+      if (typeof raw === 'string') {
+        try { raw = JSON.parse(raw); } catch (e) { return clip(raw, 40); }
+      }
+      if (typeof raw !== 'object' || raw === null) return clip(String(raw), 40);
+      var parts = [];
+      for (var k in raw) {
+        if (!Object.prototype.hasOwnProperty.call(raw, k)) continue;
+        var v = raw[k];
+        if (typeof v === 'string') {
+          parts.push(k + '="' + clip(v.replace(/\n/g, ' '), 30) + '"');
+        } else if (typeof v === 'number' || typeof v === 'boolean') {
+          parts.push(k + '=' + v);
+        } else {
+          parts.push(k + '={...}');
+        }
+      }
+      return parts.join(' ');
+    }
+
+    function onStep(e) {
+      if (quiet) return;
+      if (isJson) {
+        try {
+          console.error(JSON.stringify(e));
+        } catch (eJ) { /* stream error; ignore */ }
+        return;
+      }
+
+      var kind = e.kind;
+      var p = e.payload || {};
+
+      switch (kind) {
+        case 'start':
+          console.log(c.bold + c.cyan + '⚡ Starting task:' + c.reset + ' ' + (p.task || ''));
+          break;
+        case 'plan':
+          if (p.step || p.plan) {
+            console.log(c.blue + '📋 Plan:' + c.reset + ' ' + (p.step || p.plan));
+          }
+          break;
+        case 'think':
+        case 'thought':
+          if (p.text) {
+            console.log(c.dim + '💭 ' + clip(p.text.trim().replace(/\n/g, ' '), 120) + c.reset);
+          }
+          break;
+        case 'tool':
+          var name = p.name || 'tool';
+          var argsStr = formatToolArgs(p.args);
+          console.log(c.yellow + '⚙ [tool: ' + name + (argsStr ? ' ' + argsStr : '') + ']' + c.reset);
+          break;
+        case 'tool_result':
+          var tName = p.name || 'tool';
+          var isErr = !!p.error;
+          var dur = p.duration ? ' (' + p.duration + 'ms)' : '';
+          if (isErr) {
+            console.log('  ' + c.red + '└─▶ ✗ ' + tName + ' failed: ' + clip(p.error, 80) + dur + c.reset);
+          } else {
+            var resStr = '';
+            if (typeof p.result === 'string') {
+              var lines = p.result.split('\n').length;
+              resStr = lines > 1 ? lines + ' lines' : clip(p.result, 50);
+            } else if (p.result != null) {
+              resStr = clip(JSON.stringify(p.result), 50);
+            }
+            console.log('  ' + c.green + '└─▶ ✓ ' + (resStr ? resStr + dur : 'OK' + dur) + c.reset);
+          }
+          break;
+        case 'delegate':
+          console.log(c.magenta + '🤝 [delegate ──▶ ' + (p.agent || 'sub-agent') + ']' + c.reset);
+          break;
+        case 'error':
+          console.log(c.bold + c.red + '❌ [error] ' + (p.error || 'unknown error') + c.reset);
+          break;
+      }
+    }
+
+    function onApproval(name, args, apId) {
+      if (!isTTY || opts.headless) {
+        return false; /* Fail-closed in non-interactive/headless environments */
+      }
+      var argsFormatted = formatToolArgs(args);
+      console.log('\n' + c.bold + c.yellow + '⚠ [HITL Approval Required]' + c.reset);
+      console.log('  ' + c.bold + 'Tool:' + c.reset + '   ' + c.cyan + name + c.reset);
+      if (argsFormatted) {
+        console.log('  ' + c.bold + 'Args:' + c.reset + '   ' + argsFormatted);
+      }
+      var promptFn = (typeof globalThis !== 'undefined' && typeof globalThis.__prompt === 'function')
+        ? globalThis.__prompt
+        : null;
+      if (!promptFn) return false;
+
+      var reply = promptFn(c.bold + 'Allow this action? [y/N/always]: ' + c.reset);
+      if (!reply) return false;
+      var ans = reply.trim().toLowerCase();
+      if (ans === 'y' || ans === 'yes') return true;
+      if (ans === 'a' || ans === 'always') return { allow: true, always: true };
+      return false;
+    }
+
+    function renderAnswer(answer) {
+      if (!answer || isJson) return;
+      console.log('\n' + c.bold + c.green + 'Answer:' + c.reset + '\n' + answer);
+    }
+
+    function renderSummary(res) {
+      if (isJson || quiet || !res) return;
+      var usage = res.usage || {};
+      var steps = res.steps || 0;
+      var tools = usage.toolCalls || 0;
+      var tokens = (usage.promptTokens || 0) + (usage.completionTokens || 0);
+      var stopped = res.stopped ? ' · stopped: ' + res.stopped : '';
+      console.log('\n' + c.dim + '─── ' + steps + ' steps · ' + tools + ' tool calls · ' + tokens + ' tokens' + stopped + ' ───' + c.reset);
+    }
+
+    return {
+      onStep: onStep,
+      onApproval: onApproval,
+      renderAnswer: renderAnswer,
+      renderSummary: renderSummary,
+      colors: c,
+    };
+  }
+
+  async function interact(target, opts) {
+    opts = opts || {};
+    var d = resolveDef(target);
+    var tui = createTUI(opts);
+    var promptFn = (typeof globalThis !== 'undefined' && typeof globalThis.__prompt === 'function')
+      ? globalThis.__prompt
+      : null;
+
+    var initialTask = opts.task || opts.initialTask;
+    if (!initialTask && typeof sofuu !== 'undefined' && Array.isArray(sofuu.args) && sofuu.args.length > 0) {
+      var positional = sofuu.args.filter(function (a) { return !a.startsWith('--'); });
+      if (positional.length > 0) {
+        initialTask = positional.join(' ');
+      }
+    }
+
+    var isTTY = (typeof process !== 'undefined' && process.stdin && process.stdin.isTTY) || false;
+    if (initialTask || !isTTY || !promptFn) {
+      var task = initialTask || 'Execute agent workflow';
+      var res = await run(d, task, Object.assign({}, opts, {
+        onStep: tui.onStep,
+        onApproval: tui.onApproval,
+      }));
+      tui.renderAnswer(res.answer);
+      tui.renderSummary(res);
+      return res;
+    }
+
+    var c = tui.colors;
+    console.log(c.bold + c.cyan + '╭────────────────────────────────────────────────────────────╮' + c.reset);
+    var agentName = (d.name || 'anonymous');
+    var padName = agentName.length > 43 ? agentName.slice(0, 40) + '...' : agentName;
+    console.log(c.bold + c.cyan + '│' + c.reset + c.bold + ' 🤖 Sofuu Agent: ' + padName.padEnd(43) + c.reset + c.bold + c.cyan + '│' + c.reset);
+    var toolCount = (d.tools || []).length;
+    var metaLine = ' Tools: ' + toolCount + ' pack(s) · Type "exit" to quit';
+    console.log(c.bold + c.cyan + '│' + c.reset + c.dim + metaLine.padEnd(60) + c.reset + c.bold + c.cyan + '│' + c.reset);
+    console.log(c.bold + c.cyan + '╰────────────────────────────────────────────────────────────╯' + c.reset + '\n');
+
+    var lastResult = null;
+    var conversationHistory = [];
+
+    while (true) {
+      var input = promptFn(c.bold + c.magenta + 'Agent' + c.reset + ' ' + c.cyan + '❯' + c.reset + ' ');
+      if (input === null) {
+        console.log('\n' + c.dim + 'Session ended.' + c.reset);
+        break;
+      }
+      input = input.trim();
+      if (!input) continue;
+      if (input === 'exit' || input === 'quit' || input === '/exit' || input === '/quit') {
+        console.log(c.dim + 'Goodbye.' + c.reset);
+        break;
+      }
+
+      conversationHistory.push({ role: 'user', content: input });
+      var runOpts = Object.assign({}, opts, {
+        resumeMessages: conversationHistory,
+        onStep: tui.onStep,
+        onApproval: tui.onApproval,
+      });
+
+      lastResult = await run(d, input, runOpts);
+      if (lastResult && lastResult.answer) {
+        conversationHistory.push({ role: 'assistant', content: lastResult.answer });
+      }
+      tui.renderAnswer(lastResult && lastResult.answer);
+      tui.renderSummary(lastResult);
+      console.log('');
+    }
+
+    return lastResult;
+  }
+
   /* ── Export (merge into the live sofuu.agent object) ───────────── */
 
   A._agents_loaded = true;
@@ -6820,6 +7043,9 @@
   A.cancel = cancel;
   A.list = list;
   A.loadDir = loadDir;
+  A.createTUI = createTUI;
+  A.tui = createTUI;
+  A.interact = interact;
   /* Phase 4: Real-time QTSQ trace persistence & replay */
   A.getTrace = getTrace;
   A.resume = resume;

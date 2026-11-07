@@ -275,6 +275,18 @@ pub unsafe extern "C" fn sofuu_init() -> *mut SofuuRuntime {
 }
 
 #[no_mangle]
+#[allow(clippy::missing_safety_doc)]
+pub unsafe extern "C" fn sofuu_init_micro() -> *mut SofuuRuntime {
+    let eng = unsafe { engine_create() };
+    if eng.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { engine_register_micro_builtins(eng) };
+    let rt = Box::new(SofuuRuntime { engine: eng as *mut c_void });
+    Box::into_raw(rt)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn sofuu_eval_file(rt: *mut SofuuRuntime, path: *const c_char) -> c_int {
     if rt.is_null() || path.is_null() {
         return 1;
@@ -511,6 +523,39 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
     // Subsystem capsule declarative dispatch (PLAN-ZERO-RISK-MODULARIZATION §3.2)
     let _ = crate::domains::init_subsystems(ctx);
 
+    unsafe { build_sofuu_global(ctx) };
+}
+
+/// Ultra-lean registration for micro MCP servers and tools:
+/// Omits heavy inference engines, QTSQ vector persistence, and domain capsules.
+unsafe fn engine_register_micro_builtins(eng: *mut SofuuEngine) {
+    let ctx = unsafe { (*eng).ctx };
+    unsafe {
+        mod_console_register(ctx);
+        mod_process_register(ctx);
+        register_process_exit_code(ctx);
+        mod_timer_register(ctx);
+        mod_fs_register(ctx);
+        mod_subprocess_register(ctx);
+        mod_http_client_register(ctx);
+        mod_http_server_register(ctx);
+        mod_http_sse_register(ctx);
+        mod_mcp_register(ctx);
+        mod_cjs_register(ctx);
+        crate::rt::crypto::mod_crypto_register(ctx);
+        crate::rt::deadline::mod_deadline_register(ctx);
+        crate::rt::interrupt::ensure_installed(ctx);
+        crate::capabilities::mod_capabilities_register(ctx);
+        crate::rt::events::mod_events_register(ctx);
+        crate::rt::async_contract::mod_async_contract_register(ctx);
+        crate::rt::async_context::mod_async_context_register(ctx);
+        crate::rt::sandbox::mod_sandbox_register(ctx);
+        crate::rt::policy::mod_policy_register(ctx);
+    }
+    unsafe { build_sofuu_global(ctx) };
+}
+
+unsafe fn build_sofuu_global(ctx: *mut qjs::JSContext) {
     // ── Build capital-S 'Sofuu' convenience global ────────────────
     let global = unsafe { qjs::sofuu_js_get_global_object(ctx) };
     let sofuu_obj = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"sofuu".as_ptr()) };
@@ -661,11 +706,6 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
     unsafe { register_version_property(ctx) };
 
     // Problem B: Web Standard APIs & Node.js built-ins compatibility layer
-    //
-    // AUDIT-2026-10-31 P1-8: compat.js is embedded gzipped (52,261 B ->
-    // ~11.5 KB) by build.rs and inflated here, once — this seam runs once per
-    // engine. A payload that will not inflate must be visible, not a runtime
-    // that quietly lost the compat layer.
     match compat_js() {
         Some(src) => unsafe {
             crate::shipped::eval_shipped(ctx as *mut c_void, src, "<compat>");

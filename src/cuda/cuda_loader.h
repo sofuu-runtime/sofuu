@@ -123,6 +123,17 @@ int sofuu_cuda_ctx_download_async(sofuu_cuda_ctx *ctx, void *host_dst,
                                   unsigned long long dev_src, size_t bytes);
 int sofuu_cuda_ctx_sync(sofuu_cuda_ctx *ctx);
 
+// ── CUDA graphs ────────────────────────────────────────────────────────────
+// Capture a fixed sequence of launches once, then replay it with one driver
+// call per token. All buffers must already exist at capture time, and any
+// per-token scalar has to live in device memory (a kernel parameter is baked
+// into the graph). Returns non-zero when the driver lacks the entry points.
+int sofuu_cuda_ctx_graphs_supported(sofuu_cuda_ctx *ctx);
+int sofuu_cuda_ctx_begin_capture(sofuu_cuda_ctx *ctx);
+int sofuu_cuda_ctx_end_capture(sofuu_cuda_ctx *ctx, void **out_exec);
+int sofuu_cuda_ctx_graph_launch(sofuu_cuda_ctx *ctx, void *exec);
+int sofuu_cuda_ctx_graph_exec_free(sofuu_cuda_ctx *ctx, void *exec);
+
 // Enqueue a kernel. `params` is the CUDA Driver API argument array: one entry
 // per kernel parameter, each pointing at the host-side value/device-pointer
 // variable. `extra` must be NULL.

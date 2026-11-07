@@ -171,6 +171,17 @@ pub struct DeviceBuf {
     pub bytes: usize,
 }
 
+/// An instantiated CUDA graph. Owned by the model that captured it; the driver
+/// frees the exec when the context it belongs to is destroyed.
+///
+/// The handle is a `usize`, not a raw pointer, so the type is `Send`: the model
+/// that owns it lives in containers that require `Send`, and the existing
+/// owner-thread check is what actually keeps the driver calls on one thread.
+#[derive(Clone, Copy, Debug)]
+pub struct GraphExec {
+    pub ptr: usize,
+}
+
 /// Validate a KV-cache write before it reaches the driver.
 ///
 /// The kernel stores at `(head * cap + pos) * head_dim` with no bounds check of
@@ -546,6 +557,11 @@ mod sys {
             params: *mut *mut c_void,
         ) -> c_int;
         pub fn sofuu_cuda_ctx_sync(ctx: *mut c_void) -> c_int;
+        pub fn sofuu_cuda_ctx_graphs_supported(ctx: *mut c_void) -> c_int;
+        pub fn sofuu_cuda_ctx_begin_capture(ctx: *mut c_void) -> c_int;
+        pub fn sofuu_cuda_ctx_end_capture(ctx: *mut c_void, out: *mut *mut c_void) -> c_int;
+        pub fn sofuu_cuda_ctx_graph_launch(ctx: *mut c_void, exec: *mut c_void) -> c_int;
+        pub fn sofuu_cuda_ctx_graph_exec_free(ctx: *mut c_void, exec: *mut c_void) -> c_int;
         pub fn sofuu_cuda_ctx_host_register(
             ctx: *mut c_void,
             host: *mut c_void,
@@ -866,6 +882,42 @@ mod imp {
         pub fn sync(&self) -> Result<(), CudaError> {
             if unsafe { sys::sofuu_cuda_ctx_sync(self.ctx) } != 0 {
                 return Err(take_error("cuStreamSynchronize"));
+            }
+            Ok(())
+        }
+
+        /// True when the driver exposes the graph entry points.
+        pub fn graphs_supported(&self) -> bool {
+            unsafe { sys::sofuu_cuda_ctx_graphs_supported(self.ctx) != 0 }
+        }
+
+        /// Start recording launches on the engine's stream. No allocation or
+        /// sync may happen until `end_capture`, and any per-token scalar the
+        /// kernels read must already be a device pointer.
+        pub fn begin_capture(&self) -> Result<(), CudaError> {
+            let rc = unsafe { sys::sofuu_cuda_ctx_begin_capture(self.ctx) };
+            if rc != 0 {
+                return Err(take_error("begin_capture"));
+            }
+            Ok(())
+        }
+
+        /// Finish recording and instantiate an executable graph. The captured
+        /// work has not run: launch the returned handle to execute it.
+        pub fn end_capture(&self) -> Result<GraphExec, CudaError> {
+            let mut exec: *mut c_void = ptr::null_mut();
+            let rc = unsafe { sys::sofuu_cuda_ctx_end_capture(self.ctx, &mut exec) };
+            if rc != 0 || exec.is_null() {
+                return Err(take_error("end_capture"));
+            }
+            Ok(GraphExec { ptr: exec as usize })
+        }
+
+        pub fn graph_launch(&self, exec: GraphExec) -> Result<(), CudaError> {
+            let rc =
+                unsafe { sys::sofuu_cuda_ctx_graph_launch(self.ctx, exec.ptr as *mut c_void) };
+            if rc != 0 {
+                return Err(take_error("graph_launch"));
             }
             Ok(())
         }
@@ -1207,6 +1259,10 @@ mod imp {
             )
         }
 
+        /// `pos_dev` is a device-side i32 holding the write row (see
+        /// `sofuu_kv_write_f32`): a captured graph cannot carry a per-launch
+        /// scalar, so the position travels through memory. `pos` is still
+        /// checked on the host before the launch.
         pub fn kv_write(
             &self,
             k_cache: DeviceBuf,
@@ -1214,6 +1270,7 @@ mod imp {
             k: DeviceBuf,
             v: DeviceBuf,
             pos: usize,
+            pos_dev: DeviceBuf,
             n_kv_heads: usize,
             head_dim: usize,
             cap: usize,
@@ -1221,11 +1278,17 @@ mod imp {
             validate_kv_write(
                 pos, n_kv_heads, head_dim, cap, k_cache.bytes, v_cache.bytes, k.bytes, v.bytes,
             )?;
+            if pos_dev.bytes < 4 {
+                return Err(CudaError(format!(
+                    "kv_write position buffer is {} bytes, need 4",
+                    pos_dev.bytes
+                )));
+            }
             let mut kc = k_cache.ptr;
             let mut vc = v_cache.ptr;
             let mut kp = k.ptr;
             let mut vp = v.ptr;
-            let mut p = pos as i32;
+            let mut p = pos_dev.ptr;
             let mut h = n_kv_heads as i32;
             let mut hd = head_dim as i32;
             let mut c = cap as i32;
@@ -1234,7 +1297,7 @@ mod imp {
                 &mut vc as *mut u64 as *mut c_void,
                 &mut kp as *mut u64 as *mut c_void,
                 &mut vp as *mut u64 as *mut c_void,
-                &mut p as *mut i32 as *mut c_void,
+                &mut p as *mut u64 as *mut c_void,
                 &mut h as *mut i32 as *mut c_void,
                 &mut hd as *mut i32 as *mut c_void,
                 &mut c as *mut i32 as *mut c_void,
@@ -1261,6 +1324,7 @@ mod imp {
             n_kv_heads: usize,
             head_dim: usize,
             seq_len: usize,
+            seq_dev: DeviceBuf,
             cap: usize,
             scale: f32,
         ) -> Result<(), CudaError> {
@@ -1275,6 +1339,12 @@ mod imp {
                 v_cache.bytes,
                 out.bytes,
             )?;
+            if seq_dev.bytes < 4 {
+                return Err(CudaError(format!(
+                    "attn_decode sequence buffer is {} bytes, need 4",
+                    seq_dev.bytes
+                )));
+            }
             let mut qp = q.ptr;
             let mut kc = k_cache.ptr;
             let mut vc = v_cache.ptr;
@@ -1282,7 +1352,7 @@ mod imp {
             let mut nh = n_heads as i32;
             let mut nk = n_kv_heads as i32;
             let mut hd = head_dim as i32;
-            let mut sl = seq_len as i32;
+            let mut sl = seq_dev.ptr;
             let mut c = cap as i32;
             let mut s = scale;
             let mut params: [*mut c_void; 10] = [
@@ -1293,7 +1363,7 @@ mod imp {
                 &mut nh as *mut i32 as *mut c_void,
                 &mut nk as *mut i32 as *mut c_void,
                 &mut hd as *mut i32 as *mut c_void,
-                &mut sl as *mut i32 as *mut c_void,
+                &mut sl as *mut u64 as *mut c_void,
                 &mut c as *mut i32 as *mut c_void,
                 &mut s as *mut f32 as *mut c_void,
             ];
@@ -1695,6 +1765,22 @@ mod imp {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }
 
+        pub fn graphs_supported(&self) -> bool {
+            false
+        }
+
+        pub fn begin_capture(&self) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn end_capture(&self) -> Result<GraphExec, CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn graph_launch(&self, _exec: GraphExec) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
         pub fn gemv_q6_k_q8(
             &self,
             _weights: DeviceBuf,
@@ -1775,6 +1861,7 @@ mod imp {
             _k: DeviceBuf,
             _v: DeviceBuf,
             _pos: usize,
+            _pos_dev: DeviceBuf,
             _n_kv_heads: usize,
             _head_dim: usize,
             _cap: usize,
@@ -1793,6 +1880,7 @@ mod imp {
             _n_kv_heads: usize,
             _head_dim: usize,
             _seq_len: usize,
+            _seq_dev: DeviceBuf,
             _cap: usize,
             _scale: f32,
         ) -> Result<(), CudaError> {

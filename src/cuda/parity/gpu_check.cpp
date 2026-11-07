@@ -940,16 +940,20 @@ void test_kv_write(void *fn, uint32_t &seed) {
     std::vector<float> v = random_vec(n_kv * hd, seed, -1.0f, 1.0f);
     sofuu_ref::kv_write_ref(want_k.data(), want_v.data(), k.data(), v.data(),
                             pos, n_kv, hd, cap);
-    unsigned long long dk = 0, dv = 0, dj = 0, dl = 0;
+    unsigned long long dk = 0, dv = 0, dj = 0, dl = 0, dp = 0;
+    // kv_write reads its row from device memory (a captured graph cannot carry
+    // a per-launch scalar), so the test uploads the position like the model.
+    int pos_dev = pos;
     if (!alloc_upload(got_k.data(), got_k.size() * sizeof(float), &dk) ||
         !alloc_upload(got_v.data(), got_v.size() * sizeof(float), &dv) ||
         !alloc_upload(k.data(), k.size() * sizeof(float), &dj) ||
-        !alloc_upload(v.data(), v.size() * sizeof(float), &dl)) {
+        !alloc_upload(v.data(), v.size() * sizeof(float), &dl) ||
+        !alloc_upload(&pos_dev, sizeof(pos_dev), &dp)) {
         fail_msg("alloc");
         ++g_failures;
         return;
     }
-    std::vector<void *> params = {&dk, &dv, &dj, &dl, (void *)&pos,
+    std::vector<void *> params = {&dk, &dv, &dj, &dl, &dp,
                                   (void *)&n_kv, (void *)&hd, (void *)&cap};
     bool ok = launch(fn, (unsigned)n_kv, 128, params) &&
               download(dk, got_k.data(), (size_t)cache_n * sizeof(float)) &&
@@ -960,6 +964,7 @@ void test_kv_write(void *fn, uint32_t &seed) {
         max_err = std::fmax(max_err, std::fabs((double)got_v[(size_t)i] - want_v[(size_t)i]));
     }
     report("kv_write", ok && max_err == 0.0, max_err, 0.0, (double)want_k[0]);
+    sofuu_cuda_ctx_free(g_ctx, dp);
     sofuu_cuda_ctx_free(g_ctx, dk);
     sofuu_cuda_ctx_free(g_ctx, dv);
     sofuu_cuda_ctx_free(g_ctx, dj);
@@ -977,17 +982,21 @@ void test_attn_decode(void *fn, uint32_t &seed) {
     float scale = 1.0f / std::sqrt((float)hd);
     sofuu_ref::attn_decode_ref(q.data(), k.data(), v.data(), want.data(),
                                n_heads, n_kv, hd, seq, cap, scale);
-    unsigned long long dq = 0, dk = 0, dv = 0, dout = 0;
+    unsigned long long dq = 0, dk = 0, dv = 0, dout = 0, dsq = 0;
+    // The sequence length reaches the kernel through device memory so a captured
+    // graph can replay at a new position.
+    int seq_dev = seq;
     if (!alloc_upload(q.data(), q.size() * sizeof(float), &dq) ||
         !alloc_upload(k.data(), k.size() * sizeof(float), &dk) ||
         !alloc_upload(v.data(), v.size() * sizeof(float), &dv) ||
+        !alloc_upload(&seq_dev, sizeof(seq_dev), &dsq) ||
         !alloc_only((unsigned long long)got.size() * sizeof(float), &dout)) {
         fail_msg("alloc");
         ++g_failures;
         return;
     }
     std::vector<void *> params = {&dq, &dk, &dv, &dout, (void *)&n_heads,
-                                  (void *)&n_kv, (void *)&hd, (void *)&seq,
+                                  (void *)&n_kv, (void *)&hd, &dsq,
                                   (void *)&cap, (void *)&scale};
     bool ok = launch(fn, (unsigned)n_heads, 256, params) &&
               download(dout, got.data(), got.size() * sizeof(float));
@@ -997,6 +1006,7 @@ void test_attn_decode(void *fn, uint32_t &seed) {
                             std::fabs((double)got[i] - (double)want[i]));
     report("attn_decode", ok && max_err <= 5e-5, max_err, 5e-5,
            (double)want[0]);
+    sofuu_cuda_ctx_free(g_ctx, dsq);
     sofuu_cuda_ctx_free(g_ctx, dq);
     sofuu_cuda_ctx_free(g_ctx, dk);
     sofuu_cuda_ctx_free(g_ctx, dv);

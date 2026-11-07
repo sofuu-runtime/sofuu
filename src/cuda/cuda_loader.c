@@ -98,6 +98,20 @@ int sofuu_cuda_ctx_launch(sofuu_cuda_ctx *ctx, void *function, unsigned gx,
     (void)by; (void)bz; (void)shared; (void)params;
     return SOFUU_CUDA_ERR_LAUNCH;
 }
+int sofuu_cuda_ctx_graphs_supported(sofuu_cuda_ctx *ctx) { (void)ctx; return 0; }
+int sofuu_cuda_ctx_begin_capture(sofuu_cuda_ctx *ctx) { (void)ctx; return SOFUU_CUDA_ERR_LAUNCH; }
+int sofuu_cuda_ctx_end_capture(sofuu_cuda_ctx *ctx, void **out_exec) {
+    (void)ctx; (void)out_exec;
+    return SOFUU_CUDA_ERR_LAUNCH;
+}
+int sofuu_cuda_ctx_graph_launch(sofuu_cuda_ctx *ctx, void *exec) {
+    (void)ctx; (void)exec;
+    return SOFUU_CUDA_ERR_LAUNCH;
+}
+int sofuu_cuda_ctx_graph_exec_free(sofuu_cuda_ctx *ctx, void *exec) {
+    (void)ctx; (void)exec;
+    return SOFUU_CUDA_OK;
+}
 int sofuu_cuda_ctx_host_register(sofuu_cuda_ctx *ctx, void *host, size_t bytes,
                                  unsigned long long *out) {
     (void)ctx; (void)host; (void)bytes; (void)out;
@@ -128,6 +142,9 @@ typedef struct CUctx_st *CUcontext;
 typedef struct CUmod_st *CUmodule;
 typedef struct CUfunc_st *CUfunction;
 typedef struct CUstream_st *CUstream;
+// CUDA graphs (10.0+). Opaque handles only; the driver owns the memory.
+typedef struct CUgraph_st *CUgraph;
+typedef struct CUgraphExec_st *CUgraphExec;
 
 #define SOFUU_CUDA_SUCCESS 0
 #define SOFUU_CUDA_MEMHOSTREGISTER_DEVICEMAP 0x02u
@@ -165,6 +182,20 @@ struct sofuu_cuda_driver {
                                unsigned int, unsigned int, unsigned int,
                                unsigned int, unsigned int, CUstream, void **,
                                void **);
+    CUresult (*cuStreamBeginCapture)(CUstream, int);
+    CUresult (*cuStreamEndCapture)(CUstream, CUgraph *);
+    // Two signatures live under one name across driver versions:
+    //   cuGraphInstantiateWithFlags(exec, graph, flags)      -- 11.4+
+    //   cuGraphInstantiate(exec, graph, err_node, log, size) -- 10.x .. 11.3
+    // Calling the wrong one is not a clean failure (the third argument would be
+    // read as a flags word), so both are resolved and the wrapper picks.
+    CUresult (*cuGraphInstantiateWithFlags)(CUgraphExec *, CUgraph,
+                                            unsigned long long);
+    CUresult (*cuGraphInstantiate)(CUgraphExec *, CUgraph, CUresult *, char *,
+                                   size_t);
+    CUresult (*cuGraphLaunch)(CUgraphExec, CUstream);
+    CUresult (*cuGraphExecDestroy)(CUgraphExec);
+    CUresult (*cuGraphDestroy)(CUgraph);
     CUresult (*cuGetErrorString)(CUresult, const char **);
     CUresult (*cuGetErrorName)(CUresult, const char **);
     CUresult (*cuMemHostRegister)(void *, size_t, unsigned int);
@@ -343,6 +374,14 @@ sofuu_cuda_driver *sofuu_cuda_driver_open(const char *path) {
     LOAD_REQUIRED(cuStreamDestroy, "cuStreamDestroy_v2", "cuStreamDestroy");
     LOAD_REQUIRED(cuLaunchKernel, "cuLaunchKernel", NULL);
 
+    LOAD_OPTIONAL(cuStreamBeginCapture, "cuStreamBeginCapture", NULL);
+    LOAD_OPTIONAL(cuStreamEndCapture, "cuStreamEndCapture", NULL);
+    LOAD_OPTIONAL(cuGraphInstantiateWithFlags, "cuGraphInstantiateWithFlags",
+                  NULL);
+    LOAD_OPTIONAL(cuGraphInstantiate, "cuGraphInstantiate", NULL);
+    LOAD_OPTIONAL(cuGraphLaunch, "cuGraphLaunch", NULL);
+    LOAD_OPTIONAL(cuGraphExecDestroy, "cuGraphExecDestroy", NULL);
+    LOAD_OPTIONAL(cuGraphDestroy, "cuGraphDestroy", NULL);
     LOAD_OPTIONAL(cuGetErrorString, "cuGetErrorString", NULL);
     LOAD_OPTIONAL(cuGetErrorName, "cuGetErrorName", NULL);
     // Diagnostic only: NUM_REGS/MAX_THREADS tell the occupancy arithmetic
@@ -676,6 +715,97 @@ int sofuu_cuda_ctx_sync(sofuu_cuda_ctx *ctx) {
         set_error("cuStreamSynchronize failed: %s",
                   driver_error(ctx->driver, r, eb, sizeof(eb)));
         return SOFUU_CUDA_ERR_LAUNCH;
+    }
+    return SOFUU_CUDA_OK;
+}
+
+// ── CUDA graphs ────────────────────────────────────────────────────────────
+// One capture, then one launch per token instead of ~290. Everything the graph
+// references must already be allocated (capture forbids cuMemAlloc) and any
+// value that changes per token has to live in device memory, because a kernel
+// parameter is frozen into the graph node.
+int sofuu_cuda_ctx_graphs_supported(sofuu_cuda_ctx *ctx) {
+    if (!ctx || !ctx->driver) return 0;
+    const sofuu_cuda_driver *d = ctx->driver;
+    return d->cuStreamBeginCapture && d->cuStreamEndCapture &&
+           d->cuGraphLaunch && d->cuGraphExecDestroy &&
+           (d->cuGraphInstantiateWithFlags || d->cuGraphInstantiate);
+}
+
+int sofuu_cuda_ctx_begin_capture(sofuu_cuda_ctx *ctx) {
+    if (!ctx || !ctx->stream || !sofuu_cuda_ctx_graphs_supported(ctx)) {
+        set_error("cuStreamBeginCapture: graphs unavailable");
+        return SOFUU_CUDA_ERR_LAUNCH;
+    }
+    // GLOBAL mode: work on any other stream during capture is an error rather
+    // than being silently omitted from the graph.
+    CUresult r = ctx->driver->cuStreamBeginCapture(ctx->stream, 0);
+    if (r != SOFUU_CUDA_SUCCESS) {
+        char eb[256];
+        set_error("cuStreamBeginCapture failed: %s",
+                  driver_error(ctx->driver, r, eb, sizeof(eb)));
+        return SOFUU_CUDA_ERR_LAUNCH;
+    }
+    return SOFUU_CUDA_OK;
+}
+
+int sofuu_cuda_ctx_end_capture(sofuu_cuda_ctx *ctx, void **out_exec) {
+    if (!ctx || !ctx->stream || !out_exec ||
+        !sofuu_cuda_ctx_graphs_supported(ctx)) {
+        set_error("cuStreamEndCapture: graphs unavailable");
+        return SOFUU_CUDA_ERR_LAUNCH;
+    }
+    CUgraph graph = NULL;
+    CUresult r = ctx->driver->cuStreamEndCapture(ctx->stream, &graph);
+    if (r != SOFUU_CUDA_SUCCESS || !graph) {
+        char eb[256];
+        set_error("cuStreamEndCapture failed: %s",
+                  driver_error(ctx->driver, r ? r : 1, eb, sizeof(eb)));
+        return SOFUU_CUDA_ERR_LAUNCH;
+    }
+    CUgraphExec exec = NULL;
+    if (ctx->driver->cuGraphInstantiateWithFlags) {
+        r = ctx->driver->cuGraphInstantiateWithFlags(&exec, graph, 0);
+    } else {
+        CUresult node_err = SOFUU_CUDA_SUCCESS;
+        char log[256];
+        log[0] = '\0';
+        r = ctx->driver->cuGraphInstantiate(&exec, graph, &node_err, log,
+                                            sizeof(log));
+    }
+    if (ctx->driver->cuGraphDestroy) {
+        ctx->driver->cuGraphDestroy(graph);
+    }
+    if (r != SOFUU_CUDA_SUCCESS || !exec) {
+        char eb[256];
+        set_error("cuGraphInstantiate failed: %s",
+                  driver_error(ctx->driver, r ? r : 1, eb, sizeof(eb)));
+        return SOFUU_CUDA_ERR_LAUNCH;
+    }
+    *out_exec = exec;
+    return SOFUU_CUDA_OK;
+}
+
+int sofuu_cuda_ctx_graph_launch(sofuu_cuda_ctx *ctx, void *exec) {
+    if (!ctx || !ctx->stream || !exec ||
+        !sofuu_cuda_ctx_graphs_supported(ctx)) {
+        set_error("cuGraphLaunch: graphs unavailable");
+        return SOFUU_CUDA_ERR_LAUNCH;
+    }
+    CUresult r = ctx->driver->cuGraphLaunch((CUgraphExec)exec, ctx->stream);
+    if (r != SOFUU_CUDA_SUCCESS) {
+        char eb[256];
+        set_error("cuGraphLaunch failed: %s",
+                  driver_error(ctx->driver, r, eb, sizeof(eb)));
+        return SOFUU_CUDA_ERR_LAUNCH;
+    }
+    return SOFUU_CUDA_OK;
+}
+
+int sofuu_cuda_ctx_graph_exec_free(sofuu_cuda_ctx *ctx, void *exec) {
+    if (!ctx || !exec) return SOFUU_CUDA_OK;
+    if (ctx->driver && ctx->driver->cuGraphExecDestroy) {
+        ctx->driver->cuGraphExecDestroy((CUgraphExec)exec);
     }
     return SOFUU_CUDA_OK;
 }

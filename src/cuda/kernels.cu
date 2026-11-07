@@ -937,8 +937,9 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(128) void sofuu_rope_f32(float *x, c
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
 void sofuu_attn_decode_f32(const float *q, const float *k_cache,
                            const float *v_cache, float *out, int n_heads,
-                           int n_kv_heads, int head_dim, int seq_len, int cap,
-                           float scale) {
+                           int n_kv_heads, int head_dim, const int *seq_dev,
+                           int cap, float scale) {
+    int seq_len = *seq_dev;
     int h = (int)sofuu_ctaid_x();
     unsigned int tid = sofuu_tid_x();
     unsigned int stride = sofuu_ntid_x();
@@ -1032,10 +1033,16 @@ void sofuu_add_f32(const float *a, const float *b, float *y, int n) {
 }
 
 // ── KV cache write (f32), one block per KV head ────────────────────────────
+// `pos_dev` points at the token's position in device memory, not a kernel
+// argument: a CUDA graph captured once per model replays at a new position by
+// updating that four-byte buffer, and a kernel parameter cannot change between
+// launches of the same graph.
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(128) void sofuu_kv_write_f32(float *k_cache, float *v_cache,
                                                 const float *k, const float *v,
-                                                int pos, int n_kv_heads,
-                                                int head_dim, int cap) {
+                                                const int *pos_dev,
+                                                int n_kv_heads, int head_dim,
+                                                int cap) {
+    int pos = *pos_dev;
     int head = (int)sofuu_ctaid_x();
     unsigned int tid = sofuu_tid_x();
     unsigned int stride = sofuu_ntid_x();
@@ -1534,8 +1541,10 @@ extern "C" void sofuu_host_rope(float *x, const float *cos_tab,
 }
 
 extern "C" void sofuu_host_kv_write(float *k_cache, float *v_cache,
-                                    const float *k, const float *v, int pos,
-                                    int n_kv_heads, int head_dim, int cap) {
+                                    const float *k, const float *v,
+                                    const int *pos_dev, int n_kv_heads,
+                                    int head_dim, int cap) {
+    int pos = *pos_dev;
     for (int h = 0; h < n_kv_heads; ++h) {
         unsigned long long slot =
             ((unsigned long long)h * (unsigned long long)cap +
@@ -1553,7 +1562,8 @@ extern "C" void sofuu_host_kv_write(float *k_cache, float *v_cache,
 extern "C" void sofuu_host_attn_decode(const float *q, const float *k_cache,
                                        const float *v_cache, float *out,
                                        int n_heads, int n_kv_heads, int head_dim,
-                                       int seq_len, int cap, float scale) {
+                                       const int *seq_dev, int cap, float scale) {
+    int seq_len = *seq_dev;
     if (n_kv_heads <= 0 || head_dim <= 0 || head_dim > 256 || seq_len <= 0 ||
         seq_len > cap || (n_heads % n_kv_heads) != 0) {
         return;

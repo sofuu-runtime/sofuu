@@ -18,7 +18,7 @@
 // refuses a forward from any other one instead of issuing driver calls against
 // a context that is not current there.
 
-use super::cuda::{CudaEngine, DeviceBuf, Quant};
+use super::cuda::{CudaEngine, DeviceBuf, GraphExec, Quant};
 use super::gguf::GgufFile;
 use super::model::{LayerWeights, ModelConfig, TensorView};
 use super::quant::{self, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0};
@@ -99,6 +99,15 @@ pub struct CudaModel {
     xd: DeviceBuf,
     xsum: DeviceBuf,
     xsum16: DeviceBuf,
+
+    // [pos, pos+1] as i32 in device memory. A captured graph cannot carry a
+    // per-launch scalar, so the position and the attention length travel
+    // through this buffer and the graph replays at any position.
+    pos_dev: DeviceBuf,
+    // One replayable decode step (16 layers + lm_head), captured on the first
+    // token. `graph_off` latches a capture failure so we stop retrying.
+    graph: Option<GraphExec>,
+    graph_off: bool,
 
     logits_host: Vec<f32>,
     logit_bytes: Vec<u8>,
@@ -412,6 +421,9 @@ impl CudaModel {
         let xd = alloc_f32!(q8_blocks, "q8 scales");
         let xsum = alloc_f32!(q8_blocks, "q8 sums");
         let xsum16 = alloc_f32!(q8_blocks * 2, "q8 half sums");
+        let pos_dev = engine
+            .alloc(8)
+            .map_err(|e| format!("position buffer: allocate 8 B: {e}"))?;
 
         let xb = alloc_f32!(PREFILL_BATCH * dim, "x_batch");
         let x_norm_b = alloc_f32!(PREFILL_BATCH * dim, "x_norm_batch");
@@ -486,6 +498,9 @@ impl CudaModel {
             xd,
             xsum,
             xsum16,
+            pos_dev,
+            graph: None,
+            graph_off: false,
             logits_host: vec![0.0; cfg.vocab_size],
             logit_bytes: vec![0u8; cfg.vocab_size * 4],
             rope_host: vec![0.0; cfg.head_dim],
@@ -603,21 +618,120 @@ impl CudaModel {
         e.upload(self.rope_dev, f32_bytes(&self.rope_host))
             .map_err(|err| format!("upload rope table: {err}"))?;
 
+        // [pos, pos+1] in device memory: kv_write reads the first word, the
+        // attention kernel the second. This is what lets one captured graph
+        // replay at every position.
+        let pos_host = [pos as i32, (pos + 1) as i32];
+        let mut pos_bytes = [0u8; 8];
+        pos_bytes[0..4].copy_from_slice(&pos_host[0].to_le_bytes());
+        pos_bytes[4..8].copy_from_slice(&pos_host[1].to_le_bytes());
+        e.upload(self.pos_dev, &pos_bytes)
+            .map_err(|err| format!("upload position: {err}"))?;
+
+        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
+        let profile = std::env::var_os("SOFUU_CUDA_PROFILE").is_some();
+        let mut prof_us = [0u128; 4];
+
+        // One graph replay per token instead of ~290 driver calls. The T4 gate
+        // measures 10.74 us for an empty launch, i.e. ~3.1 ms of a ~7.8 ms
+        // token, and the graph removes all but one of them. Capture needs every
+        // buffer to exist already (it does) and every per-token scalar in device
+        // memory (pos_dev), which is why this is a whole-token graph.
+        let want_graph =
+            !profile && compute_logits && !self.graph_off && e.graphs_supported();
+        let mut launched = false;
+        if want_graph {
+            if self.graph.is_none() {
+                match self.capture_decode_graph(e, pos, scale) {
+                    Ok(g) => {
+                        self.graph = Some(g);
+                        eprintln!(
+                            "[cuda] decode graph captured: one launch per token from here"
+                        );
+                    }
+                    Err(err) => {
+                        self.graph_off = true;
+                        eprintln!(
+                            "[cuda] graph capture unavailable ({err}); using direct launches"
+                        );
+                    }
+                }
+            }
+            if let Some(g) = self.graph {
+                e.graph_launch(g)
+                    .map_err(|err| format!("graph launch: {err}"))?;
+                launched = true;
+            }
+        }
+        if !launched {
+            self.decode_body(e, pos, scale, compute_logits, profile, &mut prof_us)?;
+        }
+
+        if compute_logits {
+            // The work above is asynchronous either way. Synchronize once per
+            // token, where the host consumes the result; this also surfaces a
+            // deferred kernel fault with the position that caused it.
+            e.sync()
+                .map_err(|err| format!("sync before logits: {err}"))?;
+            e.download(&mut self.logit_bytes, self.logits_dev)
+                .map_err(|err| format!("download logits: {err}"))?;
+            for (i, c) in self.logit_bytes.chunks_exact(4).enumerate() {
+                self.logits_host[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            }
+        }
+
+        if profile {
+            eprintln!(
+                "[cuda-profile] attn {:.2}ms  o_proj {:.2}ms  ffn {:.2}ms  lm_head {:.2}ms  total {:.2}ms",
+                prof_us[0] as f64 / 1000.0,
+                prof_us[1] as f64 / 1000.0,
+                prof_us[2] as f64 / 1000.0,
+                prof_us[3] as f64 / 1000.0,
+                (prof_us[0] + prof_us[1] + prof_us[2] + prof_us[3]) as f64 / 1000.0
+            );
+        }
+
+        self.pos = pos + 1;
+        Ok(())
+    }
+
+    /// Record one decode step and instantiate it. The captured work is *not*
+    /// executed by capture, so the caller launches the returned graph.
+    fn capture_decode_graph(
+        &self,
+        e: &CudaEngine,
+        pos: usize,
+        scale: f32,
+    ) -> Result<GraphExec, String> {
+        e.begin_capture().map_err(|err| err.to_string())?;
+        let mut sink = [0u128; 4];
+        self.decode_body(e, pos, scale, true, false, &mut sink)?;
+        e.end_capture().map_err(|err| err.to_string())
+    }
+
+    /// The decode launches with no sync and no download: the exact sequence a
+    /// captured graph replays. `pos` reaches the kernels through `pos_dev`, and
+    /// is used here only for the host-side bounds checks.
+    fn decode_body(
+        &self,
+        e: &CudaEngine,
+        pos: usize,
+        scale: f32,
+        compute_logits: bool,
+        profile: bool,
+        prof_us: &mut [u128; 4],
+    ) -> Result<(), String> {
         let half = self.head_dim / 2;
         let sin_dev = DeviceBuf {
             ptr: self.rope_dev.ptr + (half * 4) as u64,
             bytes: self.rope_dev.bytes - half * 4,
         };
         let seq_len = pos + 1;
-        let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        // SOFUU_CUDA_PROFILE=1: one stream sync per phase so the host can time
-        // attention, the output projection, the FFN and lm_head separately.
-        // The syncs inflate each group by the driver round-trip, but at ~18 ms
-        // per token the phase split is still the useful signal.
-        let profile = std::env::var_os("SOFUU_CUDA_PROFILE").is_some();
-        let mut prof_us = [0u128; 4];
+        let seq_dev = DeviceBuf {
+            ptr: self.pos_dev.ptr + 4,
+            bytes: 4,
+        };
         let mut t_group = std::time::Instant::now();
-
         for (li, l) in self.layers.iter().enumerate() {
             if profile {
                 t_group = std::time::Instant::now();
@@ -687,6 +801,7 @@ impl CudaModel {
                 self.k,
                 self.v,
                 pos,
+                self.pos_dev,
                 self.n_kv_heads,
                 self.head_dim,
                 self.cap,
@@ -701,6 +816,7 @@ impl CudaModel {
                 self.n_kv_heads,
                 self.head_dim,
                 seq_len,
+                seq_dev,
                 self.cap,
                 scale,
             )
@@ -797,33 +913,12 @@ impl CudaModel {
                 self.dim,
             )
             .map_err(|err| format!("lm_head: {err}"))?;
-            // The launches above are asynchronous. Synchronize once per token,
-            // where the host actually consumes the result; this also surfaces
-            // any deferred kernel fault with the position that caused it.
-            e.sync()
-                .map_err(|err| format!("sync before logits: {err}"))?;
-            e.download(&mut self.logit_bytes, self.logits_dev)
-                .map_err(|err| format!("download logits: {err}"))?;
-            for (i, c) in self.logit_bytes.chunks_exact(4).enumerate() {
-                self.logits_host[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            }
             if profile {
+                e.sync()
+                    .map_err(|err| format!("lm_head profile sync: {err}"))?;
                 prof_us[3] += t_group.elapsed().as_micros();
             }
         }
-
-        if profile {
-            eprintln!(
-                "[cuda-profile] attn {:.2}ms  o_proj {:.2}ms  ffn {:.2}ms  lm_head {:.2}ms  total {:.2}ms",
-                prof_us[0] as f64 / 1000.0,
-                prof_us[1] as f64 / 1000.0,
-                prof_us[2] as f64 / 1000.0,
-                prof_us[3] as f64 / 1000.0,
-                (prof_us[0] + prof_us[1] + prof_us[2] + prof_us[3]) as f64 / 1000.0
-            );
-        }
-
-        self.pos = pos + 1;
         Ok(())
     }
 

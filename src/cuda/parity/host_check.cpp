@@ -258,7 +258,8 @@ void test_kv_write(uint32_t &seed) {
     std::vector<float> want_k = got_k, want_v = got_v;
     std::vector<float> k = random_vec(n_kv * hd, seed, -1.0f, 1.0f);
     std::vector<float> v = random_vec(n_kv * hd, seed, -1.0f, 1.0f);
-    sofuu_host_kv_write(got_k.data(), got_v.data(), k.data(), v.data(), pos,
+    int pos_dev = pos;
+    sofuu_host_kv_write(got_k.data(), got_v.data(), k.data(), v.data(), &pos_dev,
                         n_kv, hd, cap);
     sofuu_ref::kv_write_ref(want_k.data(), want_v.data(), k.data(), v.data(),
                             pos, n_kv, hd, cap);
@@ -278,8 +279,9 @@ void test_attn_decode(uint32_t &seed) {
     std::vector<float> v = random_vec(cache_n, seed, -1.0f, 1.0f);
     std::vector<float> got((size_t)(n_heads * hd)), want((size_t)(n_heads * hd));
     float scale = 1.0f / std::sqrt((float)hd);
+    int seq_dev = seq;
     sofuu_host_attn_decode(q.data(), k.data(), v.data(), got.data(), n_heads,
-                           n_kv, hd, seq, cap, scale);
+                           n_kv, hd, &seq_dev, cap, scale);
     sofuu_ref::attn_decode_ref(q.data(), k.data(), v.data(), want.data(),
                                n_heads, n_kv, hd, seq, cap, scale);
     check_vec("attn_decode", got.data(), want.data(), n_heads * hd, 2e-5, 2e-6);
@@ -637,10 +639,11 @@ void test_batch_paths(uint32_t &seed) {
                 want.data() + (size_t)t * n_heads * hd, n_heads, n_kv, hd,
                 start + t + 1, cap, scale);
             // The prefill kernel is the decode math with a token offset.
+            int seq_dev = start + t + 1;
             sofuu_host_attn_decode(q.data() + (size_t)t * n_heads * hd,
                                    kc.data(), vc.data(),
                                    got.data() + (size_t)t * n_heads * hd,
-                                   n_heads, n_kv, hd, start + t + 1, cap, scale);
+                                   n_heads, n_kv, hd, &seq_dev, cap, scale);
         }
         check_vec("attn_prefill", got.data(), want.data(), tokens * n_heads * hd,
                   2e-5, 2e-6);

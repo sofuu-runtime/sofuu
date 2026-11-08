@@ -58,23 +58,50 @@ filter triage_patient(patient_id, heart_rate, bp_systolic, bp_diastolic, symptom
 ## Running Directly with Sofuu CLI
 
 ```bash
-sofuu script run examples/agents/med_protocol/agent.kaze \
+sofuu script run example-agents/med_protocol/agent.kaze \
     --entry triage_patient \
-    --arg patient_id='"PT-9042"' \
+    --arg patient_id=PT-9042 \
     --arg heart_rate=142 \
     --arg bp_systolic=165 \
     --arg bp_diastolic=98 \
-    --arg symptoms='"Acute dyspnea and persistent diaphoresis"'
+    --arg symptoms="Acute dyspnea and persistent diaphoresis"
 ```
 
 ---
 
-## Compiling to a Standalone Executable
+## Compiling to a Standalone Native Executable
 
 ```bash
 # Compile pure Kaze file into a standalone executable:
-sofuu compile examples/agents/med_protocol/agent.kaze -o med-protocol
+sofuu compile example-agents/med_protocol/agent.kaze -o example-agents/med_protocol/med-protocol
+```
 
-# Run directly:
-./med-protocol --entry triage_patient --arg patient_id='"PT-9042"' --arg heart_rate=80 --arg bp_systolic=120 --arg bp_diastolic=80 --arg symptoms='"Mild headache"'
+### Production Execution Modes
+
+#### 1. Config File Driven (`--config`)
+Run cleanly using [`agent.config.json`](agent.config.json):
+```bash
+./example-agents/med_protocol/med-protocol --config example-agents/med_protocol/agent.config.json
+```
+
+#### 2. Positional Arguments (Rapid Bedside Triage)
+```bash
+./example-agents/med_protocol/med-protocol PT-9821 78 120 80 "Mild headache and fatigue"
+```
+
+#### 3. Continuous ICU Telemetry Daemon (`--daemon --every`)
+Monitor patient telemetry streams continuously:
+```bash
+./example-agents/med_protocol/med-protocol --config example-agents/med_protocol/agent.config.json --daemon --every 1s
+```
+
+#### 4. Container / Cloud Environment Injection
+```bash
+export AGENT_PATIENT_ID="PT-9821"
+export AGENT_HEART_RATE=78
+export AGENT_BP_SYSTOLIC=120
+export AGENT_BP_DIASTOLIC=80
+export AGENT_SYMPTOMS="Stable telemetry"
+
+./example-agents/med_protocol/med-protocol
 ```

@@ -620,11 +620,17 @@ action run_market_sentinel(query):
     return decision
 ```
 
-Compile directly into a standalone single-file binary with live TUI badges:
+Compile directly into a standalone single-file binary with live ANSI badges and production 12-factor configuration (`--config`, `--arg`, positionals, env vars, `--daemon`):
 
 ```bash
-sofuu compile quant_sentinel.kaze -o dist/quant-sentinel
-./dist/quant-sentinel "Analyze morning liquidity shift"
+# Compile pure Kaze agent directly to native executable:
+sofuu compile example-agents/paper_trader/agent.kaze -o paper-trader
+
+# Run with clean JSON configuration:
+./paper-trader --config example-agents/paper_trader/agent.config.json
+
+# Or run continuously as an autonomous 24/7 supervisor daemon:
+./paper-trader --config example-agents/paper_trader/agent.config.json --daemon --every 2s
 ```
 
 Scripting language reference: [docs/KAZE-SPEC.md](docs/KAZE-SPEC.md) · standalone compiler: [docs/COMPILER.md](docs/COMPILER.md) · examples:

@@ -62,38 +62,62 @@ filter evaluate_trade(ticker, signal, leverage, price):
 
 ```bash
 # Evaluate a trade signal
-sofuu script run examples/agents/quant_sentinel/agent.kaze \
+sofuu script run example-agents/quant_sentinel/agent.kaze \
     --entry evaluate_trade \
-    --arg ticker='"NVDA"' \
-    --arg signal='"BUY"' \
+    --arg ticker=NVDA \
+    --arg signal=BUY \
     --arg leverage=2 \
     --arg price=145
 
 # Test the risk guardrail (rejection on excessive leverage)
-sofuu script run examples/agents/quant_sentinel/agent.kaze \
+sofuu script run example-agents/quant_sentinel/agent.kaze \
     --entry evaluate_trade \
-    --arg ticker='"NVDA"' \
-    --arg signal='"BUY"' \
+    --arg ticker=NVDA \
+    --arg signal=BUY \
     --arg leverage=5 \
     --arg price=145
 ```
 
 ---
 
-## Compiling to a Standalone Executable
+## Compiling to a Standalone Native Executable
 
 Compile the `.kaze` file directly into a single self-contained binary:
 
 ```bash
-sofuu compile examples/agents/quant_sentinel/agent.kaze -o quant-sentinel
+sofuu compile example-agents/quant_sentinel/agent.kaze -o example-agents/quant_sentinel/quant-sentinel
 ```
 
-Run the standalone binary with CLI arguments:
+### Production Execution Modes
+
+#### 1. Config File Driven (`--config`)
+Run cleanly using [`agent.config.json`](agent.config.json):
 ```bash
-./quant-sentinel --entry evaluate_trade --arg ticker='"NVDA"' --arg signal='"BUY"' --arg leverage=2 --arg price=145
+./example-agents/quant_sentinel/quant-sentinel --config example-agents/quant_sentinel/agent.config.json
 ```
 
-Or run interactively with the focused Agent TUI:
+#### 2. 24/7 Supervisor Loop (`--daemon --every`)
+Run continuous market surveillance:
 ```bash
-./quant-sentinel --interactive
+./example-agents/quant_sentinel/quant-sentinel --config example-agents/quant_sentinel/agent.config.json --daemon --every 2s
+```
+
+#### 3. Positional Arguments (Fast Execution)
+```bash
+./example-agents/quant_sentinel/quant-sentinel NVDA BUY 2.5 130
+```
+
+#### 4. Container / Cloud Environment Injection
+```bash
+export AGENT_TICKER=NVDA
+export AGENT_SIGNAL=BUY
+export AGENT_LEVERAGE=2.5
+export AGENT_PRICE=130
+
+./example-agents/quant_sentinel/quant-sentinel
+```
+
+#### 5. Interactive Agent TUI
+```bash
+./example-agents/quant_sentinel/quant-sentinel --interactive
 ```

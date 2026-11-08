@@ -63,10 +63,10 @@ filter monitor_greenhouse(zone_id, crop_type, target_temp, target_humidity):
 ## Running Directly with Sofuu CLI
 
 ```bash
-sofuu script run examples/agents/agri_sentinel/agent.kaze \
+sofuu script run example-agents/agri_sentinel/agent.kaze \
     --entry monitor_greenhouse \
-    --arg zone_id='"Zone-3-North"' \
-    --arg crop_type='"Heirloom Tomato"' \
+    --arg zone_id=Zone-3-North \
+    --arg crop_type="Heirloom Tomato" \
     --arg target_temp=24 \
     --arg target_humidity=65 \
     --sim temperature=28.5,humidity=52
@@ -74,12 +74,38 @@ sofuu script run examples/agents/agri_sentinel/agent.kaze \
 
 ---
 
-## Compiling to a Standalone Executable
+## Compiling to a Standalone Native Executable
 
 ```bash
 # Compile pure Kaze file into a standalone executable:
-sofuu compile examples/agents/agri_sentinel/agent.kaze -o agri-sentinel
+sofuu compile example-agents/agri_sentinel/agent.kaze -o example-agents/agri_sentinel/agri-sentinel
+```
 
-# Run standalone binary:
-./agri-sentinel --entry monitor_greenhouse --arg zone_id='"Zone-1"' --arg crop_type='"Strawberries"' --arg target_temp=22 --arg target_humidity=70
+### Production Execution Modes
+
+#### 1. Config File Driven (`--config`)
+Run cleanly using [`agent.config.json`](agent.config.json):
+```bash
+./example-agents/agri_sentinel/agri-sentinel --config example-agents/agri_sentinel/agent.config.json
+```
+
+#### 2. Positional Arguments (Rapid Field Assessment)
+```bash
+./example-agents/agri_sentinel/agri-sentinel North-Greenhouse Heirloom-Tomato 22 65
+```
+
+#### 3. 24/7 Precision Irrigation Daemon (`--daemon --every`)
+Continuously monitor microclimate conditions and pulse misters/fans:
+```bash
+./example-agents/agri_sentinel/agri-sentinel --config example-agents/agri_sentinel/agent.config.json --daemon --every 5s
+```
+
+#### 4. Edge IoT / Gateway Environment Injection
+```bash
+export AGENT_ZONE_ID="North-Greenhouse"
+export AGENT_CROP_TYPE="Heirloom-Tomato"
+export AGENT_TARGET_TEMP=22
+export AGENT_TARGET_HUMIDITY=65
+
+./example-agents/agri_sentinel/agri-sentinel
 ```

@@ -168,8 +168,52 @@ When sentiment is bearish ($\le 40$) and no position is open, the agent refuses 
 
 ---
 
-### Test 6: Allocation Risk Breach Guardrail (`execute_manual_order`)
-Attempting to allocate 35% of the paper portfolio into a single position (exceeding the 25% safety cap):
+### Test 6: Credential Leak Prevention Guardrail (Rejected)
+
+If an automated signal feeds private API keys inside the asset identifier:
+
+```bash
+./example-agents/paper_trader/paper-trader \
+  --arg asset="ETH-TOKEN-sk-ant-api03-secretkey123" \
+  --arg current_price=2600 \
+  --arg volume_24h=500000000 \
+  --arg sentiment_score=65 \
+  --arg entry_price=0
+```
+
+**Expected Output:**
+```
+[AGENT] agent :: analyze_and_trade
+[POLICY] policy.detects("secrets", ...) -> true
+[VERDICT] REJECT Security refusal: asset identifier or payload contains private credentials
+```
+
+---
+
+### Test 7: Illiquid Asset Rejection (Rejected)
+
+If an asset has 24h volume below $50,000, preventing slippage simulation errors:
+
+```bash
+./example-agents/paper_trader/paper-trader \
+  --arg asset=MICRO-CAP-COIN \
+  --arg current_price=0.04 \
+  --arg volume_24h=12000 \
+  --arg sentiment_score=50 \
+  --arg entry_price=0
+```
+
+**Expected Output:**
+```
+[AGENT] agent :: analyze_and_trade
+[VERDICT] REJECT Illiquid asset refusal: 24h volume below simulated execution threshold ($50,000)
+```
+
+---
+
+### Test 8: Allocation Risk Breach Guardrail (`execute_manual_order`)
+
+Attempting to allocate 35% of the paper portfolio into a single manual position (exceeding the 25% safety cap):
 
 ```bash
 ./example-agents/paper_trader/paper-trader \
@@ -190,137 +234,66 @@ Attempting to allocate 35% of the paper portfolio into a single position (exceed
 
 ---
 
-### Test 3: Credential Leak Prevention Guardrail (Rejected)
-
-If an automated signal feeds private API keys inside the asset identifier:
-
-```bash
-./example-agents/paper_trader/paper-trader \
-  --entry analyze_and_trade \
-  --arg 'asset="ETH-TOKEN-sk-ant-api03-secretkey123"' \
-  --arg 'current_price=2600' \
-  --arg 'volume_24h=500000000' \
-  --arg 'sentiment_score=65' \
-  --arg 'requested_action="BUY"' \
-  --arg 'requested_allocation_pct=10'
-```
-
-**Expected Output:**
-```
-[AGENT] agent :: analyze_and_trade
-[POLICY] policy.detects("secrets", ...) -> true
-[VERDICT] REJECT Security refusal: asset identifier or payload contains private credentials
-```
-
----
-
-### Test 4: Illiquid Asset Rejection (Rejected)
-
-If an asset has 24h volume below $50,000, preventing slippage simulation errors:
-
-```bash
-./example-agents/paper_trader/paper-trader \
-  --entry analyze_and_trade \
-  --arg 'asset="MICRO-CAP-COIN"' \
-  --arg 'current_price=0.04' \
-  --arg 'volume_24h=12000' \
-  --arg 'sentiment_score=50' \
-  --arg 'requested_action="BUY"' \
-  --arg 'requested_allocation_pct=5'
-```
-
-**Expected Output:**
-```
-[AGENT] agent :: analyze_and_trade
-[VERDICT] REJECT Illiquid asset refusal: 24h volume below simulated execution threshold ($50,000)
-```
-
----
-
-### Test 5: Paper Portfolio Performance Review (`action review_portfolio`)
+### Test 9: Paper Portfolio Performance Review (`action review_portfolio`)
 
 Review simulated equity and rebalance recommendations:
 
 ```bash
 ./example-agents/paper_trader/paper-trader \
   --entry review_portfolio \
-  --arg 'total_paper_equity=125400' \
-  --arg 'active_positions="BTC: 40%, ETH: 25%, SOL: 15%, CASH: 20%"'
+  --arg total_paper_equity=125400 \
+  --arg active_positions="BTC: 40%, ETH: 25%, SOL: 15%, CASH: 20%"
 ```
 
 ---
 
-### Test 6: Strategy Backtesting (`action backtest_strategy`)
+### Test 10: Strategy Backtesting (`action backtest_strategy`)
 
 Run historical simulation over custom timeframes:
 
 ```bash
 ./example-agents/paper_trader/paper-trader \
   --entry backtest_strategy \
-  --arg 'asset="BTC/USD"' \
-  --arg 'timeframe_days=90' \
-  --arg 'strategy_name="EMA_Cross_20_50"'
+  --arg asset="BTC/USD" \
+  --arg timeframe_days=90 \
+  --arg strategy_name="EMA_Cross_20_50"
 ```
 
 ---
 
-### Test 7: Autonomous Position Management & Take-Profit / Stop-Loss (`action manage_position`)
+## 5. Production-Grade Configuration Hierarchy (12-Factor Design)
 
-Monitor open paper positions and automatically trigger Take Profit (+2%) or Stop Loss (-2%):
+Paper Trader supports 4 flexible configuration tiers in strict order of precedence:
 
-#### A. Take Profit Triggered (+2% Profit Target Reached)
+1. **CLI Flags (`--arg asset=...` or positional arguments)**: Quickest for testing and ad-hoc runs.
+2. **Environment Variables (`AGENT_*`)**: Native for Docker and Kubernetes pods without modifying commands.
+3. **Configuration File (`--config <file.json>`)**: Cleanest for production setups.
+4. **Signature Diagnostics**: Missing parameters trigger informative guides instead of engine crashes.
+
+### Example A: Running with Config File (`agent.config.json`)
 ```bash
-./example-agents/paper_trader/paper-trader \
-  --entry manage_position \
-  --arg asset=BTC-USDT \
-  --arg current_price=76500 \
-  --arg entry_price=75000 \
-  --arg position_allocation_pct=20
-```
-**Expected Trace:**
-```
-[AGENT] agent :: manage_position
-[INFO] Position Manager checking BTC-USDT at $76500 (Entry: $75000)
-[INFO] TAKE PROFIT triggered on BTC-USDT (+2% profit target reached)
-[TOOL] tool.call("paper_exchange", "BTC-USDT:SELL@76500;reason=TAKE_PROFIT")
-[STEP] alert.send("PROFIT TAKEN: Closed BTC-USDT position at $76500")
-57 instructions · 0 fuel
+./example-agents/paper_trader/paper-trader --config example-agents/paper_trader/agent.config.json
 ```
 
-#### B. Stop Loss Triggered (-2% Risk Threshold Hit)
+Or 24/7 supervisor daemon with the config file:
 ```bash
-./example-agents/paper_trader/paper-trader \
-  --entry manage_position \
-  --arg asset=BTC-USDT \
-  --arg current_price=73000 \
-  --arg entry_price=75000 \
-  --arg position_allocation_pct=20
-```
-**Expected Trace:**
-```
-[AGENT] agent :: manage_position
-[INFO] Position Manager checking BTC-USDT at $73000 (Entry: $75000)
-[INFO] STOP LOSS triggered on BTC-USDT (-2% risk threshold hit)
-[TOOL] tool.call("paper_exchange", "BTC-USDT:SELL@73000;reason=STOP_LOSS")
-[STEP] alert.send("STOP LOSS: Closed BTC-USDT position at $73000 to preserve capital")
-65 instructions · 0 fuel
+./example-agents/paper_trader/paper-trader --config example-agents/paper_trader/agent.config.json --daemon --every 2s
 ```
 
-#### C. In Corridor (Hold Position)
+### Example B: Running via Positional Arguments
 ```bash
-./example-agents/paper_trader/paper-trader \
-  --entry manage_position \
-  --arg asset=BTC-USDT \
-  --arg current_price=75200 \
-  --arg entry_price=75000 \
-  --arg position_allocation_pct=20
+./example-agents/paper_trader/paper-trader BTC-USDT 75893 367000000 72 0
 ```
-**Expected Trace:**
-```
-[AGENT] agent :: manage_position
-[INFO] Position Manager checking BTC-USDT at $75200 (Entry: $75000)
-[INFO] HOLD: BTC-USDT price within acceptable risk corridor
-36 instructions · 0 fuel
+
+### Example C: Running via Environment Variables
+```bash
+export AGENT_ASSET="BTC-USDT"
+export AGENT_CURRENT_PRICE=75893
+export AGENT_VOLUME_24H=367000000
+export AGENT_SENTIMENT_SCORE=72
+export AGENT_ENTRY_PRICE=0
+
+./example-agents/paper_trader/paper-trader --daemon --every 5s
 ```
 
 ---
@@ -338,8 +311,7 @@ Run Paper Trader continuously around the clock with one command:
   --arg current_price=75893 \
   --arg volume_24h=367000000 \
   --arg sentiment_score=50 \
-  --arg requested_action=HOLD \
-  --arg requested_allocation_pct=15
+  --arg entry_price=0
 ```
 
 ### 2. Auto-Installed Persistent Background Service (`sofuu daemon install`)
@@ -352,8 +324,7 @@ sofuu daemon install ./example-agents/paper_trader/paper-trader \
   --arg current_price=75893 \
   --arg volume_24h=367000000 \
   --arg sentiment_score=50 \
-  --arg requested_action=HOLD \
-  --arg requested_allocation_pct=15
+  --arg entry_price=0
 
 # View live daemon status:
 sofuu daemon status btc-paper-trader

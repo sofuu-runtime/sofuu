@@ -1,0 +1,11 @@
+{
+  "entry": "monitor_greenhouse",
+  "interval": "5s",
+  "fuel": 200000,
+  "args": {
+    "zone_id": "North-Greenhouse",
+    "crop_type": "Heirloom-Tomato",
+    "target_temp": 22,
+    "target_humidity": 65
+  }
+}

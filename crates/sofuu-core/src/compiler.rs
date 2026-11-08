@@ -1346,6 +1346,13 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     let file_stem = entry_path
         .file_stem()
         .and_then(|s| s.to_str())
+        .filter(|&s| s != "agent" && s != "main")
+        .or_else(|| {
+            entry_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+        })
         .unwrap_or("agent");
 
     let declared_grants: Vec<String> = kaze_src
@@ -1374,6 +1381,14 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     });
     let default_entry_json = serde_json::to_string(&default_entry).unwrap_or_else(|_| "null".to_string());
 
+    let mut routine_signatures: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    if let Some(ref p) = parsed_prog {
+        for item in &p.items {
+            routine_signatures.insert(item.name.clone(), item.params.clone());
+        }
+    }
+    let routine_signatures_json = serde_json::to_string(&routine_signatures).unwrap_or_else(|_| "{}".to_string());
+
     let kaze_source_json = serde_json::to_string(&kaze_src).unwrap_or_else(|_| "\"\"".to_string());
     let kaze_name_json = serde_json::to_string(file_stem).unwrap_or_else(|_| "\"agent\"".to_string());
 
@@ -1383,19 +1398,42 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     var kazeName = {kaze_name_json};
     var defaultGrants = {grants_json};
     var defaultEntry = {default_entry_json};
+    var routineSignatures = {routine_signatures_json};
 
     var argv = (typeof process !== 'undefined' && process.argv) ? process.argv.slice(2) : [];
     if (argv.indexOf('--help') !== -1 || argv.indexOf('-h') !== -1) {{
-        console.log("Usage: " + kazeName + " [options] [query]\n\nAutonomous AI Agent powered by Kaze & Sofuu.\n\nOptions:\n  -i, --interactive      Launch interactive Agent TUI shell\n  -d, --daemon           Run continuous 24/7 autonomous supervisor loop\n  --every <interval>     Supervisor cycle interval (e.g. 500ms, 2s, 10s, 1m, 1h; default: 5s)\n  --interval <interval>  Alias for --every\n  --arg key=val          Pass named argument\n  --cap <name>           Grant capability backend\n  --entry <name>         Routine to execute\n  --fuel <n>             Instruction budget\n  -h, --help             Show help\n");
+        console.log("Usage: " + kazeName + " [options] [positional args...]\n\n" +
+            "Autonomous AI Agent powered by Kaze & Sofuu.\n\n" +
+            "Options:\n" +
+            "  -c, --config <file>    Load configuration from JSON file (default: ./agent.config.json)\n" +
+            "  --arg key=val          Pass named argument (parsed as JSON primitive if valid)\n" +
+            "  --entry <name>         Routine to execute (default: " + (defaultEntry ? "'" + defaultEntry + "'" : "auto") + ")\n" +
+            "  -d, --daemon           Run continuous 24/7 autonomous supervisor loop\n" +
+            "  --every <interval>     Supervisor cycle interval (e.g. 500ms, 2s, 10s, 1m, 1h; default: 5s)\n" +
+            "  --interval <interval>  Alias for --every\n" +
+            "  --fuel <n>             Instruction budget limit (default: 200000)\n" +
+            "  --cap <name>           Grant capability backend (e.g. drone=sim)\n" +
+            "  -i, --interactive      Launch interactive Agent TUI shell\n" +
+            "  -h, --help             Show this help message\n\n" +
+            "Configuration Precedence (Production 12-Factor):\n" +
+            "  1. CLI Arguments (--arg / positionals)\n" +
+            "  2. Environment Variables (AGENT_<PARAM> / SOFUU_<PARAM>)\n" +
+            "  3. Configuration File (--config <path> / ./agent.config.json)\n");
         return;
     }}
 
     var isInteractive = argv.indexOf('--interactive') !== -1 || argv.indexOf('-i') !== -1;
     var isDaemon = argv.indexOf('--daemon') !== -1 || argv.indexOf('-d') !== -1;
+    var explicitDaemon = isDaemon;
     var intervalMs = 5000;
     var intervalRaw = '5s';
+    var explicitInterval = false;
     var entryRoutine = defaultEntry;
+    var explicitEntry = false;
     var fuel = 200000;
+    var explicitFuel = false;
+    var explicitConfigFile = null;
+    var cliArgs = {{}};
     var args = {{}};
     var positionals = [];
 
@@ -1429,18 +1467,33 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         if (a === '--interactive' || a === '-i') continue;
         if (a === '--daemon' || a === '-d') {{
             isDaemon = true;
+            explicitDaemon = true;
             continue;
         }}
         if ((a === '--every' || a === '--interval') && i + 1 < argv.length) {{
             intervalRaw = argv[++i];
             intervalMs = parseInterval(intervalRaw);
             isDaemon = true;
+            explicitInterval = true;
+            explicitDaemon = true;
         }} else if (a.startsWith('--every=') || a.startsWith('--interval=')) {{
             intervalRaw = a.slice(a.indexOf('=') + 1);
             intervalMs = parseInterval(intervalRaw);
             isDaemon = true;
+            explicitInterval = true;
+            explicitDaemon = true;
+        }} else if ((a === '--config' || a === '-c') && i + 1 < argv.length) {{
+            explicitConfigFile = argv[++i];
+        }} else if (a.startsWith('--config=')) {{
+            explicitConfigFile = a.slice(9);
+        }} else if (a.startsWith('-c=')) {{
+            explicitConfigFile = a.slice(3);
         }} else if (a === '--entry' && i + 1 < argv.length) {{
             entryRoutine = argv[++i];
+            explicitEntry = true;
+        }} else if (a.startsWith('--entry=')) {{
+            entryRoutine = a.slice(8);
+            explicitEntry = true;
         }} else if (a.startsWith('--cap')) {{
             var capVal = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
             if (capVal) defaultGrants.push(capVal.split('=')[0].trim());
@@ -1451,14 +1504,101 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
                 if (eq > 0) {{
                     var k = pair.slice(0, eq).trim();
                     var v = pair.slice(eq + 1).trim();
-                    try {{ args[k] = JSON.parse(v); }} catch (_) {{ args[k] = v; }}
+                    try {{ cliArgs[k] = JSON.parse(v); }} catch (_) {{ cliArgs[k] = v; }}
                 }}
             }}
         }} else if (a.startsWith('--fuel=') || (a === '--fuel' && i + 1 < argv.length)) {{
             fuel = parseInt(a.indexOf('=') !== -1 ? a.slice(7) : argv[++i], 10) || 200000;
+            explicitFuel = true;
         }} else if (!a.startsWith('-')) {{
             positionals.push(a);
         }}
+    }}
+
+    // --- Production Configuration Pipeline (Tiered Precedence) ---
+    // Tier 1: Config File (Base Configuration)
+    var configFileToLoad = explicitConfigFile;
+    if (!configFileToLoad && typeof sofuu !== 'undefined' && sofuu.fs && sofuu.fs.existsSync) {{
+        var autoCandidates = [
+            './agent.config.json',
+            './' + kazeName + '.config.json',
+            './config.json'
+        ];
+        for (var cIdx = 0; cIdx < autoCandidates.length; cIdx++) {{
+            if (sofuu.fs.existsSync(autoCandidates[cIdx])) {{
+                configFileToLoad = autoCandidates[cIdx];
+                break;
+            }}
+        }}
+    }}
+
+    if (configFileToLoad) {{
+        try {{
+            if (typeof sofuu !== 'undefined' && sofuu.fs && sofuu.fs.readFileSync) {{
+                var rawCfg = sofuu.fs.readFileSync(configFileToLoad, 'utf8');
+                var cfg = JSON.parse(rawCfg);
+                if (cfg && typeof cfg === 'object') {{
+                    if (cfg.entry && !explicitEntry) entryRoutine = cfg.entry;
+                    if (cfg.fuel && !explicitFuel) fuel = parseInt(cfg.fuel, 10) || fuel;
+                    if ((cfg.every || cfg.interval) && !explicitInterval) {{
+                        intervalRaw = '' + (cfg.every || cfg.interval);
+                        intervalMs = parseInterval(intervalRaw);
+                        if (!explicitDaemon) isDaemon = true;
+                    }}
+                    if (cfg.daemon !== undefined && !explicitDaemon) isDaemon = !!cfg.daemon;
+                    if (Array.isArray(cfg.grants)) {{
+                        for (var g = 0; g < cfg.grants.length; g++) {{
+                            if (defaultGrants.indexOf(cfg.grants[g]) === -1) defaultGrants.push(cfg.grants[g]);
+                        }}
+                    }}
+                    var cfgArgs = cfg.args && typeof cfg.args === 'object' ? cfg.args : cfg;
+                    for (var k in cfgArgs) {{
+                        if (k !== 'args' && k !== 'entry' && k !== 'fuel' && k !== 'interval' && k !== 'every' && k !== 'daemon' && k !== 'grants') {{
+                            if (args[k] === undefined) {{
+                                args[k] = cfgArgs[k];
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+        }} catch (cfgErr) {{
+            console.error("\x1b[31m[Config Error]\x1b[0m Failed to parse configuration file '" + configFileToLoad + "': " + (cfgErr && cfgErr.message ? cfgErr.message : cfgErr));
+            if (typeof process !== 'undefined' && process.exit) process.exit(1);
+            return;
+        }}
+    }}
+
+    // Tier 2: Environment Variables (Container / Cloud Injection)
+    if (typeof process !== 'undefined' && process.env) {{
+        var env = process.env;
+        if (env.AGENT_ENTRY && !explicitEntry) entryRoutine = env.AGENT_ENTRY;
+        if (env.AGENT_FUEL && !explicitFuel) fuel = parseInt(env.AGENT_FUEL, 10) || fuel;
+        if (env.AGENT_INTERVAL && !explicitInterval) {{
+            intervalRaw = env.AGENT_INTERVAL;
+            intervalMs = parseInterval(intervalRaw);
+            if (!explicitDaemon) isDaemon = true;
+        }}
+        if ((env.AGENT_DAEMON === 'true' || env.AGENT_DAEMON === '1') && !explicitDaemon) isDaemon = true;
+
+        for (var envKey in env) {{
+            var normKey = null;
+            if (envKey.startsWith('AGENT_')) {{
+                normKey = envKey.slice(6).toLowerCase();
+            }} else if (envKey.startsWith('SOFUU_')) {{
+                normKey = envKey.slice(6).toLowerCase();
+            }}
+            if (normKey && normKey !== 'entry' && normKey !== 'fuel' && normKey !== 'interval' && normKey !== 'every' && normKey !== 'daemon') {{
+                if (cliArgs[normKey] === undefined) {{
+                    var rawEnv = env[envKey];
+                    try {{ args[normKey] = JSON.parse(rawEnv); }} catch (_) {{ args[normKey] = rawEnv; }}
+                }}
+            }}
+        }}
+    }}
+
+    // Tier 3: CLI Arguments (Highest Precedence)
+    for (var cliKey in cliArgs) {{
+        args[cliKey] = cliArgs[cliKey];
     }}
 
     function badge(type, text) {{
@@ -1489,18 +1629,59 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             if (targetArgs['query'] === undefined) targetArgs['query'] = combined;
             if (targetArgs['prompt'] === undefined) targetArgs['prompt'] = combined;
             if (targetArgs['input'] === undefined) targetArgs['input'] = combined;
+
+            var expected = routineSignatures[entryRoutine] || [];
             for (var p = 0; p < positionals.length; p++) {{
                 var pKey = '' + p;
+                var rawPos = positionals[p];
+                var parsedVal;
+                try {{ parsedVal = JSON.parse(rawPos); }} catch (_) {{ parsedVal = rawPos; }}
                 if (targetArgs[pKey] === undefined) {{
-                    var raw = positionals[p];
-                    try {{ targetArgs[pKey] = JSON.parse(raw); }} catch (_) {{ targetArgs[pKey] = raw; }}
+                    targetArgs[pKey] = parsedVal;
+                }}
+                if (p < expected.length) {{
+                    var paramName = expected[p];
+                    if (targetArgs[paramName] === undefined) {{
+                        targetArgs[paramName] = parsedVal;
+                    }}
                 }}
             }}
         }}
     }}
 
+    function validateParameters(targetArgs) {{
+        var expected = routineSignatures[entryRoutine];
+        if (!expected || expected.length === 0) return true;
+
+        var missing = [];
+        for (var idx = 0; idx < expected.length; idx++) {{
+            var pName = expected[idx];
+            if (targetArgs[pName] === undefined && targetArgs['' + idx] === undefined) {{
+                missing.push(pName);
+            }}
+        }}
+        if (missing.length > 0) {{
+            console.error("\x1b[31m[Agent Config Error]\x1b[0m Routine '" + entryRoutine + "' requires parameter(s):");
+            for (var m = 0; m < missing.length; m++) {{
+                console.error("  • \x1b[1m" + missing[m] + "\x1b[0m");
+            }}
+            console.error("\nProvide configuration via any of the following:");
+            console.error("  1. Config file:     " + kazeName + " --config <file.json>");
+            console.error("  2. Named CLI flags: " + kazeName + " --arg " + missing[0] + "=<value> ...");
+            console.error("  3. Environment:     export AGENT_" + missing[0].toUpperCase() + "=<value>");
+            if (expected.length <= 6) {{
+                console.error("  4. Positional args: " + kazeName + " <" + expected.join("> <") + ">");
+            }}
+            console.error("");
+            if (typeof process !== 'undefined' && process.exit) process.exit(1);
+            return false;
+        }}
+        return true;
+    }}
+
     function runDaemon() {{
         bindPositionals(args);
+        if (!validateParameters(args)) return;
 
         var cycles = 0;
         var successes = 0;
@@ -1603,6 +1784,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
 
     function runHeadless() {{
         bindPositionals(args);
+        if (!validateParameters(args)) return;
 
         var opts = {{ fuel: fuel, grants: defaultGrants }};
         if (entryRoutine) opts.entry = entryRoutine;

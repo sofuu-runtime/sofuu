@@ -221,7 +221,7 @@ fn cmd_install(args: &[String]) -> i32 {
 
     let Some(target) = target_arg else {
         eprintln!("\x1b[31mError:\x1b[0m 'sofuu daemon install <target>' requires a target binary or script");
-        eprintln!("Example: sofuu daemon install ./example-agents/paper_trader/paper-trader --every 2s");
+        eprintln!("Example: sofuu daemon install ./my-agent --every 5s");
         return 1;
     };
 

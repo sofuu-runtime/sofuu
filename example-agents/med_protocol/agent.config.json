@@ -1,0 +1,11 @@
+{
+  "entry": "triage_patient",
+  "fuel": 200000,
+  "args": {
+    "patient_id": "PT-9821",
+    "heart_rate": 78,
+    "bp_systolic": 120,
+    "bp_diastolic": 80,
+    "symptoms": "Mild headache and fatigue"
+  }
+}

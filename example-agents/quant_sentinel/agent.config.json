@@ -1,0 +1,11 @@
+{
+  "entry": "evaluate_trade",
+  "interval": "2s",
+  "fuel": 200000,
+  "args": {
+    "ticker": "NVDA",
+    "signal": "BUY",
+    "leverage": 2.5,
+    "price": 130
+  }
+}

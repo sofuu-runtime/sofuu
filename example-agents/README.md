@@ -237,7 +237,103 @@ Every compiled binary is a single self-contained native executable (**~4.5 MiB**
 
 ---
 
-## 5. Architectural Benefits of Pure Kaze Agents
+## 5. Production-Grade 12-Factor Configuration Hierarchy
+
+Every compiled Kaze standalone agent includes an enterprise-grade configuration engine adhering strictly to the **Separation of Mechanism and Policy** and the **12-Factor Application Standard**.
+
+### Hierarchy of Precedence (Highest to Lowest):
+
+```
+┌────────────────────────────────────────────────────────┐
+│  1. Command-Line Arguments (--arg key=val / positionals) │  ◄ Highest Precedence (Overrides all)
+├────────────────────────────────────────────────────────┤
+│  2. Environment Variables (AGENT_<PARAM> / SOFUU_*)    │  ◄ Container / Cloud Native (Kubernetes/Docker)
+├────────────────────────────────────────────────────────┤
+│  3. Configuration File (--config <path> / agent.json)  │  ◄ Clean File-Driven Execution
+├────────────────────────────────────────────────────────┤
+│  4. Agent Routine Signature Defaults                   │  ◄ Engine Fallback
+└────────────────────────────────────────────────────────┘
+```
+
+#### Method 1: Clean JSON Configuration File (`--config`)
+Avoid typing repetitive CLI arguments by defining an `agent.config.json`:
+
+```json
+{
+  "entry": "analyze_and_trade",
+  "interval": "5s",
+  "args": {
+    "asset": "BTC-USDT",
+    "current_price": 75893,
+    "volume_24h": 367000000,
+    "sentiment_score": 72,
+    "entry_price": 0
+  }
+}
+```
+
+Run in one-shot mode:
+```bash
+./example-agents/paper_trader/paper-trader --config example-agents/paper_trader/agent.config.json
+```
+
+Or run as a 24/7 supervisor daemon:
+```bash
+./example-agents/paper_trader/paper-trader --config example-agents/paper_trader/agent.config.json --daemon --every 2s
+```
+
+#### Method 2: Cloud & Container Environment Injection (Kubernetes / Docker)
+Deploy standalone agent binaries into container environments without altering commands:
+
+```bash
+export AGENT_ASSET="BTC-USDT"
+export AGENT_CURRENT_PRICE=75893
+export AGENT_VOLUME_24H=367000000
+export AGENT_SENTIMENT_SCORE=72
+export AGENT_ENTRY_PRICE=0
+
+./example-agents/paper_trader/paper-trader --daemon
+```
+
+#### Method 3: Named CLI Arguments (`--arg`)
+Ideal for ad-hoc manual verification or dynamic CI/CD scripts:
+
+```bash
+./example-agents/paper_trader/paper-trader \
+  --arg asset=BTC-USDT \
+  --arg current_price=75893 \
+  --arg volume_24h=367000000 \
+  --arg sentiment_score=72 \
+  --arg entry_price=0
+```
+
+#### Method 4: Positional Arguments
+Fastest execution with zero syntax overhead:
+
+```bash
+./example-agents/paper_trader/paper-trader BTC-USDT 75893 367000000 72 0
+```
+
+#### Friendly Diagnostic Validation (No Silent Crashes)
+If an agent routine requires parameters that were not provided in any tier (CLI, env, or config), the runtime provides structured guidance instead of an internal arithmetic crash:
+
+```
+[Agent Config Error] Routine 'analyze_and_trade' requires parameter(s):
+  • current_price
+  • volume_24h
+  • sentiment_score
+  • entry_price
+
+Provide configuration via any of the following:
+  1. Config file:     paper_trader --config <file.json>
+  2. Named CLI flags: paper_trader --arg current_price=<value> ...
+  3. Environment:     export AGENT_CURRENT_PRICE=<value>
+  4. Positional args: paper_trader <asset> <current_price> <volume_24h> <sentiment_score> <entry_price>
+```
+
+---
+
+## 6. Architectural Benefits of Pure Kaze Agents
 
 1. **Zero Garbage Collection Stutter**: Bounded arena allocations guarantee deterministic sub-millisecond execution loops without unpredictable GC pauses.
 2. **Compile-Time Safety Verification**: Front-end checks (`sofuu.kaze.check`) validate capability declarations and type signatures at compile time before any binary is produced.

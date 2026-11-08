@@ -1,0 +1,10 @@
+{
+  "entry": "analyze_and_trade",
+  "args": {
+    "asset": "ETH-USDT",
+    "current_price": 2750,
+    "volume_24h": 450000000,
+    "sentiment_score": 68,
+    "entry_price": 0
+  }
+}

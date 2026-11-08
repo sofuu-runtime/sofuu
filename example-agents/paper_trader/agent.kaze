@@ -70,6 +70,8 @@ filter analyze_and_trade(asset, current_price, volume_24h, sentiment_score, entr
 
 filter execute_manual_order(asset, current_price, volume_24h, requested_action, requested_allocation_pct):
     log.info("Manual Order Dispatch: " + asset + " (" + requested_action + " at $" + current_price + ", allocation=" + requested_allocation_pct + "%)")
+    if policy detects secrets in asset:
+        reject "Security refusal: asset identifier or payload contains private credentials"
     if requested_allocation_pct > 25:
         send alert "RISK BREACH: Requested paper allocation (" + requested_allocation_pct + "%) exceeds 25% risk cap on " + asset
         reject "Risk limit violation: maximum single paper position allocation is 25%"

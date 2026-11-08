@@ -191,6 +191,43 @@ void test_q6_k_q8(uint32_t &seed) {
     }
 }
 
+// The three fused kernels: each must reproduce the composition it replaces
+// (norm/swiglu into the quantization), including which warp quantizes which
+// 32-value block.
+void test_fused_norm_q8(uint32_t &seed) {
+    const int n = 2048;
+    std::vector<float> x = random_vec(n, seed, -1.0f, 1.0f);
+    std::vector<float> w = random_vec(n, seed, 0.5f, 1.5f);
+    std::vector<float> b = random_vec(n, seed, -1.0f, 1.0f);
+    std::vector<float> y((size_t)n), want_y((size_t)n);
+    std::vector<float> xres((size_t)n), want_xres((size_t)n);
+    std::vector<signed char> q(n), wq(n);
+    std::vector<float> d(n / 32), wd(n / 32);
+    std::vector<int> ssum(n / 32), ws(n / 32), s16(n / 16), ws16(n / 16);
+    const float eps = 1e-5f;
+    sofuu_host_rmsnorm_q8(x.data(), w.data(), y.data(), q.data(), d.data(),
+                          ssum.data(), s16.data(), n, eps);
+    sofuu_ref::rmsnorm_ref(x.data(), w.data(), want_y.data(), n, eps);
+    sofuu_ref::quantize_q8_1(want_y.data(), wq.data(), wd.data(), ws.data(),
+                             ws16.data(), n);
+    check_vec("rmsnorm_q8", y.data(), want_y.data(), n, 1e-6, 1e-6);
+    sofuu_host_rmsnorm_add_q8(x.data(), b.data(), w.data(), xres.data(),
+                              y.data(), q.data(), d.data(), ssum.data(),
+                              s16.data(), n, eps);
+    for (int i = 0; i < n; ++i) want_xres[(size_t)i] = x[(size_t)i] + b[(size_t)i];
+    sofuu_ref::rmsnorm_ref(want_xres.data(), w.data(), want_y.data(), n, eps);
+    sofuu_ref::quantize_q8_1(want_y.data(), wq.data(), wd.data(), ws.data(),
+                             ws16.data(), n);
+    check_vec("rmsnorm_add_q8", xres.data(), want_xres.data(), n, 1e-6, 1e-6);
+    check_vec("rmsnorm_add_q8_y", y.data(), want_y.data(), n, 1e-6, 1e-6);
+    std::vector<float> g = random_vec(n, seed, -8.0f, 8.0f);
+    std::vector<float> u = random_vec(n, seed, -1.0f, 1.0f);
+    sofuu_host_swiglu_q8(g.data(), u.data(), y.data(), q.data(), d.data(),
+                         ssum.data(), s16.data(), n);
+    sofuu_ref::swiglu_ref(g.data(), u.data(), want_y.data(), n);
+    check_vec("swiglu_q8", y.data(), want_y.data(), n, 1e-6, 1e-6);
+}
+
 void test_zero_scale(uint32_t &seed) {
     // A zero f16 scale must produce an exact zero, never NaN/Inf.
     const int cols = 512;
@@ -683,6 +720,7 @@ int main(void) {
     test_q4_k_q8(seed);
     test_q6_k(seed);
     test_q6_k_q8(seed);
+    test_fused_norm_q8(seed);
     test_zero_scale(seed);
     test_rmsnorm(seed);
     test_swiglu(seed);

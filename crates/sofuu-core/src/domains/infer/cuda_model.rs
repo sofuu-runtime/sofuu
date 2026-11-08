@@ -557,6 +557,73 @@ impl CudaModel {
             .map_err(|err| format!("quantize q8_1 ({n} values): {err}"))
     }
 
+    /// True when `n` fits the fused kernels' block cover (8 warps x 32 values
+    /// per row block; every projection in the decode path does).
+    fn fused_ok(n: usize) -> bool {
+        n.is_multiple_of(256)
+    }
+
+    /// rmsnorm + quantize in one launch, falling back to the pair for widths
+    /// the fused kernel cannot cover.
+    fn norm_q8(
+        &self,
+        e: &CudaEngine,
+        src: DeviceBuf,
+        w: DeviceBuf,
+        dst: DeviceBuf,
+        n: usize,
+    ) -> Result<(), String> {
+        if Self::fused_ok(n) {
+            e.rmsnorm_q8(src, w, dst, self.xq, self.xd, self.xsum, self.xsum16, n, self.eps)
+                .map_err(|err| format!("rmsnorm_q8 ({n}): {err}"))
+        } else {
+            e.rmsnorm(src, w, dst, n, self.eps)
+                .map_err(|err| format!("rmsnorm: {err}"))?;
+            self.quantize_act(e, dst, n)
+        }
+    }
+
+    /// residual add + rmsnorm + quantize in one launch.
+    fn norm_add_q8(
+        &self,
+        e: &CudaEngine,
+        x: DeviceBuf,
+        res: DeviceBuf,
+        w: DeviceBuf,
+        dst: DeviceBuf,
+        n: usize,
+    ) -> Result<(), String> {
+        if Self::fused_ok(n) {
+            e.rmsnorm_add_q8(
+                x, res, w, x, dst, self.xq, self.xd, self.xsum, self.xsum16, n, self.eps,
+            )
+            .map_err(|err| format!("rmsnorm_add_q8 ({n}): {err}"))
+        } else {
+            e.add(x, res, x, n).map_err(|err| format!("residual add: {err}"))?;
+            e.rmsnorm(x, w, dst, n, self.eps)
+                .map_err(|err| format!("rmsnorm: {err}"))?;
+            self.quantize_act(e, dst, n)
+        }
+    }
+
+    /// swiglu + quantize in one launch.
+    fn swiglu_q8(
+        &self,
+        e: &CudaEngine,
+        g: DeviceBuf,
+        u: DeviceBuf,
+        dst: DeviceBuf,
+        n: usize,
+    ) -> Result<(), String> {
+        if Self::fused_ok(n) {
+            e.swiglu_q8(g, u, dst, self.xq, self.xd, self.xsum, self.xsum16, n)
+                .map_err(|err| format!("swiglu_q8 ({n}): {err}"))
+        } else {
+            e.swiglu(g, u, dst, n).map_err(|err| format!("swiglu: {err}"))?;
+            self.quantize_act(e, dst, n)
+        }
+    }
+
     /// GEMV that reads the q8_1 activations when the weight layout has a dp4a
     /// kernel, and the f32-activation kernel otherwise. `x` is ignored on the
     /// dp4a path, so the caller must quantize the matching buffer first.
@@ -746,11 +813,10 @@ impl CudaModel {
             if profile {
                 t_group = std::time::Instant::now();
             }
-            e.rmsnorm(self.x, l.attn_norm, self.x_norm, self.dim, self.eps)
+            // q/k/v all read the same normed row, so the norm and its
+            // quantization are one launch.
+            self.norm_q8(e, self.x, l.attn_norm, self.x_norm, self.dim)
                 .map_err(|err| format!("layer {li} attn_norm: {err}"))?;
-            // q/k/v all read the same normed row, so quantize it once.
-            self.quantize_act(e, self.x_norm, self.dim)
-                .map_err(|err| format!("layer {li}: {err}"))?;
             self.gemv_act(
                 e,
                 l.attn_q_quant,
@@ -849,8 +915,7 @@ impl CudaModel {
                 self.q_dim,
             )
             .map_err(|err| format!("layer {li} attn_output: {err}"))?;
-            e.add(self.x, self.proj, self.x, self.dim)
-                .map_err(|err| format!("layer {li} attn residual: {err}"))?;
+
             if profile {
                 e.sync()
                     .map_err(|err| format!("layer {li} profile sync (o_proj): {err}"))?;
@@ -858,10 +923,9 @@ impl CudaModel {
                 t_group = std::time::Instant::now();
             }
 
-            e.rmsnorm(self.x, l.ffn_norm, self.x_norm, self.dim, self.eps)
+            // attention residual + ffn norm + quantization in one launch
+            self.norm_add_q8(e, self.x, self.proj, l.ffn_norm, self.x_norm, self.dim)
                 .map_err(|err| format!("layer {li} ffn_norm: {err}"))?;
-            self.quantize_act(e, self.x_norm, self.dim)
-                .map_err(|err| format!("layer {li}: {err}"))?;
             self.gemv_act(
                 e,
                 l.ffn_gate_quant,
@@ -882,10 +946,8 @@ impl CudaModel {
                 self.dim,
             )
             .map_err(|err| format!("layer {li} ffn_up: {err}"))?;
-            e.swiglu(self.gate, self.up, self.act, self.hidden_dim)
+            self.swiglu_q8(e, self.gate, self.up, self.act, self.hidden_dim)
                 .map_err(|err| format!("layer {li} swiglu: {err}"))?;
-            self.quantize_act(e, self.act, self.hidden_dim)
-                .map_err(|err| format!("layer {li}: {err}"))?;
             self.gemv_act(
                 e,
                 l.ffn_down_quant,
@@ -907,11 +969,12 @@ impl CudaModel {
         }
 
         if compute_logits {
-            e.rmsnorm(self.x, self.output_norm, self.x_norm, self.dim, self.eps)
-                .map_err(|err| format!("output_norm: {err}"))?;
             if matches!(self.output_quant, Quant::Q4K | Quant::Q6K) {
-                self.quantize_act(e, self.x_norm, self.dim)
-                    .map_err(|err| format!("lm_head: {err}"))?;
+                self.norm_q8(e, self.x, self.output_norm, self.x_norm, self.dim)
+                    .map_err(|err| format!("output_norm: {err}"))?;
+            } else {
+                e.rmsnorm(self.x, self.output_norm, self.x_norm, self.dim, self.eps)
+                    .map_err(|err| format!("output_norm: {err}"))?;
             }
             self.gemv_act(
                 e,

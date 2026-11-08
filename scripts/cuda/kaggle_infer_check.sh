@@ -107,6 +107,12 @@ PY
 cmp_rc=$?
 
 echo ""
+echo "-- GPU phase split (graph off, one sync per phase)"
+SOFUU_CUDA_PROFILE=1 SOFUU_CUDA=1 "$BIN" infer "$MODEL" "$PROMPT" -n 4 -t 4 \
+    >"$WORK/gpuprof.stdout" 2>"$WORK/gpuprof.stderr" || true
+grep -E "cuda-profile" "$WORK/gpuprof.stderr" | tail -2 || true
+
+echo ""
 echo "-- GPU decode rate (32 tokens)"
 SOFUU_CUDA=1 "$BIN" infer "$MODEL" "$PROMPT" -n 32 -t 4 \
     >"$WORK/gpu32.stdout" 2>"$WORK/gpu32.stderr" || true

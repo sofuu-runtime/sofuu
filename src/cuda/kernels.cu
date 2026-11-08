@@ -658,16 +658,14 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 6) void sofuu_gemv_q4_k(con
 // integer sum the q4_K min term needs. The butterfly reduction leaves every
 // lane with the block max, so each lane rounds its own value without a
 // broadcast.
-extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
-void sofuu_quantize_q8_1(const float *__restrict__ x, signed char *__restrict__ q,
-                         float *__restrict__ d, int *__restrict__ s,
-                         int *__restrict__ s16, int n) {
-    unsigned int tid = sofuu_tid_x();
-    int warp = (int)(tid >> 5);
-    int lane = (int)(tid & 31u);
-    int block = (int)sofuu_ctaid_x() * 8 + warp;
+// One 32-value block, one value per lane: amax -> d = amax/127, q = round(x/d),
+// the 32-value sum and the two 16-value halves. Shared by the standalone
+// quantizer and the fused kernels below, so the activation encoding has exactly
+// one definition.
+static SOFUU_DEVICE SOFUU_INLINE void sofuu_quantize_block32(
+    const float *x, signed char *q, float *d, int *s, int *s16, int block,
+    int lane) {
     int base = block * 32;
-    if (base >= n) return;
     float v = x[base + lane];
     float amax = sofuu_warp_max_f(sofuu_absf(v));
     float scale = amax > 0.0f ? amax / 127.0f : 0.0f;
@@ -682,6 +680,18 @@ void sofuu_quantize_q8_1(const float *__restrict__ x, signed char *__restrict__ 
         d[block] = scale;
         s[block] = sum;
     }
+}
+
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
+void sofuu_quantize_q8_1(const float *__restrict__ x, signed char *__restrict__ q,
+                         float *__restrict__ d, int *__restrict__ s,
+                         int *__restrict__ s16, int n) {
+    unsigned int tid = sofuu_tid_x();
+    int warp = (int)(tid >> 5);
+    int lane = (int)(tid & 31u);
+    int block = (int)sofuu_ctaid_x() * 8 + warp;
+    if (block * 32 >= n) return;
+    sofuu_quantize_block32(x, q, d, s, s16, block, lane);
 }
 
 // q4_K x q8_1: eight lanes cover one block (each holds a 16-byte qs chunk), so
@@ -925,6 +935,94 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(128) void sofuu_rope_f32(float *x, c
         base[i0] = x0 * c - x1 * s;
         base[i1] = x0 * s + x1 * c;
     }
+}
+
+// ── Fused norm / swiglu + q8_1 quantization ────────────────────────────────
+// The decode step normalizes a row and immediately quantizes it for the dp4a
+// GEMV. As two kernels that is two launches, two global round trips and a
+// dependent stall for 2048 values; one block now does the reduction, the write
+// and (after a barrier) the quantization, with the same arithmetic.
+//
+// `sofuu_rmsnorm_add_q8` also swallows the residual add that always precedes
+// the FFN norm, so the profile of a layer loses three launches there too.
+static SOFUU_DEVICE SOFUU_INLINE void sofuu_quantize_row_blocks(
+    const float *y, signed char *q, float *d, int *s, int *s16, int first,
+    int count, int lane) {
+    for (int j = 0; j < count; ++j) {
+        sofuu_quantize_block32(y, q, d, s, s16, first + j, lane);
+    }
+}
+
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
+void sofuu_rmsnorm_q8(const float *__restrict__ x, const float *__restrict__ w,
+                      float *__restrict__ y, signed char *__restrict__ q,
+                      float *__restrict__ d, int *__restrict__ s,
+                      int *__restrict__ s16, int n, float eps) {
+    unsigned int tid = sofuu_tid_x();
+    unsigned int nt = sofuu_ntid_x();
+    float ss = 0.0f;
+    for (int i = (int)tid; i < n; i += (int)nt) ss += x[i] * x[i];
+    SOFUU_SHARED float red[8];
+    SOFUU_SHARED float scale;
+    float total = sofuu_block_reduce(ss, red);
+    if (tid == 0u) scale = sofuu_rsqrt(total / (float)n + eps);
+    sofuu_bar_sync();
+    float sc = scale;
+    for (int i = (int)tid; i < n; i += (int)nt) y[i] = x[i] * sc * w[i];
+    // The quantization reads values other warps just wrote.
+    sofuu_bar_sync();
+    int warp = (int)(tid >> 5);
+    int lane = (int)(tid & 31u);
+    int per = n / 32 / 8;
+    sofuu_quantize_row_blocks(y, q, d, s, s16, warp * per, per, lane);
+}
+
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
+void sofuu_rmsnorm_add_q8(const float *__restrict__ a,
+                          const float *__restrict__ b, const float *__restrict__ w,
+                          float *__restrict__ xres, float *__restrict__ y,
+                          signed char *__restrict__ q, float *__restrict__ d,
+                          int *__restrict__ s, int *__restrict__ s16, int n,
+                          float eps) {
+    unsigned int tid = sofuu_tid_x();
+    unsigned int nt = sofuu_ntid_x();
+    float ss = 0.0f;
+    for (int i = (int)tid; i < n; i += (int)nt) {
+        float v = a[i] + b[i];
+        ss += v * v;
+    }
+    SOFUU_SHARED float red[8];
+    SOFUU_SHARED float scale;
+    float total = sofuu_block_reduce(ss, red);
+    if (tid == 0u) scale = sofuu_rsqrt(total / (float)n + eps);
+    sofuu_bar_sync();
+    float sc = scale;
+    for (int i = (int)tid; i < n; i += (int)nt) {
+        float v = a[i] + b[i];
+        xres[i] = v;
+        y[i] = v * sc * w[i];
+    }
+    sofuu_bar_sync();
+    int warp = (int)(tid >> 5);
+    int lane = (int)(tid & 31u);
+    int per = n / 32 / 8;
+    sofuu_quantize_row_blocks(y, q, d, s, s16, warp * per, per, lane);
+}
+
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
+void sofuu_swiglu_q8(const float *__restrict__ g, const float *__restrict__ u,
+                     float *__restrict__ y, signed char *__restrict__ q,
+                     float *__restrict__ d, int *__restrict__ s,
+                     int *__restrict__ s16, int n) {
+    unsigned int tid = sofuu_tid_x();
+    int i = (int)sofuu_ctaid_x() * (int)sofuu_ntid_x() + (int)tid;
+    if (i < n) y[i] = sofuu_silu(g[i]) * u[i];
+    sofuu_bar_sync();
+    int warp = (int)(tid >> 5);
+    int lane = (int)(tid & 31u);
+    // One block covers 8 q8 blocks, one per warp: every warp reads values the
+    // block wrote, hence the barrier.
+    sofuu_quantize_block32(y, q, d, s, s16, (int)sofuu_ctaid_x() * 8 + warp, lane);
 }
 
 // ── Decode attention (f32, GQA, one block per query head) ─────────────────
@@ -1516,9 +1614,32 @@ extern "C" void sofuu_host_rmsnorm(const float *x, const float *w, float *y,
     for (int i = 0; i < n; ++i) y[i] = x[i] * s * w[i];
 }
 
+extern "C" void sofuu_host_rmsnorm_q8(const float *x, const float *w, float *y,
+                                      signed char *q, float *d, int *s,
+                                      int *s16, int n, float eps) {
+    sofuu_host_rmsnorm(x, w, y, n, eps);
+    sofuu_host_quantize_q8_1(y, q, d, s, s16, n);
+}
+
+extern "C" void sofuu_host_rmsnorm_add_q8(const float *a, const float *b,
+                                         const float *w, float *xres, float *y,
+                                         signed char *q, float *d, int *s,
+                                         int *s16, int n, float eps) {
+    for (int i = 0; i < n; ++i) xres[i] = a[i] + b[i];
+    sofuu_host_rmsnorm(xres, w, y, n, eps);
+    sofuu_host_quantize_q8_1(y, q, d, s, s16, n);
+}
+
 extern "C" void sofuu_host_swiglu(const float *g, const float *u, float *y,
                                   int n) {
     for (int i = 0; i < n; ++i) y[i] = sofuu_silu(g[i]) * u[i];
+}
+
+extern "C" void sofuu_host_swiglu_q8(const float *g, const float *u, float *y,
+                                     signed char *q, float *d, int *s, int *s16,
+                                     int n) {
+    sofuu_host_swiglu(g, u, y, n);
+    sofuu_host_quantize_q8_1(y, q, d, s, s16, n);
 }
 
 extern "C" void sofuu_host_rope(float *x, const float *cos_tab,

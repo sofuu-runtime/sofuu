@@ -417,6 +417,157 @@ void test_gemv_q6_k_q8(void *fn_quant, void *fn_gemv, uint32_t &seed) {
     sofuu_cuda_ctx_free(g_ctx, dy);
 }
 
+// The fused norm/swiglu + q8_1 kernels. Each must reproduce the composition it
+// replaces, including which warp quantizes which 32-value block -- that mapping
+// is the only thing the fusion changes.
+void test_fused_q8(void *fn_rms, void *fn_rmsadd, void *fn_swiglu,
+                   uint32_t &seed) {
+    const int n = 2048;
+    const int nblk = n / 32;
+    std::vector<float> x = random_vec(n, seed, -1.0f, 1.0f);
+    std::vector<float> w = random_vec(n, seed, 0.5f, 1.5f);
+    std::vector<float> b = random_vec(n, seed, -1.0f, 1.0f);
+    std::vector<float> g = random_vec(n, seed, -8.0f, 8.0f);
+    std::vector<float> u = random_vec(n, seed, -1.0f, 1.0f);
+    std::vector<float> y_ref((size_t)n), xres_ref((size_t)n), y_got((size_t)n);
+    std::vector<float> xres_got((size_t)n);
+    std::vector<int8_t> q_ref(n), q_got(n);
+    std::vector<float> d_ref(nblk), d_got(nblk);
+    std::vector<int32_t> s_ref(nblk), s_got(nblk), s16_ref(nblk * 2),
+        s16_got(nblk * 2);
+    const float eps = 1e-5f;
+
+    unsigned long long dx = 0, dw = 0, db = 0, dg = 0, du = 0, dy = 0,
+                       dxr = 0, dq = 0, dd = 0, ds = 0, d16 = 0;
+    if (!alloc_upload(x.data(), x.size() * 4, &dx) ||
+        !alloc_upload(w.data(), w.size() * 4, &dw) ||
+        !alloc_upload(b.data(), b.size() * 4, &db) ||
+        !alloc_upload(g.data(), g.size() * 4, &dg) ||
+        !alloc_upload(u.data(), u.size() * 4, &du) ||
+        !alloc_only((unsigned long long)n * 4, &dy) ||
+        !alloc_only((unsigned long long)n * 4, &dxr) ||
+        !alloc_only((unsigned long long)n, &dq) ||
+        !alloc_only((unsigned long long)nblk * 4, &dd) ||
+        !alloc_only((unsigned long long)nblk * 4, &ds) ||
+        !alloc_only((unsigned long long)nblk * 8, &d16)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    auto pull = [&](std::vector<float> &dst_y, std::vector<float> *dst_xres) {
+        if (!download(dy, dst_y.data(), (size_t)n * 4) ||
+            !download(dq, q_got.data(), n) ||
+            !download(dd, d_got.data(), (size_t)nblk * 4) ||
+            !download(ds, s_got.data(), (size_t)nblk * 4) ||
+            !download(d16, s16_got.data(), (size_t)nblk * 8)) {
+            return false;
+        }
+        if (dst_xres && !download(dxr, dst_xres->data(), (size_t)n * 4)) {
+            return false;
+        }
+        return true;
+    };
+    auto check_q8 = [&](const char *label) {
+        int bad_d = 0, bad_s = 0, bad_s16 = 0, bad_q = 0;
+        for (int i = 0; i < n; ++i) {
+            int diff = (int)q_got[(size_t)i] - (int)q_ref[(size_t)i];
+            if (diff > 1 || diff < -1) ++bad_q;
+        }
+        for (int i = 0; i < nblk; ++i) {
+            if (std::fabs((double)d_got[(size_t)i] - d_ref[(size_t)i]) >
+                1e-6 * std::fabs((double)d_ref[(size_t)i]) + 1e-9) {
+                ++bad_d;
+            }
+            if (s_got[(size_t)i] != s_ref[(size_t)i]) ++bad_s;
+            for (int hh = 0; hh < 2; ++hh) {
+                if (s16_got[(size_t)(i * 2 + hh)] != s_ref[(size_t)(i * 2 + hh)]) {
+                    ++bad_s16;
+                }
+            }
+        }
+        bool ok = bad_q == 0 && bad_d == 0 && bad_s == 0 && bad_s16 == 0;
+        report(label, ok, (double)(bad_q + bad_d + bad_s + bad_s16), 0.0, 0.0);
+        if (!ok) {
+            std::printf("      q=%d d=%d s=%d s16=%d\n", bad_q, bad_d, bad_s,
+                        bad_s16);
+        }
+    };
+
+    // rmsnorm_q8
+    {
+        int nn = n;
+        float ev = eps;
+        std::vector<void *> params = {&dx, &dw, &dy, &dq, &dd, &ds, &d16, &nn, &ev};
+        if (!launch(fn_rms, 1, 256, params) || !pull(y_got, nullptr)) return;
+        sofuu_ref::rmsnorm_ref(x.data(), w.data(), y_ref.data(), n, eps);
+        sofuu_ref::quantize_q8_1(y_ref.data(), q_ref.data(), d_ref.data(),
+                                 s_ref.data(), s16_ref.data(), n);
+        double err = 0.0;
+        for (int i = 0; i < n; ++i)
+            err = std::fmax(err, std::fabs((double)y_got[(size_t)i] -
+                                           (double)y_ref[(size_t)i]));
+        double bound = 1e-6 * (double)n;
+        report("rmsnorm_q8", err <= bound, err, bound, (double)y_ref[0]);
+        check_q8("rmsnorm_q8_acts");
+    }
+    // rmsnorm_add_q8
+    {
+        int nn = n;
+        float ev = eps;
+        std::vector<void *> params = {&dx, &db,  &dw, &dxr, &dy,
+                                      &dq, &dd,  &ds, &d16, &nn,  &ev};
+        if (!launch(fn_rmsadd, 1, 256, params) || !pull(y_got, &xres_got)) return;
+        for (int i = 0; i < n; ++i)
+            xres_ref[(size_t)i] = x[(size_t)i] + b[(size_t)i];
+        sofuu_ref::rmsnorm_ref(xres_ref.data(), w.data(), y_ref.data(), n, eps);
+        sofuu_ref::quantize_q8_1(y_ref.data(), q_ref.data(), d_ref.data(),
+                                 s_ref.data(), s16_ref.data(), n);
+        double err = 0.0;
+        for (int i = 0; i < n; ++i)
+            err = std::fmax(err, std::fabs((double)xres_got[(size_t)i] -
+                                           (double)xres_ref[(size_t)i]));
+        report("rmsnorm_add_q8_res", err == 0.0, err, 0.0, (double)xres_ref[0]);
+        err = 0.0;
+        for (int i = 0; i < n; ++i)
+            err = std::fmax(err, std::fabs((double)y_got[(size_t)i] -
+                                           (double)y_ref[(size_t)i]));
+        double bound = 1e-6 * (double)n;
+        report("rmsnorm_add_q8", err <= bound, err, bound, (double)y_ref[0]);
+        check_q8("rmsnorm_add_q8_acts");
+    }
+    // swiglu_q8
+    {
+        int nn = n;
+        std::vector<void *> params = {&dg, &du, &dy, &dq, &dd, &ds, &d16, &nn};
+        if (!launch(fn_swiglu, (unsigned)((n + 255) / 256), 256, params) ||
+            !pull(y_got, nullptr)) {
+            return;
+        }
+        sofuu_ref::swiglu_ref(g.data(), u.data(), y_ref.data(), n);
+        sofuu_ref::quantize_q8_1(y_ref.data(), q_ref.data(), d_ref.data(),
+                                 s_ref.data(), s16_ref.data(), n);
+        double err = 0.0;
+        for (int i = 0; i < n; ++i)
+            err = std::fmax(err, std::fabs((double)y_got[(size_t)i] -
+                                           (double)y_ref[(size_t)i]));
+        double bound = 1e-6 * (double)n;
+        report("swiglu_q8", err <= bound, err, bound, (double)y_ref[0]);
+        check_q8("swiglu_q8_acts");
+    }
+
+    sofuu_cuda_ctx_free(g_ctx, dx);
+    sofuu_cuda_ctx_free(g_ctx, dw);
+    sofuu_cuda_ctx_free(g_ctx, db);
+    sofuu_cuda_ctx_free(g_ctx, dg);
+    sofuu_cuda_ctx_free(g_ctx, du);
+    sofuu_cuda_ctx_free(g_ctx, dy);
+    sofuu_cuda_ctx_free(g_ctx, dxr);
+    sofuu_cuda_ctx_free(g_ctx, dq);
+    sofuu_cuda_ctx_free(g_ctx, dd);
+    sofuu_cuda_ctx_free(g_ctx, ds);
+    sofuu_cuda_ctx_free(g_ctx, d16);
+}
+
 void test_gemv_f32(void *fn, uint32_t &seed) {
     const int rows = 8, cols = 1024;
     std::vector<float> w = random_vec(rows * cols, seed, -1.0f, 1.0f);
@@ -1096,6 +1247,7 @@ int main(int argc, char **argv) {
 
     void *f_q8 = nullptr, *f_q4 = nullptr, *f_q6 = nullptr, *f_f32 = nullptr;
     void *f_quant = nullptr, *f_q4q8 = nullptr, *f_q6q8 = nullptr;
+    void *f_rms_q8 = nullptr, *f_rmsadd_q8 = nullptr, *f_swiglu_q8 = nullptr;
     void *f_rms = nullptr, *f_swi = nullptr, *f_rope = nullptr, *f_kv = nullptr;
     void *f_attn = nullptr, *f_add = nullptr;
     void *f_b8_q4 = nullptr, *f_b8_q6 = nullptr, *f_b8_q8 = nullptr;
@@ -1107,6 +1259,9 @@ int main(int argc, char **argv) {
         !get_function("sofuu_quantize_q8_1", &f_quant) ||
         !get_function("sofuu_gemv_q4_k_q8", &f_q4q8) ||
         !get_function("sofuu_gemv_q6_k_q8", &f_q6q8) ||
+        !get_function("sofuu_rmsnorm_q8", &f_rms_q8) ||
+        !get_function("sofuu_rmsnorm_add_q8", &f_rmsadd_q8) ||
+        !get_function("sofuu_swiglu_q8", &f_swiglu_q8) ||
         !get_function("sofuu_rmsnorm", &f_rms) ||
         !get_function("sofuu_swiglu", &f_swi) ||
         !get_function("sofuu_rope_f32", &f_rope) ||
@@ -1130,6 +1285,7 @@ int main(int argc, char **argv) {
     }
     test_gemv_q4_k_q8(f_quant, f_q4q8, seed);
     test_gemv_q6_k_q8(f_quant, f_q6q8, seed);
+    test_fused_q8(f_rms_q8, f_rmsadd_q8, f_swiglu_q8, seed);
     test_gemv_f32(f_f32, seed);
     test_rmsnorm(f_rms, seed);
     bench_launch(f_rms, 2048, 4000, "tiny");

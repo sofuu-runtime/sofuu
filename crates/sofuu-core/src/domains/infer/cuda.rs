@@ -21,7 +21,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 /// Every kernel name the checked-in PTX must export. Kept in one place so the
 /// generator script, the Rust init check and the tests cannot drift.
-pub const PTX_ENTRIES: [&str; 21] = [
+pub const PTX_ENTRIES: [&str; 24] = [
     "sofuu_gemv_q8_0",
     "sofuu_gemv_q4_k",
     "sofuu_gemv_q6_k",
@@ -30,6 +30,9 @@ pub const PTX_ENTRIES: [&str; 21] = [
     "sofuu_gemv_q4_k_q8",
     "sofuu_gemv_q6_k_q8",
     "sofuu_rmsnorm",
+    "sofuu_rmsnorm_q8",
+    "sofuu_rmsnorm_add_q8",
+    "sofuu_swiglu_q8",
     "sofuu_swiglu",
     "sofuu_rope_f32",
     "sofuu_kv_write_f32",
@@ -1207,6 +1210,167 @@ mod imp {
             self.launch("sofuu_gemv_q6_k_q8", (grid, 1, 1), (256, 1, 1), &mut params)
         }
 
+        /// rmsnorm + q8_1 activation quantization in one launch (`n` multiple of
+        /// 256): the decode step quantizes the row it just normalized, so the
+        /// pair was two launches and two global round trips for 2048 values.
+        pub fn rmsnorm_q8(
+            &self,
+            x: DeviceBuf,
+            w: DeviceBuf,
+            y: DeviceBuf,
+            q: DeviceBuf,
+            d: DeviceBuf,
+            s: DeviceBuf,
+            s16: DeviceBuf,
+            n: usize,
+            eps: f32,
+        ) -> Result<(), CudaError> {
+            let need_f = n * 4;
+            let blocks = n / 32;
+            if x.bytes < need_f || w.bytes < need_f || y.bytes < need_f {
+                return Err(CudaError(format!(
+                    "rmsnorm_q8 needs {need_f} B per vector, got x {}, w {}, y {}",
+                    x.bytes, w.bytes, y.bytes
+                )));
+            }
+            if q.bytes < n || d.bytes < blocks * 4 || s.bytes < blocks * 4 || s16.bytes < blocks * 8 {
+                return Err(CudaError(format!(
+                    "rmsnorm_q8 q8 buffers too small: q {}<{n}, d {}<{}, s {}<{}, s16 {}<{}",
+                    q.bytes, d.bytes, blocks * 4, s.bytes, blocks * 4, s16.bytes, blocks * 8
+                )));
+            }
+            let mut xp = x.ptr;
+            let mut wp = w.ptr;
+            let mut yp = y.ptr;
+            let mut qp = q.ptr;
+            let mut dp = d.ptr;
+            let mut sp = s.ptr;
+            let mut s16p = s16.ptr;
+            let mut nn = n as i32;
+            let mut ev = eps;
+            let mut params: [*mut c_void; 9] = [
+                &mut xp as *mut u64 as *mut c_void,
+                &mut wp as *mut u64 as *mut c_void,
+                &mut yp as *mut u64 as *mut c_void,
+                &mut qp as *mut u64 as *mut c_void,
+                &mut dp as *mut u64 as *mut c_void,
+                &mut sp as *mut u64 as *mut c_void,
+                &mut s16p as *mut u64 as *mut c_void,
+                &mut nn as *mut i32 as *mut c_void,
+                &mut ev as *mut f32 as *mut c_void,
+            ];
+            self.launch("sofuu_rmsnorm_q8", (1, 1, 1), (256, 1, 1), &mut params)
+        }
+
+        /// Residual add + rmsnorm + q8_1 quantization in one launch: the FFN
+        /// norm always follows the attention residual add, and the normed row is
+        /// immediately quantized. Writes both the residual row and the normed
+        /// row. `n` must be a multiple of 256.
+        pub fn rmsnorm_add_q8(
+            &self,
+            a: DeviceBuf,
+            b: DeviceBuf,
+            w: DeviceBuf,
+            xres: DeviceBuf,
+            y: DeviceBuf,
+            q: DeviceBuf,
+            d: DeviceBuf,
+            s: DeviceBuf,
+            s16: DeviceBuf,
+            n: usize,
+            eps: f32,
+        ) -> Result<(), CudaError> {
+            let need_f = n * 4;
+            let blocks = n / 32;
+            if a.bytes < need_f || b.bytes < need_f || w.bytes < need_f
+                || xres.bytes < need_f || y.bytes < need_f
+            {
+                return Err(CudaError(format!(
+                    "rmsnorm_add_q8 needs {need_f} B per vector (a {}, b {}, w {}, xres {}, y {})",
+                    a.bytes, b.bytes, w.bytes, xres.bytes, y.bytes
+                )));
+            }
+            if q.bytes < n || d.bytes < blocks * 4 || s.bytes < blocks * 4 || s16.bytes < blocks * 8 {
+                return Err(CudaError(format!(
+                    "rmsnorm_add_q8 q8 buffers too small: q {}<{n}, d {}<{}, s {}<{}, s16 {}<{}",
+                    q.bytes, d.bytes, blocks * 4, s.bytes, blocks * 4, s16.bytes, blocks * 8
+                )));
+            }
+            let mut ap = a.ptr;
+            let mut bp = b.ptr;
+            let mut wp = w.ptr;
+            let mut xp = xres.ptr;
+            let mut yp = y.ptr;
+            let mut qp = q.ptr;
+            let mut dp = d.ptr;
+            let mut sp = s.ptr;
+            let mut s16p = s16.ptr;
+            let mut nn = n as i32;
+            let mut ev = eps;
+            let mut params: [*mut c_void; 11] = [
+                &mut ap as *mut u64 as *mut c_void,
+                &mut bp as *mut u64 as *mut c_void,
+                &mut wp as *mut u64 as *mut c_void,
+                &mut xp as *mut u64 as *mut c_void,
+                &mut yp as *mut u64 as *mut c_void,
+                &mut qp as *mut u64 as *mut c_void,
+                &mut dp as *mut u64 as *mut c_void,
+                &mut sp as *mut u64 as *mut c_void,
+                &mut s16p as *mut u64 as *mut c_void,
+                &mut nn as *mut i32 as *mut c_void,
+                &mut ev as *mut f32 as *mut c_void,
+            ];
+            self.launch("sofuu_rmsnorm_add_q8", (1, 1, 1), (256, 1, 1), &mut params)
+        }
+
+        /// swiglu + q8_1 quantization in one launch (`n` multiple of 256).
+        pub fn swiglu_q8(
+            &self,
+            g: DeviceBuf,
+            u: DeviceBuf,
+            y: DeviceBuf,
+            q: DeviceBuf,
+            d: DeviceBuf,
+            s: DeviceBuf,
+            s16: DeviceBuf,
+            n: usize,
+        ) -> Result<(), CudaError> {
+            let need_f = n * 4;
+            let blocks = n / 32;
+            if g.bytes < need_f || u.bytes < need_f || y.bytes < need_f {
+                return Err(CudaError(format!(
+                    "swiglu_q8 needs {need_f} B per vector, got g {}, u {}, y {}",
+                    g.bytes, u.bytes, y.bytes
+                )));
+            }
+            if q.bytes < n || d.bytes < blocks * 4 || s.bytes < blocks * 4 || s16.bytes < blocks * 8 {
+                return Err(CudaError(format!(
+                    "swiglu_q8 q8 buffers too small: q {}<{n}, d {}<{}, s {}<{}, s16 {}<{}",
+                    q.bytes, d.bytes, blocks * 4, s.bytes, blocks * 4, s16.bytes, blocks * 8
+                )));
+            }
+            let mut gp = g.ptr;
+            let mut up = u.ptr;
+            let mut yp = y.ptr;
+            let mut qp = q.ptr;
+            let mut dp = d.ptr;
+            let mut sp = s.ptr;
+            let mut s16p = s16.ptr;
+            let mut nn = n as i32;
+            let mut params: [*mut c_void; 8] = [
+                &mut gp as *mut u64 as *mut c_void,
+                &mut up as *mut u64 as *mut c_void,
+                &mut yp as *mut u64 as *mut c_void,
+                &mut qp as *mut u64 as *mut c_void,
+                &mut dp as *mut u64 as *mut c_void,
+                &mut sp as *mut u64 as *mut c_void,
+                &mut s16p as *mut u64 as *mut c_void,
+                &mut nn as *mut i32 as *mut c_void,
+            ];
+            let grid = ((n + 255) / 256) as u32;
+            self.launch("sofuu_swiglu_q8", (grid, 1, 1), (256, 1, 1), &mut params)
+        }
+
         pub fn rmsnorm(
             &self,
             x: DeviceBuf,
@@ -1791,6 +1955,52 @@ mod imp {
             _y: DeviceBuf,
             _rows: usize,
             _cols: usize,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn rmsnorm_q8(
+            &self,
+            _x: DeviceBuf,
+            _w: DeviceBuf,
+            _y: DeviceBuf,
+            _q: DeviceBuf,
+            _d: DeviceBuf,
+            _s: DeviceBuf,
+            _s16: DeviceBuf,
+            _n: usize,
+            _eps: f32,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn rmsnorm_add_q8(
+            &self,
+            _a: DeviceBuf,
+            _b: DeviceBuf,
+            _w: DeviceBuf,
+            _xres: DeviceBuf,
+            _y: DeviceBuf,
+            _q: DeviceBuf,
+            _d: DeviceBuf,
+            _s: DeviceBuf,
+            _s16: DeviceBuf,
+            _n: usize,
+            _eps: f32,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn swiglu_q8(
+            &self,
+            _g: DeviceBuf,
+            _u: DeviceBuf,
+            _y: DeviceBuf,
+            _q: DeviceBuf,
+            _d: DeviceBuf,
+            _s: DeviceBuf,
+            _s16: DeviceBuf,
+            _n: usize,
         ) -> Result<(), CudaError> {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }

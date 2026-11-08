@@ -30,7 +30,7 @@ pub fn start_dev_server(config: DevServerConfig) -> Result<(), Box<dyn std::erro
     let cfg = Arc::new(config);
 
     println!("\x1b[1;36m  ┌──────────────────────────────────────────────┐\x1b[0m");
-    println!("\x1b[1;36m  │   ⚡ Sofuu AI Full-Stack App Server Ready     │\x1b[0m");
+    println!("\x1b[1;36m  │   Sofuu AI Full-Stack App Server Ready       │\x1b[0m");
     println!("\x1b[1;36m  │   Local URL: \x1b[1;32mhttp://{}:{}\x1b[1;36m             │\x1b[0m", cfg.host, cfg.port);
     println!("\x1b[1;36m  │   Mode: Native Unbundled ESM (0ms boot)      │\x1b[0m");
     println!("\x1b[1;36m  └──────────────────────────────────────────────┘\x1b[0m\n");

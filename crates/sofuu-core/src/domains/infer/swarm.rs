@@ -444,7 +444,7 @@ impl SwarmWorker {
             .map_err(|e| format!("Failed to bind worker listener on {}: {}", listen_addr, e))?;
 
         println!(
-            "\x1b[36m⚡ Sofuu Swarm Worker\x1b[0m listening on {} [layers {}..{}/{}]",
+            "\x1b[36mSofuu Swarm Worker\x1b[0m listening on {} [layers {}..{}/{}]",
             listen_addr,
             self.partition.start_layer,
             self.partition.end_layer,

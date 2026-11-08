@@ -54,7 +54,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_banner() {
     println!("\x1b[1;36m  ┌─────────────────────────────────┐");
-    println!("  │   ⚡ Sofuu (素風) Runtime        │");
+    println!("  │   Sofuu (素風) Runtime          │");
     println!("  │   v{VERSION:<31}│");
     println!("  │   Simple/Pure Wind — AI-Native  │");
     println!("  └─────────────────────────────────┘\x1b[0m");
@@ -63,93 +63,150 @@ fn print_banner() {
 fn print_help() {
     print_banner();
     println!("\n\x1b[1mUsage:\x1b[0m");
-    println!("  sofuu                    Start interactive AI chat");
-    println!("  sofuu chat               Same interactive AI chat");
-    println!("  sofuu chat -m <model>    Chat with a specific model");
-    println!("  sofuu chat -p <provider> Chat with a specific provider");
+    println!("  sofuu <command> [arguments] [flags]");
+    println!("  sofuu                    Start interactive AI chat (alias of `sofuu chat`)");
+    println!();
+    println!("\x1b[1mAI Chat & Interactive Workspace:\x1b[0m");
+    println!("  sofuu chat               Interactive AI chat with persistent session memory");
+    println!("  sofuu chat -m <model>    Chat with a specific model alias or path");
+    println!("  sofuu chat -p <provider> Chat with provider (openai, anthropic, llamacpp, ollama, vllm, lmstudio)");
     println!("  sofuu chat -k <key>      Set the API key for this session");
     println!("  sofuu chat --base-url <u> Override the provider endpoint URL");
     println!("  sofuu chat --ctx-window <n> Context window in tokens (0 = provider default, max 4M)");
     println!("  sofuu chat --max-output <n> Max output tokens per response (0 = provider default, max 384k)");
-    println!("  sofuu repl               JavaScript evaluation REPL");
-    println!("  sofuu run <file.js>      Run a JavaScript file");
-    println!("  sofuu run <file.ts>      Run a TypeScript file");
-    println!("  sofuu eval \"<code>\"      Evaluate JS inline (prints the value; -q to silence)");
-    println!("  sofuu bundle <entry.js>  Bundle to single file");
-    println!("  sofuu bundle <entry.js> -o <out.js>");
-    println!("  sofuu compile <entry.ts> Compile to a standalone executable (-o, --embed-brain)");
-    println!("  sofuu install            Install from package.json");
-    println!("  sofuu add <pkg>          Install npm package");
-    println!("  sofuu agent list         List agent definitions (~/.sofuu/agents/*.js)");
-    println!("  sofuu agent run <name> \"task\"  Run one agent headless");
-    println!("  sofuu agent run <name> \"task\" --json   …with a JSON result");
-    /* OBSERVABILITY-SPEC §4: the observation surface sits next to the agent
-     * commands because that is what it observes. Descriptions start at the
-     * same column as every other line in this block. */
-    println!("  sofuu logs               List recent runs: id, start, steps, status");
-    println!("  sofuu logs show <id>     Render one run's event trace");
-    println!("  sofuu logs --follow      Stream a run's log live (Ctrl-C exits)");
-    println!("  sofuu logs --last-error  Post-mortem box for the newest crash");
-    println!("  sofuu resume <id>        Resume an interrupted agent run from its checkpoint");
-    println!("  sofuu plugin list        List plugins in ./plugins/ and ~/.sofuu/plugins/");
-    println!("  sofuu plugin validate <f> Validate plugin syntax, export, and schema");
-    println!("  sofuu plugin run <tool>  Execute a plugin tool with 5-shield safety");
-    println!("  sofuu plugin test <tool> Alias of plugin run; executes one tool in isolation");
-    println!("  sofuu plugin init <name> Scaffold a plugin (--category=tool|service|...)");
-    println!("  sofuu dev [dir]          Start AI-native full-stack dev server (experimental) (--port, --host, --model)");
-    println!("  sofuu serve --brain <path>   Serve the brain over HTTP (--port, --host, --token)");
-    /* W7 (QTSQ_UPGRADE_PLAN): the storage engine shipped with no CLI. These
-     * sit beside `serve` because they operate on the same file, and
-     * `sofuu brain --help` documents every one of them. */
-    println!("  sofuu brain verify <path>    Full scrub: manifest, segments, digests (--json)");
-    println!("  sofuu brain repair <path>    Quarantine what is torn, keep what verifies");
-    println!("  sofuu brain stats <path>     Records, segments, generations, recovery counters");
-    println!("  sofuu brain backup <src> <dst>  Hardlink snapshot of the sealed segments");
-    println!("  sofuu brain restore <b> <dst>   Rebuild a brain from a backup");
-    println!("  sofuu brain migrate <path>   Convert a v1 flat brain to the segmented store");
-    println!("  sofuu infer <model.gguf> \"<prompt>\" Fast on-device CPU inference on GGUF models");
-    println!("  sofuu swarm worker|leader   Distributed edge swarm cluster over LAN (layer pipelining)");
-    println!("  sofuu doctor             Health check: QTSQ, brain round-trip, ctx resolution");
-    println!("  sofuu version            Print version and exit");
-    println!("  sofuu licenses           Print open-source licenses");
-    println!("  sofuu help               Print this help");
-    println!("  sofuu <command> --help   Show every flag a subcommand accepts");
-    println!("  sofuu session list       List active sessions on this project");
-    println!("  sofuu session show <id>  Show one session's full context");
-    println!("  sofuu session inspect <id>  Inspect storage without payload text");
-    println!("  sofuu session repair <id>   Rebuild a damaged segmented manifest");
-    println!("  sofuu session migrate <id>  Migrate one legacy flat session");
-    println!("  sofuu session storage-stats <id>  Show segment/storage counters");
+    println!("  sofuu chat --effort <lvl> Set reasoning/thinking effort (low, medium, high)");
+    println!("  sofuu chat --sync <on|off> Session mesh cross-terminal synchronization (default on)");
+    println!();
+    println!("\x1b[1mScript Execution & Standalone Compiler:\x1b[0m");
+    println!("  sofuu run <file.js|ts>   Run JavaScript or TypeScript with sub-20ms cold start");
+    println!("  sofuu eval \"<code>\"      Evaluate JS inline (prints value; -q to silence)");
+    println!("  sofuu repl               Interactive QuickJS evaluation REPL");
+    println!("  sofuu bundle <entry.js>  Bundle nested ESM/TypeScript imports to a single file (-o <out.js>)");
+    println!("  sofuu compile <entry>    Compile to standalone native binary (-o, --profile micro|lean|full, --embed-brain)");
+    println!("  sofuu compile-bc <entry> Compile JavaScript/TypeScript directly to AOT QuickJS bytecode (-o <out.bc>)");
+    println!("  sofuu install            Install dependencies from ./package.json");
+    println!("  sofuu add <pkg>          Install an npm package directly");
+    println!();
+    println!("\x1b[1mAutonomous Agents & Observability:\x1b[0m");
+    println!("  sofuu agent list         List registered agent definitions (~/.sofuu/agents/*.js)");
+    println!("  sofuu agent run <n> <t>  Run agent headless on task (--json for structured output, --model <m>)");
+    println!("  sofuu logs               List recent agent execution runs: id, timestamp, steps, status");
+    println!("  sofuu logs show <id>     Render one run's full event trace and tool calls");
+    println!("  sofuu logs --follow      Stream active agent logs in real time (Ctrl-C exits)");
+    println!("  sofuu logs --last-error  Post-mortem diagnostics box for the newest crash");
+    println!("  sofuu resume <id>        Resume an interrupted agent run from its last state checkpoint");
+    println!();
+    println!("\x1b[1mModel Context Protocol (MCP):\x1b[0m");
+    println!("  sofuu mcp list           List configured MCP servers, active tools, and transports");
+    println!("  sofuu mcp test <server>  Ping an MCP server and verify tools/resources connectivity");
+    println!("  sofuu mcp inspect <cmd>  Inspect an MCP server, list schemas, or invoke a tool (--call <t> --args <j>)");
+    println!("  sofuu mcp add <name> <cmd> Register a new MCP server in project/user configuration");
+    println!("  sofuu mcp remove <name>  Unregister an MCP server");
+    println!("  sofuu mcp init <name>    Scaffold a new TypeScript MCP server project");
+    println!("  sofuu mcp link <target>  Configure MCP in Cursor IDE, Claude Desktop, or Windsurf");
+    println!("  sofuu mcp build <srv.ts> Compile MCP server to ~2 MB standalone micro-binary (-o <path>)");
+    println!();
+    println!("\x1b[1mKaze Physical & Declarative Language:\x1b[0m");
+    println!("  sofuu script run <f.kaze> Execute Kaze script on zero-GC arena VM (--fuel <n>, --cap k=v)");
+    println!("  sofuu script check <f>   Validate Kaze syntax, physical units, and capability declarations");
+    println!("  sofuu script compile <f> Compile Kaze to deterministic 4-byte .kazebc bytecode (-o <out>)");
+    println!("  sofuu script repl        Interactive Kaze physical unit and expression REPL");
+    println!();
+    println!("\x1b[1mAutonomous 24/7 Supervisor Daemon:\x1b[0m");
+    println!("  sofuu daemon run <bin>   Run standalone agent under in-process supervisor (--every <duration>)");
+    println!("  sofuu daemon install <b> Install agent as an OS service (Linux systemd / macOS launchd) (--every <d>, --name <n>)");
+    println!("  sofuu daemon status [n]  Query status and health of managed agent services");
+    println!("  sofuu daemon logs <name> Tail real-time service execution logs (-f)");
+    println!("  sofuu daemon start <n>   Start a managed agent service");
+    println!("  sofuu daemon stop <n>    Stop a running agent service");
+    println!("  sofuu daemon restart <n> Restart a managed agent service");
+    println!("  sofuu daemon uninstall <n> Unregister and remove an agent service unit");
+    println!();
+    println!("\x1b[1mOn-Device Vector Memory (QTSQ):\x1b[0m");
+    println!("  sofuu brain stats <path> Records, dimensions, segments, generations, recovery counters");
+    println!("  sofuu brain verify <path> Full cryptographic integrity scrub: manifest, segments, digests (--json)");
+    println!("  sofuu brain repair <path> Quarantine torn segments and restore verified records");
+    println!("  sofuu brain backup <s> <d> Atomic hardlink snapshot of sealed brain segments");
+    println!("  sofuu brain restore <b> <d> Rebuild a healthy brain store from an archive backup");
+    println!("  sofuu brain migrate <path> Convert legacy v1 flat .qtsq file to v2 segmented store");
+    println!("  sofuu serve --brain <p>  Serve cognitive memory and agent APIs over HTTP/SSE (--port, --host, --token)");
+    println!();
+    println!("\x1b[1mRobotics, Drones & Physical Computing:\x1b[0m");
+    println!("  sofuu drone status       Query autopilot link, heartbeat, GPS fix, battery, and flight mode");
+    println!("  sofuu drone connect <t>  Connect MAVLink telemetry link (udp:14550, serial:/dev/ttyAMA0@921600)");
+    println!("  sofuu drone arm|disarm   Arm or disarm flight controller motors behind safety gate");
+    println!("  sofuu drone takeoff <m>  Execute takeoff to target altitude in meters (safety ceiling enforced)");
+    println!("  sofuu drone land|rtl     Command vehicle to land or return-to-launch");
+    println!("  sofuu drone goto <lat> <lon> <alt> Navigate to GPS waypoint under geofence policy");
+    println!("  sofuu drone observe      Stream live MAVLink attitude, position, and GPS telemetry packets");
+    println!("  sofuu drone mission <f>  Upload and execute a waypoint mission file");
+    println!("  sofuu drone init         Scaffold an autonomous drone mission profile");
+    println!("  sofuu drone why          Explain active hardware policy and flight boundary constraints");
+    println!();
+    println!("\x1b[1mPlugins & Extensibility (5-Shield Safety):\x1b[0m");
+    println!("  sofuu plugin list        List installed plugins in ./plugins/ and ~/.sofuu/plugins/");
+    println!("  sofuu plugin add <name>  Install plugin by name/package (--global, --force)");
+    println!("  sofuu plugin validate <f> Validate plugin syntax, export interface, and microZod schema");
+    println!("  sofuu plugin run <tool>  Execute a plugin tool under 5-shield safety boundaries");
+    println!("  sofuu plugin test <tool> Test a plugin tool in isolation with mock parameters");
+    println!("  sofuu plugin init <name> Scaffold a new plugin project (--category=tool|service|...)");
+    println!();
+    println!("\x1b[1mSecurity, Policies & Conformance:\x1b[0m");
+    println!("  sofuu policy init        Scaffold a default R7 security policy file (sofuu.policy.json)");
+    println!("  sofuu policy check <f>   Static audit: scan script/agent for required permissions");
+    println!("  sofuu policy dry-run <f> Simulate execution against policy and report violations");
+    println!("  sofuu policy why <rule>  Explain reasons for an R7 policy grant, jail, or denial");
+    println!("  sofuu tools list         List tools permitted under current active security policy (--json)");
+    println!("  sofuu capabilities       Print runtime capability manifest (SIMD, Metal, engine, sensors) as JSON");
+    println!("  sofuu conformance        Run R7 security firewall and policy conformance verification suite");
+    println!();
+    println!("\x1b[1mSession Mesh & Output Archives:\x1b[0m");
+    println!("  sofuu session list       List active multi-terminal sessions on this project");
+    println!("  sofuu session show <id>  Show one session's full dialogue context and task state");
+    println!("  sofuu session inspect <id> Inspect session storage manifest without payload text");
+    println!("  sofuu session export <id> Export session state and memory to portable JSON file");
+    println!("  sofuu session import <f> Import session state from JSON file");
+    println!("  sofuu session repair <id> Rebuild a damaged session manifest");
+    println!("  sofuu session migrate <id> Migrate a legacy flat session store to segmented format");
+    println!("  sofuu session storage-stats <id> Show segment storage counters and dirty cache stats");
     println!("  sofuu session prune      Remove ended sessions older than 7 days");
-    println!("  sofuu outputs list       List timestamped model/tool outputs");
-    println!("  sofuu outputs show <id>  Decode one archived output");
-    println!("  sofuu outputs search <text>  Search archived output summaries/content");
-    println!("  sofuu outputs context <task>  Build bounded historical context");
-    println!("  sofuu outputs stats      Show archive counters and diagnostics");
-    println!("  sofuu outputs rebuild-index  Rebuild output metadata index");
-    println!("  sofuu outputs prune      Dry-run retention candidates (use --apply to delete)");
-    /* PC-08 (audit 2026-10-29): the capability/tooling commands are real
-     * subcommands and were missing from this page. They get their own block
-     * with the COMMAND NAME first, because these are the commands a script
-     * probes (`sofuu --help | grep -E '^\s+capabilities\b'`) and because a
-     * name column reads like the `Chat commands` list below; descriptions
-     * still open at the same column as every `sofuu …` line above. */
-    println!("\n\x1b[1mProtocol commands (run as `sofuu <command>`):\x1b[0m");
-    println!("  capabilities             Print the runtime capability manifest as JSON");
-    println!("  tools list               List the tools the active policy allows (--json)");
-    println!("  policy init|check|dry-run|why  Write a profile, audit a script, explain a rule");
-    println!("  mcp list|test|inspect|add|remove|init|link|build Manage MCP servers and compile micro-binaries");
-    println!("  script run|check|compile|repl  Kaze: capability-gated scripting language for agents & devices");
-    println!("  daemon install|status|logs|stop|start|restart|uninstall|run 24/7 background agent service supervisor");
-    println!("\n\x1b[1mChat commands (inside the chat UI):\x1b[0m");
-    /* P3 (AUDIT-2026-09-07): /models was deliberately removed (unknown
-     * command — the model list lives in /provider) — stop advertising it. */
-    println!("  /help  /providers  /model <n>  /provider <n>");
-    println!("  /effort <lvl>  /compact  /clear  /brain  /exit");
-    println!("  /sessions | /context [id] | /work <desc> | /done | /note <msg> | /notify <msg>");
-    println!("\nSession mesh: `sofuu chat` syncs with other sessions on the SAME project");
-    println!("in real time (tasks, notes, critical notices, shared context).");
-    println!("Disable with `--sync off`. Main session data uses bounded .store QTSQ segments; legacy flat .qtsq files remain readable.");
+    println!("  sofuu outputs list       List timestamped model reasoning and tool output archives");
+    println!("  sofuu outputs show <id>  Decode and print one archived model/tool output");
+    println!("  sofuu outputs search <q> Full-text search archived output summaries and content");
+    println!("  sofuu outputs context <t> Build bounded historical context for prompt augmentation");
+    println!("  sofuu outputs stats      Show output archive counters and storage footprint");
+    println!("  sofuu outputs rebuild-index Rebuild output search index");
+    println!("  sofuu outputs prune      Dry-run output retention candidates (use --apply to delete)");
+    println!();
+    println!("\x1b[1mLocal Inference, Edge Swarm & Diagnostics:\x1b[0m");
+    println!("  sofuu infer <model.gguf> \"<prompt>\" Fast on-device CPU/Metal inference on GGUF models");
+    println!("  sofuu swarm worker       Join distributed edge AI swarm cluster over LAN (layer pipelining)");
+    println!("  sofuu swarm leader       Host edge AI swarm cluster and orchestrate distributed inference");
+    println!("  sofuu dev [dir]          Start AI-native full-stack dev server with hot reload (experimental)");
+    println!("  sofuu doctor             Run environment health check (QTSQ, Metal GPU, SIMD, policy)");
+    println!("  sofuu version            Print version, commit hash, and target architecture");
+    println!("  sofuu licenses           Print open-source licenses and attribution");
+    println!("  sofuu help               Print this help overview");
+    println!("  sofuu <command> --help   Show detailed help and all flags for a subcommand");
+    println!();
+    println!("\x1b[1mInteractive Chat Shortcuts (inside chat TUI):\x1b[0m");
+    println!("  /help                 Show chat commands and keybindings");
+    println!("  /model <name>         Switch active model (or select from list)");
+    println!("  /provider <name>      Switch active provider (openai, anthropic, llamacpp, ollama, etc.)");
+    println!("  /providers            List configured providers and health status");
+    println!("  /effort <low|med|high> Set reasoning / thinking effort level");
+    println!("  /compact              Compact conversation context window");
+    println!("  /clear                Clear dialogue history in current session");
+    println!("  /brain                Inspect attached QTSQ vector memory statistics");
+    println!("  /sessions             List active multi-terminal sessions");
+    println!("  /work <task>          Broadcast active work item to session mesh");
+    println!("  /done                 Mark active work item completed");
+    println!("  /note <text>          Append shared note to project scratchpad");
+    println!("  /notify <msg>         Broadcast high-priority notification to peers");
+    println!("  /exit                 Exit interactive chat session");
+    println!();
+    println!("Session mesh: `sofuu chat` syncs with other sessions on the SAME project in real time.");
+    println!("Disable with `--sync off`. Memory uses encrypted .qtsq segmented stores with cached KDF v2.");
     println!("\n\x1b[90mBuilt with Rust + QuickJS + C + QTSQ | MIT License · QTSQ engine: Apache-2.0\x1b[0m\n");
 }
 
@@ -206,12 +263,14 @@ fn print_subcommand_help(cmd: &str) -> bool {
              any network or disk work).\n"
         ),
         "compile" => println!(
-            "Usage: sofuu compile <entry.ts|js> [-o <out>] [--lean] [--full] [--with-inference] [--base <path>] [--embed-brain <file.qtsq>] [--no-strip]\n\n\
+            "Usage: sofuu compile <entry.ts|js|kaze> [-o <out>] [--profile <lean|full|micro>] [--lean] [--full] [--with-inference] [--micro] [--base <path>] [--embed-brain <file.qtsq>] [--no-strip]\n\n\
              Compile an agent into a standalone executable: an ultra-lean runtime base\n\
              plus the entry's bundled bytecode and, optionally, a `.qtsq` brain appended\n\
              behind a 32-byte trailer. The result runs on any host with zero dependencies.\n\
                -o, --output <file>      output path (default: the entry's stem)\n\
+               --profile <lean|full|micro>  compilation profile (default: lean)\n\
                --lean                   compile smallest possible binary (default, drops heavy GGUF/chat engines)\n\
+               --micro, --mcp           minimal profile for MCP servers and single-purpose tools (~2 MB)\n\
                --full                   compile with all engines included (same as --with-inference)\n\
                --with-inference         bundle full local inference engine inside binary\n\
                --base <path>            use a custom base executable binary\n\
@@ -282,6 +341,7 @@ fn print_subcommand_help(cmd: &str) -> bool {
         /* W7: `sofuu brain --help` — the module owns the page so the
          * subcommand list can never drift from the parser. */
         "brain" => sofuu_core::brain_cmd::print_help(),
+        "drone" => sofuu_core::drone_cmd::print_help(),
         "version" | "licenses" | "help" => print_help(),
         _ => return false,
     }
@@ -1806,7 +1866,7 @@ fn parse_compile_args(rest: &[String]) -> Result<CompileArgs, String> {
 }
 
 fn print_compile_report(r: &sofuu_core::compiler::CompileReport) {
-    println!("\x1b[1m⚡ sofuu compile\x1b[0m");
+    println!("\x1b[1msofuu compile\x1b[0m");
     println!("  Output:  \x1b[1m{}\x1b[0m", r.output);
     println!("  Profile: \x1b[32m{}\x1b[0m ({})", r.profile, r.base_source);
     match r.brain {
@@ -1869,7 +1929,7 @@ fn cmd_repl(rt: &SofuuRuntime) -> i32 {
 use std::io::{self, BufRead, Write};
 
 fn repl_shim(rt: &SofuuRuntime) -> i32 {
-    println!("\n\x1b[1;36m  ⚡ Sofuu (素風) REPL\x1b[0m  \x1b[2mv{VERSION}\x1b[0m");
+    println!("\n\x1b[1;36m  Sofuu (素風) REPL\x1b[0m  \x1b[2mv{VERSION}\x1b[0m");
     println!("\x1b[2m  Type .help for commands, Ctrl-D to exit\x1b[0m\n");
 
     let stdin = io::stdin();
@@ -1913,7 +1973,7 @@ fn repl_shim(rt: &SofuuRuntime) -> i32 {
                 ".clear" => {
                     print!("\x1b[2J\x1b[H");
                     io::stdout().flush().ok();
-                    println!("\x1b[1;36m  ⚡ Sofuu (素風) REPL\x1b[0m  \x1b[2mv{VERSION}\x1b[0m\n");
+                    println!("\x1b[1;36m  Sofuu (素風) REPL\x1b[0m  \x1b[2mv{VERSION}\x1b[0m\n");
                     continue;
                 }
                 ".version" => {
@@ -2628,7 +2688,7 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     }
 
     eprintln!("\x1b[1;36m  ┌─────────────────────────────────┐");
-    eprintln!("  │   ⚡ Sofuu Edge Server          │");
+    eprintln!("  │   Sofuu Edge Server             │");
     eprintln!("  │   v{:<31}│", VERSION);
     eprintln!("  └─────────────────────────────────┘\x1b[0m");
     if !model_path.is_empty() {
@@ -2709,7 +2769,7 @@ fn cmd_bundle(_rt: &SofuuRuntime, args: &[String]) -> i32 {
                 eprintln!("\x1b[31mError:\x1b[0m cannot write {}: {}", output, e);
                 return 1;
             }
-            println!("\x1b[1m⚡ sofuu bundle\x1b[0m");
+            println!("\x1b[1msofuu bundle\x1b[0m");
             println!("  Entry: {}", entry.display());
             println!(
                 "\x1b[32m✓\x1b[0m Bundle written: \x1b[1m{}\x1b[0m ({} B)",
@@ -2762,7 +2822,7 @@ fn cmd_add(rt: &SofuuRuntime, args: &[String]) -> i32 {
 }
 
 fn print_licenses() {
-    println!("\n\x1b[1m⚡ Sofuu (素風) Open Source Notices\x1b[0m\n");
+    println!("\n\x1b[1mSofuu (素風) Open Source Notices\x1b[0m\n");
     println!("Sofuu is MIT Licensed.");
     println!("Copyright (c) 2026 Haruhito\n");
     println!("\x1b[1mThird-party components bundled in this binary:\x1b[0m\n");
@@ -3452,9 +3512,9 @@ fn main() -> ExitCode {
              * `--cpu` / `--gpu-layers 0` stay silent by contract. */
             gpu_layers = resolve_gpu_layers(gpu_layers);
             let engine_type = if gpu_layers > 0 {
-                "⚡ Sofuu Neural Engine (Heterogeneous CPU+GPU)"
+                "Sofuu Neural Engine (Heterogeneous CPU+GPU)"
             } else {
-                "⚡ Sofuu CPU Inference Engine"
+                "Sofuu CPU Inference Engine"
             };
             eprintln!(
                 "\x1b[36m{}\x1b[0m rev {} — loading {}...",
@@ -4072,7 +4132,7 @@ fn main() -> ExitCode {
 
 fn print_swarm_help() {
     println!("\x1b[1;36m  ┌────────────────────────────────────────────────────────┐");
-    println!("  │   ⚡ Sofuu Swarm — Distributed Edge AI Swarm Cluster    │");
+    println!("  │   Sofuu Swarm — Distributed Edge AI Swarm Cluster       │");
     println!("  │   Sequential Layer Pipelining across LAN Edge Nodes    │");
     println!("  └────────────────────────────────────────────────────────┘\x1b[0m\n");
     println!("\x1b[1mUsage:\x1b[0m");
@@ -4104,7 +4164,7 @@ fn cmd_swarm(args: &[String]) -> ExitCode {
 
     match subcmd {
         "discover" => {
-            println!("\x1b[36m⚡ Searching for Sofuu Swarm nodes on local network (UDP 9770)...\x1b[0m");
+            println!("\x1b[36mSearching for Sofuu Swarm nodes on local network (UDP 9770)...\x1b[0m");
             let peers = sofuu_core::infer::swarm::SwarmDiscovery::listen(std::time::Duration::from_secs(3));
             if peers.is_empty() {
                 println!("\x1b[33mNo swarm nodes discovered on local subnet.\x1b[0m");
@@ -4344,7 +4404,7 @@ fn cmd_swarm(args: &[String]) -> ExitCode {
 
             // PC-05: same one-shot warning as `sofuu infer` / `swarm worker`.
             gpu_layers = resolve_gpu_layers(gpu_layers);
-            eprintln!("\x1b[36m⚡ Sofuu Swarm Leader\x1b[0m — loading {}...", model_path);
+            eprintln!("\x1b[36mSofuu Swarm Leader\x1b[0m — loading {}...", model_path);
             let t0 = std::time::Instant::now();
             let load_res = if gpu_layers == 0 {
                 sofuu_core::infer::InferEngine::load_with_seq_len_cpu(&model_path, custom_ctx)

@@ -52,7 +52,7 @@ Official pre-compiled single binaries are available for macOS (Apple Silicon) an
 
 ### 2. The 30-Second Demo: Runtime + Memory + Agent Tools
 
-Sofuu collapses vector databases, agent orchestrators, and tool sandboxes into standard JavaScript / TypeScript:
+Sofuu collapses vector databases, agent orchestrators, and tool sandboxes into standard JavaScript / TypeScript with **zero models, zero API keys, and zero background servers required to test**:
 
 ```javascript
 // quickstart.js — Run directly: $ sofuu run quickstart.js
@@ -68,25 +68,32 @@ brain.remember(
 const [match] = brain.recall(sofuu.ai.embedLocal("memory"), 1);
 console.log(`[Memory Recalled] ${match.text}`);
 
-// 3. Define an autonomous agent with memory recall and native tools
-sofuu.agent.define({
+// 3. Native sandboxed tools executed in-process with policy gates
+const sysInfo = sofuu.tools.execute("system_info", {});
+console.log(`[Runtime] Platform: ${sysInfo.platform || process.platform} · Architecture: ${sysInfo.arch || process.arch} · Status: ready`);
+
+// 4. Define an autonomous agent (ready for deployment with memory & tools)
+const agent = sofuu.agent.define({
   name: "assistant",
-  system: "Answer user questions using your vector memory and local tools.",
-  tools: ["coding", "web", "memory"],
+  system: "Answer user queries using vector memory and native tools.",
+  tools: ["coding", "memory", "web"],
   memory: "agent",
 });
+console.log(`[Agent Ready] "${agent.name}" registered with tools: [coding, memory, web]`);
 
-const result = await sofuu.agent.run("assistant", "What makes Sofuu unique?");
-console.log(`[Agent Response] ${result.answer}`);
+// (Optional) When you want to run the agent with an LLM, connect any provider:
+// const result = await sofuu.agent.run("assistant", "What makes Sofuu fast?");
+// console.log(result.answer);
 ```
 
 Run it immediately with zero setup, or compile it to a standalone native binary:
 
 ```bash
-# 1. Run directly with sub-20ms cold start
+# 1. Run directly with sub-20ms cold start (100% offline, zero models needed)
 $ sofuu run quickstart.js
 [Memory Recalled] Sofuu executes AI apps, tools, and agents natively under 10 MB.
-[Agent Response] Sofuu collapses the entire AI stack into a single < 10 MB binary.
+[Runtime] Platform: darwin · Architecture: arm64 · Status: ready
+[Agent Ready] "assistant" registered with tools: [coding, memory, web]
 
 # 2. Compile into a standalone native executable with zero dependencies
 $ sofuu compile quickstart.js -o my-agent

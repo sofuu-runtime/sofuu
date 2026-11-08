@@ -56,7 +56,9 @@ The agent analyzes market data, synthesizes technical support/resistance via neu
 ./example-agents/paper_trader/paper-trader \
   --arg asset=BTC-USDT \
   --arg current_price=75000 \
-  --arg sentiment_score=70
+  --arg volume_24h=367000000 \
+  --arg sentiment_score=70 \
+  --arg entry_price=0
 ```
 
 **Live Output:**
@@ -66,7 +68,7 @@ The agent analyzes market data, synthesizes technical support/resistance via neu
 [AI] ai.prompt("Act as Paper Trader market analyst. Analyze BTC-USDT at price $75000...")
 [MEMORY] memory.save("BTC-USDT_paper_thesis", ...) -> nothing
 [TOOL] tool.call("paper_exchange", "BTC-USDT:BUY@75000;allocation=20%") -> OK
-[INFO] Paper Trader analyzing BTC-USDT at $75000 (24h Vol: $100000000, Sentiment: 70, Entry: $0)
+[INFO] Paper Trader analyzing BTC-USDT at $75000 (24h Vol: $367000000, Sentiment: 70, Entry: $0)
 [INFO] AUTONOMOUS DECISION: BUY BTC-USDT at $75000 (Bullish sentiment 70, 20% allocation)
 [VERDICT] ALLOW "BUY executed: OK: tool 'paper_exchange' executed..."
 107 instructions · 0 fuel
@@ -81,6 +83,8 @@ Holding a position entered at \$75,000 when price moves to **\$76,600** (+2.1% p
 ./example-agents/paper_trader/paper-trader \
   --arg asset=BTC-USDT \
   --arg current_price=76600 \
+  --arg volume_24h=367000000 \
+  --arg sentiment_score=65 \
   --arg entry_price=75000
 ```
 
@@ -103,6 +107,8 @@ Holding a position entered at \$75,000 when price drops to **\$73,200** (-2.4% l
 ./example-agents/paper_trader/paper-trader \
   --arg asset=BTC-USDT \
   --arg current_price=73200 \
+  --arg volume_24h=367000000 \
+  --arg sentiment_score=65 \
   --arg entry_price=75000
 ```
 
@@ -125,6 +131,8 @@ Holding a position entered at \$75,000 when price is at **\$75,200** (+0.2%, wit
 ./example-agents/paper_trader/paper-trader \
   --arg asset=BTC-USDT \
   --arg current_price=75200 \
+  --arg volume_24h=367000000 \
+  --arg sentiment_score=65 \
   --arg entry_price=75000
 ```
 
@@ -145,7 +153,9 @@ When sentiment is bearish ($\le 40$) and no position is open, the agent refuses 
 ./example-agents/paper_trader/paper-trader \
   --arg asset=BTC-USDT \
   --arg current_price=74000 \
-  --arg sentiment_score=35
+  --arg volume_24h=367000000 \
+  --arg sentiment_score=35 \
+  --arg entry_price=0
 ```
 
 **Live Output:**

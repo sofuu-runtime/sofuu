@@ -234,7 +234,7 @@ const agent = sofuu.agent.define({
 });
 ```
 
-#### CLI Tooling & Standalone Binary Compilation
+#### CLI Tooling & Standalone Micro-Binary Compilation
 Sofuu includes CLI commands to test, inspect, link, and compile MCP servers:
 
 ```bash
@@ -248,11 +248,12 @@ sofuu mcp inspect "npx -y some-server" --call echo --args '{"text":"hello"}'
 sofuu mcp link cursor           # Configure in Cursor IDE
 sofuu mcp link claude-desktop   # Configure in Claude Desktop
 
-# Optional: Compile any MCP server into a standalone single-file binary (~2 MB)
+# Compile any MCP server into a standalone single-file micro-binary (~2 MB)
 sofuu mcp build server.ts -o dist/my-mcp-server
 ```
 
-> **Standalone Compilation (`sofuu mcp build`):** Packages your TypeScript/JavaScript MCP server against the `sofuu-micro` base (~2.05 MiB). Dead-code elimination strips unused AI models and UI machinery to run with < 5 MB RSS and 0 ms cold start, requiring no runtime installed on the target machine.
+* **Micro-Profile Optimization (`sofuu-micro` base):** `sofuu mcp build` automatically targets the minimal `micro` compilation profile (~2 MB). It strips out cognitive agent loops, chat TUI, and local inference machinery, keeping only QuickJS, libuv, and the streamable MCP protocol engine.
+* **Instant Start & Zero Dependencies:** The resulting standalone executable runs with `< 5 ms` cold start and `< 5 MB` idle RSS, completely eliminating Node.js, `npx`, and Python dependencies from your MCP toolchain.
 
 Documentation: [sofuu.xyz/mcp](https://sofuu.xyz/mcp)
 
@@ -374,6 +375,38 @@ Running multi-step agents against local inference servers (`llama.cpp`, Ollama, 
 
 ---
 
+### 7. Standalone Compiler & Minimum Size Profiles (`sofuu compile`)
+
+Sofuu can compile any JavaScript, TypeScript, or Kaze (`.kaze`) agent directly into a self-contained single-file executable with **zero external dependencies**. Standalone binaries append bytecode and metadata behind a 32-byte `SOFUU_BIN_V1` trailer with automatic Mach-O / ELF ad-hoc signing and sub-5ms cold starts.
+
+To achieve minimal binary sizes across different deployment targets, Sofuu provides dedicated compiler profiles:
+
+| Profile | Flag | Base Runtime | Target Size | Included Subsystems | Best For |
+| :--- | :--- | :--- | :---: | :--- | :--- |
+| **Micro** | `--profile micro` | `sofuu-micro` | **~2.0–2.5 MB** | Minimal QuickJS + libuv + MCP stream parser. No agent loops, no TUI, no inference. | Single-purpose tools, microservices, MCP servers (`sofuu mcp build`). |
+| **Lean** *(Default)* | `--lean` | `sofuu-agent` | **~5.4 MB** | Full QuickJS, libuv, vector memory (`sofuu.memory`), sandboxed tools, policy gates, and agent loop (`sofuu.agent`). Drops local GGUF engine and chat TUI. | Autonomous agents, background daemons, CLI tools. |
+| **Full** | `--full` / `--with-inference` | `sofuu` | **~6.8 MB** | Entire engine: local GGUF/SafeTensors CPU inference, MAVLink robotics, JSX transpiler, and full CLI. | Fully self-contained local offline inference systems. |
+
+#### Compiler CLI Usage
+
+```bash
+# 1. Compile an agent with the lean profile (default, under 10 MB):
+sofuu compile agent.js -o dist/my-agent
+
+# 2. Compile an MCP server with the ultra-lean micro-profile (~2 MB):
+sofuu mcp build server.ts -o dist/my-mcp-server
+# Or equivalently:
+sofuu compile server.ts --profile micro -o dist/my-mcp-server
+
+# 3. Carry on-device vector memory inside the binary trailer:
+sofuu compile agent.js --embed-brain ./knowledge.qtsq -o dist/agent-with-brain
+
+# 4. Compile pure declarative Kaze agents:
+sofuu compile agent.kaze -o dist/kaze-agent
+```
+
+---
+
 ## CLI Cheatsheet
 
 ```bash
@@ -462,15 +495,44 @@ sofuu_rt_free(rt);
 
 ## Building from Source
 
+Sofuu links the **QTSQ vector memory codec** (`libqtsq.a`) statically as a core runtime dependency. To build from source, compile the QTSQ codec first, then pass its path via `SOFUU_QTSQ_DIR` when building Sofuu:
+
+### 1. Prerequisites
+* **Rust & Cargo:** (1.80+) `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
+* **C/C++ Toolchain:** `clang` or `gcc`, `cmake`, `make`
+* **System Libraries:**
+  * **macOS:** Xcode Command Line Tools (`xcode-select --install`)
+  * **Linux (Ubuntu / Debian / AWS Linux):** `sudo apt-get install -y zlib1g-dev libcurl4-openssl-dev libssl-dev`
+
+### 2. Build the QTSQ Vector Codec
 ```bash
-# Prerequisites: Rust (cargo), clang, cmake, make
+# Clone QTSQ into your workspace
+git clone https://github.com/haruhito2666/qtsq ~/projects/qtsq
+cd ~/projects/qtsq
+
+# Build the static archive (libqtsq.a)
+make
+export SOFUU_QTSQ_DIR=$(pwd)
+cd ..
+```
+
+### 3. Build Sofuu
+```bash
+# Clone Sofuu
 git clone https://github.com/sofuu-runtime/sofuu
 cd sofuu
 
-make deps                      # Build vendored libuv
-make                           # Build release binary (./sofuu)
-make test                      # Run test suite
-./sofuu doctor                 # Health check
+# 1. Build vendored libuv
+make deps
+
+# 2. Build release binary (statically links libqtsq.a)
+SOFUU_QTSQ_DIR=$SOFUU_QTSQ_DIR make
+
+# 3. Verify health check and QTSQ memory linkage
+./sofuu doctor
+
+# 4. Run test suite
+make test
 ```
 
 ---

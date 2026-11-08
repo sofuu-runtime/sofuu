@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/sofuu-logo.png" width="118" alt="Sofuu logo"></p>
+<p align="center"><img src="https://sofuu.xyz/logo.png" width="118" alt="Sofuu logo"></p>
 
 # ⚡ Sofuu (素風)
 
@@ -244,7 +244,7 @@ sofuu mcp build server.ts -o dist/my-mcp-server
 
 > **Standalone Compilation (`sofuu mcp build`):** Packages your TypeScript/JavaScript MCP server against the `sofuu-micro` base (~2.05 MiB). Dead-code elimination strips unused AI models and UI machinery to run with < 5 MB RSS and 0 ms cold start, requiring no runtime installed on the target machine.
 
-Full documentation: [docs/MCP.md](docs/MCP.md).
+Documentation: [sofuu.xyz/mcp](https://sofuu.xyz/mcp)
 
 ---
 
@@ -293,7 +293,7 @@ sofuu plugin test weather '{"city":"Oslo"}' # Invoke tool once and print executi
 sofuu plugin list                           # View all registered plugins and breaker states
 ```
 
-Full documentation: [docs/PLUGINS.md](docs/PLUGINS.md).
+Documentation: [sofuu.xyz/docs](https://sofuu.xyz/docs)
 
 ---
 

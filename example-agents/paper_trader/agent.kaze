@@ -1,0 +1,66 @@
+# Paper Trader — Simulated Crypto & Stock Market Analysis & Paper Execution AI Agent
+#
+# Programmed 100% in Kaze. Zero JS or TS required.
+# Strictly paper trading and simulated execution (NO REAL MONEY).
+#
+# Compile to a standalone single-binary agent with:
+#   sofuu compile example-agents/paper_trader/agent.kaze -o example-agents/paper_trader/paper-trader
+#
+# Capabilities:
+#   ai: Technical price analysis, sentiment evaluation, and paper trade rationale
+#   tool: Simulated paper exchange execution, orderbook polling, and portfolio sync
+#   policy: R7 hardware safety guardrails, credential leak checks, and allocation limits
+#   memory: Historical paper trade journal, strategy performance, and thesis retention
+#   log: Detailed simulation trade audit logging
+#   alert: Volatility warnings and simulated large allocation notifications
+
+needs: ai, tool, policy, memory, log, alert
+
+filter analyze_and_trade(asset, current_price, volume_24h, sentiment_score, requested_action, requested_allocation_pct):
+    log.info("Paper Trader analyzing " + asset + " (" + requested_action + " at $" + current_price + ", allocation=" + requested_allocation_pct + "%)")
+    
+    # 1. Security & Credential Leak Guardrail
+    if policy detects secrets in asset:
+        reject "Security refusal: asset identifier or payload contains private credentials"
+        
+    # 2. Simulated Risk Management: Hard cap single position at 25% of paper portfolio
+    if requested_allocation_pct > 25:
+        send alert "RISK BREACH: Requested paper allocation (" + requested_allocation_pct + "%) exceeds 25% risk cap on " + asset
+        reject "Risk limit violation: maximum single paper position allocation is 25%"
+        
+    # 3. Market Validity & Liquidity Guardrails
+    if current_price <= 0:
+        reject "Invalid market price: asset price must be positive"
+        
+    if volume_24h < 50000:
+        reject "Illiquid asset refusal: 24h volume below simulated execution threshold ($50,000)"
+        
+    # 4. AI Market Sentiment & Technical Analysis Synthesis
+    let market_thesis = ai.prompt("Act as Paper Trader market analyst. Analyze " + asset + " at price $" + current_price + " with 24h volume $" + volume_24h + " and sentiment index " + sentiment_score + " for simulated action: " + requested_action + ". Calculate support/resistance levels, target price, stop-loss, and simulated trade rationale. Note: strictly paper trading simulation.")
+    
+    # 5. Agent Associative Memory: Persist simulated trade thesis to historical journal
+    remember market_thesis as asset + "_paper_thesis"
+    
+    # 6. Simulated Paper Exchange Execution Tool
+    let sim_execution = tool.call("paper_exchange", asset + ":" + requested_action + "@" + current_price + ";allocation=" + requested_allocation_pct + "%")
+    log.info("Simulated paper order status: " + sim_execution)
+    
+    # 7. Escalation Alert for substantial paper allocations (>= 20%)
+    if requested_allocation_pct >= 20:
+        send alert "Substantial paper position opened: " + asset + " (" + requested_allocation_pct + "% allocation at $" + current_price + ")"
+        
+    allow market_thesis
+
+action review_portfolio(total_paper_equity, active_positions):
+    log.info("Reviewing paper portfolio performance. Total equity: $" + total_paper_equity)
+    remember total_paper_equity as "latest_paper_equity"
+    let rebalance_thesis = ai.prompt("Review simulated paper portfolio with total equity $" + total_paper_equity + " across active positions: " + active_positions + ". Recommend paper rebalancing, profit-taking targets, and risk mitigations.")
+    let tracker_res = tool.call("paper_portfolio_tracker", "sync_equity=" + total_paper_equity)
+    log.info("Paper tracker sync: " + tracker_res)
+    return rebalance_thesis
+
+action backtest_strategy(asset, timeframe_days, strategy_name):
+    log.info("Running backtest for " + asset + " strategy " + strategy_name + " over " + timeframe_days + " days")
+    let backtest_raw = tool.call("paper_backtester", asset + ":" + strategy_name + "@" + timeframe_days + "d")
+    let evaluation = ai.complete("Evaluate simulated backtest performance for " + asset + " using strategy " + strategy_name + ": " + backtest_raw)
+    return evaluation

@@ -19,7 +19,7 @@ These showcase agents demonstrate full-lifecycle autonomous agent engineering us
 
 ```
 example-agents/
-├── build.sh                  # One-click script to compile all three agents
+├── build.sh                  # One-click script to compile all four agents
 ├── README.md                 # Complete guide & documentation (this file)
 ├── quant_sentinel/           # [Fintech] High-Frequency Trading Risk Sentinel
 │   ├── agent.kaze            # 100% Pure Kaze source code
@@ -29,17 +29,21 @@ example-agents/
 │   ├── agent.kaze            # 100% Pure Kaze source code
 │   ├── med-protocol          # Standalone compiled native executable (~4.5 MiB)
 │   └── README.md             # Clinical safety gates, ESI scale, and EHR integration
-└── agri_sentinel/            # [Agri-Tech] Autonomous Greenhouse Climate Agent
+├── agri_sentinel/            # [Agri-Tech] Autonomous Greenhouse Climate Agent
+│   ├── agent.kaze            # 100% Pure Kaze source code
+│   ├── agri-sentinel         # Standalone compiled native executable (~4.5 MiB)
+│   └── README.md             # Sensor telemetry, relay actuation, and agronomy AI
+└── paper_trader/             # [Simulated Trading] Crypto & Stock Paper Trader (NO REAL MONEY)
     ├── agent.kaze            # 100% Pure Kaze source code
-    ├── agri-sentinel         # Standalone compiled native executable (~4.5 MiB)
-    └── README.md             # Sensor telemetry, relay actuation, and agronomy AI
+    ├── paper-trader          # Standalone compiled native executable (~4.5 MiB)
+    └── README.md             # Sentiment analysis, risk caps, and paper exchange simulation
 ```
 
 ---
 
 ## 3. Quickstart: Building All Agents
 
-You can build all three agents with a single command:
+You can build all four agents with a single command:
 
 ```bash
 ./example-agents/build.sh
@@ -56,6 +60,9 @@ sofuu compile example-agents/med_protocol/agent.kaze -o example-agents/med_proto
 
 # Agri-Tech
 sofuu compile example-agents/agri_sentinel/agent.kaze -o example-agents/agri_sentinel/agri-sentinel
+
+# Simulated Trading
+sofuu compile example-agents/paper_trader/agent.kaze -o example-agents/paper_trader/paper-trader
 ```
 
 Every compiled binary is a single self-contained native executable (**~4.5 MiB**) with zero external runtime dependencies.
@@ -175,6 +182,52 @@ Every compiled binary is a single self-contained native executable (**~4.5 MiB**
 [MEMORY] memory.save("ZONE-NORTH_agronomy", ...)
 [TOOL] tool.call("irrigation_controller", "ZONE-NORTH:cycle_applied")
 [VERDICT] ALLOW "Synthesized autonomous decision..."
+```
+
+---
+
+### 📊 4. Paper Trader (`paper_trader`)
+* **Sector:** Simulated Trading / Crypto & Stock Market Analysis (NO REAL MONEY)
+* **Capabilities:** `ai`, `tool`, `policy`, `memory`, `log`, `alert`
+* **Purpose:** Performs technical analysis and market sentiment evaluation, enforces strict 25% single-position risk caps, prevents credential leaks, and dispatches simulated orders to a paper exchange tool.
+
+#### Valid Simulated Paper Trade (Allowed):
+```bash
+./example-agents/paper_trader/paper-trader \
+  --entry analyze_and_trade \
+  --arg 'asset="BTC/USD"' \
+  --arg 'current_price=68450' \
+  --arg 'volume_24h=1420000000' \
+  --arg 'sentiment_score=78' \
+  --arg 'requested_action="BUY"' \
+  --arg 'requested_allocation_pct=15'
+```
+*Output:*
+```
+[AGENT] agent :: analyze_and_trade
+[POLICY] policy.detects("secrets", "BTC/USD") -> false
+[AI] ai.prompt("Act as Paper Trader market analyst...")
+[MEMORY] memory.save("BTC/USD_paper_thesis", ...)
+[TOOL] tool.call("paper_exchange", "BTC/USD:BUY@68450;allocation=15%")
+[VERDICT] ALLOW "Synthesized autonomous decision..."
+```
+
+#### Allocation Limit Violation (Rejected):
+```bash
+./example-agents/paper_trader/paper-trader \
+  --entry analyze_and_trade \
+  --arg 'asset="SOL/USD"' \
+  --arg 'current_price=185' \
+  --arg 'volume_24h=850000000' \
+  --arg 'sentiment_score=82' \
+  --arg 'requested_action="BUY"' \
+  --arg 'requested_allocation_pct=35'
+```
+*Output:*
+```
+[AGENT] agent :: analyze_and_trade
+[ALERT] alert.send("RISK BREACH: Requested paper allocation (35%) exceeds 25% risk cap on SOL/USD")
+[VERDICT] REJECT Risk limit violation: maximum single paper position allocation is 25%
 ```
 
 ---

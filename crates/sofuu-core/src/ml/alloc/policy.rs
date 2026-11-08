@@ -472,9 +472,10 @@ pub fn parse_limit(err: &str) -> Option<(LimitKind, i64)> {
      * "context size", "context_window"). */
     let has_context_kw = lower.contains("context length") || lower.contains("context_length")
         || lower.contains("context window") || lower.contains("context_window")
-        || lower.contains("context size") || lower.contains("too long")
-        || lower.contains("too many tokens") || lower.contains("reduce the length")
-        || lower.contains("token limit") || lower.contains("maximum context");
+        || lower.contains("context size") || lower.contains("available context")
+        || lower.contains("too long") || lower.contains("too many tokens")
+        || lower.contains("reduce the length") || lower.contains("token limit")
+        || lower.contains("maximum context") || lower.contains("exceeds the available");
 
     if has_context_kw {
         // "a > b maximum" — the LIMIT is the second number.
@@ -483,7 +484,10 @@ pub fn parse_limit(err: &str) -> Option<(LimitKind, i64)> {
                 return Some((LimitKind::Context, n));
             }
         }
-        if let Some(n) = number_near(&lower, &["maximum", "limit", "is", "most", "up to", "at most"]) {
+        if let Some(n) = number_near(&lower, &[
+            "maximum", "limit", "is", "most", "up to", "at most",
+            "available context size", "context size",
+        ]) {
             if (1..=10_000_000).contains(&n) {
                 return Some((LimitKind::Context, n));
             }
@@ -815,6 +819,8 @@ mod tests {
         assert_eq!(parse_limit(b), Some((LimitKind::Context, 8192)));
         let c = "prompt exceeds the model's context_window limit of 8192 tokens";
         assert_eq!(parse_limit(c), Some((LimitKind::Context, 8192)));
+        let d = "HTTP 400 — request (8194 tokens) exceeds the available context size (8192 tokens), try increasing it";
+        assert_eq!(parse_limit(d), Some((LimitKind::Context, 8192)));
     }
 
     #[test]

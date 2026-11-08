@@ -523,7 +523,7 @@ struct EngineEnvControls: View {
             ToggleRow(label: "Context gates (ML)",
                       desc: "Drop the whole sofuu.ml layer — needs a restart",
                       on: noMl) {
-                noMl.toggle(); store.runtimeEnv.noMl = noMl; store.restartEngineForEnv()
+                noMl.toggle(); store.runtimeEnv.noMl = noMl; store.restartEngineManually()
             }
             ToggleRow(label: "Allow private addresses",
                       desc: "web.open may reach loopback/LAN instead of the SSRF guard",
@@ -587,6 +587,7 @@ struct EngineEnvControls: View {
 private struct AppearancePane: View {
     @ObservedObject var store: AppStore
     @Environment(\.sofuuColors) private var c
+    @AppStorage("appLanguage") private var appLanguage = "en"
 
     var body: some View {
         let state = store.state
@@ -622,11 +623,16 @@ private struct AppearancePane: View {
 
             SectionCard(label: "LANGUAGE") {
                 ControlRow(label: "App language",
-                           desc: "The string table is live — English ships today; translations are one dictionary away.") {
+                           desc: "The string table is live — English, Español and हिन्दी ship today; other strings fall back to English.") {
                     Menu {
-                        Button("English") { L10n.language = "en" }
+                        ForEach(L10n.languages, id: \.code) { lang in
+                            Button(lang.name) {
+                                appLanguage = lang.code
+                                L10n.language = lang.code
+                            }
+                        }
                     } label: {
-                        Text(L10n.language == "en" ? "English" : L10n.language)
+                        Text(L10n.languages.first { $0.code == appLanguage }?.name ?? appLanguage)
                             .font(.system(size: 11))
                             .foregroundStyle(c.text)
                     }

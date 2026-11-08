@@ -1,6 +1,12 @@
 import SwiftUI
 import AppKit
 
+/// Which editor pane a coordinator drives. The primary pane owns the
+/// shared HUD, the LSP client and the cursor/status readout; the split
+/// pane is a second writeable viewport with its own carets, folds and
+/// scroll position over the same buffers.
+enum EditorPane: Equatable { case primary, split }
+
 /// HUD state for the IDE editor leaf: gutter, hover/completion panels,
 /// cursor line, LSP status, diagnostics. Only editor-leaf views observe
 /// this, so high-frequency updates never re-render the shell.
@@ -32,6 +38,9 @@ struct CodeEditor: NSViewRepresentable {
     let store: AppStore
     var editable: Bool = true
     var onEdited: (String) -> Void
+    /// Primary by default; the split pane gets its own coordinator slot and
+    /// HUD so the two viewports never fight over one readout.
+    var pane: EditorPane = .primary
 
     static let gutterTopInset: CGFloat = 6
     static let gutterWidth: CGFloat = 46
@@ -49,7 +58,7 @@ struct CodeEditor: NSViewRepresentable {
     private var language: Language { Languages.language(forPath: path) }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(store: store)
+        Coordinator(store: store, pane: pane)
     }
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -106,19 +115,28 @@ struct CodeEditor: NSViewRepresentable {
         guard let tv = scrollView.documentView as? SofuuCodeView else { return }
         let c = context.coordinator
         c.onEdited = onEdited
+        let pathChanged = c.path != path
         c.path = path
         c.language = language
         c.textView = tv
         tv.editor = c
         tv.delegate = c
-        tv.hud = store.ideGutter
+        tv.hud = c.gutter
 
-        if tv.string != text {
+        // Shared buffer: the focused pane is the source of truth and
+        // already holds this text. A background pane follows along; its
+        // caret is clamped rather than reset. A TAB SWITCH always reloads,
+        // even while the old view is still first responder.
+        if tv.string != text && (pathChanged || tv.window?.firstResponder !== tv) {
+            let selection = tv.selectedRange()
             tv.string = text
             c.rebuildLineIndex()
             c.lexerHighlight(text: text, language: language)
             c.syncLSPDocument(path: path, text: text, language: language)
             c.push()
+            tv.setSelectedRange(NSRange(
+                location: min(selection.location, (text as NSString).length),
+                length: 0))
         }
         // Per-tab restore (cursor + scroll fraction) and a pending search
         // target  each applied exactly once per path switch.
@@ -159,11 +177,13 @@ struct CodeEditor: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextViewDelegate, NSLayoutManagerDelegate {
         let store: AppStore
         let gutter: GutterModel
+        let pane: EditorPane
         weak var textView: SofuuCodeView?
         weak var scrollView: NSScrollView?
         private var scrollObserver: NSObjectProtocol?
         private var saveObserver: NSObjectProtocol?
         private var closeObserver: NSObjectProtocol?
+        private var bufferObserver: NSObjectProtocol?
 
         var isDark = true
         var path: String?
@@ -192,11 +212,16 @@ struct CodeEditor: NSViewRepresentable {
         var lineStep: CGFloat?
         private var lspChangeWork: DispatchWorkItem?
 
-        init(store: AppStore) {
+        init(store: AppStore, pane: EditorPane = .primary) {
             self.store = store
-            self.gutter = store.ideGutter
+            self.pane = pane
+            self.gutter = pane == .split ? store.ideSplitGutter : store.ideGutter
             super.init()
-            store.ideCoordinator = self
+            if pane == .split {
+                store.splitCoordinator = self
+            } else {
+                store.ideCoordinator = self
+            }
             gutter.onModelChange = { [weak self] in
                 guard let self else { return }
                 self.applyDiagnosticUnderlines(text: self.textView?.string ?? "")
@@ -217,6 +242,7 @@ struct CodeEditor: NSViewRepresentable {
             if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
             if let saveObserver { NotificationCenter.default.removeObserver(saveObserver) }
             if let closeObserver { NotificationCenter.default.removeObserver(closeObserver) }
+            if let bufferObserver { NotificationCenter.default.removeObserver(bufferObserver) }
         }
 
         // MARK: - Attach / text pipeline
@@ -228,7 +254,7 @@ struct CodeEditor: NSViewRepresentable {
                 object: sv.contentView,
                 queue: .main
             ) { [weak self] _ in
-                self?.push()
+                MainActor.assumeIsolated { self?.push() }
             }
         }
 
@@ -238,7 +264,7 @@ struct CodeEditor: NSViewRepresentable {
             scheduleLSPChange()
             push()
             onEdited?(textView?.string ?? "")
-            (textView as? SofuuCodeView)?.triggerCompletion()
+            textView?.triggerCompletion()
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -247,23 +273,68 @@ struct CodeEditor: NSViewRepresentable {
 
         /// Hide folded glyphs: mark them .null; the layout (and every LSP
         /// offset) stays intact  only drawing skips.
-        func layoutManager(
+        nonisolated func layoutManager(
             _ layoutManager: NSLayoutManager,
             shouldGenerateGlyphs glyphs: UnsafePointer<CGGlyph>,
-            properties: UnsafeMutablePointer<NSLayoutManager.GlyphProperty>,
+            properties: UnsafePointer<NSLayoutManager.GlyphProperty>,
             characterIndexes: UnsafePointer<Int>,
             font aFont: NSFont,
             forGlyphRange glyphRange: NSRange
         ) -> Int {
-            guard !hiddenRanges.isEmpty else { return 0 }
-            var touched = false
-            for i in 0..<glyphRange.length {
-                if hiddenRanges.contains(where: { NSLocationInRange(characterIndexes[i], $0) }) {
-                    properties[i].insert(.null)
-                    touched = true
+            // AppKit calls layout on the main thread; the delegate
+            // requirement itself is nonisolated, so the witness has to be
+            // too (the "nearly matches" trap).
+            MainActor.assumeIsolated {
+                guard !hiddenRanges.isEmpty else { return 0 }
+                // The SDK imports the property buffer as UnsafePointer even
+                // though the API contract lets a delegate mutate it; the
+                // memory is the layout manager's, not ours.
+                let props = UnsafeMutablePointer(mutating: properties)
+                var touched = false
+                for i in 0..<glyphRange.length {
+                    if hiddenRanges.contains(where: { NSLocationInRange(characterIndexes[i], $0) }) {
+                        props[i].insert(.null)
+                        touched = true
+                    }
                 }
+                return touched ? glyphRange.length : 0
             }
-            return touched ? glyphRange.length : 0
+        }
+
+        /// Collapse a fully folded line to zero height.
+        ///
+        /// `shouldGenerateGlyphs` only nulls the folded glyphs — the line
+        /// fragments keep their full height, leaving a tall blank block.
+        /// This delegate fires once per line fragment with its first glyph;
+        /// when that character sits inside a hidden range the whole line is
+        /// folded, so the negative spacing removes exactly the proposed
+        /// height and the block truly collapses onto its opening line.
+        /// Document offsets are untouched (LSP, folds and carets keep their
+        /// geometry).
+        nonisolated func layoutManager(
+            _ layoutManager: NSLayoutManager,
+            lineSpacingAfterGlyphAt glyphIndex: Int,
+            withProposedLineFragmentRect rect: NSRect
+        ) -> CGFloat {
+            MainActor.assumeIsolated {
+                guard !hiddenRanges.isEmpty else { return 0 }
+                let charIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
+                let folded = hiddenRanges.contains { NSLocationInRange(charIndex, $0) }
+                return folded ? -rect.height : 0
+            }
+        }
+
+        /// Rebuild glyphs AND layout after a fold change. Glyph
+        /// invalidation alone only updates drawing; the line-spacing
+        /// delegate (height collapse) needs a layout pass, and the text
+        /// view must repaint the vacated area.
+        private func relayoutFolds(textLength: Int) {
+            guard let tv = textView, let lm = tv.layoutManager, let container = tv.textContainer else { return }
+            let full = NSRange(location: 0, length: textLength)
+            lm.invalidateGlyphs(forCharacterRange: full, changeInLength: 0, actualCharacterRange: nil)
+            lm.invalidateLayout(forCharacterRange: full, actualCharacterRange: nil)
+            lm.ensureLayout(for: container)
+            tv.needsDisplay = true
         }
 
         func rebuildLineIndex() {
@@ -316,10 +387,7 @@ struct CodeEditor: NSViewRepresentable {
                     ? NSRange(location: pair.start, length: max(1, pair.end - pair.start))
                     : nil
             }
-            if let tv = textView, let lm = tv.layoutManager {
-                lm.invalidateGlyphs(forCharacterRange: NSRange(location: 0, length: textLength),
-                                    changeInLength: 0, actualCharacterRange: nil)
-            }
+            relayoutFolds(textLength: textLength)
             publishFoldLines()
     }
 
@@ -341,30 +409,24 @@ struct CodeEditor: NSViewRepresentable {
             } else {
                 foldedStarts.insert(pair.start)
             }
-            if let tv = textView, let lm = tv.layoutManager {
-                lm.invalidateGlyphs(forCharacterRange: NSRange(location: 0, length: tv.string.utf16.count),
-                                    changeInLength: 0, actualCharacterRange: nil)
-            }
             hiddenRanges = foldablePairs.compactMap { p in
                 foldedStarts.contains(p.start)
                     ? NSRange(location: p.start, length: max(1, p.end - p.start))
                     : nil
             }
+            relayoutFolds(textLength: textView?.string.utf16.count ?? 0)
             publishFoldLines()
             push()
         }
 
         func collapseAllFolds() {
             foldedStarts = Set(foldablePairs.map(\.0))
-            if let tv = textView, let lm = tv.layoutManager {
-                lm.invalidateGlyphs(forCharacterRange: NSRange(location: 0, length: tv.string.utf16.count),
-                                    changeInLength: 0, actualCharacterRange: nil)
-            }
             hiddenRanges = foldablePairs.compactMap { p in
                 foldedStarts.contains(p.start)
                     ? NSRange(location: p.start, length: max(1, p.end - p.start))
                     : nil
             }
+            relayoutFolds(textLength: textView?.string.utf16.count ?? 0)
             publishFoldLines()
             push()
         }
@@ -372,10 +434,7 @@ struct CodeEditor: NSViewRepresentable {
         func expandAllFolds() {
             foldedStarts = []
             hiddenRanges = []
-            if let tv = textView, let lm = tv.layoutManager {
-                lm.invalidateGlyphs(forCharacterRange: NSRange(location: 0, length: tv.string.utf16.count),
-                                    changeInLength: 0, actualCharacterRange: nil)
-            }
+            relayoutFolds(textLength: textView?.string.utf16.count ?? 0)
             publishFoldLines()
             push()
         }
@@ -412,7 +471,6 @@ struct CodeEditor: NSViewRepresentable {
         func lexerHighlight(text: String, language: Language) {
             highlightWork?.cancel()
             let dark = isDark
-            let diags = gutter.diagnostics[path ?? ""] ?? []
             let work = DispatchWorkItem { [weak self] in
                 let lexed = Lexer.lex(text, language: language)
                 DispatchQueue.main.async { [weak self] in
@@ -455,6 +513,14 @@ struct CodeEditor: NSViewRepresentable {
         // MARK: - LSP lifecycle
 
         func syncLSPDocument(path: String, text: String, language: Language) {
+            // One client owns a (language, root) pair; the split pane reads
+            // the same buffers, so letting it sync too would double every
+            // didOpen/didChange (and closing the split could close a doc the
+            // primary still needs). Primary owns LSP; split is syntax-only.
+            guard pane == .primary else {
+                gutter.lspStatus = "Split view"
+                return
+            }
             let root = store.state.projectDir
                 ?? URL(fileURLWithPath: path).deletingLastPathComponent().path
             // One server per language: a tab switch between languages must
@@ -556,21 +622,51 @@ struct CodeEditor: NSViewRepresentable {
                 forName: Notification.Name("IDEFileContentSaved"),
                 object: nil, queue: .main
             ) { [weak self] note in
-                guard let savedPath = note.object as? String, savedPath == self?.path else { return }
-                self?.lsp?.didSave(path: savedPath)
+                MainActor.assumeIsolated {
+                    guard let savedPath = note.object as? String, savedPath == self?.path else { return }
+                    self?.lsp?.didSave(path: savedPath)
+                }
             }
             closeObserver = NotificationCenter.default.addObserver(
                 forName: Notification.Name("IDEDocumentClosed"),
                 object: nil, queue: .main
             ) { [weak self] note in
-                guard let closedPath = note.object as? String else { return }
-                self?.lsp?.didClose(path: closedPath)
-                self?.gutter.diagnostics[closedPath] = nil
+                MainActor.assumeIsolated {
+                    guard let closedPath = note.object as? String else { return }
+                    self?.lsp?.didClose(path: closedPath)
+                    self?.gutter.diagnostics[closedPath] = nil
+                }
+            }
+            // The split pane shares the buffer with the primary pane, so
+            // keystrokes never re-render the shell (the fileBuffers design).
+            // This is the surgical sync: the pane that is NOT editing pulls
+            // the new text; the focused pane already has it.
+            bufferObserver = NotificationCenter.default.addObserver(
+                forName: Notification.Name("IDEBufferChanged"),
+                object: nil, queue: .main
+            ) { [weak self] note in
+                MainActor.assumeIsolated {
+                    guard let self, let changedPath = note.object as? String,
+                          changedPath == self.path,
+                          let tv = self.textView,
+                          tv.window?.firstResponder !== tv else { return }
+                    let text = self.store.buffer(changedPath)
+                    guard tv.string != text else { return }
+                    let selection = tv.selectedRange()
+                    tv.string = text
+                    self.rebuildLineIndex()
+                    self.lexerHighlight(text: text, language: self.language)
+                    self.syncLSPDocument(path: changedPath, text: text, language: self.language)
+                    self.push()
+                    tv.setSelectedRange(NSRange(
+                        location: min(selection.location, (text as NSString).length),
+                        length: 0))
+                }
             }
         }
 
         private var runningLSP: Bool {
-            guard let path else { return false }
+            guard pane == .primary, let path else { return false }
             let language = Languages.language(forPath: path)
             let root = store.state.projectDir
                 ?? URL(fileURLWithPath: path).deletingLastPathComponent().path
@@ -604,7 +700,10 @@ struct CodeEditor: NSViewRepresentable {
         }
 
         private func ideRecordCursor(line: Int, column: Int) {
-            guard let path, let view = textView, view.window?.firstResponder === view else { return }
+            // Cursor/status publishing is primary-only: two panes must not
+            // fight over one persisted readout.
+            guard pane == .primary, let path, let view = textView,
+                  view.window?.firstResponder === view else { return }
             store.ideRecordCursor(path, line: line, column: column)
         }
 
@@ -641,7 +740,7 @@ struct CodeEditor: NSViewRepresentable {
             completionWork?.cancel()
             let work = DispatchWorkItem { [weak self] in
                 guard let self, let tv = self.textView else { return }
-                let rect = (tv as? SofuuCodeView)?.screenRect(at: location) ?? .zero
+                let rect = tv.screenRect(at: location)
                 if let lsp = self.lsp, let path = self.path {
                     self.flushLSPChangeNow()
                     lsp.completion(path: path, line: line - 1, character: column - 1, text: tv.string) { items in
@@ -1182,7 +1281,7 @@ struct LineGutter: View {
 
     private func handleTap(at point: CGPoint) {
         guard let coordinator else { return }
-        guard !pulse.foldLines.isEmpty, let tv = coordinator.textView else { return }
+        guard !pulse.foldLines.isEmpty, coordinator.textView != nil else { return }
         let scrollY = coordinator.scrollView?.contentView.bounds.origin.y ?? 0
         let step = coordinator.lineStep ?? 13.0
         guard step > 0 else { return }

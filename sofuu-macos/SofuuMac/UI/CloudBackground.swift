@@ -188,8 +188,14 @@ private struct TileCloud: View {
         }
         .task(id: dark) {
             let n = tileSize
-            let baked = await Task.detached(priority: .userInitiated) { bakeCloudTile(n, dark) }.value
-            tile = baked
+            // NSImage is only Sendable on macOS 14+, but the app targets
+            // 13 — carry it across the detached boundary in a box the
+            // compiler accepts. The image is produced on one background
+            // thread and only read on the main thread afterwards.
+            let baked = await Task.detached(priority: .userInitiated) {
+                BakedCloudTile(image: bakeCloudTile(n, dark))
+            }.value
+            tile = baked.image
         }
     }
 
@@ -235,6 +241,10 @@ private struct TileCloud: View {
 ///
 /// The palette, weights and alpha curve are unchanged from Android, so the
 /// tile still reads as the same cloud — only the grid is gone.
+private struct BakedCloudTile: @unchecked Sendable {
+    let image: NSImage?
+}
+
 private func bakeCloudTile(_ n: Int, _ dark: Bool) -> NSImage? {
     let gap: SIMD3<Float>  = dark ? SIMD3(0x21, 0x1E, 0x1A) / 255 : SIMD3(0xDC, 0xEC, 0xFD) / 255
     let mid: SIMD3<Float>  = dark ? SIMD3(0x32, 0x2D, 0x26) / 255 : SIMD3(0xA9, 0xCC, 0xF1) / 255

@@ -35,6 +35,9 @@ final class AppStore: ObservableObject {
     /// signal means nothing on the desktop).
     var foreground = true
 
+    /// One automatic engine restart per pump-stall episode (no loops).
+    private var pumpAutoRecoveryUsed = false
+
     // ── TUI-style streaming state (chat.rs parity) ───────────────────
     /// Spinner frames — chat.js SPINNER, verbatim.
     private let spinnerFrames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -117,9 +120,11 @@ final class AppStore: ObservableObject {
         NotificationCenter.default.addObserver(
             forName: Notification.Name("IDEReloadPath"), object: nil, queue: .main
         ) { [weak self] note in
-            guard let self, let path = note.object as? String,
-                  self.state.openTabs.contains(path), !self.isDirty(path) else { return }
-            self.reloadIfChanged(path)
+            MainActor.assumeIsolated {
+                guard let self, let path = note.object as? String,
+                      self.state.openTabs.contains(path), !self.isDirty(path) else { return }
+                self.reloadIfChanged(path)
+            }
         }
     }
 
@@ -148,6 +153,13 @@ final class AppStore: ObservableObject {
         state.liveThink = ""
         state.engineReady = false
         engine.start()
+    }
+
+    /// A human-requested restart re-arms the watchdog's one-shot recovery,
+    /// so a stall after a manual reboot still gets its automatic retry.
+    func restartEngineManually() {
+        pumpAutoRecoveryUsed = false
+        restartEngineForEnv()
     }
 
     // ── Engine event reducer ─────────────────────────────────────────
@@ -288,7 +300,7 @@ final class AppStore: ObservableObject {
     /// Patches by the streaming message's id first — after a mid-stream
     /// view switch the bubble lives in a session cache, not `messages`.
     private func finalizeTurn(error: String?, usage: Usage?) {
-        if let id = streamMessageId {
+        if streamMessageId != nil {
             patchStream { $0.status = error == nil ? "done" : "error" }
             if let error {
                 patchStream { $0.error = error }
@@ -1282,6 +1294,11 @@ final class AppStore: ObservableObject {
     /// The live editor coordinator — the gutter Canvas reads the text
     /// view's fresh geometry from it at draw time.
     weak var ideCoordinator: CodeEditor.Coordinator?
+    /// The split pane's own HUD and coordinator. Separate instances are
+    /// what keep the two viewports' folds, diagnostics and cursor readouts
+    /// independent; the file buffers stay shared.
+    let ideSplitGutter = GutterModel()
+    weak var splitCoordinator: CodeEditor.Coordinator?
 
     /// path → current editor text (live binding for the code viewport).
     var fileBuffers: [String: String] = [:]
@@ -1300,6 +1317,44 @@ final class AppStore: ObservableObject {
         if state.ideMode { return }
         uiPrefs.ideMode = true
         state.ideMode = true
+    }
+
+    // ── Split editor (⌘\) ──────────────────────────────────────────────
+
+    /// Toggle the second pane. The split opens on the active tab; with no
+    /// tab open there is nothing to mirror.
+    func toggleSplit() {
+        if state.splitEnabled {
+            closeSplit()
+            return
+        }
+        guard let path = state.activeTab else {
+            systemRow(L10n.t("split.noFile"))
+            return
+        }
+        state.splitTab = path
+        state.splitEnabled = true
+    }
+
+    /// Open (or focus) `path` in the split pane, enabling the split if it
+    /// is closed. Used by the tab context menu. Opening a file that is not
+    /// yet a tab must not steal the primary pane: the pre-existing active
+    /// tab is restored after openFile's activation.
+    func openInSplit(_ path: String) {
+        let primary = state.activeTab
+        if !state.openTabs.contains(path) {
+            openFile(path)
+        }
+        if let primary, primary != path {
+            state.activeTab = primary
+        }
+        state.splitTab = path
+        state.splitEnabled = true
+    }
+
+    func closeSplit() {
+        state.splitEnabled = false
+        state.splitTab = nil
     }
 
     // ── Platform intake (Finder/Open-with • sofuu:// • Services) ──────
@@ -1445,6 +1500,7 @@ final class AppStore: ObservableObject {
         // The server needs to drop the document too (no stale diagnostics
         // for a closed file).
         NotificationCenter.default.post(name: .init("IDEDocumentClosed"), object: path)
+        if state.splitTab == path { closeSplit() }
         if state.activeTab == path {
             state.activeTab = state.openTabs.last
         }
@@ -1461,11 +1517,13 @@ final class AppStore: ObservableObject {
     func updateBuffer(_ path: String, _ text: String) {
         fileBuffers[path] = text
         // Only publish when the dirty FLAG flips — a per-keystroke write
-        // would re-render the whole shell on every character.
+        // would re-render the whole shell on every character. The split
+        // pane listens for this notification instead.
         let dirty = text != diskContents[path]
         if state.tabDirty[path] != dirty {
             state.tabDirty[path] = dirty
         }
+        NotificationCenter.default.post(name: .init("IDEBufferChanged"), object: path)
     }
 
     func buffer(_ path: String) -> String { fileBuffers[path] ?? "" }
@@ -1629,6 +1687,7 @@ final class AppStore: ObservableObject {
         state.tabDirty = [:]
         fileBuffers = [:]
         diskContents = [:]
+        closeSplit()
     }
 
     /// ⌘S — save the active tab; failures surface as a system row.
@@ -1773,6 +1832,9 @@ final class AppStore: ObservableObject {
         state.openTabs = state.openTabs.map(remap)
         if let active = state.activeTab {
             state.activeTab = remap(active)
+        }
+        if let split = state.splitTab {
+            state.splitTab = remap(split)
         }
         for (p, v) in fileBuffers where remap(p) != p {
             fileBuffers[remap(p)] = v
@@ -2192,14 +2254,81 @@ final class AppStore: ObservableObject {
         }
     }
 
-    /// Stage relative paths. Untracked files included — the panel only
-    /// offers whole-file staging, the TUI's `git add` level.
+    /// Stage relative paths. Untracked files included — the whole-file
+    /// level (`git add`); the panel also offers per-hunk staging below.
     func gitStage(_ relatives: [String]) {
         runGitAction(["add", "--"] + relatives, failurePrefix: "git add failed")
     }
 
     func gitUnstage(_ relatives: [String]) {
         runGitAction(["restore", "--staged", "--"] + relatives, failurePrefix: "git restore failed")
+    }
+
+    // ── Hunk-level staging ─────────────────────────────────────────────
+
+    /// Load this file's hunks for the panel's expanded row.
+    /// `staged: true` reads the index-vs-HEAD diff (for unstaging).
+    func gitLoadHunks(_ relative: String, staged: Bool, completion: @escaping ([GitHunk]) -> Void) {
+        guard let root = state.projectDir else { completion([]); return }
+        DispatchQueue.global(qos: .utility).async {
+            let text = staged
+                ? GitMonitor.stagedDiff(root: root, relativePath: relative)
+                : GitMonitor.worktreeDiff(root: root, relativePath: relative)
+            let hunks = text.map { GitMonitor.parseDiff($0).hunks } ?? []
+            DispatchQueue.main.async { completion(hunks) }
+        }
+    }
+
+    /// Apply one hunk to the index. `staged: false` stages from the
+    /// worktree; `staged: true` reverses a hunk out of the index. The
+    /// diff is re-read at apply time, so a stale row can never apply a
+    /// patch whose context has moved.
+    func gitApplyHunk(_ relative: String, hunkIndex: Int, hunkHeader: String? = nil, staged: Bool,
+                      onDone: ((Bool, String) -> Void)? = nil) {
+        guard let root = state.projectDir else {
+            onDone?(false, "No workspace open")
+            return
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let text = staged
+                ? GitMonitor.stagedDiff(root: root, relativePath: relative)
+                : GitMonitor.worktreeDiff(root: root, relativePath: relative)
+            guard let text else {
+                DispatchQueue.main.async {
+                    self?.systemRow("That hunk is no longer in the diff — refresh and try again.")
+                    self?.refreshGitStatus(force: true)
+                    onDone?(false, "hunk no longer present")
+                }
+                return
+            }
+            let diff = GitMonitor.parseDiff(text)
+            guard let hunk = diff.hunks.first(where: {
+                $0.index == hunkIndex && (hunkHeader == nil || $0.header == hunkHeader)
+            }), let patch = GitMonitor.hunkPatch(diff, hunk) else {
+                DispatchQueue.main.async {
+                    self?.systemRow("That hunk is no longer in the diff — refresh and try again.")
+                    self?.refreshGitStatus(force: true)
+                    onDone?(false, "hunk no longer present")
+                }
+                return
+            }
+            let (ok, output) = GitMonitor.applyPatch(root: root, patch: patch, reverse: staged)
+            DispatchQueue.main.async {
+                if !ok { self?.systemRow("git apply failed: \(output)") }
+                self?.refreshGitStatus(force: true)
+                onDone?(ok, output)
+            }
+        }
+    }
+
+    func gitStageHunk(_ relative: String, hunkIndex: Int, hunkHeader: String? = nil,
+                      onDone: ((Bool, String) -> Void)? = nil) {
+        gitApplyHunk(relative, hunkIndex: hunkIndex, hunkHeader: hunkHeader, staged: false, onDone: onDone)
+    }
+
+    func gitUnstageHunk(_ relative: String, hunkIndex: Int, hunkHeader: String? = nil,
+                        onDone: ((Bool, String) -> Void)? = nil) {
+        gitApplyHunk(relative, hunkIndex: hunkIndex, hunkHeader: hunkHeader, staged: true, onDone: onDone)
     }
 
     /// Commit what the index holds right now. Refuses an empty message
@@ -2225,18 +2354,32 @@ final class AppStore: ObservableObject {
     // ── Engine watch / version ─────────────────────────────────────────
 
     /// 10 s watchdog: surface a wedged or exited engine pump instead of
-    /// dying silently. Auto-clears when the pump ticks again (or a fresh
-    /// restartEngineForEnv() boots a new one).
+    /// dying silently. One automatic restart per stall episode; if the
+    /// fresh pump stalls again the banner stays and the human decides
+    /// (Session ▸ Restart Engine). The flag re-arms as soon as the pump
+    /// ticks healthy again, so a later unrelated stall still recovers.
     func checkPumpHealth() {
         let age = engine.pumpAge
         if age > 8 {
+            let detail = age.isFinite ? "\(Int(age))s idle" : "thread exited"
             if state.enginePumpStall == nil {
-                let detail = age.isFinite ? "\(Int(age))s idle" : "thread exited"
-                state.enginePumpStall = "Engine pump stalled (\(detail)) — turns may not respond. Session ▸ Restart Engine reboots it."
+                state.enginePumpStall = "Engine pump stalled (\(detail)) — restarting it…"
                 NSLog("[sofuu-engine] pump stalled: \(detail)")
             }
-        } else if state.enginePumpStall != nil {
-            state.enginePumpStall = nil
+            // Only recover an engine that was healthy at least once: a slow
+            // first boot (rt_new + chat.init) would otherwise be killed
+            // before the pump loop ever starts. Boot failures surface via
+            // bootError instead.
+            guard state.engineReady, !pumpAutoRecoveryUsed else { return }
+            pumpAutoRecoveryUsed = true
+            NSLog("[sofuu-engine] auto-restarting after stall")
+            restartEngineForEnv()
+            state.enginePumpStall = "Engine stalled — it was restarted automatically. If it stalls again, use Session ▸ Restart Engine."
+        } else {
+            if state.enginePumpStall != nil {
+                state.enginePumpStall = nil
+            }
+            pumpAutoRecoveryUsed = false
         }
     }
 
@@ -2264,7 +2407,7 @@ final class AppStore: ObservableObject {
         guard let root = state.projectDir else { return }
         let rel = path.hasPrefix(root + "/") ? String(path.dropFirst(root.count + 1)) : path
         let kind = state.gitStatus[path]
-        DispatchQueue.global(qos: .utility).async { [weak self] in
+        DispatchQueue.global(qos: .utility).async {
             let old = (kind != .untracked) ? GitMonitor.headText(root: root, relativePath: rel) : ""
             let new = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
             DispatchQueue.main.async {

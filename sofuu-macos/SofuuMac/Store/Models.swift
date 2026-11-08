@@ -75,6 +75,11 @@ struct AppState {
     var sidebarCollapsed = false
     // ── IDE mode: file tree | tabbed code viewport | agent panel ────
     var ideMode = false
+    /// Split editor: a second writeable pane beside the active tab.
+    /// Ephemeral per launch by design (tab/cursor state persists, the
+    /// split itself does not).
+    var splitEnabled = false
+    var splitTab: String?
     var openTabs: [String] = []          // absolute file paths, in tab order
     var activeTab: String?
     var tabDirty: [String: Bool] = [:]   // edited vs on-disk per open path

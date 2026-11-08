@@ -141,18 +141,39 @@ pub fn ingest_one(api_root: &str, model_id: &str, entry: &serde_json::Value) -> 
     }
     let obj = entry.as_object().unwrap();
 
-    // Context window: context_length | context_window | ctx_window | ctx
-    let ctx = ["context_length", "context_window", "ctx_window", "ctx"]
+    // Context window: context_length | context_window | ctx_window | ctx | n_ctx | max_context_length
+    // Checked direct fields first, then nested meta object (llama.cpp format: {"meta":{"n_ctx": 8192}}).
+    let ctx = ["context_length", "context_window", "ctx_window", "ctx", "n_ctx", "max_context_length"]
         .iter()
         .find_map(|k| obj.get(*k).and_then(int_field))
-        .filter(|v| *v > 0);
+        .filter(|v| *v > 0)
+        .or_else(|| {
+            obj.get("meta").and_then(|m| {
+                m.as_object().and_then(|mo| {
+                    ["n_ctx", "context_length", "context_window", "ctx_window", "ctx"]
+                        .iter()
+                        .find_map(|k| mo.get(*k).and_then(int_field))
+                        .filter(|v| *v > 0)
+                })
+            })
+        });
 
-    // Max output — direct fields first, then nested top_provider/
+    // Max output — direct fields first, then nested meta, top_provider,
     // per_request_limits objects (OpenRouter-style listings nest them).
     let max_out = ["max_completion_tokens", "max_tokens", "max_output_tokens"]
         .iter()
         .find_map(|k| obj.get(*k).and_then(int_field))
         .filter(|v| *v > 0)
+        .or_else(|| {
+            obj.get("meta").and_then(|m| {
+                m.as_object().and_then(|mo| {
+                    ["max_completion_tokens", "max_tokens", "max_output_tokens"]
+                        .iter()
+                        .find_map(|k| mo.get(*k).and_then(int_field))
+                        .filter(|v| *v > 0)
+                })
+            })
+        })
         .or_else(|| {
             ["top_provider", "per_request_limits"]
                 .iter()

@@ -143,30 +143,15 @@ struct IdeLayout: View {
         ZStack(alignment: .center) {
             c.bgRaised.ignoresSafeArea()
             if let path = store.state.activeTab, store.state.openTabs.contains(path) {
-                HStack(spacing: 0) {
-                    // The gutter renders even before the coordinator exists
-                    // (first-pass ordering) and fills in on its first pulse.
-                    LineGutter(pulse: store.ideGutter, coordinator: store.ideCoordinator)
-                        .frame(width: CodeEditor.gutterWidth)
-                    ZStack(alignment: .topLeading) {
-                    if store.indentGuidesOn {
-                        IndentGuidesCanvas(pulse: store.ideGutter, coordinator: store.ideCoordinator, store: store)
-                            .allowsHitTesting(false)
+                if store.state.splitEnabled, let splitPath = store.state.splitTab,
+                   store.state.openTabs.contains(splitPath) {
+                    HStack(spacing: 0) {
+                        editorPane(path: path, pane: .primary)
+                        Rectangle().fill(c.separator).frame(width: 1)
+                        editorPane(path: splitPath, pane: .split)
                     }
-                    CodeEditor(
-                        text: Binding(
-                            get: { store.buffer(path) },
-                            set: { store.updateBuffer(path, $0) }),
-                        path: path,
-                        dark: scheme == .dark,
-                        store: store,
-                        editable: !store.state.readOnlyTabs.contains(path),
-                        onEdited: { text in
-                            store.updateBuffer(path, text)
-                            store.scheduleAutoSave(path)
-                        })
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    }
+                } else {
+                    editorPane(path: path, pane: .primary)
                 }
             } else {
                 Text(store.state.openTabs.isEmpty
@@ -177,6 +162,40 @@ struct IdeLayout: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// One editor viewport (gutter + indent guides + code view). The two
+    /// panes share the file buffer and auto-save; their HUDs/coordinators
+    /// are separate so folds, scroll and caret never bleed across.
+    private func editorPane(path: String, pane: EditorPane) -> some View {
+        let hud = pane == .split ? store.ideSplitGutter : store.ideGutter
+        let coordinator = pane == .split ? store.splitCoordinator : store.ideCoordinator
+        return HStack(spacing: 0) {
+            // The gutter renders even before the coordinator exists
+            // (first-pass ordering) and fills in on its first pulse.
+            LineGutter(pulse: hud, coordinator: coordinator)
+                .frame(width: CodeEditor.gutterWidth)
+            ZStack(alignment: .topLeading) {
+                if store.indentGuidesOn {
+                    IndentGuidesCanvas(pulse: hud, coordinator: coordinator, store: store)
+                        .allowsHitTesting(false)
+                }
+                CodeEditor(
+                    text: Binding(
+                        get: { store.buffer(path) },
+                        set: { store.updateBuffer(path, $0) }),
+                    path: path,
+                    dark: scheme == .dark,
+                    store: store,
+                    editable: !store.state.readOnlyTabs.contains(path),
+                    onEdited: { text in
+                        store.updateBuffer(path, text)
+                        store.scheduleAutoSave(path)
+                    },
+                    pane: pane)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
     }
 
     private var tabStrip: some View {
@@ -199,6 +218,24 @@ struct IdeLayout: View {
             }
 
             Spacer(minLength: 4)
+
+            // Split editor (⌘\): a second writeable pane beside the active
+            // tab, shown only while a file is open.
+            if store.state.activeTab != nil {
+                Button {
+                    store.toggleSplit()
+                } label: {
+                    Image(systemName: store.state.splitEnabled
+                            ? "rectangle.split.2x1.fill" : "rectangle.split.2x1")
+                        .font(.system(size: 12))
+                        .foregroundStyle(store.state.splitEnabled ? c.accent : c.textFaint)
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("\(L10n.t("menu.splitEditor")) (⌘\\)")
+                .padding(.trailing, 2)
+            }
 
             // Auto save: writes the buffer 0.8 s after the last edit.
             Button {
@@ -470,6 +507,12 @@ private struct EditorTab: View {
             store.setActiveTab(path)
         }
         .help(path)
+        .contextMenu {
+            Button(L10n.t("split.open")) { store.openInSplit(path) }
+            if store.state.splitTab == path && store.state.splitEnabled {
+                Button(L10n.t("split.close")) { store.closeSplit() }
+            }
+        }
     }
 }
 

@@ -162,7 +162,7 @@ struct Composer: View {
             // A mid-recording composer teardown (mode switch, settings
             // page) must not leak a running audio engine.
             if recorder != nil {
-                recorder?.stop()
+                _ = recorder?.stop()
                 recorder = nil
                 recordingSince = nil
                 transcribing = false
@@ -453,7 +453,7 @@ struct Composer: View {
 
     private func insertNewlineAtCursor() {
         if let tv = NSApp.keyWindow?.firstResponder as? NSTextView {
-            tv.insertText("\n")
+            tv.insertText("\n", replacementRange: tv.selectedRange())
         }
     }
 }

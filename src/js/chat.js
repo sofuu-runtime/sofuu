@@ -468,6 +468,11 @@
       }
     }
     var budget = ctxBudget();
+    var hTk = historyTokens();
+    var cLocal = cfg();
+    var isLoc = cLocal.provider === 'local' || cLocal.provider === 'ollama' || cLocal.provider === 'llamacpp';
+    var toolsTk = S.mcpTools.length ? estTok(JSON.stringify(chatToolDefs(isLoc || resolveCaps().window <= 16384))) : 0;
+    var totalEst = hTk + toolsTk;
     /* P2-5 (AUDIT-2026-09-01): ported the TUI's ML compaction machinery —
      * this driver used a fixed 0.70 cliff + no ML pass, so long embedded
      * sessions compacted earlier and lost strictly more context than the
@@ -574,8 +579,8 @@
         }
       } catch (eMlC) { /* gate advises — failure falls through to the cliff */ }
     }
-    if (!S.autoCompactArmed && historyTokens() < budget * 0.5) S.autoCompactArmed = true;
-    if (S.autoCompactArmed && historyTokens() > budget * compactAt && S.history.length > 2) {
+    if (!S.autoCompactArmed && totalEst < budget * 0.5) S.autoCompactArmed = true;
+    if (S.autoCompactArmed && totalEst > budget * compactAt && S.history.length > 2) {
       S.autoCompactArmed = false;
       var savedTk = historyTokens();
       /* Compact lifecycle for live UIs: start before the summarizer runs
@@ -595,7 +600,7 @@
     /* Drop-oldest guard: still over budget after compaction (or it failed).
      * Whole turn blocks only — an orphaned tool message 400s at the provider. */
     var dropped = 0;
-    while (S.history.length > 0 && historyTokens() > budget) {
+    while (S.history.length > 0 && (historyTokens() + toolsTk) > budget) {
       /* never drop the LAST block (the newest turn) */
       var lastStart = turnStartAt(S.history.length - 1);
       if (lastStart === 0) break;
@@ -898,11 +903,32 @@
     return { ok: true };
   }
 
+  function compactParamSchema(schema) {
+    if (!schema || typeof schema !== 'object') return { type: 'object', properties: {} };
+    var origProps = schema.properties || {};
+    var compactProps = {};
+    for (var k in origProps) {
+      if (!Object.prototype.hasOwnProperty.call(origProps, k)) continue;
+      var p = origProps[k];
+      if (!p || typeof p !== 'object') continue;
+      var desc = String(p.description || '').split(/[\r\n.]/)[0].trim();
+      compactProps[k] = {
+        type: p.type || 'string',
+        description: desc.length > 80 ? desc.slice(0, 77) + '…' : desc,
+      };
+    }
+    return {
+      type: 'object',
+      properties: compactProps,
+      required: Array.isArray(schema.required) ? schema.required : undefined,
+    };
+  }
+
   /* Tool set handed to sofuu.agent.run each turn (ported from the
    * DRIVER's chatToolDefs + the permission gate): built-in web tools +
    * coding tools + MCP tools as inline specs. Inline/builtin wins a name
    * clash with a visible warn. */
-  function chatToolDefs() {
+  function chatToolDefs(isTight) {
     var defs = [];
     var names = {};
     if (sofuu.web && sofuu.web.TOOLS) {
@@ -932,10 +958,17 @@
                ' (' + mt.server + ') shadowed by a built-in tool' } });
         continue;
       }
+      var desc = mt.description || ('MCP tool from ' + mt.server);
+      var schema = mt.schema || { type: 'object', properties: {} };
+      if (isTight) {
+        var firstLine = desc.split(/[\r\n.]/)[0].trim();
+        desc = firstLine.length > 130 ? firstLine.slice(0, 127) + '…' : firstLine;
+        schema = compactParamSchema(schema);
+      }
       defs.push(gateTool({
         name: mt.name,
-        description: mt.description || ('MCP tool from ' + mt.server),
-        parameters: mt.schema || { type: 'object', properties: {} },
+        description: desc,
+        parameters: schema,
         execute: (function (toolName) {
           return function (args) { return callMcpTool(toolName, args); };
         })(mt.name),
@@ -949,10 +982,17 @@
         if (names[pk]) continue;
         var pt = sofuu.plugins.TOOLS[pk];
         if (!pt) continue;
+        var pDesc = pt.description || ('Plugin tool ' + pt.name);
+        var pSchema = pt.parameters || pt.schema || { type: 'object', properties: {} };
+        if (isTight) {
+          var pFirstLine = pDesc.split(/[\r\n.]/)[0].trim();
+          pDesc = pFirstLine.length > 130 ? pFirstLine.slice(0, 127) + '…' : pFirstLine;
+          pSchema = compactParamSchema(pSchema);
+        }
         defs.push(gateTool({
           name: pt.name,
-          description: pt.description || ('Plugin tool ' + pt.name),
-          parameters: pt.parameters || pt.schema || { type: 'object', properties: {} },
+          description: pDesc,
+          parameters: pSchema,
           execute: (function (toolObj) {
             return function (args, ctx) { return toolObj.execute(args, ctx); };
           })(pt),
@@ -1697,13 +1737,21 @@
     var noThink = !!forceNoThink ||
       (c.no_think_models || []).indexOf(c.model) >= 0 ||
       S.noThink.indexOf(c.model) >= 0;
+    var isLocal = c.provider === 'local' || c.provider === 'ollama' || c.provider === 'llamacpp';
+    var isTight = isLocal || resolveCaps().window <= 16384;
+    var turnTools = noTools ? [] : chatToolDefs(isTight);
+    var turnSys = isLocal
+      ? ((turnTools && turnTools.length)
+          ? 'You are a helpful AI assistant. When tools are provided, you MUST execute the appropriate tool call to fulfill the user request. Do not describe or list the tools — call them directly.'
+          : 'You are a helpful AI assistant.')
+      : sofuu.agent.CORE_PROMPT;
     var def = {
       name: 'chat',
-      preset: 'coding',
-      system: sofuu.agent.CORE_PROMPT,
+      preset: isLocal ? undefined : 'coding',
+      system: turnSys,
       /* "Just chat" mode: an empty toolset makes the run a pure
        * conversation turn (no tool loop, no approvals). */
-      tools: noTools ? [] : chatToolDefs(),
+      tools: turnTools,
       agents: subAgentNames.length ? subAgentNames : undefined,
       provider: c.provider, model: c.model,
       effort: noThink ? undefined : (c.effort && c.effort !== 'off' ? c.effort : undefined),
@@ -2018,7 +2066,6 @@
     try {
       var c = cfg();
       if (!c.model || !c.base_url) return;
-      if (isLocalHost(c.base_url)) return;
       if (Date.now() - capsDiscoveredAt < DISCOVER_TTL_MS) return capsHarvest;
       /* P3 (AUDIT-2026-09-07): the full TTL used to be stamped BEFORE the
        * harvest, so a fully failed run (network down, 401s) was cached for
@@ -2090,12 +2137,6 @@
                 window: 0, source: '', ingested: 0, listing: false, reason: '' };
     try {
       if (!c.model || !c.base_url) { res.reason = 'no model/endpoint configured'; return Promise.resolve(res); }
-      if (isLocalHost(c.base_url)) {
-        res.window = resolveCaps().window;
-        res.source = 'local-default';
-        res.reason = 'local endpoint — detected from its first response';
-        return Promise.resolve(res);
-      }
       var endpoint = c.base_url;
       var headers = {};
       if (c.api_key) headers['Authorization'] = 'Bearer ' + c.api_key;
@@ -2250,6 +2291,7 @@
             return typeof u === 'string' && u.indexOf('data:image/') === 0;
           }).slice(0, 8)
         : undefined;
+      await trimHistory();
       for (;;) {
         try {
           res = await turn(txt, false, noTools, chain[chainIdx], turnImages);
@@ -2285,6 +2327,23 @@
               break;
             } catch (eNt2) {
               e = eNt2;
+              msg = String((e && e.message) || e);
+            }
+          }
+          var CTX_OVERFLOW_RE = /context.*(?:length|window|size|limit|exceed)|exceed.*(?:context|token)|too many tokens|maximum context/i;
+          if (CTX_OVERFLOW_RE.test(msg) && S.history.length > 0) {
+            allocNoteLimit(cA, msg);
+            emit({ kind: 'warn', payload: { message: 'context limit exceeded (' + clip(msg, 120) + ') — auto-compacting and continuing' } });
+            var compOk = false;
+            try { compOk = !!(await summarizeHistory(0)); } catch (eCH) { /* fallback to drop turn block below */ }
+            if (!compOk && S.history.length > 0) {
+              removeTurnBlock(0);
+            }
+            try {
+              res = await turn(txt, false, noTools, chain[chainIdx], turnImages);
+              break;
+            } catch (eCtxRetry) {
+              e = eCtxRetry;
               msg = String((e && e.message) || e);
             }
           }

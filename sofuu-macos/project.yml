@@ -63,6 +63,12 @@ targets:
         SWIFT_INCLUDE_PATHS: "$(PROJECT_DIR)/engine"
         GENERATE_INFOPLIST_FILE: NO
         COMBINE_HIDPI_IMAGES: YES
+        # Keep the framework's Headers/Modules when embedding. Xcode's
+        # default strip removes them AFTER the engine script ad-hoc signs
+        # the bundle, so the sealed-resource list no longer matches and
+        # `codesign --verify` fails on the embedded framework. The app only
+        # needs the binary, but the seal covers the whole bundle.
+        REMOVE_HEADERS_FROM_EMBEDDED_FRAMEWORKS: NO
         # Explicit arm64: the engine dylib is arm64-only for now.
         ARCHS: arm64
         ONLY_ACTIVE_ARCH: YES
@@ -78,7 +84,11 @@ targets:
       # (default.metallib) rides along inside it.
       - framework: engine/Sofuu.framework
         embed: true
-        codeSign: false
+        # Re-sign on copy: the engine script signs the bundle before Xcode
+        # embeds it, and the embed step (or header stripping) invalidates
+        # that resource seal. Signing on copy produces a seal that matches
+        # the framework as it actually lands in the .app.
+        codeSign: true
 
 schemes:
   SofuuMac:

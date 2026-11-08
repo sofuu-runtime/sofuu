@@ -281,7 +281,7 @@ struct FileTree: View {
                     forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
                     DispatchQueue.main.async {
                         if let data = item as? Data,
-                           let url = try? URL(dataRepresentation: data, relativeTo: nil) {
+                           let url = URL(dataRepresentation: data, relativeTo: nil) {
                             store.ingestExternalFile(url, toFolder: folder)
                         }
                     }

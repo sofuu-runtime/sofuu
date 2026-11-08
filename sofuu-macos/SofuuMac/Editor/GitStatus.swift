@@ -1,6 +1,6 @@
 import Foundation
 
-enum GitStatusKind {
+enum GitStatusKind: Equatable {
     case changed      // M / R / C — differs from HEAD
     case untracked    // ?? — new to git
     case deleted      // D — in HEAD, gone from the tree
@@ -14,6 +14,25 @@ extension GitStatusKind {
         case .deleted: return "D"
         }
     }
+}
+
+/// One hunk of a unified diff: its `@@` header plus the body lines
+/// (leading ' ', '+' or '-'). `index` is its position in the file's diff,
+/// stable for the lifetime of that diff.
+struct GitHunk: Identifiable, Equatable {
+    let index: Int
+    let header: String
+    let lines: [String]
+    var id: Int { index }
+    var added: Int { lines.filter { $0.hasPrefix("+") }.count }
+    var removed: Int { lines.filter { $0.hasPrefix("-") }.count }
+}
+
+/// A single-file unified diff split into the file header (everything before
+/// the first `@@`) and its hunks.
+struct GitDiff: Equatable {
+    var fileHeader: [String]
+    var hunks: [GitHunk]
 }
 
 /// Read-only git working-tree status for the tree's badges. `git status
@@ -89,6 +108,12 @@ enum GitMonitor {
     /// store can surface a real failure instead of guessing.
     @discardableResult
     static func mutate(_ root: String, _ args: [String]) -> (ok: Bool, output: String) {
+        mutate(root, args, stdin: nil)
+    }
+
+    /// `mutate` with a patch on stdin — what hunk staging needs.
+    @discardableResult
+    static func mutate(_ root: String, _ args: [String], stdin: String?) -> (ok: Bool, output: String) {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         proc.arguments = ["-C", root] + args
@@ -96,7 +121,15 @@ enum GitMonitor {
         proc.standardOutput = outPipe
         proc.standardError = errPipe
         do {
-            try proc.run()
+            if let stdin {
+                let inPipe = Pipe()
+                proc.standardInput = inPipe
+                try proc.run()
+                inPipe.fileHandleForWriting.write(stdin.data(using: .utf8) ?? Data())
+                try? inPipe.fileHandleForWriting.close()
+            } else {
+                try proc.run()
+            }
             let data = outPipe.fileHandleForReading.readDataToEndOfFile()
             let err = String(decoding: errPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
             proc.waitUntilExit()
@@ -106,6 +139,87 @@ enum GitMonitor {
         } catch {
             return (false, "\(error)")
         }
+    }
+
+    // ── Hunks (stage/unstage a single hunk) ─────────────────────────
+
+    /// Unstaged diff (worktree vs index) for one path. Empty for an
+    /// untracked file — it has no index entry to diff against.
+    static func worktreeDiff(root: String, relativePath: String) -> String? {
+        diff(root: root, relativePath: relativePath, cached: false)
+    }
+
+    /// Staged diff (index vs HEAD) for one path.
+    static func stagedDiff(root: String, relativePath: String) -> String? {
+        diff(root: root, relativePath: relativePath, cached: true)
+    }
+
+    private static func diff(root: String, relativePath: String, cached: Bool) -> String? {
+        var args = ["-C", root, "diff", "--no-color", "--no-ext-diff", "--unified=3"]
+        if cached { args.append("--cached") }
+        args += ["--", relativePath]
+        let out = run(args)
+        return out.isEmpty ? nil : out
+    }
+
+    /// Split a unified diff into its file header and hunks. Everything
+    /// before the first `@@` is the header the patch needs; each hunk runs
+    /// until the next `@@` (or EOF). Body lines keep their prefix so the
+    /// patch can be reconstructed byte-for-byte.
+    static func parseDiff(_ text: String) -> GitDiff {
+        var fileHeader: [String] = []
+        var hunks: [GitHunk] = []
+        var body: [String] = []
+        var header: String?
+
+        func flush() {
+            guard let header else { return }
+            hunks.append(GitHunk(index: hunks.count, header: header, lines: body))
+            body = []
+        }
+
+        var lines = text.components(separatedBy: "\n")
+        // A trailing newline produces one empty component; drop exactly it.
+        if lines.last == "" { lines.removeLast() }
+        for line in lines {
+            if line.hasPrefix("@@") {
+                flush()
+                header = line
+            } else if header == nil {
+                fileHeader.append(line)
+            } else if line.hasPrefix("diff --git ") {
+                // Belt and braces: one path was requested, but never fold a
+                // second file's header into the previous hunk.
+                flush()
+                header = nil
+                fileHeader.append(line)
+            } else {
+                body.append(line)
+            }
+        }
+        flush()
+        return GitDiff(fileHeader: fileHeader, hunks: hunks)
+    }
+
+    /// Reconstruct a one-hunk patch: the file header plus the selected
+    /// hunk. Nil when there is no header to apply against.
+    static func hunkPatch(_ diff: GitDiff, _ hunk: GitHunk) -> String? {
+        guard !diff.fileHeader.isEmpty else { return nil }
+        var out = diff.fileHeader
+        out.append(hunk.header)
+        out.append(contentsOf: hunk.lines)
+        return out.joined(separator: "\n") + "\n"
+    }
+
+    /// Apply a patch to the index only. Reverse=true takes a staged diff
+    /// and pulls that hunk back out of the index (hunk unstage); the
+    /// worktree is never touched.
+    @discardableResult
+    static func applyPatch(root: String, patch: String, reverse: Bool) -> (ok: Bool, output: String) {
+        var args = ["apply", "--cached", "--recount"]
+        if reverse { args.append("--reverse") }
+        args.append("-")
+        return mutate(root, args, stdin: patch)
     }
 
     private static func run(_ args: [String]) -> String {

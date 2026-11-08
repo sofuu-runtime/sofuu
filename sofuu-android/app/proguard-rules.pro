@@ -37,3 +37,7 @@
 # ── Coroutines ─────────────────────────────────────────────────────
 -dontwarn kotlinx.coroutines.**
 -keepclassmembers class kotlin.Metadata { *; }
+
+# ── Tink / Crypto annotations ──────────────────────────────────────
+-dontwarn com.google.errorprone.annotations.**
+-dontwarn javax.annotation.**

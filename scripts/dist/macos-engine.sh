@@ -98,14 +98,23 @@ TMP="$(mktemp -d)"
 xcrun -sdk macosx metal -c "$REPO_ROOT/src/metal/kernels.metal" \
     -o "$TMP/kernels.air" -std=metal3.0
 xcrun -sdk macosx metallib "$TMP/kernels.air" -o "$FWROOT/Resources/default.metallib"
-rm -rf "$TMP"
+# One strings pass, then grep the file.
+#
+# This used to be `strings "$out" | grep -qx "$fn"` and it reported the
+# FIRST kernel missing on a metallib that contained it. The script runs
+# under set -o pipefail, grep -q exits at the first match, and strings then
+# dies of SIGPIPE (141) — which pipefail reports as the pipeline's status,
+# so a match looked like a failure. ios.sh documents the same trap.
+STRFILE="$TMP/kernels.strings"
+strings "$FWROOT/Resources/default.metallib" > "$STRFILE"
 for fn in gemv_bf16 gemv_f16 gemv_f32 gemv_mlx4_affine_f16 \
           gemv_mlx4_affine_bf16 rmsnorm swiglu conv1d_3; do
-    if ! strings "$FWROOT/Resources/default.metallib" | grep -qx "$fn"; then
+    if ! grep -qx "$fn" "$STRFILE"; then
         echo "  \033[31m✗ default.metallib is missing kernel $fn\033[0m"
         exit 1
     fi
 done
+rm -rf "$TMP"
 
 cat > "$FWROOT/Resources/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

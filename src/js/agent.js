@@ -3631,14 +3631,55 @@
         }
         return t;
       }
+      function toolsEstTk(tls) {
+        if (!tls || !tls.length) return 0;
+        try { return estTok(JSON.stringify(tls)); } catch (eTT) { /* unstringifiable tools add 0 to estimate */ return 0; }
+      }
       function isPlain(m) {
         return !(m.tool_calls && m.tool_calls.length) && !m.tool_call_id && m.role !== 'tool';
       }
+      var toolsTk = toolsEstTk(o.tools);
       var reserve = o.max_tokens > 0 ? o.max_tokens : Math.max(512, Math.floor(win * 0.05));
-      var est = promptTk(msgs);
+      var est = promptTk(msgs) + toolsTk;
       if (est + reserve <= win) return { msgs: msgs, structural: false };
       var out = msgs.slice();
       var actions = [];
+      /* Rung 0 — slim oversized tool schemas if tools dominate the window */
+      if (toolsTk > Math.floor(win * 0.35) && o.tools && o.tools.length) {
+        var slimmedTools = [];
+        for (var sti = 0; sti < o.tools.length; sti++) {
+          var stx = o.tools[sti];
+          var stName = String(stx.name || '');
+          if (PROGRESSIVE_KEEP_FULL[stName]) {
+            slimmedTools.push(stx);
+            continue;
+          }
+          var compactProps = {};
+          var origProps = (stx.parameters && stx.parameters.properties) || {};
+          var reqKeys = (stx.parameters && Array.isArray(stx.parameters.required)) ? stx.parameters.required : [];
+          for (var pk in origProps) {
+            if (!Object.prototype.hasOwnProperty.call(origProps, pk)) continue;
+            var pVal = origProps[pk];
+            compactProps[pk] = {
+              type: (pVal && pVal.type) || 'string',
+              description: clip(String((pVal && pVal.description) || ''), 80),
+            };
+          }
+          slimmedTools.push({
+            name: stx.name,
+            description: clip(String(stx.description || ''), 120),
+            parameters: {
+              type: 'object',
+              properties: compactProps,
+              required: reqKeys,
+            },
+          });
+        }
+        o.tools = slimmedTools;
+        toolsTk = toolsEstTk(o.tools);
+        est = promptTk(msgs) + toolsTk;
+        actions.push('tool schemas compact-slimmed');
+      }
       /* Rung 1 — re-cap tool results (the largest uncontrolled blobs). */
       var cap = allocToolCap();
       for (var r1 = 0; r1 < out.length; r1++) {
@@ -3647,7 +3688,7 @@
           out[r1] = Object.assign({}, m1, { content: capToolResult(cap, m1.content).text });
         }
       }
-      est = promptTk(out);
+      est = promptTk(out) + toolsTk;
       if (est + reserve > win) actions.push('tool results re-capped to ' + cap + ' chars');
       /* Rung 2 — clamp the output reserve to what is actually left. */
       if (est + reserve > win) {
@@ -3692,7 +3733,7 @@
           /* Leave a margin for estimator rounding (estTok ceils per message
            * while providers bill the true count). */
           var margin4 = Math.max(64, Math.floor(win * 0.02));
-          var keepChars = Math.max(200, (win - reserve - margin4) * 4 - Math.max(0, est * 4 - bigLen));
+          var keepChars = Math.max(200, (win - reserve - toolsTk - margin4) * 4 - Math.max(0, promptTk(out) * 4 - bigLen));
           if (keepChars < bigLen) {
             out[big] = Object.assign({}, out[big], {
               content: String(out[big].content).slice(0, Math.floor(keepChars)) +
@@ -3702,7 +3743,7 @@
           }
         }
       }
-      est = promptTk(out);
+      est = promptTk(out) + toolsTk;
       if (est + reserve > win) {
         /* Nothing left to shed — send with the floor reserve; if the
          * provider still rejects, error learning picks up the real limit. */
@@ -4395,9 +4436,10 @@
       }
       var slimNames = {};
       if (progressive) {
+        var allowInlineSlim = toolsCostTk > PROGRESSIVE_TOOL_THRESHOLD_TK * 2;
         for (var sp2 = 0; sp2 < tools.length; sp2++) {
           var sp2n = String(tools[sp2].name || '');
-          if (sp2n && !PROGRESSIVE_KEEP_FULL[sp2n] && !inlineFull[sp2n]) slimNames[sp2n] = 1;
+          if (sp2n && !PROGRESSIVE_KEEP_FULL[sp2n] && (!inlineFull[sp2n] || allowInlineSlim)) slimNames[sp2n] = 1;
         }
         var metaSpec = {
           name: 'tool_schema',
@@ -5650,6 +5692,7 @@
             state.allocRetriedKinds[learnedKind] = true;
             emit('allocgate', { action: 'learned_limit', kind: learnedKind, model: String(d.model || ''),
                                 error: clip(String((eS && eS.message) || eS), 160) });
+            refreshPlan();
             continue;
           }
           /* LONG-HORIZON graceful degradation: a TRANSIENT provider

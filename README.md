@@ -300,6 +300,17 @@ sofuu resume <run_id>          # Resume an interrupted run from its last checkpo
 
 ---
 
+### 6. Continuous Context Persistence & Local Model Reliability
+
+Running multi-step agents against local inference servers (`llama.cpp`, Ollama, vLLM) with MCP tools often breaks on conventional runtimes due to schema token bloat and KV cache limits. Sofuu provides a native continuous context engine for zero-interruption agent loops:
+
+* **Real KV Cache Discovery:** Discovers active `meta.n_ctx` limits directly from local `/v1/models` endpoints, ensuring prompt budgeting aligns with true server KV cache allocation.
+* **90% MCP Schema Slimming:** When context is tight ($\le 16384$ tokens), tool descriptions and parameter schemas are automatically compacted ($\le 130$ and $\le 80$ chars), reducing 24 MCP tools from $\approx 7,500$ tokens to $\approx 720$ tokens without losing argument validation.
+* **Small Model Tool Steering:** Directs local models (0.6B–3B) to execute native tool calls rather than reciting markdown descriptions of available functions.
+* **Proactive Budgeting & Self-Healing:** Preflight budgeting includes tool overhead and live calibration. If an endpoint breaches its context limit (HTTP 400), Sofuu dynamically caches the ceiling limit, auto-compacts earlier history into a distilled memory gist, and retries seamlessly with zero interruption.
+
+---
+
 ## CLI Cheatsheet
 
 ```bash

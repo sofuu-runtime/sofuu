@@ -20,6 +20,7 @@ let SHORTCUTS: [ShortcutDef] = [
     ShortcutDef(group: "Turn", keys: ["⌘", "."], label: "Stop generating"),
     ShortcutDef(group: "Turn", keys: ["⌘", "K"], label: "Compact session context"),
     ShortcutDef(group: "View", keys: ["⌘", "B"], label: "Toggle sidebar"),
+    ShortcutDef(group: "View", keys: ["⌘", "\\"], label: "Split editor"),
     ShortcutDef(group: "View", keys: ["⌘", "+"], label: "Zoom in"),
     ShortcutDef(group: "View", keys: ["⌘", "-"], label: "Zoom out"),
     ShortcutDef(group: "View", keys: ["⌘", "0"], label: "Actual size"),

@@ -383,11 +383,15 @@ final class SofuuCodeView: NSTextView {
         lastHoverPoint = point
         hoverTimer?.invalidate()
         hoverTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
-            guard let self, let point = self.lastHoverPoint else { return }
-            let index = self.insertionIndex(at: point)
-            let (line, column) = self.editor?.lineColumn(ofOffset: index) ?? (0, 0)
-            let rect = self.screenRect(at: index)
-            self.editor?.requestHover(line: line, column: column, screenRect: rect)
+            // Timer callbacks on the main run loop; the closure is
+            // @Sendable, so hop back onto the main actor explicitly.
+            MainActor.assumeIsolated {
+                guard let self, let point = self.lastHoverPoint else { return }
+                let index = self.insertionIndex(at: point)
+                let (line, column) = self.editor?.lineColumn(ofOffset: index) ?? (0, 0)
+                let rect = self.screenRect(at: index)
+                self.editor?.requestHover(line: line, column: column, screenRect: rect)
+            }
         }
     }
 

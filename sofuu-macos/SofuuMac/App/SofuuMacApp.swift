@@ -307,6 +307,8 @@ struct SofuuMenus: Commands {
                 .keyboardShortcut(".", modifiers: .command)
             Button(L10n.t("menu.compact")) { store.compactSession() }
                 .keyboardShortcut("k", modifiers: .command)
+            Button(L10n.t("menu.splitEditor")) { store.toggleSplit() }
+                .keyboardShortcut("\\", modifiers: .command)
             Divider()
             // Lives here, not in CommandMenu("View"): SwiftUI drops a
             // custom View menu on the system View menu's altar on this
@@ -316,7 +318,7 @@ struct SofuuMenus: Commands {
             Divider()
             Button(L10n.t("menu.shortcuts")) { store.showShortcutHelp() }
                 .keyboardShortcut("/", modifiers: [.command, .shift])
-            Button(L10n.t("menu.restartEngine")) { store.restartEngineForEnv() }
+            Button(L10n.t("menu.restartEngine")) { store.restartEngineManually() }
         }
         CommandMenu("View") {
             Button("Toggle Sidebar") { store.toggleSidebar() }

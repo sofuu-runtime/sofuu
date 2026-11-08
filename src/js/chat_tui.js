@@ -306,15 +306,41 @@
     }
     out('');
   }
-  function chatMcpToolDefs() {
+  function compactParamSchema(schema) {
+    if (!schema || typeof schema !== 'object') return { type: 'object', properties: {} };
+    const origProps = schema.properties || {};
+    const compactProps = {};
+    for (const k of Object.keys(origProps)) {
+      const p = origProps[k];
+      if (!p || typeof p !== 'object') continue;
+      const desc = String(p.description || '').split(/[\r\n.]/)[0].trim();
+      compactProps[k] = {
+        type: p.type || 'string',
+        description: desc.length > 80 ? desc.slice(0, 77) + '…' : desc,
+      };
+    }
+    return {
+      type: 'object',
+      properties: compactProps,
+      required: Array.isArray(schema.required) ? schema.required : undefined,
+    };
+  }
+  function chatMcpToolDefs(isTight) {
     const defs = [];
     const names = {};
     for (const t of mcpTools) {
       if (names[t.name]) continue;
+      let desc = t.description || ('MCP tool from ' + t.server);
+      let schema = t.schema || { type: 'object', properties: {} };
+      if (isTight) {
+        const firstLine = desc.split(/[\r\n.]/)[0].trim();
+        desc = firstLine.length > 130 ? firstLine.slice(0, 127) + '…' : firstLine;
+        schema = compactParamSchema(schema);
+      }
       defs.push({
         name: t.name,
-        description: t.description || ('MCP tool from ' + t.server),
-        parameters: t.schema || { type: 'object', properties: {} },
+        description: desc,
+        parameters: schema,
         execute: (args) => callMcpTool(t.name, args),
       });
       names[t.name] = 1;
@@ -324,10 +350,17 @@
         if (names[pk]) continue;
         const pt = sofuu.plugins.TOOLS[pk];
         if (!pt) continue;
+        let desc = pt.description || ('Plugin tool ' + pt.name);
+        let schema = pt.parameters || pt.schema || { type: 'object', properties: {} };
+        if (isTight) {
+          const firstLine = desc.split(/[\r\n.]/)[0].trim();
+          desc = firstLine.length > 130 ? firstLine.slice(0, 127) + '…' : firstLine;
+          schema = compactParamSchema(schema);
+        }
         defs.push({
           name: pt.name,
-          description: pt.description || ('Plugin tool ' + pt.name),
-          parameters: pt.parameters || pt.schema || { type: 'object', properties: {} },
+          description: desc,
+          parameters: schema,
           execute: (args, ctx) => pt.execute(args, ctx),
         });
         names[pt.name] = 1;
@@ -1686,7 +1719,6 @@
   function discoverCaps() {
     try {
       if (!cfg.model || !cfg.base_url) return;
-      if (isLocalHost(cfg.base_url)) return;
       if (Date.now() - capsDiscoveredAt < DISCOVER_TTL_MS) return;
       /* P3 (AUDIT-2026-09-07): the full TTL used to be stamped BEFORE the
        * harvest, so a fully failed run (network down, 401s) was cached for
@@ -1981,13 +2013,20 @@
       }
     }
     const budget = ctxBudget();
+    const hTk = historyTokens();
+    const isLocal = cfg.provider === 'local' || cfg.provider === 'ollama' || cfg.provider === 'llamacpp';
+    const toolsEst = (mcpTools.length || (sofuu.plugins && sofuu.plugins.TOOLS))
+      ? estTok(JSON.stringify(chatMcpToolDefs(isLocal || resolveCaps().window <= 16384)))
+      : 0;
+    const ovTk = ctxOverhead >= 0 ? ctxOverhead : toolsEst;
+    const totalEst = hTk + ovTk;
     /* alloc gate (§14): the compaction cliff moves with context pressure —
      * 0.70 of budget when the session is slack, down to 0.50 when the net
      * sees overflow coming within ~3 turns. Fixed cliff when ML is off. */
     const planC = allocPlanChat(0, 0);
     const compactAt = (planC && planC.compactAt > 0) ? planC.compactAt : COMPACT_AT;
     /* Re-arm one-shot compaction once usage drains back below half. */
-    if (!autoCompactArmed && historyTokens() < budget * 0.5) autoCompactArmed = true;
+    if (!autoCompactArmed && totalEst < budget * 0.5) autoCompactArmed = true;
     /* PLAN-ML-GATES §12: ML compaction gate — opportunistic passes that
      * free MECHANICAL junk (duplicates, boilerplate, re-fetchable reads)
      * before the one-shot cliff ever fires. Runs while usage is past
@@ -2093,17 +2132,17 @@
      * session can continue indefinitely. Per-answer 32k thinking / 64k
      * output are *not* session caps — total thinking+output across many
      * turns can exceed them, only the per-answer limit is enforced. */
-    if (autoCompactArmed && historyTokens() > budget * compactAt && history.length > 2) {
+    if (autoCompactArmed && totalEst > budget * compactAt && history.length > 2) {
       autoCompactArmed = false;
       const savedTk = historyTokens();
       try {
         // Summarize *all* turns and keep only the summary → window → ~0
         if (await summarizeHistory(0)) {
-          const m0 = Math.max(0, savedTk + (ctxOverhead >= 0 ? ctxOverhead : 0));
+          const m0 = Math.max(0, savedTk + ovTk);
           usedCtx = ctxMeter();
           out('\x1b[90m  ⚙ auto-compacted → summary (' +
               fmtTk(Math.max(0, savedTk - historyTokens())) + ' tk saved, meter ' +
-              fmtTk(m0) + '→' + fmtTk(usedCtx) + ')\x1b[0m');
+              fmtTk(m0) + '→' + fmtTk(usedCtx) + ')\x1b[0m\n');
         }
       } catch (e) {
         /* A failed auto-compact must not be silent: the drop-oldest guard
@@ -2116,7 +2155,7 @@
      * failed)? Shed oldest whole turn blocks — never the newest block, and
      * never an orphaned tool message (hard 400 at the provider). */
     let droppedTurns = 0;
-    while (history.length > 0 && historyTokens() > budget) {
+    while (history.length > 0 && (historyTokens() + ovTk) > budget) {
       const lastStart = turnStartAt(history.length - 1);
       if (lastStart === 0) break; /* only the newest block left */
       const beforeDrop = historyTokens();
@@ -2472,18 +2511,26 @@
      * The thinking block is only sent when c.effort is low/medium/high/max.
      * Models detected as thinking-incapable at runtime (no_think_models)
      * also never get an effort parameter. */
+    /* Preflight history budget check to ensure context stays within model limits. */
+    await trimHistory();
     let noThink = (c.no_think_models || []).indexOf(c.model) >= 0 || (c.effort === 'off') || (resolveCaps().thinking === 'none');
     /* Local inference engines (ollama, llama.cpp) get the same lean shape as
      * the in-process local provider: no coding preset, no tool defs, a short
      * system prompt, so a CPU-bound model is not buried in prompt tokens. */
     const isLocal = c.provider === 'local' || c.provider === 'ollama' || c.provider === 'llamacpp';
+    const localTools = isLocal ? (mcpTools.length ? chatMcpToolDefs(true) : []) : chatToolDefs();
+    const localSys = isLocal
+      ? (localTools.length
+          ? 'You are a helpful AI assistant. When tools are provided, you MUST execute the appropriate tool call to fulfill the user request. Do not describe or list the tools — call them directly.'
+          : 'You are a helpful AI assistant.')
+      : sofuu.agent.CORE_PROMPT;
     const def = {
       name: 'chat',
       preset: isLocal ? undefined : 'coding',
       /* P1: the byte-stable shared core prompt. For local models, keep
        * it lean so CPU prefill latency matches direct `sofuu infer`. */
-      system: isLocal ? 'You are a helpful AI assistant.' : sofuu.agent.CORE_PROMPT,
-      tools: isLocal ? (mcpTools.length ? chatMcpToolDefs() : []) : chatToolDefs(),
+      system: localSys,
+      tools: localTools,
       agents: (isLocal || !subAgentNames.length) ? undefined : subAgentNames,
       provider: c.provider, model: c.model,
       /* strict: only what the user selected, never more; off → undefined */
@@ -4065,6 +4112,21 @@
             try { cfg = JSON.parse(__chat_getcfg()); } catch (eCFG) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
             out('\x1b[33m  ⓘ ' + curModel + ' rejected thinking (' + msg.slice(0, 160) +
                 ') — disabling effort for this model and retrying.\x1b[0m\n');
+            prepareArchiveRecovery(msg);
+            archiveAttempt++;
+            continue;
+          }
+          const CTX_OVERFLOW_RE = /context.*(?:length|window|size|limit|exceed)|exceed.*(?:context|token)|too many tokens|maximum context/i;
+          if (CTX_OVERFLOW_RE.test(msg) && history.length > 0) {
+            if (sofuu.ml && sofuu.ml.alloc && typeof sofuu.ml.alloc.noteLimit === 'function') {
+              try { sofuu.ml.alloc.noteLimit(curModel, msg); } catch (eNL) { /* allocator limit learning is best-effort */ }
+            }
+            out('\x1b[90m  ⚙ context limit exceeded (' + clip1(msg, 120) + ') — auto-compacting and continuing…\x1b[0m\n');
+            let compacted = false;
+            try { compacted = !!(await summarizeHistory(0)); } catch (eSC) { /* fallback to drop turn block below */ }
+            if (!compacted && history.length > 0) {
+              removeTurnBlock(0);
+            }
             prepareArchiveRecovery(msg);
             archiveAttempt++;
             continue;

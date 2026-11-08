@@ -50,93 +50,96 @@ Official pre-compiled single binaries are available for macOS (Apple Silicon) an
 
 ---
 
-### 2. On-Device Vector Memory in Standard JavaScript / TypeScript
+### 2. The 30-Second Demo: Runtime + Memory + Agent Tools
 
-Most frameworks require API keys or 2 GB model downloads just to test vector search. With Sofuu, offline semantic memory works out of the box:
+Sofuu collapses vector databases, agent orchestrators, and tool sandboxes into standard JavaScript / TypeScript:
 
 ```javascript
-// memory.js — Run directly: $ sofuu run memory.js
-const brain = sofuu.memory.open("./brain.qtsq", 768);
+// quickstart.js — Run directly: $ sofuu run quickstart.js
 
-// 1. Embed and persist facts into encrypted on-disk vector storage (0-byte model)
+// 1. On-device vector memory (encrypted, SIMD search, zero database servers)
+const brain = sofuu.memory.open("./brain.qtsq", 768);
 brain.remember(
-  sofuu.ai.embedLocal("native AI runtime"),
-  "Sofuu executes AI natively with zero background daemons."
+  sofuu.ai.embedLocal("runtime"),
+  "Sofuu executes AI apps, tools, and agents natively under 10 MB."
 );
 
-// 2. Query offline vector memory via hardware SIMD in microseconds
-const [match] = brain.recall(sofuu.ai.embedLocal("daemons"), 1);
-console.log("Recalled from vector brain:", match.text);
-```
+// 2. Offline semantic recall in microseconds (< 2ms)
+const [match] = brain.recall(sofuu.ai.embedLocal("memory"), 1);
+console.log(`[Memory Recalled] ${match.text}`);
 
-```bash
-$ sofuu run memory.js
-Recalled from vector brain: Sofuu executes AI natively with zero background daemons.
-# Completed in ~2ms · 0 background daemons · 0 cloud API calls
-```
-
----
-
-### 3. Build an Autonomous Agent with Tools
-
-```javascript
-// researcher.js — Run: $ sofuu run researcher.js
+// 3. Define an autonomous agent with memory recall and native tools
 sofuu.agent.define({
-  name: "researcher",
-  system: "You research precisely. Search the web, then synthesize answer with sources.",
+  name: "assistant",
+  system: "Answer user questions using your vector memory and local tools.",
   tools: ["coding", "web", "memory"],
   memory: "agent",
 });
 
-const result = await sofuu.agent.run("researcher", "What features shipped in QuickJS 2024?");
-console.log(result.answer);
+const result = await sofuu.agent.run("assistant", "What makes Sofuu unique?");
+console.log(`[Agent Response] ${result.answer}`);
+```
+
+Run it immediately with zero setup, or compile it to a standalone native binary:
+
+```bash
+# 1. Run directly with sub-20ms cold start
+$ sofuu run quickstart.js
+[Memory Recalled] Sofuu executes AI apps, tools, and agents natively under 10 MB.
+[Agent Response] Sofuu collapses the entire AI stack into a single < 10 MB binary.
+
+# 2. Compile into a standalone native executable with zero dependencies
+$ sofuu compile quickstart.js -o my-agent
+$ ./my-agent
 ```
 
 ---
 
-### 4. Pure Kaze Agent & Direct Native Compilation
+### 3. Instant Terminal Testing (No Files Needed)
 
-You can program autonomous AI agents in Kaze (`.kaze`) with **zero JavaScript or Python**, and compile them directly into standalone native executables:
+You can also test Sofuu's capabilities directly from your terminal:
+
+```bash
+# Launch interactive AI chat with persistent session memory
+$ sofuu chat
+
+# One-liner vector memory test
+$ sofuu eval 'const b = sofuu.memory.open("./brain.qtsq", 768); b.remember(sofuu.ai.embedLocal("fast"), "Sofuu starts in <20ms"); console.log(b.recall(sofuu.ai.embedLocal("speed"), 1)[0].text);'
+```
+
+---
+
+### 4. Prefer Pure Declarative Agents? Try Kaze (`.kaze`)
+
+For production agents with zero JavaScript or Python, define declarative capability gates (`needs: ...`) and compile directly into native binaries:
 
 ```kaze
 # agent.kaze — Declarative Autonomous Agent
-needs: ai, tool, policy, memory, log, alert
+needs: ai, tool, policy, memory, log
 
-filter monitor_and_act(source, metric_val, threshold, max_limit):
+filter monitor_and_act(source, metric_val, threshold):
     log.info("Telemetry ingest: " + source + " = " + metric_val)
 
     # 1. Fail-closed policy check: block credential leaks before execution
     if policy detects secrets in source:
         reject "Security refusal: credential leak in source"
 
-    # 2. AI reasoning with continuous vector memory
+    # 2. Reasoning with continuous on-device vector memory
     if metric_val > threshold:
         let analysis = ai.prompt("Synthesize incident analysis for " + source)
         remember analysis as source + "_incident"
-
-        # 3. Guardrailed action dispatch
-        if metric_val >= max_limit:
-            tool.call("actuator", source + ":TRIGGER_FAILSAFE")
-            send alert "CRITICAL: Failsafe triggered on " + source
-            allow "Emergency action taken"
-
-        tool.call("notifier", source + ":DISPATCH_WARNING")
-        allow "Warning dispatched"
+        tool.call("notifier", source + ":DISPATCH_ALERT")
+        allow "Alert dispatched"
 
     allow "Nominal telemetry"
 ```
 
-Compile directly into a standalone single-file native binary (under 10 MB) with 12-factor configuration:
-
 ```bash
-# 1. Compile pure Kaze directly into a standalone single binary:
+# Compile pure Kaze directly into a standalone single-file binary:
 $ sofuu compile agent.kaze -o my-agent
 
-# 2. Run anywhere with JSON config or CLI parameters (zero runtime dependencies):
+# Run anywhere with CLI flags or 12-factor config:
 $ ./my-agent --config agent.config.json
-
-# 3. Or run continuously 24/7 with the autonomous supervisor daemon:
-$ ./my-agent --config agent.config.json --daemon --every 5s
 ```
 
 ---

@@ -196,18 +196,26 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
                 value = search,
                 onValueChange = { search = it },
                 singleLine = true,
-                textStyle = androidx.compose.ui.text.TextStyle(color = c.text, fontSize = 13.sp, fontWeight = FontWeight.Medium),
+                textStyle = androidx.compose.ui.text.TextStyle(
+                    color = c.text,
+                    fontSize = 13.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false),
+                ),
                 cursorBrush = androidx.compose.ui.graphics.SolidColor(c.accent),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 44.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(c.monoFieldBg)
-                    .padding(horizontal = 12.dp, vertical = 12.dp),
+                modifier = Modifier.fillMaxWidth(),
                 decorationBox = { inner ->
-                    androidx.compose.foundation.layout.Box {
+                    androidx.compose.foundation.layout.Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(44.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(c.monoFieldBg)
+                            .padding(horizontal = 12.dp),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
                         if (search.isEmpty()) {
-                            Text("Search models…", color = c.textFaint, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                            Text("Search models…", color = c.textFaint, fontSize = 13.5.sp, fontWeight = FontWeight.Medium)
                         }
                         inner()
                     }
@@ -252,17 +260,25 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
                 value = manual,
                 onValueChange = { manual = it },
                 singleLine = true,
-                textStyle = androidx.compose.ui.text.TextStyle(color = c.text, fontSize = 13.sp, fontWeight = FontWeight.Medium),
+                textStyle = androidx.compose.ui.text.TextStyle(
+                    color = c.text,
+                    fontSize = 13.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false),
+                ),
                 cursorBrush = androidx.compose.ui.graphics.SolidColor(c.accent),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 44.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(c.monoFieldBg)
-                    .padding(horizontal = 12.dp, vertical = 12.dp),
+                modifier = Modifier.fillMaxWidth(),
                 decorationBox = { inner ->
-                    androidx.compose.foundation.layout.Box {
-                        if (manual.isEmpty()) Text("Type a model name…", color = c.textFaint, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                    androidx.compose.foundation.layout.Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(44.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(c.monoFieldBg)
+                            .padding(horizontal = 12.dp),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        if (manual.isEmpty()) Text("Type a model name…", color = c.textFaint, fontSize = 13.5.sp, fontWeight = FontWeight.Medium)
                         inner()
                     }
                 },

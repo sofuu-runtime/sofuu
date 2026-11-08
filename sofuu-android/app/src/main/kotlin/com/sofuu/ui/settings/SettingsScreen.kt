@@ -83,6 +83,11 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
     // store, so this only fires on external change.
     LaunchedEffect(store.state.settingsTab) { tab = store.state.settingsTab }
 
+    val scrollState = rememberScrollState()
+    LaunchedEffect(tab) {
+        scrollState.scrollTo(0)
+    }
+
     val statusTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     var headerPx by remember { mutableStateOf(0) }
     val headerHeight = with(density) { headerPx.toDp() }
@@ -96,7 +101,7 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
             Modifier
                 .fillMaxSize()
                 .navigationBarsPadding()
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scrollState)
                 .padding(
                     top = effectiveTopBand + 2.dp,
                     start = 16.dp,
@@ -235,7 +240,7 @@ private fun CardDivider(modifier: Modifier = Modifier) {
     Box(
         modifier
             .fillMaxWidth()
-            .padding(vertical = 10.dp)
+            .padding(vertical = 8.dp)
             .height(0.8.dp)
             .background(c.border.copy(alpha = 0.6f)),
     )
@@ -249,7 +254,7 @@ private fun Section(label: String, isFirst: Boolean = false) {
         fontWeight = FontWeight.Bold,
         letterSpacing = 0.8.sp,
         color = LocalSofuuColors.current.textFaint,
-        modifier = Modifier.padding(top = if (isFirst) 4.dp else 18.dp, bottom = 6.dp, start = 2.dp),
+        modifier = Modifier.padding(top = if (isFirst) 4.dp else 20.dp, bottom = 8.dp, start = 2.dp),
     )
 }
 
@@ -283,6 +288,9 @@ private fun Segmented(options: List<String>, selected: String, onSelect: (String
             val active = o == selected
             val label = when (o) {
                 "prompt" -> "Ask me"
+                "openai" -> "OpenAI"
+                "anthropic" -> "Anthropic"
+                "local" -> "Local"
                 else -> o.replaceFirstChar { it.uppercase() }
             }
             Box(
@@ -319,6 +327,13 @@ private fun TextFieldRow(
     LaunchedEffect(value, focused) {
         if (!focused || value.isEmpty()) text = value
     }
+    val commonStyle = androidx.compose.ui.text.TextStyle(
+        color = c.text,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 13.sp,
+        fontWeight = FontWeight.Medium,
+        platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false),
+    )
     androidx.compose.foundation.text.BasicTextField(
         value = text,
         onValueChange = {
@@ -326,30 +341,28 @@ private fun TextFieldRow(
             onChange(it)
         },
         singleLine = true,
-        textStyle = androidx.compose.ui.text.TextStyle(
-            color = c.text,
-            fontFamily = FontFamily.Monospace,
-            fontSize = 13.5.sp,
-            fontWeight = FontWeight.Medium,
-        ),
+        textStyle = commonStyle,
         cursorBrush = androidx.compose.ui.graphics.SolidColor(c.accent),
         modifier = modifier
-            .onFocusChanged { focused = it.isFocused }
             .fillMaxWidth()
-            .heightIn(min = 46.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(c.monoFieldBg)
-            .border(1.dp, if (focused) c.accent else c.border, RoundedCornerShape(8.dp))
-            .padding(horizontal = 12.dp, vertical = 12.dp),
+            .onFocusChanged { focused = it.isFocused },
         decorationBox = { inner ->
-            Box {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(44.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(c.monoFieldBg)
+                    .border(1.dp, if (focused) c.accent else c.border, RoundedCornerShape(8.dp))
+                    .padding(horizontal = 12.dp),
+                contentAlignment = Alignment.CenterStart,
+            ) {
                 if (text.isEmpty()) {
                     Text(
                         placeholder,
-                        color = c.textFaint,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 13.5.sp,
-                        fontWeight = FontWeight.Medium,
+                        style = commonStyle.copy(color = c.textFaint),
+                        maxLines = 1,
+                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                     )
                 }
                 inner()
@@ -383,7 +396,7 @@ private fun AppliedFieldRow(
         }
         Box(
             Modifier
-                .height(46.dp)
+                .height(44.dp)
                 .clip(RoundedCornerShape(8.dp))
                 .background(c.accent)
                 .clickable { onApply(text) }
@@ -429,13 +442,15 @@ private fun EngineCell(key: String, value: String, mono: Boolean = false) {
 @Composable
 private fun VectorEngineCard(store: AppStore) {
     val c = LocalSofuuColors.current
-    var manifest by remember { mutableStateOf<JSONObject?>(null) }
+    var manifest by remember { mutableStateOf(store.cachedEmbedManifest) }
     var probe by remember { mutableStateOf("Hello, Sofuu") }
     var probeResult by remember { mutableStateOf<String?>(null) }
     var probing by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
-        manifest = withContext(Dispatchers.IO) { runCatching { store.embedManifest() }.getOrNull() }
+        if (manifest == null) {
+            manifest = withContext(Dispatchers.IO) { runCatching { store.embedManifest() }.getOrNull() }
+        }
     }
 
     Section("Vector engine")
@@ -563,54 +578,47 @@ private fun VectorEngineCard(store: AppStore) {
 private fun GeneralPane(store: AppStore) {
     val c = LocalSofuuColors.current
     val state = store.state
-    var live by remember { mutableStateOf<JSONObject?>(null) }
+    var live by remember { mutableStateOf(store.cachedChatState ?: store.getOrBuildChatState()) }
     LaunchedEffect(Unit) {
+        val next = withContext(Dispatchers.IO) { store.engineChatState() }
+        live = next
         while (true) {
-            // A null answer means "no update" (the engine is mid-turn, the 2 s
-            // deadline expired) — keep the last card instead of flickering
-            // back to "Connecting…" whenever a turn is streaming.
-            val next = withContext(Dispatchers.IO) { store.engineChatState() }
-            if (next != null) live = next
             delay(2000)
+            val updated = withContext(Dispatchers.IO) { store.engineChatState() }
+            live = updated
         }
     }
     Column {
         Section("Engine status", isFirst = true)
-        if (live == null) {
-            SettingsCard {
-                Text("Connecting to the engine…", fontSize = 13.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
-            }
-        } else {
-            val e = live!!
-            SettingsCard {
-                EngineCell("Model", e.optString("model").ifEmpty { "None" }, mono = true)
+        val e = live
+        SettingsCard {
+            EngineCell("Model", e.optString("model").ifEmpty { "None" }, mono = true)
+            CardDivider()
+            EngineCell("Provider", e.optString("provider").ifEmpty { "None" })
+            CardDivider()
+            EngineCell("Session", e.optString("sessionId").let { if (it.isEmpty()) "None yet" else it.take(10) + "…" }, mono = true)
+            CardDivider()
+            EngineCell("History", "${e.optInt("historyTurns")} turns")
+            CardDivider()
+            EngineCell("Context", "${e.optInt("contextTokens")} tk")
+            CardDivider()
+            val spend = e.optDouble("sessionSpendUsd")
+            EngineCell("Session spend", if (spend.isNaN() || spend < 0) "$0.0000" else "$" + "%.4f".format(spend))
+            if (e.optBoolean("streaming") || e.optInt("pendingApprovals") > 0) {
                 CardDivider()
-                EngineCell("Provider", e.optString("provider").ifEmpty { "None" })
-                CardDivider()
-                EngineCell("Session", e.optString("sessionId").let { if (it.isEmpty()) "None yet" else it.take(10) + "…" }, mono = true)
-                CardDivider()
-                EngineCell("History", "${e.optInt("historyTurns")} turns")
-                CardDivider()
-                EngineCell("Context", "${e.optInt("contextTokens")} tk")
-                CardDivider()
-                val spend = e.optDouble("sessionSpendUsd")
-                EngineCell("Session spend", if (spend.isNaN() || spend < 0) "$0.0000" else "$" + "%.4f".format(spend))
-                if (e.optBoolean("streaming") || e.optInt("pendingApprovals") > 0) {
-                    CardDivider()
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(c.accent))
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            buildString {
-                                if (e.optBoolean("streaming")) append("Generating…")
-                                val n = e.optInt("pendingApprovals")
-                                if (n > 0) { if (isNotEmpty()) append(" · "); append("$n awaiting approval") }
-                            },
-                            fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = c.accent,
-                        )
-                    }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(6.dp).clip(RoundedCornerShape(3.dp)).background(c.accent))
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        buildString {
+                            if (e.optBoolean("streaming")) append("Generating…")
+                            val n = e.optInt("pendingApprovals")
+                            if (n > 0) { if (isNotEmpty()) append(" · "); append("$n awaiting approval") }
+                        },
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = c.accent,
+                    )
                 }
             }
         }
@@ -764,11 +772,12 @@ private fun GeneralPane(store: AppStore) {
 @Composable
 private fun PhoneToolsCard(store: AppStore) {
     val c = LocalSofuuColors.current
-    var tools by remember { mutableStateOf<List<String>>(emptyList()) }
+    var tools by remember { mutableStateOf(store.engine.hostTools.toList()) }
     LaunchedEffect(Unit) {
         while (true) {
-            tools = store.engine.hostTools.toList()
-            delay(500)
+            val list = store.engine.hostTools.toList()
+            if (list != tools) tools = list
+            delay(1000)
         }
     }
 
@@ -921,10 +930,10 @@ private fun ToggleRow(label: String, desc: String, checked: Boolean, onChange: (
     Row(
         Modifier
             .fillMaxWidth()
-            .heightIn(min = 48.dp)
+            .heightIn(min = 44.dp)
             .clip(RoundedCornerShape(8.dp))
             .clickable { onChange(!checked) }
-            .padding(vertical = 8.dp, horizontal = 2.dp),
+            .padding(vertical = 4.dp, horizontal = 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Column(Modifier.weight(1f).padding(end = 12.dp)) {
@@ -966,14 +975,14 @@ private fun AppearancePane(store: AppStore) {
             Row_("Chat font size", "Body text size in the chat pane.", {
                 Segmented(listOf("13", "15", "17", "19"), state.chatFontSize.toString()) { store.setChatFontSize(it.toInt()) }
             })
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.height(10.dp))
             Box(
                 Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(8.dp))
                     .background(c.monoFieldBg)
                     .border(1.dp, c.border, RoundedCornerShape(8.dp))
-                    .padding(10.dp),
+                    .padding(12.dp),
             ) {
                 Text(
                     "Sample chat preview at ${state.chatFontSize}sp",
@@ -1107,7 +1116,7 @@ private fun ModelsPane(store: AppStore) {
             }
         } else {
             providers.forEach { p ->
-                SettingsCard(modifier = Modifier.padding(bottom = 10.dp)) {
+                SettingsCard(modifier = Modifier.padding(bottom = 12.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.weight(1f)) {
                             Text(p.name, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = c.text)
@@ -1164,6 +1173,7 @@ private fun ModelsPane(store: AppStore) {
                 }
             }
         }
+        Spacer(Modifier.height(4.dp))
         SmallButton(c.accent, c.accentContrast, "Refresh Model Lists") {
             store.refreshModelCache()
         }
@@ -1177,6 +1187,7 @@ private fun ModelsPane(store: AppStore) {
 private fun ProvidersPane(store: AppStore) {
     val c = LocalSofuuColors.current
     val state = store.state
+    var newProfile by remember { mutableStateOf("openai") }
     var newName by remember { mutableStateOf("") }
     var newEndpoint by remember { mutableStateOf("") }
     var newModel by remember { mutableStateOf("") }
@@ -1189,14 +1200,41 @@ private fun ProvidersPane(store: AppStore) {
     var removeNote by remember { mutableStateOf<String?>(null) }
     var editing by remember { mutableStateOf(emptySet<String>()) }
 
+    val endpointPlaceholder = when (newProfile) {
+        "anthropic" -> "https://api.anthropic.com/v1/messages"
+        "local" -> "http://localhost:11434/api/chat"
+        else -> "https://api.openai.com/v1/chat/completions"
+    }
+    val modelPlaceholder = when (newProfile) {
+        "anthropic" -> "Default model (e.g. claude-3-5-sonnet-20241022)"
+        "local" -> "Default model (e.g. llama3.2)"
+        else -> "Default model (e.g. gpt-4o, deepseek-chat)"
+    }
+    val keyPlaceholder = when (newProfile) {
+        "local" -> "API key (optional for local)"
+        else -> "API key (stored securely in Keystore)"
+    }
+
     Column {
         Section("Add provider", isFirst = true)
         SettingsCard {
-            val fieldGap = Modifier.padding(bottom = 8.dp)
-            TextFieldRow("name", newName, "Name (e.g. openai, anthropic)", { newName = it }, fieldGap)
-            TextFieldRow("endpoint", newEndpoint, "Endpoint (https://…/v1/chat/completions)", { newEndpoint = it }, fieldGap)
-            TextFieldRow("model", newModel, "Default model ID (e.g. gpt-4o, claude-3-5-sonnet)", { newModel = it }, fieldGap)
-            TextFieldRow("key", newKey, "API key (stored securely in Keystore)", { newKey = it }, fieldGap)
+            val fieldGap = Modifier.padding(bottom = 10.dp)
+
+            Text(
+                "API FORMAT",
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.5.sp,
+                color = c.textFaint,
+                modifier = Modifier.padding(bottom = 6.dp),
+            )
+            Segmented(listOf("openai", "anthropic", "local"), newProfile) { newProfile = it }
+            Spacer(Modifier.height(10.dp))
+
+            TextFieldRow("name", newName, "Name (e.g. $newProfile)", { newName = it }, fieldGap)
+            TextFieldRow("endpoint", newEndpoint, endpointPlaceholder, { newEndpoint = it }, fieldGap)
+            TextFieldRow("model", newModel, modelPlaceholder, { newModel = it }, fieldGap)
+            TextFieldRow("key", newKey, keyPlaceholder, { newKey = it }, Modifier.padding(bottom = 12.dp))
 
             Box(
                 Modifier
@@ -1206,23 +1244,23 @@ private fun ProvidersPane(store: AppStore) {
                     .background(c.accent)
                     .clickable {
                         val name = newName.trim()
-                        val endpoint = newEndpoint.trim()
+                        val endpoint = newEndpoint.trim().ifEmpty { endpointPlaceholder }
                         val model = newModel.trim()
                         addNote = null
                         if (name.isEmpty() || endpoint.isEmpty()) {
-                            addError = "Name and endpoint are required."
+                            addError = "Name is required."
                         } else {
                             val providers = (state.config?.providers ?: emptyList()).map { it.toJson() }.toMutableList()
                             providers.add(
                                 JSONObject().put("name", name).put("endpoint", endpoint)
-                                    .put("model", model).put("profile", ""),
+                                    .put("model", model).put("profile", newProfile),
                             )
                             val patch = JSONObject().put("providers", org.json.JSONArray(providers))
                             if (model.isNotEmpty()) {
                                 patch.put("active", name).put("provider", name).put("model", model)
                                 addNote = null
                             } else {
-                                addNote = "Added $name — open the model sheet in the composer, pick one of its models, and it becomes active."
+                                addNote = "Added $name ($newProfile) — open the model sheet in the composer, pick one of its models, and it becomes active."
                             }
                             store.patchConfig(patch)
                             if (newKey.isNotBlank()) store.setProviderKey(name, newKey.trim())
@@ -1256,7 +1294,7 @@ private fun ProvidersPane(store: AppStore) {
             }
         } else {
             providers.forEach { p ->
-                SettingsCard(modifier = Modifier.padding(bottom = 10.dp)) {
+                SettingsCard(modifier = Modifier.padding(bottom = 12.dp)) {
                     val isActive = p.name == state.config?.active
                     val isEditing = editing.contains(p.name)
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -1278,6 +1316,24 @@ private fun ProvidersPane(store: AppStore) {
                                             .padding(horizontal = 6.dp, vertical = 2.dp),
                                     ) {
                                         Text("ACTIVE", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = c.accent)
+                                    }
+                                }
+                                val profBadge = when (p.profile.lowercase()) {
+                                    "anthropic" -> "ANTHROPIC"
+                                    "local" -> "LOCAL"
+                                    "openai" -> "OPENAI"
+                                    else -> p.profile.uppercase()
+                                }
+                                if (profBadge.isNotBlank()) {
+                                    Spacer(Modifier.width(6.dp))
+                                    Box(
+                                        Modifier
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(c.bgRaised)
+                                            .border(0.5.dp, c.border.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                                            .padding(horizontal = 6.dp, vertical = 2.dp),
+                                    ) {
+                                        Text(profBadge, fontSize = 9.5.sp, fontWeight = FontWeight.Bold, color = c.textMuted)
                                     }
                                 }
                             }
@@ -1330,10 +1386,26 @@ private fun ProvidersPane(store: AppStore) {
                         CardDivider()
                         var ep by remember(p.name, p.endpoint) { mutableStateOf(p.endpoint) }
                         var md by remember(p.name, p.model) { mutableStateOf(p.model) }
-                        var pf by remember(p.name, p.profile) { mutableStateOf(p.profile) }
-                        TextFieldRow("endpoint", ep, "https://…/v1/chat/completions", { ep = it }, Modifier.padding(bottom = 6.dp))
-                        TextFieldRow("model", md, "model id", { md = it }, Modifier.padding(bottom = 6.dp))
-                        TextFieldRow("profile", pf, "openai | anthropic | local", { pf = it }, Modifier.padding(bottom = 8.dp))
+                        var pf by remember(p.name, p.profile) {
+                            val normalized = when (p.profile.lowercase()) {
+                                "anthropic" -> "anthropic"
+                                "local" -> "local"
+                                else -> "openai"
+                            }
+                            mutableStateOf(normalized)
+                        }
+                        Text(
+                            "API FORMAT",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 0.5.sp,
+                            color = c.textFaint,
+                            modifier = Modifier.padding(bottom = 6.dp),
+                        )
+                        Segmented(listOf("openai", "anthropic", "local"), pf) { pf = it }
+                        Spacer(Modifier.height(10.dp))
+                        TextFieldRow("endpoint", ep, "https://…", { ep = it }, Modifier.padding(bottom = 10.dp))
+                        TextFieldRow("model", md, "model id", { md = it }, Modifier.padding(bottom = 12.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             SmallButton(c.accent, c.accentContrast, "Save Changes") {
                                 if (ep.isNotBlank()) {
@@ -1373,7 +1445,7 @@ private fun ProvidersPane(store: AppStore) {
                             )
                         }
                     } else {
-                        TextFieldRow("key", keyText, "paste new API key", { keyText = it }, Modifier.padding(bottom = 6.dp))
+                        TextFieldRow("key", keyText, "paste new API key", { keyText = it }, Modifier.padding(bottom = 12.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             SmallButton(c.accent, c.accentContrast, "Save key") {
                                 if (keyText.isNotBlank()) {
@@ -1888,12 +1960,10 @@ private fun BrainPane(store: AppStore) {
         SettingsCard {
             Text(
                 "Ask what the gates would say about a call before the agent makes it.",
-                fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(bottom = 6.dp),
+                fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(bottom = 8.dp),
             )
-            TextFieldRow("tool", probeTool, "tool name (e.g. read_file)", onChange = { probeTool = it })
-            Spacer(Modifier.height(6.dp))
-            TextFieldRow("args", probeArgs, "JSON arguments (e.g. {\"path\":\"README.md\"})", onChange = { probeArgs = it })
-            Spacer(Modifier.height(8.dp))
+            TextFieldRow("tool", probeTool, "tool name (e.g. read_file)", onChange = { probeTool = it }, modifier = Modifier.padding(bottom = 10.dp))
+            TextFieldRow("args", probeArgs, "JSON arguments (e.g. {\"path\":\"README.md\"})", onChange = { probeArgs = it }, modifier = Modifier.padding(bottom = 12.dp))
             SmallButton(c.accent, c.accentContrast, "Check Verdict") {
                 scope.launch {
                     val parsed = try { JSONObject(probeArgs) } catch (e: Exception) { JSONObject() }
@@ -1945,8 +2015,7 @@ private fun BrainPane(store: AppStore) {
             }
             if (imgPath != null) {
                 CardDivider()
-                TextFieldRow("describe", imgQuery, "what to look for", onChange = { imgQuery = it })
-                Spacer(Modifier.height(8.dp))
+                TextFieldRow("describe", imgQuery, "what to look for", onChange = { imgQuery = it }, modifier = Modifier.padding(bottom = 12.dp))
                 SmallButton(c.accent, c.accentContrast, "Compare to text") {
                     scope.launch {
                         imgSim = withContext(Dispatchers.IO) { surface.imageTextSimilarity(imgPath!!, imgQuery) }
@@ -1968,8 +2037,7 @@ private fun BrainPane(store: AppStore) {
 
         Section("String similarity")
         SettingsCard {
-            TextFieldRow("a", simA, "first string", onChange = { simA = it })
-            Spacer(Modifier.height(6.dp))
+            TextFieldRow("a", simA, "first string", onChange = { simA = it }, modifier = Modifier.padding(bottom = 10.dp))
             TextFieldRow("b", simB, "second string", onChange = { simB = it })
             sim?.let {
                 CardDivider()
@@ -2001,10 +2069,11 @@ private fun SpaceLine(text: Color, err: Color, faint: Color, label: String, dim:
 private fun SmallButton(bg: Color, fg: Color, label: String, onClick: () -> Unit) {
     Box(
         Modifier
+            .height(38.dp)
             .clip(RoundedCornerShape(8.dp))
             .background(bg)
             .clickable { onClick() }
-            .padding(horizontal = 14.dp, vertical = 9.dp),
+            .padding(horizontal = 14.dp),
         contentAlignment = Alignment.Center,
     ) {
         Text(
@@ -2063,7 +2132,7 @@ private fun AgentsPane(store: AppStore) {
             for (i in 0 until l.length()) {
                 val a = l.optJSONObject(i) ?: continue
                 val agentName = a.optString("name")
-                SettingsCard(modifier = Modifier.padding(bottom = 8.dp)) {
+                SettingsCard(modifier = Modifier.padding(bottom = 12.dp)) {
                     Row(
                         Modifier
                             .fillMaxWidth()
@@ -2119,17 +2188,17 @@ private fun AgentsPane(store: AppStore) {
 
         Section("Define an agent")
         SettingsCard {
-            TextFieldRow("name", name, "Agent name (e.g. reviewer)", onChange = { name = it }, modifier = Modifier.padding(bottom = 6.dp))
-            TextFieldRow("system", system, "System prompt (what this agent does)", onChange = { system = it }, modifier = Modifier.padding(bottom = 6.dp))
-            TextFieldRow("max steps", maxSteps, "Max steps (e.g. 24)", onChange = { maxSteps = it }, modifier = Modifier.padding(bottom = 8.dp))
+            TextFieldRow("name", name, "Agent name (e.g. reviewer)", onChange = { name = it }, modifier = Modifier.padding(bottom = 10.dp))
+            TextFieldRow("system", system, "System prompt (what this agent does)", onChange = { system = it }, modifier = Modifier.padding(bottom = 10.dp))
+            TextFieldRow("max steps", maxSteps, "Max steps (e.g. 24)", onChange = { maxSteps = it }, modifier = Modifier.padding(bottom = 10.dp))
             ToggleRow("Web tools", "web_search and web_open", withWeb) { withWeb = it }
             CardDivider()
             ToggleRow("Coding tools", "the 8 built-ins: read/write/edit/grep/glob/dir/bash/todo", withCode) { withCode = it }
-            Spacer(Modifier.height(10.dp))
+            CardDivider()
             Text(
                 "Approval gate — runs ask before this agent acts",
                 fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.textMuted,
-                modifier = Modifier.padding(bottom = 6.dp),
+                modifier = Modifier.padding(bottom = 8.dp),
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf("sensitive" to "Writes + shell", "all" to "Every tool", "none" to "Never").forEach { (v, label) ->
@@ -2143,7 +2212,7 @@ private fun AgentsPane(store: AppStore) {
             Text(
                 "The answer is the card in Run headlessly below (Allow / Deny / Always).",
                 fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
-                modifier = Modifier.padding(top = 6.dp, bottom = 10.dp),
+                modifier = Modifier.padding(top = 8.dp, bottom = 12.dp),
             )
             SmallButton(c.accent, c.accentContrast, "Register Agent") {
                 scope.launch {
@@ -2181,7 +2250,7 @@ private fun AgentsPane(store: AppStore) {
                 color = if (target.isEmpty()) c.warn else c.textMuted,
                 modifier = Modifier.padding(bottom = 8.dp),
             )
-            TextFieldRow("task", task, "a task to hand the agent", onChange = { task = it }, modifier = Modifier.padding(bottom = 8.dp))
+            TextFieldRow("task", task, "a task to hand the agent", onChange = { task = it }, modifier = Modifier.padding(bottom = 12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SmallButton(
                     if (running) c.bgCardHover else c.accent,

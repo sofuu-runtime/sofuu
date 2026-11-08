@@ -282,9 +282,21 @@ val runtimeEnv = RuntimeEnv(app)
                 state = state.copy(streaming = false, phase = null, liveMetrics = null)
                 if (!foreground && ev.error == null) notifier?.invoke("Sofuu finished", "The turn completed.")
                 if (ev.error != null) {
-                    patchAssistant { m -> m.copy(status = "error", error = ev.error) }
+                    val isCancel = ev.error.contains("cancel", ignoreCase = true) ||
+                        ev.error.contains("abort", ignoreCase = true)
+                    if (!isCancel) {
+                        patchAssistant { m -> if (m.status != "done") m.copy(status = "error", error = ev.error) else m }
+                    } else {
+                        patchAssistant { m ->
+                            if (m.status == "streaming") m.copy(status = "done", usage = ev.usage?.toUi(), metrics = speed)
+                            else m.copy(usage = ev.usage?.toUi() ?: m.usage, metrics = speed ?: m.metrics)
+                        }
+                    }
                 } else {
-                    patchAssistant { m -> m.copy(status = "done", usage = ev.usage?.toUi(), metrics = speed) }
+                    patchAssistant { m ->
+                        if (m.status == "streaming") m.copy(status = "done", usage = ev.usage?.toUi(), metrics = speed)
+                        else m.copy(usage = ev.usage?.toUi() ?: m.usage, metrics = speed ?: m.metrics)
+                    }
                 }
                 saveCurrentSessionMessages()
                 flushSessionSave()
@@ -417,6 +429,7 @@ val runtimeEnv = RuntimeEnv(app)
     /** The step reducer — the desktop's applyStep, in Kotlin. */
     private fun applyStep(kind: String, raw: JSONObject) {
         if (currentAssistant() == null) return
+        if (!state.streaming && (kind == "answer_delta" || kind == "think")) return
         val p = raw.optJSONObject("payload") ?: JSONObject()
         val runId = raw.optString("runId").ifEmpty { null }
         val t = if (raw.has("t")) raw.optLong("t") else null
@@ -654,7 +667,7 @@ val runtimeEnv = RuntimeEnv(app)
                     val minted = engine.newSession().get()
                     val id = minted?.optString("sessionId").orEmpty()
                     if (id.isNotEmpty()) {
-                        val sessionInfo = makeSessionInfo(id)
+                        val sessionInfo = makeSessionInfo(id, task = userText.take(40).replace("\n", " "))
                         withContext(Dispatchers.Main) {
                             state = state.copy(sessions = listOf(sessionInfo) + state.sessions, activeSessionId = id)
                             saveCurrentSessionMessages()
@@ -924,14 +937,14 @@ val runtimeEnv = RuntimeEnv(app)
 
     // ── Sessions ──────────────────────────────────────────────────
 
-    private fun makeSessionInfo(id: String): SessionInfo = SessionInfo(
+    private fun makeSessionInfo(id: String, task: String? = null): SessionInfo = SessionInfo(
         id = id,
         cwd = state.projectDir ?: "",
         model = state.config?.model ?: "",
         provider = state.config?.provider ?: "",
         startedAt = System.currentTimeMillis() / 1000,
         lastSeen = System.currentTimeMillis() / 1000,
-        task = null,
+        task = task,
     )
 
     /** Engine-use timestamps for the idle unload. Touched on every send,
@@ -979,6 +992,10 @@ val runtimeEnv = RuntimeEnv(app)
         // round-trip, so it is correct to do before the first frame.
         refreshLocalModels()
         startIdleUnloadWatch()
+        viewModelScope.launch(Dispatchers.IO) {
+            engineChatState()
+            embedManifest()
+        }
     }
 
     /**
@@ -1437,25 +1454,52 @@ val runtimeEnv = RuntimeEnv(app)
         return if (local.optJSONObject("totals")?.optLong("turns") ?: 0L > 0) local else engineReport
     }
 
-    fun engineChatState(): JSONObject? {
-        if (!engine.isReady) return null
-        // A 2s deadline will expire whenever the engine is mid-turn, which
-        // is the normal state while someone is chatting. That is a "no
-        // update", not a failure — returning null lets the card keep its
-        // last value instead of throwing out of the caller's LaunchedEffect.
+    var cachedChatState: JSONObject? = null
+        private set
+    var cachedEmbedManifest: JSONObject? = null
+        private set
+
+    fun getOrBuildChatState(): JSONObject {
+        cachedChatState?.let { return it }
+        val s = state
+        return JSONObject().apply {
+            put("ok", true)
+            put("model", s.config?.model ?: "")
+            put("provider", s.config?.active ?: "")
+            put("sessionId", s.activeSessionId ?: "")
+            put("historyTurns", s.messages.count { it.role == MsgRole.USER })
+            put("contextTokens", s.ctx?.used ?: 0)
+            put("sessionTokens", s.ctx?.used ?: 0)
+            put("sessionSpendUsd", 0.0)
+            put("streaming", s.streaming)
+            put("pendingApprovals", s.approvals.size)
+        }
+    }
+
+    fun engineChatState(): JSONObject {
+        if (!engine.isReady) return cachedChatState ?: getOrBuildChatState()
         return try {
-            engine.chatState().get(2, TimeUnit.SECONDS)
-        } catch (e: Exception) {
-            null
+            val res = engine.chatState().get(2, TimeUnit.SECONDS)
+            if (res != null && res.optBoolean("ok", false)) {
+                cachedChatState = res
+                res
+            } else {
+                cachedChatState ?: getOrBuildChatState()
+            }
+        } catch (_: Exception) {
+            cachedChatState ?: getOrBuildChatState()
         }
     }
 
     /** Vector-embedding manifest (default space + per-space manifest).
      *  Blocking: callers must be off the main thread. */
     fun embedManifest(): JSONObject? {
-        val env = engine.embedInfo().get(3, TimeUnit.SECONDS) ?: return null
+        cachedEmbedManifest?.let { return it }
+        val env = runCatching { engine.embedInfo().get(3, TimeUnit.SECONDS) }.getOrNull() ?: return null
         if (!env.optBoolean("ok", false)) return null
-        return env.optJSONObject("result")
+        val res = env.optJSONObject("result")
+        if (res != null) cachedEmbedManifest = res
+        return res
     }
 
     /** Embed one string locally (no provider, no network). Returns null if
@@ -1848,16 +1892,28 @@ val runtimeEnv = RuntimeEnv(app)
     }
 
     /** Automatically create a dedicated directory on the phone for a new workspace. */
-    fun createAndAddNewWorkspace(): String {
+    fun createAndAddNewWorkspace(name: String? = null): String {
         val context = getApplication<Application>()
         val baseDir = getWorkspacesBaseDir(context)
         baseDir.mkdirs()
 
-        var num = 1
-        var target = File(baseDir, "Workspace $num")
-        while (target.exists()) {
-            num++
-            target = File(baseDir, "Workspace $num")
+        val cleanName = name?.trim()?.replace(Regex("[/\\\\:;*?\"<>|]"), "_")?.takeIf { it.isNotEmpty() }
+        val target = if (cleanName != null) {
+            var f = File(baseDir, cleanName)
+            var num = 2
+            while (f.exists()) {
+                f = File(baseDir, "$cleanName $num")
+                num++
+            }
+            f
+        } else {
+            var num = 1
+            var f = File(baseDir, "Workspace $num")
+            while (f.exists()) {
+                num++
+                f = File(baseDir, "Workspace $num")
+            }
+            f
         }
         target.mkdirs()
         val path = target.absolutePath
@@ -1912,6 +1968,26 @@ val runtimeEnv = RuntimeEnv(app)
     }
 
     fun cancel() {
+        if (!state.streaming) return
+        flushDelta()
+        deltaFlush?.cancel()
+        deltaFlush = null
+        pendingDelta.setLength(0)
+
+        val speed = finalMetricsText()
+        state = state.copy(
+            streaming = false,
+            phase = null,
+            liveMetrics = null,
+        )
+        patchAssistant { m ->
+            if (m.status == "streaming") {
+                m.copy(status = "done", metrics = speed ?: m.metrics)
+            } else {
+                m
+            }
+        }
+        saveCurrentSessionMessages()
         engine.cancelTurn()
     }
 
@@ -2071,14 +2147,12 @@ val runtimeEnv = RuntimeEnv(app)
     }
 
     fun openSettings(open: Boolean, tab: String? = null) {
-        // No explicit pane = the last one viewed (persisted), not "general".
-        val t = tab ?: uiPrefs.settingsTab
+        val t = if (open) (tab ?: "general") else "general"
         state = state.copy(settingsOpen = open, settingsTab = t)
     }
 
-    /** A tab tap: remember it so the next open lands where you left off. */
+    /** A tab tap: selects the tab for the current settings session. */
     fun setSettingsTab(tab: String) {
-        uiPrefs.settingsTab = tab
         state = state.copy(settingsTab = tab)
     }
 
@@ -2106,7 +2180,7 @@ val runtimeEnv = RuntimeEnv(app)
             s.historyOpen -> { state = s.copy(historyOpen = false); true }
             s.sheet != null -> { state = s.copy(sheet = null); true }
             s.preview != null -> { state = s.copy(preview = null); true }
-            s.settingsOpen -> { state = s.copy(settingsOpen = false); true }
+            s.settingsOpen -> { state = s.copy(settingsOpen = false, settingsTab = "general"); true }
             else -> false
         }
     }

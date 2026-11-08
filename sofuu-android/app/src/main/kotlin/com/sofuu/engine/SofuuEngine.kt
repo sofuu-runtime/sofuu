@@ -485,15 +485,16 @@ class SofuuEngine(
         // evalNb: a cancel must execute NOW — a draining eval would queue
         // behind the very turn it is meant to stop.
         //
-        // TWO halts, on purpose: __host_poke cancels the chat loop
-        // (approvals, RLM, agent steps), but chat.js's cancel() predates
-        // local streaming and does not abort a model decoding mid-token —
-        // __ai_abort() (the desktop's Esc hook) tears down the in-flight
-        // local C stream by flipping its aborted flag.
+        // THREE halts:
+        // 1. __host_poke cancels host wait gates (approvals, RLM, agent steps)
+        // 2. __ai_abort() tears down the in-flight local C stream (llama.cpp)
+        // 3. sofuu.chat.cancel() calls sofuu.agent.cancel('chat') to abort remote HTTP
+        //    fetch streams, clear pending approvals, and flag the run as cancelled.
         onEngine { rt ->
             val poke = rt.evalNb("__host_poke('{\"type\":\"cancel\"}')")
             val abort = rt.evalNb("(typeof __ai_abort === 'function') ? JSON.stringify(__ai_abort()) : '0'")
-            log("cancel: poke=${poke?.take(60) ?: "NULL"} abort=${abort?.take(60) ?: "NULL"}")
+            val chatCancel = rt.evalNb("(function(){ try { if (globalThis.sofuu && sofuu.chat && typeof sofuu.chat.cancel === 'function') return JSON.stringify(sofuu.chat.cancel()); } catch(e){ return String(e); } return 'none'; })()")
+            log("cancel: poke=${poke?.take(60) ?: "NULL"} abort=${abort?.take(60) ?: "NULL"} chatCancel=${chatCancel?.take(60) ?: "NULL"}")
         }
     }
 

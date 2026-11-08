@@ -204,7 +204,12 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                 // newest first, capped with overflow in the history sheet.
                 val ordered = state.sessions.sortedBy { it.startedAt }
                 val recent = ordered.reversed().take(6).map { it.id }
-                val pills = listOf<String?>(null) + recent
+                val activeId = state.activeSessionId
+                val pills = if (activeId == null) {
+                    listOf<String?>(null) + recent
+                } else {
+                    if (activeId !in recent) listOf(activeId) + recent.take(5) else recent
+                }
                 for (sid in pills) {
                     val active = sid == state.activeSessionId
                     val s = ordered.firstOrNull { it.id == sid }
@@ -469,6 +474,52 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
 
     var showCustomPathDialog by remember { mutableStateOf(false) }
     var customPathInput by remember { mutableStateOf("") }
+    var showNewWorkspaceDialog by remember { mutableStateOf(false) }
+    var newWorkspaceNameInput by remember { mutableStateOf("") }
+
+    if (showNewWorkspaceDialog) {
+        AlertDialog(
+            onDismissRequest = { showNewWorkspaceDialog = false },
+            title = { Text("New Workspace", fontWeight = FontWeight.Bold, color = c.text) },
+            text = {
+                Column {
+                    Text(
+                        "Enter a name for the new workspace folder:",
+                        fontSize = 13.sp,
+                        color = c.textMuted,
+                        modifier = Modifier.padding(bottom = 8.dp),
+                    )
+                    OutlinedTextField(
+                        value = newWorkspaceNameInput,
+                        onValueChange = { newWorkspaceNameInput = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        placeholder = { Text("e.g. My Project") },
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val name = newWorkspaceNameInput.trim()
+                        if (name.isNotEmpty()) {
+                            showNewWorkspaceDialog = false
+                            onClose()
+                            store.createAndAddNewWorkspace(name)
+                        }
+                    },
+                    enabled = newWorkspaceNameInput.isNotBlank(),
+                ) {
+                    Text("Create", fontWeight = FontWeight.Bold, color = if (newWorkspaceNameInput.isNotBlank()) c.accent else c.textFaint)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showNewWorkspaceDialog = false }) {
+                    Text("Cancel", color = c.textMuted)
+                }
+            },
+        )
+    }
 
     val pickFolderLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
@@ -555,7 +606,10 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(8.dp))
                     .background(c.bgRaised)
-                    .clickable { onClose(); store.createAndAddNewWorkspace() }
+                    .clickable {
+                        newWorkspaceNameInput = ""
+                        showNewWorkspaceDialog = true
+                    }
                     .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {

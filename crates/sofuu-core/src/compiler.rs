@@ -1364,7 +1364,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     let kaze_source_json = serde_json::to_string(&kaze_src).unwrap_or_else(|_| "\"\"".to_string());
     let kaze_name_json = serde_json::to_string(file_stem).unwrap_or_else(|_| "\"agent\"".to_string());
 
-    let bootstrap = format!(r#"
+    let bootstrap = format!(r##"
 (function() {{
     var kazeSource = {kaze_source_json};
     var kazeName = {kaze_name_json};
@@ -1372,20 +1372,60 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
 
     var argv = (typeof process !== 'undefined' && process.argv) ? process.argv.slice(2) : [];
     if (argv.indexOf('--help') !== -1 || argv.indexOf('-h') !== -1) {{
-        console.log("Usage: " + kazeName + " [options] [query]\n\nAutonomous AI Agent powered by Kaze & Sofuu.\n\nOptions:\n  -i, --interactive    Launch interactive Agent TUI shell\n  --arg key=val        Pass named argument\n  --cap <name>         Grant capability backend\n  --entry <name>       Routine to execute\n  --fuel <n>           Instruction budget\n  -h, --help           Show help\n");
+        console.log("Usage: " + kazeName + " [options] [query]\n\nAutonomous AI Agent powered by Kaze & Sofuu.\n\nOptions:\n  -i, --interactive      Launch interactive Agent TUI shell\n  -d, --daemon           Run continuous 24/7 autonomous supervisor loop\n  --every <interval>     Supervisor cycle interval (e.g. 500ms, 2s, 10s, 1m, 1h; default: 5s)\n  --interval <interval>  Alias for --every\n  --arg key=val          Pass named argument\n  --cap <name>           Grant capability backend\n  --entry <name>         Routine to execute\n  --fuel <n>             Instruction budget\n  -h, --help             Show help\n");
         return;
     }}
 
     var isInteractive = argv.indexOf('--interactive') !== -1 || argv.indexOf('-i') !== -1;
+    var isDaemon = argv.indexOf('--daemon') !== -1 || argv.indexOf('-d') !== -1;
+    var intervalMs = 5000;
+    var intervalRaw = '5s';
     var entryRoutine = null;
     var fuel = 200000;
     var args = {{}};
     var positionals = [];
 
+    function parseInterval(s) {{
+        if (!s) return 5000;
+        s = ('' + s).trim().toLowerCase();
+        if (s.endsWith('ms')) {{
+            return Math.max(10, parseInt(s.slice(0, -2), 10) || 5000);
+        }}
+        if (s.endsWith('s')) {{
+            return Math.max(100, Math.round((parseFloat(s.slice(0, -1)) || 5) * 1000));
+        }}
+        if (s.endsWith('m')) {{
+            return Math.max(1000, Math.round((parseFloat(s.slice(0, -1)) || 1) * 60 * 1000));
+        }}
+        if (s.endsWith('h')) {{
+            return Math.max(1000, Math.round((parseFloat(s.slice(0, -1)) || 1) * 3600 * 1000));
+        }}
+        if (s.endsWith('d')) {{
+            return Math.max(1000, Math.round((parseFloat(s.slice(0, -1)) || 1) * 86400 * 1000));
+        }}
+        var num = parseFloat(s);
+        if (!isNaN(num) && num > 0) {{
+            return num >= 100 ? Math.round(num) : Math.round(num * 1000);
+        }}
+        return 5000;
+    }}
+
     for (var i = 0; i < argv.length; i++) {{
         var a = argv[i];
         if (a === '--interactive' || a === '-i') continue;
-        if (a === '--entry' && i + 1 < argv.length) {{
+        if (a === '--daemon' || a === '-d') {{
+            isDaemon = true;
+            continue;
+        }}
+        if ((a === '--every' || a === '--interval') && i + 1 < argv.length) {{
+            intervalRaw = argv[++i];
+            intervalMs = parseInterval(intervalRaw);
+            isDaemon = true;
+        }} else if (a.startsWith('--every=') || a.startsWith('--interval=')) {{
+            intervalRaw = a.slice(a.indexOf('=') + 1);
+            intervalMs = parseInterval(intervalRaw);
+            isDaemon = true;
+        }} else if (a === '--entry' && i + 1 < argv.length) {{
             entryRoutine = argv[++i];
         }} else if (a.startsWith('--cap')) {{
             var capVal = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
@@ -1408,7 +1448,9 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     }}
 
     var isTTY = typeof process !== 'undefined' && process.stdout && process.stdout.isTTY;
-    if (isInteractive || (positionals.length === 0 && Object.keys(args).length === 0 && isTTY)) {{
+    if (isDaemon) {{
+        runDaemon();
+    }} else if (isInteractive || (positionals.length === 0 && Object.keys(args).length === 0 && isTTY)) {{
         launchInteractiveTUI();
     }} else {{
         runHeadless();
@@ -1417,6 +1459,9 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     function badge(type, text) {{
         var colorMap = {{
             'AGENT': '\x1b[36m',
+            'DAEMON': '\x1b[35m',
+            'CYCLE': '\x1b[36m',
+            'SUMMARY': '\x1b[32m',
             'AI': '\x1b[35m',
             'TOOL': '\x1b[33m',
             'POLICY': '\x1b[34m',
@@ -1431,6 +1476,117 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         }};
         var col = colorMap[type] || '\x1b[1m';
         console.log(col + '[' + type + ']\x1b[0m ' + text);
+    }}
+
+    function runDaemon() {{
+        if (positionals.length > 0 && Object.keys(args).length === 0) {{
+            var combined = positionals.join(' ');
+            args['query'] = combined;
+            args['prompt'] = combined;
+            args['input'] = combined;
+            args['ticker'] = positionals[0];
+            if (positionals.length > 1) {{
+                args['signal'] = positionals[1];
+            }}
+        }}
+
+        var cycles = 0;
+        var successes = 0;
+        var failures = 0;
+        var startTime = Date.now();
+        var stopping = false;
+        var timerId = null;
+
+        badge('DAEMON', "Starting 24/7 supervisor loop for " + kazeName);
+        badge('DAEMON', "Interval: " + intervalRaw + " (" + intervalMs + "ms) · Fuel: " + fuel + " · PID: " + (typeof process !== 'undefined' ? process.pid : 'unknown'));
+        badge('DAEMON', "Autonomous recovery active · Press Ctrl+C to stop gracefully.");
+
+        function formatDuration(ms) {{
+            var s = Math.floor(ms / 1000);
+            var m = Math.floor(s / 60);
+            var h = Math.floor(m / 60);
+            var d = Math.floor(h / 24);
+            if (d > 0) return d + "d " + (h % 24) + "h " + (m % 60) + "m";
+            if (h > 0) return h + "h " + (m % 60) + "m " + (s % 60) + "s";
+            if (m > 0) return m + "m " + (s % 60) + "s";
+            return s + "s";
+        }}
+
+        function shutdown() {{
+            if (stopping) return;
+            stopping = true;
+            if (timerId !== null) {{
+                clearInterval(timerId);
+                timerId = null;
+            }}
+            var uptime = formatDuration(Date.now() - startTime);
+            console.log("");
+            badge('DAEMON', "Shutdown signal received. Stopping supervisor loop...");
+            badge('SUMMARY', "Cycles: " + cycles + " (" + successes + " succeeded, " + failures + " failed) · Uptime: " + uptime);
+            if (typeof process !== 'undefined' && process.exit) {{
+                process.exit(0);
+            }}
+        }}
+
+        if (typeof process !== 'undefined' && process.on) {{
+            process.on('SIGINT', shutdown);
+            process.on('SIGTERM', shutdown);
+        }}
+
+        function cycle() {{
+            if (stopping) return;
+            cycles++;
+            var ts = (new Date()).toISOString().replace('T', ' ').slice(0, 19);
+            badge('CYCLE', "#" + cycles + " · " + ts);
+            try {{
+                var runArgs = Object.assign({{}}, args);
+                runArgs['cycle'] = cycles;
+                runArgs['timestamp'] = ts;
+
+                var opts = {{ fuel: fuel, grants: defaultGrants }};
+                if (entryRoutine) opts.entry = entryRoutine;
+
+                var res = sofuu.kaze.run(kazeSource, runArgs, opts);
+                if (!res.ok) {{
+                    failures++;
+                    badge('ERROR', "Cycle #" + cycles + " failed: " + (res.error || res.code));
+                }} else {{
+                    successes++;
+                    if (res.actions && res.actions.length > 0) {{
+                        for (var j = 0; j < res.actions.length; j++) {{
+                            var act = res.actions[j];
+                            if (act.indexOf('ai.') !== -1) badge('AI', act);
+                            else if (act.indexOf('tool.') !== -1) badge('TOOL', act);
+                            else if (act.indexOf('policy.') !== -1) badge('POLICY', act);
+                            else if (act.indexOf('memory.') !== -1) badge('MEMORY', act);
+                            else badge('STEP', act);
+                        }}
+                    }}
+                    if (res.logs && res.logs.length > 0) {{
+                        for (var k = 0; k < res.logs.length; k++) {{
+                            var l = res.logs[k];
+                            badge(l.level.toUpperCase(), l.message);
+                        }}
+                    }}
+                    if (res.verdict) {{
+                        if (res.verdict.allow) {{
+                            badge('VERDICT', "\x1b[32mALLOW\x1b[0m " + res.verdict.reason);
+                        }} else {{
+                            badge('VERDICT', "\x1b[31mREJECT\x1b[0m " + res.verdict.reason);
+                        }}
+                    }} else if (res.value && res.value !== 'nothing') {{
+                        badge('RESULT', res.value);
+                    }}
+                    console.log("\x1b[90m" + (res.instructions || 0) + " instructions · " + (res.fuelUsed || 0) + " fuel\x1b[0m");
+                }}
+            }} catch (ex) {{
+                failures++;
+                badge('ERROR', "Cycle #" + cycles + " exception: " + (ex && ex.message ? ex.message : ex));
+            }}
+        }}
+
+        cycle();
+        timerId = setInterval(cycle, intervalMs);
     }}
 
     function runHeadless() {{
@@ -1522,7 +1678,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         }}
     }}
 }})();
-"#);
+"##);
 
     Ok(bootstrap)
 }

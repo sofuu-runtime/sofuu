@@ -174,3 +174,48 @@ Run historical simulation over custom timeframes:
   --arg 'timeframe_days=90' \
   --arg 'strategy_name="EMA_Cross_20_50"'
 ```
+
+---
+
+## 24/7 Autonomous Paper Trading Execution
+
+Run Paper Trader continuously around the clock with one command:
+
+### 1. Foreground Supervisor Loop (`--daemon` / `--every`)
+```bash
+./example-agents/paper_trader/paper-trader \
+  --daemon \
+  --every 5s \
+  --entry analyze_and_trade \
+  --arg 'asset=BTC-USDT' \
+  --arg 'current_price=94200' \
+  --arg 'volume_24h=18000000' \
+  --arg 'sentiment_score=85' \
+  --arg 'requested_action=BUY' \
+  --arg 'requested_allocation_pct=2.0'
+```
+
+### 2. Auto-Installed Persistent Background Service (`sofuu daemon install`)
+```bash
+# Install as launchd (macOS) or systemd (Linux) service:
+sofuu daemon install ./example-agents/paper_trader/paper-trader \
+  --name btc-paper-trader \
+  --every 10s \
+  --entry analyze_and_trade \
+  --arg 'asset=BTC-USDT' \
+  --arg 'current_price=94200' \
+  --arg 'volume_24h=18000000' \
+  --arg 'sentiment_score=85' \
+  --arg 'requested_action=BUY' \
+  --arg 'requested_allocation_pct=2.0'
+
+# View live daemon status:
+sofuu daemon status btc-paper-trader
+
+# Stream live real-time logs:
+sofuu daemon logs btc-paper-trader -f
+
+# Stop or remove service:
+sofuu daemon stop btc-paper-trader
+sofuu daemon uninstall btc-paper-trader
+```

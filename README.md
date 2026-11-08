@@ -646,6 +646,7 @@ sofuu script run|check|compile|repl <file.kaze> # Kaze device scripting (--cap d
 sofuu drone observe|status|send|mission|why|init # [Experimental - Preview] Fly vehicle through R7 hardware safety gate
 sofuu bundle <entry.js> [-o <out.js>]  # Bundle into one file
 sofuu compile <entry.ts|kaze> [-o <out>] # Standalone single-file binary (--lean [default ~4.5M], --micro/--mcp [~2.05M], --full, --base <path>, --embed-brain)
+sofuu daemon install|status|logs|stop|start|restart|uninstall|run # 24/7 autonomous background agent supervisor (launchd/systemd)
 sofuu install / add <package>          # npm packages
 sofuu agent init <name> | validate <f> # Scaffold and dry-run validate agent definitions
 sofuu agent list                       # List agent definitions (~/.sofuu/agents/*.js)

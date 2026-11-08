@@ -140,6 +140,7 @@ fn print_help() {
     println!("  policy init|check|dry-run|why  Write a profile, audit a script, explain a rule");
     println!("  mcp list|test|inspect|add|remove|init|link|build Manage MCP servers and compile micro-binaries");
     println!("  script run|check|compile|repl  Kaze: capability-gated scripting language for agents & devices");
+    println!("  daemon install|status|logs|stop|start|restart|uninstall|run 24/7 background agent service supervisor");
     println!("\n\x1b[1mChat commands (inside the chat UI):\x1b[0m");
     /* P3 (AUDIT-2026-09-07): /models was deliberately removed (unknown
      * command — the model list lives in /provider) — stop advertising it. */
@@ -236,6 +237,7 @@ fn print_subcommand_help(cmd: &str) -> bool {
                --json               machine-readable report\n"
         ),
         "script" => sofuu_core::script_cmd::print_help(),
+        "daemon" => sofuu_core::daemon_cmd::print_help(),
         "capabilities" => println!(
             "Usage: sofuu capabilities\n\n\
              Print the runtime capability manifest as JSON (features, GPU\n\
@@ -3986,6 +3988,15 @@ fn main() -> ExitCode {
              * arm never builds a runtime — `sofuu script check` answers without
              * a model, a config or a network. */
             let rc = sofuu_core::script_cmd::run(&args[2..]);
+            if rc == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        "daemon" => {
+            let sub: Vec<String> = args.get(2..).unwrap_or(&[]).to_vec();
+            let rc = sofuu_core::daemon_cmd::run(&sub);
             if rc == 0 {
                 ExitCode::SUCCESS
             } else {

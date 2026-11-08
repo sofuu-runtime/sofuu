@@ -238,3 +238,57 @@ Every compiled binary is a single self-contained native executable (**~4.5 MiB**
 2. **Compile-Time Safety Verification**: Front-end checks (`sofuu.kaze.check`) validate capability declarations and type signatures at compile time before any binary is produced.
 3. **Fail-Closed Security Matrix**: Capability family gating (`needs: ...`) prevents undeclared ambient I/O from executing inside the VM.
 4. **Single Binary Distribution**: Standalone single-file native executables run on macOS (arm64, x86_64) and Linux (x86_64, aarch64 / Pi 5) without needing Node.js, Python, or npm.
+
+---
+
+## 6. Running Agents 24/7 with One Command
+
+Run any standalone agent continuously around the clock with zero configuration files using either of the two unified modes:
+
+### Mode A: Native Standalone Daemon (`--daemon` / `--every`)
+Directly run the compiled standalone binary in a continuous autonomous supervisor loop:
+
+```bash
+./example-agents/paper_trader/paper-trader \
+  --daemon \
+  --every 5s \
+  --entry analyze_and_trade \
+  --arg 'asset=BTC-USDT' \
+  --arg 'current_price=94200' \
+  --arg 'volume_24h=18000000' \
+  --arg 'sentiment_score=85' \
+  --arg 'requested_action=BUY' \
+  --arg 'requested_allocation_pct=2.0'
+```
+
+* **Crash Recovery:** Exceptions never crash the daemon; errors are contained and logged, and the next cycle runs on time.
+* **Graceful Exit:** Press `Ctrl+C` at any time to see the shutdown summary badge:
+  `[SUMMARY] Completed 42 cycles (42 succeeded, 0 failed) · Uptime: 3m 30s`
+
+### Mode B: Zero-Config OS Background Service (`sofuu daemon install`)
+Install the agent as a persistent system service that auto-restarts on boot and survives terminal closures:
+
+```bash
+# 1. Install & start service (launchd on macOS, systemd on Linux):
+sofuu daemon install ./example-agents/paper_trader/paper-trader \
+  --name btc-paper-trader \
+  --every 10s \
+  --entry analyze_and_trade \
+  --arg 'asset=BTC-USDT' \
+  --arg 'current_price=94200' \
+  --arg 'volume_24h=18000000' \
+  --arg 'sentiment_score=85' \
+  --arg 'requested_action=BUY' \
+  --arg 'requested_allocation_pct=2.0'
+
+# 2. View running daemon status & PID:
+sofuu daemon status btc-paper-trader
+
+# 3. Stream real-time execution logs:
+sofuu daemon logs btc-paper-trader -f
+
+# 4. Stop or uninstall:
+sofuu daemon stop btc-paper-trader
+sofuu daemon uninstall btc-paper-trader
+```
+

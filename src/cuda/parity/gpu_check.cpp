@@ -479,8 +479,10 @@ void test_fused_q8(void *fn_rms, void *fn_rmsadd, void *fn_swiglu,
                 ++bad_d;
             }
             if (s_got[(size_t)i] != s_ref[(size_t)i]) ++bad_s;
+            // s16 (the 16-value halves) is a separate array from s (the
+            // 32-value sums): comparing against s read past its end.
             for (int hh = 0; hh < 2; ++hh) {
-                if (s16_got[(size_t)(i * 2 + hh)] != s_ref[(size_t)(i * 2 + hh)]) {
+                if (s16_got[(size_t)(i * 2 + hh)] != s16_ref[(size_t)(i * 2 + hh)]) {
                     ++bad_s16;
                 }
             }
@@ -896,6 +898,92 @@ void bench_gemv_q8(const char *name, void *fn, int kind, int rows, int cols,
     sofuu_cuda_ctx_free(g_ctx, ds);
     sofuu_cuda_ctx_free(g_ctx, d16);
     sofuu_cuda_ctx_free(g_ctx, dy);
+}
+
+// The model does not run a GEMV 400 times in a row: it runs it once, between a
+// rmsnorm+quantize and the next layer. In situ the same kernel that measures
+// 257 GB/s back-to-back only reaches ~159 GB/s, so this bench reproduces the
+// alternation and reports the GEMV alone. If the mixed number matches the
+// model, the gap is the call pattern and can be attacked here in seconds
+// instead of through the T4 gate.
+void bench_gemv_q8_mixed(const char *name, void *fn_gemv, int rows, int cols,
+                         uint32_t &seed) {
+    std::vector<uint8_t> w;
+    fill_q4_k(w, rows, cols, seed);
+    const int nblk = cols / 32;
+    std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
+    std::vector<int8_t> xq(cols);
+    std::vector<float> xd(nblk);
+    std::vector<int32_t> xs(nblk), xs16(nblk * 2);
+    sofuu_ref::quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(),
+                             xs16.data(), cols);
+    std::vector<float> y((size_t)rows, 0.0f);
+    std::vector<float> nw = random_vec(cols, seed, 0.5f, 1.5f);
+    unsigned long long dw = 0, dq = 0, dd = 0, ds = 0, d16 = 0, dy = 0, dn = 0,
+                       dny = 0;
+    if (!alloc_upload(w.data(), w.size(), &dw) ||
+        !alloc_upload(xq.data(), xq.size(), &dq) ||
+        !alloc_upload(xd.data(), (size_t)nblk * 4, &dd) ||
+        !alloc_upload(xs.data(), (size_t)nblk * 4, &ds) ||
+        !alloc_upload(xs16.data(), (size_t)nblk * 8, &d16) ||
+        !alloc_only((unsigned long long)rows * 4, &dy) ||
+        !alloc_upload(nw.data(), nw.size() * 4, &dn) ||
+        !alloc_only((unsigned long long)cols * 4, &dny)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    std::vector<void *> params = {&dw, &dq, &dd, &ds, &dy, (void *)&rows,
+                                  (void *)&cols};
+    unsigned grid = (unsigned)((rows + 7) / 8);
+    int nn = cols;
+    float ev = 1e-5f;
+    std::vector<void *> nparams = {&dn, &dn, &dny, &dq, &dd, &ds, &d16, &nn, &ev};
+    const int reps = 60;
+    auto mixed_pass = [&](void *rms_kernel) {
+        for (int i = 0; i < reps; ++i) {
+            if (rms_kernel && !launch_async(rms_kernel, 1, 256, nparams)) {
+                return false;
+            }
+            if (!launch_async(fn_gemv, grid, 256, params)) return false;
+        }
+        return true;
+    };
+    void *rms = nullptr;
+    if (!get_function("sofuu_rmsnorm_q8", &rms)) return;
+    if (!mixed_pass(nullptr) || sofuu_cuda_ctx_sync(g_ctx) != 0) {
+        fail_msg("mixed warmup");
+        return;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    if (!mixed_pass(nullptr)) return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
+        fail_msg("mixed sync");
+        return;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double solo = std::chrono::duration<double>(t1 - t0).count() / reps;
+    t0 = std::chrono::steady_clock::now();
+    if (!mixed_pass(rms)) return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
+        fail_msg("mixed sync 2");
+        return;
+    }
+    t1 = std::chrono::steady_clock::now();
+    double with_norm = std::chrono::duration<double>(t1 - t0).count() / reps;
+    double bytes = (double)rows * (double)(cols / 256) * 144.0;
+    std::printf("[bench] %-14s %dx%d  solo %.1f GB/s  after-norm %.1f GB/s "
+                "(+%.1f us/iter)\n",
+                name, rows, cols, bytes / solo / 1e9, bytes / with_norm / 1e9,
+                (with_norm - solo) * 1e6);
+    sofuu_cuda_ctx_free(g_ctx, dw);
+    sofuu_cuda_ctx_free(g_ctx, dq);
+    sofuu_cuda_ctx_free(g_ctx, dd);
+    sofuu_cuda_ctx_free(g_ctx, ds);
+    sofuu_cuda_ctx_free(g_ctx, d16);
+    sofuu_cuda_ctx_free(g_ctx, dy);
+    sofuu_cuda_ctx_free(g_ctx, dn);
+    sofuu_cuda_ctx_free(g_ctx, dny);
 }
 
 // Empty-launch cost on the GPU timeline. A decode step issues ~290 kernels, so
@@ -1323,6 +1411,8 @@ int main(int argc, char **argv) {
     bench_gemv_q8("x_q8_1row_lm", f_q4q8, 1, 128256, 2048, 60, seed);
     bench_gemv_q8("q6k_x_q8", f_q6q8, 2, 8192, 2048, 400, seed);
     bench_gemv_q8("q6k_x_q8_lm", f_q6q8, 2, 128256, 2048, 60, seed);
+    bench_gemv_q8_mixed("q4k_mixed", f_q4q8, 8192, 2048, seed);
+    bench_gemv_q8_mixed("q4k_mixed_2k", f_q4q8, 2048, 2048, seed);
 
     sofuu_cuda_ctx_destroy(g_ctx);
     sofuu_cuda_driver_close(g_drv);

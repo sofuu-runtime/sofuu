@@ -2,7 +2,7 @@
 
 # ⚡ Sofuu (素風)
 
-> *The general-purpose runtime for AI — built to run anywhere from servers to smart devices. A compact, sovereign systems engine (Rust/C core, QuickJS/libuv) combining autonomous agent loops, the Kaze agent language, encrypted cognitive vector memory (QTSQ), and native MCP in a single self-contained native binary (under 10 MB). Zero Python environments, zero external daemons, zero setup baggage.*
+> *A lightweight native runtime for AI applications, tools, and agents (under 10 MB). Written in Rust, QuickJS, and libuv. Unites autonomous agent loops, declarative Kaze routines, on-device vector memory (QTSQ), and native Model Context Protocol (MCP) in a single binary — zero Python environments, zero external daemons.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0--beta-orange.svg)](https://github.com/sofuu-runtime/sofuu/releases)
@@ -19,18 +19,18 @@
 
 ## Why Sofuu?
 
-Today's AI stack is fragmented and bloated: running an agent or workflow typically requires Python virtualenvs, Node.js packages, external vector databases (Chroma/Pinecone), background servers (Ollama/vLLM), and multi-gigabyte Docker containers.
+Today's AI development stack is fragmented: running an agent or workflow typically requires Python virtualenvs, Node.js packages, external vector databases (Chroma/Pinecone), background servers (Ollama/vLLM), and multi-gigabyte Docker containers.
 
 **Sofuu collapses this entire stack into a single lightweight binary (< 10 MB).**
 
-Whether you write in modern **TypeScript/JavaScript** or declare pure autonomous agents in **Kaze (`.kaze`)**, Sofuu executes everything in-process with zero external dependencies:
+Whether you write in modern **TypeScript/JavaScript** or declare autonomous agents in **Kaze (`.kaze`)**, Sofuu executes everything in-process with zero external dependencies:
 
-* 🚀 **Instant Startup (< 20 ms cold start):** Single native Mach-O / ELF binary. Zero JIT warmup pauses, making it 100% compliant with strict platform boundaries (iOS App Store, RTOS, edge IoT).
-* 🧠 **Built-in Cognitive Vector Memory (QTSQ):** Persistent semantic memory in encrypted `.qtsq` containers. Zero-byte offline embeddings, sub-2ms hardware SIMD search, zero localhost database servers.
-* 🤖 **Autonomous Agents & Kaze Language:** Full reasoning loops, cooperative scheduling, domain toolpacks, fail-closed capability gates (`needs: ...`), and compile directly to single-binary native executables (`sofuu compile`).
-* 🔌 **First-Class Model Context Protocol (MCP):** Connect to or host MCP tools over stdio, SSE, or direct in-process transports with zero npx/Node overhead.
-* 🛡 **Unified R7 Security Firewall:** Deterministic capability sandboxing governing tools, shell, filesystem, and network with fail-closed policies.
-* 📱 **Runs Everywhere (`libsofuu`):** Cloud servers, developer workstations, Raspberry Pi 5, edge IoT gateways, and embedded mobile apps (iOS & Android).
+* **Instant Cold Starts (< 20 ms):** Single native Mach-O / ELF binary without JIT warmup delays. Complies with strict execution environments like the iOS App Store and RTOS.
+* **On-Device Vector Memory (QTSQ):** Persistent semantic memory stored in encrypted `.qtsq` files. Zero-byte offline embeddings and sub-2ms SIMD vector search without running database servers.
+* **Autonomous Agents & Kaze Language:** Multi-step agent loops, cooperative scheduling, domain toolpacks, fail-closed capability gates (`needs: ...`), and single-binary compilation (`sofuu compile`).
+* **Native Model Context Protocol (MCP):** Complete client and server implementation supporting stdio, HTTP, SSE, and in-memory direct transports with zero Node.js/npx overhead.
+* **Deterministic Sandboxing:** Fine-grained policy gates governing tool execution, filesystem access, network egress, and shell commands.
+* **Universal Deployment (`libsofuu`):** Cloud servers, workstations, Raspberry Pi 5, edge IoT devices, and mobile apps (iOS & Android).
 
 ---
 
@@ -50,9 +50,9 @@ Official pre-compiled single binaries are available for macOS (Apple Silicon) an
 
 ---
 
-### 2. Native AI Memory in Standard JavaScript / TypeScript
+### 2. On-Device Vector Memory in Standard JavaScript / TypeScript
 
-Most frameworks require API keys or 2 GB model downloads just to test vector memory. With Sofuu, offline semantic memory works instantly out of the box:
+Most frameworks require API keys or 2 GB model downloads just to test vector search. With Sofuu, offline semantic memory works out of the box:
 
 ```javascript
 // memory.js — Run directly: $ sofuu run memory.js
@@ -96,16 +96,16 @@ console.log(result.answer);
 
 ### 4. Pure Kaze Agent & Direct Native Compilation
 
-You can program 100% pure autonomous AI agents in Kaze (`.kaze`) with **zero JavaScript or Python**, and compile them directly into standalone native executables:
+You can program autonomous AI agents in Kaze (`.kaze`) with **zero JavaScript or Python**, and compile them directly into standalone native executables:
 
 ```kaze
-# agent.kaze — Pure Declarative Autonomous Agent
+# agent.kaze — Declarative Autonomous Agent
 needs: ai, tool, policy, memory, log, alert
 
 filter monitor_and_act(source, metric_val, threshold, max_limit):
     log.info("Telemetry ingest: " + source + " = " + metric_val)
 
-    # 1. Fail-closed security: block credential leaks before execution
+    # 1. Fail-closed policy check: block credential leaks before execution
     if policy detects secrets in source:
         reject "Security refusal: credential leak in source"
 
@@ -126,7 +126,7 @@ filter monitor_and_act(source, metric_val, threshold, max_limit):
     allow "Nominal telemetry"
 ```
 
-Compile directly into a standalone, single-file native binary (under 10 MB) with production 12-factor configuration:
+Compile directly into a standalone single-file native binary (under 10 MB) with 12-factor configuration:
 
 ```bash
 # 1. Compile pure Kaze directly into a standalone single binary:
@@ -143,104 +143,157 @@ $ ./my-agent --config agent.config.json --daemon --every 5s
 
 ## Core Runtime vs. Experimental Preview
 
-To maintain rock-solid production reliability, Sofuu clearly delineates core guaranteed subsystems from preview modules:
+Sofuu maintains a clear demarcation between core guaranteed subsystems and preview modules:
 
-| Subsystem | Readiness | What it covers |
+| Subsystem | Status | Description |
 | :--- | :---: | :--- |
 | **Autonomous Agent Engine** | 🟢 **Core** | `sofuu.agent`, cooperative scheduling (`scheduler.yield`), step budgets, resilient editing (`smart_edit`), and real-time trace streaming. |
 | **Domain Toolpacks** | 🟢 **Core** | Modular toolpacks (`coding`, `web`, `memory`, `system`), single-instruction fuel sandbox, numbered unified diffs. |
 | **Standalone Compiler** | 🟢 **Core** | `sofuu compile`: native executables (under 10 MB) with 32-byte `SOFUU_BIN_V1` trailer, ad-hoc signing, sub-5ms cold starts. |
-| **Cognitive Memory (QTSQ)** | 🟢 **Core** | On-device `.qtsq` vector containers, cached KDF v2, plaintext zero-KDF mode, hardware SIMD search. |
-| **Model Context Protocol (MCP)** | 🟢 **Core** | Native client & server over stdio, SSE, and direct in-process transports; dynamic tool discovery. |
+| **Vector Memory (QTSQ)** | 🟢 **Core** | On-device `.qtsq` vector containers, cached KDF v2, plaintext zero-KDF mode, hardware SIMD search. |
+| **Model Context Protocol (MCP)** | 🟢 **Core** | Native client & server supporting stdio, HTTP, SSE, and direct in-process transports; dynamic tool discovery. |
 | **Kaze Agent Language** | 🟢 **Core** | Declarative agent language, linear arena VM, zero GC pauses, fail-closed policy gates, 12-factor configuration. |
-| **Unified R7 Security Firewall** | 🟢 **Core** | Deterministic path traversal blocking, private CIDR SSRF filtering, credential shielding (`.env`, `id_rsa`). |
+| **Security Sandbox** | 🟢 **Core** | Deterministic path traversal blocking, private CIDR SSRF filtering, credential shielding (`.env`, `id_rsa`). |
 | **Local Inference Engine** | 🧪 **Preview** | Built-in custom GGUF/SafeTensors engine. (For deployed local inference, use `sofuu-plugin-llamacpp` or remote providers). |
-| **Robotics & MAVLink** | 🧪 **Preview** | `sofuu drone`, MAVLink v2 codec, and GPIO line timers through R7 hardware safety gates. |
+| **Robotics & MAVLink** | 🧪 **Preview** | `sofuu drone`, MAVLink v2 codec, and GPIO line timers through hardware safety gates. |
 | **Native Frontend Engine** | 🧪 **Preview** | `sofuu dev` streaming JSX/TSX transpiler and reactive micro-runtime. |
 
 ---
 
 ## Core Capabilities
 
-### 1. Model Context Protocol (MCP) & Standalone Micro-Binaries
+### 1. Model Context Protocol (MCP)
 
-Sofuu features first-class native MCP client and server support with **zero external dependencies** — no Node.js, Python, or `npx` required.
+Sofuu provides a complete native MCP client and server implementation (protocols `2025-06-18` and `2024-11-05`) with **zero external dependencies** — no Node.js, Python, or `npx` required.
 
-#### Compile Any MCP Server into a Standalone Native Binary (`sofuu mcp build`)
-Turn any TypeScript or JavaScript MCP server into a single, self-contained native binary (~2.05 MiB) with instant startup and sub-5 MB memory footprint:
+#### MCP Client
+Connect to local or remote MCP servers to discover tools, read resources, and execute actions:
+
+```javascript
+// Connect via stdio, Streamable HTTP, or legacy SSE
+const client = await sofuu.mcp.connect("npx -y @modelcontextprotocol/server-filesystem /tmp");
+// or: await sofuu.mcp.connect({ url: "http://127.0.0.1:9000/mcp", transport: "http" });
+
+// Discover tool inventory and call tools
+const tools = await client.listTools();
+const result = await client.call("read_file", { path: "/tmp/notes.txt" });
+console.log(result.text);
+
+client.disconnect();
+```
+
+* **Transports Supported:** `stdio` (command spawning with newline-delimited JSON-RPC), `http` (Streamable HTTP with session handling), `sse` (HTTP+SSE), and `direct` (in-memory).
+* **Configuration & Policy (`~/.sofuu/mcp.json`):** Configure persistent servers with per-server tool allow/deny filters (`tools: { allow: ["read_file"], deny: ["write_file"] }`) and secret store resolution (`TOKEN: { secret: "MCP_TOKEN" }`).
+
+#### MCP Server
+Build standalone or in-process MCP servers in TypeScript or JavaScript:
+
+```javascript
+const server = sofuu.mcp.serve({ name: "math-service", version: "1.0.0" });
+
+// Register tools with schema validation
+server.tool("fibonacci", {
+  description: "Calculate the nth Fibonacci number",
+  schema: { type: "object", properties: { n: { type: "number" } }, required: ["n"] }
+}, async ({ n }) => {
+  return { result: fib(n) };
+});
+
+// Register resources and prompts
+server.resource("system://metrics", { mimeType: "application/json" }, async () => {
+  return JSON.stringify({ cpu: process.cpuUsage(), memory: process.memoryUsage() });
+});
+
+// Composable onion middleware
+server.use(async (ctx, next) => {
+  console.log(`[MCP] Invoking ${ctx.toolName}`);
+  await next();
+});
+
+server.start(); // Spawns over stdio for Cursor, Claude Desktop, or custom clients
+```
+
+#### In-Memory Direct Transport for Agents
+Connect an in-process MCP server directly to an autonomous agent without process spawning or serialization overhead:
+
+```javascript
+const directClient = await sofuu.mcp.connect(server, { transport: "direct" });
+const agent = sofuu.agent.define({
+  name: "calculator-agent",
+  tools: [directClient],
+});
+```
+
+#### CLI Tooling & Standalone Binary Compilation
+Sofuu includes CLI commands to test, inspect, link, and compile MCP servers:
 
 ```bash
-# 1. Compile MCP server directly into a standalone native micro-binary (~2.05 MiB):
-sofuu mcp build server.ts -o dist/weather-mcp
+# Test handshake, protocol negotiation, and tool count
+sofuu mcp test "npx -y @modelcontextprotocol/server-filesystem /tmp"
 
-# 2. Inspect tools and execute calls directly from the terminal (zero code):
-sofuu mcp inspect ./dist/weather-mcp --call get_weather --args '{"city":"Tokyo"}'
+# Inspect and execute a tool directly from the terminal
+sofuu mcp inspect "npx -y some-server" --call echo --args '{"text":"hello"}'
 
-# 3. Synchronize server definitions directly into your IDE:
-sofuu mcp link cursor           # Link to Cursor IDE
-sofuu mcp link claude-desktop   # Link to Claude Desktop
+# Synchronize server configurations into your editor
+sofuu mcp link cursor           # Configure in Cursor IDE
+sofuu mcp link claude-desktop   # Configure in Claude Desktop
+
+# Optional: Compile any MCP server into a standalone single-file binary (~2 MB)
+sofuu mcp build server.ts -o dist/my-mcp-server
 ```
 
-* **Ultra-Lean Footprint (~2.05 MiB):** Targets the dedicated `sofuu-micro` native base. Dead-code elimination strips over 3.2 MB of unused GPU and tensor machinery, yielding sub-5 MB RSS and 0 ms cold execution.
-* **Lightweight Multi-Server Workspaces:** Run 10+ concurrent MCP servers in your editor or autonomous agent swarms with virtually zero system resource drain.
+> **Standalone Compilation (`sofuu mcp build`):** Packages your TypeScript/JavaScript MCP server against the `sofuu-micro` base (~2.05 MiB). Dead-code elimination strips unused AI models and UI machinery to run with < 5 MB RSS and 0 ms cold start, requiring no runtime installed on the target machine.
 
-#### Write & Connect MCP Servers in Code
-```javascript
-// 1. In-process MCP server with zero serialization overhead
-const server = sofuu.mcp.serve({ name: "math-service", version: "1.0.0" });
-server.tool("fibonacci", {
-  description: "Calculate nth fibonacci",
-  schema: { type: "object", properties: { n: { type: "number" } }, required: ["n"] }
-}, async ({ n }) => ({ result: 55 }));
-
-server.start(); // Spawns over stdio for any standard MCP client
-
-// 2. Connect to external or direct in-memory MCP servers
-const client = await sofuu.mcp.connect("npx -y @modelcontextprotocol/server-filesystem /tmp");
-const tools = await client.listTools();
-await client.call("read_file", { path: "/tmp/notes.txt" });
-client.disconnect();
-
-// 3. Bind directly to an autonomous agent loop with zero IPC hops:
-const directClient = await sofuu.mcp.connect(server, { transport: "direct" });
-const agent = sofuu.agent.define({ name: "solver", tools: [directClient] });
-```
-
-Full guide: [docs/MCP.md](docs/MCP.md).
+Full documentation: [docs/MCP.md](docs/MCP.md).
 
 ---
 
-### 2. Five-Shield Plugin System & Extensibility
+### 2. Plugins & Extensibility
 
-Sofuu is extensible directly from JavaScript or TypeScript with **no build step**: drop a file into `./plugins/` (or run `sofuu plugin add`) and it is discovered, validated, and registered at startup.
+Sofuu is extensible directly from TypeScript or JavaScript with **no build step**. Drop a file into `./plugins/` (or `~/.sofuu/plugins/`), or install via `sofuu plugin add`, and it is discovered, validated, and registered at startup.
 
-Every plugin is isolated behind the **Five Shields Pipeline**, ensuring that an untrusted or crashing plugin can never bring down the host runtime:
-
-| Shield | Protection Layer | Failure Code | Behavior |
-| :--- | :--- | :---: | :--- |
-| **1. Schema** | Input & Output Validation | `E_SCHEMA` | Inputs validated before execution; callable never receives bad payloads. |
-| **2. Policy Jail** | Network & Filesystem Boundaries | `E_DENIED` | Enforces `permissions.net` allowlist, private CIDR SSRF block, and jailed `ctx.fs`. |
-| **3. Circuit Breaker** | Cascading Failure Defense | `E_CIRCUIT_OPEN` | Automatically trips after 5 consecutive failures / 30s to prevent hanging. |
-| **4. Watchdog** | Hardware Timer Deadlines | `E_TIMEOUT` | Bounded execution budget (default 15s) with cooperative abort signal (`ctx.signal`). |
-| **5. Panic Guard** | Runtime Crash Insulation | `E_TOOL` | Unhandled exceptions, rejected promises, or circular references return typed errors. |
-
-#### Five Extensible Categories:
-* **Tools (`defineTool`):** LLM-callable actions with auto-generated schemas and permission gates.
-* **Inference Providers (`defineProvider`):** Custom LLM backends (e.g. `sofuu plugin add llamacpp`, Ollama, or local HTTP endpoints).
+#### Plugin Categories
+* **Tools (`defineTool`):** Actions callable by LLMs with Zod or JSON Schema input validation and fine-grained permissions.
+* **Providers (`defineProvider`):** Custom or local model backends (e.g. `sofuu plugin add llamacpp`, Ollama, or custom HTTP endpoints).
 * **Storage & Vector Stores (`defineVectorStore` / `defineStorage`):** Connect remote databases (e.g. pgvector, Pinecone) as an asynchronous dual-write mirror behind local QTSQ memory.
-* **Lifecycle Services (`defineService`):** Background hooks for `onStart`, `onTurnStart`, `onToolCall`, and `onTurnEnd`.
-* **OpenAPI & MCP Ingest (`useOpenAPI`, `ingestMcp`):** Zero-code bridging of external REST APIs and MCP servers.
+* **Services (`defineService`):** Background lifecycle hooks (`onStart`, `onTurnStart`, `onToolCall`, `onToolResult`, `onTurnEnd`, `onStop`).
+* **OpenAPI & MCP Ingest (`useOpenAPI`, `ingestMcp`):** Automatic zero-code bridging of external REST APIs and MCP servers.
 
+#### Defining a Sandboxed Tool
+```typescript
+import { defineTool, z } from "sofuu";
+
+export default defineTool({
+  name: "weather",
+  description: "Get current weather for a city",
+  schema: z.object({ city: z.string() }),
+  timeoutMs: 5000,
+  permissions: { net: ["api.weatherapi.com"] }, // Network allowlist
+  circuitBreaker: { failureThreshold: 5, resetTimeoutMs: 30000 },
+  async run({ city }, ctx) {
+    const res = await ctx.fetch(`https://api.weatherapi.com/v1/current.json?q=${city}`);
+    return res.json();
+  },
+});
+```
+
+#### Fault Isolation & Execution Safety
+Every plugin runs with isolated boundaries:
+* **Input & Output Validation:** Arguments are validated against the schema before handler execution (`E_SCHEMA`).
+* **Resource Sandboxing:** `ctx.fs` is scoped to the project directory, and network access is restricted to declared hosts (`E_DENIED`).
+* **Timeouts & Circuit Breakers:** Execution is bounded by hardware deadlines (`E_TIMEOUT`), and failing services trip circuit breakers to prevent request stalls (`E_CIRCUIT_OPEN`).
+* **Error Containment:** Exceptions, rejected promises, or circular references return typed error structures without crashing the host process (`E_TOOL`).
+
+#### CLI Workflow
 ```bash
-# Plugin CLI Workflow
 sofuu plugin add llamacpp                   # Install official local LLM provider bridge
 sofuu plugin init weather --category=tool   # Scaffold new tool in ./plugins/weather.ts
 sofuu plugin validate plugins/weather.ts    # Parse, check types, and verify registration
 sofuu plugin test weather '{"city":"Oslo"}' # Invoke tool once and print execution envelope
-sofuu plugin list                           # View all registered plugins and circuit breaker states
+sofuu plugin list                           # View all registered plugins and breaker states
 ```
 
-Full guide: [docs/PLUGINS.md](docs/PLUGINS.md).
+Full documentation: [docs/PLUGINS.md](docs/PLUGINS.md).
 
 ---
 
@@ -325,18 +378,19 @@ sofuu script run <file.kaze>   # Run a pure Kaze agent routine
 sofuu compile <file.kaze|ts>   # Compile agent into standalone native binary (under 10 MB)
 sofuu daemon install|run       # Manage 24/7 autonomous supervisor daemon
 
-# Model Context Protocol (MCP) & Standalone Micro-Binaries
-sofuu mcp build <server.ts> -o <out> # Compile MCP server to standalone native micro-binary (~2.05 MiB)
-sofuu mcp inspect <server|bin> --call <tool> --args '<json>' # Inspect & invoke tools directly
-sofuu mcp test "npx -y <srv>"  # Protocol handshake and tool inventory verification
-sofuu mcp link cursor|claude   # Synchronize server configuration into Cursor & Claude Desktop
+# Model Context Protocol (MCP)
+sofuu mcp list                      # List configured MCP servers
+sofuu mcp test "npx -y <server>"    # Test handshake and protocol negotiation
+sofuu mcp inspect <server> --call <tool> --args '<json>' # Inspect and invoke a tool
+sofuu mcp link cursor|claude-desktop # Sync server configuration to IDEs
+sofuu mcp build <server.ts> -o <out> # Compile MCP server to standalone native binary (~2 MB)
 
-# Extensibility & 5-Shield Plugins
-sofuu plugin add <llamacpp|ollama>   # Install official plugin bridges
-sofuu plugin init <name> --category=tool # Scaffold new plugin
-sofuu plugin validate <file.ts>      # Validate registration, schemas & shields
-sofuu plugin test <name> '<json>'    # Test run a tool with circuit state reporting
-sofuu plugin list                    # List registered plugins & circuit breaker states
+# Plugins & Extensibility
+sofuu plugin list                   # List registered plugins and circuit breaker states
+sofuu plugin add <llamacpp|ollama>  # Install provider plugin
+sofuu plugin init <name> --category=tool # Scaffold a new plugin
+sofuu plugin validate <file.ts>     # Validate schemas and registration
+sofuu plugin test <name> '<json>'   # Test run a tool with circuit state reporting
 
 # Memory & Serving
 sofuu brain verify <path>      # Verify QTSQ cognitive memory container

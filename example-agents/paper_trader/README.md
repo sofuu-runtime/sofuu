@@ -47,70 +47,134 @@ The compiled binary includes:
 
 ---
 
-## 4. Execution Examples & Verification
+## 4. Autonomous Execution Examples & Verification
 
-### Test 1: Valid Simulated Trade Execution (Allowed)
-
-Simulate analyzing and executing a paper trade on Bitcoin with 15% allocation:
+### Test 1: Autonomous Market Analysis & BUY Order
+The agent analyzes market data, synthesizes technical support/resistance via neural prompt, saves the thesis to vector memory, and **autonomously decides to BUY**:
 
 ```bash
 ./example-agents/paper_trader/paper-trader \
   --arg asset=BTC-USDT \
-  --arg current_price=75893 \
-  --arg volume_24h=367000000 \
-  --arg sentiment_score=50 \
-  --arg requested_action=BUY \
-  --arg requested_allocation_pct=15
+  --arg current_price=75000 \
+  --arg sentiment_score=70
 ```
 
-**Live Trace Output:**
+**Live Output:**
 ```
 [AGENT] agent :: analyze_and_trade
-[STEP] log.info("Paper Trader analyzing BTC-USDT (BUY at $75893, allocation=15%)") -> nothing
 [POLICY] policy.detects("secrets", "BTC-USDT") -> false
-[AI] ai.prompt("Act as Paper Trader market analyst. Analyze BTC-USDT at price $75893 with 24h volume $367000000 and sentiment index 50 for simulated action: BUY. Calculate support/resistance levels, target price, stop-loss, and simulated trade rationale. Note: strictly paper trading simulation.") -> "Synthesized autonomous decision..."
+[AI] ai.prompt("Act as Paper Trader market analyst. Analyze BTC-USDT at price $75000...")
 [MEMORY] memory.save("BTC-USDT_paper_thesis", ...) -> nothing
-[TOOL] tool.call("paper_exchange", "BTC-USDT:BUY@75893;allocation=15%") -> OK
-[INFO] Paper Trader analyzing BTC-USDT (BUY at $75893, allocation=15%)
-[INFO] Simulated paper order status: OK: tool 'paper_exchange' executed
-[VERDICT] ALLOW "Synthesized autonomous decision..."
-94 instructions · 0 fuel
-```
-
-**Expected Live Trace:**
-```
-[AGENT] agent :: analyze_and_trade
-[POLICY] policy.detects("secrets", "BTC/USD") -> false
-[AI] ai.prompt("Act as Paper Trader market analyst. Analyze BTC/USD at price $68450...")
-[MEMORY] memory.save("BTC/USD_paper_thesis", ...) -> nothing
-[TOOL] tool.call("paper_exchange", "BTC/USD:BUY@68450;allocation=15%") -> OK
-[INFO] Paper Trader analyzing BTC/USD (BUY at $68450, allocation=15%)
-[INFO] Simulated paper order status: OK: tool 'paper_exchange' executed
-[VERDICT] ALLOW "Synthesized autonomous decision..."
+[TOOL] tool.call("paper_exchange", "BTC-USDT:BUY@75000;allocation=20%") -> OK
+[INFO] Paper Trader analyzing BTC-USDT at $75000 (24h Vol: $100000000, Sentiment: 70, Entry: $0)
+[INFO] AUTONOMOUS DECISION: BUY BTC-USDT at $75000 (Bullish sentiment 70, 20% allocation)
+[VERDICT] ALLOW "BUY executed: OK: tool 'paper_exchange' executed..."
+107 instructions · 0 fuel
 ```
 
 ---
 
-### Test 2: Allocation Risk Breach Guardrail (Rejected)
+### Test 2: Autonomous TAKE PROFIT Order (+2% Profit Target Hit)
+Holding a position entered at \$75,000 when price moves to **\$76,600** (+2.1% profit). The agent autonomously detects the target, triggers a SELL order to lock in profit, and dispatches an alert:
 
+```bash
+./example-agents/paper_trader/paper-trader \
+  --arg asset=BTC-USDT \
+  --arg current_price=76600 \
+  --arg entry_price=75000
+```
+
+**Live Output:**
+```
+[AGENT] agent :: analyze_and_trade
+[INFO] AUTONOMOUS DECISION: TAKE PROFIT on BTC-USDT (+2% target reached from entry $75000)
+[TOOL] tool.call("paper_exchange", "BTC-USDT:SELL@76600;reason=TAKE_PROFIT;allocation=100%")
+[STEP] alert.send("PROFIT TAKEN: Closed BTC-USDT position at $76600")
+[VERDICT] ALLOW "TAKE PROFIT executed..."
+105 instructions · 0 fuel
+```
+
+---
+
+### Test 3: Autonomous STOP LOSS Order (-2% Risk Boundary Hit)
+Holding a position entered at \$75,000 when price drops to **\$73,200** (-2.4% loss). The agent autonomously detects the risk limit, triggers a defensive SELL order, and cuts the loss:
+
+```bash
+./example-agents/paper_trader/paper-trader \
+  --arg asset=BTC-USDT \
+  --arg current_price=73200 \
+  --arg entry_price=75000
+```
+
+**Live Output:**
+```
+[AGENT] agent :: analyze_and_trade
+[INFO] AUTONOMOUS DECISION: STOP LOSS on BTC-USDT (-2% risk threshold hit from entry $75000)
+[TOOL] tool.call("paper_exchange", "BTC-USDT:SELL@73200;reason=STOP_LOSS;allocation=100%")
+[STEP] alert.send("STOP LOSS: Closed BTC-USDT position at $73200 to cut loss")
+[VERDICT] ALLOW "STOP LOSS executed..."
+113 instructions · 0 fuel
+```
+
+---
+
+### Test 4: Autonomous HOLD Decision (Monitoring within Corridor)
+Holding a position entered at \$75,000 when price is at **\$75,200** (+0.2%, within corridor):
+
+```bash
+./example-agents/paper_trader/paper-trader \
+  --arg asset=BTC-USDT \
+  --arg current_price=75200 \
+  --arg entry_price=75000
+```
+
+**Live Output:**
+```
+[AGENT] agent :: analyze_and_trade
+[INFO] AUTONOMOUS DECISION: HOLD BTC-USDT (Price $75200 within corridor of entry $75000)
+[VERDICT] ALLOW "HOLD: Position active within target corridor"
+94 instructions · 0 fuel
+```
+
+---
+
+### Test 5: Autonomous Bearish Market Entry Avoidance
+When sentiment is bearish ($\le 40$) and no position is open, the agent refuses entry to prevent buying into a falling market:
+
+```bash
+./example-agents/paper_trader/paper-trader \
+  --arg asset=BTC-USDT \
+  --arg current_price=74000 \
+  --arg sentiment_score=35
+```
+
+**Live Output:**
+```
+[AGENT] agent :: analyze_and_trade
+[INFO] AUTONOMOUS DECISION: AVOID / BEARISH on BTC-USDT (Sentiment 35 indicates downward trend)
+[VERDICT] REJECT Market entry refusal: bearish sentiment signals potential downward trend
+86 instructions · 0 fuel
+```
+
+---
+
+### Test 6: Allocation Risk Breach Guardrail (`execute_manual_order`)
 Attempting to allocate 35% of the paper portfolio into a single position (exceeding the 25% safety cap):
 
 ```bash
 ./example-agents/paper_trader/paper-trader \
-  --entry analyze_and_trade \
-  --arg 'asset="SOL/USD"' \
-  --arg 'current_price=185' \
-  --arg 'volume_24h=850000000' \
-  --arg 'sentiment_score=82' \
-  --arg 'requested_action="BUY"' \
-  --arg 'requested_allocation_pct=35'
+  --entry execute_manual_order \
+  --arg asset=SOL-USDT \
+  --arg current_price=185 \
+  --arg volume_24h=850000000 \
+  --arg requested_action=BUY \
+  --arg requested_allocation_pct=35
 ```
 
-**Expected Output (Fail-Closed Rejection in 44 instructions):**
+**Expected Output:**
 ```
-[AGENT] agent :: analyze_and_trade
-[POLICY] policy.detects("secrets", "SOL/USD") -> false
-[ALERT] alert.send("RISK BREACH: Requested paper allocation (35%) exceeds 25% risk cap on SOL/USD")
+[AGENT] agent :: execute_manual_order
+[ALERT] alert.send("RISK BREACH: Requested paper allocation (35%) exceeds 25% risk cap on SOL-USDT")
 [VERDICT] REJECT Risk limit violation: maximum single paper position allocation is 25%
 ```
 

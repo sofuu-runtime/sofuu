@@ -1497,6 +1497,9 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
                 }}
             }}
         }}
+        if (targetArgs['entry_price'] === undefined) targetArgs['entry_price'] = 0;
+        if (targetArgs['volume_24h'] === undefined) targetArgs['volume_24h'] = 100000000;
+        if (targetArgs['sentiment_score'] === undefined) targetArgs['sentiment_score'] = 65;
     }}
 
     function runDaemon() {{

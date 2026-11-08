@@ -1,4 +1,4 @@
-# Paper Trader — Simulated Crypto & Stock Market Analysis & Paper Execution AI Agent
+# Paper Trader — Autonomous Simulated Crypto & Stock Market Analysis & Paper Execution AI Agent
 #
 # Programmed 100% in Kaze. Zero JS or TS required.
 # Strictly paper trading and simulated execution (NO REAL MONEY).
@@ -7,49 +7,74 @@
 #   sofuu compile example-agents/paper_trader/agent.kaze -o example-agents/paper_trader/paper-trader
 #
 # Capabilities:
-#   ai: Technical price analysis, sentiment evaluation, and paper trade rationale
+#   ai: Technical price analysis, sentiment evaluation, and autonomous trade rationale
 #   tool: Simulated paper exchange execution, orderbook polling, and portfolio sync
 #   policy: R7 hardware safety guardrails, credential leak checks, and allocation limits
 #   memory: Historical paper trade journal, strategy performance, and thesis retention
 #   log: Detailed simulation trade audit logging
-#   alert: Volatility warnings and simulated large allocation notifications
+#   alert: Volatility warnings and simulated trade execution notifications
 
 needs: ai, tool, policy, memory, log, alert
 
-filter analyze_and_trade(asset, current_price, volume_24h, sentiment_score, requested_action, requested_allocation_pct):
-    log.info("Paper Trader analyzing " + asset + " (" + requested_action + " at $" + current_price + ", allocation=" + requested_allocation_pct + "%)")
+filter analyze_and_trade(asset, current_price, volume_24h, sentiment_score, entry_price):
+    log.info("Paper Trader analyzing " + asset + " at $" + current_price + " (24h Vol: $" + volume_24h + ", Sentiment: " + sentiment_score + ", Entry: $" + entry_price + ")")
     
     # 1. Security & Credential Leak Guardrail
     if policy detects secrets in asset:
         reject "Security refusal: asset identifier or payload contains private credentials"
         
-    # 2. Simulated Risk Management: Hard cap single position at 25% of paper portfolio
-    if requested_allocation_pct > 25:
-        send alert "RISK BREACH: Requested paper allocation (" + requested_allocation_pct + "%) exceeds 25% risk cap on " + asset
-        reject "Risk limit violation: maximum single paper position allocation is 25%"
-        
-    # 3. Market Validity & Liquidity Guardrails
+    # 2. Market Validity & Liquidity Guardrails
     if current_price <= 0:
         reject "Invalid market price: asset price must be positive"
         
     if volume_24h < 50000:
         reject "Illiquid asset refusal: 24h volume below simulated execution threshold ($50,000)"
         
-    # 4. AI Market Sentiment & Technical Analysis Synthesis
-    let market_thesis = ai.prompt("Act as Paper Trader market analyst. Analyze " + asset + " at price $" + current_price + " with 24h volume $" + volume_24h + " and sentiment index " + sentiment_score + " for simulated action: " + requested_action + ". Calculate support/resistance levels, target price, stop-loss, and simulated trade rationale. Note: strictly paper trading simulation.")
-    
-    # 5. Agent Associative Memory: Persist simulated trade thesis to historical journal
+    # 3. AI Market Sentiment & Technical Analysis Synthesis
+    let market_thesis = ai.prompt("Act as Paper Trader market analyst. Analyze " + asset + " at price $" + current_price + " with 24h volume $" + volume_24h + " and sentiment index " + sentiment_score + ". Calculate support/resistance levels, target price, stop-loss, and simulated trade rationale. Note: strictly paper trading simulation.")
     remember market_thesis as asset + "_paper_thesis"
     
-    # 6. Simulated Paper Exchange Execution Tool
-    let sim_execution = tool.call("paper_exchange", asset + ":" + requested_action + "@" + current_price + ";allocation=" + requested_allocation_pct + "%")
-    log.info("Simulated paper order status: " + sim_execution)
-    
-    # 7. Escalation Alert for substantial paper allocations (>= 20%)
-    if requested_allocation_pct >= 20:
-        send alert "Substantial paper position opened: " + asset + " (" + requested_allocation_pct + "% allocation at $" + current_price + ")"
+    # 4. Autonomous Position Management: TAKE PROFIT or TAKE LOSS (When holding a position)
+    if entry_price > 0:
+        # Take Profit Condition: +2% profit target hit
+        if current_price >= entry_price * 1.02:
+            log.info("AUTONOMOUS DECISION: TAKE PROFIT on " + asset + " (+2% target reached from entry $" + entry_price + ")")
+            let exec_tp = tool.call("paper_exchange", asset + ":SELL@" + current_price + ";reason=TAKE_PROFIT;allocation=100%")
+            send alert "PROFIT TAKEN: Closed " + asset + " position at $" + current_price
+            allow "TAKE PROFIT executed: " + exec_tp
+            
+        # Take Loss / Stop Loss Condition: -2% risk boundary hit
+        if current_price <= entry_price * 0.98:
+            log.info("AUTONOMOUS DECISION: STOP LOSS on " + asset + " (-2% risk threshold hit from entry $" + entry_price + ")")
+            let exec_sl = tool.call("paper_exchange", asset + ":SELL@" + current_price + ";reason=STOP_LOSS;allocation=100%")
+            send alert "STOP LOSS: Closed " + asset + " position at $" + current_price + " to cut loss"
+            allow "STOP LOSS executed: " + exec_sl
+            
+        # Hold Condition: price active within safe risk corridor
+        log.info("AUTONOMOUS DECISION: HOLD " + asset + " (Price $" + current_price + " within corridor of entry $" + entry_price + ")")
+        allow "HOLD: Position active within target corridor"
         
-    allow market_thesis
+    # 5. Autonomous Market Entry Decision: BUY, AVOID, or SCANNING (When no position held)
+    if sentiment_score >= 55:
+        log.info("AUTONOMOUS DECISION: BUY " + asset + " at $" + current_price + " (Bullish sentiment " + sentiment_score + ", 20% allocation)")
+        let exec_buy = tool.call("paper_exchange", asset + ":BUY@" + current_price + ";allocation=20%")
+        send alert "BUY ORDER FILLED: Opened " + asset + " position at $" + current_price
+        allow "BUY executed: " + exec_buy
+        
+    if sentiment_score <= 40:
+        log.info("AUTONOMOUS DECISION: AVOID / BEARISH on " + asset + " (Sentiment " + sentiment_score + " indicates downward trend)")
+        reject "Market entry refusal: bearish sentiment signals potential downward trend"
+        
+    log.info("AUTONOMOUS DECISION: SCANNING " + asset + " (Neutral sentiment " + sentiment_score + ", waiting for clearer setup)")
+    allow "SCANNING: Market neutral, waiting for setup"
+
+filter execute_manual_order(asset, current_price, volume_24h, requested_action, requested_allocation_pct):
+    log.info("Manual Order Dispatch: " + asset + " (" + requested_action + " at $" + current_price + ", allocation=" + requested_allocation_pct + "%)")
+    if requested_allocation_pct > 25:
+        send alert "RISK BREACH: Requested paper allocation (" + requested_allocation_pct + "%) exceeds 25% risk cap on " + asset
+        reject "Risk limit violation: maximum single paper position allocation is 25%"
+    let exec = tool.call("paper_exchange", asset + ":" + requested_action + "@" + current_price + ";allocation=" + requested_allocation_pct + "%")
+    allow "Manual order executed: " + exec
 
 action review_portfolio(total_paper_equity, active_positions):
     log.info("Reviewing paper portfolio performance. Total equity: $" + total_paper_equity)
@@ -64,18 +89,3 @@ action backtest_strategy(asset, timeframe_days, strategy_name):
     let backtest_raw = tool.call("paper_backtester", asset + ":" + strategy_name + "@" + timeframe_days + "d")
     let evaluation = ai.complete("Evaluate simulated backtest performance for " + asset + " using strategy " + strategy_name + ": " + backtest_raw)
     return evaluation
-
-action manage_position(asset, current_price, entry_price, position_allocation_pct):
-    log.info("Position Manager checking " + asset + " at $" + current_price + " (Entry: $" + entry_price + ")")
-    if current_price >= entry_price * 1.02:
-        log.info("TAKE PROFIT triggered on " + asset + " (+2% profit target reached)")
-        let res = tool.call("paper_exchange", asset + ":SELL@" + current_price + ";reason=TAKE_PROFIT")
-        send alert "PROFIT TAKEN: Closed " + asset + " position at $" + current_price
-        return "TAKE_PROFIT: Closed at $" + current_price + " (" + res + ")"
-    if current_price <= entry_price * 0.98:
-        log.info("STOP LOSS triggered on " + asset + " (-2% risk threshold hit)")
-        let res = tool.call("paper_exchange", asset + ":SELL@" + current_price + ";reason=STOP_LOSS")
-        send alert "STOP LOSS: Closed " + asset + " position at $" + current_price + " to preserve capital"
-        return "STOP_LOSS: Closed at $" + current_price + " (" + res + ")"
-    log.info("HOLD: " + asset + " price within acceptable risk corridor")
-    return "HOLD: Position active"

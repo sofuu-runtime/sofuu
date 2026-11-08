@@ -1959,6 +1959,7 @@ mod imp {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }
 
+        #[allow(clippy::too_many_arguments)]
         pub fn rmsnorm_q8(
             &self,
             _x: DeviceBuf,
@@ -1974,6 +1975,7 @@ mod imp {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }
 
+        #[allow(clippy::too_many_arguments)]
         pub fn rmsnorm_add_q8(
             &self,
             _a: DeviceBuf,
@@ -1991,6 +1993,7 @@ mod imp {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }
 
+        #[allow(clippy::too_many_arguments)]
         pub fn swiglu_q8(
             &self,
             _g: DeviceBuf,

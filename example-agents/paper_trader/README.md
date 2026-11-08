@@ -49,55 +49,32 @@ The compiled binary includes:
 
 ## 4. Execution Examples & Verification
 
-### Real-Time Live Market Data (Zero API Keys Required)
+### Test 1: Valid Simulated Trade Execution (Allowed)
 
-The agent automatically resolves real-time live market quotes for any crypto pair or stock ticker via public ticker feeds (Binance + Coinbase spot fallback for crypto; Yahoo Finance chart API for stocks).
-
-#### Test 0: One-Command Live Crypto Analysis (BTC-USDT)
-```bash
-./example-agents/paper_trader/paper-trader BTC-USDT
-```
-**Live Output:**
-```
-[MARKET] Binance · BTC-USDT $75893.26 (24h: -0.05%, Vol: $367192910, Sentiment: 50/100)
-[AGENT] paper-trader :: analyze_and_trade
-[STEP] log.info("Paper Trader analyzing BTC-USDT (HOLD at $75893.26, allocation=15%)") -> nothing
-[POLICY] policy.detects("secrets", "BTC-USDT") -> false
-[AI] ai.prompt("Act as Paper Trader market analyst. Analyze BTC-USDT at price $75893.26 with 24h volume $367192910 and sentiment index 50 for simulated action: HOLD. Calculate support/resistance levels, target price, stop-loss, and simulated trade rationale. Note: strictly paper trading simulation.") -> "Synthesized autonomous decision..."
-[MEMORY] memory.save("BTC-USDT_paper_thesis", ...) -> nothing
-[TOOL] tool.call("paper_exchange", "BTC-USDT:HOLD@75893.26;allocation=15%") -> OK
-[VERDICT] ALLOW "Synthesized autonomous decision..."
-94 instructions · 0 fuel
-```
-
-#### Test 0b: One-Command Live Stock Analysis (NVDA / AAPL)
-```bash
-./example-agents/paper_trader/paper-trader NVDA
-```
-**Live Output:**
-```
-[MARKET] Yahoo Finance · NVDA $186.64 (24h: +2.78%, Vol: $179308722, Sentiment: 61/100)
-[AGENT] paper-trader :: analyze_and_trade
-[POLICY] policy.detects("secrets", "NVDA") -> false
-[AI] ai.prompt("Act as Paper Trader market analyst. Analyze NVDA at price $186.64 with 24h volume $179308722 and sentiment index 61 for simulated action: BUY...")
-[TOOL] tool.call("paper_exchange", "NVDA:BUY@186.64;allocation=15%") -> OK
-[VERDICT] ALLOW "Synthesized autonomous decision..."
-```
-
----
-
-### Test 1: Manual Simulated Trade Execution
-Simulate analyzing and buying with custom manual parameter overrides:
+Simulate analyzing and executing a paper trade on Bitcoin with 15% allocation:
 
 ```bash
 ./example-agents/paper_trader/paper-trader \
-  --entry analyze_and_trade \
-  --arg 'asset="BTC/USD"' \
-  --arg 'current_price=68450' \
-  --arg 'volume_24h=1420000000' \
-  --arg 'sentiment_score=78' \
-  --arg 'requested_action="BUY"' \
-  --arg 'requested_allocation_pct=15'
+  --arg asset=BTC-USDT \
+  --arg current_price=75893 \
+  --arg volume_24h=367000000 \
+  --arg sentiment_score=50 \
+  --arg requested_action=BUY \
+  --arg requested_allocation_pct=15
+```
+
+**Live Trace Output:**
+```
+[AGENT] agent :: analyze_and_trade
+[STEP] log.info("Paper Trader analyzing BTC-USDT (BUY at $75893, allocation=15%)") -> nothing
+[POLICY] policy.detects("secrets", "BTC-USDT") -> false
+[AI] ai.prompt("Act as Paper Trader market analyst. Analyze BTC-USDT at price $75893 with 24h volume $367000000 and sentiment index 50 for simulated action: BUY. Calculate support/resistance levels, target price, stop-loss, and simulated trade rationale. Note: strictly paper trading simulation.") -> "Synthesized autonomous decision..."
+[MEMORY] memory.save("BTC-USDT_paper_thesis", ...) -> nothing
+[TOOL] tool.call("paper_exchange", "BTC-USDT:BUY@75893;allocation=15%") -> OK
+[INFO] Paper Trader analyzing BTC-USDT (BUY at $75893, allocation=15%)
+[INFO] Simulated paper order status: OK: tool 'paper_exchange' executed
+[VERDICT] ALLOW "Synthesized autonomous decision..."
+94 instructions · 0 fuel
 ```
 
 **Expected Live Trace:**
@@ -215,24 +192,33 @@ Run historical simulation over custom timeframes:
 
 ## 24/7 Autonomous Paper Trading Execution
 
-Run Paper Trader continuously around the clock with live real-time market quote refreshes on every cycle:
+Run Paper Trader continuously around the clock with one command:
 
-### 1. Foreground Supervisor Loop with Live Tickers (`--daemon` / `--every`)
+### 1. Foreground Supervisor Loop (`--daemon` / `--every`)
 ```bash
-# Monitor Bitcoin live every 3 seconds:
-./example-agents/paper_trader/paper-trader BTC-USDT --daemon --every 3s
-
-# Monitor Nvidia stock live every 5 seconds:
-./example-agents/paper_trader/paper-trader NVDA --daemon --every 5s
+./example-agents/paper_trader/paper-trader \
+  --daemon \
+  --every 5s \
+  --arg asset=BTC-USDT \
+  --arg current_price=75893 \
+  --arg volume_24h=367000000 \
+  --arg sentiment_score=50 \
+  --arg requested_action=HOLD \
+  --arg requested_allocation_pct=15
 ```
 
 ### 2. Auto-Installed Persistent Background Service (`sofuu daemon install`)
 ```bash
-# Install as launchd (macOS) or systemd (Linux) background service with live data:
+# Install as launchd (macOS) or systemd (Linux) background service:
 sofuu daemon install ./example-agents/paper_trader/paper-trader \
   --name btc-paper-trader \
   --every 10s \
-  BTC-USDT
+  --arg asset=BTC-USDT \
+  --arg current_price=75893 \
+  --arg volume_24h=367000000 \
+  --arg sentiment_score=50 \
+  --arg requested_action=HOLD \
+  --arg requested_allocation_pct=15
 
 # View live daemon status:
 sofuu daemon status btc-paper-trader

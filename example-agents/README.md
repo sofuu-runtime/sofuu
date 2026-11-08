@@ -189,45 +189,28 @@ Every compiled binary is a single self-contained native executable (**~4.5 MiB**
 ### 📊 4. Paper Trader (`paper_trader`)
 * **Sector:** Simulated Trading / Crypto & Stock Market Analysis (NO REAL MONEY)
 * **Capabilities:** `ai`, `tool`, `policy`, `memory`, `log`, `alert`
-* **Real-Time Data:** Native zero-API-key live market feeds from Binance, Coinbase spot, and Yahoo Finance chart APIs.
 * **Purpose:** Performs technical analysis and market sentiment evaluation, enforces strict 25% single-position risk caps, prevents credential leaks, and dispatches simulated orders to a paper exchange tool.
 
-#### One-Command Real-Time Market Analysis (Crypto & Stocks):
-```bash
-# Live Bitcoin quote & sentiment analysis:
-./example-agents/paper_trader/paper-trader BTC-USDT
-
-# Live Solana quote:
-./example-agents/paper_trader/paper-trader SOL-USDT
-
-# Live Nvidia stock quote:
-./example-agents/paper_trader/paper-trader NVDA
-```
-*Live Output:*
-```
-[MARKET] Binance · BTC-USDT $75893.26 (24h: -0.05%, Vol: $367192910, Sentiment: 50/100)
-[AGENT] paper-trader :: analyze_and_trade
-[POLICY] policy.detects("secrets", "BTC-USDT") -> false
-[AI] ai.prompt("Act as Paper Trader market analyst. Analyze BTC-USDT at price $75893.26 with 24h volume $367192910 and sentiment index 50 for simulated action: HOLD...")
-[TOOL] tool.call("paper_exchange", "BTC-USDT:HOLD@75893.26;allocation=15%") -> OK
-[VERDICT] ALLOW "Synthesized autonomous decision..."
-```
-
-#### Manual Parameter Simulation:
+#### Valid Simulated Paper Trade (Allowed):
 ```bash
 ./example-agents/paper_trader/paper-trader \
-  --entry analyze_and_trade \
-  --arg 'asset="BTC/USD"' \
-  --arg 'current_price=68450' \
-  --arg 'volume_24h=1420000000' \
-  --arg 'sentiment_score=78' \
-  --arg 'requested_action="BUY"' \
-  --arg 'requested_allocation_pct=15'
+  --arg asset=BTC-USDT \
+  --arg current_price=75893 \
+  --arg volume_24h=367000000 \
+  --arg sentiment_score=50 \
+  --arg requested_action=BUY \
+  --arg requested_allocation_pct=15
 ```
 *Output:*
 ```
 [AGENT] agent :: analyze_and_trade
-[POLICY] policy.detects("secrets", "BTC/USD") -> false
+[STEP] log.info("Paper Trader analyzing BTC-USDT (BUY at $75893, allocation=15%)") -> nothing
+[POLICY] policy.detects("secrets", "BTC-USDT") -> false
+[AI] ai.prompt("Act as Paper Trader market analyst. Analyze BTC-USDT at price $75893...")
+[MEMORY] memory.save("BTC-USDT_paper_thesis", ...)
+[TOOL] tool.call("paper_exchange", "BTC-USDT:BUY@75893;allocation=15%")
+[VERDICT] ALLOW "Synthesized autonomous decision..."
+```
 [AI] ai.prompt("Act as Paper Trader market analyst...")
 [MEMORY] memory.save("BTC/USD_paper_thesis", ...)
 [TOOL] tool.call("paper_exchange", "BTC/USD:BUY@68450;allocation=15%")

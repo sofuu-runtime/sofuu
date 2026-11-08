@@ -1,6 +1,6 @@
 <p align="center"><img src="https://sofuu.xyz/logo.png" width="118" alt="Sofuu logo"></p>
 
-# ⚡ Sofuu (素風)
+# Sofuu (素風)
 
 > *A lightweight native runtime for AI applications, tools, and agents (under 10 MB). Written in Rust, QuickJS, and libuv. Unites autonomous agent loops, declarative Kaze routines, on-device vector memory (QTSQ), and native Model Context Protocol (MCP) in a single binary — zero Python environments, zero external daemons.*
 
@@ -13,7 +13,7 @@
 [![Docs](https://img.shields.io/badge/docs-sofuu.xyz-blue.svg)](https://sofuu.xyz/docs)
 [![X](https://img.shields.io/badge/follow-%40sofuu__runtime-black?logo=x&logoColor=white)](https://x.com/sofuu_runtime)
 
-> 🚧 **Active development — iterating fast.** Open-source and MIT-licensed.
+> **Active development — iterating fast.** Open-source and MIT-licensed.
 
 ---
 
@@ -157,16 +157,16 @@ Sofuu maintains a clear demarcation between core guaranteed subsystems and previ
 
 | Subsystem | Status | Description |
 | :--- | :---: | :--- |
-| **Autonomous Agent Engine** | 🟢 **Core** | `sofuu.agent`, cooperative scheduling (`scheduler.yield`), step budgets, resilient editing (`smart_edit`), and real-time trace streaming. |
-| **Domain Toolpacks** | 🟢 **Core** | Modular toolpacks (`coding`, `web`, `memory`, `system`), single-instruction fuel sandbox, numbered unified diffs. |
-| **Standalone Compiler** | 🟢 **Core** | `sofuu compile`: native executables (under 10 MB) with 32-byte `SOFUU_BIN_V1` trailer, ad-hoc signing, sub-5ms cold starts. |
-| **Vector Memory (QTSQ)** | 🟢 **Core** | On-device `.qtsq` vector containers, cached KDF v2, plaintext zero-KDF mode, hardware SIMD search. |
-| **Model Context Protocol (MCP)** | 🟢 **Core** | Native client & server supporting stdio, HTTP, SSE, and direct in-process transports; dynamic tool discovery. |
-| **Kaze Agent Language** | 🟢 **Core** | Declarative agent language, linear arena VM, zero GC pauses, fail-closed policy gates, 12-factor configuration. |
-| **Security Sandbox** | 🟢 **Core** | Deterministic path traversal blocking, private CIDR SSRF filtering, credential shielding (`.env`, `id_rsa`). |
-| **Local Inference Engine** | 🧪 **Preview** | Built-in custom GGUF/SafeTensors engine. (For deployed local inference, use `sofuu-plugin-llamacpp` or remote providers). |
-| **Robotics & MAVLink** | 🧪 **Preview** | `sofuu drone`, MAVLink v2 codec, and GPIO line timers through hardware safety gates. |
-| **Native Frontend Engine** | 🧪 **Preview** | `sofuu dev` streaming JSX/TSX transpiler and reactive micro-runtime. |
+| **Autonomous Agent Engine** | **Core** | `sofuu.agent`, cooperative scheduling (`scheduler.yield`), step budgets, resilient editing (`smart_edit`), and real-time trace streaming. |
+| **Domain Toolpacks** | **Core** | Modular toolpacks (`coding`, `web`, `memory`, `system`), single-instruction fuel sandbox, numbered unified diffs. |
+| **Standalone Compiler** | **Core** | `sofuu compile`: native executables (under 10 MB) with 32-byte `SOFUU_BIN_V1` trailer, ad-hoc signing, sub-5ms cold starts. |
+| **Vector Memory (QTSQ)** | **Core** | On-device `.qtsq` vector containers, cached KDF v2, plaintext zero-KDF mode, hardware SIMD search. |
+| **Model Context Protocol (MCP)** | **Core** | Native client & server supporting stdio, HTTP, SSE, and direct in-process transports; dynamic tool discovery. |
+| **Kaze Agent Language** | **Core** | Declarative agent language, linear arena VM, zero GC pauses, fail-closed policy gates, 12-factor configuration. |
+| **Security Sandbox** | **Core** | Deterministic path traversal blocking, private CIDR SSRF filtering, credential shielding (`.env`, `id_rsa`). |
+| **Local Inference Engine** | **Preview** | Built-in custom GGUF/SafeTensors engine. (For deployed local inference, use `sofuu-plugin-llamacpp` or remote providers). |
+| **Robotics & MAVLink** | **Preview** | `sofuu drone`, MAVLink v2 codec, and GPIO line timers through hardware safety gates. |
+| **Native Frontend Engine** | **Preview** | `sofuu dev` streaming JSX/TSX transpiler and reactive micro-runtime. |
 
 ---
 
@@ -489,7 +489,7 @@ sofuu_rt_free(rt);
 | **Idle Memory (RSS)** | **~14.9 MB measured** | Clean process footprint with zero background daemons. |
 | **Vector Memory Query** | **< 2 ms** | In-process SIMD cosine/L2 search over encrypted `.qtsq` files. |
 
-> 👉 *For complete hardware benchmark receipts across 40+ local models, Apple Silicon Metal GPU kernels, and Raspberry Pi 5 runs, see [BENCHMARKS.md](BENCHMARKS.md).*
+> *For complete hardware benchmark receipts across 40+ local models, Apple Silicon Metal GPU kernels, and Raspberry Pi 5 runs, see [BENCHMARKS.md](BENCHMARKS.md).*
 
 ---
 

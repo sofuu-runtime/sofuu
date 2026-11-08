@@ -50,55 +50,40 @@ Official pre-compiled single binaries are available for macOS (Apple Silicon) an
 
 ---
 
-### 2. The 30-Second Demo: Runtime + Memory + Agent Tools
+### 2. Everything in One Process: Write AI as Normal Code
 
-Sofuu collapses vector databases, agent orchestrators, and tool sandboxes into standard JavaScript / TypeScript with **zero models, zero API keys, and zero background servers required to test**:
+Sofuu collapses vector databases, agent orchestrators, and tool sandboxes into standard JavaScript / TypeScript inside a single lightweight binary (< 10 MB):
 
 ```javascript
-// quickstart.js — Run directly: $ sofuu run quickstart.js
-
-// 1. On-device vector memory (encrypted, SIMD search, zero database servers)
+// hello.js - memory · agents · AI · zero daemons
 const brain = sofuu.memory.open("./brain.qtsq", 768);
-brain.remember(
-  sofuu.ai.embedLocal("runtime"),
-  "Sofuu executes AI apps, tools, and agents natively under 10 MB."
-);
+brain.remember(sofuu.ai.embedLocal("sofuu"), "AI runtime. One binary.");
 
-// 2. Offline semantic recall in microseconds (< 2ms)
-const [match] = brain.recall(sofuu.ai.embedLocal("memory"), 1);
-console.log(`[Memory Recalled] ${match.text}`);
-
-// 3. Native sandboxed tools executed in-process with policy gates
-const sysInfo = sofuu.tools.execute("system_info", {});
-console.log(`[Runtime] Platform: ${sysInfo.platform || process.platform} · Architecture: ${sysInfo.arch || process.arch} · Status: ready`);
-
-// 4. Define an autonomous agent (ready for deployment with memory & tools)
-const agent = sofuu.agent.define({
-  name: "assistant",
-  system: "Answer user queries using vector memory and native tools.",
-  tools: ["coding", "memory", "web"],
-  memory: "agent",
+// Autonomous agent - define once, then run it
+sofuu.agent.define({
+  name: "researcher",
+  system: "Cite sources.",
+  tools: ["web", "memory", "system"],
 });
-console.log(`[Agent Ready] "${agent.name}" registered with tools: [coding, memory, web]`);
 
-// (Optional) When you want to run the agent with an LLM, connect any provider:
-// const result = await sofuu.agent.run("assistant", "What makes Sofuu fast?");
-// console.log(result.answer);
+const result = await sofuu.agent.run("researcher", "Summarise this project directory");
+const [hit] = brain.recall(sofuu.ai.embedLocal("fast"), 1);
+console.log(result.answer, "•", hit.text);
+// -> AI runtime. 22.5 ms median cold start (wall clock incl. spawn) · 39.4 ms to first HTTP response · zero daemons
 ```
 
-Run it immediately with zero setup, or compile it to a standalone native binary:
+Run it immediately with zero setup, or compile it into a standalone native executable:
 
 ```bash
-# 1. Run directly with sub-20ms cold start (100% offline, zero models needed)
-$ sofuu run quickstart.js
-[Memory Recalled] Sofuu executes AI apps, tools, and agents natively under 10 MB.
-[Runtime] Platform: darwin · Architecture: arm64 · Status: ready
-[Agent Ready] "assistant" registered with tools: [coding, memory, web]
+# 1. Run directly with sub-20ms cold start
+$ sofuu run hello.js
 
 # 2. Compile into a standalone native executable with zero dependencies
-$ sofuu compile quickstart.js -o my-agent
+$ sofuu compile hello.js -o my-agent
 $ ./my-agent
 ```
+
+> *Vector memory (`brain.remember` / `brain.recall`) and native tool execution run 100% offline with zero external servers. When invoking `sofuu.agent.run()`, connect your local GGUF/llama.cpp model or any standard remote streaming provider.*
 
 ---
 

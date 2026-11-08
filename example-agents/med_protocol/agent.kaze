@@ -1,0 +1,49 @@
+# Med Protocol — Clinical Patient Triage & Emergency Response AI Agent
+#
+# Programmed 100% in Kaze. Zero JS or TS required.
+# Compile to a standalone single-binary agent with:
+#   sofuu compile examples/agents/med_protocol/agent.kaze -o med-protocol
+#
+# Capabilities:
+#   ai: LLM clinical protocol analysis & triage recommendation
+#   tool: EHR database integration and vital sign recording
+#   policy: HIPAA compliance, privacy filter, and medical safety guardrails
+#   memory: Patient historical vitals and treatment plan recall
+#   log: Formal hospital audit logging
+#   alert: Emergency medical staff paging and red-alert escalation
+
+needs: ai, tool, policy, memory, log, alert
+
+filter triage_patient(patient_id, heart_rate, bp_systolic, bp_diastolic, symptoms):
+    log.info("Med Protocol triaging patient " + patient_id + ": HR=" + heart_rate + ", BP=" + bp_systolic + "/" + bp_diastolic)
+    
+    # 1. Privacy & PHI Protection Guardrail
+    if policy detects secrets in symptoms:
+        reject "HIPAA compliance refusal: unredacted credential or private key in clinical notes"
+        
+    # 2. Critical Physiological Safety Guardrails
+    if heart_rate > 160:
+        send alert "CRITICAL: Severe tachycardia (HR " + heart_rate + ") on patient " + patient_id
+    if heart_rate < 40:
+        send alert "CRITICAL: Severe bradycardia (HR " + heart_rate + ") on patient " + patient_id
+        
+    if bp_systolic > 180 or bp_diastolic > 120:
+        send alert "EMERGENCY: Hypertensive crisis (BP " + bp_systolic + "/" + bp_diastolic + ") on patient " + patient_id
+        
+    # 3. AI Clinical Assessment & Triage Synthesis
+    let triage_assessment = ai.prompt("Clinical Triage AI: Patient " + patient_id + " HR=" + heart_rate + " BP=" + bp_systolic + "/" + bp_diastolic + " Symptoms: " + symptoms + ". Assign emergency severity index (ESI Level 1-5), immediate interventions, and required physician consult.")
+    
+    # 4. Long-Term Patient Vitals & Triage Retention
+    remember triage_assessment as patient_id + "_triage"
+    
+    # 5. EHR Chart Tool Integration
+    let ehr_status = tool.call("ehr_record_vitals", patient_id + ":triage_complete")
+    log.info("EHR vital chart status: " + ehr_status)
+    
+    allow triage_assessment
+
+action discharge_summary(patient_id):
+    log.info("Generating clinical discharge summary for " + patient_id)
+    let history = memory.recall(patient_id)
+    let summary = ai.prompt("Synthesize patient discharge instructions based on triage history: " + history)
+    return summary

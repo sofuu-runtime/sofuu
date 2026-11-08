@@ -1,0 +1,54 @@
+# Agri Sentinel — Autonomous Precision Greenhouse Climate & Irrigation AI Agent
+#
+# Programmed 100% in Kaze. Zero JS or TS required.
+# Compile to a standalone single-binary agent with:
+#   sofuu compile examples/agents/agri_sentinel/agent.kaze -o agri-sentinel
+#
+# Capabilities:
+#   sensor: Ambient temperature and humidity telemetry
+#   device: Physical actuator control for fans, mister pumps, and motorized valves
+#   ai: Agronomy crop models, vapor pressure deficit (VPD) optimization, and harvest advisory
+#   tool: Field telemetry logging and weather station integration
+#   policy: Environmental guardrails and physical duty-cycle safety gates
+#   memory: Historical crop health metrics and soil condition recall
+#   log: Farm operations audit logging
+#   alert: Frost alerts, drought warnings, and heatwave alarms
+
+needs: sensor, device, ai, tool, policy, memory, log, alert
+
+filter monitor_greenhouse(zone_id, crop_type, target_temp, target_humidity):
+    log.info("Agri Sentinel scanning Zone " + zone_id + " (" + crop_type + ")")
+    
+    let temp = sensor.temperature()
+    let humidity = sensor.humidity()
+    log.info("Telemetry in Zone " + zone_id + ": Temp=" + temp + "C, Humidity=" + humidity + "%")
+    
+    # 1. Environmental Threshold Guardrails: Extreme Temperature Protection
+    if temp > target_temp + 3:
+        send alert "HIGH TEMP WARNING in Zone " + zone_id + ": " + temp + "C"
+        turn on fan
+    otherwise:
+        turn off fan
+        
+    # 2. Moisture & Irrigation Automation
+    if humidity < target_humidity:
+        send alert "LOW MOISTURE ALERT in Zone " + zone_id + ": " + humidity + "%"
+        pulse mister for 15 seconds
+        
+    # 3. AI Agronomy Reasoning & Disease Prevention
+    let agronomy_advice = ai.prompt("Precision Agri Agronomist: Zone " + zone_id + " Crop=" + crop_type + " Current Temp=" + temp + "C Current Humidity=" + humidity + "%. Target Temp=" + target_temp + "C Target Humidity=" + target_humidity + "%. Evaluate VPD stress risk, powdery mildew probability, and nutrient pump schedule.")
+    
+    # 4. Memory Retention: Track zone microclimate history
+    remember agronomy_advice as zone_id + "_agronomy"
+    
+    # 5. Agricultural Controller Tool Invocation
+    let valve_res = tool.call("irrigation_controller", zone_id + ":cycle_applied")
+    log.info("Irrigation controller confirmation: " + valve_res)
+    
+    allow agronomy_advice
+
+action harvest_readiness_check(zone_id, crop_type, days_planted):
+    log.info("Checking harvest readiness for " + crop_type + " in Zone " + zone_id + " (day " + days_planted + ")")
+    let history = memory.recall(zone_id)
+    let assessment = ai.prompt("Synthesize harvest timeline and brix index estimate for " + crop_type + " at day " + days_planted + " with history: " + history)
+    return assessment

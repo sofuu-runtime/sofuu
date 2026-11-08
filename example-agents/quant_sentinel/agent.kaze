@@ -1,0 +1,53 @@
+# Quant Sentinel — High-Frequency Trading Risk & Execution AI Agent
+#
+# Programmed 100% in Kaze. Zero JS or TS required.
+# Compile to a standalone single-binary agent with:
+#   sofuu compile examples/agents/quant_sentinel/agent.kaze -o quant-sentinel
+#
+# Capabilities:
+#   ai: LLM reasoning and trade thesis synthesis
+#   tool: Direct execution through order router and exchange feeds
+#   policy: R7 hardware safety guardrails and credential firewalls
+#   memory: Long-term trade thesis recall and pattern matching
+#   log: Formal audit logging
+#   alert: Risk and margin notifications
+
+needs: ai, tool, policy, memory, log, alert
+
+filter evaluate_trade(ticker, signal, leverage, price):
+    log.info("Quant Sentinel evaluating trade: " + ticker + " (" + signal + " at $" + price + ", " + leverage + "x leverage)")
+    
+    # 1. Credential & Leak Detection Firewall
+    if policy detects secrets in ticker:
+        reject "Security violation: secret token leaked in symbol"
+    
+    # 2. Risk Guardrail: Reject leverage exceeding risk tolerance
+    if leverage > 3:
+        send alert "HIGH RISK: Excessive leverage (" + leverage + "x) requested on " + ticker
+        reject "Risk policy violation: leverage " + leverage + " exceeds hard cap of 3.0x"
+        
+    if price <= 0:
+        reject "Invalid market price: must be positive"
+        
+    # 3. AI Market Thesis & Risk Assessment
+    let thesis = ai.prompt("Act as Quant Sentinel risk engine. Synthesize market thesis for " + ticker + " signal=" + signal + " price=" + price + " leverage=" + leverage + ". Provide target, stop-loss, and sizing.")
+    
+    # 4. Agent Memory: Persist thesis for future strategy reviews
+    remember thesis as ticker + "_thesis"
+    
+    # 5. Order Router Tool Execution
+    let route = tool.call("order_router", ticker + ":" + signal + "@" + price)
+    log.info("Order router status: " + route)
+    
+    # 6. Safety Alert for elevated exposures
+    if leverage >= 2:
+        send alert "Elevated exposure active: " + ticker + " at " + leverage + "x leverage"
+        
+    allow thesis
+
+action rebalance_portfolio(target_allocation):
+    log.info("Portfolio rebalancing requested for: " + target_allocation)
+    let plan = ai.prompt("Synthesize risk-hedged portfolio rebalance steps for target: " + target_allocation)
+    let execution = tool.call("portfolio_rebalancer", target_allocation)
+    log.info("Rebalancer execution: " + execution)
+    return plan

@@ -628,7 +628,7 @@ sofuu compile quant_sentinel.kaze -o dist/quant-sentinel
 ```
 
 Scripting language reference: [docs/KAZE-SPEC.md](docs/KAZE-SPEC.md) · standalone compiler: [docs/COMPILER.md](docs/COMPILER.md) · examples:
-[`examples/kaze/`](examples/kaze/) and [`examples/agents/`](examples/agents/) (Fintech `quant_sentinel`, Healthcare `med_protocol`, Agri-Tech `agri_sentinel`).
+[`examples/kaze/`](examples/kaze/) and [`example-agents/`](example-agents/) (Fintech `quant_sentinel`, Healthcare `med_protocol`, Agri-Tech `agri_sentinel` — compile all via `./example-agents/build.sh`).
 
 ---
 

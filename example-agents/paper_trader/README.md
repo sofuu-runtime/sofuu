@@ -190,6 +190,67 @@ Run historical simulation over custom timeframes:
 
 ---
 
+### Test 7: Autonomous Position Management & Take-Profit / Stop-Loss (`action manage_position`)
+
+Monitor open paper positions and automatically trigger Take Profit (+2%) or Stop Loss (-2%):
+
+#### A. Take Profit Triggered (+2% Profit Target Reached)
+```bash
+./example-agents/paper_trader/paper-trader \
+  --entry manage_position \
+  --arg asset=BTC-USDT \
+  --arg current_price=76500 \
+  --arg entry_price=75000 \
+  --arg position_allocation_pct=20
+```
+**Expected Trace:**
+```
+[AGENT] agent :: manage_position
+[INFO] Position Manager checking BTC-USDT at $76500 (Entry: $75000)
+[INFO] TAKE PROFIT triggered on BTC-USDT (+2% profit target reached)
+[TOOL] tool.call("paper_exchange", "BTC-USDT:SELL@76500;reason=TAKE_PROFIT")
+[STEP] alert.send("PROFIT TAKEN: Closed BTC-USDT position at $76500")
+57 instructions · 0 fuel
+```
+
+#### B. Stop Loss Triggered (-2% Risk Threshold Hit)
+```bash
+./example-agents/paper_trader/paper-trader \
+  --entry manage_position \
+  --arg asset=BTC-USDT \
+  --arg current_price=73000 \
+  --arg entry_price=75000 \
+  --arg position_allocation_pct=20
+```
+**Expected Trace:**
+```
+[AGENT] agent :: manage_position
+[INFO] Position Manager checking BTC-USDT at $73000 (Entry: $75000)
+[INFO] STOP LOSS triggered on BTC-USDT (-2% risk threshold hit)
+[TOOL] tool.call("paper_exchange", "BTC-USDT:SELL@73000;reason=STOP_LOSS")
+[STEP] alert.send("STOP LOSS: Closed BTC-USDT position at $73000 to preserve capital")
+65 instructions · 0 fuel
+```
+
+#### C. In Corridor (Hold Position)
+```bash
+./example-agents/paper_trader/paper-trader \
+  --entry manage_position \
+  --arg asset=BTC-USDT \
+  --arg current_price=75200 \
+  --arg entry_price=75000 \
+  --arg position_allocation_pct=20
+```
+**Expected Trace:**
+```
+[AGENT] agent :: manage_position
+[INFO] Position Manager checking BTC-USDT at $75200 (Entry: $75000)
+[INFO] HOLD: BTC-USDT price within acceptable risk corridor
+36 instructions · 0 fuel
+```
+
+---
+
 ## 24/7 Autonomous Paper Trading Execution
 
 Run Paper Trader continuously around the clock with one command:

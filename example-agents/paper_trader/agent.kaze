@@ -64,3 +64,18 @@ action backtest_strategy(asset, timeframe_days, strategy_name):
     let backtest_raw = tool.call("paper_backtester", asset + ":" + strategy_name + "@" + timeframe_days + "d")
     let evaluation = ai.complete("Evaluate simulated backtest performance for " + asset + " using strategy " + strategy_name + ": " + backtest_raw)
     return evaluation
+
+action manage_position(asset, current_price, entry_price, position_allocation_pct):
+    log.info("Position Manager checking " + asset + " at $" + current_price + " (Entry: $" + entry_price + ")")
+    if current_price >= entry_price * 1.02:
+        log.info("TAKE PROFIT triggered on " + asset + " (+2% profit target reached)")
+        let res = tool.call("paper_exchange", asset + ":SELL@" + current_price + ";reason=TAKE_PROFIT")
+        send alert "PROFIT TAKEN: Closed " + asset + " position at $" + current_price
+        return "TAKE_PROFIT: Closed at $" + current_price + " (" + res + ")"
+    if current_price <= entry_price * 0.98:
+        log.info("STOP LOSS triggered on " + asset + " (-2% risk threshold hit)")
+        let res = tool.call("paper_exchange", asset + ":SELL@" + current_price + ";reason=STOP_LOSS")
+        send alert "STOP LOSS: Closed " + asset + " position at $" + current_price + " to preserve capital"
+        return "STOP_LOSS: Closed at $" + current_price + " (" + res + ")"
+    log.info("HOLD: " + asset + " price within acceptable risk corridor")
+    return "HOLD: Position active"

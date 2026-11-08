@@ -75,14 +75,14 @@ jobs:
           mkdir -p dist
           cp sofuu dist/sofuu-darwin-arm64
           tar -czf dist/sofuu-darwin-arm64.tar.gz -C dist sofuu-darwin-arm64
-          sha256sum dist/sofuu-darwin-arm64.tar.gz > dist/sofuu-darwin-arm64.tar.gz.sha256
+          (cd dist && sha256sum sofuu-darwin-arm64.tar.gz > sofuu-darwin-arm64.tar.gz.sha256)
           # libsofuu tarball (header + static lib + dylib)
           mkdir -p dist/libsofuu-darwin-arm64
           cp dist/libsofuu.a dist/libsofuu-darwin-arm64/ 2>/dev/null || true
           cp dist/libsofuu.dylib dist/libsofuu-darwin-arm64/ 2>/dev/null || true
           cp dist/sofuu_embed.h dist/libsofuu-darwin-arm64/ 2>/dev/null || true
           tar -czf dist/libsofuu-darwin-arm64.tar.gz -C dist libsofuu-darwin-arm64
-          sha256sum dist/libsofuu-darwin-arm64.tar.gz > dist/libsofuu-darwin-arm64.tar.gz.sha256
+          (cd dist && sha256sum libsofuu-darwin-arm64.tar.gz > libsofuu-darwin-arm64.tar.gz.sha256)
           ls -lh dist/
 
       # Upload the CLI + library artifacts BEFORE the SDK work: the iOS
@@ -135,7 +135,7 @@ jobs:
           # directory; ship the zip and keep the framework on disk too.
           ditto -c -k --keepParent dist/libsofuu.xcframework \
             dist/libsofuu.xcframework.zip
-          sha256sum dist/libsofuu.xcframework.zip > dist/libsofuu.xcframework.zip.sha256
+          (cd dist && sha256sum libsofuu.xcframework.zip > libsofuu.xcframework.zip.sha256)
           du -sh dist/libsofuu.xcframework dist/libsofuu.xcframework.zip
 
       # The checksum is a SwiftPM requirement: without it the manifest cannot
@@ -327,7 +327,7 @@ jobs:
           cp bindings/android/sofuu/build/outputs/aar/sofuu-release.aar dist/sofuu-android/sofuu-android.aar
           cp examples/headless/KotlinSample/CMakeLists.txt dist/sofuu-android/ 2>/dev/null || true
           tar -czf dist/libsofuu-android.tar.gz -C dist sofuu-android
-          sha256sum dist/libsofuu-android.tar.gz > dist/libsofuu-android.tar.gz.sha256
+          (cd dist && sha256sum libsofuu-android.tar.gz > libsofuu-android.tar.gz.sha256)
           # Prove the AAR really contains the native libs.
           unzip -l dist/sofuu-android/sofuu-android.aar | grep -E 'jni/.+\.so' \
             || { echo "AAR contains no jni .so files"; exit 1; }

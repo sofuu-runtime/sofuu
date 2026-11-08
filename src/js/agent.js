@@ -657,9 +657,12 @@
    * window: under real pressure memory yields to the conversation. */
   var RECALL_SAFETY_TK = 512;
   var RECALL_MIN_FREE_TK = 768;
+  function isLocalEngine(p) {
+    return p === 'local' || p === 'ollama' || p === 'llamacpp';
+  }
   function recallBudgetTok(d) {
     if (d && d.recallBudget > 0) return d.recallBudget;
-    if (d && d.provider === 'local') return 256;
+    if (d && isLocalEngine(d.provider)) return 256;
     var win = contextWindow(d && d.model, d && d.baseUrl, !mlEnabled(d));
     return Math.min(16384, Math.max(RECALL_BUDGET_TOK, Math.floor(win * 0.02)));
   }
@@ -4050,7 +4053,7 @@
           var qemb = await embedTextFor(d, backend, String(task));
           var qvec = qemb ? qemb.vec : null;
           var semQvec = semCma ? embedSemV2(String(task)) : null;
-          var maxRecallHits = (d && d.provider === 'local') ? 3 : 15;
+          var maxRecallHits = (d && isLocalEngine(d.provider)) ? 3 : 15;
           var hits = (semCma && semQvec)
             ? fuseRecall(d, brainEntry, qvec, semQvec, maxRecallHits, String(task))
             : scopeRecall(d, cma, qvec, maxRecallHits, String(task));
@@ -4107,7 +4110,7 @@
        * (never the byte-stable system prompt, P1/P6) so the model can judge
        * staleness at all. ~8 tokens/turn; the freshness gate (§5) builds on
        * this, it does not substitute for it. */
-      if (d.provider !== 'local') {
+      if (!isLocalEngine(d.provider)) {
         ctxParts.push('Current date: ' + isoDate() + '.');
         /* R-12 / RULES §1.2: repository context is STRICTLY opt-in. The
          * triggers are an explicit `agentsMd: true` on the def (resolved in

@@ -388,6 +388,49 @@ fn anthropic_fallback_max_tokens() -> i32 {
     crate::ml::alloc::policy::UNKNOWN_MAX_OUTPUT as i32
 }
 
+fn merge_plain_messages(messages: &[AiMessage]) -> Vec<AiMessage> {
+    fn eff_role(m: &AiMessage) -> &'static str {
+        match m.role.as_deref() {
+            Some("user") => "user",
+            Some("assistant") => "assistant",
+            Some("system") => "system",
+            _ => "user",
+        }
+    }
+    fn is_plain(m: &AiMessage) -> bool {
+        if let Some(t) = &m.tool_calls {
+            if !t.is_empty() {
+                return false;
+            }
+        }
+        if let Some(id) = &m.tool_call_id {
+            if !id.is_empty() {
+                return false;
+            }
+        }
+        m.images.is_empty()
+    }
+    let mut merged: Vec<AiMessage> = Vec::with_capacity(messages.len());
+    for m in messages {
+        if is_plain(m) {
+            if let Some(prev) = merged.last_mut() {
+                if is_plain(prev) && eff_role(prev) == eff_role(m) {
+                    let mut joined = prev.content.clone().unwrap_or_default();
+                    let add = m.content.clone().unwrap_or_default();
+                    if !joined.is_empty() && !add.is_empty() {
+                        joined.push_str("\n\n");
+                    }
+                    joined.push_str(&add);
+                    prev.content = Some(joined);
+                    continue;
+                }
+            }
+        }
+        merged.push(m.clone());
+    }
+    merged
+}
+
 fn build_openai_body_v2(cfg: &AiRequestConfig) -> String {
     build_openai_body_inner(cfg, true)
 }
@@ -473,7 +516,8 @@ fn build_openai_body_inner(cfg: &AiRequestConfig, emit_max: bool) -> String {
         first = false;
     }
 
-    for m in &cfg.messages {
+    let merged_messages = merge_plain_messages(&cfg.messages);
+    for m in &merged_messages {
         let es = json_escape(m.content.as_deref());
         if !first {
             body.push(',');
@@ -3921,7 +3965,8 @@ fn format_chatml(messages: &[AiMessage], system_prompt: Option<&str>, tools: &[A
         out.push_str("<|im_end|>\n");
         has_system = true;
     }
-    for m in messages {
+    let merged_messages = merge_plain_messages(messages);
+    for m in &merged_messages {
         let role = m.role.as_deref().unwrap_or("user");
         let content = m.content.as_deref().unwrap_or("");
         if role == "system" {

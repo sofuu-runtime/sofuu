@@ -857,6 +857,32 @@ mod imp {
             Ok(())
         }
 
+        /// Download f32 data straight into its destination. The logits path used
+        /// to copy into a byte buffer and rebuild the floats with a per-element
+        /// from_le_bytes loop over the whole vocabulary, which is ~0.3 ms of a
+        /// token on the Kaggle host for 128256 values.
+        pub fn download_f32(&self, dst: &mut [f32], src: DeviceBuf) -> Result<(), CudaError> {
+            let bytes = dst.len() * std::mem::size_of::<f32>();
+            if bytes > src.bytes {
+                return Err(CudaError(format!(
+                    "download_f32 {bytes} B from a {} B device buffer",
+                    src.bytes
+                )));
+            }
+            if unsafe {
+                sys::sofuu_cuda_ctx_download(
+                    self.ctx,
+                    dst.as_mut_ptr() as *mut c_void,
+                    src.ptr,
+                    bytes,
+                )
+            } != 0
+            {
+                return Err(take_error("cuMemcpyDtoH"));
+            }
+            Ok(())
+        }
+
         pub fn download(&self, dst: &mut [u8], src: DeviceBuf) -> Result<(), CudaError> {
             if dst.len() > src.bytes {
                 return Err(CudaError(format!(
@@ -1746,6 +1772,10 @@ mod imp {
         }
 
         pub fn download(&self, _dst: &mut [u8], _src: DeviceBuf) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        pub fn download_f32(&self, _dst: &mut [f32], _src: DeviceBuf) -> Result<(), CudaError> {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }
 

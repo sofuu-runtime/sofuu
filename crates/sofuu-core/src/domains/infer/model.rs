@@ -8285,7 +8285,12 @@ impl TransformerModel {
                 panic!("CUDA forward failed");
             }
             if compute_logits {
-                self.logits.copy_from_slice(cuda.logits());
+                // Straight into the sampler's buffer: no byte round-trip and no
+                // second 512 KB copy of the vocabulary.
+                if let Err(e) = cuda.logits_into(&mut self.logits) {
+                    eprintln!("\x1b[31m[cuda] logits download failed at pos {pos}: {e}\x1b[0m");
+                    panic!("CUDA logits download failed");
+                }
             }
             return;
         }

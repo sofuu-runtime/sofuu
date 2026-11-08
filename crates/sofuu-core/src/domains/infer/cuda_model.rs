@@ -110,7 +110,6 @@ pub struct CudaModel {
     graph_off: bool,
 
     logits_host: Vec<f32>,
-    logit_bytes: Vec<u8>,
     rope_host: Vec<f32>,
 
     // Batched-prefill scratch: eight token rows per buffer, token-major. The
@@ -502,7 +501,6 @@ impl CudaModel {
             graph: None,
             graph_off: false,
             logits_host: vec![0.0; cfg.vocab_size],
-            logit_bytes: vec![0u8; cfg.vocab_size * 4],
             rope_host: vec![0.0; cfg.head_dim],
             xb,
             x_norm_b,
@@ -526,6 +524,21 @@ impl CudaModel {
 
     pub fn logits(&self) -> &[f32] {
         &self.logits_host
+    }
+
+    /// Download this token's logits into `dst` in one copy, with no byte
+    /// round-trip. `dst` must hold `vocab` floats.
+    pub fn logits_into(&self, dst: &mut [f32]) -> Result<(), String> {
+        if dst.len() < self.vocab {
+            return Err(format!(
+                "logits destination has {} floats, need {}",
+                dst.len(),
+                self.vocab
+            ));
+        }
+        self.engine
+            .download_f32(&mut dst[..self.vocab], self.logits_dev)
+            .map_err(|err| format!("download logits: {err}"))
     }
 
     pub fn reset(&mut self) {
@@ -673,11 +686,8 @@ impl CudaModel {
             // deferred kernel fault with the position that caused it.
             e.sync()
                 .map_err(|err| format!("sync before logits: {err}"))?;
-            e.download(&mut self.logit_bytes, self.logits_dev)
+            e.download_f32(&mut self.logits_host, self.logits_dev)
                 .map_err(|err| format!("download logits: {err}"))?;
-            for (i, c) in self.logit_bytes.chunks_exact(4).enumerate() {
-                self.logits_host[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            }
         }
 
         if profile {
@@ -1173,11 +1183,8 @@ impl CudaModel {
             .map_err(|err| format!("lm_head batch: {err}"))?;
             e.sync()
                 .map_err(|err| format!("sync before batch logits: {err}"))?;
-            e.download(&mut self.logit_bytes, self.logits_dev)
+            e.download_f32(&mut self.logits_host, self.logits_dev)
                 .map_err(|err| format!("download batch logits: {err}"))?;
-            for (i, c) in self.logit_bytes.chunks_exact(4).enumerate() {
-                self.logits_host[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
-            }
         }
 
         self.pos = pos + n;

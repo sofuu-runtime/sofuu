@@ -189,9 +189,31 @@ Every compiled binary is a single self-contained native executable (**~4.5 MiB**
 ### 📊 4. Paper Trader (`paper_trader`)
 * **Sector:** Simulated Trading / Crypto & Stock Market Analysis (NO REAL MONEY)
 * **Capabilities:** `ai`, `tool`, `policy`, `memory`, `log`, `alert`
+* **Real-Time Data:** Native zero-API-key live market feeds from Binance, Coinbase spot, and Yahoo Finance chart APIs.
 * **Purpose:** Performs technical analysis and market sentiment evaluation, enforces strict 25% single-position risk caps, prevents credential leaks, and dispatches simulated orders to a paper exchange tool.
 
-#### Valid Simulated Paper Trade (Allowed):
+#### One-Command Real-Time Market Analysis (Crypto & Stocks):
+```bash
+# Live Bitcoin quote & sentiment analysis:
+./example-agents/paper_trader/paper-trader BTC-USDT
+
+# Live Solana quote:
+./example-agents/paper_trader/paper-trader SOL-USDT
+
+# Live Nvidia stock quote:
+./example-agents/paper_trader/paper-trader NVDA
+```
+*Live Output:*
+```
+[MARKET] Binance · BTC-USDT $75893.26 (24h: -0.05%, Vol: $367192910, Sentiment: 50/100)
+[AGENT] paper-trader :: analyze_and_trade
+[POLICY] policy.detects("secrets", "BTC-USDT") -> false
+[AI] ai.prompt("Act as Paper Trader market analyst. Analyze BTC-USDT at price $75893.26 with 24h volume $367192910 and sentiment index 50 for simulated action: HOLD...")
+[TOOL] tool.call("paper_exchange", "BTC-USDT:HOLD@75893.26;allocation=15%") -> OK
+[VERDICT] ALLOW "Synthesized autonomous decision..."
+```
+
+#### Manual Parameter Simulation:
 ```bash
 ./example-agents/paper_trader/paper-trader \
   --entry analyze_and_trade \

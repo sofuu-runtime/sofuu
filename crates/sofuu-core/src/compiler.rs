@@ -1361,26 +1361,47 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         .unwrap_or_default();
     let grants_json = serde_json::to_string(&declared_grants).unwrap_or_else(|_| "[]".to_string());
 
+    let parsed_prog = crate::domains::kaze::parser::parse(&kaze_src).ok();
+    let default_entry = parsed_prog.as_ref().and_then(|p| {
+        if p.item("main").is_some() {
+            Some("main".to_string())
+        } else {
+            p.items
+                .iter()
+                .find(|i| matches!(i.kind, crate::domains::kaze::ast::ItemKind::Action | crate::domains::kaze::ast::ItemKind::Filter | crate::domains::kaze::ast::ItemKind::Check))
+                .map(|i| i.name.clone())
+        }
+    });
+    let default_entry_json = serde_json::to_string(&default_entry).unwrap_or_else(|_| "null".to_string());
+
+    let has_market_params = parsed_prog.as_ref().is_some_and(|p| {
+        p.items.iter().any(|i| i.params.iter().any(|param| param == "current_price" || param == "asset"))
+    });
+    let has_market_params_json = if has_market_params { "true" } else { "false" };
+
     let kaze_source_json = serde_json::to_string(&kaze_src).unwrap_or_else(|_| "\"\"".to_string());
     let kaze_name_json = serde_json::to_string(file_stem).unwrap_or_else(|_| "\"agent\"".to_string());
 
     let bootstrap = format!(r##"
-(function() {{
+(async function() {{
     var kazeSource = {kaze_source_json};
     var kazeName = {kaze_name_json};
     var defaultGrants = {grants_json};
+    var defaultEntry = {default_entry_json};
+    var hasMarketParams = {has_market_params_json};
 
     var argv = (typeof process !== 'undefined' && process.argv) ? process.argv.slice(2) : [];
     if (argv.indexOf('--help') !== -1 || argv.indexOf('-h') !== -1) {{
-        console.log("Usage: " + kazeName + " [options] [query]\n\nAutonomous AI Agent powered by Kaze & Sofuu.\n\nOptions:\n  -i, --interactive      Launch interactive Agent TUI shell\n  -d, --daemon           Run continuous 24/7 autonomous supervisor loop\n  --every <interval>     Supervisor cycle interval (e.g. 500ms, 2s, 10s, 1m, 1h; default: 5s)\n  --interval <interval>  Alias for --every\n  --arg key=val          Pass named argument\n  --cap <name>           Grant capability backend\n  --entry <name>         Routine to execute\n  --fuel <n>             Instruction budget\n  -h, --help             Show help\n");
+        console.log("Usage: " + kazeName + " [options] [query]\n\nAutonomous AI Agent powered by Kaze & Sofuu.\n\nOptions:\n  -i, --interactive      Launch interactive Agent TUI shell\n  -d, --daemon           Run continuous 24/7 autonomous supervisor loop\n  --every <interval>     Supervisor cycle interval (e.g. 500ms, 2s, 10s, 1m, 1h; default: 5s)\n  --interval <interval>  Alias for --every\n  -l, --live             Fetch live real-time market quotes (crypto & stocks)\n  --arg key=val          Pass named argument\n  --cap <name>           Grant capability backend\n  --entry <name>         Routine to execute\n  --fuel <n>             Instruction budget\n  -h, --help             Show help\n");
         return;
     }}
 
     var isInteractive = argv.indexOf('--interactive') !== -1 || argv.indexOf('-i') !== -1;
     var isDaemon = argv.indexOf('--daemon') !== -1 || argv.indexOf('-d') !== -1;
+    var isLive = argv.indexOf('--live') !== -1 || argv.indexOf('-l') !== -1;
     var intervalMs = 5000;
     var intervalRaw = '5s';
-    var entryRoutine = null;
+    var entryRoutine = defaultEntry;
     var fuel = 200000;
     var args = {{}};
     var positionals = [];
@@ -1417,6 +1438,10 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             isDaemon = true;
             continue;
         }}
+        if (a === '--live' || a === '-l') {{
+            isLive = true;
+            continue;
+        }}
         if ((a === '--every' || a === '--interval') && i + 1 < argv.length) {{
             intervalRaw = argv[++i];
             intervalMs = parseInterval(intervalRaw);
@@ -1447,19 +1472,11 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         }}
     }}
 
-    var isTTY = typeof process !== 'undefined' && process.stdout && process.stdout.isTTY;
-    if (isDaemon) {{
-        runDaemon();
-    }} else if (isInteractive || (positionals.length === 0 && Object.keys(args).length === 0 && isTTY)) {{
-        launchInteractiveTUI();
-    }} else {{
-        runHeadless();
-    }}
-
     function badge(type, text) {{
         var colorMap = {{
             'AGENT': '\x1b[36m',
             'DAEMON': '\x1b[35m',
+            'MARKET': '\x1b[32m',
             'CYCLE': '\x1b[36m',
             'SUMMARY': '\x1b[32m',
             'AI': '\x1b[35m',
@@ -1478,13 +1495,111 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         console.log(col + '[' + type + ']\x1b[0m ' + text);
     }}
 
-    function runDaemon() {{
+    async function fetchLiveMarketData(ticker) {{
+        if (!ticker) ticker = 'BTC-USDT';
+        ticker = ('' + ticker).trim().toUpperCase();
+        var cleanTicker = ticker.replace('/', '-').replace('_', '-');
+        var isCrypto = cleanTicker.indexOf('-') !== -1 || ['BTC', 'ETH', 'SOL', 'BNB', 'DOGE', 'XRP', 'ADA'].indexOf(cleanTicker) !== -1;
+
+        if (isCrypto) {{
+            var binanceSymbol = cleanTicker.replace('-', '');
+            if (!binanceSymbol.endsWith('USDT') && !binanceSymbol.endsWith('USD') && !binanceSymbol.endsWith('BUSD')) {{
+                binanceSymbol += 'USDT';
+            }}
+            if (binanceSymbol.endsWith('USD') && !binanceSymbol.endsWith('USDT')) {{
+                binanceSymbol += 'T';
+            }}
+            try {{
+                var res = await fetch('https://api.binance.com/api/v3/ticker/24hr?symbol=' + binanceSymbol);
+                if (res.ok) {{
+                    var d = await res.json();
+                    var price = parseFloat(d.lastPrice);
+                    var vol = parseFloat(d.quoteVolume) || (parseFloat(d.volume) * price) || 1000000;
+                    var chgPct = parseFloat(d.priceChangePercent) || 0.0;
+                    var sentiment = Math.min(99, Math.max(1, Math.round(50 + chgPct * 4)));
+                    return {{ source: 'Binance', asset: cleanTicker, price: price, volume: vol, changePct: chgPct, sentiment: sentiment }};
+                }}
+            }} catch (_) {{}}
+
+            try {{
+                var base = cleanTicker.split('-')[0];
+                var cbRes = await fetch('https://api.coinbase.com/v2/prices/' + base + '-USD/spot');
+                if (cbRes.ok) {{
+                    var cbData = await cbRes.json();
+                    var cbPrice = parseFloat(cbData && cbData.data && cbData.data.amount);
+                    if (cbPrice > 0) {{
+                        return {{ source: 'Coinbase', asset: cleanTicker, price: cbPrice, volume: 250000000, changePct: 0.0, sentiment: 50 }};
+                    }}
+                }}
+            }} catch (_) {{}}
+        }}
+
+        var stockSymbol = cleanTicker.replace('-', '');
+        try {{
+            var yRes = await fetch('https://query1.finance.yahoo.com/v8/finance/chart/' + stockSymbol + '?interval=1d');
+            if (yRes.ok) {{
+                var yData = await yRes.json();
+                var meta = yData && yData.chart && yData.chart.result && yData.chart.result[0] && yData.chart.result[0].meta;
+                if (meta && meta.regularMarketPrice) {{
+                    var sPrice = meta.regularMarketPrice;
+                    var prevClose = meta.chartPreviousClose || meta.previousClose || sPrice;
+                    var sChgPct = prevClose > 0 ? ((sPrice - prevClose) / prevClose) * 100 : 0.0;
+                    var sVol = meta.regularMarketVolume || 50000000;
+                    var sSentiment = Math.min(99, Math.max(1, Math.round(50 + sChgPct * 4)));
+                    return {{ source: 'Yahoo Finance', asset: stockSymbol, price: sPrice, volume: sVol, changePct: sChgPct, sentiment: sSentiment }};
+                }}
+            }}
+        }} catch (_) {{}}
+        return null;
+    }}
+
+    async function resolveLiveMarketArgs(targetArgs) {{
+        var targetTicker = targetArgs['ticker'] || targetArgs['asset'] || (positionals.length > 0 ? positionals[0] : 'BTC-USDT');
+        targetArgs['asset'] = targetTicker;
+        targetArgs['ticker'] = targetTicker;
+
+        if (targetArgs['current_price'] !== undefined && targetArgs['volume_24h'] !== undefined && targetArgs['sentiment_score'] !== undefined) {{
+            return targetArgs;
+        }}
+
+        try {{
+            var live = await fetchLiveMarketData(targetTicker);
+            if (live) {{
+                if (targetArgs['current_price'] === undefined) targetArgs['current_price'] = live.price;
+                if (targetArgs['volume_24h'] === undefined) targetArgs['volume_24h'] = Math.round(live.volume);
+                if (targetArgs['sentiment_score'] === undefined) targetArgs['sentiment_score'] = live.sentiment;
+                if (targetArgs['requested_action'] === undefined) {{
+                    targetArgs['requested_action'] = live.sentiment >= 55 ? 'BUY' : (live.sentiment <= 45 ? 'SELL' : 'HOLD');
+                }}
+                if (targetArgs['requested_allocation_pct'] === undefined) targetArgs['requested_allocation_pct'] = 15;
+                var sign = live.changePct >= 0 ? '+' : '';
+                badge('MARKET', live.source + " · " + targetTicker + " $" + live.price + " (24h: " + sign + live.changePct.toFixed(2) + "%, Vol: $" + Math.round(live.volume).toLocaleString() + ", Sentiment: " + live.sentiment + "/100)");
+            }} else {{
+                if (targetArgs['current_price'] === undefined) targetArgs['current_price'] = 75000.0;
+                if (targetArgs['volume_24h'] === undefined) targetArgs['volume_24h'] = 100000000;
+                if (targetArgs['sentiment_score'] === undefined) targetArgs['sentiment_score'] = 50;
+                if (targetArgs['requested_action'] === undefined) targetArgs['requested_action'] = 'BUY';
+                if (targetArgs['requested_allocation_pct'] === undefined) targetArgs['requested_allocation_pct'] = 10;
+            }}
+        }} catch (e) {{
+            badge('WARN', "Could not fetch live quote for " + targetTicker + ": " + (e && e.message ? e.message : e));
+            if (targetArgs['current_price'] === undefined) targetArgs['current_price'] = 75000.0;
+            if (targetArgs['volume_24h'] === undefined) targetArgs['volume_24h'] = 100000000;
+            if (targetArgs['sentiment_score'] === undefined) targetArgs['sentiment_score'] = 50;
+            if (targetArgs['requested_action'] === undefined) targetArgs['requested_action'] = 'BUY';
+            if (targetArgs['requested_allocation_pct'] === undefined) targetArgs['requested_allocation_pct'] = 10;
+        }}
+        return targetArgs;
+    }}
+
+    async function runDaemon() {{
         if (positionals.length > 0 && Object.keys(args).length === 0) {{
             var combined = positionals.join(' ');
             args['query'] = combined;
             args['prompt'] = combined;
             args['input'] = combined;
             args['ticker'] = positionals[0];
+            args['asset'] = positionals[0];
             if (positionals.length > 1) {{
                 args['signal'] = positionals[1];
             }}
@@ -1516,7 +1631,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             if (stopping) return;
             stopping = true;
             if (timerId !== null) {{
-                clearInterval(timerId);
+                clearTimeout(timerId);
                 timerId = null;
             }}
             var uptime = formatDuration(Date.now() - startTime);
@@ -1533,7 +1648,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             process.on('SIGTERM', shutdown);
         }}
 
-        function cycle() {{
+        async function cycle() {{
             if (stopping) return;
             cycles++;
             var ts = (new Date()).toISOString().replace('T', ' ').slice(0, 19);
@@ -1542,6 +1657,10 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
                 var runArgs = Object.assign({{}}, args);
                 runArgs['cycle'] = cycles;
                 runArgs['timestamp'] = ts;
+
+                if (hasMarketParams || isLive) {{
+                    await resolveLiveMarketArgs(runArgs);
+                }}
 
                 var opts = {{ fuel: fuel, grants: defaultGrants }};
                 if (entryRoutine) opts.entry = entryRoutine;
@@ -1585,20 +1704,32 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             }}
         }}
 
-        cycle();
-        timerId = setInterval(cycle, intervalMs);
+        async function loop() {{
+            if (stopping) return;
+            await cycle();
+            if (!stopping) {{
+                timerId = setTimeout(loop, intervalMs);
+            }}
+        }}
+
+        await loop();
     }}
 
-    function runHeadless() {{
+    async function runHeadless() {{
         if (positionals.length > 0 && Object.keys(args).length === 0) {{
             var combined = positionals.join(' ');
             args['query'] = combined;
             args['prompt'] = combined;
             args['input'] = combined;
             args['ticker'] = positionals[0];
+            args['asset'] = positionals[0];
             if (positionals.length > 1) {{
                 args['signal'] = positionals[1];
             }}
+        }}
+
+        if (hasMarketParams || isLive) {{
+            await resolveLiveMarketArgs(args);
         }}
 
         var opts = {{ fuel: fuel, grants: defaultGrants }};
@@ -1652,6 +1783,13 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
                     runArgs['prompt'] = prompt;
                     runArgs['query'] = prompt;
                     runArgs['input'] = prompt;
+                    if (hasMarketParams || isLive) {{
+                        if (prompt && prompt.trim().length <= 10 && prompt.trim().indexOf(' ') === -1) {{
+                            runArgs['ticker'] = prompt.trim();
+                            runArgs['asset'] = prompt.trim();
+                        }}
+                        await resolveLiveMarketArgs(runArgs);
+                    }}
                     var opts = {{ fuel: fuel, grants: defaultGrants }};
                     if (entryRoutine) opts.entry = entryRoutine;
                     var res = sofuu.kaze.run(kazeSource, runArgs, opts);
@@ -1677,7 +1815,19 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             runHeadless();
         }}
     }}
-}})();
+
+    var isTTY = typeof process !== 'undefined' && process.stdout && process.stdout.isTTY;
+    if (isDaemon) {{
+        await runDaemon();
+    }} else if (isInteractive || (positionals.length === 0 && Object.keys(args).length === 0 && isTTY && !hasMarketParams)) {{
+        launchInteractiveTUI();
+    }} else {{
+        await runHeadless();
+    }}
+}})().catch(function(err) {{
+    console.error(err);
+    if (typeof process !== 'undefined' && process.exit) process.exit(1);
+}});
 "##);
 
     Ok(bootstrap)

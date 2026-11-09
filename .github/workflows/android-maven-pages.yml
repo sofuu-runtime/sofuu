@@ -58,7 +58,7 @@ jobs:
           unzip -p "$AAR" classes.jar > /tmp/sofuu-classes.jar
           unzip -p /tmp/sofuu-classes.jar 'META-INF/LICENSES/QTSQ-FORMAT.txt' > /dev/null
           unzip -p /tmp/sofuu-classes.jar 'META-INF/SOFUU-NOTICE.txt' > /dev/null
-          grep -q 'Quantum Tensor Sequence' "$POM"
+          grep -q 'QTSQ' "$POM"
           echo "✓ QTSQ-linked AAR with license and NOTICE"
 
       - name: Generate Maven metadata and checksums

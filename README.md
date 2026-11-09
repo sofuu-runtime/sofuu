@@ -55,31 +55,37 @@ Official pre-compiled single binaries are available for macOS (Apple Silicon) an
 Sofuu collapses vector databases, agent orchestrators, and tool sandboxes into standard JavaScript / TypeScript inside a single lightweight binary (< 10 MB):
 
 ```javascript
-// hello.js - memory · agents · AI · zero daemons
+// quickstart.js - memory · native tools · agents · zero daemons
 const brain = sofuu.memory.open("./brain.qtsq", 768);
-brain.remember(sofuu.ai.embedLocal("sofuu"), "AI runtime. One binary.");
+brain.remember(sofuu.ai.embedLocal("runtime"), "AI runtime. Under 10 MB.");
 
-// Autonomous agent - define once, then run it
-sofuu.agent.define({
-  name: "researcher",
+// Microsecond SIMD vector recall (< 2ms, zero database servers)
+const [hit] = brain.recall(sofuu.ai.embedLocal("speed"), 1);
+
+// Sandboxed native tool executed in-process with policy gates
+const sys = sofuu.tools.execute("system_info", {});
+
+// Autonomous agent - define once with memory & tools (0 models needed to test)
+const agent = sofuu.agent.define({
+  name: "assistant",
   system: "Cite sources.",
-  tools: ["web", "memory", "system"],
+  tools: ["coding", "memory", "web"],
 });
 
-const result = await sofuu.agent.run("researcher", "Summarise this project directory");
-const [hit] = brain.recall(sofuu.ai.embedLocal("fast"), 1);
-console.log(result.answer, "•", hit.text);
-// -> AI runtime. 22.5 ms median cold start (wall clock incl. spawn) · 39.4 ms to first HTTP response · zero daemons
+console.log(hit.text, "•", sys.platform || process.platform, "• agent:", agent.name);
+// -> AI runtime. Under 10 MB. · darwin · agent: assistant
 ```
+
+*Install with line 1 · run with line 2 · memory, tools, and agents — all in-process, zero daemons, 22.5 ms median cold start measured on macOS arm64 (31 runs, wall clock incl. spawn).*
 
 Run it immediately with zero setup, or compile it into a standalone native executable:
 
 ```bash
 # 1. Run directly with sub-20ms cold start
-$ sofuu run hello.js
+$ sofuu run quickstart.js
 
 # 2. Compile into a standalone native executable with zero dependencies
-$ sofuu compile hello.js -o my-agent
+$ sofuu compile quickstart.js -o my-agent
 $ ./my-agent
 ```
 
@@ -132,6 +138,36 @@ $ sofuu compile agent.kaze -o my-agent
 
 # Run anywhere with CLI flags or 12-factor config:
 $ ./my-agent --config agent.config.json
+```
+
+---
+
+### 5. Production Showcase Agents (`example-agents/`)
+
+The repository includes pre-built showcase agents written 100% in pure Kaze (zero JavaScript, zero package dependencies):
+
+* **Quant Sentinel (`quant_sentinel/`):** Algorithmic risk sentinel enforcing leverage hard-caps and secret-leak detection.
+* **Med Protocol (`med_protocol/`):** Clinical triage agent automating ESI emergency escalations from patient vitals.
+* **Agri Sentinel (`agri_sentinel/`):** Autonomous greenhouse climate monitor controlling irrigation and heat relays.
+* **Paper Trader (`paper_trader/`):** Simulated multi-asset exchange with portfolio risk guardrails.
+
+Compile all agents in one step, or test their standalone native executables:
+
+```bash
+# 1. Compile all showcase agents with one command:
+$ ./example-agents/build.sh
+
+# 2. Test Quant Sentinel (Within 3.0x leverage cap -> Order Routed):
+$ ./example-agents/quant_sentinel/quant-sentinel --arg ticker=BTC --arg signal=BUY --arg leverage=2 --arg price=65000
+# -> [VERDICT] ALLOW "Synthesized market thesis: BTC target $68,200..."
+
+# 3. Test Risk Policy Gate (Leverage > 3.0x -> Instant Fail-Closed Rejection):
+$ ./example-agents/quant_sentinel/quant-sentinel --arg ticker=BTC --arg signal=BUY --arg leverage=5 --arg price=65000
+# -> [VERDICT] REJECT Risk policy violation: leverage 5 exceeds hard cap of 3.0x
+
+# 4. Test Clinical Vitals Triage (Hypoxia + Tachycardia -> ESI Level 1 Escalation):
+$ ./example-agents/med_protocol/med-protocol --arg patient_id=P101 --arg heart_rate=145 --arg spo2=88 --arg systolic_bp=85
+# -> [VERDICT] REJECT CRITICAL: Severe vitals decompensation -> Emergency code triggered
 ```
 
 ---

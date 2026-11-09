@@ -2,6 +2,11 @@ name: Publish Android SDK Maven repository
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "SDK version to publish (must match an android-sdk-v<version> release)"
+        required: true
+        default: "0.3.1"
 
 permissions:
   contents: write
@@ -19,19 +24,22 @@ jobs:
       - name: Download the published AAR artifacts
         env:
           GH_TOKEN: ${{ github.token }}
+          SDK_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          mkdir -p maven/com/sofuu/sofuu-android/0.2.0
-          gh release download android-sdk-v0.2.0 \
-            --pattern 'sofuu-android-0.2.0*' \
-            --dir maven/com/sofuu/sofuu-android/0.2.0 \
+          mkdir -p "maven/com/sofuu/sofuu-android/$SDK_VERSION"
+          gh release download "android-sdk-v$SDK_VERSION" \
+            --pattern "sofuu-android-$SDK_VERSION*" \
+            --dir "maven/com/sofuu/sofuu-android/$SDK_VERSION" \
             --clobber
 
       - name: Verify the AAR is QTSQ-linked and carries its notices
+        env:
+          SDK_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          AAR=maven/com/sofuu/sofuu-android/0.2.0/sofuu-android-0.2.0.aar
-          POM=maven/com/sofuu/sofuu-android/0.2.0/sofuu-android-0.2.0.pom
+          AAR="maven/com/sofuu/sofuu-android/$SDK_VERSION/sofuu-android-$SDK_VERSION.aar"
+          POM="maven/com/sofuu/sofuu-android/$SDK_VERSION/sofuu-android-$SDK_VERSION.pom"
           for abi in arm64-v8a x86_64; do
             unzip -p "$AAR" "jni/$abi/libsofuu.so" > "/tmp/libsofuu-$abi.so"
             if grep -aqF 'built without the QTSQ codec' "/tmp/libsofuu-$abi.so"; then
@@ -54,22 +62,48 @@ jobs:
           echo "✓ QTSQ-linked AAR with license and NOTICE"
 
       - name: Generate Maven metadata and checksums
+        env:
+          SDK_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          LAST_UPDATED="$(date -u +%Y%m%d%H%M%S)"
-          cat > maven/com/sofuu/sofuu-android/maven-metadata.xml <<XML
-          <?xml version="1.0" encoding="UTF-8"?>
-          <metadata>
-            <groupId>com.sofuu</groupId>
-            <artifactId>sofuu-android</artifactId>
-            <versioning>
-              <latest>0.2.0</latest>
-              <release>0.2.0</release>
-              <versions><version>0.2.0</version></versions>
-              <lastUpdated>${LAST_UPDATED}</lastUpdated>
-            </versioning>
-          </metadata>
-          XML
+          python3 - "$SDK_VERSION" <<'PY'
+          import datetime
+          import os
+          import sys
+          import xml.etree.ElementTree as ET
+
+          version = sys.argv[1]
+          path = "maven/com/sofuu/sofuu-android/maven-metadata.xml"
+          if os.path.exists(path):
+              tree = ET.parse(path)
+              root = tree.getroot()
+              versioning = root.find("versioning")
+          else:
+              root = ET.Element("metadata")
+              ET.SubElement(root, "groupId").text = "com.sofuu"
+              ET.SubElement(root, "artifactId").text = "sofuu-android"
+              versioning = ET.SubElement(root, "versioning")
+              tree = ET.ElementTree(root)
+
+          versions = versioning.find("versions")
+          if versions is None:
+              versions = ET.SubElement(versioning, "versions")
+          existing = [v.text for v in versions.findall("version")]
+          if version not in existing:
+              ET.SubElement(versions, "version").text = version
+
+          for tag in ("latest", "release"):
+              node = versioning.find(tag)
+              if node is None:
+                  node = ET.SubElement(versioning, tag)
+              node.text = version
+          updated = versioning.find("lastUpdated")
+          if updated is None:
+              updated = ET.SubElement(versioning, "lastUpdated")
+          updated.text = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d%H%M%S")
+          ET.indent(tree, space="  ")
+          tree.write(path, encoding="UTF-8", xml_declaration=True)
+          PY
           find maven -type f \
             ! -name '*.md5' ! -name '*.sha1' ! -name '*.sha256' ! -name '*.sha512' \
             -print0 | while IFS= read -r -d '' f; do
@@ -80,6 +114,8 @@ jobs:
             done
 
       - name: Commit and push to gh-pages
+        env:
+          SDK_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -89,5 +125,5 @@ jobs:
             echo "No artifact changes"
             exit 0
           fi
-          git commit -m "Publish com.sofuu:sofuu-android:0.2.0"
+          git commit -m "Publish com.sofuu:sofuu-android:$SDK_VERSION"
           git push origin HEAD:gh-pages

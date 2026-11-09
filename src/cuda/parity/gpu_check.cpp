@@ -1423,43 +1423,92 @@ void test_rope_kv(void *fn, uint32_t &seed) {
 void test_attn_decode(void *fn, uint32_t &seed) {
     const int n_heads = 8, n_kv = 2, hd = 64, cap = 32, seq = 17;
     const int cache_n = n_kv * cap * hd;
-    std::vector<float> q = random_vec(n_heads * hd, seed, -1.0f, 1.0f);
+    const int row_n = n_heads * hd;
+    const int n_q8 = row_n / 32;
+    std::vector<float> q = random_vec(row_n, seed, -1.0f, 1.0f);
     std::vector<float> k = random_vec(cache_n, seed, -1.0f, 1.0f);
     std::vector<float> v = random_vec(cache_n, seed, -1.0f, 1.0f);
-    std::vector<float> got((size_t)(n_heads * hd), 0.0f);
-    std::vector<float> want((size_t)(n_heads * hd), 0.0f);
+    std::vector<float> got((size_t)row_n, 0.0f);
+    std::vector<float> want((size_t)row_n, 0.0f);
     float scale = 1.0f / std::sqrt((float)hd);
     sofuu_ref::attn_decode_ref(q.data(), k.data(), v.data(), want.data(),
                                n_heads, n_kv, hd, seq, cap, scale);
+    // The same reference row through the standalone quantizer: the fused path
+    // must produce these bytes, or o_proj would read a different activation.
+    std::vector<int8_t> aq_ref((size_t)row_n);
+    std::vector<float> ad_ref((size_t)n_q8);
+    std::vector<int32_t> as_ref((size_t)n_q8), as16_ref((size_t)n_q8 * 2);
+    sofuu_ref::quantize_q8_1(want.data(), aq_ref.data(), ad_ref.data(),
+                             as_ref.data(), as16_ref.data(), row_n);
+
     unsigned long long dq = 0, dk = 0, dv = 0, dout = 0, dsq = 0;
+    unsigned long long daq = 0, dad = 0, das = 0, da16 = 0;
     // The sequence length reaches the kernel through device memory so a captured
     // graph can replay at a new position.
     int seq_dev = seq;
+    int do_quant = 1;
     if (!alloc_upload(q.data(), q.size() * sizeof(float), &dq) ||
         !alloc_upload(k.data(), k.size() * sizeof(float), &dk) ||
         !alloc_upload(v.data(), v.size() * sizeof(float), &dv) ||
         !alloc_upload(&seq_dev, sizeof(seq_dev), &dsq) ||
-        !alloc_only((unsigned long long)got.size() * sizeof(float), &dout)) {
+        !alloc_only((unsigned long long)got.size() * sizeof(float), &dout) ||
+        !alloc_only((unsigned long long)row_n, &daq) ||
+        !alloc_only((unsigned long long)n_q8 * 4, &dad) ||
+        !alloc_only((unsigned long long)n_q8 * 4, &das) ||
+        !alloc_only((unsigned long long)n_q8 * 8, &da16)) {
         fail_msg("alloc");
         ++g_failures;
         return;
     }
-    std::vector<void *> params = {&dq, &dk, &dv, &dout, (void *)&n_heads,
-                                  (void *)&n_kv, (void *)&hd, &dsq,
-                                  (void *)&cap, (void *)&scale};
+    std::vector<void *> params = {&dq,           &dk,           &dv,
+                                  &dout,         (void *)&n_heads,
+                                  (void *)&n_kv, (void *)&hd,   &dsq,
+                                  (void *)&cap,  (void *)&scale, &daq,
+                                  &dad,          &das,          &da16,
+                                  (void *)&do_quant};
     bool ok = launch(fn, (unsigned)n_heads, 256, params) &&
               download(dout, got.data(), got.size() * sizeof(float));
+
+    std::vector<int8_t> aq((size_t)row_n, 0);
+    std::vector<float> ad((size_t)n_q8, 0.0f);
+    std::vector<int32_t> as((size_t)n_q8, 0), as16((size_t)n_q8 * 2, 0);
+    bool q_ok = ok && download(daq, aq.data(), (size_t)row_n) &&
+                download(dad, ad.data(), (size_t)n_q8 * 4) &&
+                download(das, as.data(), (size_t)n_q8 * 4) &&
+                download(da16, as16.data(), (size_t)n_q8 * 8);
+    int q_bad = 0, d_bad = 0, s_bad = 0, s16_bad = 0;
+    if (q_ok) {
+        for (int i = 0; i < row_n; ++i)
+            if (aq[(size_t)i] != aq_ref[(size_t)i]) ++q_bad;
+        for (int b = 0; b < n_q8; ++b) {
+            if (ad[(size_t)b] != ad_ref[(size_t)b]) ++d_bad;
+            if (as[(size_t)b] != as_ref[(size_t)b]) ++s_bad;
+            for (int h = 0; h < 2; ++h)
+                if (as16[(size_t)(b * 2 + h)] != as16_ref[(size_t)(b * 2 + h)])
+                    ++s16_bad;
+        }
+    }
     double max_err = 0.0;
     for (size_t i = 0; i < got.size(); ++i)
         max_err = std::fmax(max_err,
                             std::fabs((double)got[i] - (double)want[i]));
-    report("attn_decode", ok && max_err <= 5e-5, max_err, 5e-5,
-           (double)want[0]);
+    report("attn_decode",
+           ok && q_ok && q_bad == 0 && d_bad == 0 && s_bad == 0 &&
+               s16_bad == 0 && max_err <= 5e-5,
+           max_err, 5e-5, (double)want[0]);
+    if (q_bad || d_bad || s_bad || s16_bad) {
+        std::printf("      fused quantize mismatch: q=%d d=%d sum=%d sum16=%d\n",
+                    q_bad, d_bad, s_bad, s16_bad);
+    }
     sofuu_cuda_ctx_free(g_ctx, dsq);
     sofuu_cuda_ctx_free(g_ctx, dq);
     sofuu_cuda_ctx_free(g_ctx, dk);
     sofuu_cuda_ctx_free(g_ctx, dv);
     sofuu_cuda_ctx_free(g_ctx, dout);
+    sofuu_cuda_ctx_free(g_ctx, daq);
+    sofuu_cuda_ctx_free(g_ctx, dad);
+    sofuu_cuda_ctx_free(g_ctx, das);
+    sofuu_cuda_ctx_free(g_ctx, da16);
 }
 
 void test_add(void *fn, uint32_t &seed) {

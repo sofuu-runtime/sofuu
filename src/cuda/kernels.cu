@@ -1123,7 +1123,8 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
 void sofuu_attn_decode_f32(const float *q, const float *k_cache,
                            const float *v_cache, float *out, int n_heads,
                            int n_kv_heads, int head_dim, const int *seq_dev,
-                           int cap, float scale) {
+                           int cap, float scale, signed char *aq, float *ad,
+                           int *as, int *as16, int do_quant) {
     int seq_len = *seq_dev;
     int h = (int)sofuu_ctaid_x();
     unsigned int tid = sofuu_tid_x();
@@ -1204,6 +1205,23 @@ void sofuu_attn_decode_f32(const float *q, const float *k_cache,
     for (int d = (int)tid; d < head_dim; d += (int)stride) {
         out[(unsigned long long)h * (unsigned long long)head_dim +
             (unsigned long long)d] = acc[d] * inv;
+    }
+
+    // The o_proj GEMV needs this row quantized to q8_1, which used to be the
+    // very next launch: 2048 values round-tripping through DRAM behind a
+    // dependent stall. A block owns exactly one head's values, so it can
+    // quantize them itself once the barrier has published the writes --
+    // `head_dim / 32` warps, each taking one 32-value block. Same per-block
+    // arithmetic as the standalone quantizer, so the bytes match.
+    if (do_quant != 0) {
+        sofuu_bar_sync();
+        int nb_head = head_dim >> 5;
+        int warp = (int)(tid >> 5);
+        int lane = (int)(tid & 31u);
+        if (warp < nb_head) {
+            sofuu_quantize_block32(out, aq, ad, as, as16,
+                                   h * nb_head + warp, lane);
+        }
     }
 }
 

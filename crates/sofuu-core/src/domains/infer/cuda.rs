@@ -1714,7 +1714,11 @@ mod imp {
             let mut sl = seq_dev.ptr;
             let mut c = cap as i32;
             let mut s = scale;
-            let mut params: [*mut c_void; 10] = [
+            // The kernel carries the fused quantizer's parameters whatever the
+            // caller wants; with do_quant = 0 it never dereferences them, and
+            // the driver requires every declared parameter to be passed.
+            let mut dq = 0i32;
+            let mut params: [*mut c_void; 15] = [
                 &mut qp as *mut u64 as *mut c_void,
                 &mut kc as *mut u64 as *mut c_void,
                 &mut vc as *mut u64 as *mut c_void,
@@ -1725,6 +1729,112 @@ mod imp {
                 &mut sl as *mut u64 as *mut c_void,
                 &mut c as *mut i32 as *mut c_void,
                 &mut s as *mut f32 as *mut c_void,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dq as *mut i32 as *mut c_void,
+            ];
+            self.launch(
+                "sofuu_attn_decode_f32",
+                (n_heads as u32, 1, 1),
+                (256, 1, 1),
+                &mut params,
+            )
+        }
+
+        /// Decode attention that also quantizes its own output row to q8_1, so
+        /// the o_proj dp4a GEMV does not need a separate `quantize_q8_1`
+        /// launch. `do_quant` false leaves the quantized buffers untouched and
+        /// reproduces the plain kernel.
+        #[allow(clippy::too_many_arguments)]
+        pub fn attn_decode_quant(
+            &self,
+            q: DeviceBuf,
+            k_cache: DeviceBuf,
+            v_cache: DeviceBuf,
+            out: DeviceBuf,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            seq_len: usize,
+            seq_dev: DeviceBuf,
+            cap: usize,
+            scale: f32,
+            aq: DeviceBuf,
+            ad: DeviceBuf,
+            asum: DeviceBuf,
+            asum16: DeviceBuf,
+        ) -> Result<(), CudaError> {
+            validate_attn_decode(
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len,
+                cap,
+                q.bytes,
+                k_cache.bytes,
+                v_cache.bytes,
+                out.bytes,
+            )?;
+            if seq_dev.bytes < 4 {
+                return Err(CudaError(format!(
+                    "attn_decode sequence buffer is {} bytes, need 4",
+                    seq_dev.bytes
+                )));
+            }
+            // The quantizer works one 32-value block per warp inside the head's
+            // block, so it needs the head width to be a whole number of blocks.
+            if head_dim % 32 != 0 {
+                return Err(CudaError(format!(
+                    "attn_decode_quant needs head_dim % 32 == 0, got {head_dim}"
+                )));
+            }
+            let n_q8 = n_heads * head_dim / 32;
+            let need_q = n_heads * head_dim;
+            let need_d = n_q8 * std::mem::size_of::<f32>();
+            if aq.bytes < need_q || ad.bytes < need_d || asum.bytes < need_d || asum16.bytes < 2 * need_d
+            {
+                return Err(CudaError(format!(
+                    "attn_decode_quant quant buffers too small: q {}<{need_q}, d {}<{need_d}, s {}<{need_d}, s16 {}<{}",
+                    aq.bytes,
+                    ad.bytes,
+                    asum.bytes,
+                    asum16.bytes,
+                    2 * need_d
+                )));
+            }
+            let mut qp = q.ptr;
+            let mut kc = k_cache.ptr;
+            let mut vc = v_cache.ptr;
+            let mut op = out.ptr;
+            let mut nh = n_heads as i32;
+            let mut nk = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut sl = seq_dev.ptr;
+            let mut c = cap as i32;
+            let mut s = scale;
+            let mut aqp = aq.ptr;
+            let mut adp = ad.ptr;
+            let mut asp = asum.ptr;
+            let mut a16p = asum16.ptr;
+            let mut dq = 1i32;
+            let mut params: [*mut c_void; 15] = [
+                &mut qp as *mut u64 as *mut c_void,
+                &mut kc as *mut u64 as *mut c_void,
+                &mut vc as *mut u64 as *mut c_void,
+                &mut op as *mut u64 as *mut c_void,
+                &mut nh as *mut i32 as *mut c_void,
+                &mut nk as *mut i32 as *mut c_void,
+                &mut hd as *mut i32 as *mut c_void,
+                &mut sl as *mut u64 as *mut c_void,
+                &mut c as *mut i32 as *mut c_void,
+                &mut s as *mut f32 as *mut c_void,
+                &mut aqp as *mut u64 as *mut c_void,
+                &mut adp as *mut u64 as *mut c_void,
+                &mut asp as *mut u64 as *mut c_void,
+                &mut a16p as *mut u64 as *mut c_void,
+                &mut dq as *mut i32 as *mut c_void,
             ];
             self.launch(
                 "sofuu_attn_decode_f32",
@@ -2332,6 +2442,28 @@ mod imp {
             _seq_dev: DeviceBuf,
             _cap: usize,
             _scale: f32,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn attn_decode_quant(
+            &self,
+            _q: DeviceBuf,
+            _kc: DeviceBuf,
+            _vc: DeviceBuf,
+            _out: DeviceBuf,
+            _n_heads: usize,
+            _n_kv_heads: usize,
+            _head_dim: usize,
+            _seq_len: usize,
+            _seq_dev: DeviceBuf,
+            _cap: usize,
+            _scale: f32,
+            _aq: DeviceBuf,
+            _ad: DeviceBuf,
+            _asum: DeviceBuf,
+            _asum16: DeviceBuf,
         ) -> Result<(), CudaError> {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }

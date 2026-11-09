@@ -903,28 +903,56 @@ impl CudaModel {
                 self.cap,
             )
             .map_err(|err| format!("layer {li} rope+kv_write: {err}"))?;
-            e.attn_decode(
-                self.q,
-                k_slice,
-                v_slice,
-                self.attn_out,
-                self.n_heads,
-                self.n_kv_heads,
-                self.head_dim,
-                seq_len,
-                seq_dev,
-                self.cap,
-                scale,
-            )
-            .map_err(|err| format!("layer {li} attention: {err}"))?;
+            // The attention kernel quantizes its own output row when the head
+            // width is a whole number of 32-value blocks, which saves the
+            // quantize launch in front of the o_proj GEMV.
+            let attn_fused_quant = self.head_dim.is_multiple_of(32)
+                && self.q_dim == self.n_heads * self.head_dim;
+            if attn_fused_quant {
+                e.attn_decode_quant(
+                    self.q,
+                    k_slice,
+                    v_slice,
+                    self.attn_out,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    seq_len,
+                    seq_dev,
+                    self.cap,
+                    scale,
+                    self.xq,
+                    self.xd,
+                    self.xsum,
+                    self.xsum16,
+                )
+                .map_err(|err| format!("layer {li} attention: {err}"))?;
+            } else {
+                e.attn_decode(
+                    self.q,
+                    k_slice,
+                    v_slice,
+                    self.attn_out,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    seq_len,
+                    seq_dev,
+                    self.cap,
+                    scale,
+                )
+                .map_err(|err| format!("layer {li} attention: {err}"))?;
+            }
             if profile {
                 e.sync()
                     .map_err(|err| format!("layer {li} profile sync (attn): {err}"))?;
                 prof_us[0] += t_group.elapsed().as_micros();
                 t_group = std::time::Instant::now();
             }
-            self.quantize_act(e, self.attn_out, self.q_dim)
-                .map_err(|err| format!("layer {li}: {err}"))?;
+            if !attn_fused_quant {
+                self.quantize_act(e, self.attn_out, self.q_dim)
+                    .map_err(|err| format!("layer {li}: {err}"))?;
+            }
             self.gemv_act(
                 e,
                 l.attn_output_quant,

@@ -840,9 +840,16 @@ impl CudaModel {
                 t_group = std::time::Instant::now();
             }
             // q/k/v all read the same normed row, so the norm and its
-            // quantization are one launch.
-            self.norm_q8(e, self.x, l.attn_norm, self.x_norm, self.dim)
-                .map_err(|err| format!("layer {li} attn_norm: {err}"))?;
+            // quantization are one launch. From the second layer on, the
+            // previous FFN's output is still un-added and this norm swallows
+            // that residual (see the end of the loop).
+            if li == 0 {
+                self.norm_q8(e, self.x, l.attn_norm, self.x_norm, self.dim)
+                    .map_err(|err| format!("layer {li} attn_norm: {err}"))?;
+            } else {
+                self.norm_add_q8(e, self.x, self.down, l.attn_norm, self.x_norm, self.dim)
+                    .map_err(|err| format!("layer {li} attn_norm: {err}"))?;
+            }
             self.gemv_act(
                 e,
                 l.attn_q_quant,
@@ -963,8 +970,10 @@ impl CudaModel {
                 self.hidden_dim,
             )
             .map_err(|err| format!("layer {li} ffn_down: {err}"))?;
-            e.add(self.x, self.down, self.x, self.dim)
-                .map_err(|err| format!("layer {li} ffn residual: {err}"))?;
+            // No residual add here: `down` stays in place and the next layer's
+            // attn norm (or the output norm after the last layer) folds it into
+            // x as it normalizes. Same float adds in the same order, one
+            // launch fewer per layer.
             if profile {
                 e.sync()
                     .map_err(|err| format!("layer {li} profile sync (ffn): {err}"))?;
@@ -975,9 +984,13 @@ impl CudaModel {
 
         if compute_logits {
             if matches!(self.output_quant, Quant::Q4K | Quant::Q6K) {
-                self.norm_q8(e, self.x, self.output_norm, self.x_norm, self.dim)
+                // The last layer's FFN output is still un-added; this norm
+                // folds it in, exactly like every layer after the first.
+                self.norm_add_q8(e, self.x, self.down, self.output_norm, self.x_norm, self.dim)
                     .map_err(|err| format!("output_norm: {err}"))?;
             } else {
+                e.add(self.x, self.down, self.x, self.dim)
+                    .map_err(|err| format!("output_norm residual: {err}"))?;
                 e.rmsnorm(self.x, self.output_norm, self.x_norm, self.dim, self.eps)
                     .map_err(|err| format!("output_norm: {err}"))?;
             }

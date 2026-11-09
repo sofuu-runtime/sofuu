@@ -1639,6 +1639,67 @@ void test_attn_split(void *fn_split, void *fn_combine, void *fn_quant,
 // shape: 4096-row cache, 2402 positions (the profile that measured 69 ms of a
 // 73 ms token). One launch each, so the row is directly comparable to the
 // phase split.
+// Prefill split: rows are (token, head) pairs and each row's range ends at its
+// own token's position, so this checks the per-row clamp as well as the merge.
+void test_attn_prefill_split(void *fn_split, void *fn_combine, uint32_t &seed) {
+    const int n_heads = 8, n_kv = 2, hd = 64, cap = 64, start = 5, tokens = 4;
+    const int cache_n = n_kv * cap * hd;
+    const int rows = tokens * n_heads;
+    std::vector<float> q = random_vec(rows * hd, seed, -1.0f, 1.0f);
+    std::vector<float> k = random_vec(cache_n, seed, -1.0f, 1.0f);
+    std::vector<float> v = random_vec(cache_n, seed, -1.0f, 1.0f);
+    std::vector<float> want((size_t)rows * hd, 0.0f);
+    float scale = 1.0f / std::sqrt((float)hd);
+    for (int t = 0; t < tokens; ++t) {
+        sofuu_ref::attn_decode_ref(q.data() + (size_t)t * n_heads * hd, k.data(),
+                                   v.data(),
+                                   want.data() + (size_t)t * n_heads * hd,
+                                   n_heads, n_kv, hd, start + t + 1, cap, scale);
+    }
+    for (int n_splits : {1, 3}) {
+        const size_t part_n = (size_t)n_kv * n_splits * rows * (size_t)(2 + hd);
+        unsigned long long dq = 0, dk = 0, dv = 0, dpart = 0, dout = 0;
+        int do_quant = 0;
+        if (!alloc_upload(q.data(), q.size() * sizeof(float), &dq) ||
+            !alloc_upload(k.data(), k.size() * sizeof(float), &dk) ||
+            !alloc_upload(v.data(), v.size() * sizeof(float), &dv) ||
+            !alloc_only(part_n * sizeof(float), &dpart) ||
+            !alloc_only((unsigned long long)rows * hd * 4, &dout)) {
+            fail_msg("alloc");
+            ++g_failures;
+            return;
+        }
+        std::vector<void *> sparams = {&dq,           &dk,          &dv,
+                                       &dpart,        (void *)&n_heads,
+                                       (void *)&n_kv, (void *)&hd,
+                                       (void *)&cap,  (void *)&scale,
+                                       (void *)&start, (void *)&tokens,
+                                       (void *)&n_splits};
+        std::vector<void *> cparams = {&dpart,     &dout,
+                                       (void *)&rows, (void *)&n_heads,
+                                       (void *)&n_kv, (void *)&hd,
+                                       (void *)&n_splits, &dpart,
+                                       &dpart,     &dpart,
+                                       &dpart,     (void *)&do_quant};
+        std::vector<float> got((size_t)rows * hd, 0.0f);
+        bool ok = launch(fn_split, (unsigned)(rows * n_splits), 32, sparams) &&
+                  launch(fn_combine, (unsigned)rows, 256, cparams) &&
+                  download(dout, got.data(), (size_t)rows * hd * sizeof(float));
+        double max_err = 0.0;
+        for (size_t i = 0; i < got.size(); ++i)
+            max_err = std::fmax(max_err,
+                                std::fabs((double)got[i] - (double)want[i]));
+        char name[64];
+        std::snprintf(name, sizeof(name), "attn_prefill_split(x%d)", n_splits);
+        report(name, ok && max_err <= 5e-5, max_err, 5e-5, (double)want[0]);
+        sofuu_cuda_ctx_free(g_ctx, dq);
+        sofuu_cuda_ctx_free(g_ctx, dk);
+        sofuu_cuda_ctx_free(g_ctx, dv);
+        sofuu_cuda_ctx_free(g_ctx, dpart);
+        sofuu_cuda_ctx_free(g_ctx, dout);
+    }
+}
+
 void bench_attn_decoders(void *fn_old, void *fn_split, void *fn_combine,
                          uint32_t &seed) {
     const int n_heads = 32, n_kv = 8, hd = 64, cap = 4096, seq = 2402;
@@ -1731,6 +1792,81 @@ void bench_attn_decoders(void *fn_old, void *fn_split, void *fn_combine,
     sofuu_cuda_ctx_free(g_ctx, da16);
 }
 
+// The prefill attention pair at the shape that hurts: a chunk of 8 tokens at
+// position 2400, i.e. what the 300th chunk of a 2402-token prompt costs.
+void bench_attn_prefill_kernels(void *fn_old, void *fn_split, void *fn_combine,
+                                uint32_t &seed) {
+    const int n_heads = 32, n_kv = 8, hd = 64, cap = 4096, start = 2400,
+              tokens = 8, n_splits = 16;
+    const int cache_n = n_kv * cap * hd;
+    const int rows = tokens * n_heads;
+    const size_t part_n = (size_t)n_kv * n_splits * rows * (size_t)(2 + hd);
+    std::vector<float> q = random_vec(rows * hd, seed, -1.0f, 1.0f);
+    std::vector<float> k = random_vec(cache_n, seed, -1.0f, 1.0f);
+    std::vector<float> v = random_vec(cache_n, seed, -1.0f, 1.0f);
+    float scale = 1.0f / std::sqrt((float)hd);
+    unsigned long long dq = 0, dk = 0, dv = 0, dout = 0, dpart = 0;
+    int do_quant = 0;
+    if (!alloc_upload(q.data(), q.size() * sizeof(float), &dq) ||
+        !alloc_upload(k.data(), k.size() * sizeof(float), &dk) ||
+        !alloc_upload(v.data(), v.size() * sizeof(float), &dv) ||
+        !alloc_only((unsigned long long)rows * hd * 4, &dout) ||
+        !alloc_only(part_n * sizeof(float), &dpart)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    std::vector<void *> oparams = {&dq,           &dk,           &dv,
+                                   &dout,         (void *)&n_heads,
+                                   (void *)&n_kv, (void *)&hd,
+                                   (void *)&start, (void *)&tokens,
+                                   (void *)&cap,  (void *)&scale};
+    std::vector<void *> sparams = {&dq,            &dk,           &dv,
+                                   &dpart,         (void *)&n_heads,
+                                   (void *)&n_kv,  (void *)&hd,
+                                   (void *)&cap,   (void *)&scale,
+                                   (void *)&start, (void *)&tokens,
+                                   (void *)&n_splits};
+    std::vector<void *> cparams = {&dpart,         &dout,
+                                   (void *)&rows,  (void *)&n_heads,
+                                   (void *)&n_kv,  (void *)&hd,
+                                   (void *)&n_splits, &dpart,
+                                   &dpart,         &dpart,
+                                   &dpart,         (void *)&do_quant};
+    const int iters = 8;
+    for (int i = 0; i < 2; ++i) {
+        if (!launch_async(fn_old, (unsigned)(tokens * n_heads), 256, oparams) ||
+            !launch_async(fn_split, (unsigned)(rows * n_splits), 32, sparams) ||
+            !launch_async(fn_combine, (unsigned)rows, 256, cparams))
+            return;
+    }
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) return;
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i)
+        if (!launch_async(fn_old, (unsigned)(tokens * n_heads), 256, oparams))
+            return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) return;
+    auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) {
+        if (!launch_async(fn_split, (unsigned)(rows * n_splits), 32, sparams) ||
+            !launch_async(fn_combine, (unsigned)rows, 256, cparams))
+            return;
+    }
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) return;
+    auto t2 = std::chrono::steady_clock::now();
+    double old_ms = std::chrono::duration<double>(t1 - t0).count() * 1000.0 / iters;
+    double new_ms = std::chrono::duration<double>(t2 - t1).count() * 1000.0 / iters;
+    std::printf("[bench] prefill_attn  %dtok@%d  block %.3f ms/launch  "
+                "split(x%d) %.3f ms/launch  %.1fx\n",
+                tokens, start, old_ms, n_splits, new_ms,
+                new_ms > 0.0 ? old_ms / new_ms : 0.0);
+    sofuu_cuda_ctx_free(g_ctx, dq);
+    sofuu_cuda_ctx_free(g_ctx, dk);
+    sofuu_cuda_ctx_free(g_ctx, dv);
+    sofuu_cuda_ctx_free(g_ctx, dout);
+    sofuu_cuda_ctx_free(g_ctx, dpart);
+}
+
 void test_add(void *fn, uint32_t &seed) {
     const int n = 4096;
     std::vector<float> a = random_vec(n, seed, -2.0f, 2.0f);
@@ -1819,6 +1955,7 @@ int main(int argc, char **argv) {
     void *f_rms = nullptr, *f_swi = nullptr, *f_rope = nullptr, *f_kv = nullptr;
     void *f_rope_kv = nullptr;
     void *f_attn_split = nullptr, *f_attn_combine = nullptr;
+    void *f_attn_psplit = nullptr;
     void *f_attn = nullptr, *f_add = nullptr;
     void *f_b8_q4 = nullptr, *f_b8_q6 = nullptr, *f_b8_q8 = nullptr;
     void *f_b8_f32 = nullptr, *f_rms_b = nullptr, *f_attn_p = nullptr;
@@ -1840,6 +1977,7 @@ int main(int argc, char **argv) {
         !get_function("sofuu_kv_write_f32", &f_kv) ||
         !get_function("sofuu_attn_decode_f32", &f_attn) ||
         !get_function("sofuu_attn_decode_split", &f_attn_split) ||
+        !get_function("sofuu_attn_prefill_split", &f_attn_psplit) ||
         !get_function("sofuu_attn_combine", &f_attn_combine) ||
         !get_function("sofuu_add_f32", &f_add) ||
         !get_function("sofuu_gemm_q4_k_b8", &f_b8_q4) ||
@@ -1871,8 +2009,10 @@ int main(int argc, char **argv) {
     test_kv_write(f_kv, seed);
     test_attn_decode(f_attn, seed);
     test_attn_split(f_attn_split, f_attn_combine, f_quant, seed);
+    test_attn_prefill_split(f_attn_psplit, f_attn_combine, seed);
     test_add(f_add, seed);
     bench_attn_decoders(f_attn, f_attn_split, f_attn_combine, seed);
+    bench_attn_prefill_kernels(f_attn_p, f_attn_psplit, f_attn_combine, seed);
     for (int cols : {1024, 4096}) test_gemm_b8(f_b8_q8, seed, 0, cols);
     for (int cols : {2048, 8192}) {
         test_gemm_b8(f_b8_q4, seed, 1, cols);

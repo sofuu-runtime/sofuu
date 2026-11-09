@@ -410,8 +410,11 @@ impl CudaModel {
         let k = alloc_f32!(kv_dim, "k");
         let v = alloc_f32!(kv_dim, "v");
         let attn_out = alloc_f32!(q_dim, "attn_out");
+        // Decode needs n_heads rows, a prefill chunk needs PREFILL_BATCH times
+        // that much; one buffer serves both.
+        let attn_rows = cfg.n_heads * PREFILL_BATCH;
         let attn_part_n = super::cuda::attn_partial_floats(
-            cfg.n_heads,
+            attn_rows,
             cfg.n_kv_heads,
             cfg.head_dim,
             attn_splits.max(1),
@@ -668,6 +671,17 @@ impl CudaModel {
         }
     }
 
+    /// Split-K covers head_dim 32/64/128 with up to eight query heads per KV
+    /// head; anything else keeps the block-per-head kernels. Both the decode
+    /// and the prefill path gate on this.
+    fn split_attn_ok(&self) -> bool {
+        self.attn_splits > 0
+            && matches!(self.head_dim, 32 | 64 | 128)
+            && self.n_kv_heads > 0
+            && self.n_heads % self.n_kv_heads == 0
+            && self.n_heads / self.n_kv_heads <= 8
+    }
+
     /// gate_proj and up_proj read the same normed row and have the same shape,
     /// so one launch computes both whenever they share the q4_K layout. Every
     /// other combination falls back to two launches, which is what it was.
@@ -853,13 +867,7 @@ impl CudaModel {
             ptr: self.pos_dev.ptr + 4,
             bytes: 4,
         };
-        // Split-K covers head_dim 32/64/128 with up to eight query heads per
-        // KV head; anything else keeps the block-per-head kernel.
-        let split_attn = self.attn_splits > 0
-            && matches!(self.head_dim, 32 | 64 | 128)
-            && self.n_kv_heads > 0
-            && self.n_heads % self.n_kv_heads == 0
-            && self.n_heads / self.n_kv_heads <= 8;
+        let split_attn = self.split_attn_ok();
         let mut t_group = std::time::Instant::now();
         for (li, l) in self.layers.iter().enumerate() {
             if profile {
@@ -956,6 +964,7 @@ impl CudaModel {
                 e.attn_combine(
                     self.attn_part,
                     self.attn_out,
+                    self.n_heads,
                     self.n_heads,
                     self.n_kv_heads,
                     self.head_dim,
@@ -1171,6 +1180,7 @@ impl CudaModel {
 
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
         let n = n_tokens;
+        let split_attn = self.split_attn_ok();
 
         for (li, l) in self.layers.iter().enumerate() {
             e.rmsnorm_batch(
@@ -1248,20 +1258,52 @@ impl CudaModel {
                 self.cap,
             )
             .map_err(|err| format!("layer {li} kv_write batch: {err}"))?;
-            e.attn_prefill(
-                self.q_b,
-                k_slice,
-                v_slice,
-                self.attn_b,
-                self.n_heads,
-                self.n_kv_heads,
-                self.head_dim,
-                pos,
-                n,
-                self.cap,
-                scale,
-            )
-            .map_err(|err| format!("layer {li} prefill attention: {err}"))?;
+            if split_attn {
+                // The same split+merge the decode path uses: one warp per
+                // (token, head, position range) instead of one block per
+                // (token, head) walking positions behind block barriers.
+                e.attn_prefill_split(
+                    self.q_b,
+                    k_slice,
+                    v_slice,
+                    self.attn_part,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.cap,
+                    scale,
+                    pos,
+                    n,
+                    self.attn_splits,
+                )
+                .map_err(|err| format!("layer {li} prefill attention (split): {err}"))?;
+                e.attn_combine(
+                    self.attn_part,
+                    self.attn_b,
+                    n * self.n_heads,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.attn_splits,
+                    None,
+                )
+                .map_err(|err| format!("layer {li} prefill attention (combine): {err}"))?;
+            } else {
+                e.attn_prefill(
+                    self.q_b,
+                    k_slice,
+                    v_slice,
+                    self.attn_b,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    pos,
+                    n,
+                    self.cap,
+                    scale,
+                )
+                .map_err(|err| format!("layer {li} prefill attention: {err}"))?;
+            }
             e.gemm_b8(
                 l.attn_output_quant,
                 l.attn_output,

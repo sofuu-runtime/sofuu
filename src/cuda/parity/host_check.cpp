@@ -346,8 +346,8 @@ void test_attn_split(uint32_t &seed) {
         std::vector<float> got((size_t)(n_heads * hd), -12345.0f);
         sofuu_host_attn_split(q.data(), k.data(), v.data(), part.data(),
                               n_heads, n_kv, hd, cap, scale, seq, n_splits);
-        sofuu_host_attn_combine(part.data(), got.data(), n_heads, n_kv, hd,
-                                n_splits);
+        sofuu_host_attn_combine(part.data(), got.data(), n_heads, n_heads, n_kv, hd,
+                            n_splits);
         char name[64];
         std::snprintf(name, sizeof(name), "attn_split(x%d)", n_splits);
         check_vec(name, got.data(), want.data(), n_heads * hd, 2e-5, 2e-6);
@@ -715,6 +715,25 @@ void test_batch_paths(uint32_t &seed) {
         }
         check_vec("attn_prefill", got.data(), want.data(), tokens * n_heads * hd,
                   2e-5, 2e-6);
+
+        // Same chunk through the split+merge path the CUDA prefill now uses:
+        // every (token, head) row has its own seq_len, so this checks the
+        // per-row range clamp as well as the merge.
+        for (int n_splits : {1, 5}) {
+            const size_t part_n =
+                (size_t)n_kv * n_splits * tokens * n_heads * (size_t)(2 + hd);
+            std::vector<float> part(part_n, -12345.0f);
+            std::vector<float> sgot((size_t)tokens * n_heads * hd, -12345.0f);
+            sofuu_host_attn_prefill_split(q.data(), kc.data(), vc.data(),
+                                          part.data(), n_heads, n_kv, hd, cap,
+                                          scale, start, tokens, n_splits);
+            sofuu_host_attn_combine(part.data(), sgot.data(), tokens * n_heads,
+                                    n_heads, n_kv, hd, n_splits);
+            char name[64];
+            std::snprintf(name, sizeof(name), "attn_prefill_split(x%d)", n_splits);
+            check_vec(name, sgot.data(), want.data(), tokens * n_heads * hd,
+                      2e-5, 2e-6);
+        }
     }
 }
 

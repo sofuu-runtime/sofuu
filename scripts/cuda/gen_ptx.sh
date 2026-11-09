@@ -37,6 +37,8 @@ ENTRIES=(
     sofuu_rope_kv_f32
     sofuu_kv_write_f32
     sofuu_attn_decode_f32
+    sofuu_attn_decode_split
+    sofuu_attn_combine
     sofuu_add_f32
     sofuu_gemm_q4_k_b8
     sofuu_gemm_q6_k_b8

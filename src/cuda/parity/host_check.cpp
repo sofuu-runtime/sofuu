@@ -324,6 +324,37 @@ void test_attn_decode(uint32_t &seed) {
     check_vec("attn_decode", got.data(), want.data(), n_heads * hd, 2e-5, 2e-6);
 }
 
+// The split/merge identity: part + combine must reproduce the plain attention.
+// Exercised at several split counts, including more splits than positions (so
+// most splits are empty) and a split count that does not divide the cache, so
+// the `chunk` rounding and the empty-partial path are both covered.
+void test_attn_split(uint32_t &seed) {
+    const int n_heads = 8, n_kv = 2, hd = 64, cap = 32, seq = 17;
+    const int group = n_heads / n_kv;
+    const int cache_n = n_kv * cap * hd;
+    std::vector<float> q = random_vec(n_heads * hd, seed, -1.0f, 1.0f);
+    std::vector<float> k = random_vec(cache_n, seed, -1.0f, 1.0f);
+    std::vector<float> v = random_vec(cache_n, seed, -1.0f, 1.0f);
+    std::vector<float> want((size_t)(n_heads * hd));
+    float scale = 1.0f / std::sqrt((float)hd);
+    sofuu_ref::attn_decode_ref(q.data(), k.data(), v.data(), want.data(),
+                               n_heads, n_kv, hd, seq, cap, scale);
+    for (int n_splits : {1, 4, 5, 64}) {
+        const size_t part_n =
+            (size_t)n_kv * n_splits * n_heads * (size_t)(2 + hd);
+        std::vector<float> part(part_n, -12345.0f);
+        std::vector<float> got((size_t)(n_heads * hd), -12345.0f);
+        sofuu_host_attn_split(q.data(), k.data(), v.data(), part.data(),
+                              n_heads, n_kv, hd, cap, scale, seq, n_splits);
+        sofuu_host_attn_combine(part.data(), got.data(), n_heads, n_kv, hd,
+                                n_splits);
+        char name[64];
+        std::snprintf(name, sizeof(name), "attn_split(x%d)", n_splits);
+        check_vec(name, got.data(), want.data(), n_heads * hd, 2e-5, 2e-6);
+    }
+    (void)group;
+}
+
 void test_add(uint32_t &seed) {
     const int n = 4096;
     std::vector<float> a = random_vec(n, seed, -2.0f, 2.0f);
@@ -727,6 +758,7 @@ int main(void) {
     test_rope(seed);
     test_kv_write(seed);
     test_attn_decode(seed);
+    test_attn_split(seed);
     test_add(seed);
     test_tiled_gemv(seed);
     test_q4_vector_extract(seed);

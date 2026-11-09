@@ -1531,6 +1531,206 @@ void test_attn_decode(void *fn, uint32_t &seed) {
     sofuu_cuda_ctx_free(g_ctx, da16);
 }
 
+// Split-K: the partials for every (kv head, split, query head) carry
+// (m, sum, acc[head_dim]); combine reweights each by exp(m_s - M) and divides.
+// Compared against the same reference the block kernel is held to, with a
+// split count that leaves some splits empty (chunk 13 over 37 positions with 5
+// splits) and a wider sequence than the cache to exercise the clamp.
+void test_attn_split(void *fn_split, void *fn_combine, void *fn_quant,
+                     uint32_t &seed) {
+    const int n_heads = 8, n_kv = 2, hd = 64, cap = 64, seq = 37;
+    const int cache_n = n_kv * cap * hd;
+    const int row_n = n_heads * hd;
+    std::vector<float> q = random_vec(row_n, seed, -1.0f, 1.0f);
+    std::vector<float> k = random_vec(cache_n, seed, -1.0f, 1.0f);
+    std::vector<float> v = random_vec(cache_n, seed, -1.0f, 1.0f);
+    std::vector<float> want((size_t)row_n, 0.0f);
+    float scale = 1.0f / std::sqrt((float)hd);
+    sofuu_ref::attn_decode_ref(q.data(), k.data(), v.data(), want.data(),
+                               n_heads, n_kv, hd, seq, cap, scale);
+    for (int n_splits : {1, 5}) {
+        const size_t part_n = (size_t)n_kv * n_splits * n_heads * (size_t)(2 + hd);
+        const int n_q8 = row_n / 32;
+        unsigned long long dq = 0, dk = 0, dv = 0, dsq = 0, dpart = 0,
+                           dout = 0;
+        unsigned long long daq = 0, dad = 0, das = 0, da16 = 0;
+        int seq_dev = seq;
+        int do_quant = 1;
+        if (!alloc_upload(q.data(), q.size() * sizeof(float), &dq) ||
+            !alloc_upload(k.data(), k.size() * sizeof(float), &dk) ||
+            !alloc_upload(v.data(), v.size() * sizeof(float), &dv) ||
+            !alloc_upload(&seq_dev, sizeof(seq_dev), &dsq) ||
+            !alloc_only(part_n * sizeof(float), &dpart) ||
+            !alloc_only((unsigned long long)row_n * sizeof(float), &dout) ||
+            !alloc_only((unsigned long long)row_n, &daq) ||
+            !alloc_only((unsigned long long)n_q8 * 4, &dad) ||
+            !alloc_only((unsigned long long)n_q8 * 4, &das) ||
+            !alloc_only((unsigned long long)n_q8 * 8, &da16)) {
+            fail_msg("alloc");
+            ++g_failures;
+            return;
+        }
+        std::vector<void *> sparams = {&dq,           &dk,          &dv,
+                                       &dpart,        (void *)&n_heads,
+                                       (void *)&n_kv, (void *)&hd,
+                                       (void *)&cap,  (void *)&scale,
+                                       &dsq,          (void *)&n_splits};
+        std::vector<void *> cparams = {&dpart,       &dout,
+                                       (void *)&n_heads, (void *)&n_kv,
+                                       (void *)&hd,  (void *)&n_splits,
+                                       &daq,         &dad,
+                                       &das,         &da16,
+                                       (void *)&do_quant};
+        std::vector<float> got((size_t)row_n, 0.0f);
+        bool ok = launch(fn_split, (unsigned)(n_heads * n_splits), 32, sparams) &&
+                  launch(fn_combine, (unsigned)n_heads, 256, cparams) &&
+                  download(dout, got.data(), (size_t)row_n * sizeof(float));
+        double max_err = 0.0;
+        for (int i = 0; i < row_n; ++i)
+            max_err = std::fmax(max_err,
+                                std::fabs((double)got[(size_t)i] - (double)want[(size_t)i]));
+
+        // The fused q8_1 encoding must be the standalone quantizer's output
+        // over the same row (same criterion as the block kernel's test).
+        std::vector<int8_t> aq_ref((size_t)row_n);
+        std::vector<float> ad_ref((size_t)n_q8);
+        std::vector<int32_t> as_ref((size_t)n_q8), as16_ref((size_t)n_q8 * 2);
+        sofuu_ref::quantize_q8_1(got.data(), aq_ref.data(), ad_ref.data(),
+                                 as_ref.data(), as16_ref.data(), row_n);
+        std::vector<int8_t> aq((size_t)row_n, 0);
+        std::vector<float> ad((size_t)n_q8, 0.0f);
+        std::vector<int32_t> as((size_t)n_q8, 0), as16((size_t)n_q8 * 2, 0);
+        bool q_ok = ok && download(daq, aq.data(), (size_t)row_n) &&
+                    download(dad, ad.data(), (size_t)n_q8 * 4) &&
+                    download(das, as.data(), (size_t)n_q8 * 4) &&
+                    download(da16, as16.data(), (size_t)n_q8 * 8);
+        int bad = 0;
+        if (q_ok) {
+            for (int i = 0; i < row_n; ++i)
+                if (aq[(size_t)i] != aq_ref[(size_t)i]) ++bad;
+            for (int b = 0; b < n_q8; ++b) {
+                if (ad[(size_t)b] != ad_ref[(size_t)b]) ++bad;
+                if (as[(size_t)b] != as_ref[(size_t)b]) ++bad;
+                for (int h = 0; h < 2; ++h)
+                    if (as16[(size_t)(b * 2 + h)] != as16_ref[(size_t)(b * 2 + h)])
+                        ++bad;
+            }
+        }
+        char name[64];
+        std::snprintf(name, sizeof(name), "attn_split(x%d)", n_splits);
+        report(name, ok && q_ok && bad == 0 && max_err <= 5e-5, max_err, 5e-5,
+               (double)want[0]);
+        if (bad) std::printf("      fused quantize mismatch: %d values\n", bad);
+        sofuu_cuda_ctx_free(g_ctx, dq);
+        sofuu_cuda_ctx_free(g_ctx, dk);
+        sofuu_cuda_ctx_free(g_ctx, dv);
+        sofuu_cuda_ctx_free(g_ctx, dsq);
+        sofuu_cuda_ctx_free(g_ctx, dpart);
+        sofuu_cuda_ctx_free(g_ctx, dout);
+        sofuu_cuda_ctx_free(g_ctx, daq);
+        sofuu_cuda_ctx_free(g_ctx, dad);
+        sofuu_cuda_ctx_free(g_ctx, das);
+        sofuu_cuda_ctx_free(g_ctx, da16);
+    }
+    (void)fn_quant;
+}
+
+// Old block-per-head kernel against the split pair at a realistic long-context
+// shape: 4096-row cache, 2402 positions (the profile that measured 69 ms of a
+// 73 ms token). One launch each, so the row is directly comparable to the
+// phase split.
+void bench_attn_decoders(void *fn_old, void *fn_split, void *fn_combine,
+                         uint32_t &seed) {
+    const int n_heads = 32, n_kv = 8, hd = 64, cap = 4096, seq = 2402;
+    const int n_splits = 16;
+    const int cache_n = n_kv * cap * hd;
+    const size_t part_n = (size_t)n_kv * n_splits * n_heads * (size_t)(2 + hd);
+    std::vector<float> q = random_vec(n_heads * hd, seed, -1.0f, 1.0f);
+    std::vector<float> k = random_vec(cache_n, seed, -1.0f, 1.0f);
+    std::vector<float> v = random_vec(cache_n, seed, -1.0f, 1.0f);
+    float scale = 1.0f / std::sqrt((float)hd);
+    unsigned long long dq = 0, dk = 0, dv = 0, dout = 0, dsq = 0, dpart = 0;
+    unsigned long long daq = 0, dad = 0, das = 0, da16 = 0;
+    int seq_dev = seq;
+    int do_quant = 0;
+    const int n_q8 = n_heads * hd / 32;
+    if (!alloc_upload(q.data(), q.size() * sizeof(float), &dq) ||
+        !alloc_upload(k.data(), k.size() * sizeof(float), &dk) ||
+        !alloc_upload(v.data(), v.size() * sizeof(float), &dv) ||
+        !alloc_upload(&seq_dev, sizeof(seq_dev), &dsq) ||
+        !alloc_only((unsigned long long)n_heads * hd * 4, &dout) ||
+        !alloc_only(part_n * sizeof(float), &dpart) ||
+        !alloc_only((unsigned long long)n_heads * hd, &daq) ||
+        !alloc_only((unsigned long long)n_q8 * 4, &dad) ||
+        !alloc_only((unsigned long long)n_q8 * 4, &das) ||
+        !alloc_only((unsigned long long)n_q8 * 8, &da16)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    std::vector<void *> oparams = {&dq,  &dk, &dv,           &dout,
+                                   (void *)&n_heads, (void *)&n_kv,
+                                   (void *)&hd, &dsq, (void *)&cap,
+                                   (void *)&scale};
+    // The block kernel now also carries the fused quantizer's parameters.
+    std::vector<void *> oparams_full = {&dq,  &dk,  &dv,  &dout,
+                                        (void *)&n_heads, (void *)&n_kv,
+                                        (void *)&hd, &dsq, (void *)&cap,
+                                        (void *)&scale, &daq, &dad, &das,
+                                        &da16, (void *)&do_quant};
+    std::vector<void *> sparams = {&dq,            &dk,           &dv,
+                                   &dpart,         (void *)&n_heads,
+                                   (void *)&n_kv,  (void *)&hd,
+                                   (void *)&cap,   (void *)&scale,
+                                   &dsq,           (void *)&n_splits};
+    std::vector<void *> cparams = {&dpart,          &dout,
+                                   (void *)&n_heads, (void *)&n_kv,
+                                   (void *)&hd,     (void *)&n_splits,
+                                   &daq,            &dad,
+                                   &das,            &da16,
+                                   (void *)&do_quant};
+    const int iters = 8;
+    // Warm both paths, then time them one after the other.
+    for (int i = 0; i < 2; ++i) {
+        if (!launch_async(fn_old, (unsigned)n_heads, 256, oparams_full) ||
+            !launch_async(fn_split, (unsigned)(n_heads * n_splits), 32, sparams) ||
+            !launch_async(fn_combine, (unsigned)n_heads, 256, cparams))
+            return;
+    }
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
+        fail_msg("attn bench warmup sync");
+        return;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i)
+        if (!launch_async(fn_old, (unsigned)n_heads, 256, oparams_full)) return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) return;
+    auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) {
+        if (!launch_async(fn_split, (unsigned)(n_heads * n_splits), 32, sparams) ||
+            !launch_async(fn_combine, (unsigned)n_heads, 256, cparams))
+            return;
+    }
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) return;
+    auto t2 = std::chrono::steady_clock::now();
+    double old_ms = std::chrono::duration<double>(t1 - t0).count() * 1000.0 / iters;
+    double new_ms = std::chrono::duration<double>(t2 - t1).count() * 1000.0 / iters;
+    std::printf("[bench] attn_ctx%d    block %.3f ms/launch  split(x%d) %.3f "
+                "ms/launch  %.1fx  (per layer, quantize off)\n",
+                seq, old_ms, n_splits, new_ms, new_ms > 0.0 ? old_ms / new_ms : 0.0);
+    (void)oparams;
+    sofuu_cuda_ctx_free(g_ctx, dq);
+    sofuu_cuda_ctx_free(g_ctx, dk);
+    sofuu_cuda_ctx_free(g_ctx, dv);
+    sofuu_cuda_ctx_free(g_ctx, dsq);
+    sofuu_cuda_ctx_free(g_ctx, dout);
+    sofuu_cuda_ctx_free(g_ctx, dpart);
+    sofuu_cuda_ctx_free(g_ctx, daq);
+    sofuu_cuda_ctx_free(g_ctx, dad);
+    sofuu_cuda_ctx_free(g_ctx, das);
+    sofuu_cuda_ctx_free(g_ctx, da16);
+}
+
 void test_add(void *fn, uint32_t &seed) {
     const int n = 4096;
     std::vector<float> a = random_vec(n, seed, -2.0f, 2.0f);
@@ -1618,6 +1818,7 @@ int main(int argc, char **argv) {
     void *f_rms_q8 = nullptr, *f_rmsadd_q8 = nullptr, *f_swiglu_q8 = nullptr;
     void *f_rms = nullptr, *f_swi = nullptr, *f_rope = nullptr, *f_kv = nullptr;
     void *f_rope_kv = nullptr;
+    void *f_attn_split = nullptr, *f_attn_combine = nullptr;
     void *f_attn = nullptr, *f_add = nullptr;
     void *f_b8_q4 = nullptr, *f_b8_q6 = nullptr, *f_b8_q8 = nullptr;
     void *f_b8_f32 = nullptr, *f_rms_b = nullptr, *f_attn_p = nullptr;
@@ -1638,6 +1839,8 @@ int main(int argc, char **argv) {
         !get_function("sofuu_rope_kv_f32", &f_rope_kv) ||
         !get_function("sofuu_kv_write_f32", &f_kv) ||
         !get_function("sofuu_attn_decode_f32", &f_attn) ||
+        !get_function("sofuu_attn_decode_split", &f_attn_split) ||
+        !get_function("sofuu_attn_combine", &f_attn_combine) ||
         !get_function("sofuu_add_f32", &f_add) ||
         !get_function("sofuu_gemm_q4_k_b8", &f_b8_q4) ||
         !get_function("sofuu_gemm_q6_k_b8", &f_b8_q6) ||
@@ -1667,7 +1870,9 @@ int main(int argc, char **argv) {
     test_rope_kv(f_rope_kv, seed);
     test_kv_write(f_kv, seed);
     test_attn_decode(f_attn, seed);
+    test_attn_split(f_attn_split, f_attn_combine, f_quant, seed);
     test_add(f_add, seed);
+    bench_attn_decoders(f_attn, f_attn_split, f_attn_combine, seed);
     for (int cols : {1024, 4096}) test_gemm_b8(f_b8_q8, seed, 0, cols);
     for (int cols : {2048, 8192}) {
         test_gemm_b8(f_b8_q4, seed, 1, cols);

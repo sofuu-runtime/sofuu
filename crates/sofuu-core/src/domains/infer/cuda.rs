@@ -21,7 +21,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 /// Every kernel name the checked-in PTX must export. Kept in one place so the
 /// generator script, the Rust init check and the tests cannot drift.
-pub const PTX_ENTRIES: [&str; 26] = [
+pub const PTX_ENTRIES: [&str; 28] = [
     "sofuu_gemv_q8_0",
     "sofuu_gemv_q4_k",
     "sofuu_gemv_q6_k",
@@ -39,6 +39,8 @@ pub const PTX_ENTRIES: [&str; 26] = [
     "sofuu_rope_kv_f32",
     "sofuu_kv_write_f32",
     "sofuu_attn_decode_f32",
+    "sofuu_attn_decode_split",
+    "sofuu_attn_combine",
     "sofuu_add_f32",
     "sofuu_gemm_q4_k_b8",
     "sofuu_gemm_q6_k_b8",
@@ -294,6 +296,20 @@ pub fn validate_attn_decode(
         )));
     }
     Ok(())
+}
+
+/// Floats of scratch the split-K attention needs for its partials:
+/// `(m, sum, acc[head_dim])` for every (kv head, split, query head).
+pub fn attn_partial_floats(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_splits: usize,
+) -> Option<usize> {
+    n_kv_heads
+        .checked_mul(n_splits)?
+        .checked_mul(n_heads)?
+        .checked_mul(2usize.checked_add(head_dim)?)
 }
 
 /// Validate a batched-prefill GEMV. `x` holds `n_tokens` rows of `cols`
@@ -1844,6 +1860,180 @@ mod imp {
             )
         }
 
+        /// Split-K decode attention: grid `n_heads * n_splits` one-warp
+        /// blocks, each computing (max, sum, weighted V) for one query head
+        /// over one range of cached positions, four positions in flight.
+        /// `part` holds the partials for `attn_combine`.
+        #[allow(clippy::too_many_arguments)]
+        pub fn attn_decode_split(
+            &self,
+            q: DeviceBuf,
+            k_cache: DeviceBuf,
+            v_cache: DeviceBuf,
+            part: DeviceBuf,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            seq_len: usize,
+            seq_dev: DeviceBuf,
+            cap: usize,
+            scale: f32,
+            n_splits: usize,
+        ) -> Result<(), CudaError> {
+            validate_attn_decode(
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                seq_len,
+                cap,
+                q.bytes,
+                k_cache.bytes,
+                v_cache.bytes,
+                part.bytes,
+            )?;
+            if seq_dev.bytes < 4 {
+                return Err(CudaError(format!(
+                    "attn_decode_split sequence buffer is {} bytes, need 4",
+                    seq_dev.bytes
+                )));
+            }
+            // The kernel instantiates values-per-lane 1/2/4; anything else
+            // falls back to the block kernel in the model.
+            if !matches!(head_dim, 32 | 64 | 128) {
+                return Err(CudaError(format!(
+                    "attn_decode_split covers head_dim 32/64/128, got {head_dim}"
+                )));
+            }
+            if n_splits == 0 || n_heads % n_kv_heads != 0 || n_heads / n_kv_heads > 8 {
+                return Err(CudaError(format!(
+                    "attn_decode_split rejects n_splits={n_splits} n_heads={n_heads} n_kv_heads={n_kv_heads}"
+                )));
+            }
+            let need_part = attn_partial_floats(n_heads, n_kv_heads, head_dim, n_splits)
+                .ok_or_else(|| CudaError("attn_decode_split partial size overflow".into()))?
+                * std::mem::size_of::<f32>();
+            if part.bytes < need_part {
+                return Err(CudaError(format!(
+                    "attn_decode_split partial buffer is {} bytes, need {need_part}",
+                    part.bytes
+                )));
+            }
+            let mut qp = q.ptr;
+            let mut kc = k_cache.ptr;
+            let mut vc = v_cache.ptr;
+            let mut pp = part.ptr;
+            let mut nh = n_heads as i32;
+            let mut nk = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut c = cap as i32;
+            let mut s = scale;
+            let mut sl = seq_dev.ptr;
+            let mut ns = n_splits as i32;
+            let mut params: [*mut c_void; 11] = [
+                &mut qp as *mut u64 as *mut c_void,
+                &mut kc as *mut u64 as *mut c_void,
+                &mut vc as *mut u64 as *mut c_void,
+                &mut pp as *mut u64 as *mut c_void,
+                &mut nh as *mut i32 as *mut c_void,
+                &mut nk as *mut i32 as *mut c_void,
+                &mut hd as *mut i32 as *mut c_void,
+                &mut c as *mut i32 as *mut c_void,
+                &mut s as *mut f32 as *mut c_void,
+                &mut sl as *mut u64 as *mut c_void,
+                &mut ns as *mut i32 as *mut c_void,
+            ];
+            self.launch(
+                "sofuu_attn_decode_split",
+                ((n_heads * n_splits) as u32, 1, 1),
+                (32, 1, 1),
+                &mut params,
+            )
+        }
+
+        /// Merge the split partials into the attention row, optionally encoding
+        /// it as q8_1 for the o_proj dp4a GEMV in the same launch.
+        #[allow(clippy::too_many_arguments)]
+        pub fn attn_combine(
+            &self,
+            part: DeviceBuf,
+            out: DeviceBuf,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            n_splits: usize,
+            aq: Option<(DeviceBuf, DeviceBuf, DeviceBuf, DeviceBuf)>,
+        ) -> Result<(), CudaError> {
+            if n_splits == 0 || n_kv_heads == 0 || head_dim == 0 || head_dim > 256 {
+                return Err(CudaError(format!(
+                    "attn_combine rejects n_splits={n_splits} n_kv_heads={n_kv_heads} head_dim={head_dim}"
+                )));
+            }
+            let need_part = attn_partial_floats(n_heads, n_kv_heads, head_dim, n_splits)
+                .ok_or_else(|| CudaError("attn_combine partial size overflow".into()))?
+                * std::mem::size_of::<f32>();
+            let need_out = n_heads
+                .checked_mul(head_dim)
+                .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| CudaError("attn_combine out size overflow".into()))?;
+            if part.bytes < need_part || out.bytes < need_out {
+                return Err(CudaError(format!(
+                    "attn_combine buffers too small: part {}<{need_part}, out {}<{need_out}",
+                    part.bytes, out.bytes
+                )));
+            }
+            let mut pp = part.ptr;
+            let mut op = out.ptr;
+            let mut nh = n_heads as i32;
+            let mut nk = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut ns = n_splits as i32;
+            let (mut aqp, mut adp, mut asp, mut a16p, mut dq) = (0u64, 0u64, 0u64, 0u64, 0i32);
+            let mut params: [*mut c_void; 11] = [
+                &mut pp as *mut u64 as *mut c_void,
+                &mut op as *mut u64 as *mut c_void,
+                &mut nh as *mut i32 as *mut c_void,
+                &mut nk as *mut i32 as *mut c_void,
+                &mut hd as *mut i32 as *mut c_void,
+                &mut ns as *mut i32 as *mut c_void,
+                &mut aqp as *mut u64 as *mut c_void,
+                &mut adp as *mut u64 as *mut c_void,
+                &mut asp as *mut u64 as *mut c_void,
+                &mut a16p as *mut u64 as *mut c_void,
+                &mut dq as *mut i32 as *mut c_void,
+            ];
+            if let Some((aq, ad, asum, asum16)) = aq {
+                let n_q8 = n_heads * head_dim / 32;
+                let need_q = n_heads * head_dim;
+                let need_d = n_q8 * std::mem::size_of::<f32>();
+                if head_dim % 32 != 0
+                    || aq.bytes < need_q
+                    || ad.bytes < need_d
+                    || asum.bytes < need_d
+                    || asum16.bytes < 2 * need_d
+                {
+                    return Err(CudaError(format!(
+                        "attn_combine quant buffers too small: q {}<{need_q}, d {}<{need_d}, s {}<{need_d}, s16 {}<{}",
+                        aq.bytes,
+                        ad.bytes,
+                        asum.bytes,
+                        asum16.bytes,
+                        2 * need_d
+                    )));
+                }
+                aqp = aq.ptr;
+                adp = ad.ptr;
+                asp = asum.ptr;
+                a16p = asum16.ptr;
+                dq = 1;
+            }
+            self.launch(
+                "sofuu_attn_combine",
+                (n_heads as u32, 1, 1),
+                (256, 1, 1),
+                &mut params,
+            )
+        }
+
         /// y = a + b, elementwise (in-place when `y` aliases `a`).
         pub fn add(&self, a: DeviceBuf, b: DeviceBuf, y: DeviceBuf, n: usize) -> Result<(), CudaError> {
             let need = n
@@ -2464,6 +2654,39 @@ mod imp {
             _ad: DeviceBuf,
             _asum: DeviceBuf,
             _asum16: DeviceBuf,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn attn_decode_split(
+            &self,
+            _q: DeviceBuf,
+            _kc: DeviceBuf,
+            _vc: DeviceBuf,
+            _part: DeviceBuf,
+            _n_heads: usize,
+            _n_kv_heads: usize,
+            _head_dim: usize,
+            _seq_len: usize,
+            _seq_dev: DeviceBuf,
+            _cap: usize,
+            _scale: f32,
+            _n_splits: usize,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn attn_combine(
+            &self,
+            _part: DeviceBuf,
+            _out: DeviceBuf,
+            _n_heads: usize,
+            _n_kv_heads: usize,
+            _head_dim: usize,
+            _n_splits: usize,
+            _aq: Option<(DeviceBuf, DeviceBuf, DeviceBuf, DeviceBuf)>,
         ) -> Result<(), CudaError> {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }

@@ -1225,6 +1225,208 @@ void sofuu_attn_decode_f32(const float *q, const float *k_cache,
     }
 }
 
+// ── Decode attention, split-K (FlashDecoding shape) ───────────────────────
+//
+// The block-per-head kernel above waits a full memory round trip per cached
+// position: at 2402 tokens it measured 69 ms of a 73 ms token. The causes are
+// structural, not arithmetic -- 32 warps existed for 40 SMs, each doing 2402
+// dependent 256-byte reads twice, so neither the SM nor the warp had anything
+// to overlap the latency with.
+//
+// This pair keeps the softmax exact but gives the problem the parallelism it
+// always had:
+//   * positions are cut into `n_splits` ranges, so the grid is
+//     n_heads * n_splits warps (512 here instead of 32) and an SM holds enough
+//     resident warps to cover DRAM latency;
+//   * each warp loads four positions' keys AND values into registers before
+//     consuming any of them, so one stall amortizes four dots;
+//   * the per-split partials (max, sum, weighted V) are merged by a second
+//     kernel with the split-softmax identity -- reweight each split by
+//     exp(m_s - M) -- which is exact, not an approximation.
+//
+// `chunk = ceil(cap / n_splits)` is derived from the CACHE size, never from the
+// sequence length, so a captured graph stays valid as the position advances:
+// splits past seq_len write an empty partial and cost one block each.
+//
+// `npoh` (values per lane) is a template parameter because register arrays need
+// compile-time indices; the host dispatch covers head_dim 32/64/128, which is
+// every model in the tree, and the model falls back to the block kernel
+// otherwise.
+static SOFUU_DEVICE SOFUU_INLINE float sofuu_warp_sum_all(float v) {
+    v += sofuu_shfl_xor_f(v, 16);
+    v += sofuu_shfl_xor_f(v, 8);
+    v += sofuu_shfl_xor_f(v, 4);
+    v += sofuu_shfl_xor_f(v, 2);
+    v += sofuu_shfl_xor_f(v, 1);
+    return v;
+}
+
+// One warp computes the attention of one query head over one position range and
+// writes (m, s, acc[head_dim]) for the merge.
+template <int NPOS>
+static SOFUU_DEVICE SOFUU_INLINE void sofuu_attn_split_body(
+    const float *__restrict__ q, const float *__restrict__ k_cache,
+    const float *__restrict__ v_cache, float *__restrict__ part, int n_heads,
+    int n_kv_heads, int cap, float scale, int seq_len, int n_splits, int bx,
+    int lane) {
+    const int group = n_heads / n_kv_heads;
+    const int hd = NPOS * 32;
+    const int split = bx / n_heads;
+    const int h = bx - split * n_heads;
+    const int kvh = h / group;
+    const int chunk = (cap + n_splits - 1) / n_splits;
+    int p0 = split * chunk;
+    int p1 = p0 + chunk;
+    if (p1 > seq_len) p1 = seq_len;
+
+    float qv[NPOS];
+#pragma unroll
+    for (int i = 0; i < NPOS; ++i)
+        qv[i] = q[(unsigned long long)h * (unsigned long long)hd +
+                  (unsigned long long)lane + 32 * i];
+
+    float m = -3.402823466e38f;
+    float s = 0.0f;
+    float acc[NPOS];
+#pragma unroll
+    for (int i = 0; i < NPOS; ++i) acc[i] = 0.0f;
+
+    const float *kb = k_cache + ((unsigned long long)kvh * (unsigned long long)cap) *
+                                    (unsigned long long)hd;
+    const float *vb = v_cache + ((unsigned long long)kvh * (unsigned long long)cap) *
+                                    (unsigned long long)hd;
+    for (int p = p0; p < p1; p += 4) {
+        int n = p1 - p;
+        if (n > 4) n = 4;
+        float k0[4][NPOS], v0[4][NPOS];
+        // All four positions' key and value loads issue before the first dot:
+        // that is the whole point of the batch, so do not interleave them.
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            if (b < n) {
+                unsigned long long off =
+                    (unsigned long long)(p + b) * (unsigned long long)hd +
+                    (unsigned long long)lane;
+#pragma unroll
+                for (int i = 0; i < NPOS; ++i) {
+                    k0[b][i] = kb[off + 32 * i];
+                    v0[b][i] = vb[off + 32 * i];
+                }
+            }
+        }
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            if (b < n) {
+                float d0 = 0.0f;
+#pragma unroll
+                for (int i = 0; i < NPOS; ++i) d0 += qv[i] * k0[b][i];
+                float sc = sofuu_warp_sum_all(d0) * scale;
+                float mn = m > sc ? m : sc;
+                float corr = sofuu_exp(m - mn);
+                float w = sofuu_exp(sc - mn);
+                s = s * corr + w;
+                m = mn;
+#pragma unroll
+                for (int i = 0; i < NPOS; ++i)
+                    acc[i] = acc[i] * corr + w * v0[b][i];
+            }
+        }
+    }
+
+    float *dst = part +
+                 ((((unsigned long long)kvh * n_splits + split) *
+                       (unsigned long long)n_heads +
+                   (unsigned long long)h) *
+                  (unsigned long long)(2 + hd));
+    if (lane == 0) {
+        dst[0] = (p1 > p0) ? m : -3.402823466e38f;
+        dst[1] = s;
+    }
+#pragma unroll
+    for (int i = 0; i < NPOS; ++i) dst[2 + lane + 32 * i] = acc[i];
+}
+
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(32)
+void sofuu_attn_decode_split(const float *__restrict__ q,
+                             const float *__restrict__ k_cache,
+                             const float *__restrict__ v_cache,
+                             float *__restrict__ part, int n_heads,
+                             int n_kv_heads, int head_dim, int cap, float scale,
+                             const int *seq_dev, int n_splits) {
+    int seq_len = *seq_dev;
+    int bx = (int)sofuu_ctaid_x();
+    int lane = (int)(sofuu_tid_x() & 31u);
+    if (n_kv_heads <= 0 || head_dim <= 0 || n_splits <= 0 ||
+        (n_heads % n_kv_heads) != 0 || n_heads / n_kv_heads > 8 ||
+        bx >= n_heads * n_splits) {
+        return;
+    }
+    if (seq_len <= 0 || seq_len > cap) return;
+    if (head_dim == 32) {
+        sofuu_attn_split_body<1>(q, k_cache, v_cache, part, n_heads, n_kv_heads,
+                                 cap, scale, seq_len, n_splits, bx, lane);
+    } else if (head_dim == 64) {
+        sofuu_attn_split_body<2>(q, k_cache, v_cache, part, n_heads, n_kv_heads,
+                                 cap, scale, seq_len, n_splits, bx, lane);
+    } else if (head_dim == 128) {
+        sofuu_attn_split_body<4>(q, k_cache, v_cache, part, n_heads, n_kv_heads,
+                                 cap, scale, seq_len, n_splits, bx, lane);
+    }
+}
+
+// Merge the splits for one head and write the row. `do_quant` fuses the q8_1
+// encoding the o_proj GEMV needs, one 32-value block per warp, so the launch
+// after this one has nothing to prepare.
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
+void sofuu_attn_combine(const float *__restrict__ part, float *__restrict__ out,
+                        int n_heads, int n_kv_heads, int head_dim,
+                        int n_splits, signed char *aq, float *ad, int *as,
+                        int *as16, int do_quant) {
+    int h = (int)sofuu_ctaid_x();
+    unsigned int tid = sofuu_tid_x();
+    if (n_kv_heads <= 0 || head_dim <= 0 || head_dim > 256 || n_splits <= 0 ||
+        h >= n_heads || (n_heads % n_kv_heads) != 0) {
+        return;
+    }
+    int group = n_heads / n_kv_heads;
+    int kvh = h / group;
+    unsigned long long sstride =
+        (unsigned long long)n_heads * (unsigned long long)(2 + head_dim);
+    const float *b0 = part + (((unsigned long long)kvh * n_splits *
+                                   (unsigned long long)n_heads +
+                               (unsigned long long)h) *
+                              (unsigned long long)(2 + head_dim));
+    if (tid < (unsigned int)head_dim) {
+        float M = -3.402823466e38f;
+        for (int s = 0; s < n_splits; ++s) {
+            float ms = b0[s * sstride];
+            if (ms > M) M = ms;
+        }
+        float num = 0.0f, den = 0.0f;
+        for (int s = 0; s < n_splits; ++s) {
+            const float *r = b0 + s * sstride;
+            // An empty split carries -inf; multiplying its zero weight by a
+            // nan would poison the sum, so skip it by name.
+            if (!(r[0] > -3.0e38f)) continue;
+            float w = sofuu_exp(r[0] - M);
+            den += r[1] * w;
+            num += r[2 + tid] * w;
+        }
+        out[(unsigned long long)h * (unsigned long long)head_dim +
+            (unsigned long long)tid] = den > 0.0f ? num / den : 0.0f;
+    }
+    if (do_quant != 0) {
+        sofuu_bar_sync();
+        int nb_head = head_dim >> 5;
+        int warp = (int)(tid >> 5);
+        int lane = (int)(tid & 31u);
+        if (warp < nb_head) {
+            sofuu_quantize_block32(out, aq, ad, as, as16, h * nb_head + warp,
+                                   lane);
+        }
+    }
+}
+
 // ── Residual add: y = a + b (in-place when y == a) ─────────────────────────
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(256)
 void sofuu_add_f32(const float *a, const float *b, float *y, int n) {
@@ -1900,6 +2102,111 @@ extern "C" void sofuu_host_attn_decode(const float *q, const float *k_cache,
             out[(unsigned long long)h * (unsigned long long)head_dim +
                 (unsigned long long)d] =
                 (float)(sum > 0.0 ? acc[d] / sum : 0.0);
+    }
+}
+
+// Split-K decode attention, host reference. Partials are written in the same
+// layout the device kernel uses:
+//   part[((kvh * n_splits + split) * n_heads + h) * (2 + head_dim)]
+//   = { m, sum, acc[head_dim] }
+// Computed in double so the host check isolates the split/merge identity from
+// the device's float rounding.
+extern "C" void sofuu_host_attn_split(const float *q, const float *k_cache,
+                                      const float *v_cache, float *part,
+                                      int n_heads, int n_kv_heads,
+                                      int head_dim, int cap, float scale,
+                                      int seq_len, int n_splits) {
+    if (n_kv_heads <= 0 || head_dim <= 0 || head_dim > 256 || n_splits <= 0 ||
+        seq_len < 0 || seq_len > cap || (n_heads % n_kv_heads) != 0) {
+        return;
+    }
+    int group = n_heads / n_kv_heads;
+    int chunk = (cap + n_splits - 1) / n_splits;
+    for (int kvh = 0; kvh < n_kv_heads; ++kvh) {
+        const float *kb = k_cache + (unsigned long long)kvh *
+                                        (unsigned long long)cap *
+                                        (unsigned long long)head_dim;
+        const float *vb = v_cache + (unsigned long long)kvh *
+                                        (unsigned long long)cap *
+                                        (unsigned long long)head_dim;
+        for (int s = 0; s < n_splits; ++s) {
+            int p0 = s * chunk;
+            int p1 = p0 + chunk;
+            if (p1 > seq_len) p1 = seq_len;
+            for (int h = kvh * group; h < (kvh + 1) * group; ++h) {
+                const float *qv =
+                    q + (unsigned long long)h * (unsigned long long)head_dim;
+                float *out_part =
+                    part + ((((unsigned long long)kvh * n_splits + s) *
+                                 (unsigned long long)n_heads +
+                             (unsigned long long)h) *
+                            (unsigned long long)(2 + head_dim));
+                double acc[256];
+                for (int d = 0; d < head_dim; ++d) acc[d] = 0.0;
+                double m = -1e300, sum = 0.0;
+                for (int p = p0; p < p1; ++p) {
+                    double dot = 0.0;
+                    for (int d = 0; d < head_dim; ++d)
+                        dot += (double)qv[d] *
+                               (double)kb[(unsigned long long)p *
+                                              (unsigned long long)head_dim +
+                                          (unsigned long long)d];
+                    double score = dot * (double)scale;
+                    double mn = m > score ? m : score;
+                    double corr = exp(m - mn);
+                    double w = exp(score - mn);
+                    sum = sum * corr + w;
+                    m = mn;
+                    for (int d = 0; d < head_dim; ++d)
+                        acc[d] = acc[d] * corr +
+                                 w * (double)vb[(unsigned long long)p *
+                                                    (unsigned long long)head_dim +
+                                                (unsigned long long)d];
+                }
+                out_part[0] = (p1 > p0) ? (float)m : -3.402823466e38f;
+                out_part[1] = (float)sum;
+                for (int d = 0; d < head_dim; ++d)
+                    out_part[2 + d] = (float)acc[d];
+            }
+        }
+    }
+}
+
+extern "C" void sofuu_host_attn_combine(const float *part, float *out,
+                                        int n_heads, int n_kv_heads,
+                                        int head_dim, int n_splits) {
+    if (n_kv_heads <= 0 || head_dim <= 0 || head_dim > 256 || n_splits <= 0 ||
+        (n_heads % n_kv_heads) != 0) {
+        return;
+    }
+    int group = n_heads / n_kv_heads;
+    for (int h = 0; h < n_heads; ++h) {
+        int kvh = h / group;
+        unsigned long long sstride =
+            (unsigned long long)n_heads * (unsigned long long)(2 + head_dim);
+        const float *b0 =
+            part + (((unsigned long long)kvh * n_splits *
+                         (unsigned long long)n_heads +
+                     (unsigned long long)h) *
+                    (unsigned long long)(2 + head_dim));
+        for (int d = 0; d < head_dim; ++d) {
+            double M = -1e300;
+            for (int s = 0; s < n_splits; ++s) {
+                double ms = (double)b0[s * sstride];
+                if (ms > M) M = ms;
+            }
+            double num = 0.0, den = 0.0;
+            for (int s = 0; s < n_splits; ++s) {
+                const float *r = b0 + s * sstride;
+                if (!(r[0] > -3.0e38f)) continue;
+                double w = exp((double)r[0] - M);
+                den += (double)r[1] * w;
+                num += (double)r[2 + d] * w;
+            }
+            out[(unsigned long long)h * (unsigned long long)head_dim +
+                (unsigned long long)d] =
+                (float)(den > 0.0 ? num / den : 0.0);
+        }
     }
 }
 

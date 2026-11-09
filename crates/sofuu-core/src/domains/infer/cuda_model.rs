@@ -75,6 +75,10 @@ pub struct CudaModel {
 
     cap: usize,
     pos: usize,
+    /// Split-K decode attention: position ranges over the cache (0 = use the
+    /// block-per-head kernel) and the partials `attn_combine` merges.
+    attn_splits: usize,
+    attn_part: DeviceBuf,
 
     k_cache: DeviceBuf,
     v_cache: DeviceBuf,
@@ -245,6 +249,11 @@ impl CudaModel {
         let q_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.n_kv_heads * cfg.head_dim;
         let cap = context_cap(cfg.max_seq_len);
+        // Split-K attention: enough splits that every warp-slots-per-SM is
+        // covered even on the short-context path, and always a whole number of
+        // position ranges over the *cache* so a captured graph never changes
+        // shape as the position advances. 0 disables it (SOFUU_CUDA_ATTN_SPLITS).
+        let attn_splits = attn_split_count(cfg.n_heads, cap);
         let per_layer_kv = cfg
             .n_kv_heads
             .checked_mul(cap)
@@ -401,6 +410,14 @@ impl CudaModel {
         let k = alloc_f32!(kv_dim, "k");
         let v = alloc_f32!(kv_dim, "v");
         let attn_out = alloc_f32!(q_dim, "attn_out");
+        let attn_part_n = super::cuda::attn_partial_floats(
+            cfg.n_heads,
+            cfg.n_kv_heads,
+            cfg.head_dim,
+            attn_splits.max(1),
+        )
+        .ok_or_else(|| "split-K attention partial size overflow".to_string())?;
+        let attn_part = alloc_f32!(attn_part_n, "attn_part");
         let proj = alloc_f32!(dim, "proj");
         let gate = alloc_f32!(cfg.hidden_dim, "gate");
         let up = alloc_f32!(cfg.hidden_dim, "up");
@@ -477,6 +494,8 @@ impl CudaModel {
             output_quant,
             output_norm: output_norm_buf,
             cap,
+            attn_splits,
+            attn_part,
             pos: 0,
             k_cache,
             v_cache,
@@ -834,6 +853,13 @@ impl CudaModel {
             ptr: self.pos_dev.ptr + 4,
             bytes: 4,
         };
+        // Split-K covers head_dim 32/64/128 with up to eight query heads per
+        // KV head; anything else keeps the block-per-head kernel.
+        let split_attn = self.attn_splits > 0
+            && matches!(self.head_dim, 32 | 64 | 128)
+            && self.n_kv_heads > 0
+            && self.n_heads % self.n_kv_heads == 0
+            && self.n_heads / self.n_kv_heads <= 8;
         let mut t_group = std::time::Instant::now();
         for (li, l) in self.layers.iter().enumerate() {
             if profile {
@@ -903,12 +929,45 @@ impl CudaModel {
                 self.cap,
             )
             .map_err(|err| format!("layer {li} rope+kv_write: {err}"))?;
-            // The attention kernel quantizes its own output row when the head
-            // width is a whole number of 32-value blocks, which saves the
-            // quantize launch in front of the o_proj GEMV.
-            let attn_fused_quant = self.head_dim.is_multiple_of(32)
+            // The o_proj GEMV needs this row as q8_1. Both attention paths can
+            // produce that encoding themselves when the head width is a whole
+            // number of 32-value blocks, which saves the quantize launch.
+            let attn_q8 = self.head_dim.is_multiple_of(32)
                 && self.q_dim == self.n_heads * self.head_dim;
-            if attn_fused_quant {
+            if split_attn {
+                // Split-K: one warp per (head, position range) instead of one
+                // block per head, then an exact split-softmax merge. The merge
+                // writes the row (and quantizes it) for the o_proj GEMV.
+                e.attn_decode_split(
+                    self.q,
+                    k_slice,
+                    v_slice,
+                    self.attn_part,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    seq_len,
+                    seq_dev,
+                    self.cap,
+                    scale,
+                    self.attn_splits,
+                )
+                .map_err(|err| format!("layer {li} attention (split): {err}"))?;
+                e.attn_combine(
+                    self.attn_part,
+                    self.attn_out,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    self.attn_splits,
+                    if attn_q8 {
+                        Some((self.xq, self.xd, self.xsum, self.xsum16))
+                    } else {
+                        None
+                    },
+                )
+                .map_err(|err| format!("layer {li} attention (combine): {err}"))?;
+            } else if attn_q8 {
                 e.attn_decode_quant(
                     self.q,
                     k_slice,
@@ -949,7 +1008,7 @@ impl CudaModel {
                 prof_us[0] += t_group.elapsed().as_micros();
                 t_group = std::time::Instant::now();
             }
-            if !attn_fused_quant {
+            if !attn_q8 {
                 self.quantize_act(e, self.attn_out, self.q_dim)
                     .map_err(|err| format!("layer {li}: {err}"))?;
             }
@@ -1316,6 +1375,30 @@ fn context_cap(max_seq: usize) -> usize {
         .filter(|v| *v >= 64)
         .unwrap_or(max_seq);
     want.min(max_seq.max(1))
+}
+
+/// How many position ranges the split-K decode attention cuts the cache into.
+///
+/// The block-per-head kernel exists for 32 warps and does 2402 dependent reads
+/// per pass, so the cache walk is pure latency (69 ms/token at 2402 tokens on a
+/// T4). One warp per (head, split) instead aims at ~512 warps -- eight per SM on
+/// a 40-SM part -- while keeping at least 128 positions per split so the
+/// per-split bookkeeping stays irrelevant. Splits are derived from the CACHE
+/// size, never the sequence length, so a captured graph keeps its shape.
+///
+/// `SOFUU_CUDA_ATTN_SPLITS=0` returns 0, which sends the model back to the
+/// block kernel (the escape hatch if the split path ever misbehaves).
+fn attn_split_count(n_heads: usize, cap: usize) -> usize {
+    if let Ok(raw) = std::env::var("SOFUU_CUDA_ATTN_SPLITS") {
+        if let Ok(v) = raw.parse::<usize>() {
+            return v;
+        }
+    }
+    let per_split = 128;
+    let target_warps = 512usize;
+    let by_warps = target_warps.div_ceil(n_heads.max(1)).max(1);
+    let by_cap = (cap / per_split).max(1);
+    by_warps.min(by_cap)
 }
 
 fn layer_slice(base: DeviceBuf, layer: usize, per_layer: usize) -> DeviceBuf {

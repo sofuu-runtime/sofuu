@@ -1476,18 +1476,34 @@ void test_attn_decode(void *fn, uint32_t &seed) {
                 download(dad, ad.data(), (size_t)n_q8 * 4) &&
                 download(das, as.data(), (size_t)n_q8 * 4) &&
                 download(da16, as16.data(), (size_t)n_q8 * 8);
+    // Quantize the row the KERNEL produced, not the reference row. The scalar
+    // reference sums in a different order, so it differs from the kernel by an
+    // ULP or two; d = amax/127 is an exact compare and 11 of 16 blocks moved by
+    // one ULP, while q (rounded) and both sum arrays matched. The property that
+    // matters is that a block's own quantization matches the standalone
+    // quantizer over the same values -- that is what o_proj consumes.
+    std::vector<int8_t> aq_ref2((size_t)row_n);
+    std::vector<float> ad_ref2((size_t)n_q8);
+    std::vector<int32_t> as_ref2((size_t)n_q8), as16_ref2((size_t)n_q8 * 2);
+    sofuu_ref::quantize_q8_1(got.data(), aq_ref2.data(), ad_ref2.data(),
+                             as_ref2.data(), as16_ref2.data(), row_n);
     int q_bad = 0, d_bad = 0, s_bad = 0, s16_bad = 0;
     if (q_ok) {
         for (int i = 0; i < row_n; ++i)
-            if (aq[(size_t)i] != aq_ref[(size_t)i]) ++q_bad;
+            if (aq[(size_t)i] != aq_ref2[(size_t)i]) ++q_bad;
         for (int b = 0; b < n_q8; ++b) {
-            if (ad[(size_t)b] != ad_ref[(size_t)b]) ++d_bad;
-            if (as[(size_t)b] != as_ref[(size_t)b]) ++s_bad;
+            if (ad[(size_t)b] != ad_ref2[(size_t)b]) ++d_bad;
+            if (as[(size_t)b] != as_ref2[(size_t)b]) ++s_bad;
             for (int h = 0; h < 2; ++h)
-                if (as16[(size_t)(b * 2 + h)] != as16_ref[(size_t)(b * 2 + h)])
+                if (as16[(size_t)(b * 2 + h)] != as16_ref2[(size_t)(b * 2 + h)])
                     ++s16_bad;
         }
     }
+    // ...and separately: the row must still round-trip to the same integers the
+    // reference row does (a wrong value there is a real bug, not an ULP).
+    int q_vs_ref = 0;
+    for (int i = 0; i < row_n; ++i)
+        if (aq[(size_t)i] != aq_ref[(size_t)i]) ++q_vs_ref;
     double max_err = 0.0;
     for (size_t i = 0; i < got.size(); ++i)
         max_err = std::fmax(max_err,
@@ -1499,6 +1515,10 @@ void test_attn_decode(void *fn, uint32_t &seed) {
     if (q_bad || d_bad || s_bad || s16_bad) {
         std::printf("      fused quantize mismatch: q=%d d=%d sum=%d sum16=%d\n",
                     q_bad, d_bad, s_bad, s16_bad);
+    }
+    if (q_vs_ref) {
+        std::printf("      quantized row differs from the reference row in %d values\n",
+                    q_vs_ref);
     }
     sofuu_cuda_ctx_free(g_ctx, dsq);
     sofuu_cuda_ctx_free(g_ctx, dq);

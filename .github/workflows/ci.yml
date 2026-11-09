@@ -89,7 +89,7 @@ jobs:
         # the suite on one thread removes the cross-thread interleaving that
         # the lock exists to manage, so the deadlock cannot form at all. It
         # costs ~1s (376 tests in 2.8s locally).
-        run: cargo test --release -- --test-threads=1
+        run: SOFUU_ALLOW_LOOPBACK=1 cargo test --release -- --test-threads=1
 
       - name: Phase exit gates (QTSQ_UPGRADE_PLAN.md)
         # The plan's Phase 1/2 exit gates were never measured, so they were
@@ -278,8 +278,8 @@ jobs:
           # above already built dist/, so the cabi parity cases run too.
           CONTRACT_NOQTSQ_BIN=target/release/sofuu \
             CONTRACT_LIBSOFUU=dist/libsofuu.dylib \
-            bash scripts/contract/run_contract_tests.sh \
-            || echo "contract suite: non-blocking while P3 is in progress"
+            ALLOW_BLOCKED=1 \
+            bash scripts/contract/run_contract_tests.sh
 
       - name: 32-token tiny-model smoke (P5)
         run: bash scripts/smoke32.sh ./sofuu contract/fixtures/sofuu-fixture.gguf

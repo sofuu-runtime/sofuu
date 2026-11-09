@@ -3067,7 +3067,7 @@
      * delegate (or map), and has the one-shot advisory been injected? */
     var delegatedOnce = false;
     var delegateNudged = false;
-    /* Claude-style context retention (2026-09-03 e): the turn's tool
+    /* Turn-block context retention (2026-09-03 e): the turn's tool
      * transcript (assistant tool_calls + tool results) is returned to the
      * DRIVER so it persists into conversation history — the model can still
      * reference what it read/did in earlier turns, and compaction (not a
@@ -3367,7 +3367,7 @@
               };
             })()
           : null,
-        /* Claude-style retention: the turn's tool transcript for the driver
+        /* Turn-block retention: the turn's tool transcript for the driver
          * to persist into history. Empty array on plain turns (falsy length
          * checks keep old callers working). */
         transcript: (depth === 0) ? turnTranscript() : undefined,
@@ -3643,12 +3643,16 @@
       }
       var toolsTk = toolsEstTk(o.tools);
       var reserve = o.max_tokens > 0 ? o.max_tokens : Math.max(512, Math.floor(win * 0.05));
+      if (win <= 16384 && reserve > Math.floor(win * 0.25)) {
+        reserve = Math.max(512, Math.floor(win * 0.25));
+        o.max_tokens = reserve;
+      }
       var est = promptTk(msgs) + toolsTk;
       if (est + reserve <= win) return { msgs: msgs, structural: false };
       var out = msgs.slice();
       var actions = [];
       /* Rung 0 — slim oversized tool schemas if tools dominate the window */
-      if (toolsTk > Math.floor(win * 0.35) && o.tools && o.tools.length) {
+      if (toolsTk > Math.floor(win * 0.25) && o.tools && o.tools.length) {
         var slimmedTools = [];
         for (var sti = 0; sti < o.tools.length; sti++) {
           var stx = o.tools[sti];
@@ -3696,7 +3700,7 @@
       /* Rung 2 — clamp the output reserve to what is actually left. */
       if (est + reserve > win) {
         var left = win - est - Math.max(256, Math.floor(win * 0.02));
-        if (left >= 512 && left < reserve) {
+        if (left >= 256 && left < reserve) {
           o.max_tokens = Math.floor(left);
           reserve = o.max_tokens;
           actions.push('output reserve clamped to ' + reserve + ' tokens');

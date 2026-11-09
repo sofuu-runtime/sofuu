@@ -1716,6 +1716,15 @@
     if (u.charAt(u.length - 1) === '/') u = u.slice(0, -1);
     return u + '/models';
   }
+  function propsRootUrl(endpoint) {
+    let u = String(endpoint || '');
+    u = u.split('#')[0].split('?')[0];
+    while (/\/(chat\/completions|completions|messages|models)\/?$/.test(u)) {
+      u = u.replace(/\/(chat\/completions|completions|messages|models)\/?$/, '');
+    }
+    if (u.charAt(u.length - 1) === '/') u = u.slice(0, -1);
+    return u + '/props';
+  }
   function discoverCaps() {
     try {
       if (!cfg.model || !cfg.base_url) return;
@@ -1757,6 +1766,14 @@
             .then(j => ({ endpoint: endpoint, listing: j }))
             .catch(() => ({ endpoint: endpoint, listing: null }))
         );
+        if (isLocalHost(endpoint)) {
+          jobs.push(
+            fetch(propsRootUrl(endpoint), { headers: headers })
+              .then(res => (res && res.ok) ? res.json() : null)
+              .then(j => ({ endpoint: endpoint, listing: j }))
+              .catch(() => ({ endpoint: endpoint, listing: null }))
+          );
+        }
       }
       Promise.all(jobs).then(function (results) {
         let anyOk = false;
@@ -1798,12 +1815,26 @@
       if (listing && sofuu.ml && sofuu.ml.alloc && typeof sofuu.ml.alloc.ingestListing === 'function') {
         try { ingested = sofuu.ml.alloc.ingestListing(endpoint, JSON.stringify(listing)) || 0; } catch (eI) { ingested = 0; }
       }
+      if (local) {
+        try {
+          const resProps = await fetch(propsRootUrl(endpoint), { headers: headers });
+          if (resProps && resProps.ok) {
+            const propsJ = await resProps.json();
+            if (propsJ && sofuu.ml && sofuu.ml.alloc && typeof sofuu.ml.alloc.ingestListing === 'function') {
+              try {
+                const nP = sofuu.ml.alloc.ingestListing(endpoint, JSON.stringify(propsJ)) || 0;
+                if (nP > 0) ingested += nP;
+              } catch (eP) { /* best-effort ingest of local props */ }
+            }
+          }
+        } catch (eProps) { /* local props endpoint is optional */ }
+      }
       /* Stamp the TTL so the per-turn harvest does not re-fetch what we
        * just pulled (a failed pull keeps the short retry clock). */
       capsDiscoveredAt = Date.now() - DISCOVER_TTL_MS + (ingested > 0 ? DISCOVER_TTL_MS : DISCOVER_RETRY_MS);
       const r = resolveCaps();
       const known = r && r.known;
-      if (!listing) {
+      if (!listing && ingested === 0) {
         if (local) {
           out('\x1b[90m  local endpoint — no model list to read; context is detected from its first response (default ' + fmtTk(r.window) + ')\x1b[0m\n');
         } else {
@@ -1908,7 +1939,7 @@
     }
     return Math.ceil(String(s).length / 4);
   }
-  /* ── Turn blocks (Claude-style retention, 2026-09-03 e) ────────────
+  /* ── Turn blocks (turn-block context retention, 2026-09-03 e) ─────
    * History is a list of TURN BLOCKS: one user message, then zero or more
    * retained tool_calls/tool messages (the turn's transcript), then the
    * assistant answer. Trimming/compaction moves whole blocks — an
@@ -1987,11 +2018,32 @@
      * instruction-last is the better summary shape anyway. */
     const tailAsk = { role: 'user', content: (opts && opts.tailPrompt) ||
       'Summarize the conversation above into a compact summary that preserves key facts, decisions, and the user\'s intent. Output only the summary.' };
-    const summary = await complete([
-      { role: 'system', content: sysPrompt },
-      ...history.slice(0, oldCount),
-      tailAsk,
-    ]);
+    let summary = null;
+    try {
+      summary = await complete([
+        { role: 'system', content: sysPrompt },
+        ...history.slice(0, oldCount),
+        tailAsk,
+      ], { max_tokens: 512 });
+    } catch (eSumm) { /* LLM summarizer failed on oversized context or provider; deterministic fallback below */ }
+    if (!summary || typeof summary !== 'string' || !summary.trim() || summary.trim() === '(no response)') {
+      const bullets = [];
+      for (let bi = 0; bi < oldCount; bi++) {
+        const hm = history[bi];
+        if (!hm) continue;
+        const c = String(hm.content || '').trim();
+        if (!c) continue;
+        if (hm.role === 'user') {
+          bullets.push('• User: ' + clip1(c, 160));
+        } else if (hm.role === 'assistant') {
+          const line1 = c.split('\n')[0].trim();
+          if (line1) bullets.push('• Assistant: ' + clip1(line1, 160));
+        }
+      }
+      if (bullets.length > 0) {
+        summary = 'Summary of earlier conversation:\n' + bullets.slice(-8).join('\n');
+      }
+    }
     if (!summary || typeof summary !== 'string' || !summary.trim() || summary.trim() === '(no response)') return false;
     archiveWrite('summary', 'complete', (opts && opts.source) || 'compaction', summary, {
       compacted_messages: oldCount,
@@ -2978,7 +3030,7 @@
       /* F3: history stores the manifest only (not full file text). */
       const histText = manifest ? text + ' [' + manifest + ']' : text;
       history.push({ role: 'user', content: histText });
-      /* Claude-style retention (2026-09-03 e): the turn's tool transcript
+      /* Turn-block retention (2026-09-03 e): the turn's tool transcript
        * (assistant tool_calls + tool results) persists into history between
        * the prompt and the answer — the model keeps its tool context across
        * turns; compaction sheds it, not a per-turn release. */
@@ -4117,15 +4169,17 @@
             continue;
           }
           const CTX_OVERFLOW_RE = /context.*(?:length|window|size|limit|exceed)|exceed.*(?:context|token)|too many tokens|maximum context/i;
-          if (CTX_OVERFLOW_RE.test(msg) && history.length > 0) {
+          if (CTX_OVERFLOW_RE.test(msg) && (history.length > 0 || archiveAttempt === 0)) {
             if (sofuu.ml && sofuu.ml.alloc && typeof sofuu.ml.alloc.noteLimit === 'function') {
               try { sofuu.ml.alloc.noteLimit(curModel, msg); } catch (eNL) { /* allocator limit learning is best-effort */ }
             }
             out('\x1b[90m  ⚙ context limit exceeded (' + clip1(msg, 120) + ') — auto-compacting and continuing…\x1b[0m\n');
             let compacted = false;
-            try { compacted = !!(await summarizeHistory(0)); } catch (eSC) { /* fallback to drop turn block below */ }
-            if (!compacted && history.length > 0) {
-              removeTurnBlock(0);
+            if (history.length > 0) {
+              try { compacted = !!(await summarizeHistory(0)); } catch (eSC) { /* fallback to drop turn block below */ }
+              if (!compacted && history.length > 0) {
+                removeTurnBlock(0);
+              }
             }
             prepareArchiveRecovery(msg);
             archiveAttempt++;

@@ -137,9 +137,10 @@ static LEARNED: LazyLock<Mutex<HashMap<String, (Option<i64>, Option<i64>)>>> =
 /// (scheme/host case, trailing slash, query/fragment) so `/v1` and `/v1/`
 /// address the same learned entry.
 pub fn learned_key(base_url: Option<&str>, model: &str) -> String {
+    let clean_model = model.trim().to_lowercase();
     match base_url.map(crate::rt::model_caps_discovered::normalize_api_root) {
-        Some(root) if !root.is_empty() => format!("{}\u{1}{}", root, model),
-        _ => model.to_string(),
+        Some(root) if !root.is_empty() => format!("{}\u{1}{}", root, clean_model),
+        _ => clean_model,
     }
 }
 
@@ -148,14 +149,15 @@ pub fn learned_key(base_url: Option<&str>, model: &str) -> String {
 /// was known), else None.
 fn learned_entry(base_url: Option<&str>, model: &str) -> Option<(Option<i64>, Option<i64>)> {
     let g = LEARNED.lock().ok()?;
+    let clean_model = model.trim().to_lowercase();
     if let Some(root) = base_url.map(crate::rt::model_caps_discovered::normalize_api_root) {
         if !root.is_empty() {
-            if let Some(v) = g.get(&format!("{}\u{1}{}", root, model)) {
+            if let Some(v) = g.get(&format!("{}\u{1}{}", root, clean_model)) {
                 return Some(*v);
             }
         }
     }
-    g.get(model).copied()
+    g.get(&clean_model).copied()
 }
 
 /// Public read seam for diagnostics (e.g. `sofuu doctor`).

@@ -310,6 +310,34 @@ fn main() {
         Ok(d) => PathBuf::from(d),
         Err(_) => root.join("deps/libuv/build"),
     };
+    let uv_src = root.join("deps/libuv");
+    if !uv_lib.join("libuv.a").exists()
+        && !uv_lib.join("uv_a.lib").exists()
+        && !uv_lib.join("libuv_a.a").exists()
+        && uv_src.join("CMakeLists.txt").exists()
+    {
+        println!("cargo:warning=libuv not found in {}. Attempting automatic cmake build...", uv_lib.display());
+        let _ = std::fs::create_dir_all(&uv_lib);
+        let configure = std::process::Command::new("cmake")
+            .arg("-S")
+            .arg(&uv_src)
+            .arg("-B")
+            .arg(&uv_lib)
+            .arg("-DBUILD_TESTING=OFF")
+            .arg("-DBUILD_SHARED_LIBS=OFF")
+            .status();
+        if let Ok(c_status) = configure {
+            if c_status.success() {
+                let _ = std::process::Command::new("cmake")
+                    .arg("--build")
+                    .arg(&uv_lib)
+                    .arg("--config")
+                    .arg("Release")
+                    .arg("--parallel")
+                    .status();
+            }
+        }
+    }
     if is_windows {
         // MSVC does no lib-prefixing and the CMake MSVC build produces
         // uv_a.lib (BUILD_SHARED_LIBS=OFF), not libuv.a. The zig/mingw

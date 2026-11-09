@@ -2067,7 +2067,7 @@ fn welcome_plain(cfg: &ChatConfig, session: Option<&str>, dir: &str) -> Vec<Stri
     };
     vec![
         format!(
-            "\x1b[1;35m  ✻ sofuu\x1b[0m \x1b[90m— AI-native JS runtime · v{}\x1b[0m",
+            "\x1b[1;35m  ✻ sofuu\x1b[0m \x1b[90m— runtime for AI · v{}\x1b[0m",
             env!("CARGO_PKG_VERSION")
         ),
         format!(

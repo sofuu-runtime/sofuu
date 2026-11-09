@@ -1757,8 +1757,14 @@ fn ipv4_is_internal(v4: Ipv4Addr) -> bool {
 /// net.ssrf / net.allow_private (`allowPrivate`), shared by `net_policy`
 /// and the pure evaluator so the two read the same switch.
 fn net_ssrf(policy: &serde_json::Value) -> bool {
+    if bool_at(policy, &["net", "ssrf"]) == Some(true)
+        || bool_at(policy, &["net", "allow_private"]) == Some(false)
+        || bool_at(policy, &["net", "allowPrivate"]) == Some(false)
+    {
+        return true;
+    }
     if std::env::var_os("SOFUU_ALLOW_LOOPBACK").is_some() || std::env::var_os("SOFUU_WEB_ALLOW_INTERNAL").is_some() {
-        return bool_at(policy, &["net", "ssrf"]).unwrap_or(false);
+        return false;
     }
     if bool_at(policy, &["net", "allow_private"]) == Some(true)
         || bool_at(policy, &["net", "allowPrivate"]) == Some(true)

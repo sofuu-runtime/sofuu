@@ -164,9 +164,21 @@ fn decode_payload(p: &[u8], crc32: u32) -> Result<EmbeddedPayload, String> {
         ));
     }
     let flags = u16::from_le_bytes([p[10], p[11]]);
-    let bc_len = u32::from_le_bytes(p[12..16].try_into().unwrap()) as usize;
-    let brain_len = u32::from_le_bytes(p[16..20].try_into().unwrap()) as usize;
-    let brain_dim = u32::from_le_bytes(p[20..24].try_into().unwrap());
+    let bc_len = u32::from_le_bytes(
+        p[12..16]
+            .try_into()
+            .map_err(|_| "ERR_BINARY_CORRUPTED: invalid bytecode length".to_string())?,
+    ) as usize;
+    let brain_len = u32::from_le_bytes(
+        p[16..20]
+            .try_into()
+            .map_err(|_| "ERR_BINARY_CORRUPTED: invalid brain length".to_string())?,
+    ) as usize;
+    let brain_dim = u32::from_le_bytes(
+        p[20..24]
+            .try_into()
+            .map_err(|_| "ERR_BINARY_CORRUPTED: invalid brain dimension".to_string())?,
+    );
     let name_len = u16::from_le_bytes([p[24], p[25]]) as usize;
 
     let name_start = PAYLOAD_HEADER_LEN;

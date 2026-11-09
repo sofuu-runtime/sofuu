@@ -521,7 +521,10 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
     }
 
     // Subsystem capsule declarative dispatch (PLAN-ZERO-RISK-MODULARIZATION §3.2)
-    let _ = crate::domains::init_subsystems(ctx);
+    if let Err(err) = crate::domains::init_subsystems(ctx) {
+        eprintln!("[sofuu:fatal] Failed to initialize subsystem capsules: {}", err);
+        panic!("Subsystem initialization failure: {}", err);
+    }
 
     unsafe { build_sofuu_global(ctx) };
 }

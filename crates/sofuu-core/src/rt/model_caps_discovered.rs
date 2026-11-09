@@ -133,6 +133,40 @@ fn int_field(v: &serde_json::Value) -> Option<i64> {
 /// silently skipped (a listing that carries no caps must not fail the
 /// ingest of the ones that do). Returns true when this entry actually
 /// carried at least one usable number.
+fn model_aliases_and_stems(id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let lower = id.trim().to_lowercase();
+    if lower.is_empty() {
+        return out;
+    }
+    out.push(lower.clone());
+
+    // Basename if id contains path
+    let base = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    if base != lower && !base.is_empty() {
+        out.push(base.to_string());
+    }
+
+    // Stem without .gguf or .bin
+    for b in [&lower, &base.to_string()] {
+        let stem = b.trim_end_matches(".gguf").trim_end_matches(".bin");
+        if stem != b && !stem.is_empty() {
+            out.push(stem.to_string());
+        }
+        for pat in &[".i1-", ".q4_", ".q5_", ".q8_", ".q2_", ".q3_", ".q6_", "-q4_", "-q5_", "-q8_", "-q4-", "-q8-"] {
+            if let Some(pos) = stem.rfind(pat) {
+                let prefix = &stem[..pos];
+                if !prefix.is_empty() {
+                    out.push(prefix.to_string());
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 pub fn ingest_one(api_root: &str, model_id: &str, entry: &serde_json::Value) -> bool {
     let root = normalize_api_root(api_root);
     let id = model_id.trim().to_lowercase();
@@ -208,7 +242,18 @@ pub fn ingest_one(api_root: &str, model_id: &str, entry: &serde_json::Value) -> 
         at: now_secs(),
     };
     if let Ok(mut st) = STORE.lock() {
-        st.map.insert((root, id), caps);
+        for key in model_aliases_and_stems(&id) {
+            st.map.insert((root.clone(), key), caps);
+        }
+        if let Some(aliases) = obj.get("aliases").and_then(|a| a.as_array()) {
+            for a in aliases {
+                if let Some(alias_str) = a.as_str() {
+                    for key in model_aliases_and_stems(alias_str) {
+                        st.map.insert((root.clone(), key), caps);
+                    }
+                }
+            }
+        }
     }
     true
 }
@@ -217,6 +262,29 @@ pub fn ingest_one(api_root: &str, model_id: &str, entry: &serde_json::Value) -> 
 /// array). Returns the count of entries that carried caps. Never fails:
 /// a malformed listing ingests nothing.
 pub fn ingest_listing(api_root: &str, listing: &serde_json::Value) -> usize {
+    if let Some(obj) = listing.as_object() {
+        if let Some(dgs) = obj.get("default_generation_settings") {
+            let ctx = dgs.get("params")
+                .and_then(|p| p.get("n_ctx"))
+                .or_else(|| dgs.get("n_ctx"))
+                .and_then(int_field)
+                .filter(|v| *v > 0);
+            if let Some(n_ctx) = ctx {
+                let id = obj.get("model_alias")
+                    .or_else(|| obj.get("model_path"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("default");
+                let fake_entry = serde_json::json!({
+                    "id": id,
+                    "meta": { "n_ctx": n_ctx }
+                });
+                if ingest_one(api_root, id, &fake_entry) {
+                    persist();
+                    return 1;
+                }
+            }
+        }
+    }
     let rows = listing
         .as_object()
         .and_then(|o| {
@@ -264,7 +332,36 @@ pub fn lookup(api_root: &str, model: &str) -> Option<DiscoveredCaps> {
     if root.is_empty() || id.is_empty() {
         return None;
     }
-    STORE.lock().ok().and_then(|st| st.map.get(&(root, id)).copied())
+    let st = STORE.lock().ok()?;
+    if let Some(c) = st.map.get(&(root.clone(), id.clone())).copied() {
+        return Some(c);
+    }
+    for variant in model_aliases_and_stems(&id) {
+        if let Some(c) = st.map.get(&(root.clone(), variant)).copied() {
+            return Some(c);
+        }
+    }
+    let id_stem = id.trim_end_matches(".gguf").trim_end_matches(".bin");
+    if let Some((_, caps)) = st.map.iter().find(|((r, m), _)| {
+        if r != &root {
+            return false;
+        }
+        let m_stem = m.trim_end_matches(".gguf").trim_end_matches(".bin");
+        m_stem == id_stem || m_stem.ends_with(id_stem) || id_stem.ends_with(m_stem)
+    }) {
+        return Some(*caps);
+    }
+    let root_entries: Vec<DiscoveredCaps> = st.map.iter()
+        .filter(|((r, _), _)| r == &root)
+        .map(|(_, caps)| *caps)
+        .collect();
+    if !root_entries.is_empty() {
+        let first_win = root_entries[0].ctx_window;
+        if root_entries.iter().all(|c| c.ctx_window == first_win) {
+            return Some(root_entries[0]);
+        }
+    }
+    None
 }
 
 /// Cross-root fallback: the caps the SAME model id published on ANY other

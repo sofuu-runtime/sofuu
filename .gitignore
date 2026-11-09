@@ -140,13 +140,19 @@ sofuu-desktop/src-tauri/icons/StoreLogo.png
 /bench/
 /benchmarks/
 
-# ── Local-only test suites and samples (kept on this Mac, out of the repo) ──
 # tests/ holds the JS + shell test corpus and run_js_tests.sh (the runner
 # behind `make test`); examples/ holds the demo scripts and the five
-# headless/ C samples behind `make headless-test`. Both stay on disk; the
-# Makefile targets skip cleanly when they are absent.
+# headless/ C samples behind `make headless-test`.
 /tests/
 /examples/
+test_*.js
+my_calc_server.ts
+plugins/weather.ts
+*.qtsq.lock
+secrets.json
+.perch/
+terrain/
+logs/
 
 # ── Local-only clean-room embedding models (kept on this Mac) ──
 # emb-m/ is a standalone PyTorch research project (sofuu_arch/ + its own

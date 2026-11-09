@@ -152,7 +152,7 @@ echo "→ build stamp: $SOFUU_BUILD"
 # it is published, because none of this changes the size gate's own checks.
 if [ "${SOFUU_LEAN_BUILD:-1}" != "0" ]; then
     RUSTFLAGS="$RUSTFLAGS -C force-unwind-tables=no -C relocation-model=static"
-    RUSTFLAGS="$RUSTFLAGS -C link-arg=-no-pie -C link-arg=-Wl,--no-eh-frame-hdr"
+    RUSTFLAGS="$RUSTFLAGS -C link-arg=-no-pie -C link-arg=-Wl,--no-eh-frame-hdr -C link-arg=-Wl,--strip-all -C link-arg=-Wl,--gc-sections"
     # The C dependencies (QuickJS, http-parser) ship unwind tables by default
     # and nothing C here throws: worth 77,216 B on a clean tree. Must be set
     # before cargo runs, and it only takes effect when the C objects are

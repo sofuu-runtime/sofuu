@@ -136,7 +136,7 @@ echo "→ build stamp: $SOFUU_BUILD"
 export SOFUU_KERNEL_OPT="${SOFUU_KERNEL_OPT:-z}"
 if [ "${SOFUU_LEAN_BUILD:-1}" != "0" ]; then
     RUSTFLAGS="$RUSTFLAGS -C force-unwind-tables=no -C relocation-model=static"
-    RUSTFLAGS="$RUSTFLAGS -C link-arg=-no-pie -C link-arg=-Wl,--no-eh-frame-hdr"
+    RUSTFLAGS="$RUSTFLAGS -C link-arg=-no-pie -C link-arg=-Wl,--no-eh-frame-hdr -C link-arg=-Wl,--strip-all -C link-arg=-Wl,--gc-sections"
     NOUNWIND="-fno-asynchronous-unwind-tables -fno-unwind-tables"
     export CFLAGS="${CFLAGS:-} $NOUNWIND"
     export CFLAGS_aarch64_unknown_linux_musl="${CFLAGS_aarch64_unknown_linux_musl:-} $NOUNWIND"

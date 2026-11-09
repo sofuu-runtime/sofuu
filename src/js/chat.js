@@ -337,7 +337,7 @@
     }
     return Math.ceil(String(s).length / 4);
   }
-  /* ── Turn blocks (Claude-style retention, 2026-09-03 e) ────────────
+  /* ── Turn blocks (turn-block context retention, 2026-09-03 e) ─────
    * History is a list of TURN BLOCKS: one user message, then zero or more
    * retained tool_calls/tool messages (the turn's transcript), then the
    * assistant answer. Trimming/compaction must move whole blocks — an
@@ -446,9 +446,30 @@
      * role=user" — the folded prefix ends with an assistant message). The
      * instruction rides LAST as a user message; system-first stays for
      * lenient providers. */
-    var summary = await complete([
-      { role: 'system', content: 'You are a conversation summarizer. Compress the following conversation into a compact summary that preserves key facts, decisions, and the user\'s intent. Output only the summary.' }
-    ].concat(S.history.slice(0, oldCount), [{ role: 'user', content: 'Summarize the conversation above into a compact summary that preserves key facts, decisions, and the user\'s intent. Output only the summary.' }]));
+    var summary = null;
+    try {
+      summary = await complete([
+        { role: 'system', content: 'You are a conversation summarizer. Compress the following conversation into a compact summary that preserves key facts, decisions, and the user\'s intent. Output only the summary.' }
+      ].concat(S.history.slice(0, oldCount), [{ role: 'user', content: 'Summarize the conversation above into a compact summary that preserves key facts, decisions, and the user\'s intent. Output only the summary.' }]), { max_tokens: 512 });
+    } catch (eSumm) { /* LLM summarizer failed on oversized context or provider; deterministic fallback below */ }
+    if (!summary || typeof summary !== 'string' || !summary.trim() || summary.trim() === '(no response)') {
+      var bullets = [];
+      for (var bi = 0; bi < oldCount; bi++) {
+        var hm = S.history[bi];
+        if (!hm) continue;
+        var c = String(hm.content || '').trim();
+        if (!c) continue;
+        if (hm.role === 'user') {
+          bullets.push('• User: ' + clip(c, 160));
+        } else if (hm.role === 'assistant') {
+          var line1 = c.split('\n')[0].trim();
+          if (line1) bullets.push('• Assistant: ' + clip(line1, 160));
+        }
+      }
+      if (bullets.length > 0) {
+        summary = 'Summary of earlier conversation:\n' + bullets.slice(-8).join('\n');
+      }
+    }
     if (!summary || typeof summary !== 'string' || !summary.trim() || summary.trim() === '(no response)') return false;
     S.history = [{ role: 'system', content: 'Prior conversation summary: ' + summary }].concat(S.history.slice(oldCount));
     return true;
@@ -1908,7 +1929,7 @@
      * the turn's transcript, and firstPromptTk alone would under-count it. */
     var histAtReq = historyTokens();
     var turnTk = estTok(histText);
-    /* Claude-style retention (2026-09-03 e): the turn's tool transcript
+    /* Turn-block retention (2026-09-03 e): the turn's tool transcript
      * (assistant tool_calls + tool results) persists into history between
      * the prompt and the answer — the model keeps its tool context across
      * turns and compaction sheds it, not a per-turn release. */
@@ -2331,13 +2352,15 @@
             }
           }
           var CTX_OVERFLOW_RE = /context.*(?:length|window|size|limit|exceed)|exceed.*(?:context|token)|too many tokens|maximum context/i;
-          if (CTX_OVERFLOW_RE.test(msg) && S.history.length > 0) {
+          if (CTX_OVERFLOW_RE.test(msg)) {
             allocNoteLimit(cA, msg);
             emit({ kind: 'warn', payload: { message: 'context limit exceeded (' + clip(msg, 120) + ') — auto-compacting and continuing' } });
             var compOk = false;
-            try { compOk = !!(await summarizeHistory(0)); } catch (eCH) { /* fallback to drop turn block below */ }
-            if (!compOk && S.history.length > 0) {
-              removeTurnBlock(0);
+            if (S.history.length > 0) {
+              try { compOk = !!(await summarizeHistory(0)); } catch (eCH) { /* fallback to drop turn block below */ }
+              if (!compOk && S.history.length > 0) {
+                removeTurnBlock(0);
+              }
             }
             try {
               res = await turn(txt, false, noTools, chain[chainIdx], turnImages);

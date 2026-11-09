@@ -224,6 +224,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [x] Update README with `quickstart.js` visual snippet and pure Kaze example agents demo.
   - [x] Release and publish `sofuu@0.3.0-beta.3` to npm registry.
   - [x] Deploy updated release tarballs and static site to Cloudflare Pages (`sofuu.xyz`).
+  - [x] Optimize landing and documentation responsive layout for mobile viewports (360px-480px).
 
 ---
 

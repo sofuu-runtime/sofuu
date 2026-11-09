@@ -1000,20 +1000,19 @@ $L__BB2_5:
 	mov.u32 %r74, %ctaid.x;
 	// end inline asm
 	shl.b32 	%r77, %r74, 3;
-	add.s32 	%r2, %r77, %r76;
-	setp.ge.s32 	%p1, %r2, %r75;
+	add.s32 	%r1, %r77, %r76;
+	setp.ge.s32 	%p1, %r1, %r75;
 	@%p1 bra 	$L__BB3_33;
 // %bb.1:
 	ld.param.b32 	%r72, [sofuu_gemv_q4_k_q8_param_6];
-	and.b32 	%r1, %r73, 31;
 	shr.s32 	%r78, %r72, 31;
 	shr.u32 	%r79, %r78, 24;
 	add.s32 	%r80, %r72, %r79;
 	shr.s32 	%r3, %r80, 8;
 	mul.lo.s32 	%r81, %r3, 144;
-	mul.wide.s32 	%rd7, %r81, %r2;
+	mul.wide.s32 	%rd7, %r81, %r1;
 	and.b32 	%r4, %r73, 7;
-	shr.u32 	%r226, %r1, 3;
+	bfe.u32 	%r226, %r73, 3, 2;
 	and.b32 	%r5, %r73, 6;
 	or.b32 	%r82, %r226, 4;
 	setp.ge.s32 	%p2, %r82, %r3;
@@ -1032,10 +1031,10 @@ $L__BB2_5:
 	cvt.u64.u32 	%rd8, %r220;
 	shl.b32 	%r85, %r226, 3;
 	or.b32 	%r86, %r85, %r5;
-	mul.wide.u32 	%rd23, %r86, 4;
-	add.s64 	%rd54, %rd23, 4;
 	or.b32 	%r87, %r86, 32;
-	mul.wide.u32 	%rd53, %r87, 4;
+	mul.wide.u32 	%rd54, %r87, 4;
+	mul.wide.u32 	%rd23, %r86, 4;
+	add.s64 	%rd53, %rd23, 4;
 	cvt.u64.u32 	%rd24, %r217;
 	add.s64 	%rd9, %rd24, 592;
 	cvt.u64.u32 	%rd25, %r73;
@@ -1074,9 +1073,9 @@ $L__BB3_3:                              // =>This Inner Loop Header: Depth=1
 	ld.global.nc.v4.b32 	{%r14, %r15, %r16, %r17}, [%rd33+-576];
 	ld.global.nc.v4.b32 	{%r18, %r19, %r20, %r21}, [%rd51];
 	ld.global.nc.v4.b32 	{%r22, %r23, %r24, %r25}, [%rd51+32];
-	add.s64 	%rd34, %rd3, %rd54;
+	add.s64 	%rd34, %rd3, %rd53;
 	ld.global.nc.b32 	%r26, [%rd34+-4];
-	add.s64 	%rd35, %rd4, %rd54;
+	add.s64 	%rd35, %rd4, %rd53;
 	ld.global.nc.b32 	%r27, [%rd35+-4];
 	ld.global.nc.b32 	%r28, [%rd34];
 	ld.global.nc.b32 	%r29, [%rd35];
@@ -1196,9 +1195,9 @@ $L__BB3_13:                             //   in Loop: Header=BB3_3 Depth=1
 	neg.f32 	%r123, %r121;
 	fma.rn.f32 	%r223, %r123, %r122, %r223;
 $L__BB3_15:                             //   in Loop: Header=BB3_3 Depth=1
-	add.s64 	%rd36, %rd3, %rd53;
+	add.s64 	%rd36, %rd3, %rd54;
 	ld.global.nc.b32 	%r38, [%rd36];
-	add.s64 	%rd37, %rd4, %rd53;
+	add.s64 	%rd37, %rd4, %rd54;
 	ld.global.nc.b32 	%r39, [%rd37];
 	ld.global.nc.b32 	%r40, [%rd36+4];
 	ld.global.nc.b32 	%r41, [%rd37+4];
@@ -1320,6 +1319,7 @@ $L__BB3_21:                             //   in Loop: Header=BB3_3 Depth=1
 	fma.rn.f32 	%r225, %r156, %r155, %r225;
 	bra.uni 	$L__BB3_23;
 $L__BB3_5:
+	and.b32 	%r2, %r73, 31;
 	setp.ge.s32 	%p5, %r226, %r3;
 	@%p5 bra 	$L__BB3_31;
 // %bb.6:
@@ -1509,15 +1509,1002 @@ $L__BB3_31:
 	// begin inline asm
 	shfl.sync.down.b32 %r214, %r215, %r216, 0x1f, %r204;
 	// end inline asm
-	setp.ne.b32 	%p8, %r1, 0;
+	setp.ne.b32 	%p8, %r2, 0;
 	@%p8 bra 	$L__BB3_33;
 // %bb.32:
-	cvt.s64.s32 	%rd6, %r2;
+	cvt.s64.s32 	%rd6, %r1;
 	shl.b64 	%rd49, %rd6, 2;
 	add.s64 	%rd17, %rd5, %rd49;
 	add.f32 	%r71, %r215, %r214;
 	st.global.b32 	[%rd17], %r71;
 $L__BB3_33:
+	ret;
+                                        // -- End function
+}
+	// .globl	sofuu_gemv_q4_k_q8_x2   // -- Begin function sofuu_gemv_q4_k_q8_x2
+.visible .entry sofuu_gemv_q4_k_q8_x2(
+	.param .u64 .ptr .align 1 sofuu_gemv_q4_k_q8_x2_param_0,
+	.param .u64 .ptr .align 1 sofuu_gemv_q4_k_q8_x2_param_1,
+	.param .u64 .ptr .align 1 sofuu_gemv_q4_k_q8_x2_param_2,
+	.param .u64 .ptr .align 1 sofuu_gemv_q4_k_q8_x2_param_3,
+	.param .u64 .ptr .align 1 sofuu_gemv_q4_k_q8_x2_param_4,
+	.param .u64 .ptr .align 1 sofuu_gemv_q4_k_q8_x2_param_5,
+	.param .u64 .ptr .align 1 sofuu_gemv_q4_k_q8_x2_param_6,
+	.param .u32 sofuu_gemv_q4_k_q8_x2_param_7,
+	.param .u32 sofuu_gemv_q4_k_q8_x2_param_8
+)
+.maxntid 256
+.minnctapersm 4                         // @sofuu_gemv_q4_k_q8_x2
+{
+	.reg .pred 	%p<11>;
+	.reg .b16 	%rs<205>;
+	.reg .b32 	%r<379>;
+	.reg .b64 	%rd<98>;
+
+// %bb.0:
+	ld.param.b64 	%rd26, [sofuu_gemv_q4_k_q8_x2_param_0];
+	cvta.to.global.u64 	%rd1, %rd26;
+	ld.param.b64 	%rd27, [sofuu_gemv_q4_k_q8_x2_param_1];
+	cvta.to.global.u64 	%rd2, %rd27;
+	ld.param.b64 	%rd28, [sofuu_gemv_q4_k_q8_x2_param_2];
+	cvta.to.global.u64 	%rd3, %rd28;
+	ld.param.b64 	%rd29, [sofuu_gemv_q4_k_q8_x2_param_3];
+	cvta.to.global.u64 	%rd4, %rd29;
+	ld.param.b64 	%rd30, [sofuu_gemv_q4_k_q8_x2_param_4];
+	cvta.to.global.u64 	%rd5, %rd30;
+	ld.param.b64 	%rd31, [sofuu_gemv_q4_k_q8_x2_param_5];
+	ld.param.b64 	%rd32, [sofuu_gemv_q4_k_q8_x2_param_6];
+	cvta.to.global.u64 	%rd6, %rd32;
+	cvta.to.global.u64 	%rd7, %rd31;
+	ld.param.b32 	%r85, [sofuu_gemv_q4_k_q8_x2_param_7];
+	// begin inline asm
+	mov.u32 %r83, %tid.x;
+	// end inline asm
+	shr.u32 	%r86, %r83, 5;
+	// begin inline asm
+	mov.u32 %r84, %ctaid.x;
+	// end inline asm
+	shl.b32 	%r87, %r84, 3;
+	add.s32 	%r2, %r87, %r86;
+	setp.ge.s32 	%p1, %r2, %r85;
+	@%p1 bra 	$L__BB4_57;
+// %bb.1:
+	ld.param.b32 	%r82, [sofuu_gemv_q4_k_q8_x2_param_8];
+	and.b32 	%r1, %r83, 31;
+	shr.s32 	%r88, %r82, 31;
+	shr.u32 	%r89, %r88, 24;
+	add.s32 	%r90, %r82, %r89;
+	shr.s32 	%r3, %r90, 8;
+	mul.lo.s32 	%r91, %r3, 144;
+	mul.wide.s32 	%rd9, %r2, %r91;
+	and.b32 	%r4, %r83, 7;
+	shr.u32 	%r372, %r1, 3;
+	and.b32 	%r5, %r83, 6;
+	or.b32 	%r92, %r372, 4;
+	setp.ge.s32 	%p2, %r92, %r3;
+	mov.b32 	%r377, 0f00000000;
+	shl.b32 	%r355, %r4, 4;
+	shl.b32 	%r356, %r4, 5;
+	and.b32 	%r357, %r83, 1;
+	cvt.u64.u32 	%rd75, %r5;
+	or.b32 	%r358, %r4, 1;
+	setp.gt.u32 	%p9, %r5, 3;
+	setp.gt.u32 	%p10, %r4, 3;
+	mov.b32 	%r378, %r377;
+	@%p2 bra 	$L__BB4_5;
+// %bb.2:
+	and.b32 	%r93, %r355, 96;
+	cvt.u64.u32 	%rd33, %r93;
+	and.b32 	%r94, %r355, 16;
+	cvt.u64.u32 	%rd34, %r94;
+	and.b32 	%r95, %r356, 192;
+	cvt.u64.u32 	%rd35, %r358;
+	shl.b32 	%r96, %r372, 3;
+	or.b32 	%r97, %r96, %r5;
+	mul.wide.u32 	%rd36, %r97, 4;
+	add.s64 	%rd86, %rd36, 4;
+	or.b32 	%r98, %r97, 32;
+	mul.wide.u32 	%rd85, %r98, 4;
+	cvt.u64.u32 	%rd37, %r83;
+	bfe.u64 	%rd38, %rd37, 3, 2;
+	mul.lo.s64 	%rd10, %rd38, 144;
+	add.s64 	%rd39, %rd9, %rd33;
+	add.s64 	%rd40, %rd39, %rd34;
+	add.s64 	%rd41, %rd40, 592;
+	add.s64 	%rd84, %rd2, %rd41;
+	add.s64 	%rd42, %rd9, %rd75;
+	add.s64 	%rd83, %rd2, %rd42;
+	add.s64 	%rd43, %rd9, %rd35;
+	add.s64 	%rd82, %rd2, %rd43;
+	add.s64 	%rd44, %rd9, 578;
+	add.s64 	%rd81, %rd2, %rd44;
+	add.s64 	%rd80, %rd1, %rd41;
+	add.s64 	%rd79, %rd1, %rd42;
+	add.s64 	%rd78, %rd1, %rd43;
+	add.s64 	%rd77, %rd1, %rd44;
+	shl.b64 	%rd45, %rd38, 8;
+	or.b32 	%r99, %r95, %r94;
+	cvt.u64.u32 	%rd46, %r99;
+	or.b64 	%rd47, %rd45, %rd46;
+	add.s64 	%rd48, %rd47, %rd3;
+	add.s64 	%rd76, %rd48, 1024;
+	mov.b32 	%r378, 0f00000000;
+	setp.ne.b32 	%p3, %r357, 0;
+	mov.b32 	%r377, %r378;
+	mov.b32 	%r363, %r372;
+	bra.uni 	$L__BB4_3;
+$L__BB4_39:                             //   in Loop: Header=BB4_3 Depth=1
+	add.f32 	%r378, %r38, %r208;
+	mul.f32 	%r242, %r41, %r371;
+	fma.rn.f32 	%r243, %r39, %r370, %r242;
+	add.f32 	%r377, %r51, %r243;
+	add.s32 	%r372, %r363, 8;
+	add.s64 	%rd86, %rd86, 256;
+	add.s64 	%rd85, %rd85, 256;
+	add.s32 	%r244, %r363, 12;
+	add.s64 	%rd84, %rd84, 1152;
+	add.s64 	%rd83, %rd83, 1152;
+	add.s64 	%rd82, %rd82, 1152;
+	add.s64 	%rd81, %rd81, 1152;
+	add.s64 	%rd80, %rd80, 1152;
+	add.s64 	%rd79, %rd79, 1152;
+	add.s64 	%rd78, %rd78, 1152;
+	add.s64 	%rd77, %rd77, 1152;
+	add.s64 	%rd76, %rd76, 2048;
+	setp.lt.s32 	%p4, %r244, %r3;
+	mov.b32 	%r363, %r372;
+	@!%p4 bra 	$L__BB4_5;
+$L__BB4_3:                              // =>This Inner Loop Header: Depth=1
+	add.s64 	%rd49, %rd80, %rd10;
+	ld.global.nc.v4.b32 	{%r100, %r101, %r102, %r103}, [%rd49+-576];
+	add.s64 	%rd50, %rd84, %rd10;
+	ld.global.nc.v4.b32 	{%r6, %r7, %r8, %r9}, [%rd50+-576];
+	ld.global.nc.v4.b32 	{%r141, %r144, %r146, %r148}, [%rd76+-1024];
+	ld.global.nc.v4.b32 	{%r150, %r152, %r154, %r156}, [%rd76+-992];
+	ld.global.nc.v4.b32 	{%r10, %r11, %r12, %r13}, [%rd49];
+	ld.global.nc.v4.b32 	{%r14, %r15, %r16, %r17}, [%rd50];
+	ld.global.nc.v4.b32 	{%r211, %r214, %r216, %r218}, [%rd76];
+	ld.global.nc.v4.b32 	{%r220, %r222, %r224, %r226}, [%rd76+32];
+	add.s64 	%rd51, %rd4, %rd86;
+	ld.global.nc.b32 	%r18, [%rd51+-4];
+	add.s64 	%rd52, %rd5, %rd86;
+	ld.global.nc.b32 	%r19, [%rd52+-4];
+	ld.global.nc.b32 	%r20, [%rd51];
+	ld.global.nc.b32 	%r21, [%rd52];
+	add.s64 	%rd14, %rd79, %rd10;
+	@%p9 bra 	$L__BB4_9;
+// %bb.4:                               //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs10, [%rd14+4];
+	and.b16 	%rs181, %rs10, 63;
+	ld.global.nc.b8 	%rs11, [%rd14+8];
+	and.b16 	%rs182, %rs11, 63;
+	bra.uni 	$L__BB4_10;
+$L__BB4_9:                              //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs1, [%rd14+8];
+	and.b16 	%rs2, %rs1, 15;
+	ld.global.nc.b8 	%rs3, [%rd14];
+	shr.u16 	%rs4, %rs3, 2;
+	and.b16 	%rs5, %rs4, 48;
+	or.b16 	%rs181, %rs5, %rs2;
+	shr.u16 	%rs6, %rs1, 4;
+	ld.global.nc.b8 	%rs7, [%rd14+4];
+	shr.u16 	%rs8, %rs7, 2;
+	and.b16 	%rs9, %rs8, 48;
+	or.b16 	%rs182, %rs9, %rs6;
+$L__BB4_10:                             //   in Loop: Header=BB4_3 Depth=1
+	and.b32 	%r22, %r100, 252645135;
+	shr.u32 	%r104, %r100, 4;
+	and.b32 	%r23, %r104, 252645135;
+	and.b32 	%r24, %r101, 252645135;
+	shr.u32 	%r105, %r101, 4;
+	and.b32 	%r25, %r105, 252645135;
+	and.b32 	%r26, %r102, 252645135;
+	shr.u32 	%r106, %r102, 4;
+	and.b32 	%r27, %r106, 252645135;
+	and.b32 	%r28, %r103, 252645135;
+	shr.u32 	%r107, %r103, 4;
+	and.b32 	%r29, %r107, 252645135;
+	add.s64 	%rd15, %rd78, %rd10;
+	@%p10 bra 	$L__BB4_12;
+// %bb.11:                              //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs21, [%rd15+4];
+	and.b16 	%rs183, %rs21, 63;
+	ld.global.nc.b8 	%rs22, [%rd15+8];
+	and.b16 	%rs184, %rs22, 63;
+	bra.uni 	$L__BB4_13;
+$L__BB4_12:                             //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs12, [%rd15+8];
+	and.b16 	%rs13, %rs12, 15;
+	ld.global.nc.b8 	%rs14, [%rd15];
+	shr.u16 	%rs15, %rs14, 2;
+	and.b16 	%rs16, %rs15, 48;
+	or.b16 	%rs183, %rs16, %rs13;
+	shr.u16 	%rs17, %rs12, 4;
+	ld.global.nc.b8 	%rs18, [%rd15+4];
+	shr.u16 	%rs19, %rs18, 2;
+	and.b16 	%rs20, %rs19, 48;
+	or.b16 	%rs184, %rs20, %rs17;
+$L__BB4_13:                             //   in Loop: Header=BB4_3 Depth=1
+	add.s64 	%rd12, %rd77, %rd10;
+	ld.global.nc.b8 	%rs24, [%rd12+-578];
+	ld.global.nc.b8 	%rs25, [%rd12+-577];
+	shl.b16 	%rs26, %rs25, 8;
+	or.b16 	%rs23, %rs26, %rs24;
+	// begin inline asm
+	cvt.f32.f16 %r108, %rs23;
+	// end inline asm
+	cvt.rn.f32.u16 	%r118, %rs181;
+	mul.f32 	%r119, %r108, %r118;
+	mov.b32 	%r110, 0;
+	// begin inline asm
+	dp4a.s32.s32 %r109, %r22, %r141, %r110;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r111, %r24, %r144, %r109;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r112, %r26, %r146, %r110;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r113, %r28, %r148, %r112;
+	// end inline asm
+	add.s32 	%r120, %r113, %r111;
+	cvt.rn.f32.s32 	%r121, %r120;
+	mul.f32 	%r364, %r119, %r121;
+	cvt.rn.f32.u16 	%r122, %rs183;
+	mul.f32 	%r123, %r108, %r122;
+	// begin inline asm
+	dp4a.s32.s32 %r114, %r23, %r150, %r110;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r115, %r25, %r152, %r114;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r116, %r27, %r154, %r110;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r117, %r29, %r156, %r116;
+	// end inline asm
+	add.s32 	%r124, %r117, %r115;
+	cvt.rn.f32.s32 	%r125, %r124;
+	mul.f32 	%r365, %r123, %r125;
+	cvt.rn.f32.s32 	%r361, %r19;
+	cvt.rn.f32.s32 	%r362, %r21;
+	@%p3 bra 	$L__BB4_15;
+// %bb.14:                              //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs28, [%rd12+-576];
+	ld.global.nc.b8 	%rs29, [%rd12+-575];
+	shl.b16 	%rs30, %rs29, 8;
+	or.b16 	%rs27, %rs30, %rs28;
+	// begin inline asm
+	cvt.f32.f16 %r126, %rs27;
+	// end inline asm
+	cvt.rn.f32.u16 	%r127, %rs182;
+	mul.f32 	%r128, %r126, %r127;
+	neg.f32 	%r129, %r128;
+	fma.rn.f32 	%r364, %r129, %r361, %r364;
+	cvt.rn.f32.u16 	%r130, %rs184;
+	mul.f32 	%r131, %r126, %r130;
+	neg.f32 	%r132, %r131;
+	fma.rn.f32 	%r365, %r132, %r362, %r365;
+$L__BB4_15:                             //   in Loop: Header=BB4_3 Depth=1
+	add.s64 	%rd16, %rd83, %rd10;
+	@%p9 bra 	$L__BB4_17;
+// %bb.16:                              //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs40, [%rd16+4];
+	and.b16 	%rs185, %rs40, 63;
+	ld.global.nc.b8 	%rs41, [%rd16+8];
+	and.b16 	%rs186, %rs41, 63;
+	bra.uni 	$L__BB4_18;
+$L__BB4_17:                             //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs31, [%rd16+8];
+	and.b16 	%rs32, %rs31, 15;
+	ld.global.nc.b8 	%rs33, [%rd16];
+	shr.u16 	%rs34, %rs33, 2;
+	and.b16 	%rs35, %rs34, 48;
+	or.b16 	%rs185, %rs35, %rs32;
+	shr.u16 	%rs36, %rs31, 4;
+	ld.global.nc.b8 	%rs37, [%rd16+4];
+	shr.u16 	%rs38, %rs37, 2;
+	and.b16 	%rs39, %rs38, 48;
+	or.b16 	%rs186, %rs39, %rs36;
+$L__BB4_18:                             //   in Loop: Header=BB4_3 Depth=1
+	and.b32 	%r30, %r6, 252645135;
+	shr.u32 	%r133, %r6, 4;
+	and.b32 	%r31, %r133, 252645135;
+	and.b32 	%r32, %r7, 252645135;
+	shr.u32 	%r134, %r7, 4;
+	and.b32 	%r33, %r134, 252645135;
+	and.b32 	%r34, %r8, 252645135;
+	shr.u32 	%r135, %r8, 4;
+	and.b32 	%r35, %r135, 252645135;
+	and.b32 	%r36, %r9, 252645135;
+	shr.u32 	%r136, %r9, 4;
+	and.b32 	%r37, %r136, 252645135;
+	add.s64 	%rd17, %rd82, %rd10;
+	@%p10 bra 	$L__BB4_20;
+// %bb.19:                              //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs51, [%rd17+4];
+	and.b16 	%rs187, %rs51, 63;
+	ld.global.nc.b8 	%rs52, [%rd17+8];
+	and.b16 	%rs188, %rs52, 63;
+	bra.uni 	$L__BB4_21;
+$L__BB4_20:                             //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs42, [%rd17+8];
+	and.b16 	%rs43, %rs42, 15;
+	ld.global.nc.b8 	%rs44, [%rd17];
+	shr.u16 	%rs45, %rs44, 2;
+	and.b16 	%rs46, %rs45, 48;
+	or.b16 	%rs187, %rs46, %rs43;
+	shr.u16 	%rs47, %rs42, 4;
+	ld.global.nc.b8 	%rs48, [%rd17+4];
+	shr.u16 	%rs49, %rs48, 2;
+	and.b16 	%rs50, %rs49, 48;
+	or.b16 	%rs188, %rs50, %rs47;
+$L__BB4_21:                             //   in Loop: Header=BB4_3 Depth=1
+	add.s64 	%rd13, %rd81, %rd10;
+	ld.global.nc.b8 	%rs54, [%rd13+-578];
+	ld.global.nc.b8 	%rs55, [%rd13+-577];
+	shl.b16 	%rs56, %rs55, 8;
+	or.b16 	%rs53, %rs56, %rs54;
+	// begin inline asm
+	cvt.f32.f16 %r139, %rs53;
+	// end inline asm
+	cvt.rn.f32.u16 	%r157, %rs185;
+	mul.f32 	%r158, %r139, %r157;
+	mov.b32 	%r142, 0;
+	// begin inline asm
+	dp4a.s32.s32 %r140, %r30, %r141, %r142;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r143, %r32, %r144, %r140;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r145, %r34, %r146, %r142;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r147, %r36, %r148, %r145;
+	// end inline asm
+	add.s32 	%r159, %r147, %r143;
+	cvt.rn.f32.s32 	%r160, %r159;
+	mul.f32 	%r366, %r158, %r160;
+	cvt.rn.f32.u16 	%r161, %rs187;
+	mul.f32 	%r162, %r139, %r161;
+	// begin inline asm
+	dp4a.s32.s32 %r149, %r31, %r150, %r142;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r151, %r33, %r152, %r149;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r153, %r35, %r154, %r142;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r155, %r37, %r156, %r153;
+	// end inline asm
+	add.s32 	%r163, %r155, %r151;
+	cvt.rn.f32.s32 	%r164, %r163;
+	mul.f32 	%r367, %r162, %r164;
+	@%p3 bra 	$L__BB4_23;
+// %bb.22:                              //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs58, [%rd13+-576];
+	ld.global.nc.b8 	%rs59, [%rd13+-575];
+	shl.b16 	%rs60, %rs59, 8;
+	or.b16 	%rs57, %rs60, %rs58;
+	// begin inline asm
+	cvt.f32.f16 %r165, %rs57;
+	// end inline asm
+	cvt.rn.f32.u16 	%r166, %rs186;
+	mul.f32 	%r167, %r165, %r166;
+	neg.f32 	%r168, %r167;
+	fma.rn.f32 	%r366, %r168, %r361, %r366;
+	cvt.rn.f32.u16 	%r169, %rs188;
+	mul.f32 	%r170, %r165, %r169;
+	neg.f32 	%r171, %r170;
+	fma.rn.f32 	%r367, %r171, %r362, %r367;
+$L__BB4_23:                             //   in Loop: Header=BB4_3 Depth=1
+	add.s64 	%rd53, %rd4, %rd85;
+	ld.global.nc.b32 	%r39, [%rd53];
+	add.s64 	%rd54, %rd5, %rd85;
+	ld.global.nc.b32 	%r40, [%rd54];
+	ld.global.nc.b32 	%r41, [%rd53+4];
+	ld.global.nc.b32 	%r42, [%rd54+4];
+	@%p9 bra 	$L__BB4_25;
+// %bb.24:                              //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs70, [%rd14+580];
+	and.b16 	%rs189, %rs70, 63;
+	ld.global.nc.b8 	%rs71, [%rd14+584];
+	and.b16 	%rs190, %rs71, 63;
+	bra.uni 	$L__BB4_26;
+$L__BB4_25:                             //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs61, [%rd14+584];
+	and.b16 	%rs62, %rs61, 15;
+	ld.global.nc.b8 	%rs63, [%rd14+576];
+	shr.u16 	%rs64, %rs63, 2;
+	and.b16 	%rs65, %rs64, 48;
+	or.b16 	%rs189, %rs65, %rs62;
+	shr.u16 	%rs66, %rs61, 4;
+	ld.global.nc.b8 	%rs67, [%rd14+580];
+	shr.u16 	%rs68, %rs67, 2;
+	and.b16 	%rs69, %rs68, 48;
+	or.b16 	%rs190, %rs69, %rs66;
+$L__BB4_26:                             //   in Loop: Header=BB4_3 Depth=1
+	and.b32 	%r43, %r10, 252645135;
+	shr.u32 	%r172, %r10, 4;
+	and.b32 	%r44, %r172, 252645135;
+	and.b32 	%r45, %r11, 252645135;
+	shr.u32 	%r173, %r11, 4;
+	and.b32 	%r46, %r173, 252645135;
+	and.b32 	%r47, %r12, 252645135;
+	shr.u32 	%r174, %r12, 4;
+	and.b32 	%r48, %r174, 252645135;
+	and.b32 	%r49, %r13, 252645135;
+	shr.u32 	%r175, %r13, 4;
+	and.b32 	%r50, %r175, 252645135;
+	@%p10 bra 	$L__BB4_28;
+// %bb.27:                              //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs81, [%rd15+580];
+	and.b16 	%rs191, %rs81, 63;
+	ld.global.nc.b8 	%rs82, [%rd15+584];
+	and.b16 	%rs192, %rs82, 63;
+	bra.uni 	$L__BB4_29;
+$L__BB4_28:                             //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs72, [%rd15+584];
+	and.b16 	%rs73, %rs72, 15;
+	ld.global.nc.b8 	%rs74, [%rd15+576];
+	shr.u16 	%rs75, %rs74, 2;
+	and.b16 	%rs76, %rs75, 48;
+	or.b16 	%rs191, %rs76, %rs73;
+	shr.u16 	%rs77, %rs72, 4;
+	ld.global.nc.b8 	%rs78, [%rd15+580];
+	shr.u16 	%rs79, %rs78, 2;
+	and.b16 	%rs80, %rs79, 48;
+	or.b16 	%rs192, %rs80, %rs77;
+$L__BB4_29:                             //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs84, [%rd12+-2];
+	ld.global.nc.b8 	%rs85, [%rd12+-1];
+	shl.b16 	%rs86, %rs85, 8;
+	or.b16 	%rs83, %rs86, %rs84;
+	// begin inline asm
+	cvt.f32.f16 %r178, %rs83;
+	// end inline asm
+	cvt.rn.f32.u16 	%r188, %rs189;
+	mul.f32 	%r189, %r178, %r188;
+	mov.b32 	%r180, 0;
+	// begin inline asm
+	dp4a.s32.s32 %r179, %r43, %r211, %r180;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r181, %r45, %r214, %r179;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r182, %r47, %r216, %r180;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r183, %r49, %r218, %r182;
+	// end inline asm
+	add.s32 	%r190, %r183, %r181;
+	cvt.rn.f32.s32 	%r191, %r190;
+	mul.f32 	%r368, %r189, %r191;
+	cvt.rn.f32.u16 	%r192, %rs191;
+	mul.f32 	%r193, %r178, %r192;
+	// begin inline asm
+	dp4a.s32.s32 %r184, %r44, %r220, %r180;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r185, %r46, %r222, %r184;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r186, %r48, %r224, %r180;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r187, %r50, %r226, %r186;
+	// end inline asm
+	add.s32 	%r194, %r187, %r185;
+	cvt.rn.f32.s32 	%r195, %r194;
+	mul.f32 	%r369, %r193, %r195;
+	cvt.rn.f32.s32 	%r359, %r40;
+	cvt.rn.f32.s32 	%r360, %r42;
+	@%p3 bra 	$L__BB4_31;
+// %bb.30:                              //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs88, [%rd12];
+	ld.global.nc.b8 	%rs89, [%rd12+1];
+	shl.b16 	%rs90, %rs89, 8;
+	or.b16 	%rs87, %rs90, %rs88;
+	// begin inline asm
+	cvt.f32.f16 %r196, %rs87;
+	// end inline asm
+	cvt.rn.f32.u16 	%r197, %rs190;
+	mul.f32 	%r198, %r196, %r197;
+	neg.f32 	%r199, %r198;
+	fma.rn.f32 	%r368, %r199, %r359, %r368;
+	cvt.rn.f32.u16 	%r200, %rs192;
+	mul.f32 	%r201, %r196, %r200;
+	neg.f32 	%r202, %r201;
+	fma.rn.f32 	%r369, %r202, %r360, %r369;
+$L__BB4_31:                             //   in Loop: Header=BB4_3 Depth=1
+	mul.f32 	%r137, %r20, %r365;
+	mul.f32 	%r176, %r20, %r367;
+	@%p9 bra 	$L__BB4_33;
+// %bb.32:                              //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs100, [%rd16+580];
+	and.b16 	%rs193, %rs100, 63;
+	ld.global.nc.b8 	%rs101, [%rd16+584];
+	and.b16 	%rs194, %rs101, 63;
+	bra.uni 	$L__BB4_34;
+$L__BB4_33:                             //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs91, [%rd16+584];
+	and.b16 	%rs92, %rs91, 15;
+	ld.global.nc.b8 	%rs93, [%rd16+576];
+	shr.u16 	%rs94, %rs93, 2;
+	and.b16 	%rs95, %rs94, 48;
+	or.b16 	%rs193, %rs95, %rs92;
+	shr.u16 	%rs96, %rs91, 4;
+	ld.global.nc.b8 	%rs97, [%rd16+580];
+	shr.u16 	%rs98, %rs97, 2;
+	and.b16 	%rs99, %rs98, 48;
+	or.b16 	%rs194, %rs99, %rs96;
+$L__BB4_34:                             //   in Loop: Header=BB4_3 Depth=1
+	fma.rn.f32 	%r138, %r18, %r364, %r137;
+	fma.rn.f32 	%r177, %r18, %r366, %r176;
+	and.b32 	%r52, %r14, 252645135;
+	shr.u32 	%r203, %r14, 4;
+	and.b32 	%r53, %r203, 252645135;
+	and.b32 	%r54, %r15, 252645135;
+	shr.u32 	%r204, %r15, 4;
+	and.b32 	%r55, %r204, 252645135;
+	and.b32 	%r56, %r16, 252645135;
+	shr.u32 	%r205, %r16, 4;
+	and.b32 	%r57, %r205, 252645135;
+	and.b32 	%r58, %r17, 252645135;
+	shr.u32 	%r206, %r17, 4;
+	and.b32 	%r59, %r206, 252645135;
+	mul.f32 	%r207, %r41, %r369;
+	@%p10 bra 	$L__BB4_36;
+// %bb.35:                              //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs111, [%rd17+580];
+	and.b16 	%rs195, %rs111, 63;
+	ld.global.nc.b8 	%rs112, [%rd17+584];
+	and.b16 	%rs196, %rs112, 63;
+	bra.uni 	$L__BB4_37;
+$L__BB4_36:                             //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs102, [%rd17+584];
+	and.b16 	%rs103, %rs102, 15;
+	ld.global.nc.b8 	%rs104, [%rd17+576];
+	shr.u16 	%rs105, %rs104, 2;
+	and.b16 	%rs106, %rs105, 48;
+	or.b16 	%rs195, %rs106, %rs103;
+	shr.u16 	%rs107, %rs102, 4;
+	ld.global.nc.b8 	%rs108, [%rd17+580];
+	shr.u16 	%rs109, %rs108, 2;
+	and.b16 	%rs110, %rs109, 48;
+	or.b16 	%rs196, %rs110, %rs107;
+$L__BB4_37:                             //   in Loop: Header=BB4_3 Depth=1
+	add.f32 	%r38, %r378, %r138;
+	fma.rn.f32 	%r208, %r39, %r368, %r207;
+	add.f32 	%r51, %r377, %r177;
+	ld.global.nc.b8 	%rs114, [%rd13+-2];
+	ld.global.nc.b8 	%rs115, [%rd13+-1];
+	shl.b16 	%rs116, %rs115, 8;
+	or.b16 	%rs113, %rs116, %rs114;
+	// begin inline asm
+	cvt.f32.f16 %r209, %rs113;
+	// end inline asm
+	cvt.rn.f32.u16 	%r227, %rs193;
+	mul.f32 	%r228, %r209, %r227;
+	mov.b32 	%r212, 0;
+	// begin inline asm
+	dp4a.s32.s32 %r210, %r52, %r211, %r212;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r213, %r54, %r214, %r210;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r215, %r56, %r216, %r212;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r217, %r58, %r218, %r215;
+	// end inline asm
+	add.s32 	%r229, %r217, %r213;
+	cvt.rn.f32.s32 	%r230, %r229;
+	mul.f32 	%r370, %r228, %r230;
+	cvt.rn.f32.u16 	%r231, %rs195;
+	mul.f32 	%r232, %r209, %r231;
+	// begin inline asm
+	dp4a.s32.s32 %r219, %r53, %r220, %r212;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r221, %r55, %r222, %r219;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r223, %r57, %r224, %r212;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r225, %r59, %r226, %r223;
+	// end inline asm
+	add.s32 	%r233, %r225, %r221;
+	cvt.rn.f32.s32 	%r234, %r233;
+	mul.f32 	%r371, %r232, %r234;
+	@%p3 bra 	$L__BB4_39;
+// %bb.38:                              //   in Loop: Header=BB4_3 Depth=1
+	ld.global.nc.b8 	%rs118, [%rd13];
+	ld.global.nc.b8 	%rs119, [%rd13+1];
+	shl.b16 	%rs120, %rs119, 8;
+	or.b16 	%rs117, %rs120, %rs118;
+	// begin inline asm
+	cvt.f32.f16 %r235, %rs117;
+	// end inline asm
+	cvt.rn.f32.u16 	%r236, %rs194;
+	mul.f32 	%r237, %r235, %r236;
+	neg.f32 	%r238, %r237;
+	fma.rn.f32 	%r370, %r238, %r359, %r370;
+	cvt.rn.f32.u16 	%r239, %rs196;
+	mul.f32 	%r240, %r235, %r239;
+	neg.f32 	%r241, %r240;
+	fma.rn.f32 	%r371, %r241, %r360, %r371;
+	bra.uni 	$L__BB4_39;
+$L__BB4_5:
+	setp.ge.s32 	%p5, %r372, %r3;
+	@%p5 bra 	$L__BB4_55;
+// %bb.6:
+	add.s64 	%rd91, %rd1, %rd9;
+	add.s64 	%rd95, %rd2, %rd9;
+	and.b32 	%r245, %r355, 96;
+	cvt.u64.u32 	%rd55, %r245;
+	and.b32 	%r246, %r355, 16;
+	cvt.u64.u32 	%rd56, %r246;
+	and.b32 	%r247, %r356, 192;
+	cvt.u64.u32 	%rd57, %r358;
+	shl.b32 	%r248, %r372, 3;
+	or.b32 	%r249, %r248, %r5;
+	mul.wide.u32 	%rd58, %r249, 4;
+	add.s64 	%rd59, %rd58, 4;
+	add.s64 	%rd97, %rd5, %rd59;
+	add.s64 	%rd96, %rd4, %rd59;
+	mul.wide.u32 	%rd11, %r372, 144;
+	add.s64 	%rd60, %rd9, %rd55;
+	add.s64 	%rd61, %rd60, %rd56;
+	add.s64 	%rd62, %rd61, 28;
+	add.s64 	%rd94, %rd2, %rd62;
+	add.s64 	%rd63, %rd9, %rd75;
+	add.s64 	%rd64, %rd63, 8;
+	add.s64 	%rd93, %rd2, %rd64;
+	add.s64 	%rd65, %rd9, %rd57;
+	add.s64 	%rd66, %rd65, %rd2;
+	add.s64 	%rd92, %rd66, 8;
+	mul.wide.u32 	%rd67, %r372, 256;
+	or.b32 	%r250, %r247, %r246;
+	cvt.u64.u32 	%rd68, %r250;
+	or.b64 	%rd69, %rd67, %rd68;
+	add.s64 	%rd70, %rd69, %rd3;
+	add.s64 	%rd90, %rd70, 32;
+	add.s64 	%rd89, %rd1, %rd62;
+	add.s64 	%rd88, %rd1, %rd64;
+	add.s64 	%rd71, %rd65, %rd1;
+	add.s64 	%rd87, %rd71, 4;
+	setp.ne.b32 	%p6, %r357, 0;
+	bra.uni 	$L__BB4_7;
+$L__BB4_54:                             //   in Loop: Header=BB4_7 Depth=1
+	add.f32 	%r378, %r378, %r293;
+	mul.f32 	%r327, %r62, %r376;
+	fma.rn.f32 	%r328, %r60, %r375, %r327;
+	add.f32 	%r377, %r377, %r328;
+	add.s32 	%r372, %r372, 4;
+	add.s64 	%rd97, %rd97, 128;
+	add.s64 	%rd96, %rd96, 128;
+	add.s64 	%rd95, %rd95, 576;
+	add.s64 	%rd94, %rd94, 576;
+	add.s64 	%rd93, %rd93, 576;
+	add.s64 	%rd92, %rd92, 576;
+	add.s64 	%rd91, %rd91, 576;
+	add.s64 	%rd90, %rd90, 1024;
+	add.s64 	%rd89, %rd89, 576;
+	add.s64 	%rd88, %rd88, 576;
+	add.s64 	%rd87, %rd87, 576;
+	setp.lt.s32 	%p7, %r372, %r3;
+	@!%p7 bra 	$L__BB4_55;
+$L__BB4_7:                              // =>This Inner Loop Header: Depth=1
+	add.s64 	%rd72, %rd89, %rd11;
+	ld.global.nc.v4.b32 	{%r251, %r252, %r253, %r254}, [%rd72+-12];
+	ld.global.nc.v4.b32 	{%r296, %r299, %r301, %r303}, [%rd90+-32];
+	ld.global.nc.v4.b32 	{%r305, %r307, %r309, %r311}, [%rd90];
+	ld.global.nc.b32 	%r60, [%rd96+-4];
+	ld.global.nc.b32 	%r61, [%rd97+-4];
+	ld.global.nc.b32 	%r62, [%rd96];
+	ld.global.nc.b32 	%r63, [%rd97];
+	add.s64 	%rd20, %rd88, %rd11;
+	@%p9 bra 	$L__BB4_40;
+// %bb.8:                               //   in Loop: Header=BB4_7 Depth=1
+	ld.global.nc.b8 	%rs130, [%rd20+-4];
+	and.b16 	%rs197, %rs130, 63;
+	ld.global.nc.b8 	%rs131, [%rd20];
+	and.b16 	%rs198, %rs131, 63;
+	bra.uni 	$L__BB4_41;
+$L__BB4_40:                             //   in Loop: Header=BB4_7 Depth=1
+	ld.global.nc.b8 	%rs121, [%rd20];
+	and.b16 	%rs122, %rs121, 15;
+	ld.global.nc.b8 	%rs123, [%rd20+-8];
+	shr.u16 	%rs124, %rs123, 2;
+	and.b16 	%rs125, %rs124, 48;
+	or.b16 	%rs197, %rs125, %rs122;
+	shr.u16 	%rs126, %rs121, 4;
+	ld.global.nc.b8 	%rs127, [%rd20+-4];
+	shr.u16 	%rs128, %rs127, 2;
+	and.b16 	%rs129, %rs128, 48;
+	or.b16 	%rs198, %rs129, %rs126;
+$L__BB4_41:                             //   in Loop: Header=BB4_7 Depth=1
+	and.b32 	%r64, %r251, 252645135;
+	shr.u32 	%r255, %r251, 4;
+	and.b32 	%r65, %r255, 252645135;
+	and.b32 	%r66, %r252, 252645135;
+	shr.u32 	%r256, %r252, 4;
+	and.b32 	%r67, %r256, 252645135;
+	and.b32 	%r68, %r253, 252645135;
+	shr.u32 	%r257, %r253, 4;
+	and.b32 	%r69, %r257, 252645135;
+	and.b32 	%r70, %r254, 252645135;
+	shr.u32 	%r258, %r254, 4;
+	and.b32 	%r71, %r258, 252645135;
+	add.s64 	%rd21, %rd87, %rd11;
+	@%p10 bra 	$L__BB4_43;
+// %bb.42:                              //   in Loop: Header=BB4_7 Depth=1
+	ld.global.nc.b8 	%rs141, [%rd21];
+	and.b16 	%rs199, %rs141, 63;
+	ld.global.nc.b8 	%rs142, [%rd21+4];
+	and.b16 	%rs200, %rs142, 63;
+	bra.uni 	$L__BB4_44;
+$L__BB4_43:                             //   in Loop: Header=BB4_7 Depth=1
+	ld.global.nc.b8 	%rs132, [%rd21+4];
+	and.b16 	%rs133, %rs132, 15;
+	ld.global.nc.b8 	%rs134, [%rd21+-4];
+	shr.u16 	%rs135, %rs134, 2;
+	and.b16 	%rs136, %rs135, 48;
+	or.b16 	%rs199, %rs136, %rs133;
+	shr.u16 	%rs137, %rs132, 4;
+	ld.global.nc.b8 	%rs138, [%rd21];
+	shr.u16 	%rs139, %rs138, 2;
+	and.b16 	%rs140, %rs139, 48;
+	or.b16 	%rs200, %rs140, %rs137;
+$L__BB4_44:                             //   in Loop: Header=BB4_7 Depth=1
+	add.s64 	%rd18, %rd91, %rd11;
+	ld.global.nc.b8 	%rs144, [%rd18];
+	ld.global.nc.b8 	%rs145, [%rd18+1];
+	shl.b16 	%rs146, %rs145, 8;
+	or.b16 	%rs143, %rs146, %rs144;
+	// begin inline asm
+	cvt.f32.f16 %r259, %rs143;
+	// end inline asm
+	cvt.rn.f32.u16 	%r269, %rs197;
+	mul.f32 	%r270, %r259, %r269;
+	mov.b32 	%r261, 0;
+	// begin inline asm
+	dp4a.s32.s32 %r260, %r64, %r296, %r261;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r262, %r66, %r299, %r260;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r263, %r68, %r301, %r261;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r264, %r70, %r303, %r263;
+	// end inline asm
+	add.s32 	%r271, %r264, %r262;
+	cvt.rn.f32.s32 	%r272, %r271;
+	mul.f32 	%r373, %r270, %r272;
+	cvt.rn.f32.u16 	%r273, %rs199;
+	mul.f32 	%r274, %r259, %r273;
+	// begin inline asm
+	dp4a.s32.s32 %r265, %r65, %r305, %r261;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r266, %r67, %r307, %r265;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r267, %r69, %r309, %r261;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r268, %r71, %r311, %r267;
+	// end inline asm
+	add.s32 	%r275, %r268, %r266;
+	cvt.rn.f32.s32 	%r276, %r275;
+	mul.f32 	%r374, %r274, %r276;
+	cvt.rn.f32.s32 	%r353, %r61;
+	cvt.rn.f32.s32 	%r354, %r63;
+	@%p6 bra 	$L__BB4_46;
+// %bb.45:                              //   in Loop: Header=BB4_7 Depth=1
+	ld.global.nc.b8 	%rs148, [%rd18+2];
+	ld.global.nc.b8 	%rs149, [%rd18+3];
+	shl.b16 	%rs150, %rs149, 8;
+	or.b16 	%rs147, %rs150, %rs148;
+	// begin inline asm
+	cvt.f32.f16 %r277, %rs147;
+	// end inline asm
+	cvt.rn.f32.u16 	%r278, %rs198;
+	mul.f32 	%r279, %r277, %r278;
+	neg.f32 	%r280, %r279;
+	fma.rn.f32 	%r373, %r280, %r353, %r373;
+	cvt.rn.f32.u16 	%r281, %rs200;
+	mul.f32 	%r282, %r277, %r281;
+	neg.f32 	%r283, %r282;
+	fma.rn.f32 	%r374, %r283, %r354, %r374;
+$L__BB4_46:                             //   in Loop: Header=BB4_7 Depth=1
+	add.s64 	%rd73, %rd94, %rd11;
+	ld.global.nc.v4.b32 	{%r284, %r285, %r286, %r287}, [%rd73+-12];
+	add.s64 	%rd22, %rd93, %rd11;
+	@%p9 bra 	$L__BB4_48;
+// %bb.47:                              //   in Loop: Header=BB4_7 Depth=1
+	ld.global.nc.b8 	%rs160, [%rd22+-4];
+	and.b16 	%rs201, %rs160, 63;
+	ld.global.nc.b8 	%rs161, [%rd22];
+	and.b16 	%rs202, %rs161, 63;
+	bra.uni 	$L__BB4_49;
+$L__BB4_48:                             //   in Loop: Header=BB4_7 Depth=1
+	ld.global.nc.b8 	%rs151, [%rd22];
+	and.b16 	%rs152, %rs151, 15;
+	ld.global.nc.b8 	%rs153, [%rd22+-8];
+	shr.u16 	%rs154, %rs153, 2;
+	and.b16 	%rs155, %rs154, 48;
+	or.b16 	%rs201, %rs155, %rs152;
+	shr.u16 	%rs156, %rs151, 4;
+	ld.global.nc.b8 	%rs157, [%rd22+-4];
+	shr.u16 	%rs158, %rs157, 2;
+	and.b16 	%rs159, %rs158, 48;
+	or.b16 	%rs202, %rs159, %rs156;
+$L__BB4_49:                             //   in Loop: Header=BB4_7 Depth=1
+	and.b32 	%r72, %r284, 252645135;
+	shr.u32 	%r288, %r284, 4;
+	and.b32 	%r73, %r288, 252645135;
+	and.b32 	%r74, %r285, 252645135;
+	shr.u32 	%r289, %r285, 4;
+	and.b32 	%r75, %r289, 252645135;
+	and.b32 	%r76, %r286, 252645135;
+	shr.u32 	%r290, %r286, 4;
+	and.b32 	%r77, %r290, 252645135;
+	and.b32 	%r78, %r287, 252645135;
+	shr.u32 	%r291, %r287, 4;
+	and.b32 	%r79, %r291, 252645135;
+	mul.f32 	%r292, %r62, %r374;
+	add.s64 	%rd23, %rd92, %rd11;
+	@%p10 bra 	$L__BB4_51;
+// %bb.50:                              //   in Loop: Header=BB4_7 Depth=1
+	ld.global.nc.b8 	%rs171, [%rd23+-4];
+	and.b16 	%rs203, %rs171, 63;
+	ld.global.nc.b8 	%rs172, [%rd23];
+	and.b16 	%rs204, %rs172, 63;
+	bra.uni 	$L__BB4_52;
+$L__BB4_51:                             //   in Loop: Header=BB4_7 Depth=1
+	ld.global.nc.b8 	%rs162, [%rd23];
+	and.b16 	%rs163, %rs162, 15;
+	ld.global.nc.b8 	%rs164, [%rd23+-8];
+	shr.u16 	%rs165, %rs164, 2;
+	and.b16 	%rs166, %rs165, 48;
+	or.b16 	%rs203, %rs166, %rs163;
+	shr.u16 	%rs167, %rs162, 4;
+	ld.global.nc.b8 	%rs168, [%rd23+-4];
+	shr.u16 	%rs169, %rs168, 2;
+	and.b16 	%rs170, %rs169, 48;
+	or.b16 	%rs204, %rs170, %rs167;
+$L__BB4_52:                             //   in Loop: Header=BB4_7 Depth=1
+	fma.rn.f32 	%r293, %r60, %r373, %r292;
+	add.s64 	%rd19, %rd95, %rd11;
+	ld.global.nc.b8 	%rs174, [%rd19];
+	ld.global.nc.b8 	%rs175, [%rd19+1];
+	shl.b16 	%rs176, %rs175, 8;
+	or.b16 	%rs173, %rs176, %rs174;
+	// begin inline asm
+	cvt.f32.f16 %r294, %rs173;
+	// end inline asm
+	cvt.rn.f32.u16 	%r312, %rs201;
+	mul.f32 	%r313, %r294, %r312;
+	mov.b32 	%r297, 0;
+	// begin inline asm
+	dp4a.s32.s32 %r295, %r72, %r296, %r297;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r298, %r74, %r299, %r295;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r300, %r76, %r301, %r297;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r302, %r78, %r303, %r300;
+	// end inline asm
+	add.s32 	%r314, %r302, %r298;
+	cvt.rn.f32.s32 	%r315, %r314;
+	mul.f32 	%r375, %r313, %r315;
+	cvt.rn.f32.u16 	%r316, %rs203;
+	mul.f32 	%r317, %r294, %r316;
+	// begin inline asm
+	dp4a.s32.s32 %r304, %r73, %r305, %r297;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r306, %r75, %r307, %r304;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r308, %r77, %r309, %r297;
+	// end inline asm
+	// begin inline asm
+	dp4a.s32.s32 %r310, %r79, %r311, %r308;
+	// end inline asm
+	add.s32 	%r318, %r310, %r306;
+	cvt.rn.f32.s32 	%r319, %r318;
+	mul.f32 	%r376, %r317, %r319;
+	@%p6 bra 	$L__BB4_54;
+// %bb.53:                              //   in Loop: Header=BB4_7 Depth=1
+	ld.global.nc.b8 	%rs178, [%rd19+2];
+	ld.global.nc.b8 	%rs179, [%rd19+3];
+	shl.b16 	%rs180, %rs179, 8;
+	or.b16 	%rs177, %rs180, %rs178;
+	// begin inline asm
+	cvt.f32.f16 %r320, %rs177;
+	// end inline asm
+	cvt.rn.f32.u16 	%r321, %rs202;
+	mul.f32 	%r322, %r320, %r321;
+	neg.f32 	%r323, %r322;
+	fma.rn.f32 	%r375, %r323, %r353, %r375;
+	cvt.rn.f32.u16 	%r324, %rs204;
+	mul.f32 	%r325, %r320, %r324;
+	neg.f32 	%r326, %r325;
+	fma.rn.f32 	%r376, %r326, %r354, %r376;
+	bra.uni 	$L__BB4_54;
+$L__BB4_55:
+	mov.b32 	%r330, 16;
+	mov.b32 	%r331, -1;
+	// begin inline asm
+	shfl.sync.down.b32 %r329, %r378, %r330, 0x1f, %r331;
+	// end inline asm
+	add.f32 	%r333, %r378, %r329;
+	mov.b32 	%r334, 8;
+	// begin inline asm
+	shfl.sync.down.b32 %r332, %r333, %r334, 0x1f, %r331;
+	// end inline asm
+	add.f32 	%r336, %r333, %r332;
+	mov.b32 	%r337, 4;
+	// begin inline asm
+	shfl.sync.down.b32 %r335, %r336, %r337, 0x1f, %r331;
+	// end inline asm
+	add.f32 	%r339, %r336, %r335;
+	mov.b32 	%r340, 2;
+	// begin inline asm
+	shfl.sync.down.b32 %r338, %r339, %r340, 0x1f, %r331;
+	// end inline asm
+	add.f32 	%r342, %r339, %r338;
+	mov.b32 	%r343, 1;
+	// begin inline asm
+	shfl.sync.down.b32 %r341, %r342, %r343, 0x1f, %r331;
+	// end inline asm
+	// begin inline asm
+	shfl.sync.down.b32 %r344, %r377, %r330, 0x1f, %r331;
+	// end inline asm
+	add.f32 	%r346, %r377, %r344;
+	// begin inline asm
+	shfl.sync.down.b32 %r345, %r346, %r334, 0x1f, %r331;
+	// end inline asm
+	add.f32 	%r348, %r346, %r345;
+	// begin inline asm
+	shfl.sync.down.b32 %r347, %r348, %r337, 0x1f, %r331;
+	// end inline asm
+	add.f32 	%r350, %r348, %r347;
+	// begin inline asm
+	shfl.sync.down.b32 %r349, %r350, %r340, 0x1f, %r331;
+	// end inline asm
+	add.f32 	%r352, %r350, %r349;
+	// begin inline asm
+	shfl.sync.down.b32 %r351, %r352, %r343, 0x1f, %r331;
+	// end inline asm
+	setp.ne.b32 	%p8, %r1, 0;
+	@%p8 bra 	$L__BB4_57;
+// %bb.56:
+	cvt.s64.s32 	%rd8, %r2;
+	shl.b64 	%rd74, %rd8, 2;
+	add.s64 	%rd24, %rd6, %rd74;
+	add.s64 	%rd25, %rd7, %rd74;
+	add.f32 	%r80, %r352, %r351;
+	add.f32 	%r81, %r342, %r341;
+	st.global.b32 	[%rd25], %r81;
+	st.global.b32 	[%rd24], %r80;
+$L__BB4_57:
 	ret;
                                         // -- End function
 }
@@ -1534,7 +2521,7 @@ $L__BB3_33:
 )
 .maxntid 256                            // @sofuu_gemv_q6_k_q8
 {
-	.local .align 16 .b8 	__local_depot4[16];
+	.local .align 16 .b8 	__local_depot5[16];
 	.reg .b64 	%SP;
 	.reg .b64 	%SPL;
 	.reg .pred 	%p<5>;
@@ -1543,7 +2530,7 @@ $L__BB3_33:
 	.reg .b64 	%rd<50>;
 
 // %bb.0:
-	mov.b64 	%SPL, __local_depot4;
+	mov.b64 	%SPL, __local_depot5;
 	ld.param.b64 	%rd19, [sofuu_gemv_q6_k_q8_param_0];
 	cvta.to.global.u64 	%rd1, %rd19;
 	ld.param.b64 	%rd20, [sofuu_gemv_q6_k_q8_param_1];
@@ -1569,7 +2556,7 @@ $L__BB3_33:
 	shl.b32 	%r16, %r13, 3;
 	add.s32 	%r2, %r16, %r15;
 	setp.ge.s32 	%p1, %r2, %r14;
-	@%p1 bra 	$L__BB4_6;
+	@%p1 bra 	$L__BB5_6;
 // %bb.1:
 	ld.param.b32 	%r11, [sofuu_gemv_q6_k_q8_param_7];
 	and.b32 	%r1, %r12, 31;
@@ -1580,7 +2567,7 @@ $L__BB3_33:
 	shr.u32 	%r227, %r1, 2;
 	setp.ge.s32 	%p2, %r227, %r3;
 	mov.b32 	%r226, 0f00000000;
-	@%p2 bra 	$L__BB4_4;
+	@%p2 bra 	$L__BB5_4;
 // %bb.2:
 	mul.lo.s32 	%r20, %r3, 224;
 	mul.wide.s32 	%rd11, %r20, %r2;
@@ -1637,7 +2624,7 @@ $L__BB3_33:
 	cvt.u64.u32 	%rd16, %r37;
 	or.b64 	%rd17, %rd24, 128;
 	mov.b32 	%r226, 0f00000000;
-$L__BB4_3:                              // =>This Inner Loop Header: Depth=1
+$L__BB5_3:                              // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd41, %rd44, %rd16;
 	ld.global.nc.v4.b32 	{%r88, %r89, %r90, %r91}, [%rd41+-208];
 	ld.global.nc.v4.b32 	{%r92, %r93, %r94, %r95}, [%rd41+-192];
@@ -1838,8 +2825,8 @@ $L__BB4_3:                              // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd45, %rd45, 512;
 	add.s64 	%rd44, %rd44, 1792;
 	setp.lt.s32 	%p3, %r227, %r3;
-	@%p3 bra 	$L__BB4_3;
-$L__BB4_4:
+	@%p3 bra 	$L__BB5_3;
+$L__BB5_4:
 	mov.b32 	%r212, 16;
 	mov.b32 	%r213, -1;
 	// begin inline asm
@@ -1866,14 +2853,14 @@ $L__BB4_4:
 	shfl.sync.down.b32 %r223, %r224, %r225, 0x1f, %r213;
 	// end inline asm
 	setp.eq.b32 	%p4, %r1, 0;
-	@!%p4 bra 	$L__BB4_6;
+	@!%p4 bra 	$L__BB5_6;
 // %bb.5:
 	cvt.s64.s32 	%rd10, %r2;
 	shl.b64 	%rd43, %rd10, 2;
 	add.s64 	%rd18, %rd5, %rd43;
 	add.f32 	%r10, %r224, %r223;
 	st.global.b32 	[%rd18], %r10;
-$L__BB4_6:
+$L__BB5_6:
 	ret;
                                         // -- End function
 }
@@ -1911,7 +2898,7 @@ $L__BB4_6:
 	shl.b32 	%r15, %r12, 3;
 	add.s32 	%r2, %r15, %r14;
 	setp.ge.s32 	%p1, %r2, %r13;
-	@%p1 bra 	$L__BB5_9;
+	@%p1 bra 	$L__BB6_9;
 // %bb.1:
 	ld.param.b32 	%r10, [sofuu_gemv_q6_k_param_4];
 	and.b32 	%r1, %r11, 31;
@@ -1931,7 +2918,7 @@ $L__BB4_6:
 	and.b32 	%r400, %r4, 3;
 	shl.b32 	%r401, %r4, 5;
 	setp.gt.u32 	%p9, %r5, 15;
-	@%p2 bra 	$L__BB5_4;
+	@%p2 bra 	$L__BB6_4;
 // %bb.2:
 	shl.b32 	%r21, %r399, 3;
 	shl.b32 	%r6, %r400, 1;
@@ -1956,7 +2943,7 @@ $L__BB4_6:
 	mov.b32 	%r404, 0f00000000;
 	mov.b32 	%r402, 0;
 	setp.lt.u32 	%p3, %r400, 2;
-$L__BB5_3:                              // =>This Inner Loop Header: Depth=1
+$L__BB6_3:                              // =>This Inner Loop Header: Depth=1
 	mov.b32 	%r8, %r402;
 	ld.global.nc.v4.b32 	{%r31, %r32, %r33, %r34}, [%rd46+-1024];
 	ld.global.nc.v4.b32 	{%r35, %r36, %r37, %r38}, [%rd46+-1008];
@@ -2205,10 +3192,10 @@ $L__BB5_3:                              // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd47, %rd47, 448;
 	add.s64 	%rd46, %rd46, 2048;
 	setp.gt.s32 	%p4, %r260, %r3;
-	@!%p4 bra 	$L__BB5_3;
-$L__BB5_4:
+	@!%p4 bra 	$L__BB6_3;
+$L__BB6_4:
 	setp.le.s32 	%p5, %r3, %r402;
-	@%p5 bra 	$L__BB5_7;
+	@%p5 bra 	$L__BB6_7;
 // %bb.5:
 	shl.b32 	%r261, %r399, 3;
 	shl.b32 	%r7, %r400, 1;
@@ -2235,7 +3222,7 @@ $L__BB5_4:
 	add.s64 	%rd38, %rd37, %rd2;
 	add.s64 	%rd48, %rd38, 16;
 	setp.lt.u32 	%p6, %r400, 2;
-$L__BB5_6:                              // =>This Inner Loop Header: Depth=1
+$L__BB6_6:                              // =>This Inner Loop Header: Depth=1
 	ld.global.nc.v4.b32 	{%r270, %r271, %r272, %r273}, [%rd48+-16];
 	ld.global.nc.v4.b32 	{%r274, %r275, %r276, %r277}, [%rd48];
 	ld.global.nc.b8 	%rs12, [%rd49];
@@ -2363,8 +3350,8 @@ $L__BB5_6:                              // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd49, %rd49, 224;
 	add.s64 	%rd48, %rd48, 1024;
 	setp.ne.b32 	%p7, %r403, 0;
-	@%p7 bra 	$L__BB5_6;
-$L__BB5_7:
+	@%p7 bra 	$L__BB6_6;
+$L__BB6_7:
 	mov.b32 	%r385, 16;
 	mov.b32 	%r386, -1;
 	// begin inline asm
@@ -2391,14 +3378,14 @@ $L__BB5_7:
 	shfl.sync.down.b32 %r396, %r397, %r398, 0x1f, %r386;
 	// end inline asm
 	setp.ne.b32 	%p8, %r1, 0;
-	@%p8 bra 	$L__BB5_9;
+	@%p8 bra 	$L__BB6_9;
 // %bb.8:
 	cvt.s64.s32 	%rd4, %r2;
 	shl.b64 	%rd45, %rd4, 2;
 	add.s64 	%rd14, %rd3, %rd45;
 	add.f32 	%r9, %r397, %r396;
 	st.global.b32 	[%rd14], %r9;
-$L__BB5_9:
+$L__BB6_9:
 	ret;
                                         // -- End function
 }
@@ -2435,7 +3422,7 @@ $L__BB5_9:
 	shl.b32 	%r12, %r9, 3;
 	add.s32 	%r2, %r12, %r11;
 	setp.ge.s32 	%p1, %r2, %r10;
-	@%p1 bra 	$L__BB6_19;
+	@%p1 bra 	$L__BB7_19;
 // %bb.1:
 	ld.param.b32 	%r7, [sofuu_gemv_f32_param_4];
 	and.b32 	%r1, %r8, 31;
@@ -2445,7 +3432,7 @@ $L__BB5_9:
 	mov.b32 	%r128, 0f00000000;
 	mov.b32 	%r127, 0;
 	mul.lo.s64 	%rd21, %rd5, %rd4;
-	@%p2 bra 	$L__BB6_4;
+	@%p2 bra 	$L__BB7_4;
 // %bb.2:
 	shl.b64 	%rd10, %rd21, 2;
 	mul.wide.u32 	%rd11, %r1, 32;
@@ -2456,7 +3443,7 @@ $L__BB5_9:
 	add.s64 	%rd22, %rd14, 1024;
 	mov.b32 	%r128, 0f00000000;
 	mov.b32 	%r127, 0;
-$L__BB6_3:                              // =>This Inner Loop Header: Depth=1
+$L__BB7_3:                              // =>This Inner Loop Header: Depth=1
 	mov.b32 	%r4, %r127;
 	ld.global.nc.v4.b32 	{%r13, %r14, %r15, %r16}, [%rd22+-1024];
 	ld.global.nc.v4.b32 	{%r17, %r18, %r19, %r20}, [%rd22+-1008];
@@ -2501,10 +3488,10 @@ $L__BB6_3:                              // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd23, %rd23, 2048;
 	add.s64 	%rd22, %rd22, 2048;
 	setp.gt.s32 	%p3, %r62, %r7;
-	@!%p3 bra 	$L__BB6_3;
-$L__BB6_4:
+	@!%p3 bra 	$L__BB7_3;
+$L__BB7_4:
 	setp.ge.s32 	%p4, %r127, %r7;
-	@%p4 bra 	$L__BB6_17;
+	@%p4 bra 	$L__BB7_17;
 // %bb.5:
 	shl.b32 	%r3, %r1, 3;
 	shl.b64 	%rd15, %rd21, 2;
@@ -2515,8 +3502,8 @@ $L__BB6_4:
 	add.s64 	%rd25, %rd18, 16;
 	add.s64 	%rd19, %rd16, %rd2;
 	add.s64 	%rd24, %rd19, 16;
-	bra.uni 	$L__BB6_6;
-$L__BB6_20:                             //   in Loop: Header=BB6_6 Depth=1
+	bra.uni 	$L__BB7_6;
+$L__BB7_20:                             //   in Loop: Header=BB7_6 Depth=1
 	ld.global.nc.v4.b32 	{%r65, %r66, %r67, %r68}, [%rd24+-16];
 	ld.global.nc.v4.b32 	{%r69, %r70, %r71, %r72}, [%rd24];
 	ld.global.nc.b32 	%r73, [%rd25+-16];
@@ -2536,75 +3523,75 @@ $L__BB6_20:                             //   in Loop: Header=BB6_6 Depth=1
 	ld.global.nc.b32 	%r87, [%rd25+12];
 	fma.rn.f32 	%r88, %r87, %r72, %r86;
 	add.f32 	%r128, %r128, %r88;
-$L__BB6_16:                             //   in Loop: Header=BB6_6 Depth=1
+$L__BB7_16:                             //   in Loop: Header=BB7_6 Depth=1
 	add.s32 	%r127, %r127, 256;
 	add.s64 	%rd25, %rd25, 1024;
 	add.s64 	%rd24, %rd24, 1024;
 	setp.lt.s32 	%p14, %r127, %r7;
-	@!%p14 bra 	$L__BB6_17;
-$L__BB6_6:                              // =>This Inner Loop Header: Depth=1
+	@!%p14 bra 	$L__BB7_17;
+$L__BB7_6:                              // =>This Inner Loop Header: Depth=1
 	add.s32 	%r5, %r3, %r127;
 	add.s32 	%r64, %r5, 8;
 	setp.le.s32 	%p5, %r64, %r7;
-	@%p5 bra 	$L__BB6_20;
-// %bb.7:                               //   in Loop: Header=BB6_6 Depth=1
+	@%p5 bra 	$L__BB7_20;
+// %bb.7:                               //   in Loop: Header=BB7_6 Depth=1
 	setp.lt.s32 	%p6, %r5, %r7;
-	@!%p6 bra 	$L__BB6_16;
-// %bb.8:                               //   in Loop: Header=BB6_6 Depth=1
+	@!%p6 bra 	$L__BB7_16;
+// %bb.8:                               //   in Loop: Header=BB7_6 Depth=1
 	ld.global.nc.b32 	%r89, [%rd25+-16];
 	ld.global.nc.b32 	%r90, [%rd24+-16];
 	fma.rn.f32 	%r128, %r89, %r90, %r128;
 	add.s32 	%r91, %r5, 1;
 	setp.ge.s32 	%p7, %r91, %r7;
-	@%p7 bra 	$L__BB6_16;
-// %bb.9:                               //   in Loop: Header=BB6_6 Depth=1
+	@%p7 bra 	$L__BB7_16;
+// %bb.9:                               //   in Loop: Header=BB7_6 Depth=1
 	ld.global.nc.b32 	%r92, [%rd25+-12];
 	ld.global.nc.b32 	%r93, [%rd24+-12];
 	fma.rn.f32 	%r128, %r92, %r93, %r128;
 	add.s32 	%r94, %r5, 2;
 	setp.ge.s32 	%p8, %r94, %r7;
-	@%p8 bra 	$L__BB6_16;
-// %bb.10:                              //   in Loop: Header=BB6_6 Depth=1
+	@%p8 bra 	$L__BB7_16;
+// %bb.10:                              //   in Loop: Header=BB7_6 Depth=1
 	ld.global.nc.b32 	%r95, [%rd25+-8];
 	ld.global.nc.b32 	%r96, [%rd24+-8];
 	fma.rn.f32 	%r128, %r95, %r96, %r128;
 	add.s32 	%r97, %r5, 3;
 	setp.ge.s32 	%p9, %r97, %r7;
-	@%p9 bra 	$L__BB6_16;
-// %bb.11:                              //   in Loop: Header=BB6_6 Depth=1
+	@%p9 bra 	$L__BB7_16;
+// %bb.11:                              //   in Loop: Header=BB7_6 Depth=1
 	ld.global.nc.b32 	%r98, [%rd25+-4];
 	ld.global.nc.b32 	%r99, [%rd24+-4];
 	fma.rn.f32 	%r128, %r98, %r99, %r128;
 	add.s32 	%r100, %r5, 4;
 	setp.ge.s32 	%p10, %r100, %r7;
-	@%p10 bra 	$L__BB6_16;
-// %bb.12:                              //   in Loop: Header=BB6_6 Depth=1
+	@%p10 bra 	$L__BB7_16;
+// %bb.12:                              //   in Loop: Header=BB7_6 Depth=1
 	ld.global.nc.b32 	%r101, [%rd25];
 	ld.global.nc.b32 	%r102, [%rd24];
 	fma.rn.f32 	%r128, %r101, %r102, %r128;
 	add.s32 	%r103, %r5, 5;
 	setp.ge.s32 	%p11, %r103, %r7;
-	@%p11 bra 	$L__BB6_16;
-// %bb.13:                              //   in Loop: Header=BB6_6 Depth=1
+	@%p11 bra 	$L__BB7_16;
+// %bb.13:                              //   in Loop: Header=BB7_6 Depth=1
 	ld.global.nc.b32 	%r104, [%rd25+4];
 	ld.global.nc.b32 	%r105, [%rd24+4];
 	fma.rn.f32 	%r128, %r104, %r105, %r128;
 	add.s32 	%r106, %r5, 6;
 	setp.ge.s32 	%p12, %r106, %r7;
-	@%p12 bra 	$L__BB6_16;
-// %bb.14:                              //   in Loop: Header=BB6_6 Depth=1
+	@%p12 bra 	$L__BB7_16;
+// %bb.14:                              //   in Loop: Header=BB7_6 Depth=1
 	ld.global.nc.b32 	%r107, [%rd25+8];
 	ld.global.nc.b32 	%r108, [%rd24+8];
 	fma.rn.f32 	%r128, %r107, %r108, %r128;
 	add.s32 	%r109, %r5, 7;
 	setp.ge.s32 	%p13, %r109, %r7;
-	@%p13 bra 	$L__BB6_16;
-// %bb.15:                              //   in Loop: Header=BB6_6 Depth=1
+	@%p13 bra 	$L__BB7_16;
+// %bb.15:                              //   in Loop: Header=BB7_6 Depth=1
 	ld.global.nc.b32 	%r110, [%rd25+12];
 	ld.global.nc.b32 	%r111, [%rd24+12];
 	fma.rn.f32 	%r128, %r110, %r111, %r128;
-	bra.uni 	$L__BB6_16;
-$L__BB6_17:
+	bra.uni 	$L__BB7_16;
+$L__BB7_17:
 	mov.b32 	%r113, 16;
 	mov.b32 	%r114, -1;
 	// begin inline asm
@@ -2631,13 +3618,13 @@ $L__BB6_17:
 	shfl.sync.down.b32 %r124, %r125, %r126, 0x1f, %r114;
 	// end inline asm
 	setp.ne.b32 	%p15, %r1, 0;
-	@%p15 bra 	$L__BB6_19;
+	@%p15 bra 	$L__BB7_19;
 // %bb.18:
 	shl.b64 	%rd20, %rd4, 2;
 	add.s64 	%rd6, %rd3, %rd20;
 	add.f32 	%r6, %r125, %r124;
 	st.global.b32 	[%rd6], %r6;
-$L__BB6_19:
+$L__BB7_19:
 	ret;
                                         // -- End function
 }
@@ -2671,11 +3658,11 @@ $L__BB6_19:
 	// end inline asm
 	setp.ge.s32 	%p1, %r54, %r3;
 	mov.b32 	%r52, 0f00000000;
-	@%p1 bra 	$L__BB7_3;
+	@%p1 bra 	$L__BB8_3;
 // %bb.1:
 	mov.b32 	%r52, 0f00000000;
 	mov.b32 	%r53, %r54;
-$L__BB7_2:                              // =>This Inner Loop Header: Depth=1
+$L__BB8_2:                              // =>This Inner Loop Header: Depth=1
 	mul.wide.s32 	%rd9, %r53, 4;
 	add.s64 	%rd10, %rd1, %rd9;
 	ld.global.b32 	%r6, [%rd10];
@@ -2685,8 +3672,8 @@ $L__BB7_2:                              // =>This Inner Loop Header: Depth=1
 	// end inline asm
 	add.s32 	%r53, %r5, %r53;
 	setp.lt.s32 	%p2, %r53, %r3;
-	@%p2 bra 	$L__BB7_2;
-$L__BB7_3:
+	@%p2 bra 	$L__BB8_2;
+$L__BB8_3:
 	// begin inline asm
 	mov.u32 %r7, %tid.x;
 	// end inline asm
@@ -2718,29 +3705,29 @@ $L__BB7_3:
 	and.b32 	%r23, %r7, 31;
 	setp.ne.b32 	%p3, %r23, 0;
 	mov.b64 	%rd12, _ZZ13sofuu_rmsnormE3red;
-	@%p3 bra 	$L__BB7_5;
+	@%p3 bra 	$L__BB8_5;
 // %bb.4:
 	shr.u32 	%r24, %r7, 5;
 	mul.wide.u32 	%rd11, %r24, 4;
 	add.s64 	%rd4, %rd12, %rd11;
 	add.f32 	%r1, %r21, %r20;
 	st.shared.b32 	[%rd4], %r1;
-$L__BB7_5:
+$L__BB8_5:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	setp.gt.u32 	%p4, %r7, 31;
 	mov.b32 	%r51, 0f00000000;
-	@%p4 bra 	$L__BB7_9;
+	@%p4 bra 	$L__BB8_9;
 // %bb.6:
 	setp.gt.u32 	%p5, %r7, 7;
 	mov.b32 	%r50, 0f00000000;
-	@%p5 bra 	$L__BB7_8;
+	@%p5 bra 	$L__BB8_8;
 // %bb.7:
 	mul.wide.u32 	%rd13, %r7, 4;
 	add.s64 	%rd5, %rd12, %rd13;
 	ld.shared.b32 	%r50, [%rd5];
-$L__BB7_8:
+$L__BB8_8:
 	mov.b32 	%r26, 16;
 	mov.b32 	%r27, -1;
 	// begin inline asm
@@ -2769,9 +3756,9 @@ $L__BB7_8:
 	setp.eq.b32 	%p6, %r7, 0;
 	add.f32 	%r40, %r38, %r37;
 	selp.f32 	%r51, %r40, 0f00000000, %p6;
-$L__BB7_9:
+$L__BB8_9:
 	setp.eq.b32 	%p7, %r54, 0;
-	@!%p7 bra 	$L__BB7_11;
+	@!%p7 bra 	$L__BB8_11;
 // %bb.10:
 	ld.param.b32 	%r4, [sofuu_rmsnorm_param_4];
 	cvt.rn.f32.s32 	%r41, %r3;
@@ -2781,14 +3768,14 @@ $L__BB7_9:
 	rsqrt.approx.f32 %r43, %r44;
 	// end inline asm
 	st.shared.b32 	[_ZZ13sofuu_rmsnormE5scale], %r43;
-$L__BB7_11:
+$L__BB8_11:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
-	@%p1 bra 	$L__BB7_14;
+	@%p1 bra 	$L__BB8_14;
 // %bb.12:
 	ld.shared.b32 	%r2, [_ZZ13sofuu_rmsnormE5scale];
-$L__BB7_13:                             // =>This Inner Loop Header: Depth=1
+$L__BB8_13:                             // =>This Inner Loop Header: Depth=1
 	mul.wide.s32 	%rd14, %r54, 4;
 	add.s64 	%rd15, %rd1, %rd14;
 	ld.global.b32 	%r46, [%rd15];
@@ -2803,8 +3790,8 @@ $L__BB7_13:                             // =>This Inner Loop Header: Depth=1
 	// end inline asm
 	add.s32 	%r54, %r45, %r54;
 	setp.lt.s32 	%p8, %r54, %r3;
-	@%p8 bra 	$L__BB7_13;
-$L__BB7_14:
+	@%p8 bra 	$L__BB8_13;
+$L__BB8_14:
 	ret;
                                         // -- End function
 }
@@ -2840,7 +3827,7 @@ $L__BB7_14:
 	// end inline asm
 	mad.lo.s32 	%r1, %r4, %r3, %r2;
 	setp.ge.s32 	%p1, %r1, %r5;
-	@%p1 bra 	$L__BB8_2;
+	@%p1 bra 	$L__BB9_2;
 // %bb.1:
 	mul.wide.s32 	%rd7, %r1, 4;
 	add.s64 	%rd8, %rd1, %rd7;
@@ -2856,7 +3843,7 @@ $L__BB7_14:
 	mul.f32 	%r12, %r11, %r10;
 	add.s64 	%rd10, %rd3, %rd7;
 	st.global.b32 	[%rd10], %r12;
-$L__BB8_2:
+$L__BB9_2:
 	ret;
                                         // -- End function
 }
@@ -2895,7 +3882,7 @@ $L__BB8_2:
 	// end inline asm
 	shr.s32 	%r1, %r7, 1;
 	setp.ge.s32 	%p1, %r22, %r1;
-	@%p1 bra 	$L__BB9_3;
+	@%p1 bra 	$L__BB10_3;
 // %bb.1:
 	ld.param.b32 	%r3, [sofuu_rope_f32_param_6];
 	ld.param.b32 	%r6, [sofuu_rope_f32_param_4];
@@ -2907,7 +3894,7 @@ $L__BB8_2:
 	shl.b32 	%r21, %r22, 1;
 	shl.b32 	%r2, %r5, 1;
 	setp.eq.b32 	%p2, %r3, 0;
-$L__BB9_2:                              // =>This Inner Loop Header: Depth=1
+$L__BB10_2:                             // =>This Inner Loop Header: Depth=1
 	selp.b32 	%r8, %r22, %r21, %p2;
 	add.s32 	%r9, %r21, 1;
 	add.s32 	%r10, %r1, %r22;
@@ -2933,8 +3920,8 @@ $L__BB9_2:                              // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd17, %rd17, %rd4;
 	add.s32 	%r21, %r21, %r2;
 	setp.lt.s32 	%p3, %r22, %r1;
-	@%p3 bra 	$L__BB9_2;
-$L__BB9_3:
+	@%p3 bra 	$L__BB10_2;
+$L__BB10_3:
 	ret;
                                         // -- End function
 }
@@ -2984,20 +3971,20 @@ $L__BB9_3:
 	setp.ge.s32 	%p1, %r11, %r9;
 	mov.b32 	%r107, 0f00000000;
 	mul.wide.s32 	%rd31, %r12, 4;
-	@%p1 bra 	$L__BB10_3;
+	@%p1 bra 	$L__BB11_3;
 // %bb.1:
 	mul.wide.s32 	%rd18, %r11, 4;
 	add.s64 	%rd32, %rd1, %rd18;
 	mov.b32 	%r107, 0f00000000;
 	mov.b32 	%r108, %r11;
-$L__BB10_2:                             // =>This Inner Loop Header: Depth=1
+$L__BB11_2:                             // =>This Inner Loop Header: Depth=1
 	ld.global.nc.b32 	%r13, [%rd32];
 	fma.rn.f32 	%r107, %r13, %r13, %r107;
 	add.s32 	%r108, %r108, %r12;
 	add.s64 	%rd32, %rd32, %rd31;
 	setp.lt.s32 	%p2, %r108, %r9;
-	@%p2 bra 	$L__BB10_2;
-$L__BB10_3:
+	@%p2 bra 	$L__BB11_2;
+$L__BB11_3:
 	// begin inline asm
 	mov.u32 %r14, %tid.x;
 	// end inline asm
@@ -3029,29 +4016,29 @@ $L__BB10_3:
 	and.b32 	%r30, %r14, 31;
 	setp.ne.b32 	%p3, %r30, 0;
 	mov.b64 	%rd20, _ZZ16sofuu_rmsnorm_q8E3red;
-	@%p3 bra 	$L__BB10_5;
+	@%p3 bra 	$L__BB11_5;
 // %bb.4:
 	shr.u32 	%r31, %r14, 5;
 	mul.wide.u32 	%rd19, %r31, 4;
 	add.s64 	%rd8, %rd20, %rd19;
 	add.f32 	%r1, %r28, %r27;
 	st.shared.b32 	[%rd8], %r1;
-$L__BB10_5:
+$L__BB11_5:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	setp.gt.u32 	%p4, %r14, 31;
 	mov.b32 	%r106, 0f00000000;
-	@%p4 bra 	$L__BB10_9;
+	@%p4 bra 	$L__BB11_9;
 // %bb.6:
 	setp.gt.u32 	%p5, %r14, 7;
 	mov.b32 	%r105, 0f00000000;
-	@%p5 bra 	$L__BB10_8;
+	@%p5 bra 	$L__BB11_8;
 // %bb.7:
 	mul.wide.u32 	%rd21, %r14, 4;
 	add.s64 	%rd9, %rd20, %rd21;
 	ld.shared.b32 	%r105, [%rd9];
-$L__BB10_8:
+$L__BB11_8:
 	mov.b32 	%r33, 16;
 	mov.b32 	%r34, -1;
 	// begin inline asm
@@ -3080,9 +4067,9 @@ $L__BB10_8:
 	setp.eq.b32 	%p6, %r14, 0;
 	add.f32 	%r47, %r45, %r44;
 	selp.f32 	%r106, %r47, 0f00000000, %p6;
-$L__BB10_9:
+$L__BB11_9:
 	setp.eq.b32 	%p7, %r11, 0;
-	@!%p7 bra 	$L__BB10_11;
+	@!%p7 bra 	$L__BB11_11;
 // %bb.10:
 	ld.param.b32 	%r10, [sofuu_rmsnorm_q8_param_8];
 	cvt.rn.f32.s32 	%r48, %r9;
@@ -3092,16 +4079,16 @@ $L__BB10_9:
 	rsqrt.approx.f32 %r50, %r51;
 	// end inline asm
 	st.shared.b32 	[_ZZ16sofuu_rmsnorm_q8E5scale], %r50;
-$L__BB10_11:
+$L__BB11_11:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
-	@%p1 bra 	$L__BB10_14;
+	@%p1 bra 	$L__BB11_14;
 // %bb.12:
 	mul.wide.s32 	%rd35, %r11, 4;
 	ld.shared.b32 	%r2, [_ZZ16sofuu_rmsnorm_q8E5scale];
 	mov.b32 	%r112, %r11;
-$L__BB10_13:                            // =>This Inner Loop Header: Depth=1
+$L__BB11_13:                            // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd22, %rd1, %rd35;
 	ld.global.nc.b32 	%r52, [%rd22];
 	mul.f32 	%r53, %r2, %r52;
@@ -3113,13 +4100,13 @@ $L__BB10_13:                            // =>This Inner Loop Header: Depth=1
 	add.s32 	%r112, %r112, %r12;
 	add.s64 	%rd35, %rd35, %rd31;
 	setp.lt.s32 	%p8, %r112, %r9;
-	@%p8 bra 	$L__BB10_13;
-$L__BB10_14:
+	@%p8 bra 	$L__BB11_13;
+$L__BB11_14:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	setp.lt.s32 	%p9, %r9, 256;
-	@%p9 bra 	$L__BB10_21;
+	@%p9 bra 	$L__BB11_21;
 // %bb.15:
 	shr.u32 	%r56, %r11, 5;
 	and.b32 	%r3, %r11, 31;
@@ -3139,16 +4126,16 @@ $L__BB10_14:
 	or.b32 	%r110, %r62, %r3;
 	setp.ne.b32 	%p10, %r5, 0;
 	setp.ne.b32 	%p18, %r3, 0;
-	bra.uni 	$L__BB10_16;
-$L__BB10_20:                            //   in Loop: Header=BB10_16 Depth=1
+	bra.uni 	$L__BB11_16;
+$L__BB11_20:                            //   in Loop: Header=BB11_16 Depth=1
 	add.s64 	%rd34, %rd34, 4;
 	add.s64 	%rd33, %rd33, 4;
 	add.s32 	%r111, %r111, 2;
 	add.s32 	%r110, %r110, 32;
 	add.s32 	%r109, %r109, -1;
 	setp.ne.b32 	%p19, %r109, 0;
-	@!%p19 bra 	$L__BB10_21;
-$L__BB10_16:                            // =>This Inner Loop Header: Depth=1
+	@!%p19 bra 	$L__BB11_21;
+$L__BB11_16:                            // =>This Inner Loop Header: Depth=1
 	cvt.u64.u32 	%rd26, %r110;
 	mul.wide.u32 	%rd27, %r110, 4;
 	add.s64 	%rd28, %rd2, %rd27;
@@ -3232,22 +4219,22 @@ $L__BB10_16:                            // =>This Inner Loop Header: Depth=1
 	// begin inline asm
 	shfl.sync.bfly.b32 %r95, %r96, %r77, 0x1f, 0xffffffff;
 	// end inline asm
-	@%p10 bra 	$L__BB10_18;
-// %bb.17:                              //   in Loop: Header=BB10_16 Depth=1
+	@%p10 bra 	$L__BB11_18;
+// %bb.17:                              //   in Loop: Header=BB11_16 Depth=1
 	mul.wide.u32 	%rd30, %r111, 4;
 	add.s64 	%rd10, %rd4, %rd30;
 	add.s32 	%r8, %r96, %r95;
 	st.global.b32 	[%rd10], %r8;
-$L__BB10_18:                            //   in Loop: Header=BB10_16 Depth=1
-	@%p18 bra 	$L__BB10_20;
-// %bb.19:                              //   in Loop: Header=BB10_16 Depth=1
+$L__BB11_18:                            //   in Loop: Header=BB11_16 Depth=1
+	@%p18 bra 	$L__BB11_20;
+// %bb.19:                              //   in Loop: Header=BB11_16 Depth=1
 	div.rn.f32 	%r100, %r99, 0f42FE0000;
 	selp.f32 	%r6, %r100, 0f00000000, %p17;
 	add.s32 	%r7, %r89, %r88;
 	st.global.b32 	[%rd34], %r6;
 	st.global.b32 	[%rd33], %r7;
-	bra.uni 	$L__BB10_20;
-$L__BB10_21:
+	bra.uni 	$L__BB11_20;
+$L__BB11_21:
 	ret;
                                         // -- End function
 }
@@ -3303,12 +4290,12 @@ $L__BB10_21:
 	setp.ge.s32 	%p1, %r11, %r9;
 	mov.b32 	%r111, 0f00000000;
 	mul.wide.s32 	%rd38, %r12, 4;
-	@%p1 bra 	$L__BB11_3;
+	@%p1 bra 	$L__BB12_3;
 // %bb.1:
 	mul.wide.s32 	%rd39, %r11, 4;
 	mov.b32 	%r111, 0f00000000;
 	mov.b32 	%r112, %r11;
-$L__BB11_2:                             // =>This Inner Loop Header: Depth=1
+$L__BB12_2:                             // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd22, %rd1, %rd39;
 	ld.global.nc.b32 	%r13, [%rd22];
 	add.s64 	%rd23, %rd2, %rd39;
@@ -3318,8 +4305,8 @@ $L__BB11_2:                             // =>This Inner Loop Header: Depth=1
 	add.s32 	%r112, %r112, %r12;
 	add.s64 	%rd39, %rd39, %rd38;
 	setp.lt.s32 	%p2, %r112, %r9;
-	@%p2 bra 	$L__BB11_2;
-$L__BB11_3:
+	@%p2 bra 	$L__BB12_2;
+$L__BB12_3:
 	// begin inline asm
 	mov.u32 %r16, %tid.x;
 	// end inline asm
@@ -3351,29 +4338,29 @@ $L__BB11_3:
 	and.b32 	%r32, %r16, 31;
 	setp.ne.b32 	%p3, %r32, 0;
 	mov.b64 	%rd25, _ZZ20sofuu_rmsnorm_add_q8E3red;
-	@%p3 bra 	$L__BB11_5;
+	@%p3 bra 	$L__BB12_5;
 // %bb.4:
 	shr.u32 	%r33, %r16, 5;
 	mul.wide.u32 	%rd24, %r33, 4;
 	add.s64 	%rd10, %rd25, %rd24;
 	add.f32 	%r1, %r30, %r29;
 	st.shared.b32 	[%rd10], %r1;
-$L__BB11_5:
+$L__BB12_5:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	setp.gt.u32 	%p4, %r16, 31;
 	mov.b32 	%r110, 0f00000000;
-	@%p4 bra 	$L__BB11_9;
+	@%p4 bra 	$L__BB12_9;
 // %bb.6:
 	setp.gt.u32 	%p5, %r16, 7;
 	mov.b32 	%r109, 0f00000000;
-	@%p5 bra 	$L__BB11_8;
+	@%p5 bra 	$L__BB12_8;
 // %bb.7:
 	mul.wide.u32 	%rd26, %r16, 4;
 	add.s64 	%rd11, %rd25, %rd26;
 	ld.shared.b32 	%r109, [%rd11];
-$L__BB11_8:
+$L__BB12_8:
 	mov.b32 	%r35, 16;
 	mov.b32 	%r36, -1;
 	// begin inline asm
@@ -3402,9 +4389,9 @@ $L__BB11_8:
 	setp.eq.b32 	%p6, %r16, 0;
 	add.f32 	%r49, %r47, %r46;
 	selp.f32 	%r110, %r49, 0f00000000, %p6;
-$L__BB11_9:
+$L__BB12_9:
 	setp.eq.b32 	%p7, %r11, 0;
-	@!%p7 bra 	$L__BB11_11;
+	@!%p7 bra 	$L__BB12_11;
 // %bb.10:
 	ld.param.b32 	%r10, [sofuu_rmsnorm_add_q8_param_10];
 	cvt.rn.f32.s32 	%r50, %r9;
@@ -3414,16 +4401,16 @@ $L__BB11_9:
 	rsqrt.approx.f32 %r52, %r53;
 	// end inline asm
 	st.shared.b32 	[_ZZ20sofuu_rmsnorm_add_q8E5scale], %r52;
-$L__BB11_11:
+$L__BB12_11:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
-	@%p1 bra 	$L__BB11_14;
+	@%p1 bra 	$L__BB12_14;
 // %bb.12:
 	mul.wide.s32 	%rd42, %r11, 4;
 	ld.shared.b32 	%r2, [_ZZ20sofuu_rmsnorm_add_q8E5scale];
 	mov.b32 	%r116, %r11;
-$L__BB11_13:                            // =>This Inner Loop Header: Depth=1
+$L__BB12_13:                            // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd27, %rd1, %rd42;
 	ld.global.nc.b32 	%r54, [%rd27];
 	add.s64 	%rd28, %rd2, %rd42;
@@ -3440,13 +4427,13 @@ $L__BB11_13:                            // =>This Inner Loop Header: Depth=1
 	add.s32 	%r116, %r116, %r12;
 	add.s64 	%rd42, %rd42, %rd38;
 	setp.lt.s32 	%p8, %r116, %r9;
-	@%p8 bra 	$L__BB11_13;
-$L__BB11_14:
+	@%p8 bra 	$L__BB12_13;
+$L__BB12_14:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	setp.lt.s32 	%p9, %r9, 256;
-	@%p9 bra 	$L__BB11_21;
+	@%p9 bra 	$L__BB12_21;
 // %bb.15:
 	shr.u32 	%r60, %r11, 5;
 	and.b32 	%r3, %r11, 31;
@@ -3466,16 +4453,16 @@ $L__BB11_14:
 	or.b32 	%r114, %r66, %r3;
 	setp.ne.b32 	%p10, %r5, 0;
 	setp.ne.b32 	%p18, %r3, 0;
-	bra.uni 	$L__BB11_16;
-$L__BB11_20:                            //   in Loop: Header=BB11_16 Depth=1
+	bra.uni 	$L__BB12_16;
+$L__BB12_20:                            //   in Loop: Header=BB12_16 Depth=1
 	add.s64 	%rd41, %rd41, 4;
 	add.s64 	%rd40, %rd40, 4;
 	add.s32 	%r115, %r115, 2;
 	add.s32 	%r114, %r114, 32;
 	add.s32 	%r113, %r113, -1;
 	setp.ne.b32 	%p19, %r113, 0;
-	@!%p19 bra 	$L__BB11_21;
-$L__BB11_16:                            // =>This Inner Loop Header: Depth=1
+	@!%p19 bra 	$L__BB12_21;
+$L__BB12_16:                            // =>This Inner Loop Header: Depth=1
 	cvt.u64.u32 	%rd33, %r114;
 	mul.wide.u32 	%rd34, %r114, 4;
 	add.s64 	%rd35, %rd3, %rd34;
@@ -3559,22 +4546,22 @@ $L__BB11_16:                            // =>This Inner Loop Header: Depth=1
 	// begin inline asm
 	shfl.sync.bfly.b32 %r99, %r100, %r81, 0x1f, 0xffffffff;
 	// end inline asm
-	@%p10 bra 	$L__BB11_18;
-// %bb.17:                              //   in Loop: Header=BB11_16 Depth=1
+	@%p10 bra 	$L__BB12_18;
+// %bb.17:                              //   in Loop: Header=BB12_16 Depth=1
 	mul.wide.u32 	%rd37, %r115, 4;
 	add.s64 	%rd12, %rd5, %rd37;
 	add.s32 	%r8, %r100, %r99;
 	st.global.b32 	[%rd12], %r8;
-$L__BB11_18:                            //   in Loop: Header=BB11_16 Depth=1
-	@%p18 bra 	$L__BB11_20;
-// %bb.19:                              //   in Loop: Header=BB11_16 Depth=1
+$L__BB12_18:                            //   in Loop: Header=BB12_16 Depth=1
+	@%p18 bra 	$L__BB12_20;
+// %bb.19:                              //   in Loop: Header=BB12_16 Depth=1
 	div.rn.f32 	%r104, %r103, 0f42FE0000;
 	selp.f32 	%r6, %r104, 0f00000000, %p17;
 	add.s32 	%r7, %r93, %r92;
 	st.global.b32 	[%rd41], %r6;
 	st.global.b32 	[%rd40], %r7;
-	bra.uni 	$L__BB11_20;
-$L__BB11_21:
+	bra.uni 	$L__BB12_20;
+$L__BB12_21:
 	ret;
                                         // -- End function
 }
@@ -3622,7 +4609,7 @@ $L__BB11_21:
 	// end inline asm
 	mad.lo.s32 	%r1, %r9, %r8, %r7;
 	setp.ge.s32 	%p1, %r1, %r10;
-	@%p1 bra 	$L__BB12_2;
+	@%p1 bra 	$L__BB13_2;
 // %bb.1:
 	mul.wide.s32 	%rd18, %r1, 4;
 	add.s64 	%rd19, %rd1, %rd18;
@@ -3638,7 +4625,7 @@ $L__BB11_21:
 	mul.f32 	%r17, %r16, %r15;
 	add.s64 	%rd21, %rd3, %rd18;
 	st.global.b32 	[%rd21], %r17;
-$L__BB12_2:
+$L__BB13_2:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
@@ -3736,7 +4723,7 @@ $L__BB12_2:
 	// end inline asm
 	and.b32 	%r65, %r7, 15;
 	setp.ne.b32 	%p9, %r65, 0;
-	@%p9 bra 	$L__BB12_4;
+	@%p9 bra 	$L__BB13_4;
 // %bb.3:
 	shl.b32 	%r66, %r3, 1;
 	bfe.u32 	%r67, %r7, 4, 1;
@@ -3745,9 +4732,9 @@ $L__BB12_2:
 	add.s64 	%rd8, %rd5, %rd26;
 	add.s32 	%r6, %r52, %r51;
 	st.global.b32 	[%rd8], %r6;
-$L__BB12_4:
+$L__BB13_4:
 	setp.ne.b32 	%p10, %r2, 0;
-	@%p10 bra 	$L__BB12_6;
+	@%p10 bra 	$L__BB13_6;
 // %bb.5:
 	div.rn.f32 	%r60, %r59, 0f42FE0000;
 	selp.f32 	%r4, %r60, 0f00000000, %p8;
@@ -3757,7 +4744,7 @@ $L__BB12_4:
 	add.s64 	%rd10, %rd7, %rd27;
 	st.global.b32 	[%rd10], %r4;
 	st.global.b32 	[%rd9], %r5;
-$L__BB12_6:
+$L__BB13_6:
 	ret;
                                         // -- End function
 }
@@ -3824,17 +4811,17 @@ $L__BB12_6:
 	setp.gt.s32 	%p7, %r1, %r12;
 	or.pred 	%p8, %p6, %p7;
 	or.pred 	%p9, %p5, %p8;
-	@%p9 bra 	$L__BB13_43;
+	@%p9 bra 	$L__BB14_43;
 // %bb.1:
 	div.s32 	%r2, %r9, %r10;
 	mul.lo.s32 	%r17, %r2, %r10;
 	sub.s32 	%r18, %r9, %r17;
 	setp.ne.b32 	%p10, %r18, 0;
-	@%p10 bra 	$L__BB13_43;
+	@%p10 bra 	$L__BB14_43;
 // %bb.2:
 	div.s32 	%r3, %r14, %r2;
 	setp.ge.s32 	%p11, %r3, %r10;
-	@%p11 bra 	$L__BB13_43;
+	@%p11 bra 	$L__BB14_43;
 // %bb.3:
 	cvt.s64.s32 	%rd24, %r14;
 	cvt.u64.u32 	%rd5, %r11;
@@ -3846,27 +4833,27 @@ $L__BB12_6:
 	mul.lo.s64 	%rd29, %rd28, %rd26;
 	shl.b64 	%rd30, %rd29, 2;
 	setp.ne.b32 	%p12, %r117, 0;
-	@%p12 bra 	$L__BB13_5;
+	@%p12 bra 	$L__BB14_5;
 // %bb.4:
 	st.shared.b32 	[_ZZ21sofuu_attn_decode_f32E5s_max], -8388609;
-$L__BB13_5:
+$L__BB14_5:
 	add.s64 	%rd7, %rd1, %rd25;
 	add.s64 	%rd8, %rd2, %rd30;
 	setp.ge.s32 	%p13, %r117, %r11;
 	mov.b64 	%rd45, _ZZ21sofuu_attn_decode_f32E3acc;
 	mul.wide.s32 	%rd46, %r15, 4;
-	@%p13 bra 	$L__BB13_8;
+	@%p13 bra 	$L__BB14_8;
 // %bb.6:
 	mul.wide.s32 	%rd31, %r117, 4;
 	add.s64 	%rd47, %rd45, %rd31;
 	mov.b32 	%r107, %r117;
-$L__BB13_7:                             // =>This Inner Loop Header: Depth=1
+$L__BB14_7:                             // =>This Inner Loop Header: Depth=1
 	st.shared.b32 	[%rd47], 0;
 	add.s32 	%r107, %r107, %r15;
 	add.s64 	%rd47, %rd47, %rd46;
 	setp.lt.s32 	%p14, %r107, %r11;
-	@%p14 bra 	$L__BB13_7;
-$L__BB13_8:
+	@%p14 bra 	$L__BB14_7;
+$L__BB14_8:
 	ld.param.b32 	%r13, [sofuu_attn_decode_f32_param_9];
 	add.s64 	%rd49, %rd3, %rd30;
 	mul.wide.s32 	%rd51, %r117, 4;
@@ -3879,8 +4866,8 @@ $L__BB13_8:
 	shl.b64 	%rd11, %rd5, 2;
 	mov.b64 	%rd48, %rd9;
 	mov.b32 	%r108, %r1;
-	bra.uni 	$L__BB13_9;
-$L__BB13_16:                            //   in Loop: Header=BB13_9 Depth=1
+	bra.uni 	$L__BB14_9;
+$L__BB14_16:                            //   in Loop: Header=BB14_9 Depth=1
 	mov.b32 	%r40, 16;
 	mov.b32 	%r41, -1;
 	// begin inline asm
@@ -3909,24 +4896,24 @@ $L__BB13_16:                            //   in Loop: Header=BB13_9 Depth=1
 	setp.eq.b32 	%p18, %r21, 0;
 	add.f32 	%r54, %r52, %r51;
 	selp.f32 	%r111, %r54, 0f00000000, %p18;
-$L__BB13_17:                            //   in Loop: Header=BB13_9 Depth=1
-	@!%p12 bra 	$L__BB13_18;
-$L__BB13_20:                            //   in Loop: Header=BB13_9 Depth=1
+$L__BB14_17:                            //   in Loop: Header=BB14_9 Depth=1
+	@!%p12 bra 	$L__BB14_18;
+$L__BB14_20:                            //   in Loop: Header=BB14_9 Depth=1
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	add.s32 	%r108, %r108, -1;
 	add.s64 	%rd48, %rd48, %rd11;
 	setp.eq.b32 	%p20, %r108, 0;
-	@%p20 bra 	$L__BB13_21;
-$L__BB13_9:                             // =>This Inner Loop Header: Depth=1
+	@%p20 bra 	$L__BB14_21;
+$L__BB14_9:                             // =>This Inner Loop Header: Depth=1
 	mov.b32 	%r109, 0f00000000;
-	@%p13 bra 	$L__BB13_11;
-// %bb.10:                              //   in Loop: Header=BB13_9 Depth=1
+	@%p13 bra 	$L__BB14_11;
+// %bb.10:                              //   in Loop: Header=BB14_9 Depth=1
 	ld.global.b32 	%r19, [%rd10];
 	ld.global.b32 	%r20, [%rd48];
 	mul.f32 	%r109, %r19, %r20;
-$L__BB13_11:                            //   in Loop: Header=BB13_9 Depth=1
+$L__BB14_11:                            //   in Loop: Header=BB14_9 Depth=1
 	// begin inline asm
 	mov.u32 %r21, %tid.x;
 	// end inline asm
@@ -3958,60 +4945,60 @@ $L__BB13_11:                            //   in Loop: Header=BB13_9 Depth=1
 	and.b32 	%r37, %r21, 31;
 	setp.ne.b32 	%p15, %r37, 0;
 	mov.b64 	%rd34, _ZZ21sofuu_attn_decode_f32E3red;
-	@%p15 bra 	$L__BB13_13;
-// %bb.12:                              //   in Loop: Header=BB13_9 Depth=1
+	@%p15 bra 	$L__BB14_13;
+// %bb.12:                              //   in Loop: Header=BB14_9 Depth=1
 	shr.u32 	%r38, %r21, 5;
 	mul.wide.u32 	%rd33, %r38, 4;
 	add.s64 	%rd12, %rd34, %rd33;
 	add.f32 	%r4, %r35, %r34;
 	st.shared.b32 	[%rd12], %r4;
-$L__BB13_13:                            //   in Loop: Header=BB13_9 Depth=1
+$L__BB14_13:                            //   in Loop: Header=BB14_9 Depth=1
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	setp.gt.u32 	%p16, %r21, 31;
 	mov.b32 	%r111, 0f00000000;
-	@%p16 bra 	$L__BB13_17;
-// %bb.14:                              //   in Loop: Header=BB13_9 Depth=1
+	@%p16 bra 	$L__BB14_17;
+// %bb.14:                              //   in Loop: Header=BB14_9 Depth=1
 	setp.gt.u32 	%p17, %r21, 7;
 	mov.b32 	%r110, 0f00000000;
-	@%p17 bra 	$L__BB13_16;
-// %bb.15:                              //   in Loop: Header=BB13_9 Depth=1
+	@%p17 bra 	$L__BB14_16;
+// %bb.15:                              //   in Loop: Header=BB14_9 Depth=1
 	mul.wide.u32 	%rd35, %r21, 4;
 	add.s64 	%rd13, %rd34, %rd35;
 	ld.shared.b32 	%r110, [%rd13];
-	bra.uni 	$L__BB13_16;
-$L__BB13_18:                            //   in Loop: Header=BB13_9 Depth=1
+	bra.uni 	$L__BB14_16;
+$L__BB14_18:                            //   in Loop: Header=BB14_9 Depth=1
 	mul.f32 	%r5, %r13, %r111;
 	ld.shared.b32 	%r55, [_ZZ21sofuu_attn_decode_f32E5s_max];
 	setp.leu.f32 	%p19, %r5, %r55;
-	@%p19 bra 	$L__BB13_20;
-// %bb.19:                              //   in Loop: Header=BB13_9 Depth=1
+	@%p19 bra 	$L__BB14_20;
+// %bb.19:                              //   in Loop: Header=BB14_9 Depth=1
 	st.shared.b32 	[_ZZ21sofuu_attn_decode_f32E5s_max], %r5;
-	bra.uni 	$L__BB13_20;
-$L__BB13_21:
-	@%p12 bra 	$L__BB13_23;
+	bra.uni 	$L__BB14_20;
+$L__BB14_21:
+	@%p12 bra 	$L__BB14_23;
 // %bb.22:
 	st.shared.b32 	[_ZZ21sofuu_attn_decode_f32E5s_sum], 0;
-$L__BB13_23:
+$L__BB14_23:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	mov.b32 	%r112, 0;
-	bra.uni 	$L__BB13_24;
-$L__BB13_37:                            //   in Loop: Header=BB13_24 Depth=1
+	bra.uni 	$L__BB14_24;
+$L__BB14_37:                            //   in Loop: Header=BB14_24 Depth=1
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	add.s32 	%r112, %r112, 1;
 	add.s64 	%rd49, %rd49, %rd11;
 	setp.eq.b32 	%p26, %r112, %r1;
-	@%p26 bra 	$L__BB13_38;
-$L__BB13_24:                            // =>This Loop Header: Depth=1
-                                        //     Child Loop BB13_36 Depth 2
+	@%p26 bra 	$L__BB14_38;
+$L__BB14_24:                            // =>This Loop Header: Depth=1
+                                        //     Child Loop BB14_36 Depth 2
 	mov.b32 	%r113, 0f00000000;
-	@%p13 bra 	$L__BB13_26;
-// %bb.25:                              //   in Loop: Header=BB13_24 Depth=1
+	@%p13 bra 	$L__BB14_26;
+// %bb.25:                              //   in Loop: Header=BB14_24 Depth=1
 	cvt.u64.u32 	%rd36, %r112;
 	mul.lo.s64 	%rd37, %rd36, %rd5;
 	shl.b64 	%rd38, %rd37, 2;
@@ -4019,7 +5006,7 @@ $L__BB13_24:                            // =>This Loop Header: Depth=1
 	ld.global.b32 	%r56, [%rd10];
 	ld.global.b32 	%r57, [%rd14];
 	mul.f32 	%r113, %r56, %r57;
-$L__BB13_26:                            //   in Loop: Header=BB13_24 Depth=1
+$L__BB14_26:                            //   in Loop: Header=BB14_24 Depth=1
 	// begin inline asm
 	mov.u32 %r58, %tid.x;
 	// end inline asm
@@ -4050,29 +5037,29 @@ $L__BB13_26:                            //   in Loop: Header=BB13_24 Depth=1
 	// end inline asm
 	and.b32 	%r74, %r58, 31;
 	setp.ne.b32 	%p21, %r74, 0;
-	@%p21 bra 	$L__BB13_28;
-// %bb.27:                              //   in Loop: Header=BB13_24 Depth=1
+	@%p21 bra 	$L__BB14_28;
+// %bb.27:                              //   in Loop: Header=BB14_24 Depth=1
 	shr.u32 	%r75, %r58, 5;
 	mul.wide.u32 	%rd39, %r75, 4;
 	add.s64 	%rd15, %rd34, %rd39;
 	add.f32 	%r6, %r72, %r71;
 	st.shared.b32 	[%rd15], %r6;
-$L__BB13_28:                            //   in Loop: Header=BB13_24 Depth=1
+$L__BB14_28:                            //   in Loop: Header=BB14_24 Depth=1
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	setp.gt.u32 	%p22, %r58, 31;
 	mov.b32 	%r115, 0f00000000;
-	@%p22 bra 	$L__BB13_32;
-// %bb.29:                              //   in Loop: Header=BB13_24 Depth=1
+	@%p22 bra 	$L__BB14_32;
+// %bb.29:                              //   in Loop: Header=BB14_24 Depth=1
 	setp.gt.u32 	%p23, %r58, 7;
 	mov.b32 	%r114, 0f00000000;
-	@%p23 bra 	$L__BB13_31;
-// %bb.30:                              //   in Loop: Header=BB13_24 Depth=1
+	@%p23 bra 	$L__BB14_31;
+// %bb.30:                              //   in Loop: Header=BB14_24 Depth=1
 	mul.wide.u32 	%rd40, %r58, 4;
 	add.s64 	%rd16, %rd34, %rd40;
 	ld.shared.b32 	%r114, [%rd16];
-$L__BB13_31:                            //   in Loop: Header=BB13_24 Depth=1
+$L__BB14_31:                            //   in Loop: Header=BB14_24 Depth=1
 	mov.b32 	%r77, 16;
 	mov.b32 	%r78, -1;
 	// begin inline asm
@@ -4101,9 +5088,9 @@ $L__BB13_31:                            //   in Loop: Header=BB13_24 Depth=1
 	setp.eq.b32 	%p24, %r58, 0;
 	add.f32 	%r91, %r89, %r88;
 	selp.f32 	%r115, %r91, 0f00000000, %p24;
-$L__BB13_32:                            //   in Loop: Header=BB13_24 Depth=1
-	@%p12 bra 	$L__BB13_34;
-// %bb.33:                              //   in Loop: Header=BB13_24 Depth=1
+$L__BB14_32:                            //   in Loop: Header=BB14_24 Depth=1
+	@%p12 bra 	$L__BB14_34;
+// %bb.33:                              //   in Loop: Header=BB14_24 Depth=1
 	ld.shared.b32 	%r94, [_ZZ21sofuu_attn_decode_f32E5s_max];
 	neg.f32 	%r95, %r94;
 	fma.rn.f32 	%r96, %r13, %r115, %r95;
@@ -4115,16 +5102,16 @@ $L__BB13_32:                            //   in Loop: Header=BB13_24 Depth=1
 	add.f32 	%r98, %r92, %r97;
 	st.shared.b32 	[_ZZ21sofuu_attn_decode_f32E5s_sum], %r98;
 	st.shared.b32 	[_ZZ21sofuu_attn_decode_f32E3s_w], %r92;
-$L__BB13_34:                            //   in Loop: Header=BB13_24 Depth=1
+$L__BB14_34:                            //   in Loop: Header=BB14_24 Depth=1
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
-	@%p13 bra 	$L__BB13_37;
-// %bb.35:                              //   in Loop: Header=BB13_24 Depth=1
+	@%p13 bra 	$L__BB14_37;
+// %bb.35:                              //   in Loop: Header=BB14_24 Depth=1
 	ld.shared.b32 	%r7, [_ZZ21sofuu_attn_decode_f32E3s_w];
 	mov.b64 	%rd50, %rd51;
 	mov.b32 	%r116, %r117;
-$L__BB13_36:                            //   Parent Loop BB13_24 Depth=1
+$L__BB14_36:                            //   Parent Loop BB14_24 Depth=1
                                         // =>  This Inner Loop Header: Depth=2
 	add.s64 	%rd41, %rd49, %rd50;
 	ld.global.b32 	%r99, [%rd41];
@@ -4135,25 +5122,25 @@ $L__BB13_36:                            //   Parent Loop BB13_24 Depth=1
 	add.s32 	%r116, %r116, %r15;
 	add.s64 	%rd50, %rd50, %rd46;
 	setp.lt.s32 	%p25, %r116, %r11;
-	@%p25 bra 	$L__BB13_36;
-	bra.uni 	$L__BB13_37;
-$L__BB13_38:
-	@%p12 bra 	$L__BB13_40;
+	@%p25 bra 	$L__BB14_36;
+	bra.uni 	$L__BB14_37;
+$L__BB14_38:
+	@%p12 bra 	$L__BB14_40;
 // %bb.39:
 	ld.shared.b32 	%r102, [_ZZ21sofuu_attn_decode_f32E5s_sum];
 	setp.gt.f32 	%p27, %r102, 0f00000000;
 	rcp.rn.f32 	%r103, %r102;
 	selp.f32 	%r104, %r103, 0f00000000, %p27;
 	st.shared.b32 	[_ZZ21sofuu_attn_decode_f32E3s_w], %r104;
-$L__BB13_40:
+$L__BB14_40:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
-	@%p13 bra 	$L__BB13_43;
+	@%p13 bra 	$L__BB14_43;
 // %bb.41:
 	ld.shared.b32 	%r8, [_ZZ21sofuu_attn_decode_f32E3s_w];
 	add.s64 	%rd17, %rd4, %rd25;
-$L__BB13_42:                            // =>This Inner Loop Header: Depth=1
+$L__BB14_42:                            // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd43, %rd45, %rd51;
 	ld.shared.b32 	%r105, [%rd43];
 	mul.f32 	%r106, %r8, %r105;
@@ -4162,8 +5149,8 @@ $L__BB13_42:                            // =>This Inner Loop Header: Depth=1
 	add.s32 	%r117, %r117, %r15;
 	add.s64 	%rd51, %rd51, %rd46;
 	setp.lt.s32 	%p28, %r117, %r11;
-	@%p28 bra 	$L__BB13_42;
-$L__BB13_43:
+	@%p28 bra 	$L__BB14_42;
+$L__BB14_43:
 	ret;
                                         // -- End function
 }
@@ -4199,7 +5186,7 @@ $L__BB13_43:
 	// end inline asm
 	mad.lo.s32 	%r5, %r3, %r2, %r1;
 	setp.ge.s32 	%p1, %r5, %r4;
-	@%p1 bra 	$L__BB14_2;
+	@%p1 bra 	$L__BB15_2;
 // %bb.1:
 	mul.wide.s32 	%rd10, %r5, 4;
 	add.s64 	%rd1, %rd6, %rd10;
@@ -4209,7 +5196,7 @@ $L__BB13_43:
 	ld.global.b32 	%r7, [%rd2];
 	add.f32 	%r8, %r6, %r7;
 	st.global.b32 	[%rd1], %r8;
-$L__BB14_2:
+$L__BB15_2:
 	ret;
                                         // -- End function
 }
@@ -4258,11 +5245,11 @@ $L__BB14_2:
 	setp.ge.s32 	%p3, %r3, %r5;
 	or.pred 	%p4, %p2, %p3;
 	or.pred 	%p5, %p4, %p1;
-	@%p5 bra 	$L__BB15_4;
+	@%p5 bra 	$L__BB16_4;
 // %bb.1:
 	ld.param.b32 	%r1, [sofuu_kv_write_f32_param_6];
 	setp.ge.s32 	%p6, %r9, %r1;
-	@%p6 bra 	$L__BB15_4;
+	@%p6 bra 	$L__BB16_4;
 // %bb.2:
 	cvt.u64.u32 	%rd5, %r6;
 	cvt.s64.s32 	%rd19, %r3;
@@ -4279,7 +5266,7 @@ $L__BB14_2:
 	shl.b64 	%rd24, %rd23, 2;
 	add.s64 	%rd11, %rd3, %rd24;
 	add.s64 	%rd12, %rd4, %rd24;
-$L__BB15_3:                             // =>This Inner Loop Header: Depth=1
+$L__BB16_3:                             // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd25, %rd8, %rd29;
 	ld.global.b32 	%r7, [%rd25];
 	add.s64 	%rd26, %rd11, %rd29;
@@ -4291,8 +5278,8 @@ $L__BB15_3:                             // =>This Inner Loop Header: Depth=1
 	add.s32 	%r9, %r9, %r4;
 	add.s64 	%rd29, %rd29, %rd10;
 	setp.lt.s32 	%p7, %r9, %r1;
-	@%p7 bra 	$L__BB15_3;
-$L__BB15_4:
+	@%p7 bra 	$L__BB16_3;
+$L__BB16_4:
 	ret;
                                         // -- End function
 }
@@ -4322,7 +5309,7 @@ $L__BB15_4:
 	ld.param.b64 	%rd20, [sofuu_gemm_q4_k_b8_param_2];
 	cvta.to.global.u64 	%rd3, %rd20;
 	setp.lt.s32 	%p1, %r15, 1;
-	@%p1 bra 	$L__BB16_10;
+	@%p1 bra 	$L__BB17_10;
 // %bb.1:
 	ld.param.b32 	%r13, [sofuu_gemm_q4_k_b8_param_3];
 	// begin inline asm
@@ -4336,7 +5323,7 @@ $L__BB15_4:
 	add.s32 	%r2, %r19, %r18;
 	div.s32 	%r3, %r2, %r15;
 	setp.ge.s32 	%p2, %r3, %r13;
-	@%p2 bra 	$L__BB16_10;
+	@%p2 bra 	$L__BB17_10;
 // %bb.2:
 	ld.param.b32 	%r14, [sofuu_gemm_q4_k_b8_param_4];
 	and.b32 	%r1, %r16, 31;
@@ -4345,7 +5332,7 @@ $L__BB15_4:
 	cvt.s64.s32 	%rd4, %r21;
 	setp.lt.s32 	%p3, %r14, 256;
 	mov.b32 	%r111, 0f00000000;
-	@%p3 bra 	$L__BB16_8;
+	@%p3 bra 	$L__BB17_8;
 // %bb.3:
 	shr.s32 	%r22, %r14, 31;
 	shr.u32 	%r23, %r22, 24;
@@ -4389,13 +5376,13 @@ $L__BB15_4:
 	add.s64 	%rd66, %rd29, 16;
 	mov.b32 	%r111, 0f00000000;
 	setp.gt.u32 	%p4, %r1, 15;
-	bra.uni 	$L__BB16_4;
-$L__BB16_5:                             //   in Loop: Header=BB16_4 Depth=1
+	bra.uni 	$L__BB17_4;
+$L__BB17_5:                             //   in Loop: Header=BB17_4 Depth=1
 	ld.global.nc.b8 	%rs10, [%rd17+-4];
 	and.b16 	%rs20, %rs10, 63;
 	ld.global.nc.b8 	%rs11, [%rd17];
 	and.b16 	%rs21, %rs11, 63;
-$L__BB16_7:                             //   in Loop: Header=BB16_4 Depth=1
+$L__BB17_7:                             //   in Loop: Header=BB17_4 Depth=1
 	ld.global.nc.b8 	%rs14, [%rd67];
 	ld.global.nc.b8 	%rs15, [%rd67+1];
 	shl.b16 	%rs16, %rs15, 8;
@@ -4499,13 +5486,13 @@ $L__BB16_7:                             //   in Loop: Header=BB16_4 Depth=1
 	add.s64 	%rd67, %rd67, 144;
 	add.s64 	%rd66, %rd66, 1024;
 	setp.eq.b32 	%p5, %r110, 0;
-	@%p5 bra 	$L__BB16_8;
-$L__BB16_4:                             // =>This Inner Loop Header: Depth=1
+	@%p5 bra 	$L__BB17_8;
+$L__BB17_4:                             // =>This Inner Loop Header: Depth=1
 	ld.global.nc.v4.b32 	{%r5, %r6, %r7, %r8}, [%rd66+-16];
 	ld.global.nc.v4.b32 	{%r9, %r10, %r11, %r12}, [%rd66];
 	add.s64 	%rd17, %rd67, %rd14;
-	@!%p4 bra 	$L__BB16_5;
-// %bb.6:                               //   in Loop: Header=BB16_4 Depth=1
+	@!%p4 bra 	$L__BB17_5;
+// %bb.6:                               //   in Loop: Header=BB17_4 Depth=1
 	ld.global.nc.b8 	%rs1, [%rd17];
 	and.b16 	%rs2, %rs1, 15;
 	ld.global.nc.b8 	%rs3, [%rd17+-8];
@@ -4517,8 +5504,8 @@ $L__BB16_4:                             // =>This Inner Loop Header: Depth=1
 	shr.u16 	%rs8, %rs7, 2;
 	and.b16 	%rs9, %rs8, 48;
 	or.b16 	%rs21, %rs9, %rs6;
-	bra.uni 	$L__BB16_7;
-$L__BB16_8:
+	bra.uni 	$L__BB17_7;
+$L__BB17_8:
 	mov.b32 	%r96, 16;
 	mov.b32 	%r97, -1;
 	// begin inline asm
@@ -4545,7 +5532,7 @@ $L__BB16_8:
 	shfl.sync.down.b32 %r107, %r108, %r109, 0x1f, %r97;
 	// end inline asm
 	setp.eq.b32 	%p6, %r1, 0;
-	@!%p6 bra 	$L__BB16_10;
+	@!%p6 bra 	$L__BB17_10;
 // %bb.9:
 	cvt.s64.s32 	%rd5, %r3;
 	cvt.s64.s32 	%rd61, %r13;
@@ -4556,7 +5543,7 @@ $L__BB16_8:
 	add.s64 	%rd16, %rd64, %rd65;
 	add.f32 	%r4, %r108, %r107;
 	st.global.b32 	[%rd16], %r4;
-$L__BB16_10:
+$L__BB17_10:
 	ret;
                                         // -- End function
 }
@@ -4586,7 +5573,7 @@ $L__BB16_10:
 	ld.param.b64 	%rd14, [sofuu_gemm_q6_k_b8_param_2];
 	cvta.to.global.u64 	%rd3, %rd14;
 	setp.lt.s32 	%p1, %r10, 1;
-	@%p1 bra 	$L__BB17_7;
+	@%p1 bra 	$L__BB18_7;
 // %bb.1:
 	ld.param.b32 	%r8, [sofuu_gemm_q6_k_b8_param_3];
 	// begin inline asm
@@ -4600,7 +5587,7 @@ $L__BB16_10:
 	add.s32 	%r2, %r14, %r13;
 	div.s32 	%r3, %r2, %r10;
 	setp.ge.s32 	%p2, %r3, %r8;
-	@%p2 bra 	$L__BB17_7;
+	@%p2 bra 	$L__BB18_7;
 // %bb.2:
 	ld.param.b32 	%r9, [sofuu_gemm_q6_k_b8_param_4];
 	and.b32 	%r1, %r11, 31;
@@ -4609,7 +5596,7 @@ $L__BB16_10:
 	cvt.s64.s32 	%rd4, %r16;
 	setp.lt.s32 	%p3, %r9, 256;
 	mov.b32 	%r163, 0f00000000;
-	@%p3 bra 	$L__BB17_5;
+	@%p3 bra 	$L__BB18_5;
 // %bb.3:
 	shr.s32 	%r17, %r9, 31;
 	shr.u32 	%r18, %r17, 24;
@@ -4648,7 +5635,7 @@ $L__BB16_10:
 	mov.b32 	%r163, 0f00000000;
 	setp.lt.u32 	%p4, %r5, 2;
 	setp.gt.u32 	%p5, %r4, 15;
-$L__BB17_4:                             // =>This Inner Loop Header: Depth=1
+$L__BB18_4:                             // =>This Inner Loop Header: Depth=1
 	ld.global.nc.v4.b32 	{%r33, %r34, %r35, %r36}, [%rd34+-16];
 	ld.global.nc.v4.b32 	{%r37, %r38, %r39, %r40}, [%rd34];
 	ld.global.nc.b8 	%rs2, [%rd35];
@@ -4776,8 +5763,8 @@ $L__BB17_4:                             // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd35, %rd35, 224;
 	add.s64 	%rd34, %rd34, 1024;
 	setp.eq.b32 	%p6, %r162, 0;
-	@!%p6 bra 	$L__BB17_4;
-$L__BB17_5:
+	@!%p6 bra 	$L__BB18_4;
+$L__BB18_5:
 	mov.b32 	%r148, 16;
 	mov.b32 	%r149, -1;
 	// begin inline asm
@@ -4804,7 +5791,7 @@ $L__BB17_5:
 	shfl.sync.down.b32 %r159, %r160, %r161, 0x1f, %r149;
 	// end inline asm
 	setp.eq.b32 	%p7, %r1, 0;
-	@!%p7 bra 	$L__BB17_7;
+	@!%p7 bra 	$L__BB18_7;
 // %bb.6:
 	cvt.s64.s32 	%rd5, %r3;
 	cvt.s64.s32 	%rd29, %r8;
@@ -4815,7 +5802,7 @@ $L__BB17_5:
 	add.s64 	%rd11, %rd32, %rd33;
 	add.f32 	%r7, %r160, %r159;
 	st.global.b32 	[%rd11], %r7;
-$L__BB17_7:
+$L__BB18_7:
 	ret;
                                         // -- End function
 }
@@ -4845,7 +5832,7 @@ $L__BB17_7:
 	ld.param.b64 	%rd11, [sofuu_gemm_q8_0_b8_param_2];
 	cvta.to.global.u64 	%rd3, %rd11;
 	setp.lt.s32 	%p1, %r7, 1;
-	@%p1 bra 	$L__BB18_7;
+	@%p1 bra 	$L__BB19_7;
 // %bb.1:
 	ld.param.b32 	%r5, [sofuu_gemm_q8_0_b8_param_3];
 	// begin inline asm
@@ -4859,7 +5846,7 @@ $L__BB17_7:
 	add.s32 	%r2, %r11, %r10;
 	div.s32 	%r3, %r2, %r7;
 	setp.ge.s32 	%p2, %r3, %r5;
-	@%p2 bra 	$L__BB18_7;
+	@%p2 bra 	$L__BB19_7;
 // %bb.2:
 	ld.param.b32 	%r6, [sofuu_gemm_q8_0_b8_param_4];
 	and.b32 	%r1, %r8, 31;
@@ -4868,7 +5855,7 @@ $L__BB17_7:
 	cvt.s64.s32 	%rd4, %r13;
 	setp.lt.s32 	%p3, %r6, 1;
 	mov.b32 	%r68, 0f00000000;
-	@%p3 bra 	$L__BB18_5;
+	@%p3 bra 	$L__BB19_5;
 // %bb.3:
 	shr.s32 	%r14, %r6, 31;
 	shr.u32 	%r15, %r14, 27;
@@ -4893,7 +5880,7 @@ $L__BB17_7:
 	add.s64 	%rd29, %rd22, 16;
 	mov.b32 	%r69, 0;
 	mov.b32 	%r68, 0f00000000;
-$L__BB18_4:                             // =>This Inner Loop Header: Depth=1
+$L__BB19_4:                             // =>This Inner Loop Header: Depth=1
 	ld.global.nc.v4.b32 	{%r21, %r22, %r23, %r24}, [%rd29+-16];
 	ld.global.nc.v4.b32 	{%r25, %r26, %r27, %r28}, [%rd29];
 	ld.global.nc.b8 	%rs2, [%rd30];
@@ -4941,8 +5928,8 @@ $L__BB18_4:                             // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd30, %rd30, 272;
 	add.s64 	%rd29, %rd29, 1024;
 	setp.lt.s32 	%p4, %r69, %r6;
-	@%p4 bra 	$L__BB18_4;
-$L__BB18_5:
+	@%p4 bra 	$L__BB19_4;
+$L__BB19_5:
 	mov.b32 	%r54, 16;
 	mov.b32 	%r55, -1;
 	// begin inline asm
@@ -4969,7 +5956,7 @@ $L__BB18_5:
 	shfl.sync.down.b32 %r65, %r66, %r67, 0x1f, %r55;
 	// end inline asm
 	setp.eq.b32 	%p5, %r1, 0;
-	@!%p5 bra 	$L__BB18_7;
+	@!%p5 bra 	$L__BB19_7;
 // %bb.6:
 	cvt.s64.s32 	%rd5, %r3;
 	cvt.s64.s32 	%rd24, %r5;
@@ -4980,7 +5967,7 @@ $L__BB18_5:
 	add.s64 	%rd8, %rd27, %rd28;
 	add.f32 	%r4, %r66, %r65;
 	st.global.b32 	[%rd8], %r4;
-$L__BB18_7:
+$L__BB19_7:
 	ret;
                                         // -- End function
 }
@@ -5009,7 +5996,7 @@ $L__BB18_7:
 	ld.param.b64 	%rd9, [sofuu_gemm_f32_b8_param_2];
 	cvta.to.global.u64 	%rd3, %rd9;
 	setp.lt.s32 	%p1, %r7, 1;
-	@%p1 bra 	$L__BB19_7;
+	@%p1 bra 	$L__BB20_7;
 // %bb.1:
 	ld.param.b32 	%r5, [sofuu_gemm_f32_b8_param_3];
 	// begin inline asm
@@ -5023,7 +6010,7 @@ $L__BB18_7:
 	add.s32 	%r2, %r11, %r10;
 	div.s32 	%r3, %r2, %r7;
 	setp.ge.s32 	%p2, %r3, %r5;
-	@%p2 bra 	$L__BB19_7;
+	@%p2 bra 	$L__BB20_7;
 // %bb.2:
 	ld.param.b32 	%r6, [sofuu_gemm_f32_b8_param_4];
 	and.b32 	%r1, %r8, 31;
@@ -5033,7 +6020,7 @@ $L__BB18_7:
 	cvt.s64.s32 	%rd5, %r3;
 	setp.lt.s32 	%p3, %r6, 1;
 	mov.b32 	%r54, 0f00000000;
-	@%p3 bra 	$L__BB19_5;
+	@%p3 bra 	$L__BB20_5;
 // %bb.3:
 	cvt.u64.u32 	%rd10, %r6;
 	mul.lo.s64 	%rd11, %rd5, %rd10;
@@ -5049,7 +6036,7 @@ $L__BB18_7:
 	add.s64 	%rd25, %rd19, 16;
 	mov.b32 	%r54, 0f00000000;
 	mov.b32 	%r53, 0;
-$L__BB19_4:                             // =>This Inner Loop Header: Depth=1
+$L__BB20_4:                             // =>This Inner Loop Header: Depth=1
 	ld.global.nc.v4.b32 	{%r14, %r15, %r16, %r17}, [%rd25+-16];
 	ld.global.nc.v4.b32 	{%r18, %r19, %r20, %r21}, [%rd25];
 	ld.global.nc.b32 	%r22, [%rd26+-16];
@@ -5073,8 +6060,8 @@ $L__BB19_4:                             // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd26, %rd26, 1024;
 	add.s64 	%rd25, %rd25, 1024;
 	setp.lt.s32 	%p4, %r53, %r6;
-	@%p4 bra 	$L__BB19_4;
-$L__BB19_5:
+	@%p4 bra 	$L__BB20_4;
+$L__BB20_5:
 	mov.b32 	%r39, 16;
 	mov.b32 	%r40, -1;
 	// begin inline asm
@@ -5101,7 +6088,7 @@ $L__BB19_5:
 	shfl.sync.down.b32 %r50, %r51, %r52, 0x1f, %r40;
 	// end inline asm
 	setp.eq.b32 	%p5, %r1, 0;
-	@!%p5 bra 	$L__BB19_7;
+	@!%p5 bra 	$L__BB20_7;
 // %bb.6:
 	cvt.s64.s32 	%rd20, %r5;
 	mul.lo.s64 	%rd21, %rd4, %rd20;
@@ -5111,7 +6098,7 @@ $L__BB19_5:
 	add.s64 	%rd6, %rd23, %rd24;
 	add.f32 	%r4, %r51, %r50;
 	st.global.b32 	[%rd6], %r4;
-$L__BB19_7:
+$L__BB20_7:
 	ret;
                                         // -- End function
 }
@@ -5145,7 +6132,7 @@ $L__BB19_7:
 	// end inline asm
 	ld.param.b32 	%r6, [sofuu_rmsnorm_batch_param_5];
 	setp.ge.s32 	%p1, %r5, %r6;
-	@%p1 bra 	$L__BB20_15;
+	@%p1 bra 	$L__BB21_15;
 // %bb.1:
 	ld.param.b32 	%r3, [sofuu_rmsnorm_batch_param_3];
 	mul.wide.s32 	%rd11, %r5, %r3;
@@ -5156,11 +6143,11 @@ $L__BB19_7:
 	// end inline asm
 	setp.ge.s32 	%p2, %r56, %r3;
 	mov.b32 	%r54, 0f00000000;
-	@%p2 bra 	$L__BB20_4;
+	@%p2 bra 	$L__BB21_4;
 // %bb.2:
 	mov.b32 	%r54, 0f00000000;
 	mov.b32 	%r55, %r56;
-$L__BB20_3:                             // =>This Inner Loop Header: Depth=1
+$L__BB21_3:                             // =>This Inner Loop Header: Depth=1
 	mul.wide.s32 	%rd13, %r55, 4;
 	add.s64 	%rd14, %rd4, %rd13;
 	ld.global.b32 	%r8, [%rd14];
@@ -5170,8 +6157,8 @@ $L__BB20_3:                             // =>This Inner Loop Header: Depth=1
 	// end inline asm
 	add.s32 	%r55, %r7, %r55;
 	setp.lt.s32 	%p3, %r55, %r3;
-	@%p3 bra 	$L__BB20_3;
-$L__BB20_4:
+	@%p3 bra 	$L__BB21_3;
+$L__BB21_4:
 	// begin inline asm
 	mov.u32 %r9, %tid.x;
 	// end inline asm
@@ -5203,29 +6190,29 @@ $L__BB20_4:
 	and.b32 	%r25, %r9, 31;
 	setp.ne.b32 	%p4, %r25, 0;
 	mov.b64 	%rd16, _ZZ19sofuu_rmsnorm_batchE3red;
-	@%p4 bra 	$L__BB20_6;
+	@%p4 bra 	$L__BB21_6;
 // %bb.5:
 	shr.u32 	%r26, %r9, 5;
 	mul.wide.u32 	%rd15, %r26, 4;
 	add.s64 	%rd6, %rd16, %rd15;
 	add.f32 	%r1, %r23, %r22;
 	st.shared.b32 	[%rd6], %r1;
-$L__BB20_6:
+$L__BB21_6:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	setp.gt.u32 	%p5, %r9, 31;
 	mov.b32 	%r53, 0f00000000;
-	@%p5 bra 	$L__BB20_10;
+	@%p5 bra 	$L__BB21_10;
 // %bb.7:
 	setp.gt.u32 	%p6, %r9, 7;
 	mov.b32 	%r52, 0f00000000;
-	@%p6 bra 	$L__BB20_9;
+	@%p6 bra 	$L__BB21_9;
 // %bb.8:
 	mul.wide.u32 	%rd17, %r9, 4;
 	add.s64 	%rd7, %rd16, %rd17;
 	ld.shared.b32 	%r52, [%rd7];
-$L__BB20_9:
+$L__BB21_9:
 	mov.b32 	%r28, 16;
 	mov.b32 	%r29, -1;
 	// begin inline asm
@@ -5254,9 +6241,9 @@ $L__BB20_9:
 	setp.eq.b32 	%p7, %r9, 0;
 	add.f32 	%r42, %r40, %r39;
 	selp.f32 	%r53, %r42, 0f00000000, %p7;
-$L__BB20_10:
+$L__BB21_10:
 	setp.eq.b32 	%p8, %r56, 0;
-	@!%p8 bra 	$L__BB20_12;
+	@!%p8 bra 	$L__BB21_12;
 // %bb.11:
 	ld.param.b32 	%r4, [sofuu_rmsnorm_batch_param_4];
 	cvt.rn.f32.s32 	%r43, %r3;
@@ -5266,15 +6253,15 @@ $L__BB20_10:
 	rsqrt.approx.f32 %r45, %r46;
 	// end inline asm
 	st.shared.b32 	[_ZZ19sofuu_rmsnorm_batchE5scale], %r45;
-$L__BB20_12:
+$L__BB21_12:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
-	@%p2 bra 	$L__BB20_15;
+	@%p2 bra 	$L__BB21_15;
 // %bb.13:
 	add.s64 	%rd5, %rd2, %rd12;
 	ld.shared.b32 	%r2, [_ZZ19sofuu_rmsnorm_batchE5scale];
-$L__BB20_14:                            // =>This Inner Loop Header: Depth=1
+$L__BB21_14:                            // =>This Inner Loop Header: Depth=1
 	mul.wide.s32 	%rd18, %r56, 4;
 	add.s64 	%rd19, %rd4, %rd18;
 	ld.global.b32 	%r48, [%rd19];
@@ -5289,8 +6276,8 @@ $L__BB20_14:                            // =>This Inner Loop Header: Depth=1
 	// end inline asm
 	add.s32 	%r56, %r47, %r56;
 	setp.lt.s32 	%p9, %r56, %r3;
-	@%p9 bra 	$L__BB20_14;
-$L__BB20_15:
+	@%p9 bra 	$L__BB21_14;
+$L__BB21_15:
 	ret;
                                         // -- End function
 }
@@ -5322,7 +6309,7 @@ $L__BB20_15:
 	div.s32 	%r1, %r8, %r4;
 	ld.param.b32 	%r9, [sofuu_rope_batch_param_6];
 	setp.ge.s32 	%p1, %r1, %r9;
-	@%p1 bra 	$L__BB21_4;
+	@%p1 bra 	$L__BB22_4;
 // %bb.1:
 	ld.param.b32 	%r6, [sofuu_rope_batch_param_4];
 	// begin inline asm
@@ -5333,7 +6320,7 @@ $L__BB20_15:
 	// end inline asm
 	shr.s32 	%r2, %r6, 1;
 	setp.ge.s32 	%p2, %r28, %r2;
-	@%p2 bra 	$L__BB21_4;
+	@%p2 bra 	$L__BB22_4;
 // %bb.2:
 	ld.param.b32 	%r7, [sofuu_rope_batch_param_5];
 	ld.param.b32 	%r5, [sofuu_rope_batch_param_3];
@@ -5359,7 +6346,7 @@ $L__BB20_15:
 	shl.b32 	%r27, %r28, 1;
 	shl.b32 	%r3, %r10, 1;
 	setp.eq.b32 	%p3, %r7, 0;
-$L__BB21_3:                             // =>This Inner Loop Header: Depth=1
+$L__BB22_3:                             // =>This Inner Loop Header: Depth=1
 	selp.b32 	%r14, %r28, %r27, %p3;
 	add.s32 	%r15, %r27, 1;
 	add.s32 	%r16, %r2, %r28;
@@ -5384,8 +6371,8 @@ $L__BB21_3:                             // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd25, %rd25, %rd7;
 	add.s32 	%r27, %r27, %r3;
 	setp.lt.s32 	%p4, %r28, %r2;
-	@%p4 bra 	$L__BB21_3;
-$L__BB21_4:
+	@%p4 bra 	$L__BB22_3;
+$L__BB22_4:
 	ret;
                                         // -- End function
 }
@@ -5423,7 +6410,7 @@ $L__BB21_4:
 	// end inline asm
 	div.s32 	%r1, %r7, %r4;
 	setp.ge.s32 	%p1, %r1, %r9;
-	@%p1 bra 	$L__BB22_5;
+	@%p1 bra 	$L__BB23_5;
 // %bb.1:
 	ld.param.b32 	%r6, [sofuu_kv_write_batch_param_8];
 	ld.param.b32 	%r8, [sofuu_kv_write_batch_param_4];
@@ -5435,7 +6422,7 @@ $L__BB21_4:
 	setp.ge.s32 	%p4, %r3, %r6;
 	or.pred 	%p5, %p4, %p2;
 	or.pred 	%p6, %p5, %p3;
-	@%p6 bra 	$L__BB22_5;
+	@%p6 bra 	$L__BB23_5;
 // %bb.2:
 	ld.param.b32 	%r5, [sofuu_kv_write_batch_param_7];
 	// begin inline asm
@@ -5445,7 +6432,7 @@ $L__BB21_4:
 	mov.u32 %r11, %ntid.x;
 	// end inline asm
 	setp.ge.s32 	%p7, %r14, %r5;
-	@%p7 bra 	$L__BB22_5;
+	@%p7 bra 	$L__BB23_5;
 // %bb.3:
 	cvt.s64.s32 	%rd16, %r2;
 	cvt.u64.u32 	%rd17, %r6;
@@ -5464,7 +6451,7 @@ $L__BB21_4:
 	shl.b64 	%rd24, %rd23, 2;
 	add.s64 	%rd10, %rd3, %rd24;
 	add.s64 	%rd11, %rd4, %rd24;
-$L__BB22_4:                             // =>This Inner Loop Header: Depth=1
+$L__BB23_4:                             // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd25, %rd7, %rd29;
 	ld.global.b32 	%r12, [%rd25];
 	add.s64 	%rd26, %rd10, %rd29;
@@ -5476,8 +6463,8 @@ $L__BB22_4:                             // =>This Inner Loop Header: Depth=1
 	add.s32 	%r14, %r14, %r11;
 	add.s64 	%rd29, %rd29, %rd9;
 	setp.lt.s32 	%p8, %r14, %r5;
-	@%p8 bra 	$L__BB22_4;
-$L__BB22_5:
+	@%p8 bra 	$L__BB23_4;
+$L__BB23_5:
 	ret;
                                         // -- End function
 }
@@ -5526,7 +6513,7 @@ $L__BB22_5:
 	div.s32 	%r1, %r17, %r11;
 	ld.param.b32 	%r19, [sofuu_attn_prefill_f32_param_8];
 	setp.ge.s32 	%p1, %r1, %r19;
-	@%p1 bra 	$L__BB23_44;
+	@%p1 bra 	$L__BB24_44;
 // %bb.1:
 	ld.param.b32 	%r13, [sofuu_attn_prefill_f32_param_6];
 	ld.param.b32 	%r12, [sofuu_attn_prefill_f32_param_5];
@@ -5538,13 +6525,13 @@ $L__BB22_5:
 	add.s32 	%r20, %r13, -257;
 	setp.lt.u32 	%p5, %r20, -256;
 	or.pred 	%p6, %p5, %p4;
-	@%p6 bra 	$L__BB23_44;
+	@%p6 bra 	$L__BB24_44;
 // %bb.2:
 	div.s32 	%r3, %r11, %r12;
 	mul.lo.s32 	%r21, %r3, %r12;
 	sub.s32 	%r22, %r11, %r21;
 	setp.ne.b32 	%p7, %r22, 0;
-	@%p7 bra 	$L__BB23_44;
+	@%p7 bra 	$L__BB24_44;
 // %bb.3:
 	ld.param.b32 	%r15, [sofuu_attn_prefill_f32_param_9];
 	ld.param.b32 	%r14, [sofuu_attn_prefill_f32_param_7];
@@ -5552,7 +6539,7 @@ $L__BB22_5:
 	setp.lt.s32 	%p8, %r4, 0;
 	setp.ge.s32 	%p9, %r4, %r15;
 	or.pred 	%p10, %p8, %p9;
-	@%p10 bra 	$L__BB23_44;
+	@%p10 bra 	$L__BB24_44;
 // %bb.4:
 	div.s32 	%r24, %r2, %r3;
 	mul.wide.s32 	%rd21, %r1, %r11;
@@ -5572,27 +6559,27 @@ $L__BB22_5:
 	mov.u32 %r23, %ntid.x;
 	// end inline asm
 	setp.ne.b32 	%p11, %r123, 0;
-	@%p11 bra 	$L__BB23_6;
+	@%p11 bra 	$L__BB24_6;
 // %bb.5:
 	st.shared.b32 	[_ZZ22sofuu_attn_prefill_f32E5s_max], -8388609;
-$L__BB23_6:
+$L__BB24_6:
 	add.s64 	%rd6, %rd1, %rd25;
 	add.s64 	%rd8, %rd3, %rd29;
 	setp.ge.s32 	%p12, %r123, %r13;
 	mov.b64 	%rd44, _ZZ22sofuu_attn_prefill_f32E3acc;
 	mul.wide.s32 	%rd45, %r23, 4;
-	@%p12 bra 	$L__BB23_9;
+	@%p12 bra 	$L__BB24_9;
 // %bb.7:
 	mul.wide.s32 	%rd30, %r123, 4;
 	add.s64 	%rd46, %rd44, %rd30;
 	mov.b32 	%r113, %r123;
-$L__BB23_8:                             // =>This Inner Loop Header: Depth=1
+$L__BB24_8:                             // =>This Inner Loop Header: Depth=1
 	st.shared.b32 	[%rd46], 0;
 	add.s32 	%r113, %r113, %r23;
 	add.s64 	%rd46, %rd46, %rd45;
 	setp.lt.s32 	%p13, %r113, %r13;
-	@%p13 bra 	$L__BB23_8;
-$L__BB23_9:
+	@%p13 bra 	$L__BB24_8;
+$L__BB24_9:
 	ld.param.b32 	%r16, [sofuu_attn_prefill_f32_param_10];
 	add.s64 	%rd7, %rd2, %rd25;
 	add.s64 	%rd48, %rd4, %rd29;
@@ -5606,8 +6593,8 @@ $L__BB23_9:
 	add.s32 	%r114, %r4, 1;
 	shl.b64 	%rd11, %rd5, 2;
 	mov.b64 	%rd47, %rd9;
-	bra.uni 	$L__BB23_10;
-$L__BB23_17:                            //   in Loop: Header=BB23_10 Depth=1
+	bra.uni 	$L__BB24_10;
+$L__BB24_17:                            //   in Loop: Header=BB24_10 Depth=1
 	mov.b32 	%r46, 16;
 	mov.b32 	%r47, -1;
 	// begin inline asm
@@ -5636,24 +6623,24 @@ $L__BB23_17:                            //   in Loop: Header=BB23_10 Depth=1
 	setp.eq.b32 	%p17, %r27, 0;
 	add.f32 	%r60, %r58, %r57;
 	selp.f32 	%r117, %r60, 0f00000000, %p17;
-$L__BB23_18:                            //   in Loop: Header=BB23_10 Depth=1
-	@!%p11 bra 	$L__BB23_19;
-$L__BB23_21:                            //   in Loop: Header=BB23_10 Depth=1
+$L__BB24_18:                            //   in Loop: Header=BB24_10 Depth=1
+	@!%p11 bra 	$L__BB24_19;
+$L__BB24_21:                            //   in Loop: Header=BB24_10 Depth=1
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	add.s32 	%r114, %r114, -1;
 	add.s64 	%rd47, %rd47, %rd11;
 	setp.eq.b32 	%p19, %r114, 0;
-	@%p19 bra 	$L__BB23_22;
-$L__BB23_10:                            // =>This Inner Loop Header: Depth=1
+	@%p19 bra 	$L__BB24_22;
+$L__BB24_10:                            // =>This Inner Loop Header: Depth=1
 	mov.b32 	%r115, 0f00000000;
-	@%p12 bra 	$L__BB23_12;
-// %bb.11:                              //   in Loop: Header=BB23_10 Depth=1
+	@%p12 bra 	$L__BB24_12;
+// %bb.11:                              //   in Loop: Header=BB24_10 Depth=1
 	ld.global.b32 	%r25, [%rd10];
 	ld.global.b32 	%r26, [%rd47];
 	mul.f32 	%r115, %r25, %r26;
-$L__BB23_12:                            //   in Loop: Header=BB23_10 Depth=1
+$L__BB24_12:                            //   in Loop: Header=BB24_10 Depth=1
 	// begin inline asm
 	mov.u32 %r27, %tid.x;
 	// end inline asm
@@ -5685,48 +6672,48 @@ $L__BB23_12:                            //   in Loop: Header=BB23_10 Depth=1
 	and.b32 	%r43, %r27, 31;
 	setp.ne.b32 	%p14, %r43, 0;
 	mov.b64 	%rd33, _ZZ22sofuu_attn_prefill_f32E3red;
-	@%p14 bra 	$L__BB23_14;
-// %bb.13:                              //   in Loop: Header=BB23_10 Depth=1
+	@%p14 bra 	$L__BB24_14;
+// %bb.13:                              //   in Loop: Header=BB24_10 Depth=1
 	shr.u32 	%r44, %r27, 5;
 	mul.wide.u32 	%rd32, %r44, 4;
 	add.s64 	%rd12, %rd33, %rd32;
 	add.f32 	%r5, %r41, %r40;
 	st.shared.b32 	[%rd12], %r5;
-$L__BB23_14:                            //   in Loop: Header=BB23_10 Depth=1
+$L__BB24_14:                            //   in Loop: Header=BB24_10 Depth=1
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	setp.gt.u32 	%p15, %r27, 31;
 	mov.b32 	%r117, 0f00000000;
-	@%p15 bra 	$L__BB23_18;
-// %bb.15:                              //   in Loop: Header=BB23_10 Depth=1
+	@%p15 bra 	$L__BB24_18;
+// %bb.15:                              //   in Loop: Header=BB24_10 Depth=1
 	setp.gt.u32 	%p16, %r27, 7;
 	mov.b32 	%r116, 0f00000000;
-	@%p16 bra 	$L__BB23_17;
-// %bb.16:                              //   in Loop: Header=BB23_10 Depth=1
+	@%p16 bra 	$L__BB24_17;
+// %bb.16:                              //   in Loop: Header=BB24_10 Depth=1
 	mul.wide.u32 	%rd34, %r27, 4;
 	add.s64 	%rd13, %rd33, %rd34;
 	ld.shared.b32 	%r116, [%rd13];
-	bra.uni 	$L__BB23_17;
-$L__BB23_19:                            //   in Loop: Header=BB23_10 Depth=1
+	bra.uni 	$L__BB24_17;
+$L__BB24_19:                            //   in Loop: Header=BB24_10 Depth=1
 	mul.f32 	%r6, %r16, %r117;
 	ld.shared.b32 	%r61, [_ZZ22sofuu_attn_prefill_f32E5s_max];
 	setp.leu.f32 	%p18, %r6, %r61;
-	@%p18 bra 	$L__BB23_21;
-// %bb.20:                              //   in Loop: Header=BB23_10 Depth=1
+	@%p18 bra 	$L__BB24_21;
+// %bb.20:                              //   in Loop: Header=BB24_10 Depth=1
 	st.shared.b32 	[_ZZ22sofuu_attn_prefill_f32E5s_max], %r6;
-	bra.uni 	$L__BB23_21;
-$L__BB23_22:
-	@%p11 bra 	$L__BB23_24;
+	bra.uni 	$L__BB24_21;
+$L__BB24_22:
+	@%p11 bra 	$L__BB24_24;
 // %bb.23:
 	st.shared.b32 	[_ZZ22sofuu_attn_prefill_f32E5s_sum], 0;
-$L__BB23_24:
+$L__BB24_24:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	mov.b32 	%r118, 0;
-	bra.uni 	$L__BB23_25;
-$L__BB23_38:                            //   in Loop: Header=BB23_25 Depth=1
+	bra.uni 	$L__BB24_25;
+$L__BB24_38:                            //   in Loop: Header=BB24_25 Depth=1
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
@@ -5734,12 +6721,12 @@ $L__BB23_38:                            //   in Loop: Header=BB23_25 Depth=1
 	add.s64 	%rd48, %rd48, %rd11;
 	setp.eq.b32 	%p25, %r118, %r4;
 	mov.b32 	%r118, %r9;
-	@%p25 bra 	$L__BB23_39;
-$L__BB23_25:                            // =>This Loop Header: Depth=1
-                                        //     Child Loop BB23_37 Depth 2
+	@%p25 bra 	$L__BB24_39;
+$L__BB24_25:                            // =>This Loop Header: Depth=1
+                                        //     Child Loop BB24_37 Depth 2
 	mov.b32 	%r119, 0f00000000;
-	@%p12 bra 	$L__BB23_27;
-// %bb.26:                              //   in Loop: Header=BB23_25 Depth=1
+	@%p12 bra 	$L__BB24_27;
+// %bb.26:                              //   in Loop: Header=BB24_25 Depth=1
 	cvt.u64.u32 	%rd35, %r118;
 	mul.lo.s64 	%rd36, %rd35, %rd5;
 	shl.b64 	%rd37, %rd36, 2;
@@ -5747,7 +6734,7 @@ $L__BB23_25:                            // =>This Loop Header: Depth=1
 	ld.global.b32 	%r62, [%rd10];
 	ld.global.b32 	%r63, [%rd14];
 	mul.f32 	%r119, %r62, %r63;
-$L__BB23_27:                            //   in Loop: Header=BB23_25 Depth=1
+$L__BB24_27:                            //   in Loop: Header=BB24_25 Depth=1
 	// begin inline asm
 	mov.u32 %r64, %tid.x;
 	// end inline asm
@@ -5778,29 +6765,29 @@ $L__BB23_27:                            //   in Loop: Header=BB23_25 Depth=1
 	// end inline asm
 	and.b32 	%r80, %r64, 31;
 	setp.ne.b32 	%p20, %r80, 0;
-	@%p20 bra 	$L__BB23_29;
-// %bb.28:                              //   in Loop: Header=BB23_25 Depth=1
+	@%p20 bra 	$L__BB24_29;
+// %bb.28:                              //   in Loop: Header=BB24_25 Depth=1
 	shr.u32 	%r81, %r64, 5;
 	mul.wide.u32 	%rd38, %r81, 4;
 	add.s64 	%rd15, %rd33, %rd38;
 	add.f32 	%r7, %r78, %r77;
 	st.shared.b32 	[%rd15], %r7;
-$L__BB23_29:                            //   in Loop: Header=BB23_25 Depth=1
+$L__BB24_29:                            //   in Loop: Header=BB24_25 Depth=1
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
 	setp.gt.u32 	%p21, %r64, 31;
 	mov.b32 	%r121, 0f00000000;
-	@%p21 bra 	$L__BB23_33;
-// %bb.30:                              //   in Loop: Header=BB23_25 Depth=1
+	@%p21 bra 	$L__BB24_33;
+// %bb.30:                              //   in Loop: Header=BB24_25 Depth=1
 	setp.gt.u32 	%p22, %r64, 7;
 	mov.b32 	%r120, 0f00000000;
-	@%p22 bra 	$L__BB23_32;
-// %bb.31:                              //   in Loop: Header=BB23_25 Depth=1
+	@%p22 bra 	$L__BB24_32;
+// %bb.31:                              //   in Loop: Header=BB24_25 Depth=1
 	mul.wide.u32 	%rd39, %r64, 4;
 	add.s64 	%rd16, %rd33, %rd39;
 	ld.shared.b32 	%r120, [%rd16];
-$L__BB23_32:                            //   in Loop: Header=BB23_25 Depth=1
+$L__BB24_32:                            //   in Loop: Header=BB24_25 Depth=1
 	mov.b32 	%r83, 16;
 	mov.b32 	%r84, -1;
 	// begin inline asm
@@ -5829,9 +6816,9 @@ $L__BB23_32:                            //   in Loop: Header=BB23_25 Depth=1
 	setp.eq.b32 	%p23, %r64, 0;
 	add.f32 	%r97, %r95, %r94;
 	selp.f32 	%r121, %r97, 0f00000000, %p23;
-$L__BB23_33:                            //   in Loop: Header=BB23_25 Depth=1
-	@%p11 bra 	$L__BB23_35;
-// %bb.34:                              //   in Loop: Header=BB23_25 Depth=1
+$L__BB24_33:                            //   in Loop: Header=BB24_25 Depth=1
+	@%p11 bra 	$L__BB24_35;
+// %bb.34:                              //   in Loop: Header=BB24_25 Depth=1
 	ld.shared.b32 	%r100, [_ZZ22sofuu_attn_prefill_f32E5s_max];
 	neg.f32 	%r101, %r100;
 	fma.rn.f32 	%r102, %r16, %r121, %r101;
@@ -5843,16 +6830,16 @@ $L__BB23_33:                            //   in Loop: Header=BB23_25 Depth=1
 	add.f32 	%r104, %r98, %r103;
 	st.shared.b32 	[_ZZ22sofuu_attn_prefill_f32E5s_sum], %r104;
 	st.shared.b32 	[_ZZ22sofuu_attn_prefill_f32E3s_w], %r98;
-$L__BB23_35:                            //   in Loop: Header=BB23_25 Depth=1
+$L__BB24_35:                            //   in Loop: Header=BB24_25 Depth=1
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
-	@%p12 bra 	$L__BB23_38;
-// %bb.36:                              //   in Loop: Header=BB23_25 Depth=1
+	@%p12 bra 	$L__BB24_38;
+// %bb.36:                              //   in Loop: Header=BB24_25 Depth=1
 	ld.shared.b32 	%r8, [_ZZ22sofuu_attn_prefill_f32E3s_w];
 	mov.b64 	%rd49, %rd50;
 	mov.b32 	%r122, %r123;
-$L__BB23_37:                            //   Parent Loop BB23_25 Depth=1
+$L__BB24_37:                            //   Parent Loop BB24_25 Depth=1
                                         // =>  This Inner Loop Header: Depth=2
 	add.s64 	%rd40, %rd48, %rd49;
 	ld.global.b32 	%r105, [%rd40];
@@ -5863,24 +6850,24 @@ $L__BB23_37:                            //   Parent Loop BB23_25 Depth=1
 	add.s32 	%r122, %r122, %r23;
 	add.s64 	%rd49, %rd49, %rd45;
 	setp.lt.s32 	%p24, %r122, %r13;
-	@%p24 bra 	$L__BB23_37;
-	bra.uni 	$L__BB23_38;
-$L__BB23_39:
-	@%p11 bra 	$L__BB23_41;
+	@%p24 bra 	$L__BB24_37;
+	bra.uni 	$L__BB24_38;
+$L__BB24_39:
+	@%p11 bra 	$L__BB24_41;
 // %bb.40:
 	ld.shared.b32 	%r108, [_ZZ22sofuu_attn_prefill_f32E5s_sum];
 	setp.gt.f32 	%p26, %r108, 0f00000000;
 	rcp.rn.f32 	%r109, %r108;
 	selp.f32 	%r110, %r109, 0f00000000, %p26;
 	st.shared.b32 	[_ZZ22sofuu_attn_prefill_f32E3s_w], %r110;
-$L__BB23_41:
+$L__BB24_41:
 	// begin inline asm
 	bar.sync 0;
 	// end inline asm
-	@%p12 bra 	$L__BB23_44;
+	@%p12 bra 	$L__BB24_44;
 // %bb.42:
 	ld.shared.b32 	%r10, [_ZZ22sofuu_attn_prefill_f32E3s_w];
-$L__BB23_43:                            // =>This Inner Loop Header: Depth=1
+$L__BB24_43:                            // =>This Inner Loop Header: Depth=1
 	add.s64 	%rd42, %rd44, %rd50;
 	ld.shared.b32 	%r111, [%rd42];
 	mul.f32 	%r112, %r10, %r111;
@@ -5889,8 +6876,8 @@ $L__BB23_43:                            // =>This Inner Loop Header: Depth=1
 	add.s32 	%r123, %r123, %r23;
 	add.s64 	%rd50, %rd50, %rd45;
 	setp.lt.s32 	%p27, %r123, %r13;
-	@%p27 bra 	$L__BB23_43;
-$L__BB23_44:
+	@%p27 bra 	$L__BB24_43;
+$L__BB24_44:
 	ret;
                                         // -- End function
 }

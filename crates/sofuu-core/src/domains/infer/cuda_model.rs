@@ -649,6 +649,32 @@ impl CudaModel {
         }
     }
 
+    /// gate_proj and up_proj read the same normed row and have the same shape,
+    /// so one launch computes both whenever they share the q4_K layout. Every
+    /// other combination falls back to two launches, which is what it was.
+    fn gemv_gate_up(
+        &self,
+        e: &CudaEngine,
+        gate_quant: Quant,
+        gate: DeviceBuf,
+        up_quant: Quant,
+        up: DeviceBuf,
+        y_gate: DeviceBuf,
+        y_up: DeviceBuf,
+        rows: usize,
+        cols: usize,
+    ) -> Result<(), String> {
+        if gate_quant == Quant::Q4K && up_quant == Quant::Q4K {
+            return e
+                .gemv_q4_k_q8_x2(
+                    gate, up, self.xq, self.xd, self.xsum, y_gate, y_up, rows, cols,
+                )
+                .map_err(|err| format!("gemv q4_K x q8_1 (gate+up): {err}"));
+        }
+        self.gemv_act(e, gate_quant, gate, self.x_norm, y_gate, rows, cols)?;
+        self.gemv_act(e, up_quant, up, self.x_norm, y_up, rows, cols)
+    }
+
     /// Run one token. `x_host` is the embedding row (dim f32); `pos` is the
     /// absolute position, which is also the KV row this token writes.
     pub fn forward(
@@ -926,26 +952,18 @@ impl CudaModel {
             // attention residual + ffn norm + quantization in one launch
             self.norm_add_q8(e, self.x, self.proj, l.ffn_norm, self.x_norm, self.dim)
                 .map_err(|err| format!("layer {li} ffn_norm: {err}"))?;
-            self.gemv_act(
+            self.gemv_gate_up(
                 e,
                 l.ffn_gate_quant,
                 l.ffn_gate,
-                self.x_norm,
-                self.gate,
-                self.hidden_dim,
-                self.dim,
-            )
-            .map_err(|err| format!("layer {li} ffn_gate: {err}"))?;
-            self.gemv_act(
-                e,
                 l.ffn_up_quant,
                 l.ffn_up,
-                self.x_norm,
+                self.gate,
                 self.up,
                 self.hidden_dim,
                 self.dim,
             )
-            .map_err(|err| format!("layer {li} ffn_up: {err}"))?;
+            .map_err(|err| format!("layer {li} ffn gate/up: {err}"))?;
             self.swiglu_q8(e, self.gate, self.up, self.act, self.hidden_dim)
                 .map_err(|err| format!("layer {li} swiglu: {err}"))?;
             self.gemv_act(

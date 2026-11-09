@@ -700,23 +700,14 @@ void sofuu_quantize_q8_1(const float *__restrict__ x, signed char *__restrict__ 
 // the difference to the earlier 8-byte version: same arithmetic, 4x the weight
 // bytes per load instruction and 6x the bytes in flight, which is what a decode
 // row-dot needs to cover DRAM latency.
-extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4)
-void sofuu_gemv_q4_k_q8(const unsigned char *__restrict__ w,
-                        const signed char *__restrict__ xq,
-                        const float *__restrict__ xd,
-                        const int *__restrict__ xs,
-                        float *__restrict__ y, int rows, int cols) {
-    unsigned int tid = sofuu_tid_x();
-    int warp = (int)(tid >> 5);
-    int lane = (int)(tid & 31u);
-    int row = (int)sofuu_ctaid_x() * 8 + warp;
-    if (row >= rows) return;
-    int nb = cols / SOFUU_QK_K;
-    const unsigned char *roww = w + (unsigned long long)row *
-                                     (unsigned long long)nb * SOFUU_Q4_K_BYTES;
-    const int chunk = lane & 7;  // 16-byte qs chunk inside a block
-    const int bgrp = lane >> 3;  // which of four blocks this lane feeds
-    const int k = chunk >> 1;
+// One row's lane-partial accumulator over `nb` q4_K blocks; the caller finishes
+// with a warp sum. The fused gate+up kernel below carries its own loop (it
+// loads the activation chunk once for two matrices), so this one stays the
+// shape the single-matrix kernel wants.
+static SOFUU_DEVICE SOFUU_INLINE float sofuu_q4k_row_q8(
+    const unsigned char *__restrict__ roww, const signed char *__restrict__ xq,
+    const float *__restrict__ xd, const int *__restrict__ xs, int nb, int chunk,
+    int bgrp, int k) {
     float acc = 0.0f;
     int b = bgrp;
     // Pairs of four-block groups: both groups' weight and activation loads are
@@ -743,8 +734,104 @@ void sofuu_gemv_q4_k_q8(const unsigned char *__restrict__ w,
         acc += sofuu_q4k_chunk32_q8(p, xq + (unsigned long long)b * 256, chunk,
                                    b, xd, xs);
     }
+    return acc;
+}
+
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4)
+void sofuu_gemv_q4_k_q8(const unsigned char *__restrict__ w,
+                        const signed char *__restrict__ xq,
+                        const float *__restrict__ xd,
+                        const int *__restrict__ xs,
+                        float *__restrict__ y, int rows, int cols) {
+    unsigned int tid = sofuu_tid_x();
+    int warp = (int)(tid >> 5);
+    int lane = (int)(tid & 31u);
+    int row = (int)sofuu_ctaid_x() * 8 + warp;
+    if (row >= rows) return;
+    int nb = cols / SOFUU_QK_K;
+    const unsigned char *roww = w + (unsigned long long)row *
+                                     (unsigned long long)nb * SOFUU_Q4_K_BYTES;
+    const int chunk = lane & 7;  // 16-byte qs chunk inside a block
+    const int bgrp = lane >> 3;  // which of four blocks this lane feeds
+    float acc = sofuu_q4k_row_q8(roww, xq, xd, xs, nb, chunk, bgrp, chunk >> 1);
     float total = sofuu_warp_sum(acc);
     if (lane == 0) y[row] = total;
+}
+
+// gate_proj and up_proj share the normed row, the shape and (in every Q4_K_M
+// model) the quant type, so a decode step launched them back to back over the
+// same activation. That cost two dispatches and two dependent stalls for what
+// is one 2x-longer weight stream: the mixed launch bench puts a single
+// intervening kernel at ~8 us, which on a 9.4 MiB matrix is a fifth of its
+// runtime. The activation chunk is loaded once and fed to both matrices, so the
+// per-lane dp4a count doubles while the load count only grows by the weights.
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4)
+void sofuu_gemv_q4_k_q8_x2(const unsigned char *__restrict__ w0,
+                           const unsigned char *__restrict__ w1,
+                           const signed char *__restrict__ xq,
+                           const float *__restrict__ xd,
+                           const int *__restrict__ xs,
+                           float *__restrict__ y0, float *__restrict__ y1,
+                           int rows, int cols) {
+    unsigned int tid = sofuu_tid_x();
+    int warp = (int)(tid >> 5);
+    int lane = (int)(tid & 31u);
+    int row = (int)sofuu_ctaid_x() * 8 + warp;
+    if (row >= rows) return;
+    int nb = cols / SOFUU_QK_K;
+    unsigned long long stride = (unsigned long long)nb * SOFUU_Q4_K_BYTES;
+    const unsigned char *r0 = w0 + (unsigned long long)row * stride;
+    const unsigned char *r1 = w1 + (unsigned long long)row * stride;
+    const int chunk = lane & 7;
+    const int bgrp = lane >> 3;
+    const int k = chunk >> 1;
+    float acc0 = 0.0f, acc1 = 0.0f;
+    int b = bgrp;
+    for (; b + 4 < nb; b += 8) {
+        const sofuu_block_q4_K *a0 = (const sofuu_block_q4_K *)(
+            r0 + (unsigned long long)b * SOFUU_Q4_K_BYTES);
+        const sofuu_block_q4_K *c0 = (const sofuu_block_q4_K *)(
+            r1 + (unsigned long long)b * SOFUU_Q4_K_BYTES);
+        const sofuu_block_q4_K *a1 = (const sofuu_block_q4_K *)(
+            r0 + (unsigned long long)(b + 4) * SOFUU_Q4_K_BYTES);
+        const sofuu_block_q4_K *c1 = (const sofuu_block_q4_K *)(
+            r1 + (unsigned long long)(b + 4) * SOFUU_Q4_K_BYTES);
+        sofuu_u128 wa0, wc0, wa1, wc1, xlo0, xhi0, xlo1, xhi1;
+        // Four weight loads and two activation loads signed to this warp before
+        // the first dp4a; the activation pairs are then used twice each.
+        sofuu_q4k_w_load(a0, chunk, &wa0);
+        sofuu_q4k_w_load(c0, chunk, &wc0);
+        sofuu_q4k_x_load(xq + (unsigned long long)b * 256, 0, chunk, &xlo0,
+                         &xhi0);
+        sofuu_q4k_w_load(a1, chunk, &wa1);
+        sofuu_q4k_w_load(c1, chunk, &wc1);
+        sofuu_q4k_x_load(xq + (unsigned long long)(b + 4) * 256, 0, chunk,
+                         &xlo1, &xhi1);
+        int i0 = b * 8 + 2 * k, i1 = (b + 4) * 8 + 2 * k;
+        acc0 += sofuu_q4k_chunk32_compute(wa0, xlo0, xhi0, a0, chunk, xd[i0],
+                                          xs[i0], xd[i0 + 1], xs[i0 + 1]);
+        acc1 += sofuu_q4k_chunk32_compute(wc0, xlo0, xhi0, c0, chunk, xd[i0],
+                                          xs[i0], xd[i0 + 1], xs[i0 + 1]);
+        acc0 += sofuu_q4k_chunk32_compute(wa1, xlo1, xhi1, a1, chunk, xd[i1],
+                                          xs[i1], xd[i1 + 1], xs[i1 + 1]);
+        acc1 += sofuu_q4k_chunk32_compute(wc1, xlo1, xhi1, c1, chunk, xd[i1],
+                                          xs[i1], xd[i1 + 1], xs[i1 + 1]);
+    }
+    for (; b < nb; b += 4) {
+        const sofuu_block_q4_K *a = (const sofuu_block_q4_K *)(
+            r0 + (unsigned long long)b * SOFUU_Q4_K_BYTES);
+        const sofuu_block_q4_K *c = (const sofuu_block_q4_K *)(
+            r1 + (unsigned long long)b * SOFUU_Q4_K_BYTES);
+        const signed char *xrow = xq + (unsigned long long)b * 256;
+        acc0 += sofuu_q4k_chunk32_q8(a, xrow, chunk, b, xd, xs);
+        acc1 += sofuu_q4k_chunk32_q8(c, xrow, chunk, b, xd, xs);
+    }
+    float t0 = sofuu_warp_sum(acc0);
+    float t1 = sofuu_warp_sum(acc1);
+    if (lane == 0) {
+        y0[row] = t0;
+        y1[row] = t1;
+    }
 }
 
 // Four lanes per block, 64 values each, so a warp covers eight blocks and a

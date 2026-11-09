@@ -358,6 +358,79 @@ void test_gemv_q4_k_q8(void *fn_quant, void *fn_gemv, uint32_t &seed) {
     sofuu_cuda_ctx_free(g_ctx, dy);
 }
 
+// gate+up: two matrices, one activation row, two outputs. The check is the
+// same per-row dot as the single-matrix test, run against both weight buffers,
+// so a lane mapping that leaks between the two streams shows up here.
+void test_gemv_q4_k_q8_x2(void *fn_quant, void *fn_gemv, uint32_t &seed) {
+    const int rows = 16, cols = 2048;
+    const int nblk = cols / 32;
+    std::vector<uint8_t> w0, w1;
+    fill_q4_k(w0, rows, cols, seed);
+    fill_q4_k(w1, rows, cols, seed);
+    std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
+    std::vector<int8_t> xq(cols);
+    std::vector<float> xd(nblk);
+    std::vector<int32_t> xs(nblk), xs16(nblk * 2);
+    sofuu_ref::quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(),
+                             xs16.data(), cols);
+
+    unsigned long long dw0 = 0, dw1 = 0, dx = 0, dq = 0, dd = 0, ds = 0,
+                       d16 = 0, dy0 = 0, dy1 = 0;
+    if (!alloc_upload(w0.data(), w0.size(), &dw0) ||
+        !alloc_upload(w1.data(), w1.size(), &dw1) ||
+        !alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
+        !alloc_only((unsigned long long)cols, &dq) ||
+        !alloc_only((unsigned long long)nblk * 4, &dd) ||
+        !alloc_only((unsigned long long)nblk * 4, &ds) ||
+        !alloc_only((unsigned long long)nblk * 8, &d16) ||
+        !alloc_only((unsigned long long)rows * sizeof(float), &dy0) ||
+        !alloc_only((unsigned long long)rows * sizeof(float), &dy1)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    {
+        int n = cols;
+        std::vector<void *> params = {&dx, &dq, &dd, &ds, &d16, (void *)&n};
+        if (!launch(fn_quant, (unsigned)((nblk + 7) / 8), 256, params)) return;
+    }
+    std::vector<float> got0((size_t)rows, 0.0f), got1((size_t)rows, 0.0f);
+    {
+        int r = rows, c = cols;
+        std::vector<void *> params = {&dw0, &dw1, &dq,       &dd,       &ds,
+                                      &dy0, &dy1, (void *)&r, (void *)&c};
+        if (!launch(fn_gemv, (unsigned)((rows + 7) / 8), 256, params) ||
+            !download(dy0, got0.data(), (size_t)rows * sizeof(float)) ||
+            !download(dy1, got1.data(), (size_t)rows * sizeof(float))) {
+            return;
+        }
+    }
+    double worst = 0.0, bound = 0.0, worst_ref = 0.0;
+    for (int r = 0; r < rows; ++r) {
+        for (int which = 0; which < 2; ++which) {
+            const std::vector<uint8_t> &w = which == 0 ? w0 : w1;
+            const std::vector<float> &got = which == 0 ? got0 : got1;
+            const uint8_t *row = w.data() + (size_t)r * (cols / 256) * 144;
+            sofuu_ref::Dot want =
+                sofuu_ref::dot_q4_k_q8(row, xq.data(), xd.data(), xs.data(), cols);
+            double e = std::fabs((double)got[(size_t)r] - want.value);
+            double b = 1e-5 * (want.l1 > 1.0 ? want.l1 : 1.0) + 1e-6;
+            if (e > worst) { worst = e; worst_ref = want.value; }
+            if (b > bound) bound = b;
+        }
+    }
+    report("gemv_q4_k_x2_x_q8", worst <= bound, worst, bound, worst_ref);
+    sofuu_cuda_ctx_free(g_ctx, dw0);
+    sofuu_cuda_ctx_free(g_ctx, dw1);
+    sofuu_cuda_ctx_free(g_ctx, dx);
+    sofuu_cuda_ctx_free(g_ctx, dq);
+    sofuu_cuda_ctx_free(g_ctx, dd);
+    sofuu_cuda_ctx_free(g_ctx, ds);
+    sofuu_cuda_ctx_free(g_ctx, d16);
+    sofuu_cuda_ctx_free(g_ctx, dy0);
+    sofuu_cuda_ctx_free(g_ctx, dy1);
+}
+
 void test_gemv_q6_k_q8(void *fn_quant, void *fn_gemv, uint32_t &seed) {
     const int rows = 8, cols = 2048;
     const int nblk = cols / 32;
@@ -900,6 +973,66 @@ void bench_gemv_q8(const char *name, void *fn, int kind, int rows, int cols,
     sofuu_cuda_ctx_free(g_ctx, dy);
 }
 
+// The FFN pair the model actually issues: gate and up over one activation row.
+// The interesting number is not GB/s on its own but GB/s against the single
+// matrix above -- the fused launch streams twice the bytes for one dispatch, so
+// it should land at or above the solo rate instead of losing to it.
+void bench_gemv_q4_k_q8_x2(const char *name, void *fn, int rows, int cols,
+                           int iters, uint32_t &seed) {
+    std::vector<uint8_t> w0, w1;
+    fill_q4_k(w0, rows, cols, seed);
+    fill_q4_k(w1, rows, cols, seed);
+    const int nblk = cols / 32;
+    std::vector<float> x = random_vec(cols, seed, -1.0f, 1.0f);
+    std::vector<int8_t> xq(cols);
+    std::vector<float> xd(nblk);
+    std::vector<int32_t> xs(nblk), xs16(nblk * 2);
+    sofuu_ref::quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(),
+                             xs16.data(), cols);
+    unsigned long long dw0 = 0, dw1 = 0, dq = 0, dd = 0, ds = 0, dy0 = 0,
+                       dy1 = 0;
+    if (!alloc_upload(w0.data(), w0.size(), &dw0) ||
+        !alloc_upload(w1.data(), w1.size(), &dw1) ||
+        !alloc_upload(xq.data(), xq.size(), &dq) ||
+        !alloc_upload(xd.data(), (size_t)nblk * 4, &dd) ||
+        !alloc_upload(xs.data(), (size_t)nblk * 4, &ds) ||
+        !alloc_only((unsigned long long)rows * sizeof(float), &dy0) ||
+        !alloc_only((unsigned long long)rows * sizeof(float), &dy1)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    std::vector<void *> params = {&dw0, &dw1, &dq, &dd, &ds, &dy0, &dy1,
+                                  (void *)&rows, (void *)&cols};
+    unsigned grid = (unsigned)((rows + 7) / 8);
+    for (int i = 0; i < 3; ++i)
+        if (!launch_async(fn, grid, 256, params)) return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
+        fail_msg("q8_x2 warmup sync");
+        return;
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i)
+        if (!launch_async(fn, grid, 256, params)) return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) {
+        fail_msg("q8_x2 bench sync");
+        return;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    double sec = std::chrono::duration<double>(t1 - t0).count();
+    double bytes = 2.0 * (double)rows * (double)(cols / 256) * 144.0 *
+                   (double)iters;
+    std::printf("[bench] %-10s %dx%d  %.1f GB/s  %.3f ms/launch\n", name, rows,
+                cols, bytes / sec / 1e9, sec * 1000.0 / (double)iters);
+    sofuu_cuda_ctx_free(g_ctx, dw0);
+    sofuu_cuda_ctx_free(g_ctx, dw1);
+    sofuu_cuda_ctx_free(g_ctx, dq);
+    sofuu_cuda_ctx_free(g_ctx, dd);
+    sofuu_cuda_ctx_free(g_ctx, ds);
+    sofuu_cuda_ctx_free(g_ctx, dy0);
+    sofuu_cuda_ctx_free(g_ctx, dy1);
+}
+
 // The model does not run a GEMV 400 times in a row: it runs it once, between a
 // rmsnorm+quantize and the next layer. In situ the same kernel that measures
 // 257 GB/s back-to-back only reaches ~159 GB/s, so this bench reproduces the
@@ -1335,6 +1468,7 @@ int main(int argc, char **argv) {
 
     void *f_q8 = nullptr, *f_q4 = nullptr, *f_q6 = nullptr, *f_f32 = nullptr;
     void *f_quant = nullptr, *f_q4q8 = nullptr, *f_q6q8 = nullptr;
+    void *f_q4q8x2 = nullptr;
     void *f_rms_q8 = nullptr, *f_rmsadd_q8 = nullptr, *f_swiglu_q8 = nullptr;
     void *f_rms = nullptr, *f_swi = nullptr, *f_rope = nullptr, *f_kv = nullptr;
     void *f_attn = nullptr, *f_add = nullptr;
@@ -1346,6 +1480,7 @@ int main(int argc, char **argv) {
         !get_function("sofuu_gemv_f32", &f_f32) ||
         !get_function("sofuu_quantize_q8_1", &f_quant) ||
         !get_function("sofuu_gemv_q4_k_q8", &f_q4q8) ||
+        !get_function("sofuu_gemv_q4_k_q8_x2", &f_q4q8x2) ||
         !get_function("sofuu_gemv_q6_k_q8", &f_q6q8) ||
         !get_function("sofuu_rmsnorm_q8", &f_rms_q8) ||
         !get_function("sofuu_rmsnorm_add_q8", &f_rmsadd_q8) ||
@@ -1372,6 +1507,7 @@ int main(int argc, char **argv) {
         test_gemv_q6_k(f_q6, seed, cols);
     }
     test_gemv_q4_k_q8(f_quant, f_q4q8, seed);
+    test_gemv_q4_k_q8_x2(f_quant, f_q4q8x2, seed);
     test_gemv_q6_k_q8(f_quant, f_q6q8, seed);
     test_fused_q8(f_rms_q8, f_rmsadd_q8, f_swiglu_q8, seed);
     test_gemv_f32(f_f32, seed);
@@ -1413,6 +1549,7 @@ int main(int argc, char **argv) {
     bench_gemv_q8("q6k_x_q8_lm", f_q6q8, 2, 128256, 2048, 60, seed);
     bench_gemv_q8_mixed("q4k_mixed", f_q4q8, 8192, 2048, seed);
     bench_gemv_q8_mixed("q4k_mixed_2k", f_q4q8, 2048, 2048, seed);
+    bench_gemv_q4_k_q8_x2("q4k_x2", f_q4q8x2, 8192, 2048, 200, seed);
 
     sofuu_cuda_ctx_destroy(g_ctx);
     sofuu_cuda_driver_close(g_drv);

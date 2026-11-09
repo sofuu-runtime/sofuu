@@ -127,7 +127,15 @@ build_abi() {
     export SOFUU_QTSQ_DIR="$QTSQ_DIR"
     export SOFUU_ZLIB_DIR="$QTSQ_DIR"
 
-    cargo build --release -p sofuu-capi --target "$RUST_TARGET"
+    # A Rust cdylib has no DT_SONAME by default. Without it the AAR's JNI
+    # shim records the build-time absolute path in DT_NEEDED, which Android
+    # cannot resolve from an installed APK. The 16 KiB page alignment is
+    # required for Android 15+ devices; both flags must match the
+    # scripts/mobile/build_engine_android.sh path.
+    RUSTFLAGS="${RUSTFLAGS:-} \
+        -C link-arg=-Wl,-soname,libsofuu.so \
+        -C link-arg=-Wl,-z,max-page-size=16384" \
+        cargo build --release -p sofuu-capi --target "$RUST_TARGET"
 
     mkdir -p "$DIST"
     cp "target/${RUST_TARGET}/release/libsofuu_capi.so" "$DIST/libsofuu-android-$ABI.so" 2>/dev/null || \

@@ -304,27 +304,24 @@ jobs:
       - name: Build the Android .so's
         run: ./scripts/dist/android.sh all
 
-      - name: Build the AAR
+      - name: Build and verify the AAR
         run: |
           set -euo pipefail
-          # Stage the prebuilt .so's where the library's CMake expects them.
-          mkdir -p bindings/android/sofuu/src/main/jniLibs/arm64-v8a
-          mkdir -p bindings/android/sofuu/src/main/jniLibs/x86_64
-          cp dist/libsofuu-android-aarch64.so bindings/android/sofuu/src/main/jniLibs/arm64-v8a/libsofuu.so
-          cp dist/libsofuu-android-x86_64.so  bindings/android/sofuu/src/main/jniLibs/x86_64/libsofuu.so
-          # Verify the native payload is really there — an AAR with no .so is a
-          # silent UnsatisfiedLinkError in every consumer app.
-          for abi in arm64-v8a x86_64; do
-            test -s "bindings/android/sofuu/src/main/jniLibs/$abi/libsofuu.so" \
-              || { echo "missing .so for $abi"; exit 1; }
-          done
+          # Stage libsofuu.so + libc++_shared.so + the C header and legal
+          # notices. The manual copy this replaced omitted libc++_shared.so.
+          bash scripts/mobile/stage_android_sdk.sh
           cd bindings/android
           # A committed gradle wrapper is not in this repo; use the runner's
           # gradle. This job is the one place the AAR is built.
-          gradle --no-daemon :sofuu:assembleRelease
+          gradle --no-daemon -PsofuuVersion=0.3.1 :sofuu:verifyAarContents
           cd ../..
+          # Fail closed on the three 0.3.0 regressions: missing libc++,
+          # absolute DT_NEEDED, and 4 KiB LOAD alignment.
+          bash scripts/mobile/verify_android_aar.sh \
+            bindings/android/sofuu/build/outputs/aar/sofuu-release.aar
           mkdir -p dist/sofuu-android
-          cp bindings/android/sofuu/build/outputs/aar/sofuu-release.aar dist/sofuu-android/sofuu-android.aar
+          cp bindings/android/sofuu/build/outputs/aar/sofuu-release.aar \
+            dist/sofuu-android/sofuu-android.aar
           cp examples/headless/KotlinSample/CMakeLists.txt dist/sofuu-android/ 2>/dev/null || true
           tar -czf dist/libsofuu-android.tar.gz -C dist sofuu-android
           (cd dist && sha256sum libsofuu-android.tar.gz > libsofuu-android.tar.gz.sha256)

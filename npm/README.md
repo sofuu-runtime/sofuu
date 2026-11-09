@@ -24,7 +24,7 @@ its SHA-256 against the published checksum, and places it under
 `bin/runtime/`. If the verification fails, **nothing is installed** — this
 package will not put an unverified binary on your machine.
 
-Current release: **v0.3.0-beta.2**. The binary is revision-stamped — run
+Current release: **v0.3.0-beta.3**. The binary is revision-stamped — run
 `sofuu version` and it prints the exact commit it was built from.
 
 Supported today: macOS (arm64) and Linux, x86_64 and arm64. (Windows is on

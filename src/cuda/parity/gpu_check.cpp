@@ -16,8 +16,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "../cuda_loader.h"
@@ -28,6 +30,47 @@ namespace {
 int g_failures = 0;
 sofuu_cuda_driver *g_drv = nullptr;
 sofuu_cuda_ctx *g_ctx = nullptr;
+
+// Parameter count per resolved kernel, parsed out of the PTX the harness
+// loaded. `cuLaunchKernel` reads one pointer per DECLARED parameter and cannot
+// know how many the caller built, so a kernel that gains an argument silently
+// reads past the caller's array -- a segfault in the harness process rather
+// than a parity failure. That has now cost two round trips; the PTX already
+// states the arity, so check it on every launch.
+std::map<void *, std::pair<std::string, int>> g_arity;
+std::string g_ptx_text;
+
+int ptx_param_count(const std::string &ptx, const char *name) {
+    const std::string key = std::string(".entry ") + name + "(";
+    size_t pos = ptx.find(key);
+    if (pos == std::string::npos) return -1;
+    pos += key.size();
+    int count = 0, depth = 1;
+    for (size_t i = pos; i < ptx.size(); ++i) {
+        char c = ptx[i];
+        if (c == '(') {
+            ++depth;
+        } else if (c == ')') {
+            if (--depth == 0) break;
+        } else if (c == '.' && ptx.compare(i, 6, ".param") == 0) {
+            ++count;
+            i += 5;
+        }
+    }
+    return count;
+}
+
+bool check_arity(void *fn, size_t got) {
+    auto it = g_arity.find(fn);
+    if (it == g_arity.end() || it->second.second < 0) return true;
+    if ((size_t)it->second.second == got) return true;
+    std::fprintf(stderr,
+                 "FAIL: %s declares %d parameters, the harness passed %zu -- "
+                 "cuLaunchKernel would read past the array\n",
+                 it->second.first.c_str(), it->second.second, got);
+    ++g_failures;
+    return false;
+}
 
 void fail_msg(const char *what) {
     std::fprintf(stderr, "[cuda] %s: %s\n", what, sofuu_cuda_last_error());
@@ -75,6 +118,7 @@ bool download(unsigned long long dev, void *host, size_t bytes) {
 
 bool launch(void *fn, unsigned grid, unsigned block,
             std::vector<void *> params) {
+    if (!check_arity(fn, params.size())) return false;
     if (sofuu_cuda_ctx_launch(g_ctx, fn, grid, 1, 1, block, 1, 1, 0,
                               params.data()) != 0) {
         fail_msg("cuLaunchKernel");
@@ -92,6 +136,7 @@ bool launch(void *fn, unsigned grid, unsigned block,
 // round-trip latency.
 bool launch_async(void *fn, unsigned grid, unsigned block,
                   std::vector<void *> params) {
+    if (!check_arity(fn, params.size())) return false;
     if (sofuu_cuda_ctx_launch(g_ctx, fn, grid, 1, 1, block, 1, 1, 0,
                               params.data()) != 0) {
         fail_msg("cuLaunchKernel");
@@ -158,6 +203,8 @@ bool get_function(const char *name, void **out) {
         fail_msg(name);
         return false;
     }
+    g_arity[*out] = std::make_pair(std::string(name),
+                                   ptx_param_count(g_ptx_text, name));
     return true;
 }
 
@@ -1575,12 +1622,12 @@ void test_attn_split(void *fn_split, void *fn_combine, void *fn_quant,
                                        (void *)&n_kv, (void *)&hd,
                                        (void *)&cap,  (void *)&scale,
                                        &dsq,          (void *)&n_splits};
-        std::vector<void *> cparams = {&dpart,       &dout,
-                                       (void *)&n_heads, (void *)&n_kv,
-                                       (void *)&hd,  (void *)&n_splits,
-                                       &daq,         &dad,
-                                       &das,         &da16,
-                                       (void *)&do_quant};
+        std::vector<void *> cparams = {&dpart,         &dout,
+                                       (void *)&n_heads, (void *)&n_heads,
+                                       (void *)&n_kv,  (void *)&hd,
+                                       (void *)&n_splits, &daq,
+                                       &dad,           &das,
+                                       &da16,          (void *)&do_quant};
         std::vector<float> got((size_t)row_n, 0.0f);
         bool ok = launch(fn_split, (unsigned)(n_heads * n_splits), 32, sparams) &&
                   launch(fn_combine, (unsigned)n_heads, 256, cparams) &&
@@ -1729,10 +1776,6 @@ void bench_attn_decoders(void *fn_old, void *fn_split, void *fn_combine,
         ++g_failures;
         return;
     }
-    std::vector<void *> oparams = {&dq,  &dk, &dv,           &dout,
-                                   (void *)&n_heads, (void *)&n_kv,
-                                   (void *)&hd, &dsq, (void *)&cap,
-                                   (void *)&scale};
     // The block kernel now also carries the fused quantizer's parameters.
     std::vector<void *> oparams_full = {&dq,  &dk,  &dv,  &dout,
                                         (void *)&n_heads, (void *)&n_kv,
@@ -1745,11 +1788,11 @@ void bench_attn_decoders(void *fn_old, void *fn_split, void *fn_combine,
                                    (void *)&cap,   (void *)&scale,
                                    &dsq,           (void *)&n_splits};
     std::vector<void *> cparams = {&dpart,          &dout,
-                                   (void *)&n_heads, (void *)&n_kv,
-                                   (void *)&hd,     (void *)&n_splits,
-                                   &daq,            &dad,
-                                   &das,            &da16,
-                                   (void *)&do_quant};
+                                   (void *)&n_heads, (void *)&n_heads,
+                                   (void *)&n_kv,   (void *)&hd,
+                                   (void *)&n_splits, &daq,
+                                   &dad,            &das,
+                                   &da16,           (void *)&do_quant};
     const int iters = 8;
     // Warm both paths, then time them one after the other.
     for (int i = 0; i < 2; ++i) {
@@ -1779,7 +1822,6 @@ void bench_attn_decoders(void *fn_old, void *fn_split, void *fn_combine,
     std::printf("[bench] attn_ctx%d    block %.3f ms/launch  split(x%d) %.3f "
                 "ms/launch  %.1fx  (per layer, quantize off)\n",
                 seq, old_ms, n_splits, new_ms, new_ms > 0.0 ? old_ms / new_ms : 0.0);
-    (void)oparams;
     sofuu_cuda_ctx_free(g_ctx, dq);
     sofuu_cuda_ctx_free(g_ctx, dk);
     sofuu_cuda_ctx_free(g_ctx, dv);
@@ -1938,6 +1980,7 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "FAIL: cannot read PTX at %s\n", ptx_path);
         return 1;
     }
+    g_ptx_text = ptx;
     g_ctx = sofuu_cuda_ctx_create(g_drv, 0);
     if (!g_ctx) {
         fail_msg("ctx_create");

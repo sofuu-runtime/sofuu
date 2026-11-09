@@ -874,41 +874,28 @@ impl CudaModel {
             )
             .map_err(|err| format!("layer {li} attn_v: {err}"))?;
 
-            e.rope(
-                self.q,
-                self.rope_dev,
-                sin_dev,
-                self.n_heads,
-                self.head_dim,
-                self.rope_n_rot,
-                self.rope_interleaved,
-            )
-            .map_err(|err| format!("layer {li} q rope: {err}"))?;
-            e.rope(
-                self.k,
-                self.rope_dev,
-                sin_dev,
-                self.n_kv_heads,
-                self.head_dim,
-                self.rope_n_rot,
-                self.rope_interleaved,
-            )
-            .map_err(|err| format!("layer {li} k rope: {err}"))?;
-
             let k_slice = layer_slice(self.k_cache, li, self.per_layer_kv);
             let v_slice = layer_slice(self.v_cache, li, self.per_layer_kv);
-            e.kv_write(
-                k_slice,
-                v_slice,
+            // q RoPE, k RoPE and the cache write are one serial dependency on
+            // ~3 KiB of data, so they share a launch: the trailing blocks
+            // rotate k and then write both rows at `pos`.
+            e.rope_kv(
+                self.q,
                 self.k,
                 self.v,
-                pos,
+                k_slice,
+                v_slice,
+                self.rope_dev,
+                sin_dev,
                 self.pos_dev,
+                self.n_heads,
                 self.n_kv_heads,
                 self.head_dim,
+                self.rope_n_rot,
+                self.rope_interleaved,
                 self.cap,
             )
-            .map_err(|err| format!("layer {li} kv_write: {err}"))?;
+            .map_err(|err| format!("layer {li} rope+kv_write: {err}"))?;
             e.attn_decode(
                 self.q,
                 k_slice,

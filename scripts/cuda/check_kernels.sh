@@ -56,7 +56,7 @@ fi
 missing=0
 for k in sofuu_gemv_q8_0 sofuu_gemv_q4_k sofuu_gemv_q6_k sofuu_gemv_f32 \
          sofuu_quantize_q8_1 sofuu_gemv_q4_k_q8 sofuu_gemv_q4_k_q8_x2 sofuu_gemv_q6_k_q8 \
-         sofuu_rmsnorm sofuu_rmsnorm_q8 sofuu_rmsnorm_add_q8 sofuu_swiglu sofuu_swiglu_q8 sofuu_rope_f32 sofuu_kv_write_f32 \
+         sofuu_rmsnorm sofuu_rmsnorm_q8 sofuu_rmsnorm_add_q8 sofuu_swiglu sofuu_swiglu_q8 sofuu_rope_f32 sofuu_rope_kv_f32 sofuu_kv_write_f32 \
          sofuu_attn_decode_f32 sofuu_add_f32 \
          sofuu_gemm_q4_k_b8 sofuu_gemm_q6_k_b8 sofuu_gemm_q8_0_b8 \
          sofuu_gemm_f32_b8 sofuu_rmsnorm_batch sofuu_rope_batch \
@@ -67,7 +67,7 @@ for k in sofuu_gemv_q8_0 sofuu_gemv_q4_k sofuu_gemv_q6_k sofuu_gemv_f32 \
     }
 done
 if [[ "$missing" -eq 0 ]]; then
-    echo "[PASS] 25 kernel entries present in kernels.ptx"
+    echo "[PASS] 26 kernel entries present in kernels.ptx"
     pass=$((pass + 1))
 else
     exit 1

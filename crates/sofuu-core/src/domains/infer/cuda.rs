@@ -21,7 +21,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 /// Every kernel name the checked-in PTX must export. Kept in one place so the
 /// generator script, the Rust init check and the tests cannot drift.
-pub const PTX_ENTRIES: [&str; 25] = [
+pub const PTX_ENTRIES: [&str; 26] = [
     "sofuu_gemv_q8_0",
     "sofuu_gemv_q4_k",
     "sofuu_gemv_q6_k",
@@ -36,6 +36,7 @@ pub const PTX_ENTRIES: [&str; 25] = [
     "sofuu_swiglu_q8",
     "sofuu_swiglu",
     "sofuu_rope_f32",
+    "sofuu_rope_kv_f32",
     "sofuu_kv_write_f32",
     "sofuu_attn_decode_f32",
     "sofuu_add_f32",
@@ -1520,6 +1521,103 @@ mod imp {
             )
         }
 
+        /// RoPE on q, RoPE on k and the KV write, as one launch: the three
+        /// ran back to back on tiny buffers. Grid is n_heads + n_kv_heads
+        /// blocks; the trailing n_kv_heads blocks also write the cache.
+        #[allow(clippy::too_many_arguments)]
+        pub fn rope_kv(
+            &self,
+            q: DeviceBuf,
+            k: DeviceBuf,
+            v: DeviceBuf,
+            k_cache: DeviceBuf,
+            v_cache: DeviceBuf,
+            cos_tab: DeviceBuf,
+            sin_tab: DeviceBuf,
+            pos_dev: DeviceBuf,
+            n_heads: usize,
+            n_kv_heads: usize,
+            head_dim: usize,
+            n_rot: usize,
+            interleaved: bool,
+            cap: usize,
+        ) -> Result<(), CudaError> {
+            let need_row = head_dim
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| CudaError("rope_kv row size overflow".into()))?;
+            let need_cache = cap
+                .checked_mul(n_kv_heads)
+                .and_then(|n| n.checked_mul(head_dim))
+                .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| CudaError("rope_kv cache size overflow".into()))?;
+            if n_heads == 0
+                || n_kv_heads == 0
+                || head_dim == 0
+                || n_rot == 0
+                || n_rot > head_dim
+                || n_rot % 2 != 0
+            {
+                return Err(CudaError(format!(
+                    "rope_kv rejects n_heads={n_heads} n_kv_heads={n_kv_heads} head_dim={head_dim} n_rot={n_rot}"
+                )));
+            }
+            if q.bytes < n_heads * need_row
+                || k.bytes < n_kv_heads * need_row
+                || v.bytes < n_kv_heads * need_row
+                || k_cache.bytes < need_cache
+                || v_cache.bytes < need_cache
+                || pos_dev.bytes < 4
+            {
+                return Err(CudaError(format!(
+                    "rope_kv buffers too small: q {}<{}, k {}<{}, v {}<{}, k_cache {}<{need_cache}, v_cache {}<{need_cache}",
+                    q.bytes,
+                    n_heads * need_row,
+                    k.bytes,
+                    n_kv_heads * need_row,
+                    v.bytes,
+                    n_kv_heads * need_row,
+                    k_cache.bytes,
+                    v_cache.bytes
+                )));
+            }
+            let mut qp = q.ptr;
+            let mut kp = k.ptr;
+            let mut vp = v.ptr;
+            let mut kcp = k_cache.ptr;
+            let mut vcp = v_cache.ptr;
+            let mut cp = cos_tab.ptr;
+            let mut sp = sin_tab.ptr;
+            let mut pp = pos_dev.ptr;
+            let mut nh = n_heads as i32;
+            let mut nkv = n_kv_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut nr = n_rot as i32;
+            let mut il = if interleaved { 1i32 } else { 0i32 };
+            let mut capi = cap as i32;
+            let mut params: [*mut c_void; 14] = [
+                &mut qp as *mut u64 as *mut c_void,
+                &mut kp as *mut u64 as *mut c_void,
+                &mut vp as *mut u64 as *mut c_void,
+                &mut kcp as *mut u64 as *mut c_void,
+                &mut vcp as *mut u64 as *mut c_void,
+                &mut cp as *mut u64 as *mut c_void,
+                &mut sp as *mut u64 as *mut c_void,
+                &mut pp as *mut u64 as *mut c_void,
+                &mut nh as *mut i32 as *mut c_void,
+                &mut nkv as *mut i32 as *mut c_void,
+                &mut hd as *mut i32 as *mut c_void,
+                &mut nr as *mut i32 as *mut c_void,
+                &mut il as *mut i32 as *mut c_void,
+                &mut capi as *mut i32 as *mut c_void,
+            ];
+            self.launch(
+                "sofuu_rope_kv_f32",
+                ((n_heads + n_kv_heads) as u32, 1, 1),
+                (128, 1, 1),
+                &mut params,
+            )
+        }
+
         /// `pos_dev` is a device-side i32 holding the write row (see
         /// `sofuu_kv_write_f32`): a captured graph cannot carry a per-launch
         /// scalar, so the position travels through memory. `pos` is still
@@ -2180,6 +2278,27 @@ mod imp {
             _head_dim: usize,
             _n_rot: usize,
             _interleaved: bool,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn rope_kv(
+            &self,
+            _q: DeviceBuf,
+            _k: DeviceBuf,
+            _v: DeviceBuf,
+            _kc: DeviceBuf,
+            _vc: DeviceBuf,
+            _cos: DeviceBuf,
+            _sin: DeviceBuf,
+            _pos_dev: DeviceBuf,
+            _n_heads: usize,
+            _n_kv_heads: usize,
+            _head_dim: usize,
+            _n_rot: usize,
+            _interleaved: bool,
+            _cap: usize,
         ) -> Result<(), CudaError> {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }

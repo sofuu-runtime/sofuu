@@ -1343,6 +1343,83 @@ void test_kv_write(void *fn, uint32_t &seed) {
     sofuu_cuda_ctx_free(g_ctx, dl);
 }
 
+// rope(q) + rope(k) + the KV write in one launch: q rotated in place, k rotated
+// in place *and* the rotated row copied into the cache, v copied untouched.
+// The rotated-k assertion is the one that matters -- the whole reason these
+// three were ordered launches is that the cache must hold the post-RoPE keys.
+void test_rope_kv(void *fn, uint32_t &seed) {
+    const int n_heads = 8, n_kv = 2, hd = 128, n_rot = 64, cap = 16, pos = 3;
+    const int cache_n = n_kv * cap * hd;
+    std::vector<float> cos_t(32), sin_t(32);
+    for (int i = 0; i < 32; ++i) {
+        float a = 0.05f * (float)i;
+        cos_t[(size_t)i] = std::cos(a);
+        sin_t[(size_t)i] = std::sin(a);
+    }
+    for (int interleaved = 0; interleaved <= 1; ++interleaved) {
+        std::vector<float> q = random_vec(n_heads * hd, seed, -1.0f, 1.0f);
+        std::vector<float> k = random_vec(n_kv * hd, seed, -1.0f, 1.0f);
+        std::vector<float> v = random_vec(n_kv * hd, seed, -1.0f, 1.0f);
+        std::vector<float> want_q = q, want_k = k;
+        sofuu_ref::rope_ref(want_q.data(), cos_t.data(), sin_t.data(), n_heads,
+                            hd, n_rot, interleaved);
+        sofuu_ref::rope_ref(want_k.data(), cos_t.data(), sin_t.data(), n_kv, hd,
+                            n_rot, interleaved);
+        std::vector<float> want_kc((size_t)cache_n, -99.0f),
+            want_vc((size_t)cache_n, -99.0f);
+        sofuu_ref::kv_write_ref(want_kc.data(), want_vc.data(), want_k.data(),
+                                v.data(), pos, n_kv, hd, cap);
+
+        unsigned long long dq = 0, dk = 0, dv = 0, dkc = 0, dvc = 0, dc = 0,
+                           ds = 0, dp = 0;
+        std::vector<float> got_kc((size_t)cache_n, -99.0f),
+            got_vc((size_t)cache_n, -99.0f);
+        int pos_dev = pos;
+        if (!alloc_upload(q.data(), q.size() * sizeof(float), &dq) ||
+            !alloc_upload(k.data(), k.size() * sizeof(float), &dk) ||
+            !alloc_upload(v.data(), v.size() * sizeof(float), &dv) ||
+            !alloc_upload(got_kc.data(), got_kc.size() * sizeof(float), &dkc) ||
+            !alloc_upload(got_vc.data(), got_vc.size() * sizeof(float), &dvc) ||
+            !alloc_upload(cos_t.data(), cos_t.size() * sizeof(float), &dc) ||
+            !alloc_upload(sin_t.data(), sin_t.size() * sizeof(float), &ds) ||
+            !alloc_upload(&pos_dev, sizeof(pos_dev), &dp)) {
+            fail_msg("alloc");
+            ++g_failures;
+            return;
+        }
+        int il = interleaved;
+        std::vector<void *> params = {&dq,  &dk,           &dv,  &dkc,
+                                      &dvc, &dc,           &ds,  &dp,
+                                      (void *)&n_heads, (void *)&n_kv,
+                                      (void *)&hd,      (void *)&n_rot,
+                                      (void *)&il,      (void *)&cap};
+        bool ok = launch(fn, (unsigned)(n_heads + n_kv), 128, params) &&
+                  download(dq, q.data(), q.size() * sizeof(float)) &&
+                  download(dk, k.data(), k.size() * sizeof(float)) &&
+                  download(dkc, got_kc.data(), got_kc.size() * sizeof(float)) &&
+                  download(dvc, got_vc.data(), got_vc.size() * sizeof(float));
+        double max_err = 0.0;
+        for (int i = 0; i < n_heads * hd; ++i)
+            max_err = std::fmax(max_err, std::fabs((double)q[(size_t)i] - want_q[(size_t)i]));
+        for (int i = 0; i < n_kv * hd; ++i)
+            max_err = std::fmax(max_err, std::fabs((double)k[(size_t)i] - want_k[(size_t)i]));
+        for (int i = 0; i < cache_n; ++i) {
+            max_err = std::fmax(max_err, std::fabs((double)got_kc[(size_t)i] - want_kc[(size_t)i]));
+            max_err = std::fmax(max_err, std::fabs((double)got_vc[(size_t)i] - want_vc[(size_t)i]));
+        }
+        report(interleaved ? "rope_kv_interleaved" : "rope_kv_split",
+               ok && max_err <= 1e-6, max_err, 1e-6, (double)want_kc[0]);
+        sofuu_cuda_ctx_free(g_ctx, dq);
+        sofuu_cuda_ctx_free(g_ctx, dk);
+        sofuu_cuda_ctx_free(g_ctx, dv);
+        sofuu_cuda_ctx_free(g_ctx, dkc);
+        sofuu_cuda_ctx_free(g_ctx, dvc);
+        sofuu_cuda_ctx_free(g_ctx, dc);
+        sofuu_cuda_ctx_free(g_ctx, ds);
+        sofuu_cuda_ctx_free(g_ctx, dp);
+    }
+}
+
 void test_attn_decode(void *fn, uint32_t &seed) {
     const int n_heads = 8, n_kv = 2, hd = 64, cap = 32, seq = 17;
     const int cache_n = n_kv * cap * hd;
@@ -1471,6 +1548,7 @@ int main(int argc, char **argv) {
     void *f_q4q8x2 = nullptr;
     void *f_rms_q8 = nullptr, *f_rmsadd_q8 = nullptr, *f_swiglu_q8 = nullptr;
     void *f_rms = nullptr, *f_swi = nullptr, *f_rope = nullptr, *f_kv = nullptr;
+    void *f_rope_kv = nullptr;
     void *f_attn = nullptr, *f_add = nullptr;
     void *f_b8_q4 = nullptr, *f_b8_q6 = nullptr, *f_b8_q8 = nullptr;
     void *f_b8_f32 = nullptr, *f_rms_b = nullptr, *f_attn_p = nullptr;
@@ -1488,6 +1566,7 @@ int main(int argc, char **argv) {
         !get_function("sofuu_rmsnorm", &f_rms) ||
         !get_function("sofuu_swiglu", &f_swi) ||
         !get_function("sofuu_rope_f32", &f_rope) ||
+        !get_function("sofuu_rope_kv_f32", &f_rope_kv) ||
         !get_function("sofuu_kv_write_f32", &f_kv) ||
         !get_function("sofuu_attn_decode_f32", &f_attn) ||
         !get_function("sofuu_add_f32", &f_add) ||
@@ -1516,6 +1595,7 @@ int main(int argc, char **argv) {
     bench_launch(f_rms, 1 << 20, 2000, "big");
     test_swiglu(f_swi, seed);
     test_rope(f_rope, seed);
+    test_rope_kv(f_rope_kv, seed);
     test_kv_write(f_kv, seed);
     test_attn_decode(f_attn, seed);
     test_add(f_add, seed);

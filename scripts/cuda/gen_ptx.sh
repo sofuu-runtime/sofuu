@@ -34,6 +34,7 @@ ENTRIES=(
     sofuu_swiglu_q8
     sofuu_swiglu
     sofuu_rope_f32
+    sofuu_rope_kv_f32
     sofuu_kv_write_f32
     sofuu_attn_decode_f32
     sofuu_add_f32

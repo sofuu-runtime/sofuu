@@ -1248,6 +1248,72 @@ extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(128) void sofuu_kv_write_f32(float *
     }
 }
 
+// ── RoPE on q and k, then the KV write: one launch ────────────────────────
+//
+// A decode step rotated q (n_heads blocks), then rotated k (n_kv_heads
+// blocks), then copied k and v into the cache (n_kv_heads blocks) -- three
+// launches for ~3 KiB of data, each paying the dispatch and the drain the mixed
+// bench prices at ~8 us. They are also strictly ordered: the cache must hold
+// the *rotated* k. One kernel keeps that order with a block barrier, since a
+// block owns one head's row, and merges the three grids:
+//
+//   block <  n_heads            -> rotate q head `block`
+//   block >= n_heads            -> rotate k head `block - n_heads`, then write
+//                                  that head's k and v rows to the cache
+//
+// The kv blocks pack two rows of head_dim floats, so the post-barrier copy is
+// the same loop the standalone kv_write ran.
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS(128)
+void sofuu_rope_kv_f32(float *q, float *k, const float *v, float *k_cache,
+                       float *v_cache, const float *cos_tab,
+                       const float *sin_tab, const int *pos_dev, int n_heads,
+                       int n_kv_heads, int head_dim, int n_rot, int interleaved,
+                       int cap) {
+    int blk = (int)sofuu_ctaid_x();
+    unsigned int tid = sofuu_tid_x();
+    unsigned int stride = sofuu_ntid_x();
+    int half = n_rot >> 1;
+    if (blk < n_heads) {
+        float *base = q + (unsigned long long)blk * (unsigned long long)head_dim;
+        for (int i = (int)tid; i < half; i += (int)stride) {
+            int i0 = interleaved ? (2 * i) : i;
+            int i1 = interleaved ? (2 * i + 1) : (i + half);
+            float c = cos_tab[i];
+            float s = sin_tab[i];
+            float x0 = base[i0];
+            float x1 = base[i1];
+            base[i0] = x0 * c - x1 * s;
+            base[i1] = x0 * s + x1 * c;
+        }
+        return;
+    }
+    int kvh = blk - n_heads;
+    int pos = *pos_dev;
+    if (kvh >= n_kv_heads || pos < 0 || pos >= cap) return;
+    float *kbase = k + (unsigned long long)kvh * (unsigned long long)head_dim;
+    for (int i = (int)tid; i < half; i += (int)stride) {
+        int i0 = interleaved ? (2 * i) : i;
+        int i1 = interleaved ? (2 * i + 1) : (i + half);
+        float c = cos_tab[i];
+        float s = sin_tab[i];
+        float x0 = kbase[i0];
+        float x1 = kbase[i1];
+        kbase[i0] = x0 * c - x1 * s;
+        kbase[i1] = x0 * s + x1 * c;
+    }
+    // The copy below must see this block's own rotated values.
+    sofuu_bar_sync();
+    unsigned long long slot =
+        ((unsigned long long)kvh * (unsigned long long)cap +
+         (unsigned long long)pos) *
+        (unsigned long long)head_dim;
+    const float *vrow = v + (unsigned long long)kvh * (unsigned long long)head_dim;
+    for (int d = (int)tid; d < head_dim; d += (int)stride) {
+        k_cache[slot + (unsigned long long)d] = kbase[d];
+        v_cache[slot + (unsigned long long)d] = vrow[d];
+    }
+}
+
 // ── Batched prefill: one warp per (token, row) dot ─────────────────────────
 //
 // Prefill used to run the decode GEMV once per prompt token, which streams the

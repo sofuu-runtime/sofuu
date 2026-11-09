@@ -109,7 +109,7 @@ $ sofuu eval 'const b = sofuu.memory.open("./brain.qtsq", 768); b.remember(sofuu
 
 ### 4. Prefer Pure Declarative Agents? Try Kaze (`.kaze`)
 
-For production agents with zero JavaScript or Python, define declarative capability gates (`needs: ...`) and compile directly into native binaries:
+For declarative autonomous agents with zero JavaScript or Python, define capability gates (`needs: ...`) and compile directly into native binaries:
 
 ```kaze
 # agent.kaze — Declarative Autonomous Agent
@@ -142,7 +142,7 @@ $ ./my-agent --config agent.config.json
 
 ---
 
-### 5. Production Showcase Agents (`example-agents/`)
+### 5. Pure Kaze Showcase Agents (`example-agents/`)
 
 The repository includes pre-built showcase agents written 100% in pure Kaze (zero JavaScript, zero package dependencies):
 

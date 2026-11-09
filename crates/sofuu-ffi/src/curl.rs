@@ -240,7 +240,7 @@ pub fn curl_easy_init() -> *mut Curl {
 fn apply_ca_defaults(easy: *mut Curl) {
     // The option copies the string, so the CString only needs to outlive
     // the setopt call.
-    if let Some(path) = env_nonempty("SOFUU_CA_BUNDLE") {
+    if let Some(path) = env_nonempty("SOFUU_CA_BUNDLE").or_else(|| env_nonempty("SSL_CERT_FILE")) {
         if let Ok(c) = CString::new(path) {
             // SAFETY: valid handle; CAINFO is an OBJECTPOINT (char *).
             unsafe {
@@ -249,11 +249,49 @@ fn apply_ca_defaults(easy: *mut Curl) {
             return;
         }
     }
-    if let Some(path) = env_nonempty("SOFUU_CA_PATH") {
+    if let Some(path) = env_nonempty("SOFUU_CA_PATH").or_else(|| env_nonempty("SSL_CERT_DIR")) {
         if let Ok(c) = CString::new(path) {
             // SAFETY: valid handle; CAPATH is an OBJECTPOINT (char *).
             unsafe {
                 curl_easy_setopt(easy, CURLOPT_CAPATH, c.as_ptr());
+            }
+            return;
+        }
+    }
+
+    // On Linux, static builds (e.g. musl) have no baked-in dynamic CA store.
+    // Auto-probe standard distribution certificate locations so HTTPS works out of the box.
+    #[cfg(target_os = "linux")]
+    {
+        const PROBE_PATHS: &[&str] = &[
+            "/etc/ssl/certs/ca-certificates.crt",                // Debian, Ubuntu, Alpine, Arch, Gentoo
+            "/etc/pki/tls/certs/ca-bundle.crt",                  // Fedora, RHEL, CentOS, Amazon Linux
+            "/etc/ssl/ca-bundle.pem",                            // openSUSE, SUSE
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem", // RHEL/CentOS modern ca-trust
+            "/etc/ssl/cert.pem",                                 // Alpine / BSD fallback
+        ];
+        for probe in PROBE_PATHS {
+            if std::path::Path::new(probe).exists() {
+                if let Ok(c) = CString::new(*probe) {
+                    unsafe {
+                        curl_easy_setopt(easy, CURLOPT_CAINFO, c.as_ptr());
+                    }
+                    return;
+                }
+            }
+        }
+        const PROBE_DIRS: &[&str] = &[
+            "/etc/ssl/certs",
+            "/etc/pki/tls/certs",
+        ];
+        for dir in PROBE_DIRS {
+            if std::path::Path::new(dir).is_dir() {
+                if let Ok(c) = CString::new(*dir) {
+                    unsafe {
+                        curl_easy_setopt(easy, CURLOPT_CAPATH, c.as_ptr());
+                    }
+                    return;
+                }
             }
         }
     }

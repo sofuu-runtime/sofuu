@@ -4,6 +4,19 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Enterprise Hardening & Linux Cross-Compile Static TLS Integration — 2026-11-09
+
+Reliability, networking, and cross-platform transport hardening across Linux, enterprise schemas, and zero-crash invariants:
+
+**Linux Standalone Static TLS & HTTPS Support.**
+- **Static OpenSSL 3.3.2 Cross-Compilation (`scripts/cross/build_openssl_static.sh`):** Added automated cross-compilation pipeline for static `libcrypto.a` and `libssl.a` targeting `x86_64-linux-musl` and `aarch64-linux-musl` using `zig cc` (pure C with `no-asm` and deterministic symbols).
+- **TLS-Enabled Static Libcurl (`scripts/cross/build_libcurl_static.sh`):** Built libcurl with `-DCURL_USE_OPENSSL=ON` and merged OpenSSL static archives into `libcurl.a` using response-file bundling (`@objlist.txt`). Automatically detects and replaces stale TLS-free static archives.
+- **Root CA Trust Store Auto-Discovery (`crates/sofuu-ffi/src/curl.rs`):** Implemented multi-distribution root certificate bundle probing on Linux (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`, `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`, `/etc/ssl/cert.pem`). Honors standard `SSL_CERT_FILE` and `SSL_CERT_DIR` environment variables in addition to `SOFUU_CA_BUNDLE` and `SOFUU_CA_PATH`. Resolves `CURLE_UNSUPPORTED_PROTOCOL` (`✖ Unsupported protocol`) when communicating with cloud LLM endpoints from cross-compiled Linux binaries.
+
+**Enterprise Hardening Phase 1 & 2 (Zero-Crash & Schema DX).**
+- **Promise Rejection Containment:** Implemented global unhandled rejection trapping in `promise.rs` and `process.on('unhandledRejection')` lifecycle handling in `process.rs`.
+- **Global Schema Engine (`sofuu.z` / `globalThis.z`):** Built-in zero-dependency schema validation and conversion to Claude, OpenAI, and MCP tool definitions.
+
 ## MCP Tooling, In-Memory Direct Transport, Middleware & Bundler Hardening — 2026-11-07
 
 Post-stabilization freeze enhancements across Model Context Protocol (MCP), standalone bundler resolution, cross-compilation tooling, and CUDA kernel decoders:

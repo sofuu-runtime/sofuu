@@ -1,15 +1,10 @@
 #!/usr/bin/env bash
 # scripts/cross/build_libcurl_static.sh
 #
-# Fetches and builds a minimal, statically-linkable libcurl using Zig as CC.
-# Produces: dist/libcurl-<target>/lib/libcurl.a
+# Fetches and builds a statically-linkable, TLS-capable libcurl using OpenSSL and Zig as CC.
+# Produces: dist/libcurl-<target>/lib/libcurl.a (with OpenSSL merged in)
 #
-# This avoids needing a system libcurl on the cross-target.
-# P1-16 (AUDIT-2026-09-07): ALL TLS backends are DISABLED here (no OpenSSL/
-# mbedTLS cross-deps) — this curl does HTTP only: `http://` works,
-# `https://` does NOT through this layer (proxy that terminates TLS, or wire
-# an mbedTLS/OpenSSL backend below, to get https). Documented in
-# cli/README.md "Networking"; the earlier "HTTP/HTTPS + TLS" claim was false.
+# This provides self-contained HTTPS support for cross-compiled Linux targets.
 #
 # Usage:
 #   bash scripts/cross/build_libcurl_static.sh x86_64-linux-musl
@@ -32,6 +27,7 @@ CURL_URL="https://curl.se/download/${CURL_TARBALL}"
 CURL_SHA256="9c6db808160015f30f3c656c0dec125feb9dc00753596bf858a272b5dd8dc398"
 CURL_SRC="/tmp/curl-${CURL_VER}"
 CURL_INSTALL="$DIST/libcurl-${TARGET}"
+BUILD_DIR="${CURL_SRC}/build-${TARGET}"
 
 # Normalise target for naming  
 ARCH=$(echo "$TARGET" | cut -d- -f1)
@@ -42,14 +38,25 @@ case "$ARCH" in
 esac
 
 if [ -f "$CURL_INSTALL/lib/libcurl.a" ]; then
-    echo "✓ libcurl already built for $TARGET"
-    exit 0
+    if nm "$CURL_INSTALL/lib/libcurl.a" 2>/dev/null | grep "SSL_connect" >/dev/null; then
+        echo "✓ libcurl (with OpenSSL) already built for $TARGET"
+        exit 0
+    else
+        echo "→ Existing libcurl for $TARGET is TLS-free — rebuilding with OpenSSL..."
+        rm -rf "$CURL_INSTALL" "$BUILD_DIR"
+    fi
 fi
 
 if [ ! -x "$ZIG" ]; then
     echo "Zig not found. Run: bash scripts/cross/install_zig.sh"
     exit 1
 fi
+
+# ── Ensure static OpenSSL is prebuilt for target ─────────────────
+echo "→ Ensuring OpenSSL static is built for ${TARGET}..."
+bash "$REPO_ROOT/scripts/cross/build_openssl_static.sh" "$TARGET"
+OPENSSL_DIR="$DIST/openssl-${TARGET}"
+[ -f "$OPENSSL_DIR/lib/libssl.a" ] || { echo "✗ Missing OpenSSL for $TARGET at $OPENSSL_DIR"; exit 1; }
 
 echo "→ Downloading curl ${CURL_VER}..."
 if [ ! -f "/tmp/${CURL_TARBALL}" ]; then
@@ -104,10 +111,15 @@ cmake -S "$CURL_SRC" -B "$BUILD_DIR" \
     -DCURL_DISABLE_TFTP=ON \
     -DCURL_USE_LIBSSL=OFF \
     -DCURL_USE_MBEDTLS=OFF \
-    -DCURL_USE_OPENSSL=OFF \
+    -DCURL_USE_OPENSSL=ON \
+    -DOPENSSL_ROOT_DIR="$OPENSSL_DIR" \
+    -DOPENSSL_INCLUDE_DIR="$OPENSSL_DIR/include" \
+    -DOPENSSL_CRYPTO_LIBRARY="$OPENSSL_DIR/lib/libcrypto.a" \
+    -DOPENSSL_SSL_LIBRARY="$OPENSSL_DIR/lib/libssl.a" \
     -DCURL_USE_GNUTLS=OFF \
     -DCURL_USE_BEARSSL=OFF \
-    -DCMAKE_USE_OPENSSL=OFF \
+    -DCURL_USE_LIBSSH2=OFF \
+    -DCURL_USE_LIBPSL=OFF \
     -DUSE_NGHTTP2=OFF \
     -DCURL_CA_BUNDLE=none \
     -DCURL_CA_PATH=none \
@@ -117,6 +129,29 @@ echo "→ Building curl..."
 cmake --build "$BUILD_DIR" -- -j$(nproc 2>/dev/null || sysctl -n hw.ncpu) 2>&1 | tail -5
 cmake --install "$BUILD_DIR"
 
+echo "→ Merging OpenSSL static archives into libcurl.a..."
+MERGE_DIR="${BUILD_DIR}/merge"
+rm -rf "$MERGE_DIR"
+mkdir -p "$MERGE_DIR/ossl"
+(
+    cd "$MERGE_DIR"
+    "$ZIG" ar x "$CURL_INSTALL/lib/libcurl.a"
+    (
+        cd ossl
+        "$ZIG" ar x "$OPENSSL_DIR/lib/libssl.a"
+        "$ZIG" ar x "$OPENSSL_DIR/lib/libcrypto.a"
+        for f in *.o; do mv "$f" "ossl_$f"; done
+    )
+    find . -name "*.o" | sort > objlist.txt
+    rm -f "$CURL_INSTALL/lib/libcurl.a"
+    "$ZIG" ar crs "$CURL_INSTALL/lib/libcurl.a" @objlist.txt
+    "$ZIG" ranlib "$CURL_INSTALL/lib/libcurl.a" 2>/dev/null || true
+)
+
+nm "$CURL_INSTALL/lib/libcurl.a" 2>/dev/null | grep "SSL_connect" >/dev/null || {
+    echo "✗ Verification failed: libcurl.a does not contain OpenSSL symbols!"; exit 1;
+}
+
 echo ""
-echo "✅ Built: $CURL_INSTALL/lib/libcurl.a"
+echo "✅ Built: $CURL_INSTALL/lib/libcurl.a (with OpenSSL TLS support)"
 echo ""

@@ -64,11 +64,10 @@ libcurl 8.6.0:
 
 - **Windows** — curl built with **Schannel** TLS: full `https://` support,
   certificates come from the OS store.
-- **Linux** — curl built with **all TLS backends disabled** (no OpenSSL
-  cross-deps): `http://` works everywhere; `https://` through the curl
-  layer does not. Run behind a local proxy that terminates TLS, or build
-  for the target with an mbedTLS/OpenSSL curl (see
-  `scripts/cross/build_libcurl_static.sh`) to enable it.
+- **Linux** — curl built with static **OpenSSL 3.3.2** TLS: full `https://`
+  support out of the box. Certificates are auto-probed from the host OS trust store
+  (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, etc.),
+  or customized via `SOFUU_CA_BUNDLE` / `SSL_CERT_FILE`.
 - **macOS** — curl uses SecureTransport: full `https://` support.
 
 ## Rebuilding

@@ -32,6 +32,7 @@ cp "$BIN" "$STAGE/sofuu"
 chmod +x "$STAGE/sofuu"
 cp "$ROOT/scripts/cuda/kaggle_gpu_check.sh" "$STAGE/scripts/cuda/"
 cp "$ROOT/scripts/cuda/kaggle_infer_check.sh" "$STAGE/scripts/cuda/"
+cp "$ROOT/scripts/cuda/kaggle_longctx_check.sh" "$STAGE/scripts/cuda/"
 # The kernel gate compiles cuda_loader.c + gpu_check.cpp against this tree.
 # Ship the whole src/cuda directory so the kit is self-contained.
 cp -R "$ROOT/src/cuda" "$STAGE/src/cuda"

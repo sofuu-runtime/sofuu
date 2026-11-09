@@ -225,6 +225,32 @@ pub unsafe extern "C" fn sofuu_loop_run(ctx: *mut JSContext) {
 /// exit — the bound only decides WHEN libuv is polled, never whether a job
 /// runs).
 pub(crate) const MICROTASK_BATCH: usize = 256;
+pub(crate) const MICROTASK_BATCH_MAX: usize = 1024;
+pub(crate) const MICROTASK_BATCH_MIN: usize = 64;
+
+/// Calculate adaptive microtask batch size based on libuv event loop latency pressure.
+///
+/// Under saturated event loops:
+/// - If `uv_backend_timeout == 0`: An expired timer or pending I/O event is immediately ready.
+///   Clamp batch size to `MICROTASK_BATCH_MIN` (64) so high-priority I/O or timer events are never delayed.
+/// - If `uv_backend_timeout < 0` or `timeout > 5`: No immediate I/O or timer is pending.
+///   Expand batch size up to `MICROTASK_BATCH_MAX` (1024) to drain saturated microtask floods
+///   with 4x fewer roundtrips and zero useless non-blocking syscalls.
+/// - Otherwise: Use standard baseline `MICROTASK_BATCH` (256).
+#[inline]
+pub(crate) fn adaptive_microtask_batch(lp: *mut UvLoop) -> usize {
+    if lp.is_null() {
+        return MICROTASK_BATCH;
+    }
+    let timeout = unsafe { uv::uv_backend_timeout(lp) };
+    if timeout == 0 {
+        MICROTASK_BATCH_MIN
+    } else if timeout < 0 || timeout > 5 {
+        MICROTASK_BATCH_MAX
+    } else {
+        MICROTASK_BATCH
+    }
+}
 
 /// R-14 (second half): how much microtask work ONE libuv round may spend
 /// inside native macrotask callbacks (timer / immediate / sleep).
@@ -302,9 +328,11 @@ pub(crate) unsafe fn sofuu_loop_run_bounded(
         if crate::rt::engine::run_status(ctx).fatal {
             break;
         }
-        /* First: pump immediately-available JS microtasks, bounded per round
-         * (R-14) so a long promise chain cannot starve libuv's timers. */
-        let drained = sofuu_flush_jobs_bounded(ctx, MICROTASK_BATCH);
+        /* First: pump immediately-available JS microtasks, bounded adaptively
+         * so a long promise chain cannot starve libuv's timers, while allowing
+         * saturated microtask drains to run at high throughput when no I/O is pending. */
+        let batch = adaptive_microtask_batch(loop_ptr());
+        let drained = sofuu_flush_jobs_bounded(ctx, batch);
         if !drained {
             /* Starvation escape: poll libuv without blocking so timers/I/O run */
             begin_round();
@@ -322,8 +350,9 @@ pub(crate) unsafe fn sofuu_loop_run_bounded(
          * the exit(130/143) fallback) — previously dead code. */
         process_dispatch_pending_signals();
 
-        /* After libuv fires callbacks, flush JS microtasks again (bounded) */
-        let drained_after = sofuu_flush_jobs_bounded(ctx, MICROTASK_BATCH);
+        /* After libuv fires callbacks, flush JS microtasks again (bounded adaptively) */
+        let batch_after = adaptive_microtask_batch(loop_ptr());
+        let drained_after = sofuu_flush_jobs_bounded(ctx, batch_after);
         if !drained_after {
             begin_round();
             uv::uv_run(loop_ptr(), UV_RUN_NOWAIT);
@@ -378,10 +407,11 @@ pub unsafe extern "C" fn sofuu_loop_tick_nb(ctx: *mut JSContext) {
     if loop_ptr().is_null() {
         return;
     }
-    sofuu_flush_jobs_bounded(ctx, MICROTASK_BATCH);
+    let batch = adaptive_microtask_batch(loop_ptr());
+    sofuu_flush_jobs_bounded(ctx, batch);
     uv::uv_run(loop_ptr(), UV_RUN_NOWAIT);
     process_dispatch_pending_signals();
-    sofuu_flush_jobs_bounded(ctx, MICROTASK_BATCH);
+    sofuu_flush_jobs_bounded(ctx, batch);
 }
 
 /// Walk callback: closes any handle that is still active.

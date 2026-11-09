@@ -90,6 +90,7 @@ extern "C" {
     pub fn uv_loop_init(loop_: *mut UvLoop) -> c_int;
     pub fn uv_loop_close(loop_: *mut UvLoop) -> c_int;
     pub fn uv_loop_alive(loop_: *const UvLoop) -> c_int;
+    pub fn uv_backend_timeout(loop_: *const UvLoop) -> c_int;
     pub fn uv_run(loop_: *mut UvLoop, mode: c_int) -> c_int;
     pub fn uv_close(handle: *mut UvHandle, close_cb: Option<unsafe extern "C" fn(*mut UvHandle)>);
     pub fn uv_is_closing(handle: *const UvHandle) -> c_int;

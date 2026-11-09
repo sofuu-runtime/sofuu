@@ -598,4 +598,56 @@ queueMicrotask(function() { microtaskFired = true; }); \
         unsafe { qjs::JS_FreeContext(ctx) };
         unsafe { qjs::JS_FreeRuntime(rt) };
     }
+
+    #[test]
+    fn test_saturated_microtask_drain_with_concurrent_timer() {
+        let _loop_guard = crate::rt::test_loop_lock();
+        let rt = unsafe { qjs::JS_NewRuntime() };
+        let ctx = unsafe { qjs::JS_NewContext(rt) };
+        let ctp = unsafe { CtxPtr::new(ctx) };
+        unsafe { sofuu_rt_install_rejection_tracker(rt) };
+        unsafe { crate::rt::event_loop::sofuu_loop_init() };
+        unsafe { mod_timer_register(ctx) };
+
+        let script = c"var microtasksCount = 0; \
+var timerFired = false; \
+setTimeout(function() { timerFired = true; }, 1); \
+async function recurse(n) { \
+  if (n <= 0) return; \
+  microtasksCount++; \
+  await Promise.resolve(); \
+  await recurse(n - 1); \
+} \
+recurse(1000);";
+        let r = unsafe {
+            qjs::JS_Eval(
+                ctx,
+                script.as_ptr(),
+                script.to_bytes().len(),
+                c"<microtask-saturation-test>".as_ptr(),
+                qjs::JS_EVAL_TYPE_GLOBAL,
+            )
+        };
+        assert!(!unsafe { qjs::is_exception(r) }, "eval must not throw");
+        unsafe { qjs::sofuu_js_free_value(ctx, r) };
+
+        unsafe { crate::rt::event_loop::sofuu_loop_run_bounded(ctx, Some(std::time::Duration::from_secs(10))) };
+
+        let global = unsafe { qjs::global_object(ctp) };
+
+        let count_val = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"microtasksCount".as_ptr()) };
+        let mut count: i32 = 0;
+        unsafe { qjs::JS_ToInt32(ctx, &mut count, count_val) };
+        assert_eq!(count, 1000, "all 1000 saturated microtasks must drain completely");
+        unsafe { qjs::sofuu_js_free_value(ctx, count_val) };
+
+        let tf = unsafe { qjs::sofuu_js_get_property_str(ctx, global, c"timerFired".as_ptr()) };
+        assert_eq!(unsafe { qjs::JS_ToBool(ctx, tf) }, 1, "concurrent timer must fire without starvation");
+        unsafe { qjs::sofuu_js_free_value(ctx, tf) };
+
+        unsafe { qjs::sofuu_js_free_value(ctx, global) };
+        unsafe { crate::rt::event_loop::sofuu_loop_close() };
+        unsafe { qjs::JS_FreeContext(ctx) };
+        unsafe { qjs::JS_FreeRuntime(rt) };
+    }
 }

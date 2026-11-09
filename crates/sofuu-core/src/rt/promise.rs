@@ -172,6 +172,10 @@ pub unsafe extern "C" fn sofuu_promise_reject_str(p: *mut PromiseHandle, msg: *c
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_flush_jobs_bounded(ctx: *mut JSContext, max_jobs: usize) -> bool {
     let rt = qjs::JS_GetRuntime(ctx);
+    if qjs::JS_IsJobPending(rt) == 0 {
+        sofuu_rt_report_pending_rejections(ctx);
+        return true;
+    }
     let mut ctx2: *mut JSContext = ptr::null_mut();
     let mut executed = 0usize;
 
@@ -489,6 +493,10 @@ pub unsafe extern "C" fn sofuu_rt_install_rejection_tracker(rt: *mut JSRuntime) 
 /// `ctx` must be the live runtime context.
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_rt_report_pending_rejections(ctx: *mut JSContext) {
+    let has_any = PENDING.with(|p| !p.borrow().is_empty());
+    if !has_any {
+        return;
+    }
     let drained: Vec<(JSValue, JSValue)> = PENDING.with(|p| {
         let mut pending = p.borrow_mut();
         let mut items = Vec::new();

@@ -105,11 +105,8 @@ fn is_secret_key(key: &str) -> bool {
 fn redact_value(v: &mut Value) {
     match v {
         Value::Object(map) => {
-            let keys: Vec<String> = map.keys().cloned().collect();
-            for k in keys {
-                let secret = is_secret_key(&k);
-                let entry = map.get_mut(&k).unwrap();
-                if secret && entry.is_string() {
+            for (k, entry) in map.iter_mut() {
+                if is_secret_key(k) && !entry.is_null() {
                     *entry = Value::String("[REDACTED]".into());
                 } else {
                     redact_value(entry);
@@ -126,7 +123,7 @@ fn redact_value(v: &mut Value) {
          * body. Every free-form string goes through the ONE shared text
          * sanitizer (also used by diagnostic rendering). */
         Value::String(s) => {
-            *s = crate::rt::diag_contract::redact_text(s);
+            *s = crate::rt::diag_contract::redact_event_text(s);
         }
         _ => {}
     }
@@ -228,6 +225,15 @@ pub fn validate(ev: &Value) -> Vec<String> {
 pub fn redact(ev: &Value) -> Value {
     let mut out = ev.clone();
     redact_value(&mut out);
+    // A redacted checkpoint is not the original rehydration state. Mark it
+    // rather than silently resuming with altered data or repeating a step.
+    if ev.get("kind").and_then(Value::as_str) == Some("checkpoint")
+        && ev.get("payload") != out.get("payload")
+    {
+        if let Some(payload) = out.get_mut("payload").and_then(Value::as_object_mut) {
+            payload.insert("_sofuu_resume_unavailable".into(), Value::Bool(true));
+        }
+    }
     out
 }
 

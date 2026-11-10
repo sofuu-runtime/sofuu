@@ -572,7 +572,7 @@ thread_local! {
     static SUBPROCESS_PROTO_FUNCS: [JSCFunctionListEntry; 2] = [
         JSCFunctionListEntry {
             name: c"kill".as_ptr(),
-            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE | qjs::JS_PROP_ENUMERABLE,
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc {
@@ -584,7 +584,7 @@ thread_local! {
         },
         JSCFunctionListEntry {
             name: c"write".as_ptr(),
-            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE | qjs::JS_PROP_ENUMERABLE,
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc {
@@ -838,6 +838,15 @@ unsafe extern "C" fn js_sofuu_spawn(
     /* Keep the object alive until the fence frees the request: spawn_free
      * needs a valid JSValue to null the opaque through. */
     (*req_ptr).self_obj = qjs::sofuu_js_dup_value(ctx, obj);
+    /* JR-077 (AUDIT-2026-11-08): a handle with no pid gave the caller no way
+     * to signal, poll or correlate the child — the audit saw spawn() resolve
+     * to an object with none of the fields it documented. */
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        obj,
+        c"pid".as_ptr(),
+        qjs::sofuu_js_new_int32(ctx, pid as i32),
+    );
 
     /* The argv/cwd buffers must stay valid until exit_cb — they live in
      * the Box, which the close-callback fence frees. */

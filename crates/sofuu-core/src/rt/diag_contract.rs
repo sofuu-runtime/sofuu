@@ -31,6 +31,7 @@ pub const MAX_MESSAGE: usize = 512;
 pub const MAX_HINT: usize = 256;
 pub const MAX_SNIPPET_LINE: usize = 200;
 pub const MAX_HINTS: usize = 4;
+pub const MAX_FRAMES: usize = 16;
 
 /// The one fallback code. Deliberately not an `E_` taxonomy code: an
 /// unclassifiable failure must not masquerade as a known one.
@@ -103,6 +104,10 @@ impl SourceLocation {
     }
 
     fn normalize(&mut self) {
+        if self.line == Some(0) { self.line = None; }
+        if self.column == Some(0) { self.column = None; }
+        if self.end_line == Some(0) { self.end_line = None; }
+        if self.end_column == Some(0) { self.end_column = None; }
         self.source = self.source.take().and_then(|s| {
             let s = sanitize_line(&s, MAX_MESSAGE);
             if s.is_empty() {
@@ -165,6 +170,8 @@ pub struct Diagnostic {
     /// A known explanation (not observed causality).
     pub reason: Option<String>,
     pub hints: Vec<String>,
+    /// Bounded frames observed in the error's reported stack.
+    pub frames: Vec<String>,
 }
 
 impl Default for Diagnostic {
@@ -179,6 +186,7 @@ impl Default for Diagnostic {
             location: None,
             reason: None,
             hints: Vec::new(),
+            frames: Vec::new(),
         }
     }
 }
@@ -204,6 +212,7 @@ impl Diagnostic {
             location: None,
             reason: None,
             hints: Vec::new(),
+            frames: Vec::new(),
         }
     }
 
@@ -278,6 +287,9 @@ impl Diagnostic {
         if !self.hints.is_empty() {
             m.insert("hints".into(), json!(self.hints));
         }
+        if !self.frames.is_empty() {
+            m.insert("frames".into(), json!(self.frames));
+        }
         Value::Object(m)
     }
 
@@ -320,6 +332,10 @@ impl Diagnostic {
                 }
             }
         }
+        if let Some(items) = v.get("frames").and_then(Value::as_array) {
+            d.frames = items.iter().take(MAX_FRAMES).filter_map(Value::as_str)
+                .map(|s| sanitize_line(s, MAX_MESSAGE)).filter(|s| !s.is_empty()).collect();
+        }
         d
     }
 
@@ -356,6 +372,9 @@ impl Diagnostic {
             } else if let Some(l) = loc.line {
                 out.push_str(&format!("  --> line {l}\n"));
             }
+            if let Some(label) = &loc.label {
+                out.push_str(&format!("   = location: {label}\n"));
+            }
         }
         if let Some(reason) = self.reason.as_ref() {
             out.push_str(&format!("   = reason: {reason}\n"));
@@ -367,6 +386,14 @@ impl Diagnostic {
         };
         for h in &self.hints[..hints] {
             out.push_str(&format!("   = help: {h}\n"));
+        }
+        if full && !self.frames.is_empty() {
+            out.push_str("Trace (reported stack):\n");
+            for frame in &self.frames {
+                out.push_str("  ");
+                out.push_str(frame);
+                out.push('\n');
+            }
         }
         out
     }
@@ -510,10 +537,11 @@ fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{FEFF}')
 }
 
-fn escape_untrusted(s: &str) -> String {
+fn escape_untrusted(s: &str, preserve_layout: bool) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
+            '\n' | '\t' | '\r' if preserve_layout => out.push(c),
             '\n' | '\t' | '\r' => out.push(' '),
             c if c.is_control() || is_bidi_control(c) => out.push('\u{FFFD}'),
             c => out.push(c),
@@ -566,7 +594,7 @@ fn scrub_scheme_token(s: &str, scheme: &str) -> String {
         while j < bytes.len() && token_byte(bytes[j]) {
             j += 1;
         }
-        if j - token_start >= 4 {
+        if j > token_start {
             out.push(' ');
             out.push_str("[REDACTED]");
             i = j;
@@ -596,64 +624,64 @@ const SECRET_KEYS: &[&str] = &[
 fn scrub_key_values(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = String::with_capacity(s.len());
-    let mut i = 0usize;
+    let mut copy_from = 0;
+    let mut i = 0;
     while i < bytes.len() {
-        let mut found: Option<(usize, usize)> = None;
-        for key in SECRET_KEYS {
-            if let Some(k) = find_ascii_ci(&s[i..], key) {
-                let start = i + k;
-                let end = start + key.len();
-                let prev = s[..start].chars().last();
-                let next = s[end..].chars().next();
-                let before = prev.map_or(true, |c| !c.is_ascii_alphanumeric() && c != '_');
-                let after = next.map_or(true, |c| !c.is_ascii_alphanumeric() && c != '_');
-                if before && after {
-                    found = Some((start, end));
-                    break;
-                }
-            }
-        }
-        let Some((_start, key_end)) = found else {
-            out.push_str(&s[i..]);
-            break;
+        // Scan left to right, not in key-list order: otherwise a later
+        // api_key can cause an earlier password to be copied unredacted.
+        let boundary = |b: u8| !b.is_ascii_alphanumeric() && b != b'_';
+        let before = i == 0 || boundary(bytes[i - 1]);
+        let key = if before {
+            SECRET_KEYS.iter().find(|key| {
+                let end = i + key.len();
+                end <= bytes.len()
+                    && bytes[i..end].eq_ignore_ascii_case(key.as_bytes())
+                    && (end == bytes.len() || boundary(bytes[end]))
+            })
+        } else { None };
+        let Some(key) = key else {
+            i += 1;
+            continue;
         };
-        out.push_str(&s[i..key_end]);
-        let mut j = key_end;
-        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-            j += 1;
-        }
-        if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
-            out.push(bytes[j] as char);
-            j += 1;
-        }
-        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-            j += 1;
-        }
-        if j >= bytes.len() || (bytes[j] != b':' && bytes[j] != b'=') {
-            i = key_end;
+        let mut j = i + key.len();
+        if j < bytes.len() && matches!(bytes[j], b'"' | b'\'') { j += 1; }
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') { j += 1; }
+        if j >= bytes.len() || !matches!(bytes[j], b':' | b'=') {
+            i += key.len();
             continue;
         }
-        out.push(bytes[j] as char);
         j += 1;
-        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+        while j < bytes.len() && matches!(bytes[j], b' ' | b'\t') { j += 1; }
+        let quote = if j < bytes.len() && matches!(bytes[j], b'"' | b'\'') {
+            let q = bytes[j];
             j += 1;
-        }
+            Some(q)
+        } else { None };
         let value_start = j;
-        while j < bytes.len()
-            && !matches!(
-                bytes[j],
-                b' ' | b'\t' | b'\r' | b'\n' | b',' | b';' | b'&' | b'#' | b'"' | b'\'' | b'}' | b']'
-            )
-        {
-            j += 1;
+        if s[value_start..].starts_with("[REDACTED]") {
+            let end = value_start + "[REDACTED]".len();
+            if end == bytes.len() || matches!(bytes[end], b' ' | b'\t' | b'\r' | b'\n' | b',' | b';' | b'&' | b'#' | b'"' | b'\'' | b'}' | b']') {
+                i = end;
+                continue;
+            }
         }
-        if j - value_start >= 4 {
-            out.push_str("[REDACTED]");
+        if let Some(q) = quote {
+            while j < bytes.len() {
+                if bytes[j] == b'\\' && j + 1 < bytes.len() { j += 2; continue; }
+                if bytes[j] == q { break; }
+                j += 1;
+            }
         } else {
-            out.push_str(&s[value_start..j]);
+            while j < bytes.len() && !matches!(bytes[j], b' ' | b'\t' | b'\r' | b'\n' | b',' | b';' | b'&' | b'#' | b'"' | b'\'' | b'}' | b']') { j += 1; }
         }
-        i = j;
+        if j > value_start {
+            out.push_str(&s[copy_from..value_start]);
+            out.push_str("[REDACTED]");
+            copy_from = j;
+        }
+        i = j.max(i + key.len());
     }
+    out.push_str(&s[copy_from..]);
     out
 }
 
@@ -678,6 +706,95 @@ fn scrub_home(s: &str) -> String {
     s
 }
 
+/// Redact common credential prefixes without treating every ordinary word
+/// containing a short prefix as a secret. This is not a complete detector.
+fn scrub_token_prefixes(s: &str) -> String {
+    const PREFIXES: &[&str] = &["github_pat_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "xoxb-", "xoxp-", "glpat-", "sk-", "sk_", "AKIA", "ASIA", "AIza"];
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut copy = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let before = i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+        if before {
+            if let Some(prefix) = PREFIXES.iter().find(|p| s[i..].starts_with(**p)) {
+                let mut end = i + prefix.len();
+                while end < b.len() && (b[end].is_ascii_alphanumeric() || matches!(b[end], b'_' | b'-')) { end += 1; }
+                if end >= i + prefix.len() + 8 {
+                    out.push_str(&s[copy..i]);
+                    out.push_str("[REDACTED]");
+                    copy = end;
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i += s[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    out.push_str(&s[copy..]);
+    out
+}
+
+fn scrub_url_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pos = 0;
+    while let Some(rel) = s[pos..].find("://") {
+        let start = pos + rel + 3;
+        let authority_end = s[start..].find(|c: char| matches!(c, '/' | '?' | '#' | ' ' | '\n' | '\r' | '\t' | '"' | '\''))
+            .map_or(s.len(), |n| start + n);
+        if let Some(at) = s[start..authority_end].rfind('@') {
+            out.push_str(&s[pos..start]);
+            out.push_str("[REDACTED]@");
+            pos = start + at + 1;
+        } else {
+            out.push_str(&s[pos..start]);
+            pos = start;
+        }
+    }
+    out.push_str(&s[pos..]);
+    out
+}
+
+fn scrub_private_keys(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pos = 0;
+    while let Some(rel) = s[pos..].find("-----BEGIN ") {
+        let start = pos + rel;
+        let Some(header_end) = s[start + 11..].find("-----").map(|n| start + 11 + n + 5) else {
+            if s[start..].contains("PRIVATE KEY") {
+                out.push_str(&s[pos..start]);
+                out.push_str("[REDACTED PRIVATE KEY]");
+                return out;
+            }
+            break;
+        };
+        if !s[start..header_end].contains("PRIVATE KEY") {
+            out.push_str(&s[pos..header_end]);
+            pos = header_end;
+            continue;
+        }
+        out.push_str(&s[pos..start]);
+        out.push_str("[REDACTED PRIVATE KEY]");
+        let rest = &s[header_end..];
+        pos = rest.find("-----END ")
+            .and_then(|n| rest[n + 9..].find("-----").map(|end| header_end + n + 9 + end + 5))
+            .unwrap_or(s.len());
+    }
+    out.push_str(&s[pos..]);
+    out
+}
+
+fn scrub_sensitive(s: &str) -> String {
+    let s = strip_ansi(s);
+    let s = scrub_private_keys(&s);
+    let s = scrub_url_userinfo(&s);
+    let s = scrub_scheme_token(&s, "bearer");
+    let s = scrub_scheme_token(&s, "basic");
+    let s = scrub_key_values(&s);
+    let s = scrub_token_prefixes(&s);
+    scrub_home(&s)
+}
+
 /// The shared text sanitizer: strip terminal escapes, redact secret-shaped
 /// substrings, normalize private home paths, and replace dangerous controls.
 /// Applied by both diagnostic rendering and the event redaction seam.
@@ -686,12 +803,16 @@ pub fn redact_text(s: &str) -> String {
         return String::new();
     }
     let bounded = truncate_chars(s, 64 * 1024);
-    let s = strip_ansi(&bounded);
-    let s = scrub_scheme_token(&s, "bearer");
-    let s = scrub_scheme_token(&s, "basic");
-    let s = scrub_key_values(&s);
-    let s = scrub_home(&s);
-    escape_untrusted(&s)
+    let s = scrub_sensitive(&bounded);
+    escape_untrusted(&s, false)
+}
+
+/// Stored events may carry recoverable content: keep whitespace and do not
+/// silently truncate it. Terminal controls and secret-shaped text remain
+/// sanitized. Callers must not treat a changed checkpoint as recoverable.
+pub fn redact_event_text(s: &str) -> String {
+    let s = scrub_sensitive(s);
+    escape_untrusted(&s, true)
 }
 
 /// Mask the contents of string literals so a source snippet can be shown
@@ -764,7 +885,7 @@ fn location_from_json(v: &Value) -> Option<SourceLocation> {
         return None;
     }
     let num = |key: &str| v.get(key).and_then(Value::as_u64).map(|n| n.min(u32::MAX as u64) as u32);
-    let loc = SourceLocation {
+    let mut loc = SourceLocation {
         source: v.get("source").and_then(Value::as_str).map(str::to_string),
         line: num("line"),
         column: num("column"),
@@ -773,6 +894,7 @@ fn location_from_json(v: &Value) -> Option<SourceLocation> {
         generated: v.get("generated").and_then(Value::as_bool).unwrap_or(false),
         label: v.get("label").and_then(Value::as_str).map(str::to_string),
     };
+    loc.normalize();
     if loc.present() {
         Some(loc)
     } else {
@@ -781,7 +903,7 @@ fn location_from_json(v: &Value) -> Option<SourceLocation> {
 }
 
 fn normalize_ident(v: Option<String>, max: usize) -> Option<String> {
-    let raw = v?;
+    let raw = sanitize_line(&v?, MAX_MESSAGE);
     let mut out = String::with_capacity(raw.len().min(max));
     for c in raw.chars() {
         if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/') {
@@ -802,7 +924,7 @@ fn normalize_ident(v: Option<String>, max: usize) -> Option<String> {
 
 // ── JavaScript exception adapter ────────────────────────────────────────────
 
-/// The first verified location in a QuickJS stack, when one is present.
+/// The first parseable location in a reported QuickJS stack, when present.
 /// Only `file:line:col` (or `file:line`) shapes are accepted; anything else is
 /// reported as unavailable rather than guessed.
 pub fn first_stack_location(stack: &str) -> Option<SourceLocation> {
@@ -811,7 +933,7 @@ pub fn first_stack_location(stack: &str) -> Option<SourceLocation> {
         if let Some(open) = line.rfind(" (") {
             if line.ends_with(')') {
                 if let Some(loc) = parse_location_text(&line[open + 2..line.len() - 1]) {
-                    return Some(loc);
+                    if loc.line.is_some() { return Some(loc); }
                 }
             }
         }
@@ -829,44 +951,39 @@ fn parse_location_text(text: &str) -> Option<SourceLocation> {
     if text.is_empty() || (text.starts_with('<') && !text.contains(':')) {
         return None;
     }
-    let mut parts = text.rsplitn(3, ':');
-    let last = parts.next()?;
-    let middle = parts.next();
-    let first = parts.next();
-    let (source, line, column) = match (first, middle) {
-        (Some(src), Some(mid)) => match (mid.parse::<u32>(), last.parse::<u32>()) {
-            (Ok(l), Ok(c)) => (src.to_string(), Some(l), Some(c)),
-            _ => (text.to_string(), None, None),
-        },
-        _ => match last.parse::<u32>() {
-            Ok(l) => (middle.unwrap_or("").to_string(), Some(l), None),
-            Err(_) => (text.to_string(), None, None),
-        },
+    let (prefix, last) = text.rsplit_once(':')?;
+    let last = last.parse::<u32>().ok().filter(|n| *n > 0)?;
+    let (source, line, column) = match prefix.rsplit_once(':') {
+        Some((src, l)) if l.parse::<u32>().ok().filter(|n| *n > 0).is_some() =>
+            (src, l.parse::<u32>().ok()?, Some(last)),
+        _ => (prefix, last, None),
     };
-    if source.is_empty() && line.is_none() {
-        return None;
-    }
-    Some(SourceLocation {
-        source: if source.is_empty() { None } else { Some(source) },
-        line,
-        column,
-        ..SourceLocation::default()
-    })
+    if source.is_empty() { return None; }
+    let mut loc = SourceLocation::at(source, line, column);
+    loc.label = Some("reported stack; source mapping not verified".into());
+    loc.normalize();
+    Some(loc)
 }
 
-unsafe fn js_prop_string(ctx: *mut JSContext, obj: JSValueConst, key: &CStr) -> Option<String> {
-    let v = qjs::sofuu_js_get_property_str(ctx, obj, key.as_ptr());
-    if qjs::is_exception(v) {
+/// Read only own string-valued data properties from a genuine QuickJS Error.
+/// Proxies, accessors, inherited properties and object coercions are skipped.
+pub unsafe fn js_error_own_string(ctx: *mut JSContext, obj: JSValueConst, key: &CStr) -> Option<String> {
+    if qjs::JS_IsError(ctx, obj) == 0 { return None; }
+    let atom = qjs::JS_NewAtom(ctx, key.as_ptr());
+    if atom == 0 { return None; }
+    let mut desc = std::mem::MaybeUninit::<qjs::JSPropertyDescriptor>::uninit();
+    let status = qjs::JS_GetOwnProperty(ctx, desc.as_mut_ptr(), obj, atom);
+    qjs::JS_FreeAtom(ctx, atom);
+    if status < 0 {
         let exc = qjs::sofuu_js_get_exception(ctx);
         qjs::sofuu_js_free_value(ctx, exc);
-        qjs::sofuu_js_free_value(ctx, v);
         return None;
     }
-    if qjs::is_undefined(v) || qjs::is_null(v) {
-        qjs::sofuu_js_free_value(ctx, v);
-        return None;
-    }
-    let c = qjs::sofuu_js_to_cstring(ctx, v);
+    if status == 0 { return None; }
+    let desc = desc.assume_init();
+    let c = if desc.flags & (1 << 4) == 0 && qjs::is_string(desc.value) {
+        qjs::sofuu_js_to_cstring(ctx, desc.value)
+    } else { std::ptr::null() };
     let out = if c.is_null() {
         None
     } else {
@@ -874,7 +991,23 @@ unsafe fn js_prop_string(ctx: *mut JSContext, obj: JSValueConst, key: &CStr) -> 
         qjs::sofuu_js_free_cstring(ctx, c);
         Some(s)
     };
-    qjs::sofuu_js_free_value(ctx, v);
+    qjs::sofuu_js_free_value(ctx, desc.value);
+    qjs::sofuu_js_free_value(ctx, desc.getter);
+    qjs::sofuu_js_free_value(ctx, desc.setter);
+    out
+}
+
+/// Read a primitive exception without calling user-defined conversion hooks.
+pub unsafe fn safe_exception_fallback(ctx: *mut JSContext, reason: JSValueConst) -> String {
+    if !qjs::is_string(reason) && !qjs::is_number(reason)
+        && reason.tag as i32 != qjs::JS_TAG_BOOL && !qjs::is_null(reason)
+        && !qjs::is_undefined(reason) {
+        return "The operation failed. No further detail was reported.".into();
+    }
+    let c = qjs::sofuu_js_to_cstring(ctx, reason);
+    if c.is_null() { return "The operation failed. No further detail was reported.".into(); }
+    let out = CStr::from_ptr(c).to_string_lossy().into_owned();
+    qjs::sofuu_js_free_cstring(ctx, c);
     out
 }
 
@@ -888,11 +1021,11 @@ pub unsafe fn from_js_exception_message(
     reason: JSValueConst,
     fallback: &str,
 ) -> Diagnostic {
-    let code = js_prop_string(ctx, reason, c"code");
-    let name = js_prop_string(ctx, reason, c"name");
-    let message = js_prop_string(ctx, reason, c"message").unwrap_or_else(|| fallback.to_string());
-    let stack = js_prop_string(ctx, reason, c"stack");
-    let op = js_prop_string(ctx, reason, c"op");
+    let code = js_error_own_string(ctx, reason, c"code");
+    let name = js_error_own_string(ctx, reason, c"name");
+    let message = js_error_own_string(ctx, reason, c"message").unwrap_or_else(|| fallback.to_string());
+    let stack = js_error_own_string(ctx, reason, c"stack");
+    let op = js_error_own_string(ctx, reason, c"op");
 
     let mut d = match code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
         Some(code) => Diagnostic::from_code(code, message),
@@ -911,6 +1044,8 @@ pub unsafe fn from_js_exception_message(
     }
     if let Some(stack) = stack {
         d.location = first_stack_location(&stack);
+        d.frames = stack.lines().map(str::trim).filter(|s| s.starts_with("at "))
+            .take(MAX_FRAMES).map(|s| sanitize_line(s, MAX_MESSAGE)).collect();
     }
     if d
         .location
@@ -919,7 +1054,8 @@ pub unsafe fn from_js_exception_message(
         .is_some_and(|s| s.ends_with(".ts") || s.ends_with(".tsx"))
     {
         if let Some(loc) = d.location.as_mut() {
-            loc.label = Some("type-stripped source".to_string());
+            loc.generated = true;
+            loc.label = Some("type-stripped source; mapping not verified".to_string());
         }
     }
     d
@@ -928,7 +1064,8 @@ pub unsafe fn from_js_exception_message(
 /// # Safety
 /// `ctx` and `reason` must belong to a live context.
 pub unsafe fn from_js_exception(ctx: *mut JSContext, reason: JSValueConst) -> Diagnostic {
-    from_js_exception_message(ctx, reason, "The operation failed. No further detail was reported.")
+    let fallback = safe_exception_fallback(ctx, reason);
+    from_js_exception_message(ctx, reason, &fallback)
 }
 
 // ── JavaScript surface: sofuu.diagnostics.* ─────────────────────────────────
@@ -1102,6 +1239,57 @@ mod tests {
         }
         assert!(clean.contains("[REDACTED]"), "{clean}");
         assert!(clean.contains("~/project/file.rs"), "{clean}");
+    }
+
+    #[test]
+    fn sanitizer_redacts_ordered_and_quoted_values_without_losing_other_text() {
+        let raw = r#"password=firstsecret api_key=secondsecret {"password":"a\\\"b-secret","token":"x"} café"#;
+        let clean = redact_text(raw);
+        for leak in ["firstsecret", "secondsecret", "b-secret", "\"x\""] {
+            assert!(!clean.contains(leak), "leaked {leak:?}: {clean:?}");
+        }
+        assert!(clean.contains("café"), "{clean}");
+        assert!(clean.matches("[REDACTED]").count() >= 4, "{clean}");
+        assert_eq!(redact_text(&clean), clean);
+        assert!(!redact_text("Bearer abc").contains("abc"));
+    }
+
+    #[test]
+    fn sanitizer_redacts_common_tokens_url_userinfo_and_private_keys() {
+        let raw = "sk-abcdefgh123456 https://alice:privatepass@example.test/path\n-----BEGIN PRIVATE KEY-----\nFAKE-PRIVATE-MATERIAL\n-----END PRIVATE KEY-----\nfinished";
+        let clean = redact_text(raw);
+        for secret in ["abcdefgh123456", "alice", "privatepass", "FAKE-PRIVATE-MATERIAL"] {
+            assert!(!clean.contains(secret), "leaked {secret:?}: {clean:?}");
+        }
+        assert!(clean.contains("example.test/path") && clean.contains("finished"), "{clean}");
+        assert_eq!(redact_text(&clean), clean);
+    }
+
+    #[test]
+    fn event_redaction_keeps_newlines_and_long_nonsecret_values() {
+        let raw = format!("first\nsecond\t{}", "x".repeat(70_000));
+        assert_eq!(redact_event_text(&raw), raw);
+    }
+
+    #[test]
+    fn json_locations_and_frames_are_sanitized_and_bounded() {
+        let value = json!({"message": "failure", "location": {
+            "source": format!("\u{1b}[2J{}", "s".repeat(900)), "line": 7,
+            "label": "password=syntheticsecret"
+        }, "frames": ["at \u{1b}[31mrun password=syntheticsecret"]});
+        let d = Diagnostic::from_json(&value);
+        let out = d.render_human(true, false);
+        assert!(!out.contains('\u{1b}'), "{out:?}");
+        assert!(!out.contains("syntheticsecret"), "{out:?}");
+        assert!(d.location.unwrap().source.unwrap().chars().count() <= MAX_MESSAGE);
+    }
+
+    #[test]
+    fn reported_native_frame_does_not_hide_next_source_frame() {
+        let loc = first_stack_location(" at x (native)\n at y (https://host/path.js:42:3)").unwrap();
+        assert_eq!(loc.source.as_deref(), Some("https://host/path.js"));
+        assert_eq!(loc.line, Some(42));
+        assert_eq!(loc.column, Some(3));
     }
 
     #[test]

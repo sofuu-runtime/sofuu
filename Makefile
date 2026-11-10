@@ -351,6 +351,21 @@ clean:
 	rm -f $(TARGET) sofuu-agent sofuu-micro
 	cargo clean 2>/dev/null || true
 
+# Rust tests. SOFUU_ALLOW_LOOPBACK=1 is required, not optional: the crate's own
+# http_client fixtures bind 127.0.0.1 and the SSRF gate (AUDIT-2026-11-08 §2.6)
+# refuses loopback by default, so without the switch 19 of 24 transport tests
+# fail with "loopback target refused" — a property of the gate, not of the
+# transport. The JS suite sets the same variable for the same reason.
+#
+# Run it with the module filters to keep the engine tests from sharing one
+# process (they serialize on rt::test_loop_lock; a few, e.g. the MCP child
+# tests, can then stall each other). The plain form is what CI wants:
+#   make test-rust
+# and for a single area:
+#   SOFUU_ALLOW_LOOPBACK=1 cargo test --release -p sofuu-core --lib rt::policy
+test-rust:
+	SOFUU_ALLOW_LOOPBACK=1 cargo test --release --all
+
 test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check
 	@echo ""
 	@echo "\033[1m=== Sofuu Test Suite ===\033[0m"

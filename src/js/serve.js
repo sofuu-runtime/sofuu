@@ -129,6 +129,9 @@
       port: num(opts.port, 8080),
       version: str(opts.version) || '0.1.0',
       project: str(opts.project) || str(opts.cwd),
+      /* SV-02: see the /health route — set by the Rust boot call from
+       * --public-health. */
+      publicHealth: opts.publicHealth === true,
     };
   }
 
@@ -826,7 +829,11 @@
         }
 
         if (method === 'GET' && path === '/health') {
-          if (authMode() !== 'none') {
+          /* SV-02 (AUDIT-2026-11-08): container probes only know /health, so
+           * an operator running behind k8s/compose passes --public-health and
+           * gets the same data-free answer the /healthz probe already gives.
+           * Everything else stays behind the token. */
+          if (authMode() !== 'none' && !cfg.publicHealth) {
             var hAuth = (req.headers && (req.headers.authorization || req.headers.Authorization)) || '';
             if (!ctEq(hAuth, 'Bearer ' + cfg.token)) {
               fail(res, 401, 'missing or invalid bearer token', 'authentication_error', 'invalid_api_key');

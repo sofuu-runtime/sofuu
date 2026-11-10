@@ -466,8 +466,15 @@
             }
             return buf;
           }
-          if (enc === "base64") {
-            const binary = globalThis.atob(value);
+          if (enc === "base64" || enc === "base64url") {
+            /* JR-046: base64url is the URL-safe alphabet with the padding
+             * dropped, and Node accepts padded or unpadded input. Translate
+             * to plain base64 (atob handles the missing "=" itself) so both
+             * siblings decode through one path. */
+            const b64 = enc === "base64url"
+              ? value.replace(/-/g, "+").replace(/_/g, "/")
+              : value;
+            const binary = globalThis.atob(b64);
             const buf = new Buffer(binary.length);
             for (let i = 0; i < binary.length; i++) {
               buf[i] = binary.charCodeAt(i);
@@ -517,12 +524,16 @@
           }
           return hex;
         }
-        if (enc === "base64") {
+        if (enc === "base64" || enc === "base64url") {
           let bin = "";
           for (let i = 0; i < sub.length; i++) {
             bin += String.fromCharCode(sub[i]);
           }
-          return globalThis.btoa(bin);
+          const b64 = globalThis.btoa(bin);
+          /* JR-046: Node's base64url output is URL-safe and unpadded. */
+          return enc === "base64url"
+            ? b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+            : b64;
         }
         return new TextDecoder().decode(sub);
       }
@@ -763,10 +774,11 @@
     sep: "/",
     delimiter: ":",
     join(...parts) {
-      return parts
-        .filter(Boolean)
-        .join("/")
-        .replace(/\/+/g, "/");
+      /* JR-047: Node joins with "/" and then normalises the result, so
+       * path.join("a/b/../c") is "a/c" — the old shim only collapsed
+       * repeated slashes and handed ".." straight through. */
+      const joined = parts.filter(Boolean).join("/");
+      return joined ? nodePath.normalize(joined) : ".";
     },
     resolve(...parts) {
       let resolved = "";
@@ -861,6 +873,82 @@
     },
   };
 
+  /* ── digest helpers (node:crypto digests/hmacs) ─────────────────────
+   * The bridge is string-only, so bytes travel as hex and the digest comes
+   * back as hex; every encoding conversion happens here, once. */
+  const DIGEST_ALGS = {
+    md5: "md5",
+    sha1: "sha1",
+    "sha-1": "sha1",
+    sha256: "sha256",
+    "sha-256": "sha256",
+    sha512: "sha512",
+    "sha-512": "sha512",
+  };
+
+  function digestAlgName(algorithm) {
+    const raw = typeof algorithm === "string" ? algorithm : algorithm && algorithm.name;
+    const key = String(raw || "").trim().toLowerCase();
+    const alg = DIGEST_ALGS[key];
+    if (!alg) {
+      throw new Error("Digest method not supported: " + raw);
+    }
+    return alg;
+  }
+
+  function digestBytes(chunk, encoding) {
+    const B = globalThis.Buffer;
+    if (typeof chunk === "string") {
+      return B.from(chunk, encoding || "utf8");
+    }
+    if (chunk instanceof Uint8Array) {
+      return B.from(chunk);
+    }
+    if (chunk && chunk.buffer) {
+      return B.from(chunk.buffer, chunk.byteOffset || 0, chunk.byteLength);
+    }
+    return B.from(String(chunk), "utf8");
+  }
+
+  function digestConcatHex(chunks) {
+    if (chunks.length === 0) return "";
+    return globalThis.Buffer.concat(chunks).toString("hex");
+  }
+
+  function sofuuDigest(alg, dataHex) {
+    const native = globalThis.sofuu && globalThis.sofuu.crypto;
+    if (!native || !native.digest) {
+      throw new Error("crypto.digest unavailable in this runtime");
+    }
+    const out = native.digest(alg, dataHex);
+    if (typeof out !== "string") {
+      throw new Error("Digest method not supported: " + alg);
+    }
+    return out;
+  }
+
+  function sofuuHmac(alg, keyHex, dataHex) {
+    const native = globalThis.sofuu && globalThis.sofuu.crypto;
+    if (!native || !native.hmac) {
+      throw new Error("crypto.hmac unavailable in this runtime");
+    }
+    const out = native.hmac(alg, keyHex, dataHex);
+    if (typeof out !== "string") {
+      throw new Error("Digest method not supported: " + alg);
+    }
+    return out;
+  }
+
+  function digestOutput(hex, encoding) {
+    if (encoding === "hex") return hex;
+    if (encoding === "buffer") return globalThis.Buffer.from(hex, "hex");
+    const buf = globalThis.Buffer.from(hex, "hex");
+    if (encoding === "base64") return buf.toString("base64");
+    if (encoding === "base64url") return buf.toString("base64url");
+    if (encoding === "latin1" || encoding === "binary") return buf.toString("latin1");
+    return buf;
+  }
+
   const nodeCrypto = {
     randomUUID: cryptoObj.randomUUID,
     getRandomValues: cryptoObj.getRandomValues,
@@ -870,33 +958,41 @@
       cryptoObj.getRandomValues(buf);
       return buf;
     },
+    /* JR-053 (AUDIT-2026-11-08): createHash answered every algorithm name with
+     * SHA-256, and createHmac threw the key away. Both now go through
+     * sofuu.crypto.digest / sofuu.crypto.hmac, which select the real primitive
+     * (MD5, SHA-1, SHA-256, SHA-512) and do true RFC 2104 HMAC. An unsupported
+     * name throws, as node does, instead of quietly returning a SHA-256. */
     createHash(algorithm) {
-      let data = "";
+      const alg = digestAlgName(algorithm);
+      const chunks = [];
       return {
-        update(chunk) {
-          if (typeof chunk === "string") {
-            data += chunk;
-          } else if (chunk && chunk.toString) {
-            data += chunk.toString("utf8");
-          }
+        update(chunk, encoding) {
+          chunks.push(digestBytes(chunk, encoding));
           return this;
         },
-        digest(encoding = "hex") {
-          let hex = "";
-          if (globalThis.sofuu && globalThis.sofuu.crypto && globalThis.sofuu.crypto.sha256) {
-            hex = globalThis.sofuu.crypto.sha256(data);
-          } else {
-            hex = "0".repeat(64);
-          }
-          if (encoding === "hex") return hex;
-          const buf = globalThis.Buffer.from(hex, "hex");
-          if (encoding === "base64") return buf.toString("base64");
-          return buf;
+        digest(encoding) {
+          /* Node: digest() with no argument returns a Buffer; an explicit
+           * encoding returns a string. */
+          const hex = sofuuDigest(alg, digestConcatHex(chunks));
+          return digestOutput(hex, encoding === undefined ? "buffer" : encoding);
         },
       };
     },
     createHmac(algorithm, key) {
-      return nodeCrypto.createHash(algorithm);
+      const alg = digestAlgName(algorithm);
+      const keyHex = digestBytes(key).toString("hex");
+      const chunks = [];
+      return {
+        update(chunk, encoding) {
+          chunks.push(digestBytes(chunk, encoding));
+          return this;
+        },
+        digest(encoding) {
+          const hex = sofuuHmac(alg, keyHex, digestConcatHex(chunks));
+          return digestOutput(hex, encoding === undefined ? "buffer" : encoding);
+        },
+      };
     },
   };
 
@@ -919,6 +1015,21 @@
         return sfs.writeFileSync(p, data, enc);
       }
       throw new Error(`fs.writeFileSync unavailable for ${p}`);
+    },
+    appendFileSync(p, data, enc) {
+      if (sfs.appendFileSync) {
+        return sfs.appendFileSync(p, data, enc);
+      }
+      /* JR-048: there is no native sync append, and an async one is useless
+       * to an appendFileSync caller, so read the existing bytes and write
+       * old+new. Bytes (not text) keep a binary append byte-exact, and a
+       * missing file simply starts empty, i.e. it is created. */
+      const add = typeof data === "string"
+        ? globalThis.Buffer.from(data, enc || "utf8")
+        : globalThis.Buffer.from(data);
+      const exists = sfs.existsSync && sfs.existsSync(p);
+      const old = exists ? globalThis.Buffer.from(nodeFs.readFileSync(p)) : new globalThis.Buffer(0);
+      return nodeFs.writeFileSync(p, globalThis.Buffer.concat([old, add]));
     },
     existsSync(p) {
       if (sfs.existsSync) {
@@ -2029,3 +2140,269 @@ if (typeof globalThis.ReadableStream === "undefined") {
   //       for await (var chunk of res.body) { ... }
 })();
 
+
+// ── sofuu.spawn handle fidelity (AUDIT-2026-11-08 JR-077/JR-079) ────────────
+// The native child object exposes kill()/write() and callback options, but no
+// pid, no reusable stdout/stderr, and no promise for its exit, so
+//   const p = sofuu.spawn(...); const r = await p.exited;
+// was a no-op on a handle with no such fields. This wrapper adds the
+// Node-shaped surface WITHOUT touching the native object: exit resolves
+// { code, signal }, and stdout/stderr are small emitters fed by the callbacks
+// the native layer already invokes.
+(function () {
+  if (typeof sofuu === 'undefined' || !sofuu || typeof sofuu.spawn !== 'function') return;
+  if (sofuu.spawn.__handleFidelity) return;
+  var nativeSpawn = sofuu.spawn;
+
+  function emitter(handlers) {
+    var api = {
+      on: function (ev, fn) {
+        if (typeof fn === 'function' && handlers[ev]) handlers[ev].push(fn);
+        return api;
+      },
+      once: function (ev, fn) {
+        if (typeof fn !== 'function' || !handlers[ev]) return api;
+        var wrap = function (arg) { api.off(ev, wrap); fn(arg); };
+        handlers[ev].push(wrap);
+        return api;
+      },
+      off: function (ev, fn) {
+        var list = handlers[ev];
+        if (list) {
+          var i = list.indexOf(fn);
+          if (i >= 0) list.splice(i, 1);
+        }
+        return api;
+      },
+      emit: function (ev, arg) {
+        var list = handlers[ev] || [];
+        for (var i = 0; i < list.length; i++) {
+          try { list[i](arg); } catch (e) { /* a listener must not kill the child loop */ }
+        }
+        return true;
+      },
+    };
+    return api;
+  }
+
+  function spawn(opts) {
+    opts = opts || {};
+    var outHandlers = { data: [], end: [], error: [] };
+    var errHandlers = { data: [], end: [], error: [] };
+    var stdout = emitter(outHandlers);
+    var stderr = emitter(errHandlers);
+    var userOut = opts.onStdout, userErr = opts.onStderr, userExit = opts.onExit;
+    var resolveExit;
+    var exited = new Promise(function (res) { resolveExit = res; });
+
+    var nativeOpts = {};
+    for (var k in opts) {
+      if (Object.prototype.hasOwnProperty.call(opts, k)) nativeOpts[k] = opts[k];
+    }
+    nativeOpts.onStdout = function (chunk) {
+      if (typeof userOut === 'function') { try { userOut(chunk); } catch (e) {} }
+      stdout.emit('data', chunk);
+    };
+    nativeOpts.onStderr = function (chunk) {
+      if (typeof userErr === 'function') { try { userErr(chunk); } catch (e) {} }
+      stderr.emit('data', chunk);
+    };
+    nativeOpts.onExit = function (code, signal) {
+      var res = {
+        code: (code === undefined || code === null) ? null : Number(code),
+        signal: (!signal) ? null : Number(signal),
+      };
+      try { if (typeof userExit === 'function') userExit(res.code, res.signal); } catch (e) {}
+      stdout.emit('end');
+      stderr.emit('end');
+      resolveExit(res);
+    };
+
+    var child = nativeSpawn(nativeOpts);
+    if (!child) return child;
+    child.exited = exited;
+    child.stdout = stdout;
+    child.stderr = stderr;
+    child.exitCode = null;
+    child.stdin = {
+      write: function (data) {
+        if (typeof child.write !== 'function') throw new Error('sofuu.spawn: this child has no stdin');
+        child.write(typeof data === 'string' ? data : String(data));
+        return true;
+      },
+      end: function () {
+        /* The native child closes stdin when it exits; an explicit end() is
+         * accepted for API parity and closes nothing early. */
+        return true;
+      },
+    };
+    return child;
+  }
+  spawn.__handleFidelity = true;
+  sofuu.spawn = spawn;
+})();
+
+// ── timer handle fidelity (AUDIT-2026-11-08 JR-073) ─────────────────────────
+// The native setTimeout/setInterval answer with a bare uint32 id, so the
+// Node idiom "setInterval(fn, 60000).unref()" threw "unref is not a function"
+// — the one call every heartbeat / keep-alive makes. The wrapper below hands
+// back a Node-shaped Timeout instead: unref()/ref()/hasRef()/close() plus a
+// numeric primitive value, so clearTimeout(handle) and clearTimeout(id) both
+// keep working.
+//
+// Honest limit: nothing in this runtime exposes uv_unref to JS, so unref()
+// cannot detach the native handle — the loop still waits for the timer even
+// after unref(). The flag follows Node (hasRef() answers what was requested);
+// a keep-alive that must not hold the process open has to clearTimeout().
+(function () {
+  if (typeof globalThis.setTimeout !== "function") return;
+  if (globalThis.setTimeout.__timerHandles) return;
+  var nativeSetTimeout = globalThis.setTimeout;
+  var nativeSetInterval = globalThis.setInterval;
+  var nativeClearTimeout = globalThis.clearTimeout;
+  var nativeClearInterval = globalThis.clearInterval;
+
+  /* The native clear functions take the numeric id; a handle carries it. */
+  function timerId(t) {
+    return (t && typeof t === "object" && typeof t._id === "number") ? t._id : t;
+  }
+
+  function makeHandle(id) {
+    var handle = {
+      _id: id,
+      _ref: true,
+      ref: function () { handle._ref = true; return handle; },
+      unref: function () { handle._ref = false; return handle; },
+      hasRef: function () { return handle._ref; },
+      refresh: function () { return handle; },
+      close: function () {
+        if (nativeClearTimeout) nativeClearTimeout(handle._id);
+        return handle;
+      },
+      valueOf: function () { return handle._id; },
+      toString: function () { return String(handle._id); },
+    };
+    if (typeof Symbol === "function" && Symbol.toPrimitive) {
+      handle[Symbol.toPrimitive] = function () { return handle._id; };
+    }
+    return handle;
+  }
+
+  globalThis.setTimeout = function (cb, delay) {
+    return makeHandle(nativeSetTimeout(cb, delay));
+  };
+  globalThis.setInterval = function (cb, delay) {
+    return makeHandle(nativeSetInterval(cb, delay));
+  };
+  globalThis.setTimeout.__timerHandles = true;
+  if (nativeClearTimeout) {
+    globalThis.clearTimeout = function (t) { return nativeClearTimeout(timerId(t)); };
+  }
+  if (nativeClearInterval) {
+    globalThis.clearInterval = function (t) { return nativeClearInterval(timerId(t)); };
+  }
+})();
+
+// ── sofuu.exec typed failures (AUDIT-2026-11-08 JR-074) ─────────────────────
+// A spawn that never started rejected with libuv's bare sentence ("no such
+// file or directory"): a string with no code, so
+//   try { await sofuu.exec(cmd, args); }
+//   catch (e) { if (e.code === "ENOENT") ... }
+// could never match. A child killed by a signal (exec's own timeout sends
+// SIGTERM) also resolved like a success, {code: 0, signal: 15}. Both are
+// Node-shaped failures now: a rejected Error carrying code/errno/syscall/path/
+// signal/cmd, plus the captured stdout/stderr when the child did run.
+(function () {
+  if (typeof sofuu === "undefined" || !sofuu || typeof sofuu.exec !== "function") return;
+  if (sofuu.exec.__typedFailures) return;
+  var nativeExec = sofuu.exec;
+
+  /* libuv strerror text -> Node's errno name, in spawn order of likelihood. */
+  var SPAWN_ERRNOS = [
+    { match: "no such file or directory", code: "ENOENT", errno: -2 },
+    { match: "permission denied", code: "EACCES", errno: -13 },
+    { match: "not a directory", code: "ENOTDIR", errno: -20 },
+    { match: "exec format error", code: "ENOEXEC", errno: -8 },
+    { match: "operation not permitted", code: "EPERM", errno: -1 },
+    { match: "argument list too long", code: "E2BIG", errno: -7 },
+    { match: "too many open files", code: "EMFILE", errno: -24 },
+    { match: "cannot allocate memory", code: "ENOMEM", errno: -12 },
+  ];
+  var SIGNAL_NAMES = {
+    1: "SIGHUP", 2: "SIGINT", 3: "SIGQUIT", 6: "SIGABRT", 9: "SIGKILL",
+    11: "SIGSEGV", 13: "SIGPIPE", 14: "SIGALRM", 15: "SIGTERM",
+  };
+
+  function spawnError(command, text) {
+    var info = { code: "E_EXEC", errno: 0 };
+    var lower = String(text).toLowerCase();
+    for (var i = 0; i < SPAWN_ERRNOS.length; i++) {
+      if (lower.indexOf(SPAWN_ERRNOS[i].match) >= 0) { info = SPAWN_ERRNOS[i]; break; }
+    }
+    var err = new Error("spawn " + command + " " + info.code
+      + (info.code === "E_EXEC" ? ": " + text : ""));
+    err.code = info.code;
+    err.errno = info.errno;
+    err.syscall = "spawn " + command;
+    err.path = command;
+    err.cmd = command;
+    err.signal = null;
+    return err;
+  }
+
+  function exec(command, args, opts) {
+    return nativeExec.call(sofuu, command, args, opts).then(function (r) {
+      if (r && r.signal) {
+        /* A signalled child did not succeed, whatever its exit status says. */
+        var sig = SIGNAL_NAMES[r.signal] || r.signal;
+        var err = new Error("spawn " + command + " " + sig);
+        err.code = null;
+        err.errno = 0;
+        err.syscall = "spawn " + command;
+        err.path = command;
+        err.cmd = command;
+        err.signal = sig;
+        err.exitCode = r.code;
+        err.stdout = r.stdout;
+        err.stderr = r.stderr;
+        throw err;
+      }
+      return r;
+    }, function (reason) {
+      if (reason && typeof reason === "object" && reason.code) throw reason;
+      throw spawnError(command, reason && reason.message ? reason.message : String(reason));
+    });
+  }
+  exec.__typedFailures = true;
+  sofuu.exec = exec;
+})();
+
+
+/* JR-003 / JR-082 (AUDIT-2026-11-08, Task 4.2): the ML namespaces are native
+ * OBJECTS, so sofuu.ml.relevance(...) — the shape the audit exercised — threw
+ * "TypeError: not a function", and the offline heuristics were unreachable by
+ * the obvious spelling. Each namespace is now ALSO callable: calling it
+ * delegates to its primary verb, and every original member stays attached, so
+ * sofuu.ml.relevance(x) and sofuu.ml.relevance.plan(x) both work. The offline
+ * fallback is the native one — no model needs to be loaded to answer. */
+(function () {
+  var ml = (typeof sofuu !== 'undefined' && sofuu) ? sofuu.ml : null;
+  if (!ml) return;
+  var SPEC = [['relevance', 'plan'], ['freshness', 'score'],
+              ['compaction', 'plan'], ['alloc', 'plan']];
+  for (var i = 0; i < SPEC.length; i++) {
+    var name = SPEC[i][0], verb = SPEC[i][1];
+    var ns = ml[name];
+    if (!ns || typeof ns !== 'object' || typeof ns === 'function') continue;
+    var callable = (function (nsRef, verbName) {
+      return function () {
+        var target = nsRef[verbName];
+        if (typeof target === 'function') return target.apply(nsRef, arguments);
+        return nsRef;
+      };
+    })(ns, verb);
+    for (var k in ns) { try { callable[k] = ns[k]; } catch (e) { } }
+    callable.__sofuuNamespace = name;
+    try { ml[name] = callable; } catch (e) { }
+  }
+})();

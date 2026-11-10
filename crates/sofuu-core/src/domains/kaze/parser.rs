@@ -21,6 +21,9 @@ pub struct ParseError {
     pub line: u32,
     pub col: u32,
     pub msg: String,
+    /* KZ-038: the lexer tags an out-of-range numeric literal with its own
+     * code; every other parse error keeps E_KAZE_PARSE. */
+    pub code: &'static str,
 }
 
 impl ParseError {
@@ -29,12 +32,12 @@ impl ParseError {
     }
 
     fn from_lex(e: LexError) -> Self {
-        ParseError { line: e.line, col: e.col, msg: e.msg }
+        ParseError { line: e.line, col: e.col, msg: e.msg, code: e.code }
     }
 }
 
 fn err<T>(line: u32, col: u32, msg: impl Into<String>) -> Result<T, ParseError> {
-    Err(ParseError { line, col, msg: msg.into() })
+    Err(ParseError { line, col, msg: msg.into(), code: "E_KAZE_PARSE" })
 }
 
 /// Parse a whole script.
@@ -47,6 +50,7 @@ pub fn parse(src: &str) -> Result<Program, ParseError> {
         needs: Vec::new(),
         ambient: None,
         hook_seq: 0,
+        depth: 0,
     };
     p.program()
 }
@@ -59,6 +63,8 @@ struct Parser {
     /// The script's single hardware family, when it declared exactly one.
     ambient: Option<&'static str>,
     hook_seq: u32,
+    /// Current expression-nesting depth; see MAX_EXPR_DEPTH.
+    depth: usize,
 }
 
 impl Parser {
@@ -591,8 +597,33 @@ impl Parser {
     }
 
     // ── expressions ──────────────────────────────────────────────────
+    /// The deepest expression nesting the front end will parse.
+    ///
+    /// AUDIT-2026-11-08 KZ-095/KZ-099: 4,000 nested parentheses overflowed the
+    /// native stack and aborted the process (exit 134) instead of failing the
+    /// script. Each level costs about ten recursive descent frames, so the
+    /// limit is set where a human script never reaches it and the parser still
+    /// runs comfortably inside a 2 MiB worker-thread stack (256 levels is about
+    /// half a megabyte of frames), so an embedded Kaze parse cannot abort the
+    /// process either.
+    const MAX_EXPR_DEPTH: usize = 256;
+
     fn expr(&mut self) -> Result<Expr, ParseError> {
-        self.or_expr()
+        if self.depth >= Self::MAX_EXPR_DEPTH {
+            let (line, col) = self.here();
+            return err(
+                line,
+                col,
+                format!(
+                    "expression nested more than {} levels deep; bind the inner part to a name",
+                    Self::MAX_EXPR_DEPTH
+                ),
+            );
+        }
+        self.depth += 1;
+        let out = self.or_expr();
+        self.depth -= 1;
+        out
     }
 
     fn or_expr(&mut self) -> Result<Expr, ParseError> {
@@ -813,11 +844,30 @@ impl Parser {
         }
     }
 
+    /// True when the token at pos can begin a value, i.e. a percent sign
+    /// followed by it is the modulo operator and not a unit suffix.
+    fn starts_value_at(&self, pos: usize) -> bool {
+        matches!(
+            self.peek_at(pos),
+            Tok::Num(_) | Tok::Str(_) | Tok::Ident(_) | Tok::Punct('(') | Tok::Punct('[')
+        )
+    }
+
     /// Consume a unit suffix if one is written.
     fn take_unit(&mut self) -> Result<Option<(&'static str, Unit)>, ParseError> {
         let word = match self.peek().clone() {
             Tok::Ident(w) => w,
             Tok::Punct('%') => {
+                /* KZ-079 (AUDIT-2026-11-08): 9 % 4 used to parse as the
+                 * percent literal 9 followed by a stray 4, so a modulo whose
+                 * left side was a number literal silently returned that
+                 * number (and 9 % 0 never trapped). A percent sign is a unit
+                 * only when no value follows it: 20%:, 20% at line end and
+                 * 20% > 5 stay percent literals, 9 % 4 and 9 % (x) are
+                 * modulo. */
+                if self.starts_value_at(1) {
+                    return Ok(None);
+                }
                 self.bump();
                 return Ok(Some(("%", Unit::Pct)));
             }

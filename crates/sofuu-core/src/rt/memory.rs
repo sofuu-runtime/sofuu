@@ -1640,6 +1640,26 @@ mod impl_qtsq {
                  * fresh — never wipe silently, never break chat. W2.2: a
                  * readonly open takes no backup and leaves the bytes alone. */
                 if std::path::Path::new(path).exists() {
+                    /* AG-105 (AUDIT-2026-11-08, MEM-013): a file that does not
+                     * even carry the QTSQ magic is not a brain. Opening a
+                     * fresh store over it (backup or not) told the caller its
+                     * brain had loaded and invited a later flush to replace
+                     * it; refuse the open instead. */
+                    let foreign_magic = std::fs::File::open(path)
+                        .and_then(|mut f| {
+                            use std::io::Read;
+                            let mut m = [0u8; 4];
+                            f.read_exact(&mut m).map(|_| m)
+                        })
+                        .map(|m| m != *b"QTS\x01")
+                        .unwrap_or(false);
+                    if foreign_magic {
+                        eprintln!(
+                            "[sofuu/cma] brain file {} is not a QTSQ container (bad magic) — refusing to open it",
+                            path
+                        );
+                        return Err(OpenError::Corrupt);
+                    }
                     if opts.readonly {
                         eprintln!(
                             "[sofuu/cma] brain file {} failed to load (qtsq error {}) — readonly open: left untouched, no backup taken",
@@ -3619,6 +3639,28 @@ mod impl_qtsq {
         }
 
         let path_owned = cstr_opt(path);
+        /* MEM-003/MEM-057 (AUDIT-2026-11-08): memory.open('') and
+         * memory.open(<directory>) used to answer a usable-looking handle that
+         * then failed at flush time, and an unreadable file reported a
+         * "foreign format". Both are refusals at the entry point now. */
+        if let Some(p) = path_owned.clone() {
+            if p.trim().is_empty() || std::path::Path::new(&p).is_dir() {
+                return throw_coded(
+                    ctx,
+                    "E_INVALID_PATH",
+                    "memory.open: the path must name a brain file (an empty path or a directory is refused)",
+                );
+            }
+            if let Err(e) = std::fs::File::open(&p) {
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    return throw_coded(
+                        ctx,
+                        "E_ACCES",
+                        &format!("memory.open: {p}: permission denied (the file is not readable by this process)"),
+                    );
+                }
+            }
+        }
         let shell = match path_owned.as_deref() {
             Some(p) => cma_open_ex(p, dim as usize, embed_id.as_deref(), open_opts),
             None => Err(OpenError::Corrupt),
@@ -3795,6 +3837,23 @@ mod impl_qtsq {
         }
     }
 
+
+    /// AG-103 (AUDIT-2026-11-08, MEM-024): a closed handle is dead. Before
+    /// this guard, remember() after close() returned a success id for a row
+    /// that could never be flushed — the lock had already been released, so
+    /// the write was silently lost and the caller was told it succeeded.
+    unsafe fn closed_refusal(ctx: *mut JSContext, cma: &CmaShell) -> bool {
+        if !cma.closed {
+            return false;
+        }
+        let _ = throw_coded(
+            ctx,
+            E_LOCKED,
+            "this brain handle is closed — reopen the brain before reading or writing",
+        );
+        true
+    }
+
     unsafe extern "C" fn js_cma_remember(
         ctx: *mut JSContext,
         this_val: JSValueConst,
@@ -3807,6 +3866,9 @@ mod impl_qtsq {
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
+        if closed_refusal(ctx, cma) {
+            return qjs::sofuu_js_exception();
+        }
         /* W2.2: a readonly handle holds a SHARED lock. Buffering a write it
          * can never flush would be silent data loss, so refuse at the entry
          * point instead of at flush time. */
@@ -3814,6 +3876,30 @@ mod impl_qtsq {
             return throw_coded(ctx, E_LOCKED, "this brain is open readonly (shared lock) — write refused");
         }
 
+        /* MEM-022 (AUDIT-2026-11-08): the segment row format stores the text
+         * length in 16 bits, so a longer payload was silently truncated on
+         * disk. Refuse it, with the size, before anything is embedded.
+         * Both shapes carry text: remember(text, ...) and
+         * remember(vec, text, ...) — the second word is the text there. */
+        for i in 0..argc.min(2) {
+            let probe = *argv.add(i as usize);
+            if qjs::sofuu_js_is_string(probe) == 0 {
+                continue;
+            }
+            let cstr = qjs::sofuu_js_to_cstring(ctx, probe);
+            if cstr.is_null() {
+                continue;
+            }
+            let n = std::ffi::CStr::from_ptr(cstr).to_bytes().len();
+            qjs::sofuu_js_free_cstring(ctx, cstr);
+            if n > 65535 {
+                return throw_coded(
+                    ctx,
+                    "E_RECORD_TOO_LARGE",
+                    &format!("payload size {n} exceeds 65535 byte limit"),
+                );
+            }
+        }
 
         // B8.1: If first argument is a string, auto-embed via local TF-IDF
         if qjs::sofuu_js_is_string(*argv) != 0 {
@@ -4063,6 +4149,9 @@ mod impl_qtsq {
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
+        if closed_refusal(ctx, cma) {
+            return qjs::sofuu_js_exception();
+        }
         /* W2.2: a readonly handle holds a SHARED lock. Buffering a write it
          * can never flush would be silent data loss, so refuse at the entry
          * point instead of at flush time. */
@@ -4119,18 +4208,63 @@ mod impl_qtsq {
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
+        if closed_refusal(ctx, cma) {
+            return qjs::sofuu_js_exception();
+        }
+
+        /* MEM-020 (AUDIT-2026-11-08): recall also accepts the documented
+         * options object, recall({query|text, topK|k, diversity}), so the
+         * native handle and the memory_api wrapper agree on one shape. */
+        let mut obj_query: Option<String> = None;
+        let mut obj_top_k: Option<u32> = None;
+        let mut obj_diversity_off = false;
+        if qjs::is_object(*argv) {
+            for key in [c"query", c"text"] {
+                if obj_query.is_some() {
+                    break;
+                }
+                let v = qjs::sofuu_js_get_property_str(ctx, *argv, key.as_ptr());
+                if qjs::sofuu_js_is_string(v) != 0 {
+                    let cptr = qjs::sofuu_js_to_cstring(ctx, v);
+                    obj_query = cstr_opt(cptr);
+                    if !cptr.is_null() {
+                        qjs::sofuu_js_free_cstring(ctx, cptr);
+                    }
+                }
+                qjs::sofuu_js_free_value(ctx, v);
+            }
+            for key in [c"topK", c"top_k", c"k"] {
+                if obj_top_k.is_some() {
+                    break;
+                }
+                let v = qjs::sofuu_js_get_property_str(ctx, *argv, key.as_ptr());
+                if qjs::sofuu_js_is_number(v) != 0 {
+                    let mut n: u32 = 0;
+                    qjs::sofuu_js_to_uint32(ctx, &mut n, v);
+                    obj_top_k = Some(n);
+                }
+                qjs::sofuu_js_free_value(ctx, v);
+            }
+            let d = qjs::sofuu_js_get_property_str(ctx, *argv, c"diversity".as_ptr());
+            obj_diversity_off = qjs::is_bool(d) && qjs::JS_ToBool(ctx, d) == 0;
+            qjs::sofuu_js_free_value(ctx, d);
+        }
 
         // B8.2: If first argument is a string, auto-embed query text + token re-rank
-        if qjs::sofuu_js_is_string(*argv) != 0 {
-            let text_c = qjs::sofuu_js_to_cstring(ctx, *argv);
-            let text = if !text_c.is_null() {
-                let s = std::ffi::CStr::from_ptr(text_c).to_string_lossy().into_owned();
-                qjs::sofuu_js_free_cstring(ctx, text_c);
+        if let Some(query) = obj_query.or_else(|| {
+            if qjs::sofuu_js_is_string(*argv) != 0 {
+                let text_c = qjs::sofuu_js_to_cstring(ctx, *argv);
+                let s = cstr_opt(text_c);
+                if !text_c.is_null() {
+                    qjs::sofuu_js_free_cstring(ctx, text_c);
+                }
                 s
             } else {
-                String::new()
-            };
-            let mut top_k: u32 = 5;
+                None
+            }
+        }) {
+            let text = query;
+            let mut top_k: u32 = obj_top_k.unwrap_or(5);
             if argc >= 2 && qjs::sofuu_js_is_number(*argv.add(1)) != 0 {
                 qjs::sofuu_js_to_uint32(ctx, &mut top_k, *argv.add(1));
             }
@@ -4140,12 +4274,40 @@ mod impl_qtsq {
             let mut query_vec = vec![0.0f32; cma.vec_dim];
             crate::rt::ai::sofuu_tfidf_embed(text.as_bytes(), &mut query_vec, cma.vec_dim);
 
+            /* MEM-020 (AUDIT-2026-11-08): the third argument may ask for a
+             * strictly monotone ranking. The diversity floor is store state,
+             * so it is saved and restored around THIS call only. */
+            let saved_floor = cma.cma.diversity_floor;
+            let mut floor_off = obj_diversity_off;
+            if argc >= 3 && !floor_off {
+                let opt = *argv.add(2);
+                let off = if qjs::is_bool(opt) {
+                    qjs::JS_ToBool(ctx, opt) == 0
+                } else if qjs::is_object(opt) {
+                    let d = qjs::sofuu_js_get_property_str(ctx, opt, c"diversity".as_ptr());
+                    let is_off = qjs::is_bool(d) && qjs::JS_ToBool(ctx, d) == 0;
+                    qjs::sofuu_js_free_value(ctx, d);
+                    is_off
+                } else {
+                    false
+                };
+                if off {
+                    floor_off = true;
+                }
+            }
+            if floor_off {
+                cma.cma.set_diversity_floor(None);
+            }
+
             let json = cma_recall_text_json(cma, &query_vec, top_k as usize, &text);
             let cj = CString::new(json).unwrap_or_default();
             let mut arr = qjs::JS_ParseJSON(ctx, cj.as_ptr(), cj.as_bytes().len(), c"<cma-recall>".as_ptr());
             if qjs::is_exception(arr) {
                 qjs::sofuu_js_get_exception(ctx);
                 arr = qjs::JS_NewArray(ctx);
+            }
+            if floor_off {
+                cma.cma.set_diversity_floor(saved_floor);
             }
             return arr;
         }
@@ -4605,6 +4767,9 @@ mod impl_qtsq {
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
+        if closed_refusal(ctx, cma) {
+            return qjs::sofuu_js_exception();
+        }
         /* W2.2: a readonly handle holds a SHARED lock. Buffering a write it
          * can never flush would be silent data loss, so refuse at the entry
          * point instead of at flush time. */
@@ -4968,7 +5133,9 @@ mod impl_qtsq {
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
-        qjs::sofuu_js_new_uint32(ctx, cma.cma.len() as u32)
+        /* MEM-003 (AUDIT-2026-11-08): count() answered the physical row count,
+         * so forget() never moved it. Tombstones are not live records. */
+        qjs::sofuu_js_new_uint32(ctx, cma.cma.live_len() as u32)
     }
 
     /// W6.1 (AUDIT-2026-10-29): `cma.flush()` → `{ok:true, recordsWritten:N,
@@ -4988,6 +5155,9 @@ mod impl_qtsq {
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
+        if closed_refusal(ctx, cma) {
+            return qjs::sofuu_js_exception();
+        }
         let r = cma_flush(cma);
         if r != 0 {
             /* The failure path already recorded WHY (code + message). */
@@ -5282,6 +5452,9 @@ mod impl_qtsq {
         let Some(cma) = shell_from_this(ctx, this_val) else {
             return qjs::sofuu_js_exception();
         };
+        if closed_refusal(ctx, cma) {
+            return qjs::sofuu_js_exception();
+        }
         /* W2.2: a readonly handle holds a SHARED lock. Buffering a write it
          * can never flush would be silent data loss, so refuse at the entry
          * point instead of at flush time. */
@@ -6277,7 +6450,7 @@ mod impl_qtsq {
     ) -> qjs::JSCFunctionListEntry {
         qjs::JSCFunctionListEntry {
             name: name.as_ptr(),
-            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE | qjs::JS_PROP_ENUMERABLE,
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc {
@@ -7074,16 +7247,33 @@ mod impl_qtsq {
     }
 
     #[test]
-    fn corrupt_container_is_backed_up_then_fresh_start() {
+    fn foreign_container_is_refused_and_left_untouched() {
+        /* MEM-013 (AUDIT-2026-11-08): a file that does not even carry the QTSQ
+         * magic is NOT a brain. Opening a fresh store over it told the caller
+         * its brain had loaded and invited the next flush to replace whatever
+         * was there. The open refuses with OpenError::Corrupt instead — the
+         * caller (chat) carries on without memory rather than crashing — and
+         * nothing in the directory is touched: no wipe, no backup of a file we
+         * were never asked to own. */
         let dir = fresh_test_dir("brain-garbage");
         let path = dir.join("brain.qtsq");
         let p = path.to_str().unwrap();
         std::fs::write(&path, b"not a qtsq container at all").unwrap();
         let before = std::fs::read(&path).unwrap();
-        let mut shell = unsafe { cma_open_loaded(p, crate::embedding::HASH_DIM, None) }
-            .expect("garbage must not fail the open — chat keeps working");
-        assert!(shell.cma.is_empty());
-        assert_eq!(std::fs::read(dir.join("brain.qtsq.bak")).unwrap(), before);
+        let opened = unsafe { cma_open_loaded(p, crate::embedding::HASH_DIM, None) };
+        assert!(
+            opened.is_none(),
+            "a non-QTSQ file must not be reported as a loaded brain"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a refused open must leave the file byte-for-byte alone"
+        );
+        assert!(
+            !dir.join("brain.qtsq.bak").exists(),
+            "a refused open must not silently rewrite the directory either"
+        );
     }
 
     #[test]

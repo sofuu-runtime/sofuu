@@ -513,6 +513,72 @@ unsafe extern "C" fn js_crypto_sha256(
     }
 }
 
+/// sofuu.crypto.digest(alg, dataHex) -> hex digest.
+///
+/// JR-053 (AUDIT-2026-11-08): the node:crypto shim called this with the
+/// algorithm name it was given, so createHash("md5") returned SHA-256. The
+/// name is resolved here, against the real primitive.
+unsafe extern "C" fn js_crypto_digest(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 2 {
+        return qjs::sofuu_js_null();
+    }
+    let Some(name) = arg_string(ctx, *argv) else {
+        return qjs::sofuu_js_null();
+    };
+    let Some(data_hex) = arg_string(ctx, *argv.add(1)) else {
+        return qjs::sofuu_js_null();
+    };
+    let Some(alg) = crate::rt::digest::Alg::parse(&name) else {
+        return qjs::sofuu_js_null();
+    };
+    let Some(data) = crate::rt::digest::unhex(&data_hex) else {
+        return qjs::sofuu_js_null();
+    };
+    text_result(ctx, &crate::rt::digest::hex(&crate::rt::digest::digest(alg, &data)))
+}
+
+/// sofuu.crypto.hmac(alg, keyHex, dataHex) -> hex MAC (RFC 2104).
+///
+/// The key is part of the computation; before JR-053 the shim dropped it and
+/// createHmac("sha256", key) was plain SHA-256 of the message.
+unsafe extern "C" fn js_crypto_hmac(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 3 {
+        return qjs::sofuu_js_null();
+    }
+    let Some(name) = arg_string(ctx, *argv) else {
+        return qjs::sofuu_js_null();
+    };
+    let Some(key_hex) = arg_string(ctx, *argv.add(1)) else {
+        return qjs::sofuu_js_null();
+    };
+    let Some(data_hex) = arg_string(ctx, *argv.add(2)) else {
+        return qjs::sofuu_js_null();
+    };
+    let Some(alg) = crate::rt::digest::Alg::parse(&name) else {
+        return qjs::sofuu_js_null();
+    };
+    let (Some(key), Some(data)) = (
+        crate::rt::digest::unhex(&key_hex),
+        crate::rt::digest::unhex(&data_hex),
+    ) else {
+        return qjs::sofuu_js_null();
+    };
+    text_result(
+        ctx,
+        &crate::rt::digest::hex(&crate::rt::digest::hmac(alg, &key, &data)),
+    )
+}
+
 unsafe extern "C" fn js_crypto_base64url_encode(
     ctx: *mut JSContext,
     _this: JSValueConst,
@@ -674,8 +740,10 @@ pub unsafe fn mod_crypto_register(ctx: *mut JSContext) {
     let functions: [(
         &std::ffi::CStr,
         unsafe extern "C" fn(*mut JSContext, JSValueConst, c_int, *const JSValueConst) -> JSValue,
-    ); 6] = [
+    ); 8] = [
         (c"sha256", js_crypto_sha256),
+        (c"digest", js_crypto_digest),
+        (c"hmac", js_crypto_hmac),
         (c"base64urlEncode", js_crypto_base64url_encode),
         (c"base64urlDecode", js_crypto_base64url_decode),
         (c"verifyJWT", js_crypto_verify_jwt),

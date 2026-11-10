@@ -173,6 +173,7 @@ pub unsafe extern "C" fn sofuu_promise_reject_str(p: *mut PromiseHandle, msg: *c
 pub unsafe extern "C" fn sofuu_flush_jobs_bounded(ctx: *mut JSContext, max_jobs: usize) -> bool {
     let rt = qjs::JS_GetRuntime(ctx);
     if qjs::JS_IsJobPending(rt) == 0 {
+        report_dropped_continuations(ctx);
         sofuu_rt_report_pending_rejections(ctx);
         return true;
     }
@@ -218,8 +219,111 @@ pub unsafe extern "C" fn sofuu_flush_jobs_bounded(ctx: *mut JSContext, max_jobs:
         }
         executed += 1;
     }
+    report_dropped_continuations(ctx);
     sofuu_rt_report_pending_rejections(ctx);
     true
+}
+
+/// Report continuations QuickJS had to drop because a job entry could not be
+/// allocated, then clear the counter.
+///
+/// AUDIT-2026-11-08 CLI-054: at one million chained promise callbacks the job
+/// entries exhaust the JavaScript heap, JS_EnqueueJob fails, and QuickJS drops
+/// the continuation with no exception and no signal. The process used to finish
+/// with exit 0 and a fraction of the work done. Returns true when a drop was
+/// found and reported; the run is then fatal, so the exit code is 1.
+///
+/// # Safety
+/// ctx must be the live runtime context.
+pub unsafe fn report_dropped_continuations(ctx: *mut JSContext) -> bool {
+    if ctx.is_null() {
+        return false;
+    }
+    let rt = qjs::JS_GetRuntime(ctx);
+    if rt.is_null() {
+        return false;
+    }
+    let dropped = qjs::sofuu_qjs_job_oom_count(rt);
+    if dropped <= 0 {
+        return false;
+    }
+    qjs::sofuu_qjs_job_oom_reset(rt);
+    let limit_mib = crate::rt::engine::js_heap_limit() / (1024 * 1024);
+    let msg = format!(
+        "Maximum microtask queue depth exceeded: {dropped} promise continuation(s) could not be \
+         enqueued because the JavaScript heap hit its {limit_mib} MiB ceiling. QuickJS drops a \
+         continuation it cannot allocate, so the runtime reports this instead of exiting 0 with \
+         work lost — raise SOFUU_JS_HEAP_MB or reduce the fan-out width."
+    );
+    let err = crate::rt::engine::new_range_error(ctx, &msg);
+    if process_dispatch_uncaught(ctx, err) == 0 {
+        eprintln!("\x1b[31m[sofuu] UncaughtException:\x1b[0m {}", msg);
+    }
+    crate::rt::engine::note_fatal(ctx);
+    qjs::sofuu_js_free_value(ctx, err);
+    true
+}
+
+/// Drain the whole job queue, or stop at a hard ceiling and say so.
+///
+/// AUDIT-2026-11-08 CLI-054: the loop must not leave queued continuations
+/// behind, and it must not pretend a run succeeded after giving up on them.
+/// Returns true when the queue is empty. When the ceiling is reached the run is
+/// reported as a RangeError and marked fatal (exit 1), and the caller is told
+/// (false) that work remains, so it keeps polling instead of exiting.
+///
+/// # Safety
+/// ctx must be the live runtime context.
+pub unsafe fn sofuu_flush_jobs_ceiling(ctx: *mut JSContext, ceiling: usize) -> bool {
+    let rt = qjs::JS_GetRuntime(ctx);
+    if qjs::JS_IsJobPending(rt) == 0 {
+        report_dropped_continuations(ctx);
+        sofuu_rt_report_pending_rejections(ctx);
+        return true;
+    }
+    let mut ctx2: *mut JSContext = ptr::null_mut();
+    let mut executed = 0usize;
+    loop {
+        if executed >= ceiling {
+            report_runaway_microtasks(ctx, executed);
+            return false;
+        }
+        let err = qjs::JS_ExecutePendingJob(rt, &mut ctx2);
+        if err < 0 {
+            let exc = qjs::sofuu_js_get_exception(ctx2);
+            if is_oom_reason(ctx2, exc) {
+                report_microtask_overflow(ctx2, executed);
+            } else if process_dispatch_uncaught(ctx2, exc) == 0 {
+                crate::rt::engine::report_uncaught(ctx2, exc);
+            }
+            qjs::sofuu_js_free_value(ctx2, exc);
+            break;
+        }
+        if err == 0 {
+            break;
+        }
+        executed += 1;
+    }
+    report_dropped_continuations(ctx);
+    sofuu_rt_report_pending_rejections(ctx);
+    qjs::JS_IsJobPending(rt) == 0
+}
+
+/// The runaway case of sofuu_flush_jobs_ceiling: a script queued more
+/// continuations than the per-drain ceiling, so the loop refuses to keep the
+/// turn alive forever. Reported once, as a RangeError, and fatal.
+unsafe fn report_runaway_microtasks(ctx: *mut JSContext, executed: usize) {
+    let msg = format!(
+        "Maximum microtask queue depth exceeded: {executed} continuation(s) ran without the \
+         queue draining. A continuation that keeps re-queueing itself never yields to timers \
+         or I/O; break the chain with an await or a timer."
+    );
+    let err = crate::rt::engine::new_range_error(ctx, &msg);
+    if process_dispatch_uncaught(ctx, err) == 0 {
+        eprintln!("\x1b[31m[sofuu] UncaughtException:\x1b[0m {}", msg);
+    }
+    crate::rt::engine::note_fatal(ctx);
+    qjs::sofuu_js_free_value(ctx, err);
 }
 
 /// Pump all pending QuickJS microtasks/jobs — call after each libuv callback.
@@ -251,21 +355,6 @@ thread_local! {
 /// A pathological flood with no drain prints the oldest eagerly (C: 64).
 const EAGER_CAP: usize = 64;
 
-/// Read a live JS value as a Rust string (borrowed value; nothing is freed).
-///
-/// # Safety
-/// `ctx` live; `val` a value of `ctx`.
-unsafe fn value_str(ctx: *mut JSContext, val: JSValueConst) -> Option<String> {
-    let s = qjs::sofuu_js_to_cstring(ctx, val);
-    if s.is_null() {
-        return None;
-    }
-    // SAFETY: s valid until freed below.
-    let out = CStr::from_ptr(s).to_string_lossy().into_owned();
-    qjs::sofuu_js_free_cstring(ctx, s);
-    Some(out)
-}
-
 /// True when `reason` is QuickJS's out-of-memory sentinel rather than a real
 /// script error.
 ///
@@ -288,12 +377,8 @@ pub unsafe fn is_oom_reason(ctx: *mut JSContext, reason: JSValueConst) -> bool {
     if qjs::is_undefined(reason) {
         return false;
     }
-    let name = qjs::sofuu_js_get_property_str(ctx, reason, c"name".as_ptr());
-    let msg = qjs::sofuu_js_get_property_str(ctx, reason, c"message".as_ptr());
-    let name_s = value_str(ctx, name).unwrap_or_default();
-    let msg_s = value_str(ctx, msg).unwrap_or_default();
-    qjs::sofuu_js_free_value(ctx, name);
-    qjs::sofuu_js_free_value(ctx, msg);
+    let name_s = crate::rt::diag_contract::js_error_own_string(ctx, reason, c"name").unwrap_or_default();
+    let msg_s = crate::rt::diag_contract::js_error_own_string(ctx, reason, c"message").unwrap_or_default();
     name_s == "InternalError" && msg_s.to_ascii_lowercase().contains("out of memory")
 }
 
@@ -368,15 +453,7 @@ unsafe fn print_rejection(ctx: *mut JSContext, reason: JSValueConst, promise: JS
     if process_dispatch_unhandled_rejection(ctx, reason, promise) != 0 {
         return;
     }
-    // SAFETY: str_v is live; freed below.
-    let str_v = qjs::JS_ToString(ctx, reason);
-    let msg = qjs::sofuu_js_to_cstring(ctx, str_v);
-    let msg_s = if msg.is_null() {
-        "(unknown)".to_string()
-    } else {
-        // SAFETY: msg valid until freed below.
-        CStr::from_ptr(msg).to_string_lossy().into_owned()
-    };
+    let msg_s = crate::rt::diag_contract::safe_exception_fallback(ctx, reason);
     /* PLAN-UNIFIED-DIAGNOSTICS: the rejection goes through the same contract
      * as a sync uncaught exception — code, message, verified location, known
      * reason, one safe next step, and only the frames QuickJS printed. The
@@ -389,10 +466,6 @@ unsafe fn print_rejection(ctx: *mut JSContext, reason: JSValueConst, promise: JS
         "{}",
         diag.render_human(full, crate::rt::engine::stderr_wants_color())
     );
-    if !msg.is_null() {
-        qjs::sofuu_js_free_cstring(ctx, msg);
-    }
-    qjs::sofuu_js_free_value(ctx, str_v);
     // C-01: an unhandled rejection is a fatal script error for the process
     // status, even though the event loop keeps running to idle.
     crate::rt::engine::note_uncaught_error(ctx);

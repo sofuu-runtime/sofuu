@@ -1103,6 +1103,7 @@
       try {
         resumedSummary = await summarizeHistory(0, {
           source: 'resume',
+          modelOnly: true,
           prompt: 'You are resuming a previous coding session. Summarize the conversation below BRIEFLY for continuity: what the user was working on, key decisions, files touched (exact paths), current task state, and the next step. Output only the summary, no preamble.',
         });
       } catch (e) { resumedSummary = null; }
@@ -2026,7 +2027,13 @@
         tailAsk,
       ], { max_tokens: 512 });
     } catch (eSumm) { /* LLM summarizer failed on oversized context or provider; deterministic fallback below */ }
-    if (!summary || typeof summary !== 'string' || !summary.trim() || summary.trim() === '(no response)') {
+    /* opts.modelOnly: the caller needs a MODEL summary or none at all.
+     * /resume is that caller — the deterministic bullet recap is fine for
+     * background compaction, but printing it after a resume implies the model
+     * read the session, and the honest answer when the provider is dead is
+     * the delimited transcript ("summary unavailable"). */
+    const modelOnly = !!(opts && opts.modelOnly);
+    if (!modelOnly && (!summary || typeof summary !== 'string' || !summary.trim() || summary.trim() === '(no response)')) {
       const bullets = [];
       for (let bi = 0; bi < oldCount; bi++) {
         const hm = history[bi];

@@ -1435,6 +1435,38 @@
     return wrappedTool;
   };
 
+  /* PL-011 (AUDIT-2026-11-08): --confirm-all (approval.mode "always") and a
+   * spec's requiresApproval reached the tool METADATA and the agent loop, but a
+   * script calling sofuu.plugins.invoke()/runTool()/call() ran the tool with no
+   * prompt at all — the gate existed everywhere except the path the plugin SDK
+   * documents. Ask the same question here, and fail CLOSED when there is no
+   * terminal to ask, because an unattended run must never imply approval. */
+  function approvalReason(tool) {
+    if (tool && tool.requiresApproval === true) return 'the plugin declared requiresApproval';
+    try {
+      var p = (sofuu.policy && typeof sofuu.policy.get === 'function') ? sofuu.policy.get() : null;
+      var mode = p && p.approval && p.approval.mode;
+      if (mode === 'always' || mode === 'every') return 'approval.mode is "' + mode + '" (--confirm-all)';
+    } catch (e) { /* an unreadable policy cannot approve anything; fall through */ }
+    return null;
+  }
+  async function confirmInvoke(name, args, why) {
+    var detail = '';
+    try { detail = JSON.stringify(args == null ? {} : args); } catch (e) { detail = String(args); }
+    if (detail.length > 300) detail = detail.slice(0, 300) + '…';
+    var ask = 'Approve plugin tool "' + name + '"? [' + why + '] ' + detail + ' (y/N) ';
+    /* No terminal, no question: an unattended caller gets a denial with a
+     * reason instead of a prompt nobody can answer (and instead of a hang). */
+    var tty = (typeof process !== 'undefined' && process.stdin && process.stdin.isTTY) === true;
+    var promptFn = (typeof globalThis !== 'undefined' && typeof globalThis.__prompt === 'function')
+      ? globalThis.__prompt : null;
+    if (!promptFn || !tty) return false;
+    var answer = promptFn(ask);
+    if (answer === null || answer === undefined) return false;
+    answer = String(answer).trim().toLowerCase();
+    return answer === 'y' || answer === 'yes';
+  }
+
   P.invoke = async function invoke(name, args, ctx) {
     var tool = P.TOOLS[name];
     if (!tool) {
@@ -1443,6 +1475,18 @@
         source: 'plugin',
         error: { code: 'E_CAPABILITY', message: 'Plugin tool "' + name + '" not found' },
         text: 'tool error [E_CAPABILITY]: plugin tool not found'
+      };
+    }
+    /* A host that already asked (chat's approval UI, the agent loop) passes
+     * ctx.approved — never ask the same human twice. */
+    var alreadyApproved = !!(ctx && ctx.approved === true);
+    var why = alreadyApproved ? null : approvalReason(tool);
+    if (why && !(await confirmInvoke(name, args, why))) {
+      return {
+        ok: false,
+        source: 'plugin',
+        error: { code: 'E_APPROVAL', message: 'plugin tool "' + name + '" was not approved (' + why + ')' },
+        text: 'tool error [E_APPROVAL]: plugin tool "' + name + '" was not approved — ' + why
       };
     }
     try {
@@ -1843,6 +1887,73 @@
     if (toolCalls) res2.data.toolCalls = toolCalls;
     return res2;
   };
+
+  /* ── PL-062: sofuu.ai.complete routes through a registered adapter ────
+   * complete() is a compiled Rust wire (rt/ai.rs), so a Category 2 adapter
+   * registered from a plugin was invisible to it: the call left the process
+   * on the built-in endpoint no matter what the plugin said. The wire stays
+   * the DIRECT path; the wrapper below asks the registry first and only
+   * delegates when a plugin actually owns the named provider. */
+
+  /* Exactly the names rt/ai.rs's parse_provider owns (including "ollama" →
+   * Provider::Local, which is the in-process .gguf path). providers.js
+   * mirrors those adapters into the SAME registry, so "a spec is registered"
+   * cannot be the whole match rule: routing them through a JS adapter would
+   * swap the native streaming and local-inference paths for a buffered HTTP
+   * replay. src/js/agent.js applies this rule to the agent loop (its
+   * NATIVE_PROVIDER_NAMES); keep the two lists in step. */
+  var NATIVE_AI_PROVIDERS = {
+    openai: 1, anthropic: 1, local: 1, ollama: 1,
+    llamacpp: 1, 'llama.cpp': 1, 'llama-server': 1
+  };
+
+  /* The adapter that owns this call, or null for "the native wire does".
+   * Only a provider the caller NAMED can be plugin-owned: an unnamed call is
+   * the runtime default, never a guess. */
+  function providerForAiCall(req) {
+    if (!req || typeof req !== 'object') return null;
+    var name = req.provider;
+    if (name === undefined || name === null || name === '') return null;
+    var key = String(name);
+    if (NATIVE_AI_PROVIDERS[key] || NATIVE_AI_PROVIDERS[key.toLowerCase()]) return null;
+    return lookupProvider(key);
+  }
+
+  /* One complete() call through the adapter, normalised to ai.complete's
+   * shape ({text, usage, toolCalls}) so a caller needs no change. A failed
+   * adapter rejects with its typed code, exactly like a failed HTTP call. */
+  function completeViaAiShape(spec, req, ctx) {
+    return P.completeVia(spec.name, req, ctx || {}).then(function (res) {
+      if (!res || res.ok !== true) {
+        var e = (res && res.error) || {};
+        var err = makeError(e.code || 'E_PROVIDER', e.message || ('provider "' + spec.name + '" failed'));
+        err.provider = spec.name;
+        throw err;
+      }
+      var data = res.data || {};
+      var out = { text: (typeof data.text === 'string') ? data.text : String(res.text || '') };
+      if (data.usage) out.usage = data.usage;
+      if (data.toolCalls) out.toolCalls = data.toolCalls;
+      return out;
+    });
+  }
+
+  function installAiCompleteRouting() {
+    var ai = sofuu.ai;
+    if (!ai || typeof ai.complete !== 'function' || ai.complete.__pluginRouted) return;
+    var direct = ai.complete;
+    /* Deliberately a plain function, not async: the direct path must keep
+     * throwing synchronously (a missing model, a custom provider without a
+     * base URL) instead of turning every argument error into a rejection. */
+    var routed = function complete(req, opts) {
+      var spec = providerForAiCall(req);
+      if (!spec || typeof spec.complete !== 'function') return direct.apply(ai, arguments);
+      return completeViaAiShape(spec, req, opts);
+    };
+    routed.__pluginRouted = true;
+    ai.complete = routed;
+  }
+  installAiCompleteRouting();
 
   /* ══ module: store ═══════════════════════════════════════════════════
    * Category 3 — storage & vector adapters, plus the dual-write mirror.
@@ -2316,6 +2427,40 @@
       }
     }
     return { started: started, errors: errors };
+  };
+
+  /* One boot per process (PL-075/L-02b). A host that only RUNS an agent —
+   * `sofuu agent run`, a chat turn, serve — never discovered ./plugins, so a
+   * service's onStart never ran and its turn hooks saw a half-built state.
+   * Idempotent by design: re-evaluating a plugin file re-registers (fresh,
+   * unstarted) services and repeats whatever side effects the file has, so
+   * only the FIRST caller pays and everyone else awaits the same boot. */
+  var AUTOLOAD = null;
+  P.autoload = function autoload(ctx) {
+    if (!AUTOLOAD) {
+      AUTOLOAD = (async function () {
+        var bootCtx = ctx || {};
+        if (typeof bootCtx.log !== 'function') bootCtx.log = console.error.bind(console);
+        if (!bootCtx.env) bootCtx.env = envOf();
+        var discovery = null, services = null;
+        try { discovery = await P.discoverAll(); } catch (eD) { /* a project with no plugin tree is the normal case. */ }
+        /* A plugin file that registers nothing is silently absent otherwise,
+         * so it is said ONCE here, through the caller's log (stderr by
+         * default) — a broken plugin must never look like a loaded one. */
+        try {
+          var d = discovery || {};
+          ['local', 'global'].forEach(function (k) {
+            var broken = (d[k] && d[k].broken) || [];
+            for (var i = 0; i < broken.length; i++) {
+              bootCtx.log('⚠ plugin ' + broken[i].file + ': ' + broken[i].error);
+            }
+          });
+        } catch (eW) { /* the warning is advisory; the boot goes on. */ }
+        try { services = await P.startServices(bootCtx); } catch (eS) { /* startServices already contains per-service failures. */ }
+        return { discovery: discovery, services: services };
+      })();
+    }
+    return AUTOLOAD;
   };
 
   P.stopServices = async function stopServices(ctx) {

@@ -220,7 +220,7 @@ thread_local! {
     static FRESHNESS_FUNCS: [qjs::JSCFunctionListEntry; 1] = [
         qjs::JSCFunctionListEntry {
             name: c"score".as_ptr(),
-            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE | qjs::JS_PROP_ENUMERABLE,
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_freshness_score },

@@ -12,6 +12,7 @@
 //
 //   H-1  the family is declared in the script's `needs:`          E_CAP_UNDECLARED
 //   H-2  an effector family has an explicit host backend grant     E_CAP_MISSING
+//        and the granted backend is one this runtime has          E_CAP_INVALID
 //   H-3  the host policy does not deny this exact operation        E_CAP_DENIED
 //   H-4  every numeric argument is inside its physical range       E_KAZE_RANGE
 //
@@ -46,6 +47,84 @@ impl Denial {
     fn new(code: &'static str, rule: &'static str, reason: String) -> Self {
         Denial { code, rule, reason }
     }
+}
+
+/// The backend names a `--cap <family>=<backend>` grant may carry.
+///
+/// `sim` is the deterministic simulator (and the default), `real` asks for the
+/// family's live hardware, `mavlink` for its MAVLink link. Anything else is a
+/// typo — and a typo used to be accepted at grant time, with the simulator
+/// answering every call behind a backend nobody implemented (RB-08).
+pub const BACKENDS: &[&str] = &["sim", "real", "mavlink"];
+
+/// The live backends a family actually has. A family missing from this table
+/// has none, so a grant naming one is refused at grant time instead of being
+/// quietly simulated.
+pub fn live_backends(family: &str) -> &'static [&'static str] {
+    match family {
+        "drone" => &["real", "mavlink"],
+        _ => &[],
+    }
+}
+
+/// The transport spellings a `drone` grant may use instead of a backend name:
+/// `udp:HOST:PORT`, `udpout:HOST:PORT`, `uart:PATH[@BAUD]`. These are the exact
+/// strings the link layer opens, so the shape is checked at grant time rather
+/// than after the script has started.
+fn is_link_device(device: &str) -> bool {
+    if super::mavlink_link::parse_endpoint(device).is_some() {
+        return true;
+    }
+    let Some(rest) = device.trim().strip_prefix("uart:") else {
+        return false;
+    };
+    let (path, baud) = match rest.rsplit_once('@') {
+        Some((p, b)) => (p, Some(b)),
+        None => (rest, None),
+    };
+    !path.trim().is_empty() && baud.map_or(true, |b| b.trim().parse::<u32>().is_ok())
+}
+
+/// H-2 at GRANT time (RB-08): one `--cap <family>=<backend>` from the host,
+/// judged before the script runs rather than when the first capability fires.
+///
+/// An unrecognized backend is a usage mistake the host must not paper over: a
+/// grant that says `sensor=bogus` used to be accepted, the run proceeded, and
+/// the simulator answered for a backend nobody had implemented. It fails here
+/// as E_CAP_INVALID instead.
+pub fn validate_grant(family: &str, backend: &str) -> Result<(), Denial> {
+    let name = backend.trim();
+    // No device named (`--cap drone=`) means "the simulator", exactly as
+    // `--cap drone` does.
+    if name.is_empty() || name == "sim" {
+        return Ok(());
+    }
+    let fam = crate::sfs::caps::family_of(family);
+    if BACKENDS.contains(&name) {
+        return if live_backends(fam).contains(&name) {
+            Ok(())
+        } else {
+            Err(Denial::new(
+                "E_CAP_INVALID",
+                "H-2/backend",
+                format!(
+                    "'{}' has no live backend, so --cap {}={} is refused rather than simulated; grant --cap {}=sim",
+                    fam, family, name, family
+                ),
+            ))
+        };
+    }
+    if fam == "drone" && is_link_device(name) {
+        return Ok(());
+    }
+    Err(Denial::new(
+        "E_CAP_INVALID",
+        "H-2/backend",
+        format!(
+            "'{}' is not a capability backend: a grant names sim, real or mavlink (a drone may also name udp:HOST:PORT, udpout:HOST:PORT or uart:PATH@BAUD)",
+            name
+        ),
+    ))
 }
 
 /// H-1 + H-2 + H-3 for one capability call.
@@ -297,5 +376,62 @@ mod tests {
         assert_eq!(d.code, "E_KAZE_RANGE");
         assert!(d.reason.contains("not clamped"), "{}", d.reason);
         assert!(validate_arguments("drone", "takeoff", &[Value::Num(15.0)], &arena).is_ok());
+    }
+
+    /// RB-09: the refusal happens AT the ceiling, not somewhere near it. A
+    /// takeoff one metre past the limit fails and the message reports the
+    /// altitude the script asked for — a clamped 500 m flight would be a
+    /// machine acting on a number nobody wrote.
+    #[test]
+    fn a_takeoff_past_the_ceiling_is_rejected_at_the_boundary() {
+        let arena = Arena::new(1024);
+        assert!(validate_arguments("drone", "takeoff", &[Value::Num(500.0)], &arena).is_ok());
+        let d = validate_arguments("drone", "takeoff", &[Value::Num(501.0)], &arena).unwrap_err();
+        assert_eq!(d.code, "E_KAZE_RANGE");
+        assert_eq!(d.rule, "H-4/range");
+        assert!(d.reason.contains("got 501 meters"), "{}", d.reason);
+        assert!(d.reason.contains("not clamped"), "{}", d.reason);
+        for bad in [-1.0, f64::NAN, f64::INFINITY] {
+            let d = validate_arguments("drone", "takeoff", &[Value::Num(bad)], &arena).unwrap_err();
+            assert_eq!(d.code, "E_KAZE_RANGE", "takeoff {} was not refused", bad);
+        }
+    }
+
+    /// RB-08: a `--cap family=backend` grant is judged at grant time. A typo is
+    /// E_CAP_INVALID immediately, and a valid live backend is refused for a
+    /// family that has none rather than being answered by the simulator.
+    #[test]
+    fn backend_grants_are_validated_at_grant_time() {
+        for backend in ["sim", "real", "mavlink"] {
+            assert!(validate_grant("drone", backend).is_ok(), "--cap drone={}", backend);
+        }
+        assert!(validate_grant("drone", "udp:127.0.0.1:14550").is_ok());
+        assert!(validate_grant("drone", "uart:/dev/ttyAMA0@921600").is_ok());
+        // The grant the audit found accepted.
+        let d = validate_grant("sensor", "bogus").unwrap_err();
+        assert_eq!(d.code, "E_CAP_INVALID");
+        assert_eq!(d.rule, "H-2/backend");
+        assert!(d.reason.contains("bogus"), "{}", d.reason);
+        // A device string is a drone transport, so it is judged for shape.
+        assert_eq!(validate_grant("drone", "udp:no-port").unwrap_err().code, "E_CAP_INVALID");
+        assert_eq!(validate_grant("drone", "bogus").unwrap_err().code, "E_CAP_INVALID");
+        // No live backend exists for these families, so a live grant is refused.
+        for (family, backend) in [
+            ("sensor", "real"),
+            ("sensor", "mavlink"),
+            ("rover", "mavlink"),
+            ("alert", "real"),
+            ("device", "real"),
+        ] {
+            let d = validate_grant(family, backend).unwrap_err();
+            assert_eq!(d.code, "E_CAP_INVALID", "--cap {}={}", family, backend);
+            assert!(d.reason.contains("no live backend"), "{}", d.reason);
+        }
+        // Instance names (`lidar`, `fan`) resolve to their family first.
+        assert!(validate_grant("lidar", "sim").is_ok());
+        assert_eq!(validate_grant("lidar", "bogus").unwrap_err().code, "E_CAP_INVALID");
+        assert!(validate_grant("fan", "sim").is_ok());
+        // `--cap drone` and `--cap drone=` both mean the simulator.
+        assert!(validate_grant("drone", "").is_ok());
     }
 }

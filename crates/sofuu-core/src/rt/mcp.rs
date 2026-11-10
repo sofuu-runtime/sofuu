@@ -37,11 +37,69 @@ const MAX_PENDING: usize = 64;
 /* P2-7: how much of the child's stderr the early-exit error quotes. */
 const MCP_STDERR_CAP: usize = 1024;
 
+/* MC-019 (AUDIT-2026-11-08): the line buffer used to be a fixed 64 KiB array,
+ * so a response bigger than one read chunk was truncated and the call died on
+ * a timeout. It now starts at this size and doubles; a single JSON-RPC line
+ * may grow to MCP_MAX_LINE, well past the 5 MiB payload the plan requires. */
 const MCP_READ_BUF: usize = 65536;
+
+/// Hard ceiling for ONE newline-delimited JSON-RPC message. A peer that sends
+/// 32 MiB with no newline is refused with E_MCP_PAYLOAD_TOO_LARGE instead of
+/// hanging the call until its deadline.
+const MCP_MAX_LINE: usize = 32 * 1024 * 1024;
+
+/// Ensure the line buffer can hold existing + extra bytes, growing it (never
+/// shrinking) up to MCP_MAX_LINE. Returns false when the line would cross the
+/// ceiling; the caller then refuses the payload.
+fn reserve_line_buf(buf: &mut Vec<u8>, read_len: usize, extra: usize) -> bool {
+    let need = read_len.saturating_add(extra).saturating_add(1);
+    if need > MCP_MAX_LINE {
+        return false;
+    }
+    if need <= buf.len() {
+        return true;
+    }
+    let mut cap = buf.len().max(MCP_READ_BUF);
+    while cap < need {
+        cap = cap.saturating_mul(2);
+    }
+    buf.resize(cap.min(MCP_MAX_LINE), 0);
+    true
+}
 const MAX_TOOLS: usize = 64;
 
 static ACTIVE_MCP_CHILDREN: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
 static MCP_ATEXIT_INIT: Once = Once::new();
+
+/// Terminate ONE MCP child process — never a process group, never pid 0.
+///
+/// MC-017 (AUDIT-2026-11-08): disconnect() called uv_process_kill(handle,
+/// SIGTERM), which is kill(pid, SIGTERM). Once the child had already exited,
+/// the pid could read back as 0, and kill(0, SIGTERM) signals the CALLER'S own
+/// process group — the shell running sofuu. The pid is now checked, and the
+/// signal always goes to that one positive pid (never 0, never negative).
+///
+/// Returns true when a signal was delivered.
+///
+/// # Safety
+/// process is a live libuv process handle, or null.
+unsafe fn terminate_mcp_child(process: *mut UvProcess) -> bool {
+    if process.is_null() {
+        return false;
+    }
+    let pid = uv::uv_process_get_pid(process);
+    if pid <= 1 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        unsafe { uv::uv_process_kill(process, libc::SIGTERM) == 0 }
+    }
+}
 
 /// Zombie defense: terminate all active MCP child processes when parent exits.
 pub extern "C" fn mcp_reap_active_children() {
@@ -77,6 +135,8 @@ const MCP_ERR_CONNECT_FAILED: i32 = -32002;
 const MCP_ERR_TRANSPORT_UNAVAILABLE: i32 = -32003;
 /// The peer violated the framing (e.g. an over-long line with no newline).
 const MCP_ERR_PROTOCOL: i32 = -32004;
+/// A single JSON-RPC line crossed MCP_MAX_LINE (MC-019).
+const MCP_ERR_PAYLOAD_TOO_LARGE: i32 = -32005;
 
 /// g_next_id (C static).
 static NEXT_ID: AtomicI32 = AtomicI32::new(1);
@@ -111,7 +171,9 @@ struct McpClient {
     ctx: *mut JSContext,
     self_val: JSValue, /* the JS MCPClient object */
 
-    read_buf: [u8; MCP_READ_BUF],
+    /* MC-019: grows with the line (see reserve_line_buf) instead of a fixed
+     * 64 KiB array that truncated any larger response. */
+    read_buf: Vec<u8>,
     read_len: usize,
 
     /* P2-7 (AUDIT-2026-10-31): the child's stderr, captured (first
@@ -684,33 +746,37 @@ unsafe extern "C" fn mcp_on_read(stream: *mut UvStream, nread: isize, buf: *cons
         let chunk = std::slice::from_raw_parts((*buf).base as *const u8, nread as usize);
         /* Append to line buffer */
         let c = &mut *client;
-        let space = MCP_READ_BUF - c.read_len - 1;
-        if space == 0 {
-            // Over-long line (>64KB, no newline): drop the buffer and fail
-            // the connection instead of wedging forever with copy=0.
-            // A hostile/broken MCP server must not pin pending promises.
+        if !reserve_line_buf(&mut c.read_buf, c.read_len, chunk.len()) {
+            /* MC-019: one JSON-RPC line crossed the 32 MiB ceiling. Refuse it
+             * as a typed error and fail every call waiting on this peer now,
+             * instead of letting them die on their own 5s/45s deadlines. */
             c.read_len = 0;
-            c.read_buf[0] = 0;
             uv::uv_read_stop(stream);
+            let msg = format!(
+                "MCP payload too large (E_MCP_PAYLOAD_TOO_LARGE): a single JSON-RPC \
+                 line exceeded {MCP_MAX_LINE} bytes"
+            );
+            for i in 0..c.pending_count {
+                if c.pending[i].promise.is_null() {
+                    continue;
+                }
+                let err = mcp_error_value(c.ctx, MCP_ERR_PAYLOAD_TOO_LARGE, &msg, None);
+                sofuu_promise_reject(c.pending[i].promise, err); /* consumes err */
+            }
+            c.pending_count = 0;
             if !c.connect_promise.is_null() {
-                let err = mcp_error_value(
-                    c.ctx,
-                    MCP_ERR_PROTOCOL,
-                    "MCP server sent an over-long line (>64KB)",
-                    None,
-                );
+                let err = mcp_error_value(c.ctx, MCP_ERR_PAYLOAD_TOO_LARGE, &msg, None);
                 sofuu_promise_reject(c.connect_promise, err); /* consumes err */
                 c.connect_promise = ptr::null_mut();
             }
+            sofuu_flush_jobs(c.ctx);
             if !buf.is_null() && !(*buf).base.is_null() {
                 libc::free((*buf).base as *mut c_void);
             }
             return;
         }
-        let copy = chunk.len().min(space);
-        c.read_buf[c.read_len..c.read_len + copy].copy_from_slice(&chunk[..copy]);
-        c.read_len += copy;
-        c.read_buf[c.read_len] = 0;
+        c.read_buf[c.read_len..c.read_len + chunk.len()].copy_from_slice(chunk);
+        c.read_len += chunk.len();
 
         /* Process complete newline-delimited JSON lines */
         let mut head = 0usize;
@@ -733,7 +799,6 @@ unsafe extern "C" fn mcp_on_read(stream: *mut UvStream, nread: isize, buf: *cons
         let remaining = c.read_len - head;
         c.read_buf.copy_within(head..c.read_len, 0);
         c.read_len = remaining;
-        c.read_buf[remaining] = 0;
 
         /* NOTE: no sofuu_flush_jobs here at all — we are inside a libuv
          * read callback; running JS re-enters the loop mid-dispatch and
@@ -1036,7 +1101,9 @@ unsafe extern "C" fn js_mcp_disconnect(
                 lock.retain(|&p| p != pid);
             }
         }
-        uv::uv_process_kill((*client).process, libc::SIGTERM);
+        /* One guarded SIGTERM to the child's own pid: repeated disconnects are
+         * harmless, and no path can signal the caller's process group. */
+        unsafe { terminate_mcp_child((*client).process) };
     }
     qjs::sofuu_js_undefined()
 }
@@ -1317,7 +1384,7 @@ unsafe extern "C" fn js_mcp_connect(
         stderr_pipe: ptr::null_mut(),
         ctx,
         self_val: qjs::sofuu_js_undefined(),
-        read_buf: [0u8; MCP_READ_BUF],
+        read_buf: vec![0u8; MCP_READ_BUF],
         read_len: 0,
         stderr_buf: [0u8; MCP_STDERR_CAP],
         stderr_len: 0,
@@ -1415,7 +1482,22 @@ unsafe extern "C" fn js_mcp_connect(
         args: argv_ptr.as_mut_ptr(),
         env: env_ptr.as_mut_ptr(),
         cwd: cwd_c.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
-        flags: 0,
+        /* MC-017 (AUDIT-2026-11-08): the MCP child gets its OWN session and
+         * process group. Before this, the child shared the host's group, so a
+         * group-directed signal — or kill(0, SIGTERM) from a stale child pid —
+         * took down the shell that launched sofuu. Unix only: libuv maps the
+         * flag to setsid there; on Windows it means DETACHED_PROCESS, which
+         * would hide the child's console, so the flag stays off. */
+        flags: {
+            #[cfg(unix)]
+            {
+                uv::UV_PROCESS_DETACHED
+            }
+            #[cfg(not(unix))]
+            {
+                0
+            }
+        },
         stdio_count: 3,
         stdio: stdio.as_mut_ptr(),
         #[cfg(unix)]
@@ -1873,18 +1955,22 @@ struct McpPrompt {
 struct McpServer {
     ctx: *mut JSContext,
     self_val: JSValue,
+    /* MC-051 (AUDIT-2026-11-08): the identity the caller gave
+     * sofuu.mcp.serve({name, version}) — mirrored verbatim in the
+     * initialize result's serverInfo. Defaults preserved when omitted. */
+    name: String,
+    version: String,
     tools: Vec<McpTool>,
     tool_count: usize,
     /* M3 (2026-10-23): resources/prompts + lifecycle flags. */
     resources: Vec<McpResource>,
     prompts: Vec<McpPrompt>,
     started: c_int,
-    listed_tools: c_int,
 
     stdin_pipe: *mut UvPipe,
     stdout_pipe: *mut UvPipe,
 
-    read_buf: [u8; MCP_READ_BUF],
+    read_buf: Vec<u8>,
     read_len: usize,
 }
 
@@ -2123,12 +2209,17 @@ fn mcp_page_start(total: usize, cursor: usize, size: usize) -> (usize, usize) {
     (start, (start + size).min(total))
 }
 
-/// Route an incoming RPC request to a registered tool.
-unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
+/// Handle ONE JSON-RPC message and RETURN its response line.
+///
+/// `None` means nothing must be written: a notification, a response to a
+/// request this server never sent, or malformed input (the single-message
+/// path keeps the pre-existing "garbage gets no reply" behavior; the batch
+/// path in `mcp_server_handle_batch` answers a non-object element with
+/// -32600). Async tool handlers answer later through `mcp_tool_write_response`
+/// when their promise settles, so they contribute nothing here.
+unsafe fn mcp_server_handle_message(srv: *mut McpServer, input: &str) -> Option<String> {
     let ctx = (*srv).ctx;
-    let Ok(input) = std::str::from_utf8(line) else {
-        return;
-    };
+    let mut out = String::new();
 
     /* Parse inbound with the Rust jsonrpc::parse (safe serde). */
     let (req_id, method, req_params) = match crate::mcp::jsonrpc::parse(input) {
@@ -2138,7 +2229,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
 
     /* JSON-RPC notifications carry no id and MUST NOT get a response. */
     let Some(method) = method else {
-        return;
+        return None;
     };
 
     /* --- initialize (M3: negotiate the version) --- */
@@ -2153,20 +2244,24 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
         } else {
             "2025-06-18"
         };
+        /* MC-051: the registered name/version, not a hardcoded label. */
+        let srv_name =
+            serde_json::to_string(&(*srv).name).unwrap_or_else(|_| "\"sofuu-mcp\"".into());
+        let srv_version =
+            serde_json::to_string(&(*srv).version).unwrap_or_else(|_| "\"0.1.0\"".into());
         let result = format!(
-            "{{\"protocolVersion\":\"{chosen}\",\"capabilities\":{{\"tools\":{{}},\"resources\":{{}},\"prompts\":{{}}}},\"serverInfo\":{{\"name\":\"sofuu-mcp\",\"version\":\"0.1.0\"}}}}"
+            "{{\"protocolVersion\":\"{chosen}\",\"capabilities\":{{\"tools\":{{}},\"resources\":{{}},\"prompts\":{{}}}},\"serverInfo\":{{\"name\":{srv_name},\"version\":{srv_version}}}}}"
         );
         let resp = jsonrpc_response_cstr(req_id, &result);
-        mcp_server_write_str(srv, resp.as_bytes());
+        out.push_str(&resp.to_string_lossy());
 
     /* --- ping (M3) --- */
     } else if method == "ping" {
         let resp = jsonrpc_response_cstr(req_id, "{}");
-        mcp_server_write_str(srv, resp.as_bytes());
+        out.push_str(&resp.to_string_lossy());
 
     /* --- tools/list (paginated) --- */
     } else if method == "tools/list" {
-        (*srv).listed_tools = 1;
         let tool_list: &Vec<McpTool> = &(*srv).tools;
         let total = tool_list.len();
         let (start, end) = mcp_page_start(total, mcp_cursor(&req_params), 50);
@@ -2196,7 +2291,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
         };
         let result = format!("{{\"tools\":{tools_json}{next}}}");
         let resp = jsonrpc_response_cstr(req_id, &result);
-        mcp_server_write_str(srv, resp.as_bytes());
+        out.push_str(&resp.to_string_lossy());
 
     /* --- resources/list + resources/read (M3; sync handlers) --- */
     } else if method == "resources/list" {
@@ -2224,7 +2319,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
         };
         let result = format!("{{\"resources\":{arr}{next}}}");
         let resp = jsonrpc_response_cstr(req_id, &result);
-        mcp_server_write_str(srv, resp.as_bytes());
+        out.push_str(&resp.to_string_lossy());
 
     } else if method == "resources/read" {
         let uri = req_params
@@ -2238,7 +2333,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
         match found {
             None => {
                 let err = jsonrpc_error_cstr(req_id, -32602, "Resource not found");
-                mcp_server_write_str(srv, err.as_bytes());
+                out.push_str(&err.to_string_lossy());
             }
             Some(i) => {
                 let handler = res_list[i].handler;
@@ -2250,7 +2345,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                 if qjs::is_exception(ret) {
                     qjs::js_std_dump_error(ctx);
                     let err = jsonrpc_error_cstr(req_id, -32603, "Resource handler threw");
-                    mcp_server_write_str(srv, err.as_bytes());
+                    out.push_str(&err.to_string_lossy());
                 } else {
                     let then_fn = qjs::sofuu_js_get_property_str(ctx, ret, c"then".as_ptr());
                     if qjs::JS_IsFunction(ctx, then_fn) != 0 {
@@ -2260,7 +2355,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                             -32603,
                             "Async resource handlers are not supported yet",
                         );
-                        mcp_server_write_str(srv, err.as_bytes());
+                        out.push_str(&err.to_string_lossy());
                     } else if qjs::sofuu_js_is_string(ret) != 0 {
                         let sp = qjs::sofuu_js_to_cstring(ctx, ret);
                         let text = if sp.is_null() {
@@ -2278,13 +2373,13 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                                 .unwrap_or_else(|_| "\"\"".into())
                         );
                         let resp = jsonrpc_response_cstr(req_id, &body);
-                        mcp_server_write_str(srv, resp.as_bytes());
+                        out.push_str(&resp.to_string_lossy());
                     } else {
                         let body = mcp_json_text(ctx, ret)
                             .map(|j| format!("{{\"contents\":{j}}}"))
                             .unwrap_or_else(|| "{\"contents\":[]}".into());
                         let resp = jsonrpc_response_cstr(req_id, &body);
-                        mcp_server_write_str(srv, resp.as_bytes());
+                        out.push_str(&resp.to_string_lossy());
                     }
                     qjs::sofuu_js_free_value(ctx, then_fn);
                 }
@@ -2317,7 +2412,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
         };
         let result = format!("{{\"prompts\":{arr}{next}}}");
         let resp = jsonrpc_response_cstr(req_id, &result);
-        mcp_server_write_str(srv, resp.as_bytes());
+        out.push_str(&resp.to_string_lossy());
 
     } else if method == "prompts/get" {
         let pname = req_params
@@ -2331,7 +2426,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
         match found {
             None => {
                 let err = jsonrpc_error_cstr(req_id, -32602, "Prompt not found");
-                mcp_server_write_str(srv, err.as_bytes());
+                out.push_str(&err.to_string_lossy());
             }
             Some(i) => {
                 let handler = prompt_list[i].handler;
@@ -2357,7 +2452,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                 if qjs::is_exception(ret) {
                     qjs::js_std_dump_error(ctx);
                     let err = jsonrpc_error_cstr(req_id, -32603, "Prompt handler threw");
-                    mcp_server_write_str(srv, err.as_bytes());
+                    out.push_str(&err.to_string_lossy());
                 } else {
                     let then_fn = qjs::sofuu_js_get_property_str(ctx, ret, c"then".as_ptr());
                     if qjs::JS_IsFunction(ctx, then_fn) != 0 {
@@ -2366,7 +2461,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                             -32603,
                             "Async prompt handlers are not supported yet",
                         );
-                        mcp_server_write_str(srv, err.as_bytes());
+                        out.push_str(&err.to_string_lossy());
                     } else {
                         let text = if qjs::sofuu_js_is_string(ret) != 0 {
                             let sp = qjs::sofuu_js_to_cstring(ctx, ret);
@@ -2387,7 +2482,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                             serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into())
                         );
                         let resp = jsonrpc_response_cstr(req_id, &body);
-                        mcp_server_write_str(srv, resp.as_bytes());
+                        out.push_str(&resp.to_string_lossy());
                     }
                     qjs::sofuu_js_free_value(ctx, then_fn);
                 }
@@ -2440,7 +2535,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                     "reason": "unknown_tool",
                 });
                 let err = jsonrpc_error_data_cstr(req_id, -32602, &msg, &data);
-                mcp_server_write_str(srv, err.as_bytes());
+                out.push_str(&err.to_string_lossy());
             }
             Some(ti) => {
                 /* Validate against the SAME schema tools/list advertises. A
@@ -2450,7 +2545,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                 let violation = (&*srv).tools[ti].schema.validate(&args_value);
                 if let Some(v) = violation {
                     let err = mcp_schema_violation_cstr(req_id, &v);
-                    mcp_server_write_str(srv, err.as_bytes());
+                    out.push_str(&err.to_string_lossy());
                 } else {
                     /* Parse the (validated) arguments into a JS object. */
                     let arg_text =
@@ -2488,7 +2583,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                         );
                         let body = mcp_iserror_text(&msg);
                         let resp = jsonrpc_response_cstr(req_id, &body);
-                        mcp_server_write_str(srv, resp.as_bytes());
+                        out.push_str(&resp.to_string_lossy());
                     } else {
                         /* Check if the return value is a Promise by testing for
                          * a callable .then property. */
@@ -2512,7 +2607,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                                 let msg = mcp_take_exception_message(ctx);
                                 eprintln!("[sofuu mcp] tool promise chain failed: {}", msg);
                                 let err = jsonrpc_error_cstr(req_id, -32603, "Internal error in promise chain");
-                                mcp_server_write_str(srv, err.as_bytes());
+                                out.push_str(&err.to_string_lossy());
                             }
 
                             qjs::sofuu_js_free_value(ctx, then_err);
@@ -2525,7 +2620,7 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
                         } else {
                             let body = mcp_success_body(ctx, ret);
                             let resp = jsonrpc_response_cstr(req_id, &body);
-                            mcp_server_write_str(srv, resp.as_bytes());
+                            out.push_str(&resp.to_string_lossy());
                         }
 
                         qjs::sofuu_js_free_value(ctx, ret);
@@ -2537,11 +2632,96 @@ unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
     /* --- unknown method --- */
     } else {
         let err = jsonrpc_error_cstr(req_id, -32601, "Method not found");
-        mcp_server_write_str(srv, err.as_bytes());
+        out.push_str(&err.to_string_lossy());
     }
 
     /* NOTE: no sofuu_flush_jobs here — inside a libuv read callback; the
      * loop pumps jobs after uv_run. */
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// MC-062 (AUDIT-2026-11-08): answer a JSON-RPC 2.0 batch array with ONE
+/// batch array, preserving each element's id. A notification element adds no
+/// response element (JSON-RPC 2.0 §6), and a batch of nothing but
+/// notifications gets no response at all. Async tool handlers still answer
+/// when their promise settles (a separate frame — the batch array carries
+/// only the responses this call produced).
+unsafe fn mcp_server_handle_batch(srv: *mut McpServer, input: &str) {
+    let parsed: serde_json::Value = match serde_json::from_str(input.trim()) {
+        Ok(v) => v,
+        Err(_) => {
+            let err = jsonrpc_error_cstr(0, -32700, "Parse error");
+            mcp_server_write_str(srv, err.as_bytes());
+            return;
+        }
+    };
+    let Some(items) = parsed.as_array() else {
+        return;
+    };
+    if items.is_empty() {
+        let line = invalid_request_body("empty batch");
+        mcp_server_write_str(srv, line.as_bytes());
+        return;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    for item in items {
+        if !item.is_object() {
+            parts.push(
+                invalid_request_body("batch element is not an object")
+                    .trim_end_matches('\n')
+                    .to_string(),
+            );
+            continue;
+        }
+        if let Some(resp) = mcp_server_handle_message(srv, &item.to_string()) {
+            parts.push(resp.trim_end_matches(['\r', '\n']).to_string());
+        }
+    }
+    if parts.is_empty() {
+        return; /* every element was a notification: no response at all */
+    }
+    let mut out = String::with_capacity(2 + parts.iter().map(|p| p.len() + 1).sum::<usize>());
+    out.push('[');
+    out.push_str(&parts.join(","));
+    out.push_str("]\n");
+    mcp_server_write_str(srv, out.as_bytes());
+}
+
+/// The `-32600 Invalid Request` element for a batch member that is not a
+/// JSON-RPC message at all. Its id must be null (there is no id to echo).
+fn invalid_request_body(reason: &str) -> String {
+    let v = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": serde_json::Value::Null,
+        "error": { "code": -32600, "message": format!("Invalid Request: {reason}") },
+    });
+    let mut s = serde_json::to_string(&v).unwrap_or_else(|_| {
+        "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}"
+            .to_string()
+    });
+    s.push('\n');
+    s
+}
+
+/// Route ONE inbound line: a single JSON-RPC message, or a batch array.
+unsafe fn mcp_server_handle_request(srv: *mut McpServer, line: &[u8]) {
+    let Ok(input) = std::str::from_utf8(line) else {
+        return;
+    };
+    /* A batch is one line beginning with '['; everything else is the
+     * single-message path this function has always been. */
+    if input.trim_start().starts_with('[') {
+        mcp_server_handle_batch(srv, input);
+        return;
+    }
+    if let Some(resp) = mcp_server_handle_message(srv, input) {
+        mcp_server_write_str(srv, resp.as_bytes());
+    }
 }
 
 /// Escape `"` and `\` inside a JSON string body (the tools/list appender —
@@ -2568,11 +2748,24 @@ unsafe extern "C" fn mcp_server_on_read(stream: *mut UvStream, nread: isize, buf
     if nread > 0 {
         let chunk = std::slice::from_raw_parts((*buf).base as *const u8, nread as usize);
         let s = &mut *srv;
-        let space = MCP_READ_BUF - s.read_len - 1;
-        let copy = chunk.len().min(space);
-        s.read_buf[s.read_len..s.read_len + copy].copy_from_slice(&chunk[..copy]);
-        s.read_len += copy;
-        s.read_buf[s.read_len] = 0;
+        if !reserve_line_buf(&mut s.read_buf, s.read_len, chunk.len()) {
+            /* MC-019: the same ceiling on the serving side. Answer with a
+             * JSON-RPC error frame, then stop reading this stdin. */
+            s.read_len = 0;
+            uv::uv_read_stop(stream);
+            let msg = format!(
+                "MCP payload too large (E_MCP_PAYLOAD_TOO_LARGE): a single request \
+                 exceeded {MCP_MAX_LINE} bytes"
+            );
+            let frame = jsonrpc_error_cstr(0, MCP_ERR_PAYLOAD_TOO_LARGE, &msg);
+            mcp_server_write_str(srv, frame.as_bytes());
+            if !buf.is_null() && !(*buf).base.is_null() {
+                libc::free((*buf).base as *mut c_void);
+            }
+            return;
+        }
+        s.read_buf[s.read_len..s.read_len + chunk.len()].copy_from_slice(chunk);
+        s.read_len += chunk.len();
 
         let mut head = 0usize;
         while let Some(nl) = s.read_buf[head..s.read_len]
@@ -2593,7 +2786,6 @@ unsafe extern "C" fn mcp_server_on_read(stream: *mut UvStream, nread: isize, buf
         let remaining = s.read_len - head;
         s.read_buf.copy_within(head..s.read_len, 0);
         s.read_len = remaining;
-        s.read_buf[remaining] = 0;
     }
 
     if !(*buf).base.is_null() {
@@ -2690,9 +2882,11 @@ unsafe extern "C" fn js_server_tool(
         handler,
     });
     (*srv).tool_count += 1;
-    /* M3: a tool registered after the client listed the inventory is
-     * announced instead of silently appearing. */
-    if (*srv).started != 0 && (*srv).listed_tools != 0 {
+    /* MC-066 (AUDIT-2026-11-08): a tool registered after the server started
+     * is ANNOUNCED. The old condition also required that the client had
+     * already called tools/list, so a post-start registration before the
+     * first list changed the inventory silently. */
+    if (*srv).started != 0 {
         let note = jsonrpc_notify_cstr("notifications/tools/list_changed", None);
         mcp_server_write_str(srv, note.as_bytes());
     }
@@ -2905,21 +3099,40 @@ thread_local! {
 unsafe extern "C" fn js_mcp_serve(
     ctx: *mut JSContext,
     _this: JSValueConst,
-    _argc: c_int,
-    _argv: *const JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
 ) -> JSValue {
+    /* MC-051 (AUDIT-2026-11-08): sofuu.mcp.serve({name, version}) is the
+     * identity the initialize result reports. An omitted value keeps the
+     * historical default, so existing callers see no change. */
+    let mut name = String::from("sofuu-mcp");
+    let mut version = String::from("0.1.0");
+    if argc > 0 && qjs::is_object(*argv) {
+        for (key, slot) in [(c"name", &mut name), (c"version", &mut version)] {
+            let v = qjs::sofuu_js_get_property_str(ctx, *argv, key.as_ptr());
+            if qjs::sofuu_js_is_string(v) != 0 {
+                let p = qjs::sofuu_js_to_cstring(ctx, v);
+                if !p.is_null() {
+                    *slot = CStr::from_ptr(p).to_string_lossy().into_owned();
+                    qjs::sofuu_js_free_cstring(ctx, p);
+                }
+            }
+            qjs::sofuu_js_free_value(ctx, v);
+        }
+    }
     let srv = Box::new(McpServer {
         ctx,
         self_val: qjs::sofuu_js_undefined(),
+        name,
+        version,
         tools: Vec::new(),
         tool_count: 0,
         resources: Vec::new(),
         prompts: Vec::new(),
         started: 0,
-        listed_tools: 0,
         stdin_pipe: ptr::null_mut(),
         stdout_pipe: ptr::null_mut(),
-        read_buf: [0u8; MCP_READ_BUF],
+        read_buf: vec![0u8; MCP_READ_BUF],
         read_len: 0,
     });
 
@@ -3452,7 +3665,7 @@ mod tests {
                 stderr_pipe: ptr::null_mut(),
                 ctx,
                 self_val: qjs::sofuu_js_undefined(),
-                read_buf: [0u8; MCP_READ_BUF],
+                read_buf: vec![0u8; MCP_READ_BUF],
                 read_len: 0,
                 stderr_buf: [0u8; MCP_STDERR_CAP],
                 stderr_len: 0,

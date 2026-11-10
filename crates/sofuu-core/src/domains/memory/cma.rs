@@ -272,46 +272,89 @@ pub const DUP_TEXT_JACCARD: f32 = 0.85;
 /// proves nothing, and the caller (the gate) then falls back to the
 /// distance key alone rather than silently merging or silently splitting.
 pub fn token_jaccard(a: &str, b: &str) -> f32 {
-    let sa: HashSet<String> = tokenize(a).into_iter().collect();
-    let sb: HashSet<String> = tokenize(b).into_iter().collect();
-    if sa.is_empty() || sb.is_empty() {
-        return 0.0;
+    TextKey::of(a).similarity(&TextKey::of(b))
+}
+
+/// MEM-049: one text's token set, built ONCE and reused for every candidate
+/// the near-duplicate gate compares against.
+///
+/// The gate used to re-derive BOTH sides' token sets three times per
+/// comparison — the emptiness pre-check, then `token_jaccard`, then the
+/// containment pass — so one insert against `DUP_GATE_K` candidates built
+/// the incoming text's set up to 12 times and allocated a HashSet each time.
+/// The set only depends on the text, and the incoming text is the same for
+/// every candidate of one insert, so it is built once per insert (lazily:
+/// the distinct-text ingest never builds one at all, because no candidate
+/// ever clears the distance key).
+///
+/// Measured on the 2000-row / 768-dim fixture (`SOFUU_CMA_TRACE`): the
+/// gate's text-key work is ~0.1% of ingest either way — the near-duplicate
+/// path is bounded by `DUP_GATE_EF` and was NOT what made the fixture slow
+/// (the graph's back-link re-prune was, see `hnsw::Hnsw::select_neighbors`).
+/// This is a constant-factor cleanup that keeps the per-insert cost flat as
+/// `DUP_GATE_K` grows; the behaviour is unchanged, which the
+/// `dual_key_gate_*` fixtures pin.
+struct TextKey {
+    set: HashSet<String>,
+}
+
+impl TextKey {
+    fn of(text: &str) -> Self {
+        Self {
+            set: tokenize(text).into_iter().collect(),
+        }
     }
-    let inter = sa.intersection(&sb).count();
-    let union = sa.len() + sb.len() - inter;
-    inter as f32 / union as f32
+
+    fn is_empty(&self) -> bool {
+        self.set.is_empty()
+    }
+
+    /// Jaccard, plus the restatement case: a text that keeps every content
+    /// token of the other and merely adds words to it ("session-only fact" ->
+    /// "session-only fact, restated", Jaccard 0.667) is the same fact said
+    /// again. An embedding collision between unrelated sentences shares no
+    /// token set at all, so containment cannot resurrect the merges the text
+    /// key exists to stop — that is what the `dual_key_gate_*` tests pin.
+    ///
+    /// `0.0` when either side has no tokens (see `token_jaccard`).
+    fn similarity(&self, other: &TextKey) -> f32 {
+        if self.is_empty() || other.is_empty() {
+            return 0.0;
+        }
+        let inter = self.set.intersection(&other.set).count();
+        let union = self.set.len() + other.set.len() - inter;
+        let j = inter as f32 / union as f32;
+        if j >= DUP_TEXT_JACCARD {
+            return j;
+        }
+        let (small, big) = if self.set.len() <= other.set.len() {
+            (&self.set, &other.set)
+        } else {
+            (&other.set, &self.set)
+        };
+        if small.len() >= 2 && small.iter().all(|t| big.contains(t)) {
+            1.0
+        } else {
+            j
+        }
+    }
 }
 
 /// W5.1: the text key's verdict for one candidate pair. `None` = the pair
 /// carries no text evidence (at least one side is empty/untokenizable), in
 /// which case the gate uses the distance key alone.
 fn text_key_verdict(incoming: &str, existing: &str) -> Option<bool> {
-    if tokenize(incoming).is_empty() || tokenize(existing).is_empty() {
-        return None;
-    }
-    Some(text_jaccard_or_containment(incoming, existing) >= DUP_TEXT_JACCARD)
+    text_key_verdict_with(&TextKey::of(incoming), existing)
 }
 
-/// Jaccard, plus the restatement case: a text that keeps every content token
-/// of the other and merely adds words to it ("session-only fact" ->
-/// "session-only fact, restated", Jaccard 0.667) is the same fact said
-/// again. An embedding collision between unrelated sentences shares no
-/// token set at all, so containment cannot resurrect the merges the text
-/// key exists to stop — that is what the `dual_key_gate_*` tests pin.
-fn text_jaccard_or_containment(incoming: &str, existing: &str) -> f32 {
-    let j = token_jaccard(incoming, existing);
-    if j >= DUP_TEXT_JACCARD {
-        return j;
+/// MEM-049: `text_key_verdict` with the INCOMING text's set already built —
+/// the ingest hot path, where one insert compares against several candidates.
+fn text_key_verdict_with(incoming: &TextKey, existing: &str) -> Option<bool> {
+    let other = TextKey::of(existing);
+    if incoming.is_empty() || other.is_empty() {
+        return None;
     }
-    let (a, b) = (tokenize(incoming), tokenize(existing));
-    let (sa, sb): (std::collections::HashSet<&String>, std::collections::HashSet<&String>) =
-        (a.iter().collect(), b.iter().collect());
-    let (small, big) = if sa.len() <= sb.len() { (&sa, &sb) } else { (&sb, &sa) };
-    if small.len() >= 2 && small.iter().all(|t| big.contains(t)) {
-        1.0
-    } else {
-        j
-    }
+    Some(incoming.similarity(&other) >= DUP_TEXT_JACCARD)
 }
 
 /// W5.1: the gate's text-key decision, with the documented no-text
@@ -320,6 +363,12 @@ fn text_jaccard_or_containment(incoming: &str, existing: &str) -> f32 {
 /// though the vectors are close.
 fn text_key_passes(incoming: &str, existing: &str) -> bool {
     text_key_verdict(incoming, existing).unwrap_or(true)
+}
+
+/// MEM-049: `text_key_passes` for a caller that already built the incoming
+/// text's token set (see `TextKey`).
+fn text_key_passes_with(incoming: &TextKey, existing: &str) -> bool {
+    text_key_verdict_with(incoming, existing).unwrap_or(true)
 }
 
 /// H-07: recall's minimum search frontier on a corpus bigger than
@@ -551,6 +600,90 @@ impl RememberOutcome {
     }
 }
 
+/// MEM-049 (diagnostics, off by default): per-stage timings of the ingest
+/// path, enabled by `SOFUU_CMA_TRACE=1` (`SOFUU_CMA_TRACE_WINDOW=N` sets
+/// the reporting window, default 500 remembers). Unset — the shipped
+/// default — costs `remember_with_source_outcome` one `is_none()` branch.
+///
+/// It exists so the numbers quoted in the `TextKey` and
+/// `hnsw::Hnsw::select_neighbors` comments are reproducible:
+///
+/// ```text
+/// SOFUU_CMA_TRACE=1 sofuu run /tmp/cma_probe.js /tmp/x.qtsq 2000 dup 768
+/// [cma-trace] 500 remembers: total 349.1 ms (stage1 0.1, gate 39.4, index 309.4, other 0.2)
+/// ```
+///
+/// `stage1` is the exact-text key, `gate` the dual-key HNSW probe + token
+/// Jaccard, `index` the record insert plus `Hnsw::add_vector`, and `other`
+/// the remainder of the call.
+#[derive(Default)]
+struct RememberTrace {
+    stage1: std::time::Duration,
+    gate: std::time::Duration,
+    index: std::time::Duration,
+    total: std::time::Duration,
+    calls: u64,
+    window: u64,
+}
+
+fn ms(d: std::time::Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+impl RememberTrace {
+    /// Fold one remember into the window, printing (and resetting) the
+    /// window every `window` calls.
+    fn record(&mut self, stages: [std::time::Duration; 3], total: std::time::Duration) {
+        self.stage1 += stages[0];
+        self.gate += stages[1];
+        self.index += stages[2];
+        self.total += total;
+        self.calls += 1;
+        if self.window == 0 || self.calls % self.window != 0 {
+            return;
+        }
+        let other = self
+            .total
+            .saturating_sub(self.stage1 + self.gate + self.index);
+        eprintln!(
+            "[cma-trace] {} remembers: total {:.1} ms (stage1 {:.1}, gate {:.1}, index {:.1}, other {:.1})",
+            self.calls,
+            ms(self.total),
+            ms(self.stage1),
+            ms(self.gate),
+            ms(self.index),
+            ms(other)
+        );
+        *self = RememberTrace {
+            window: self.window,
+            calls: self.calls,
+            ..RememberTrace::default()
+        };
+    }
+}
+
+/// MEM-049: `SOFUU_CMA_TRACE` / `SOFUU_CMA_TRACE_WINDOW` → the trace, if on.
+fn remember_trace_from_env() -> Option<RememberTrace> {
+    let on = std::env::var("SOFUU_CMA_TRACE")
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+        })
+        .unwrap_or(false);
+    if !on {
+        return None;
+    }
+    let window = std::env::var("SOFUU_CMA_TRACE_WINDOW")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(500);
+    Some(RememberTrace {
+        window,
+        ..RememberTrace::default()
+    })
+}
+
 pub struct Cma {
     pub vec_dim: usize,
     /// W5.1 scope switch: TRUE only while `promote_working_by_ids` runs.
@@ -610,6 +743,9 @@ pub struct Cma {
     /// DECAY_TAG_EXPONENTIAL (`0.0` = the per-record legacy curve) and the
     /// TTL for DECAY_TAG_TTL (`0.0` = unused, DECAY_TAG_NONE).
     decay_seconds: f64,
+    /// MEM-049: `SOFUU_CMA_TRACE` diagnostics (see `RememberTrace`). None
+    /// on every shipped path.
+    trace: Option<RememberTrace>,
 }
 
 /// Above this many dirty ids, tracking per-record stops paying — the next
@@ -704,6 +840,7 @@ impl Cma {
              * ticks the same way until `set_decay_params` says otherwise. */
             decay_tag: DECAY_TAG_EXPONENTIAL,
             decay_seconds: 0.0,
+            trace: remember_trace_from_env(),
         }
     }
 
@@ -845,9 +982,13 @@ impl Cma {
          * within the session is ONE working record") for the ordinary case
          * of restating a sentence — 'session-only fact' vs 'session-only
          * fact, restated' scores Jaccard 0.667 and used to get a NEW id. */
+        /* MEM-049: the incoming text's token set is built ONCE for the whole
+         * working set instead of once per comparison (see `TextKey`). */
+        let mut incoming_key: Option<TextKey> = None;
         for w in &mut self.working {
             let d = sq_dist(w.vector.as_slice(), vec).sqrt();
-            if (d == 0.0 || d < DUP_DISTANCE && text_key_passes(text, &w.text)) {
+            let key = incoming_key.get_or_insert_with(|| TextKey::of(text));
+            if (d == 0.0 || d < DUP_DISTANCE && text_key_passes_with(key, &w.text)) {
                 w.created_at = now_secs();
                 if !source.is_empty() {
                     w.source = source.to_string();
@@ -1374,15 +1515,27 @@ impl Cma {
             let dup = if self.records.is_empty() || !self.dup_gate {
                 None
             } else {
-                self.index
-                    .search_with_ef(v, DUP_GATE_K, DUP_GATE_EF)
-                    .into_iter()
-                    .find(|(id, d)| {
-                        let rec = &self.records[*id as usize];
-                        *d < DUP_DISTANCE
-                            && rec.tier != TIER_FORGOTTEN
-                            && (self.text_gate_disabled || text_key_passes(text, &rec.text))
-                    })
+                let hits = self.index.search_with_ef(v, DUP_GATE_K, DUP_GATE_EF);
+                /* MEM-049: one token set per imported row, not one per
+                 * candidate comparison (see `TextKey`). */
+                let mut incoming_key: Option<TextKey> = None;
+                let mut found: Option<(u32, f32)> = None;
+                for &(id, d) in &hits {
+                    let rec = &self.records[id as usize];
+                    if d < DUP_DISTANCE && rec.tier != TIER_FORGOTTEN {
+                        let agrees = if self.text_gate_disabled {
+                            true
+                        } else {
+                            let key = incoming_key.get_or_insert_with(|| TextKey::of(text));
+                            text_key_passes_with(key, &rec.text)
+                        };
+                        if agrees {
+                            found = Some((id, d));
+                            break;
+                        }
+                    }
+                }
+                found
             };
             if let Some((dup_id, _)) = dup {
                 let rec = &mut self.records[dup_id as usize];
@@ -1458,6 +1611,16 @@ impl Cma {
         self.records.len()
     }
 
+    /// MEM-003 (AUDIT-2026-11-08): the number of LIVE records. len() is the
+    /// physical row count and keeps a forgotten row until consolidation, so it
+    /// was the wrong answer for cma.count().
+    pub fn live_len(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|r| r.tier != TIER_FORGOTTEN)
+            .count()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
@@ -1529,47 +1692,103 @@ impl Cma {
         kv_page_id: u32,
         source: &str,
     ) -> RememberOutcome {
+        /* MEM-049: the untraced path is ONE branch — the stage clocks live in
+         * `remember_ingest` so a traced run and a shipped run execute
+         * literally the same code, and the numbers in the `TextKey` /
+         * `hnsw::select_neighbors` comments were measured on this path. */
+        if self.trace.is_none() {
+            return self.remember_ingest(vec, text, role, kv_page_id, source).0;
+        }
+        let started = std::time::Instant::now();
+        let (outcome, stages) = self.remember_ingest(vec, text, role, kv_page_id, source);
+        let total = started.elapsed();
+        if let Some(tr) = self.trace.as_mut() {
+            tr.record(stages, total);
+        }
+        outcome
+    }
+
+    /// MEM-049: the ingest body, with the per-stage clocks the
+    /// `SOFUU_CMA_TRACE` line reports. Returns (verdict, [stage 1, gate,
+    /// index]) — the durations are `Duration::ZERO` for stages a call does
+    /// not reach (a stage-1 merge never runs the gate).
+    fn remember_ingest(
+        &mut self,
+        vec: &[f32],
+        text: &str,
+        role: &str,
+        kv_page_id: u32,
+        source: &str,
+    ) -> (RememberOutcome, [std::time::Duration; 3]) {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
         debug_assert_eq!(vec.len(), self.vec_dim);
         /* Stage 1: exact text. */
         if let Some(dup_id) = self.live_id_for_text(text) {
             let same_place = sq_dist(self.index.vector(dup_id), vec).sqrt() < DUP_DISTANCE;
             if same_place {
                 self.reinforce_duplicate(dup_id);
-                return RememberOutcome {
-                    id: dup_id,
-                    merged: true,
-                    into: Some(dup_id),
-                };
+                return (
+                    RememberOutcome {
+                        id: dup_id,
+                        merged: true,
+                        into: Some(dup_id),
+                    },
+                    [t0.elapsed(), Duration::ZERO, Duration::ZERO],
+                );
             }
             /* Same words, different embedding (re-said in a new context):
              * not a duplicate by construction — fall through so the vector
              * gate can still fold it into a near neighbour, and let the
              * insert record the newer sighting in the text index. */
         }
+        let t_stage1 = t0.elapsed();
+        let t1 = std::time::Instant::now();
         /* Stage 2: dual-key near-duplicate gate (optional, bounded). The
          * nearest FEW neighbours are inspected because a closer row can
          * VETO the merge on the text key while the row that really is the
          * same fact sits just behind it. */
         if self.dup_gate && !self.records.is_empty() {
             let hits = self.index.search_with_ef(vec, DUP_GATE_K, DUP_GATE_EF);
-            let target = hits.iter().copied().find(|(dup_id, dist)| {
-                let rec = &self.records[*dup_id as usize];
+            /* MEM-049: ONE token set for the incoming text across every
+             * candidate of this insert (see `TextKey`), and none at all
+             * when no hit clears the distance key — which is the ordinary
+             * distinct-text ingest. */
+            let mut incoming_key: Option<TextKey> = None;
+            let mut target: Option<u32> = None;
+            for &(dup_id, dist) in &hits {
+                let rec = &self.records[dup_id as usize];
                 /* W5.1: the AND gate. A close vector alone is NOT a
                  * duplicate; the text has to agree too (or be absent on
                  * one side — the documented vector-only fallback). */
-                *dist < DUP_DISTANCE
-                    && rec.tier != TIER_FORGOTTEN
-                    && (self.text_gate_disabled || text_key_passes(text, &rec.text))
-            });
-            if let Some((dup_id, _)) = target {
+                if dist < DUP_DISTANCE && rec.tier != TIER_FORGOTTEN {
+                    let agrees = if self.text_gate_disabled {
+                        true
+                    } else {
+                        let key = incoming_key.get_or_insert_with(|| TextKey::of(text));
+                        text_key_passes_with(key, &rec.text)
+                    };
+                    if agrees {
+                        target = Some(dup_id);
+                        break;
+                    }
+                }
+            }
+            if let Some(dup_id) = target {
                 self.reinforce_duplicate(dup_id);
-                return RememberOutcome {
-                    id: dup_id,
-                    merged: true,
-                    into: Some(dup_id),
-                };
+                let gate = t1.elapsed();
+                return (
+                    RememberOutcome {
+                        id: dup_id,
+                        merged: true,
+                        into: Some(dup_id),
+                    },
+                    [t_stage1, gate, Duration::ZERO],
+                );
             }
         }
+        let t_gate = t1.elapsed();
+        let t2 = std::time::Instant::now();
         let id = self.records.len() as u32;
         let mut rec = Record::new(id, text, role, kv_page_id);
         rec.source = source.to_string();
@@ -1579,11 +1798,14 @@ impl Cma {
             self.text_index.insert(text.to_string(), id);
         }
         self.mark_dirty(id);
-        RememberOutcome {
-            id,
-            merged: false,
-            into: None,
-        }
+        (
+            RememberOutcome {
+                id,
+                merged: false,
+                into: None,
+            },
+            [t_stage1, t_gate, t2.elapsed()],
+        )
     }
 
     /// The merge arm shared by both gate stages: the surviving row is

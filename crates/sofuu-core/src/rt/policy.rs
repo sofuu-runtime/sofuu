@@ -715,12 +715,17 @@ pub fn evaluate(req: &serde_json::Value, policy: &serde_json::Value) -> serde_js
      * `{host:'169.254.169.254'}` asks. */
     if op == "net.fetch" && !host.is_empty() && net_ssrf(policy) {
         if let Some(ip) = parse_ip_literal(&host) {
-            if ip_is_internal(ip) {
-                return decision(
-                    "deny",
-                    "R7.1/net.ssrf",
-                    &format!("host '{host}' is an internal address and net.ssrf is on"),
-                );
+            if let Some(class) = ip_internal_class(ip) {
+                /* JR-090: name the class, and let net.allow_loopback exempt
+                 * loopback ONLY — a metadata endpoint stays refused. */
+                let loopback = class == "loopback";
+                if !(loopback && loopback_allowed(policy)) {
+                    return decision(
+                        "deny",
+                        "R7.1/net.ssrf",
+                        &format!("host '{host}' is a {class} address and net.ssrf is on"),
+                    );
+                }
             }
         }
     }
@@ -897,13 +902,31 @@ fn merge_layers(layers: &[serde_json::Value]) -> serde_json::Value {
 /// thinks they wrote but that silently does not apply is worse than a hard
 /// stop.
 pub fn layered_policy_from_disk() -> Result<serde_json::Value, String> {
+    let user = std::env::var("HOME")
+        .ok()
+        .map(|home| std::path::PathBuf::from(home).join(".sofuu/policy.json"));
+    let project = std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join(".sofuu/policy.json"));
+    layered_policy_from_paths(user, project)
+}
+
+/// The testable half of layered_policy_from_disk: merge the layers found at the
+/// given paths, in user-then-project order.
+///
+/// A file that exists but cannot be parsed is an error naming the file and the
+/// reason, never a silently skipped layer (AUDIT-2026-11-08 KZ-051/KZ-052).
+pub fn layered_policy_from_paths(
+    user: Option<std::path::PathBuf>,
+    project: Option<std::path::PathBuf>,
+) -> Result<serde_json::Value, String> {
     let mut layers: Vec<serde_json::Value> = Vec::new();
-    let mut paths: Vec<(String, std::path::PathBuf)> = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        paths.push(("user".into(), std::path::PathBuf::from(home).join(".sofuu/policy.json")));
+    let mut paths: Vec<(&str, std::path::PathBuf)> = Vec::new();
+    if let Some(p) = user {
+        paths.push(("user", p));
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        paths.push(("project".into(), cwd.join(".sofuu/policy.json")));
+    if let Some(p) = project {
+        paths.push(("project", p));
     }
     for (label, path) in paths {
         if !path.is_file() {
@@ -1722,37 +1745,72 @@ pub(crate) unsafe fn net_policy(ctx: *mut JSContext) -> NetPolicy {
     NetPolicy { ssrf, deny_ips }
 }
 
-/// Is `ip` an address SSRF protection refuses (loopback, private, CGNAT,
-/// link-local, unique-local, unspecified/broadcast)?
-pub(crate) fn ip_is_internal(ip: IpAddr) -> bool {
+/// AG-110 (AUDIT-2026-11-08, JR-090/JR-092): WHAT KIND of internal address
+/// this is. The audit found every refusal reported the same cloud-metadata
+/// wording, so an operator could not tell a loopback dev server from the
+/// EC2 metadata endpoint, and [::1] was not classified at all.
+pub(crate) fn ip_internal_class(ip: IpAddr) -> Option<&'static str> {
     match ip {
-        IpAddr::V4(v4) => ipv4_is_internal(v4),
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            if o == [169, 254, 169, 254] {
+                return Some("cloud metadata");
+            }
+            if v4.is_loopback() {
+                return Some("loopback");
+            }
+            if o[0] == 100 && (o[1] & 0xc0) == 64 {
+                return Some("CGNAT");
+            }
+            if v4.is_link_local() {
+                return Some("link-local");
+            }
+            if v4.is_private() {
+                return Some("private");
+            }
+            if v4.is_unspecified() {
+                return Some("unspecified");
+            }
+            if v4.is_broadcast() {
+                return Some("broadcast");
+            }
+            if o[0] == 192 && o[1] == 0 && o[2] == 0 {
+                return Some("IETF-reserved");
+            }
+            None
+        }
         IpAddr::V6(v6) => {
             /* IPv4-mapped ::ffff:a.b.c.d — judged as the IPv4 it reaches.
              * Written out rather than via to_ipv4_mapped() so the check does
              * not depend on a newer std than the toolchain pins. */
             let o = v6.octets();
             if o[..10].iter().all(|&b| b == 0) && o[10] == 0xff && o[11] == 0xff {
-                return ipv4_is_internal(Ipv4Addr::new(o[12], o[13], o[14], o[15]));
+                return ip_internal_class(IpAddr::V4(Ipv4Addr::new(o[12], o[13], o[14], o[15])));
             }
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || (u16::from_be_bytes([o[0], o[1]]) & 0xfe00) == 0xfc00 /* fc00::/7 */
-                || (u16::from_be_bytes([o[0], o[1]]) & 0xffc0) == 0xfe80 /* fe80::/10 */
+            if v6.is_loopback() {
+                return Some("loopback");
+            }
+            if v6.is_unspecified() {
+                return Some("unspecified");
+            }
+            if (u16::from_be_bytes([o[0], o[1]]) & 0xfe00) == 0xfc00 {
+                return Some("unique-local");
+            }
+            if (u16::from_be_bytes([o[0], o[1]]) & 0xffc0) == 0xfe80 {
+                return Some("link-local");
+            }
+            None
         }
     }
 }
 
-fn ipv4_is_internal(v4: Ipv4Addr) -> bool {
-    let o = v4.octets();
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || (o[0] == 100 && (o[1] & 0xc0) == 64) /* 100.64/10 CGNAT */
-        || (o[0] == 192 && o[1] == 0 && o[2] == 0) /* 192.0.0/24 IETF */
+/// Is this address one SSRF protection refuses (loopback, private, CGNAT,
+/// link-local, unique-local, unspecified/broadcast)? One predicate, one
+/// classifier: the two can never disagree.
+pub(crate) fn ip_is_internal(ip: IpAddr) -> bool {
+    ip_internal_class(ip).is_some()
 }
+
 
 /// net.ssrf / net.allow_private (`allowPrivate`), shared by `net_policy`
 /// and the pure evaluator so the two read the same switch.
@@ -1763,7 +1821,14 @@ fn net_ssrf(policy: &serde_json::Value) -> bool {
     {
         return true;
     }
-    if std::env::var_os("SOFUU_ALLOW_LOOPBACK").is_some() || std::env::var_os("SOFUU_WEB_ALLOW_INTERNAL").is_some() {
+    /* JR-092 (AUDIT-2026-11-08): SOFUU_ALLOW_LOOPBACK=0 used to DISABLE the
+     * guard — testing var_os(..).is_some() cannot tell "0" from "1". Only an
+     * explicitly truthy value may relax SSRF. */
+    /* SOFUU_ALLOW_LOOPBACK is handled per address (loopback_allowed): it
+     * must never excuse a metadata endpoint, so it cannot disable SSRF
+     * wholesale here. SOFUU_WEB_ALLOW_INTERNAL keeps its historical meaning
+     * (the host says this deployment has no untrusted network). */
+    if env_truthy("SOFUU_WEB_ALLOW_INTERNAL") {
         return false;
     }
     if bool_at(policy, &["net", "allow_private"]) == Some(true)
@@ -1773,6 +1838,28 @@ fn net_ssrf(policy: &serde_json::Value) -> bool {
         return false;
     }
     true
+}
+
+/// SOFUU_ALLOW_LOOPBACK=1|true|yes|on — anything else (including "0")
+/// leaves the guard on. Absent and empty are the same: off.
+pub(crate) fn env_truthy(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !matches!(v.as_str(), "" | "0" | "false" | "no" | "off")
+        }
+        Err(_) => false,
+    }
+}
+
+/// net.allow_loopback: true (or allowLoopback) or the env switch: the
+/// operator accepts loopback targets while keeping SSRF on for every other
+/// internal address. Read by the pure evaluator AND the fetch/MCP gates.
+pub(crate) fn loopback_allowed(policy: &serde_json::Value) -> bool {
+    bool_at(policy, &["net", "allow_loopback"]) == Some(true)
+        || bool_at(policy, &["net", "allowLoopback"]) == Some(true)
+        || env_truthy("SOFUU_ALLOW_LOOPBACK")
+
 }
 
 /// Does this policy contain any rule that only a host can satisfy?
@@ -2320,9 +2407,15 @@ mod tests {
         let d = evaluate(&serde_json::json!({"op":"net.fetch","target":"example.com"}), &p);
         assert_eq!(d.get("decision").and_then(|v| v.as_str()), Some("deny"));
         assert_eq!(d.get("rule").and_then(|v| v.as_str()), Some("R7.1/net.host-required"));
-        /* With no network rules at all there is nothing to judge, so the
-         * answer stays allow — the empty policy must keep working. */
-        assert_eq!(eval(serde_json::json!({"op":"net.fetch"}), serde_json::json!({})), "allow");
+        /* SSRF is ON by default (R7.1/net.ssrf, AUDIT-2026-11-08 §2.6), so an
+         * empty policy still HAS network rules and a host-less fetch cannot be
+         * judged: it is refused. Only a policy that switches the guard off has
+         * nothing to judge. */
+        assert_eq!(eval(serde_json::json!({"op":"net.fetch"}), serde_json::json!({})), "deny");
+        assert_eq!(
+            eval(serde_json::json!({"op":"net.fetch"}), serde_json::json!({"net":{"ssrf":false}})),
+            "allow"
+        );
         /* net.ssrf refuses an internal IP literal without a resolver. */
         let ssrf = serde_json::json!({"net":{"ssrf":true}});
         let d = evaluate(&serde_json::json!({"op":"net.fetch","host":"169.254.169.254"}), &ssrf);
@@ -2338,5 +2431,72 @@ mod tests {
     fn lexical_clean_folds_dot_segments() {
         assert_eq!(lexical_clean(Path::new("/a/b/../c/./d")), PathBuf::from("/a/c/d"));
         assert_eq!(lexical_clean(Path::new("a/./b")), PathBuf::from("a/b"));
+    }
+}
+
+#[cfg(test)]
+mod ssrf_class_tests {
+    use super::*;
+    use std::net::IpAddr;
+
+    fn cls(s: &str) -> Option<&'static str> {
+        ip_internal_class(s.parse::<IpAddr>().unwrap())
+    }
+
+    fn dec(req: serde_json::Value, p: &serde_json::Value) -> String {
+        evaluate(&req, p)
+            .get("decision")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    /// AG-110 (AUDIT-2026-11-08, JR-090/JR-092): each internal family has its
+    /// own label, IPv6 loopback included, and public addresses have none.
+    #[test]
+    fn internal_addresses_are_classified_individually() {
+        assert_eq!(cls("169.254.169.254"), Some("cloud metadata"));
+        assert_eq!(cls("127.0.0.1"), Some("loopback"));
+        assert_eq!(cls("::1"), Some("loopback"));
+        assert_eq!(cls("10.1.2.3"), Some("private"));
+        assert_eq!(cls("192.168.1.1"), Some("private"));
+        assert_eq!(cls("172.16.0.1"), Some("private"));
+        assert_eq!(cls("100.64.0.1"), Some("CGNAT"));
+        assert_eq!(cls("169.254.1.1"), Some("link-local"));
+        assert_eq!(cls("fd00::1"), Some("unique-local"));
+        assert_eq!(cls("::ffff:127.0.0.1"), Some("loopback"));
+        assert_eq!(cls("8.8.8.8"), None);
+        assert_eq!(cls("2606:4700::1111"), None);
+    }
+
+    /// net.allow_loopback exempts loopback ONLY: the metadata endpoint stays
+    /// refused, and the denial names the class it refused.
+    #[test]
+    fn allow_loopback_exempts_loopback_but_not_metadata() {
+        let p = serde_json::json!({"net":{"ssrf":true,"allow_loopback":true}});
+        assert_eq!(dec(serde_json::json!({"op":"net.fetch","host":"127.0.0.1"}), &p), "allow");
+        assert_eq!(dec(serde_json::json!({"op":"net.fetch","host":"::1"}), &p), "allow");
+        assert_eq!(dec(serde_json::json!({"op":"net.fetch","host":"169.254.169.254"}), &p), "deny");
+        assert_eq!(dec(serde_json::json!({"op":"net.fetch","host":"10.0.0.1"}), &p), "deny");
+        let strict = serde_json::json!({"net":{"ssrf":true}});
+        /* SOFUU_ALLOW_LOOPBACK is the process-wide escape hatch for local
+         * fixtures and it is applied after the policy document, so it wins
+         * here by design. The make test-rust target sets it (the HTTP client
+         * tests need a loopback listener); a plain cargo test does not. Assert
+         * whichever precedence is in force rather than pinning the ambient
+         * environment, so the suite is green either way. */
+        if std::env::var_os("SOFUU_ALLOW_LOOPBACK").is_some() {
+            assert_eq!(
+                dec(serde_json::json!({"op":"net.fetch","host":"127.0.0.1"}), &strict),
+                "allow",
+                "the env escape hatch outranks the policy document"
+            );
+        } else {
+            let d = evaluate(&serde_json::json!({"op":"net.fetch","host":"127.0.0.1"}), &strict);
+            assert_eq!(
+                d.get("reason").and_then(|v| v.as_str()),
+                Some("host '127.0.0.1' is a loopback address and net.ssrf is on")
+            );
+        }
     }
 }

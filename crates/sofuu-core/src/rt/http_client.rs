@@ -1751,27 +1751,63 @@ unsafe extern "C" fn start_timeout(_multi: *mut CurlM, timeout_ms: c_long, _user
 
 /// Entry-level URL guard: loopback, RFC 1918 private subnets, and cloud-metadata
 /// IPs are refused by default unless loopback is allowed explicitly.
-fn ssrf_url_reject(url: &str) -> Option<&'static str> {
-    if std::env::var_os("SOFUU_ALLOW_LOOPBACK").is_some() || std::env::var_os("SOFUU_WEB_ALLOW_INTERNAL").is_some() {
+fn ssrf_url_reject(url: &str, policy_loop_ok: bool) -> Option<&'static str> {
+    /* JR-092 (AUDIT-2026-11-08): a set-but-false switch (SOFUU_ALLOW_LOOPBACK=0)
+     * used to switch the guard OFF; only a truthy value may. */
+    if crate::rt::policy::env_truthy("SOFUU_WEB_ALLOW_INTERNAL") {
         return None;
     }
-    let low = url.to_ascii_lowercase();
-    if low.contains("169.254.169.254") {
-        return Some("fetch blocked: cloud metadata IP");
-    }
+    /* SOFUU_ALLOW_LOOPBACK=1 permits LOOPBACK only; the metadata endpoint and
+     * private ranges stay refused (JR-090/JR-092). */
+    let loop_ok = policy_loop_ok || crate::rt::policy::env_truthy("SOFUU_ALLOW_LOOPBACK");
     if let Some((_scheme, authority, _path)) = url_parts(url) {
-        let host = authority.split('@').last().unwrap_or(authority);
-        let host_no_port = host.split(':').next().unwrap_or(host).trim_matches('[').trim_matches(']');
-        if host_no_port == "localhost" || host_no_port == "127.0.0.1" || host_no_port == "::1" || host_no_port == "0.0.0.0" {
-            return Some("fetch blocked: loopback address refused");
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        /* JR-092: [::1] used to fall through — splitting an authority on the
+         * first colon turns "[::1]:8080" into "[", which parses as nothing.
+         * A bracketed host is parsed between the brackets instead. */
+        let host_no_port = if let Some(rest) = host.strip_prefix('[') {
+            match rest.find(']') {
+                Some(end) => &rest[..end],
+                None => rest,
+            }
+        } else {
+            host.split(':').next().unwrap_or(host)
+        };
+        if host_no_port.eq_ignore_ascii_case("localhost") || host_no_port.ends_with(".localhost") {
+            if loop_ok {
+                return None;
+            }
+            return Some("fetch blocked: loopback host refused (localhost) — set SOFUU_ALLOW_LOOPBACK=1 to permit it");
         }
         if let Ok(ip) = host_no_port.parse::<std::net::IpAddr>() {
-            if crate::rt::policy::ip_is_internal(ip) {
-                return Some("fetch blocked: private/loopback network address refused");
+            if let Some(class) = crate::rt::policy::ip_internal_class(ip) {
+                if class == "loopback" && loop_ok {
+                    return None;
+                }
+                /* JR-090: the refusal names the class it refused, so a
+                 * loopback dev server is not reported as a metadata IP. */
+                return Some(match class {
+                    "cloud metadata" => "fetch blocked: cloud metadata address refused (169.254.169.254)",
+                    "loopback" => "fetch blocked: loopback address refused — set SOFUU_ALLOW_LOOPBACK=1 to permit it",
+                    "private" => "fetch blocked: private network address refused (RFC 1918)",
+                    "CGNAT" => "fetch blocked: CGNAT address refused (100.64.0.0/10)",
+                    "link-local" => "fetch blocked: link-local address refused",
+                    "unique-local" => "fetch blocked: unique-local IPv6 address refused (fc00::/7)",
+                    "unspecified" => "fetch blocked: unspecified address refused",
+                    "broadcast" => "fetch blocked: broadcast address refused",
+                    _ => "fetch blocked: internal network address refused",
+                });
             }
         }
     }
     None
+}
+
+/// Does the LOADED policy allow loopback? (net.allow_loopback / allowLoopback)
+/// The env switch is folded in by ssrf_url_reject itself.
+unsafe fn policy_loopback_ok(ctx: *mut JSContext) -> bool {
+    let p = crate::rt::policy::policy_json(ctx);
+    crate::rt::policy::loopback_allowed(&p)
 }
 
 /// fetch only speaks http(s) (web.js's own guard mirrors this).
@@ -1973,7 +2009,18 @@ unsafe fn policy_refuses_address(
         return Some("R7.1/net.deny");
     }
     if (*req).policy_ssrf != 0 && crate::rt::policy::ip_is_internal(ip) {
-        return Some("R7.1/net.ssrf");
+        /* SOFUU_ALLOW_LOOPBACK / net.allow_loopback is the documented escape
+         * hatch for local fixtures, and the URL-level gate honours it
+         * (policy_loopback_ok). The RESOLVED-address gate has to agree, or the
+         * hatch is a no-op for every name that resolves to 127.0.0.1 — which
+         * is how a memory-adapter conformance run died with E_PERMISSION_DENIED
+         * even though the operator had set it. It exempts loopback only:
+         * metadata, private, CGNAT and ULA stay refused. */
+        let exempt = crate::rt::policy::ip_internal_class(ip) == Some("loopback")
+            && policy_loopback_ok((*req).ctx);
+        if !exempt {
+            return Some("R7.1/net.ssrf");
+        }
     }
     None
 }
@@ -2059,7 +2106,7 @@ unsafe fn redirect_reissue(
     if !scheme_ok(next_url) {
         return Err("fetch blocked: redirect target must be http(s)");
     }
-    if let Some(reason) = ssrf_url_reject(next_url) {
+    if let Some(reason) = ssrf_url_reject(next_url, policy_loopback_ok((*req).ctx)) {
         return Err(reason);
     }
     /* H-02(b): the policy's host rules bind every hop, not just the URL the
@@ -2186,9 +2233,16 @@ unsafe extern "C" fn js_sofuu_fetch(
     // manual per-hop redirect re-issue below handle the rest (net-4).
     {
         let url_str = CStr::from_ptr(url_ptr).to_string_lossy();
-        if ssrf_url_reject(&url_str).is_some() {
+        if let Some(reason) = ssrf_url_reject(&url_str, policy_loopback_ok(ctx)) {
             qjs::sofuu_js_free_cstring(ctx, url_ptr);
-            return qjs::JS_ThrowTypeError(ctx, c"fetch blocked: cloud metadata IP".as_ptr());
+            /* JR-090: report the guard's own reason, not one fixed string
+             * that called every refused target a metadata IP. */
+            let reason_c = match std::ffi::CString::new(reason) {
+                Ok(c) => c,
+                Err(_) => std::ffi::CString::new("fetch blocked: internal network address refused")
+                    .unwrap_or_default(),
+            };
+            return qjs::JS_ThrowTypeError(ctx, reason_c.as_ptr());
         }
         if !scheme_ok(&url_str) {
             qjs::sofuu_js_free_cstring(ctx, url_ptr);

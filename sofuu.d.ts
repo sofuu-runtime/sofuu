@@ -1606,6 +1606,8 @@ export interface Diagnostic {
   /** A known explanation, separate from observed causality. */
   reason?: string;
   hints?: string[];
+  /** Bounded, sanitized frames from the reported stack, when available. */
+  frames?: string[];
 }
 
 /**
@@ -1618,7 +1620,8 @@ export interface SofuuDiagnostics {
   version(): number;
   /**
    * Human text: concise by default (one hint). SOFUU_DIAGNOSTICS=full or
-   * verbose shows every hint. Takes one JSON string, like the rest.
+   * verbose shows every hint and available reported stack frames. Takes one
+   * JSON string, like the rest.
    */
   render(input: string): string;
   /** Build the shape from a live Error (values in this realm, not serialized). */
@@ -1661,6 +1664,45 @@ export interface SofuuRuntime {
   build: SofuuBuild;
   /** Runtime semver, e.g. 0.3.0-beta. */
   version: string;
+  /**
+   * The transformer KV cache (GL-01b).
+   *
+   * This is NOT a string key/value store — `sofuu.storage`'s `db.kv` is the
+   * one with `set`/`get`/`del`. `sofuu.kv` stores the per-layer attention
+   * key/value tensors a model produced for a prompt, so a follow-up turn can
+   * be answered without re-running the prefill: open a cache at the model's
+   * embedding width, `save` what a generation returned, then `search` it
+   * with a query vector to get the closest stored entries back.
+   *
+   * ```ts
+   * const cache = sofuu.kv.open("/tmp/conv.kv", 768);
+   * cache.save(keyVec, valueVec, "turn-1");
+   * const hits = cache.search(queryVec, 4);  // nearest entries, best first
+   * cache.flush();                            // publish to disk
+   * ```
+   */
+  kv?: SofuuKvCache;
+}
+
+/**
+ * One open transformer KV cache (GL-01b) — dense vectors at a fixed width.
+ * Writes land in memory and become durable on `flush()`; entries are recalled
+ * by vector similarity, not by key string.
+ */
+export interface SofuuKvCache {
+  /** Embedding width this cache was opened with; every vector must match. */
+  readonly dim: number;
+  /** Store one entry (a transformer key/value pair) under a label. */
+  save(key: Float32Array | number[], value: Float32Array | number[], label?: string): boolean;
+  /** The `topK` entries closest to `query`, best first. */
+  search(query: Float32Array | number[], topK?: number): Array<{ label: string; score: number }>;
+  /** Make everything written since the last flush durable. */
+  flush(): boolean;
+}
+
+/** The KV-cache factory: `sofuu.kv.open(path, dimension)`. */
+export interface SofuuKvFactory {
+  open(path: string, dimension: number): SofuuKvCache;
 }
 
 /** What the running binary was compiled with — the probe-free half of the manifest. */

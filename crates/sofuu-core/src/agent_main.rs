@@ -45,6 +45,53 @@ fn install_compiled_prelude(
     let _ = rt.eval_string(&js, "<compiled-prelude>");
 }
 
+
+/// CP-046 / CP-047 (AUDIT-2026-11-08): a standalone artifact used to forward
+/// EVERY argument to the embedded program, so `artifact --version` ran the
+/// user code (usually starting a real workload) and a typo like `--confg` was
+/// silently swallowed. The artifact now answers for itself first: version and
+/// help are intercepted, and an unknown leading flag is refused with the
+/// list of what is accepted.
+fn artifact_arg_gate(args: &[String]) -> Option<ExitCode> {
+    let mut i = 1usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            return None;
+        }
+        match a {
+            "--version" | "-V" => {
+                println!("sofuu-artifact {}", env!("CARGO_PKG_VERSION"));
+                return Some(ExitCode::SUCCESS);
+            }
+            "--help" | "-h" => {
+                println!("Usage: {} [--arg name=value]... [--config <path>] [--json]\n\n\
+                          A compiled Sofuu artifact: the program is embedded, so there is\n\
+                          nothing to install. Arguments reach the program as sofuu.args and\n\
+                          appear in process.argv.\n\n\
+                          Options:\n\
+                          \x20 --arg name=value   Bind one routine parameter (repeatable)\n\
+                          \x20 --config <path>    JSON configuration file\n\
+                          \x20 --json             Machine-readable output where the program supports it\n\
+                          \x20 --version, -V      Print the artifact version and exit\n\
+                          \x20 --help, -h         This text\n\
+                          \x20 --                 Pass everything after this through untouched\n",
+                    args.first().map(|s| s.as_str()).unwrap_or("artifact")
+                );
+                return Some(ExitCode::SUCCESS);
+            }
+            _ => {}
+        }
+        let known = a.starts_with("--arg") || a.starts_with("--config") || a == "--json";
+        if a.starts_with('-') && !known {
+            eprintln!("Error: Unrecognized flag '{}'", a);
+            eprintln!("  accepted: --arg name=value, --config <path>, --json, --version, --help, --");
+            return Some(ExitCode::from(2));
+        }
+        i += 1;
+    }
+    None
+}
 fn run_compiled_payload(payload: &sofuu_core::compiler::EmbeddedPayload) -> ExitCode {
     let rt = match SofuuRuntime::init() {
         Some(rt) => rt,
@@ -79,6 +126,11 @@ fn main() -> ExitCode {
     // 1. Embedded Payload (Standalone compiled agent binary mode)
     match sofuu_core::compiler::detect_embedded_payload() {
         Ok(Some(payload)) => {
+            /* CP-046/CP-047: answer for the artifact before the embedded
+             * program ever runs. */
+            if let Some(code) = artifact_arg_gate(&args) {
+                return code;
+            }
             let mut payload_argv: Vec<String> = Vec::with_capacity(args.len() + 1);
             payload_argv.push(args[0].clone());
             payload_argv.push(args[0].clone());
@@ -108,6 +160,18 @@ fn main() -> ExitCode {
     if args.len() < 2 {
         println!("\x1b[1msofuu-agent\x1b[0m v{} — lean autonomous agent runtime", env!("CARGO_PKG_VERSION"));
         println!("Usage: sofuu-agent <entry.js|ts> [args...]");
+        return ExitCode::SUCCESS;
+    }
+    /* A flag is not a filename: before this arm, sofuu-agent --help tried to
+     * open a file called "--help" and printed "Cannot open file". Any other
+     * unknown flag still fails, but usage is one word away. */
+    if matches!(args[1].as_str(), "-h" | "--help" | "help") {
+        println!("\x1b[1msofuu-agent\x1b[0m v{} — lean autonomous agent runtime", env!("CARGO_PKG_VERSION"));
+        println!("Usage: sofuu-agent <entry.js|ts> [args...]");
+        println!();
+        println!("  The entry script gets the agent runtime: sofuu.agent, sofuu.ai,");
+        println!("  sofuu.tools and sofuu.memory, plus SOFUU_* / AGENT_* configuration.");
+        println!("  A Kaze agent runs through: sofuu script run <agent.kaze>");
         return ExitCode::SUCCESS;
     }
 

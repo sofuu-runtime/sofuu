@@ -1799,12 +1799,20 @@
             schema: schema || {},
             handler: handler
           };
+          var reg;
           try {
-            return realTool.call(serverObj, name, schema || {}, handler);
+            reg = realTool.call(serverObj, name, schema || {}, handler);
           } catch (eTool) {
             /* non-fatal fallback if native C tool registration has format differences */
-            return serverObj;
+            reg = serverObj;
           }
+          /* MC-066: a registration after start() is ANNOUNCED. The stdio
+           * transport does this natively; the HTTP transport pushes it to the
+           * open SSE streams through _notify. */
+          if (serverObj._started && typeof serverObj._notify === 'function') {
+            serverObj._notify('notifications/tools/list_changed');
+          }
+          return reg;
         };
 
         var realResource = serverObj.resource;
@@ -1845,14 +1853,172 @@
         if (transport === 'http') {
           var port = parseInt(opts.port || 8080, 10);
           var httpServer = null;
-          var sessions = 0;
+          /* MC-105 (AUDIT-2026-11-08): ONE mapped endpoint. It used to answer
+           * tools/list on ANY path; every other path is now a 404. */
+          var endpointPath = '/' + String(opts.path || '').replace(/^\/+/, '');
+          if (endpointPath.length > 1) endpointPath = endpointPath.replace(/\/+$/, '');
+          /* MC-063: initialize mints a session id; every other message must
+           * carry a live one, or the answer is HTTP 400 (typed JSON-RPC
+           * error). Before this, any request without the header got a 200. */
+          var sessions = {};
+          var sessionSeq = 0;
+          var subscribers = [];
+
+          function badRequest(res, id, message) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              jsonrpc: '2.0',
+              id: (id === undefined ? null : id),
+              error: { code: -32000, message: 'Bad Request: ' + message }
+            }));
+          }
+          function sessionValid(sid) {
+            return !!(sid && Object.prototype.hasOwnProperty.call(sessions, sid));
+          }
+          /* MC-066: server push over the GET SSE stream (streamable HTTP).
+           * A registration after start() is announced to every open stream. */
+          function notifyListeners(method, params) {
+            var frame = 'data: ' + JSON.stringify({
+              jsonrpc: '2.0',
+              method: method,
+              params: (params === undefined ? null : params)
+            }) + '\n\n';
+            for (var i = subscribers.length - 1; i >= 0; i--) {
+              var sub = subscribers[i];
+              try {
+                if (typeof sub.closed === 'function' && sub.closed()) { subscribers.splice(i, 1); continue; }
+                sub.write(frame);
+              } catch (eSub) { subscribers.splice(i, 1); }
+            }
+          }
+          serverObj._notify = notifyListeners;
+
+          /* One JSON-RPC message -> { body, session }. body === null means
+           * "no response element" (a notification). */
+          async function dispatch(msg) {
+            var id = msg.id;
+            var method = msg.method;
+            if (method === 'initialize') {
+              sessionSeq++;
+              var newSid = 'sofuu-sess-' + sessionSeq;
+              sessions[newSid] = true;
+              return {
+                session: newSid,
+                body: {
+                  jsonrpc: '2.0',
+                  id: id,
+                  result: {
+                    protocolVersion: '2025-06-18',
+                    capabilities: { tools: { listChanged: true }, resources: {}, prompts: {} },
+                    serverInfo: { name: serverObj._name, version: serverObj._version }
+                  }
+                }
+              };
+            }
+            if (typeof method === 'string' && method.indexOf('notifications/') === 0) {
+              return { body: null };
+            }
+            if (method === 'ping') {
+              return { body: { jsonrpc: '2.0', id: id, result: {} } };
+            }
+            if (method === 'tools/list') {
+              var toolList = [];
+              for (var tk in serverObj._tools) {
+                var t = serverObj._tools[tk];
+                toolList.push({
+                  name: t.name,
+                  description: t.description,
+                  inputSchema: (t.schema && (t.schema.schema || t.schema.parameters || t.schema)) || { type: 'object', properties: {} }
+                });
+              }
+              return { body: { jsonrpc: '2.0', id: id, result: { tools: toolList } } };
+            }
+            if (method === 'resources/list') {
+              var resList = [];
+              for (var rk in serverObj._resources) {
+                var r = serverObj._resources[rk];
+                resList.push({ uri: r.uri, name: r.name, mimeType: r.mimeType });
+              }
+              return { body: { jsonrpc: '2.0', id: id, result: { resources: resList } } };
+            }
+            if (method === 'prompts/list') {
+              var prList = [];
+              for (var pk in serverObj._prompts) {
+                var p = serverObj._prompts[pk];
+                prList.push({ name: p.name, description: p.description, arguments: p.arguments });
+              }
+              return { body: { jsonrpc: '2.0', id: id, result: { prompts: prList } } };
+            }
+            if (method === 'tools/call') {
+              var tName = msg.params && msg.params.name;
+              var tEntry = serverObj._tools && serverObj._tools[tName];
+              if (!tEntry) {
+                return { body: { jsonrpc: '2.0', id: id, error: { code: -32601, message: 'Tool not found: ' + tName } } };
+              }
+              var tArgs = (msg.params && msg.params.arguments) || {};
+              try {
+                var mws = serverObj._middlewares || [];
+                var mIdx = 0;
+                var callCtx = { toolName: tName, args: tArgs, params: msg.params, server: serverObj, result: null };
+                async function execPipeline() {
+                  if (mIdx < mws.length) {
+                    var m = mws[mIdx++];
+                    await m(callCtx, execPipeline);
+                  } else {
+                    callCtx.result = await tEntry.handler(callCtx.args);
+                  }
+                }
+                await execPipeline();
+                var callOut = callCtx.result;
+                var formatted = (callOut && typeof callOut === 'object' && Array.isArray(callOut.content))
+                  ? callOut
+                  : { content: [{ type: 'text', text: typeof callOut === 'string' ? callOut : JSON.stringify(callOut) }] };
+                return { body: { jsonrpc: '2.0', id: id, result: formatted } };
+              } catch (eExec) {
+                return {
+                  body: {
+                    jsonrpc: '2.0',
+                    id: id,
+                    result: { content: [{ type: 'text', text: String((eExec && eExec.message) || eExec) }], isError: true }
+                  }
+                };
+              }
+            }
+            return { body: { jsonrpc: '2.0', id: id, error: { code: -32601, message: 'Method not found: ' + method } } };
+          }
 
           serverObj.start = function (cb) {
             if (!sofuu.http || typeof sofuu.http.createServer !== 'function') {
               throw makeError('E_MCP_HTTP_SERVER_UNAVAILABLE', 'sofuu.http.createServer is required for transport: "http"');
             }
             httpServer = sofuu.http.createServer(async function (req, res) {
+              var headers = req.headers || {};
+              var rawPath = String(req.url || '/');
+              var qMark = rawPath.indexOf('?');
+              if (qMark >= 0) rawPath = rawPath.slice(0, qMark);
+              if (rawPath !== endpointPath) {
+                res.writeHead(404, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: null,
+                  error: { code: -32601, message: 'Not Found: ' + rawPath }
+                }));
+                return;
+              }
+              var sid = String(headers['mcp-session-id'] || '');
+              if (req.method === 'GET') {
+                if (!sessionValid(sid)) { badRequest(res, null, 'missing or invalid Mcp-Session-Id'); return; }
+                res.writeHead(200, {
+                  'Content-Type': 'text/event-stream',
+                  'Cache-Control': 'no-cache'
+                });
+                res.write(': connected\n\n');
+                subscribers.push(res);
+                return;
+              }
               if (req.method === 'DELETE') {
+                if (!sessionValid(sid)) { badRequest(res, null, 'missing or invalid Mcp-Session-Id'); return; }
+                delete sessions[sid];
                 res.writeHead(200);
                 res.end();
                 return;
@@ -1865,123 +2031,61 @@
               var msg = {};
               try { msg = JSON.parse(req.body || '{}'); } catch (eJson) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' } }));
+                res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }));
                 return;
               }
-              var id = msg.id;
-              var method = msg.method;
-              if (method === 'initialize') {
-                sessions++;
-                var initRes = {
-                  jsonrpc: '2.0',
-                  id: id,
-                  result: {
-                    protocolVersion: '2025-06-18',
-                    capabilities: { tools: { listChanged: true }, resources: {}, prompts: {} },
-                    serverInfo: { name: serverObj._name, version: serverObj._version }
+              /* MC-062: a JSON-RPC 2.0 batch is answered with a batch array;
+               * notification elements produce no element at all. */
+              var batch = Array.isArray(msg);
+              var msgs = batch ? msg : [msg];
+              var initOnly = !batch && msg && typeof msg === 'object' && msg.method === 'initialize';
+              if (!initOnly && !sessionValid(sid)) {
+                badRequest(res, (batch ? null : (msg && msg.id)), 'missing or invalid Mcp-Session-Id');
+                return;
+              }
+              var replies = [];
+              var issued = '';
+              for (var i = 0; i < msgs.length; i++) {
+                var one = msgs[i];
+                if (!one || typeof one !== 'object' || Array.isArray(one)) {
+                  if (batch) {
+                    replies.push({ jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request: batch element is not an object' } });
                   }
-                };
-                res.writeHead(200, {
-                  'Content-Type': 'application/json',
-                  'Mcp-Session-Id': 'sofuu-sess-' + sessions
-                });
-                res.end(JSON.stringify(initRes));
-                return;
-              }
-              if (method === 'notifications/initialized') {
-                res.writeHead(202);
-                res.end();
-                return;
-              }
-              if (method === 'ping') {
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ jsonrpc: '2.0', id: id, result: {} }));
-                return;
-              }
-              if (method === 'tools/list') {
-                var toolList = [];
-                for (var tk in serverObj._tools) {
-                  var t = serverObj._tools[tk];
-                  toolList.push({
-                    name: t.name,
-                    description: t.description,
-                    inputSchema: (t.schema && (t.schema.schema || t.schema.parameters || t.schema)) || { type: 'object', properties: {} }
-                  });
+                  continue;
                 }
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ jsonrpc: '2.0', id: id, result: { tools: toolList } }));
+                var out = await dispatch(one);
+                if (out && out.session) issued = out.session;
+                if (out && out.body !== null && out.body !== undefined) replies.push(out.body);
+              }
+              if (batch) {
+                if (!replies.length) { res.writeHead(202); res.end(); return; }
+                var batchHeaders = { 'Content-Type': 'application/json' };
+                if (issued) batchHeaders['Mcp-Session-Id'] = issued;
+                res.writeHead(200, batchHeaders);
+                res.end(JSON.stringify(replies));
                 return;
               }
-              if (method === 'resources/list') {
-                var resList = [];
-                for (var rk in serverObj._resources) {
-                  var r = serverObj._resources[rk];
-                  resList.push({ uri: r.uri, name: r.name, mimeType: r.mimeType });
-                }
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ jsonrpc: '2.0', id: id, result: { resources: resList } }));
-                return;
-              }
-              if (method === 'prompts/list') {
-                var prList = [];
-                for (var pk in serverObj._prompts) {
-                  var p = serverObj._prompts[pk];
-                  prList.push({ name: p.name, description: p.description, arguments: p.arguments });
-                }
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ jsonrpc: '2.0', id: id, result: { prompts: prList } }));
-                return;
-              }
-              if (method === 'tools/call') {
-                var tName = msg.params && msg.params.name;
-                var tEntry = serverObj._tools && serverObj._tools[tName];
-                if (!tEntry) {
-                  res.writeHead(200, { 'Content-Type': 'application/json' });
-                  res.end(JSON.stringify({ jsonrpc: '2.0', id: id, error: { code: -32601, message: 'Tool not found: ' + tName } }));
-                  return;
-                }
-                var tArgs = (msg.params && msg.params.arguments) || {};
-                try {
-                  var mws = serverObj._middlewares || [];
-                  var mIdx = 0;
-                  var callCtx = { toolName: tName, args: tArgs, params: msg.params, server: serverObj, result: null };
-                  async function execPipeline() {
-                    if (mIdx < mws.length) {
-                      var m = mws[mIdx++];
-                      await m(callCtx, execPipeline);
-                    } else {
-                      callCtx.result = await tEntry.handler(callCtx.args);
-                    }
-                  }
-                  await execPipeline();
-                  var callOut = callCtx.result;
-                  var formatted = (callOut && typeof callOut === 'object' && Array.isArray(callOut.content))
-                    ? callOut
-                    : { content: [{ type: 'text', text: typeof callOut === 'string' ? callOut : JSON.stringify(callOut) }] };
-                  res.writeHead(200, { 'Content-Type': 'application/json' });
-                  res.end(JSON.stringify({ jsonrpc: '2.0', id: id, result: formatted }));
-                } catch (eExec) {
-                  res.writeHead(200, { 'Content-Type': 'application/json' });
-                  res.end(JSON.stringify({
-                    jsonrpc: '2.0',
-                    id: id,
-                    result: { content: [{ type: 'text', text: String((eExec && eExec.message) || eExec) }], isError: true }
-                  }));
-                }
-                return;
-              }
-
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ jsonrpc: '2.0', id: id, error: { code: -32601, message: 'Method not found: ' + method } }));
+              if (!replies.length) { res.writeHead(202); res.end(); return; }
+              var oneHeaders = { 'Content-Type': 'application/json' };
+              if (issued) oneHeaders['Mcp-Session-Id'] = issued;
+              res.writeHead(200, oneHeaders);
+              res.end(JSON.stringify(replies[0]));
             });
 
             httpServer.listen(port, function () {
+              serverObj._started = true;
               if (typeof cb === 'function') cb();
             });
             return serverObj;
           };
 
           serverObj.stop = function () {
+            serverObj._started = false;
+            for (var si = 0; si < subscribers.length; si++) {
+              try { subscribers[si].end(); } catch (eSubEnd) { /* subscriber already gone */ }
+            }
+            subscribers.length = 0;
+            sessions = {};
             if (httpServer) {
               if (typeof httpServer.close === 'function') {
                 try { httpServer.close(); } catch (eCl) { /* http server close clean up */ }
@@ -2003,17 +2107,102 @@
       if (!srv) return Promise.reject(new Error('mcp.connect: target server is required for direct transport'));
       var disconnected = false;
 
+      /* MC-008 (AUDIT-2026-11-08): the direct transport speaks the same
+       * notification surface as the pipe transports. `client.onNotification(
+       * method, handler)` registers a per-method handler; the older
+       * `client.onNotification = fn` assignment still installs one catch-all,
+       * delivered as (method, paramsJson) — the native hook's shape. */
+      var noteByMethod = {};
+      var noteLegacy = null;
+
+      /* Handlers get (method, paramsJson) on EVERY transport: the native stdio
+       * hook hands the callback a JSON string, so the direct transport does
+       * the same instead of inventing a second shape. */
+      function directDeliver(method, params) {
+        var m = String(method);
+        var json = (params === undefined || params === null) ? null : JSON.stringify(params);
+        var bucket = noteByMethod[m];
+        if (bucket) {
+          for (var i = 0; i < bucket.length; i++) {
+            try { bucket[i](m, json); } catch (eH) { /* one bad handler must not starve the rest. */ }
+          }
+        }
+        var wild = noteByMethod['*'];
+        if (wild) {
+          for (var j = 0; j < wild.length; j++) {
+            try { wild[j](m, json); } catch (eW) { /* same rule for the catch-all bucket. */ }
+          }
+        }
+        if (noteLegacy) {
+          try { noteLegacy(m, json); } catch (eL) { /* host hook: a throw must not stop delivery. */ }
+        }
+      }
+
+      function directNoteApi(method, handler) {
+        if (typeof handler === 'function') {
+          var key = String(method);
+          var bucket = noteByMethod[key] || (noteByMethod[key] = []);
+          bucket.push(handler);
+          return function off() {
+            var at = bucket.indexOf(handler);
+            if (at >= 0) bucket.splice(at, 1);
+          };
+        }
+        if (typeof method === 'function' && handler === undefined) {
+          noteLegacy = method;
+          return function off() { if (noteLegacy === method) noteLegacy = null; };
+        }
+        /* A callback installed by assignment can still be invoked the old
+         * way: client.onNotification(method, paramsJson). */
+        if (noteLegacy) return noteLegacy(String(method), handler);
+        throw new TypeError('onNotification(method, handler) needs a handler function');
+      }
+
+      /* An in-process server pushes through `_notify` (the name the HTTP
+       * transport's broadcaster already uses), so a direct client installs —
+       * or chains onto — one and sees exactly what its server emits. */
+      function attachNotifications() {
+        var subs = srv._directNotifySubs || (srv._directNotifySubs = []);
+        if (subs.indexOf(directDeliver) < 0) subs.push(directDeliver);
+        if (srv._directNotifyChained) return;
+        var prev = (typeof srv._notify === 'function') ? srv._notify : null;
+        srv._directNotifyChained = true;
+        srv._notify = function (method, params) {
+          if (prev) {
+            try { prev.call(this, method, params); } catch (ePrev) { /* the other broadcaster reports its own failures. */ }
+          }
+          var list = srv._directNotifySubs || [];
+          for (var i = 0; i < list.length; i++) {
+            try { list[i](method, params); } catch (eSub) { /* one client's handler failure stays local. */ }
+          }
+        };
+        /* A direct server had no broadcaster before this; `notify` is the
+         * public name for the one now installed. */
+        if (typeof srv.notify !== 'function') srv.notify = srv._notify;
+      }
+      attachNotifications();
+
+      function detachNotifications() {
+        var subs = srv._directNotifySubs || [];
+        var at = subs.indexOf(directDeliver);
+        if (at >= 0) subs.splice(at, 1);
+      }
+
       var rawClient = {
         transport: 'direct',
         state: 'CONNECTED',
         url: undefined,
         pid: function () { return (typeof process !== 'undefined' && process.pid) || 0; },
-        protocolVersion: function () { return '2024-11-05'; },
+        protocolVersion: function () { return '2025-06-18'; },
         endpoint: function () { return 'in-process://' + ((srv && srv._name) || 'mcp'); },
         sessionId: function () { return 'direct-sess-1'; },
-        onNotification: null,
+        /* Callable registry, and an assignment still means "catch-all". */
+        get onNotification() { return directNoteApi; },
+        set onNotification(fn) { noteLegacy = (typeof fn === 'function') ? fn : null; },
         disconnect: function () {
+          if (disconnected) return;
           disconnected = true;
+          detachNotifications();
         },
         listTools: async function () {
           if (disconnected) throw makeError('E_MCP_DISCONNECTED', 'MCP client is disconnected');
@@ -2048,23 +2237,32 @@
             throw discErr;
           }
           params = params || {};
-          if (method === 'initialize') {
+          /* MC-034/MC-067 (AUDIT-2026-11-08): `client.call(name, args)` is a
+           * TOOL call — the same bare-name routing the stdio and HTTP clients
+           * already do. Slash-free protocol methods keep their names. */
+          var m = String(method);
+          var p = params;
+          if (m.indexOf('/') < 0 && m !== 'ping' && m !== 'initialize') {
+            p = { name: m, arguments: params };
+            m = 'tools/call';
+          }
+          if (m === 'initialize') {
             return {
-              protocolVersion: '2024-11-05',
+              protocolVersion: '2025-06-18',
               capabilities: { tools: { listChanged: true }, resources: {}, prompts: {} },
               serverInfo: { name: (srv && srv._name) || 'sofuu-direct', version: (srv && srv._version) || '1.0.0' }
             };
           }
-          if (method === 'notifications/initialized' || method === 'ping') {
+          if (m === 'notifications/initialized' || m === 'ping') {
             return {};
           }
-          if (method === 'tools/list') {
+          if (m === 'tools/list') {
             return rawClient.listTools();
           }
-          if (method === 'resources/list') {
+          if (m === 'resources/list') {
             return rawClient.listResources();
           }
-          if (method === 'prompts/list') {
+          if (m === 'prompts/list') {
             var prs = [];
             if (srv && srv._prompts) {
               for (var pk in srv._prompts) {
@@ -2074,8 +2272,51 @@
             }
             return { prompts: prs };
           }
-          if (method === 'tools/call') {
-            var toolName = params.name;
+          /* MC-020/MC-021 (AUDIT-2026-11-08): the direct transport answers the
+           * two READS, not just the lists. Result shapes mirror the native
+           * stdio server (rt/mcp.rs): a resource handler's string becomes
+           * {contents:[{uri, mimeType, text}]}, a prompt handler's string
+           * becomes one user message. */
+          if (m === 'resources/read') {
+            var readUri = String((p && p.uri) || '');
+            var resEntry = srv && srv._resources && srv._resources[readUri];
+            if (!resEntry) {
+              var noRes = new Error("Resource not found: '" + readUri + "'");
+              noRes.code = -32602;
+              throw noRes;
+            }
+            var resRead = (typeof resEntry.handler === 'function') ? await resEntry.handler(readUri) : '';
+            if (resRead && typeof resRead === 'object' && Array.isArray(resRead.contents)) return resRead;
+            if (Array.isArray(resRead)) return { contents: resRead };
+            var resText = typeof resRead === 'string' ? resRead : JSON.stringify(resRead);
+            return {
+              contents: [{ uri: readUri, mimeType: resEntry.mimeType || 'text/plain', text: resText }]
+            };
+          }
+          if (m === 'prompts/get') {
+            var promptName = String((p && p.name) || '');
+            var promptEntry = srv && srv._prompts && srv._prompts[promptName];
+            if (!promptEntry) {
+              var noPrompt = new Error("Prompt not found: '" + promptName + "'");
+              noPrompt.code = -32602;
+              throw noPrompt;
+            }
+            var promptArgs = (p && p.arguments && typeof p.arguments === 'object') ? p.arguments : {};
+            var promptOut = (typeof promptEntry.handler === 'function') ? await promptEntry.handler(promptArgs) : {};
+            if (promptOut && typeof promptOut === 'object' && Array.isArray(promptOut.messages)) {
+              return {
+                description: (promptOut.description === undefined) ? (promptEntry.description || '') : promptOut.description,
+                messages: promptOut.messages
+              };
+            }
+            var promptText = typeof promptOut === 'string' ? promptOut : JSON.stringify(promptOut);
+            return {
+              description: promptEntry.description || '',
+              messages: [{ role: 'user', content: { type: 'text', text: promptText } }]
+            };
+          }
+          if (m === 'tools/call') {
+            var toolName = p.name;
             var t = srv && srv._tools && srv._tools[toolName];
             if (!t) {
               var notFound = new Error("Tool not found: '" + toolName + "'");
@@ -2087,8 +2328,8 @@
             var sIdx = 0;
             var srvCtx = {
               toolName: toolName,
-              args: params.arguments || {},
-              params: params,
+              args: p.arguments || {},
+              params: p,
               server: srv,
               result: null
             };
@@ -2115,7 +2356,7 @@
             };
           }
 
-          throw makeError('E_MCP_METHOD_NOT_SUPPORTED', "Method not supported on direct transport: '" + method + "'");
+          throw makeError('E_MCP_METHOD_NOT_SUPPORTED', "Method not supported on direct transport: '" + m + "'");
         }
       };
 
@@ -2771,6 +3012,9 @@
                   if (tArr[ti] && tArr[ti].name) toolNames[tArr[ti].name] = true;
                 }
                 curClient = freshClient;
+                /* A reconnected transport is a fresh object: reinstall the
+                 * notification hook so the registry keeps receiving push. */
+                noteHookRaw();
                 clientState = 'CONNECTED';
                 reconnectingPromise = null;
 
@@ -2825,6 +3069,57 @@
           return reconnectingPromise;
         }
 
+        /* MC-008 (AUDIT-2026-11-08): ONE notification registry above the
+         * transports. `client.onNotification(method, handler)` is the
+         * documented surface (docs/MCP.md); `client.onNotification = fn`
+         * stays supported for the drivers written against the old shape. The
+         * registry lives on the wrapper, so it survives a reconnect, and the
+         * transport hook is reinstalled on each replacement client. */
+        var noteByMethod = {};
+        var noteLegacy = null;
+
+        function noteFire(method, paramsJson) {
+          var m = String(method);
+          function runBucket(bucket) {
+            if (!bucket) return;
+            for (var i = 0; i < bucket.length; i++) {
+              try { bucket[i](m, paramsJson); } catch (eH) { /* one bad handler must not starve the rest. */ }
+            }
+          }
+          runBucket(noteByMethod[m]);
+          if (m !== '*') runBucket(noteByMethod['*']);
+          if (noteLegacy) {
+            try { noteLegacy(m, paramsJson); } catch (eL) { /* host hook: a throw must not stop delivery. */ }
+          }
+        }
+
+        function noteHookRaw() {
+          if (!curClient) return;
+          try { curClient.onNotification = noteFire; } catch (eHook) { /* a transport without a writable hook keeps its own. */ }
+        }
+
+        function noteApi(method, handler) {
+          if (typeof handler === 'function') {
+            var key = String(method);
+            var bucket = noteByMethod[key] || (noteByMethod[key] = []);
+            bucket.push(handler);
+            noteHookRaw();
+            return function off() {
+              var at = bucket.indexOf(handler);
+              if (at >= 0) bucket.splice(at, 1);
+            };
+          }
+          if (typeof method === 'function' && handler === undefined) {
+            noteLegacy = method;
+            noteHookRaw();
+            return function off() { if (noteLegacy === method) noteLegacy = null; };
+          }
+          /* A callback installed by assignment can still be invoked the old
+           * way: client.onNotification(method, paramsJson). */
+          if (noteLegacy) return noteLegacy(String(method), handler);
+          throw new TypeError('onNotification(method, handler) needs a handler function');
+        }
+
         var clientMiddlewares = [];
         var wrapper = {
           use: function (fn) {
@@ -2845,11 +3140,14 @@
           sessionId: function () {
             return (curClient && typeof curClient.sessionId === 'function') ? curClient.sessionId() : '';
           },
+          /* Callable registry (method, handler); an assignment still means
+           * "one catch-all callback", the shape the drivers use. */
           set onNotification(fn) {
-            if (curClient) curClient.onNotification = fn;
+            noteLegacy = (typeof fn === 'function') ? fn : null;
+            noteHookRaw();
           },
           get onNotification() {
-            return curClient ? curClient.onNotification : null;
+            return noteApi;
           },
           get state() { return clientState; },
           get circuitState() { return circuitState; },

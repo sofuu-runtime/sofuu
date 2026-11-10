@@ -1150,6 +1150,43 @@ pub unsafe extern "C" fn sofuu_module_loader(
         &name
     };
 
+    /* CP-076..078 (AUDIT-2026-11-08): `@sofuu/<ns>` is a virtual module that
+     * re-exports the runtime's own namespace, so a program can import its
+     * bindings instead of reaching for a global (and `@sofuu/runtime` answers
+     * the whole object). Only a plain identifier is accepted; anything else
+     * falls through to the normal resolver, so a real installed package with
+     * that name keeps working. */
+    if let Some(ns) = norm_name.strip_prefix("@sofuu/") {
+        let ident = if ns == "runtime" || ns.is_empty() { "sofuu" } else { ns };
+        let ok = !ident.is_empty()
+            && ident.len() <= 40
+            && ident
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_alphabetic() || c == '_')
+                .unwrap_or(false)
+            && ident.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if ok {
+            let src = format!(
+                "const m=(globalThis.sofuu&&(globalThis.sofuu.{ident}||globalThis.sofuu));export const {ident}=m;export default m;\0"
+            );
+            let func = unsafe {
+                qjs::JS_Eval(
+                    ctx,
+                    src.as_ptr() as *const c_char,
+                    src.len() - 1,
+                    module_name,
+                    qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_COMPILE_ONLY,
+                )
+            };
+            if unsafe { qjs::is_exception(func) } {
+                unsafe { qjs::js_std_dump_error(ctx) };
+                return ptr::null_mut();
+            }
+            return unsafe { qjs::sofuu_js_value_get_ptr(func) };
+        }
+    }
+
     let builtin_code: Option<&'static [u8]> = match norm_name {
         "async_hooks" => Some(b"export const AsyncLocalStorage = (globalThis.sofuu && globalThis.sofuu.context && globalThis.sofuu.context.AsyncLocalStorage) || globalThis.AsyncLocalStorage; export default { AsyncLocalStorage };\0"),
         "sofuu" => Some(b"const p=globalThis.sofuu?.plugins||{};export const defineTool=p.defineTool,defineProvider=p.defineProvider,defineService=p.defineService,defineVectorStore=p.defineVectorStore,defineStorage=p.defineStorage,z=p.z,mcp=globalThis.sofuu?.mcp,agent=globalThis.sofuu?.agent,ai=globalThis.sofuu?.ai,sofuu=globalThis.sofuu,sfs=globalThis.sofuu?.sfs,kaze=globalThis.sofuu?.kaze;export default globalThis.sofuu;\0"),
@@ -1360,17 +1397,8 @@ pub(crate) unsafe fn report_uncaught(ctx: *mut qjs::JSContext, reason: qjs::JSVa
         unsafe { crate::rt::promise::report_microtask_overflow(ctx, 0) };
         return;
     }
-    // SAFETY: str_v/stack are live values, each freed exactly once below.
-    let str_v = unsafe { qjs::JS_ToString(ctx, reason) };
-    let msg = unsafe { qjs::sofuu_js_to_cstring(ctx, str_v) };
-    let msg_s = if msg.is_null() {
-        "(unknown error)".to_string()
-    } else {
-        let s = unsafe { CStr::from_ptr(msg) }.to_string_lossy().into_owned();
-        // SAFETY: msg came from to_cstring on this ctx.
-        unsafe { qjs::sofuu_js_free_cstring(ctx, msg) };
-        s
-    };
+    // Never coerce an arbitrary thrown object: toString/getters may run code.
+    let msg_s = unsafe { crate::rt::diag_contract::safe_exception_fallback(ctx, reason) };
     /* An interrupt is UNCATCHABLE (the vendored QuickJS marks it so), which
      * makes it the one error a plugin cannot handle itself — so the host is
      * the only place it can be explained. classify_interrupted rewrites it
@@ -1380,8 +1408,11 @@ pub(crate) unsafe fn report_uncaught(ctx: *mut qjs::JSContext, reason: qjs::JSVa
     /* P1-14: the same uncatchable interrupt is how the regexp budget ends a
      * catastrophic match, so it is classified first (its own one-shot flag
      * decides whether THIS abort was the regexp guard's). */
-    match crate::rt::interrupt::classify_interrupted(&msg_s)
-        .or_else(|| crate::rt::deadline::classify_interrupted(&msg_s))
+    let diag = unsafe {
+        crate::rt::diag_contract::from_js_exception_message(ctx, reason, &msg_s)
+    };
+    match crate::rt::interrupt::classify_interrupted(&diag.message)
+        .or_else(|| crate::rt::deadline::classify_interrupted(&diag.message))
     {
         Some(named) => eprintln!("{}", paint("31", &format!("[sofuu] {}", named))),
         None => {
@@ -1390,14 +1421,10 @@ pub(crate) unsafe fn report_uncaught(ctx: *mut qjs::JSContext, reason: qjs::JSVa
              * the frames QuickJS actually printed. The stack is no longer
              * printed twice. SOFUU_DIAGNOSTICS=full expands causes/evidence
              * and every observed frame. */
-            let diag = unsafe {
-                crate::rt::diag_contract::from_js_exception_message(ctx, reason, &msg_s)
-            };
             let full = crate::rt::diag_contract::full_detail_requested();
             eprint!("{}", diag.render_human(full, stderr_wants_color()));
         }
     }
-    unsafe { qjs::sofuu_js_free_value(ctx, str_v) };
     note_uncaught_error(ctx);
 }
 
@@ -1541,6 +1568,7 @@ unsafe fn engine_eval_file(eng: *mut SofuuEngine, path_c: *const c_char) -> c_in
     unsafe { qjs::sofuu_js_free_value((*eng).ctx, result) };
     // Run the libuv event loop — drains timers, I/O, and Promise chains.
     unsafe { sofuu_loop_run((*eng).ctx) };
+    unsafe { crate::modules::process::emit_exit_hooks_once((*eng).ctx) };
     // An unhandled rejection (or a microtask overflow) surfaced during the
     // drain: the status flag is the CLI's exit-1 signal. process.exitCode, if
     // the script set one, overrides it in main.rs.
@@ -1700,6 +1728,10 @@ unsafe fn eval_source(
     }
 
     unsafe { sofuu_loop_run(ctx) };
+    /* AUDIT-2026-11-08: exit handlers run once, after the loop drains — the
+     * natural-exit half of Node's contract (process.exit() dispatches them
+     * itself, and the once-flag keeps the two from doubling). */
+    unsafe { crate::modules::process::emit_exit_hooks_once(ctx) };
     // An unhandled rejection surfaced during the drain (C-01): exit 1 unless
     // the script picked a code via process.exitCode (main.rs decides).
     let rc = if run_status(ctx).has_uncaught_error { 1 } else { 0 };
@@ -1894,6 +1926,7 @@ unsafe fn engine_run_jobs(eng: *mut SofuuEngine) {
             break;
         }
     }
+    unsafe { crate::rt::promise::report_dropped_continuations((*eng).ctx) };
 }
 
 /// engine_destroy — the C teardown order: surface pending rejections, close

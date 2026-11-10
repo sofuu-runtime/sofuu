@@ -9,6 +9,136 @@
 // Safe Rust: operates on Vec<u8>/String with explicit indices; no raw
 // pointers, no manual realloc.
 
+/// JR-027..029 (AUDIT-2026-11-08): constructs the stripper cannot lower.
+/// Each one used to reach QuickJS as a raw SyntaxError ("expecting ';'",
+/// "unexpected token in expression: '@'"), which said nothing about
+/// TypeScript being the problem. Returns (construct, line) for the first
+/// occurrence, or None. Only line starts are inspected, which is where each
+/// of these constructs must appear.
+pub fn unsupported_construct(src: &str) -> Option<(&'static str, usize)> {
+    for (idx, raw) in src.lines().enumerate() {
+        let line = raw.trim_start();
+        if line.starts_with("//") || line.starts_with("/*") || line.starts_with('*') {
+            continue;
+        }
+        if line.starts_with("namespace ") || line.starts_with("export namespace ") {
+            return Some(("namespace", idx + 1));
+        }
+        if line.starts_with("module ") || line.starts_with("export module ") {
+            return Some(("namespace", idx + 1));
+        }
+        if line.starts_with('@') || line.starts_with("export @") {
+            return Some(("decorator", idx + 1));
+        }
+    }
+    None
+}
+
+/// The message the CLI prints for an unsupported construct.
+pub fn unsupported_message(what: &str, line: usize) -> String {
+    match what {
+        "namespace" => format!(
+            "TypeScript namespaces are not supported (line {line}): use a plain object literal or a module file instead (E_TS_UNSUPPORTED)"
+        ),
+        "decorator" => format!(
+            "TypeScript decorators are not supported (line {line}): call the wrapper explicitly instead of annotating the class (E_TS_UNSUPPORTED)"
+        ),
+        other => format!("unsupported TypeScript construct '{other}' (line {line}) (E_TS_UNSUPPORTED)"),
+    }
+}
+
+/// JR-025 (AUDIT-2026-11-08): a class may declare overload signatures
+/// (m(a: string): void; with no body) — legal TypeScript, not JS. They are
+/// blanked line for line (same length, newlines kept) so the scanner below
+/// sees only the implementing method. A member is an overload when it ends
+/// with a semicolon AND carries a parameter list; a field (x: number;) or a
+/// call statement (f();) is left alone.
+fn blank_overload_signatures(src: &str) -> String {
+    let bytes = src.as_bytes();
+    let len = bytes.len();
+    let mut out: Vec<u8> = bytes.to_vec();
+    let mut depth: i32 = 0;
+    let mut class_depths: Vec<i32> = Vec::new();
+    let mut stmt_start: usize = 0;
+    let mut pending_class = false;
+    let mut i = 0usize;
+    while i < len {
+        let c = bytes[i];
+        if c == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            i = skip_line_comment(bytes, i, len);
+            continue;
+        }
+        if c == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i = skip_block_comment(bytes, i, len);
+            continue;
+        }
+        if c == b'\'' || c == b'"' {
+            i = skip_string(bytes, i, len);
+            continue;
+        }
+        if c == b'`' {
+            i = skip_template(bytes, i, len);
+            continue;
+        }
+        if c == b'c' && kw(bytes, i, len, b"class") {
+            pending_class = true;
+            i += 5;
+            continue;
+        }
+        if c == b'{' {
+            depth += 1;
+            if pending_class {
+                class_depths.push(depth);
+                pending_class = false;
+            }
+            stmt_start = i + 1;
+            i += 1;
+            continue;
+        }
+        if c == b'}' {
+            if let Some(&d) = class_depths.last() {
+                if d == depth {
+                    class_depths.pop();
+                }
+            }
+            if depth > 0 {
+                depth -= 1;
+            }
+            stmt_start = i + 1;
+            i += 1;
+            continue;
+        }
+        if c == b';' {
+            let in_class = class_depths.last().map(|&d| d == depth).unwrap_or(false);
+            if in_class {
+                let t = src[stmt_start..i].trim();
+                let blankable = t.contains('(')
+                    && !t.contains('{')
+                    && !t.contains('=')
+                    && !t.starts_with("return ")
+                    && !t.starts_with("if ")
+                    && !t.starts_with("for ")
+                    && !t.starts_with("while ")
+                    && !t.starts_with("switch ")
+                    && !t.starts_with("throw ")
+                    && !t.starts_with("super");
+                if blankable {
+                    for b in &mut out[stmt_start..=i] {
+                        if *b != b'\n' {
+                            *b = b' ';
+                        }
+                    }
+                }
+            }
+            stmt_start = i + 1;
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Strip TypeScript type syntax from `src`, returning JS source of the
 /// same length (types replaced by spaces, newlines preserved).
 pub fn strip(src: &str) -> String {
@@ -20,7 +150,8 @@ pub fn strip(src: &str) -> String {
      * semantics a type-stripper would otherwise drop, so they are rewritten
      * into plain JS first; the length-preserving scan below then only has to
      * blank real type syntax. */
-    let rewritten = rewrite_ctor_param_props(&rewrite_enums(src));
+    let without_overloads = blank_overload_signatures(src);
+    let rewritten = rewrite_ctor_param_props(&rewrite_enums(&without_overloads));
     let bytes: Vec<u8> = rewritten.as_bytes().to_vec();
     let len = bytes.len();
     let mut out = bytes.clone();
@@ -203,11 +334,15 @@ pub fn strip(src: &str) -> String {
                     r += 1;
                 }
                 if r < len && bytes[r] != b'{' {
-                    blank(&mut out, pos, r);
+                    /* Blank only the keyword: the type rule below consumes
+                     * the declaration itself. Blanking up to r left
+                     * "Foo = string;" behind -> "'string' is not defined". */
+                    blank(&mut out, pos, q);
+                    pos = q;
                 } else {
                     blank(&mut out, q, q + 4);
+                    pos = q + 4;
                 }
-                pos = q + 4;
                 last_sig = false;
                 continue;
             }

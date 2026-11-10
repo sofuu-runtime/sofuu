@@ -42,6 +42,10 @@ pub struct LexError {
     pub line: u32,
     pub col: u32,
     pub msg: String,
+    /* KZ-038 (AUDIT-2026-11-08): a numeric literal too large for an f64 is not
+     * a syntax error, it is an overflow, and the operator needs the different
+     * code to know the difference. Everything else stays E_KAZE_PARSE. */
+    pub code: &'static str,
 }
 
 impl LexError {
@@ -51,7 +55,11 @@ impl LexError {
 }
 
 fn err(line: u32, col: u32, msg: impl Into<String>) -> LexError {
-    LexError { line, col, msg: msg.into() }
+    LexError { line, col, msg: msg.into(), code: "E_KAZE_PARSE" }
+}
+
+fn err_code(line: u32, col: u32, code: &'static str, msg: impl Into<String>) -> LexError {
+    LexError { line, col, msg: msg.into(), code }
 }
 
 /// Tokenize a whole script. The result always ends with `Tok::Eof`.
@@ -209,6 +217,21 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
                 let n: f64 = text
                     .parse()
                     .map_err(|_| err(line, start_col, format!("'{}' is not a number", text)))?;
+                /* KZ-038: 400 digits parse to +inf, which used to flow into
+                 * arithmetic as an infinity and surface much later as a
+                 * nonsense value. Trap it where it is written. */
+                if !n.is_finite() {
+                    let shown: String = text.chars().take(24).collect();
+                    return Err(err_code(
+                        line,
+                        start_col,
+                        "E_KAZE_OVERFLOW",
+                        format!(
+                            "numeric literal {}… is outside the 64-bit float range (max ~1.8e308)",
+                            shown
+                        ),
+                    ));
+                }
                 out.push(Token { tok: Tok::Num(n), line, col: start_col });
                 line_has_token = true;
             }

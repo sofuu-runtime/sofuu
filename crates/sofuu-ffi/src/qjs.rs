@@ -45,6 +45,15 @@ pub struct JSValue {
 /// `JSValueConst` is `#define JSValueConst JSValue` — same type.
 pub type JSValueConst = JSValue;
 
+/// Layout of QuickJS's JSPropertyDescriptor (quickjs.h).
+#[repr(C)]
+pub struct JSPropertyDescriptor {
+    pub flags: c_int,
+    pub value: JSValue,
+    pub getter: JSValue,
+    pub setter: JSValue,
+}
+
 /// The C `JSClassDef` (we only set `.finalizer` — same shape as C).
 #[repr(C)]
 pub struct JSClassDef {
@@ -449,6 +458,13 @@ extern "C" {
     pub fn js_free(ctx: *mut JSContext, ptr: *mut c_void);
     // ── M4: HTTP client (Response.body accessor + SSE) ──
     pub fn JS_NewAtom(ctx: *mut JSContext, str_: *const c_char) -> JSAtom;
+    pub fn JS_IsError(ctx: *mut JSContext, val: JSValueConst) -> c_int;
+    pub fn JS_GetOwnProperty(
+        ctx: *mut JSContext,
+        desc: *mut JSPropertyDescriptor,
+        obj: JSValueConst,
+        prop: JSAtom,
+    ) -> c_int;
     pub fn JS_DefineProperty(
         ctx: *mut JSContext,
         this_obj: JSValueConst,
@@ -636,6 +652,12 @@ extern "C" {
     ) -> JSValue;
     pub fn JS_ExecutePendingJob(rt: *mut JSRuntime, pctx: *mut *mut JSContext) -> c_int;
     pub fn JS_IsJobPending(rt: *mut JSRuntime) -> c_int;
+    /// Promise continuations dropped because the job entry could not be
+    /// allocated (0 in a healthy run). A non-zero count is a fatal overflow:
+    /// the work is gone, so the process must not report success
+    /// (AUDIT-2026-11-08 §1, microtask drainage guarantee).
+    pub fn sofuu_qjs_job_oom_count(rt: *mut JSRuntime) -> c_int;
+    pub fn sofuu_qjs_job_oom_reset(rt: *mut JSRuntime);
     pub fn JS_SetPropertyFunctionList(
         ctx: *mut JSContext,
         obj: JSValueConst,

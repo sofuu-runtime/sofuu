@@ -159,7 +159,7 @@ thread_local! {
     // JS_CFUNC_DEF("feed", 1, js_sse_feed).
     static SSE_PROTO_FUNCS: [qjs::JSCFunctionListEntry; 1] = [qjs::JSCFunctionListEntry {
         name: c"feed".as_ptr(),
-        prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+        prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE | qjs::JS_PROP_ENUMERABLE,
         def_type: qjs::JS_DEF_CFUNC,
         magic: 0,
         u: qjs::JSCFunctionListEntryFunc {

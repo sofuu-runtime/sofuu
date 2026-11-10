@@ -16,6 +16,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub mod bridge;
 pub mod curl; // M4: fetch() over libcurl (multi-handle ↔ libuv bridge)
@@ -27,6 +28,49 @@ pub mod qtsq; // M9: QTSQ codec bindings (brain/KV persistence; crates/sofuu-cor
 #[cfg(has_qtsq)]
 pub mod qtsq_table; // Phase 3: Sofuu QTSQ columnar table engine (crates/sofuu-core/src/rt/storage.rs)
 pub mod uv;
+
+// ── User interrupt (CLI-062) ────────────────────────────────────
+//
+// Ctrl-C in the REPL has to abort a synchronous evaluation, and the only
+// place a running script can be stopped is the QuickJS interrupt poll. The
+// SIGINT handler may do nothing but store an atomic, so it parks the request
+// here; the poll (sofuu-core rt/interrupt.rs owns the engine's slot,
+// qjs_rt.rs the sandbox's) consumes it and returns 1, which QuickJS turns
+// into its uncatchable "InternalError: interrupted".
+
+/// A Ctrl-C arrived: abort the evaluation in flight.
+static USER_INTERRUPT: AtomicBool = AtomicBool::new(false);
+/// The poll actually aborted an eval for that Ctrl-C, so the host can name
+/// the user as the cause instead of reporting a deadline.
+static USER_INTERRUPT_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// Queue a user interrupt. Async-signal-safe: one atomic store, no lock, no
+/// allocation — the only thing a SIGINT handler may run.
+pub fn request_user_interrupt() {
+    USER_INTERRUPT.store(true, Ordering::SeqCst);
+}
+
+/// Drop a queued request and report whether there was one. The REPL calls
+/// this before every eval, so a Ctrl-C typed at the idle prompt can never
+/// abort the next line.
+pub fn take_user_interrupt() -> bool {
+    USER_INTERRUPT.swap(false, Ordering::SeqCst)
+}
+
+/// The interrupt-callback half: 1 means "the user asked to stop this". Reports
+/// the request once and remembers that the abort came from the user.
+pub fn poll_user_interrupt() -> bool {
+    let hit = USER_INTERRUPT.swap(false, Ordering::SeqCst);
+    if hit {
+        USER_INTERRUPT_FIRED.store(true, Ordering::SeqCst);
+    }
+    hit
+}
+
+/// Did the poll abort for the user since the last call? Consumes the record.
+pub fn take_user_interrupt_fired() -> bool {
+    USER_INTERRUPT_FIRED.swap(false, Ordering::SeqCst)
+}
 
 // ── C API (mirrors src/sofuu.h) ─────────────────────────────────
 

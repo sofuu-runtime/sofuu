@@ -4,6 +4,16 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Audit Remediation — 2026-11-08/10
+
+All 32 tasks of `docs/PLAN-AUDIT-REMEDIATION-2026-11-08.md` (150 findings across the P0 security gates, Kaze/QuickJS isolation, CLI truthfulness and the 12-factor surface) are implemented, with the plan's four gates green:
+
+- **Fail-closed policy everywhere (KZ-051/KZ-052):** a policy document that exists but cannot be parsed is fatal. This round closed the last hole — `sofuu script run|check|repl --policy <file>` advertised the flag but never parsed it, so `--policy bad.json` became a positional and the run used the default-allow document. It now fails with `E_CAP_DENIED` and exit 1 (array/numeric/malformed documents alike), honours `--policy=<file>` and `SOFUU_POLICY`, and refuses `--policy` + `--no-policy` as a usage error.
+- **SSRF escape hatch is consistent (JR-092):** `SOFUU_ALLOW_LOOPBACK` / `net.allow_loopback` exempted the policy evaluator but not the RESOLVED-address gate in `opensocket`, so the documented hatch was a no-op for every name resolving to 127.0.0.1. Both gates now agree, and the exemption covers loopback only — metadata, private, CGNAT and ULA addresses stay refused.
+- **Binary budget recovered without dropping a feature:** the five learned gates keep their trained weights, now stored as IEEE half precision (build-time conversion in `crates/sofuu-core/build.rs`, version-2 container decoded by `ml::net::from_blob`). Committed `.f32` blobs remain the source of truth; `shipped_f16_blobs_track_the_committed_f32_blobs` asserts every weight and a forward pass against them.
+- **CLI polish:** `sofuu-agent --help` prints usage instead of trying to open a file named `--help`, and points Kaze agents at `sofuu script run <agent.kaze>`.
+
+Verification on the final tree: `make size-check` → `Size 5668400 bytes <= 5767168 bytes`; `scripts/check-driver-bc.sh` → `BC-CHECK: OK (11 shipped snapshots match their source)`; `cargo test --release --all` (with `SOFUU_ALLOW_LOOPBACK=1`, as `make test-rust` runs it) → 1395 passed, 0 failed, 48 ignored; `tests/run_js_tests.sh` → 72 passed, 0 failed, 1 skipped (the live-provider test, which needs a real API key).
 ## Unified Diagnostics — 2026-11-10
 
 One versioned diagnostic contract across the CLI, JavaScript, Kaze, events and crash cards (`docs/PLAN-UNIFIED-DIAGNOSTICS.md`):
@@ -15,7 +25,7 @@ One versioned diagnostic contract across the CLI, JavaScript, Kaze, events and c
 - **Compatibility:** existing codes, event kinds, exit status, retries, approvals, C ABI status/envelope and protocol stdout are unchanged. Legacy codes map into the event taxonomy with the original retained in `legacy_code`.
 - **Context-limit finding:** regression tests prove the configured short model name resolves a local listing's full-path `.gguf` id, and that learned-limit keys are case- and endpoint-normalized.
 
-Verification: `cargo test -p sofuu-core --lib rt::diag_contract`, `rt::events`, `rt::observability`, `domains::kaze`, plus `cargo test -p sofuu-core --test diagnostics_contract` (all passing locally), and real `sofuu eval` / `sofuu script run|check` receipts. Binary size: the isolated landing commit measures 5,717,776 B (cap 5,767,168 B). The shared working tree measured 5,783,984 B after concurrent uncommitted audit edits added ~24 KB of `__text`, so `make size-check` is red there, not in this commit (see `docs/DIAGNOSTICS.md` §8).
+Verification: `cargo test -p sofuu-core --lib rt::diag_contract`, `rt::events`, `rt::observability`, `domains::kaze`, plus `cargo test -p sofuu-core --test diagnostics_contract` (all passing locally), and real `sofuu eval` / `sofuu script run|check` receipts. Binary size: this contract measured 5,750,928 B (cap 5,767,168 B) before concurrent audit edits to `main.rs`/`engine.rs` landed; the combined tree reached 5,810,928 B after the audit remediation landed, and `make size-check` is green again at 5,668,400 B: the five TinyMlp weight blobs now ship as version-2 (f16) containers, which halved ~250 KB of committed f32 weights without changing any gate's scores (`blob_integrity` and a new shipped-vs-committed drift test pin both directions).
 
 ## Enterprise Hardening & Linux Cross-Compile Static TLS Integration — 2026-11-09
 

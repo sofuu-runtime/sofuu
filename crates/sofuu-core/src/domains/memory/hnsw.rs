@@ -438,6 +438,31 @@ impl Hnsw {
             if out.len() >= m {
                 break;
             }
+            /* MEM-049: an EXACT duplicate of `base` (d_base == 0.0) can never
+             * be rejected — `dist` is a sum of squares, so `dist(c, s) < 0.0`
+             * is unsatisfiable (and a NaN or a missing-coordinate f32::MAX is
+             * not < 0.0 either). Skipping the inner loop is therefore
+             * bit-identical: every zero-distance candidate is still kept, in
+             * this same sorted order.
+             *
+             * It is also where a duplicate-heavy ingest spent its whole
+             * budget: with no candidate ever rejected, EVERY back-link
+             * re-prune ran the full m0 x m0 = 33 x 32 node-to-node distance
+             * product over 768 dims (~34k distance evaluations per insert).
+             * Measured on the 2000-row / 768-dim fixture whose vectors are
+             * `(i % 7)/7` (7 distinct vectors, all texts distinct), macOS
+             * `sample` at 1 ms attributed 6036 of 7115 samples (85%) to
+             * `select_neighbors -> dist`, and only 493 (7%) to the CMA
+             * duplicate gate. Insert time for those 2000 rows went from
+             * 23151 ms to 3652 ms (the index stage alone: ~21.1 s -> 2.05 s,
+             * `SOFUU_CMA_TRACE`).
+             *
+             * Closest-M and LegacyRandom never reach this loop (they return
+             * above), so this changes nothing for the benchmark baselines. */
+            if d_base == 0.0 {
+                out.push(c);
+                continue;
+            }
             let mut keep = true;
             for &s in &out {
                 if self.dist(c, s) < d_base {
@@ -469,7 +494,7 @@ impl Hnsw {
         if l >= self.nodes[nb as usize].links.len() {
             return;
         }
-        let mut cand = self.nodes[nb as usize].links[l].clone();
+        let cand = self.nodes[nb as usize].links[l].clone();
         if cand.contains(&nid) {
             return;
         }
@@ -501,6 +526,28 @@ impl Hnsw {
         /* W4.6: the OLD list, captured before `nid` joins the candidates —
          * only edges that really existed may be charged to a counter. */
         let old = cand.clone();
+        /* MEM-049: `nid` goes FIRST, not last.
+         *
+         * `select_neighbors` orders candidates with a STABLE sort, so for
+         * distinct distances the input order cannot matter — but on an exact
+         * tie (`dist(nb, c) == dist(nb, nid)`) the earlier entry wins the
+         * last free slot. Appending nid therefore meant the NEW node was the
+         * one dropped whenever the list was already at `m`, and a node with
+         * no level-0 in-edge cannot be reached from `enter_node`: it landed
+         * in `orphans`, and `search_with_ef` scores EVERY orphan on EVERY
+         * query. With one vector shared by a whole corpus that is O(n) per
+         * search, i.e. a quadratic ingest — the measured CMA gate stage went
+         * 1554 ms (2000 rows) -> ~7 s (4000 rows) back when ties broke
+         * toward the existing links.
+         *
+         * With the new node winning ties the graph stays connected
+         * (measured: gate stage flat ~70 ms per 500 rows at 2000 rows,
+         * orphans stay at O(1)), and for non-tied distances `pruned` is
+         * bit-identical to before — the only pairs whose outcome moves are
+         * ones at exactly equal distance, where every candidate is
+         * interchangeable for ranking. */
+        let mut cand = Vec::with_capacity(old.len() + 1);
+        cand.extend_from_slice(&old);
         cand.push(nid);
         let pruned = self.select_neighbors(nb, &cand, m, self.policy);
         if l == 0 {

@@ -274,6 +274,13 @@ pub fn last_checkpoint(args: &Value) -> Value {
             continue;
         }
         let payload = ev.get("payload").cloned().unwrap_or_else(|| json!({}));
+        if payload.get("_sofuu_resume_unavailable").and_then(Value::as_bool) == Some(true) {
+            return json!({
+                "ok": false, "found": false, "code": "E_CAPABILITY",
+                "message": "The newest checkpoint was redacted or incomplete and cannot be resumed safely.",
+                "checkpoint": null,
+            });
+        }
         let step = payload
             .get("step")
             .and_then(Value::as_u64)
@@ -374,6 +381,8 @@ pub fn postmortem(args: &Value) -> Value {
     if let Some(trace) = args.get("trace_path").and_then(Value::as_str).filter(|t| !t.is_empty()) {
         card["trace_path"] = json!(trace);
     }
+
+    card = crate::rt::events::redact(&card);
 
     let dir = crashes_dir(&project);
     if std::fs::create_dir_all(&dir).is_err() {

@@ -440,28 +440,28 @@ thread_local! {
     static ALLOC_FUNCS: [qjs::JSCFunctionListEntry; 4] = [
         qjs::JSCFunctionListEntry {
             name: c"plan".as_ptr(),
-            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE | qjs::JS_PROP_ENUMERABLE,
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 1, cproto: 0, _pad: [0; 6], cfunc: js_alloc_plan },
         },
         qjs::JSCFunctionListEntry {
             name: c"noteLimit".as_ptr(),
-            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE | qjs::JS_PROP_ENUMERABLE,
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_alloc_note_limit },
         },
         qjs::JSCFunctionListEntry {
             name: c"ingestListing".as_ptr(),
-            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE | qjs::JS_PROP_ENUMERABLE,
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 2, cproto: 0, _pad: [0; 6], cfunc: js_alloc_ingest },
         },
         qjs::JSCFunctionListEntry {
             name: c"noteMaxOutput".as_ptr(),
-            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE,
+            prop_flags: qjs::JS_PROP_WRITABLE | qjs::JS_PROP_CONFIGURABLE | qjs::JS_PROP_ENUMERABLE,
             def_type: qjs::JS_DEF_CFUNC,
             magic: 0,
             u: qjs::JSCFunctionListEntryFunc { length: 3, cproto: 0, _pad: [0; 6], cfunc: js_alloc_note_max_output },

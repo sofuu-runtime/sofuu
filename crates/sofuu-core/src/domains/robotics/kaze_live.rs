@@ -406,6 +406,20 @@ pub fn policy_for_device(device: &str) -> J {
     })
 }
 
+/// What a bare live grant resolves to: `--cap drone=real` and
+/// `--cap drone=mavlink` both mean the MAVLink link on the endpoint this repo
+/// documents for SITL and companion computers.
+pub const DEFAULT_MAVLINK_DEVICE: &str = "udp:127.0.0.1:14550";
+
+/// The device a granted backend string names. `sim` never reaches here (the
+/// simulator stays in place), and a `udp:`/`uart:` string is its own device.
+fn backend_device(device: &str) -> &str {
+    match device.trim() {
+        "real" | "mavlink" => DEFAULT_MAVLINK_DEVICE,
+        other => other,
+    }
+}
+
 /// `udp:host:port`, `uart:/dev/ttyAMA0@921600`, or a bare device path.
 fn open_device(device: &str) -> Result<Box<dyn Io>, String> {
     let trimmed = device.trim();
@@ -445,7 +459,7 @@ impl LiveHost {
             if family != "drone" || device.is_empty() || device == "sim" {
                 continue;
             }
-            live = Some(DroneLink::connect(device)?);
+            live = Some(DroneLink::connect(backend_device(device))?);
         }
         let gpio = if pins.is_empty() {
             None

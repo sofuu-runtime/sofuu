@@ -636,6 +636,10 @@ r#"globalThis.__sofuu_cli_rc = 1;
       console.log('');
     }}
 
+    /* MC-012 (AUDIT-2026-11-08): a failed or unknown tool call must leave a
+     * non-zero exit status; before this the inspect script reset the code to
+     * 0 unconditionally. */
+    var callFailed = false;
     if (callTool) {{
       console.log('\x1b[1;33m● Executing Tool Call: ' + callTool + '\x1b[0m');
       var parsedArgs = {{}};
@@ -653,14 +657,19 @@ r#"globalThis.__sofuu_cli_rc = 1;
         console.log('\x1b[32m✓ Completed in ' + dur + 'ms:\x1b[0m');
         var resMapped = sofuu.tools.mcpResult(callRes);
         console.log(resMapped);
+        /* An in-band isError result is a failed call, not a clean inspect. */
+        if (!resMapped || resMapped.ok === false) callFailed = true;
       }} catch (eCall) {{
         var durFail = Date.now() - startT;
+        /* An unknown tool (JSON-RPC -32601) and a throwing tool both land
+         * here; either has to fail the command. */
+        callFailed = true;
         console.log('\x1b[31m✗ Tool execution failed after ' + durFail + 'ms:\x1b[0m');
         console.log('  ' + (eCall.message || eCall));
       }}
     }}
 
-    globalThis.__sofuu_cli_rc = 0;
+    globalThis.__sofuu_cli_rc = callFailed ? 1 : 0;
     try {{ client.disconnect(); }} catch (eD2) {{}}
   }} catch (e) {{
     console.log('\x1b[31m✗ Failed to inspect MCP server: ' + targetDisp + '\x1b[0m');

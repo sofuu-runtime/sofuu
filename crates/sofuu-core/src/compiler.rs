@@ -290,6 +290,34 @@ fn trailer_ending_before(bytes: &[u8], end: usize) -> Option<Found> {
     None
 }
 
+/// The error a file cut short INSIDE its own trailer deserves.
+///
+/// A trailer is 32 bytes and starts with [`TRAILER_MAGIC`], so a copy that was
+/// truncated keeps a PREFIX of that magic at EOF. That prefix is proof a
+/// payload was there, which makes the file `ERR_BINARY_CORRUPTED` — reporting
+/// "no payload" would boot a half-downloaded agent as the plain CLI, and
+/// running the wrong program is worse than a loud failure. (A cut that removes
+/// the magic as well is indistinguishable from a plain binary and stays
+/// `Ok(None)`: nothing left in the file can prove otherwise.)
+fn truncated_trailer(tail: &[u8]) -> Option<String> {
+    let lo = tail.len().saturating_sub(TRAILER_LEN - 1);
+    (lo..tail.len()).find_map(|at| {
+        let rest = &tail[at..];
+        /* The whole magic present, but the fixed-width trailer it starts
+         * does not fit: 12..31 bytes at EOF is exactly this. */
+        (rest.len() >= TRAILER_MAGIC.len()
+            && rest.len() < TRAILER_LEN
+            && rest.starts_with(TRAILER_MAGIC))
+            .then(|| {
+                format!(
+                    "ERR_BINARY_CORRUPTED: the trailer is truncated ({} of {TRAILER_LEN} bytes at EOF) — \
+                     the artifact is incomplete, rebuild the agent",
+                    rest.len()
+                )
+            })
+    })
+}
+
 /// Find a trailer in an in-memory image: at (or within a few bytes of) EOF,
 /// or — on a signed Mach-O — before the code-signature blob.
 ///
@@ -340,7 +368,12 @@ pub fn assemble(base: &[u8], payload: &[u8]) -> Vec<u8> {
 /// Decode the payload of an in-memory executable image.
 pub fn embedded_payload(bytes: &[u8]) -> Result<Option<EmbeddedPayload>, String> {
     let Some(f) = find_trailer(bytes) else {
-        return Ok(None);
+        /* No complete trailer: either a plain binary or one that was cut
+         * inside its trailer. Only the second one is a failure (CP-024). */
+        return match truncated_trailer(&bytes[bytes.len().saturating_sub(TRAILER_LEN)..]) {
+            Some(e) => Err(e),
+            None => Ok(None),
+        };
     };
     let t = f.trailer;
     if t.version != TRAILER_VERSION {
@@ -437,7 +470,12 @@ pub fn detect_embedded_payload() -> Result<Option<EmbeddedPayload>, String> {
     }
 
     let Some(found) = found else {
-        return Ok(None);
+        /* The tail is already in hand: a dangling trailer prefix here is a
+         * truncated artifact, not a plain binary (CP-024). */
+        return match truncated_trailer(&tail) {
+            Some(e) => Err(e),
+            None => Ok(None),
+        };
     };
     let t = found.trailer;
     if t.version != TRAILER_VERSION {
@@ -748,12 +786,19 @@ fn resolve_base_binary(
     opts: &CompileOptions,
     self_path: &Path,
     self_bytes: &[u8],
-) -> (Vec<u8>, &'static str, String) {
+) -> Result<(Vec<u8>, &'static str, String), CompileError> {
     if let Some(custom) = &opts.base {
         let p = Path::new(custom);
-        if let Ok(bytes) = std::fs::read(p) {
-            return (bytes, "custom", p.to_string_lossy().into_owned());
-        }
+        /* CP-015/CP-024: an operator who names a base gets THAT base or an
+         * error. Falling back to the lean profile built an artifact on a
+         * runtime they did not choose — and said nothing about it. */
+        let bytes = std::fs::read(p).map_err(|e| {
+            err(
+                "E_BASE_NOT_FOUND",
+                format!("--base {custom}: {e} (no base binary to append the payload to)"),
+            )
+        })?;
+        return Ok((bytes, "custom", p.to_string_lossy().into_owned()));
     }
 
     if opts.profile == CompileProfile::Micro {
@@ -784,7 +829,7 @@ fn resolve_base_binary(
         for candidate in candidates {
             if candidate.is_file() {
                 if let Ok(bytes) = std::fs::read(&candidate) {
-                    return (bytes, "micro", candidate.to_string_lossy().into_owned());
+                    return Ok((bytes, "micro", candidate.to_string_lossy().into_owned()));
                 }
             }
         }
@@ -811,13 +856,13 @@ fn resolve_base_binary(
         for candidate in candidates {
             if candidate.is_file() {
                 if let Ok(bytes) = std::fs::read(&candidate) {
-                    return (bytes, "lean", candidate.to_string_lossy().into_owned());
+                    return Ok((bytes, "lean", candidate.to_string_lossy().into_owned()));
                 }
             }
         }
     }
 
-    (self_bytes.to_vec(), opts.profile.as_str(), self_path.to_string_lossy().into_owned())
+    Ok((self_bytes.to_vec(), opts.profile.as_str(), self_path.to_string_lossy().into_owned()))
 }
 
 /// Compile `entry` into a standalone executable.
@@ -846,18 +891,52 @@ pub fn compile(entry: &str, opts: &CompileOptions) -> Result<CompileReport, Comp
         let raw_len = existing.bytecode.len() as u64;
         (existing.bytecode, existing.gzipped, raw_len, br, dim)
     } else {
-        /* 1. Bundle: one self-contained script, TypeScript stripped per module. */
-        let source = if entry_path.extension().is_some_and(|ext| ext == "kaze") {
-            generate_kaze_agent_bootstrap(entry_path, &entry_bytes)?
-        } else {
-            crate::bundler::bundle(entry_path, &crate::npm::npm_resolve)
-                .map_err(|e| err("E_BUNDLE", format!("{entry}: {e}")))?
+        /* 1. Bundle: one self-contained script, TypeScript stripped per module.
+         *    `awaiting` is the CP-007 second form (see the retry in step 2);
+         *    a Kaze entry has only one form, so the flag is a no-op there. */
+        let bundle_entry = |awaiting: bool| -> Result<String, CompileError> {
+            if entry_path.extension().is_some_and(|ext| ext == "kaze") {
+                return generate_kaze_agent_bootstrap(entry_path, &entry_bytes);
+            }
+            let bundled = if awaiting {
+                crate::bundler::bundle_await(entry_path, &crate::npm::npm_resolve)
+            } else {
+                crate::bundler::bundle(entry_path, &crate::npm::npm_resolve)
+            };
+            bundled.map_err(|e| {
+                /* A missing import is a COMPILE error, not a bundler failure
+                 * (CP-075): the operator sees E_COMPILE and a specifier they
+                 * can act on, never an artifact built around a stub. */
+                match e.strip_prefix("E_COMPILE: ") {
+                    Some(rest) => err("E_COMPILE", format!("{entry}: {rest}")),
+                    None => err("E_BUNDLE", format!("{entry}: {e}")),
+                }
+            })
         };
+        let source = bundle_entry(false)?;
 
         /* 2. Compile the bundle. A bare QuickJS runtime is enough: this only has
-         *    to parse, so booting the engine here would buy nothing. */
-        let bytecode = unsafe { compile_source(&source, entry) }
-            .map_err(|m| err("E_COMPILE", m))?;
+         *    to parse, so booting the engine here would buy nothing.
+         *
+         *    CP-007/CP-008: a top-level `await` in the ENTRY cannot parse while
+         *    the entry's module body is a synchronous factory, and no eval flag
+         *    changes that. So the parser decides: emit the ordinary bundle, and
+         *    when it does not parse, re-emit the entry as an async factory once.
+         *    An entry that never awaits keeps the synchronous factory (and its
+         *    synchronous throw); if the retry fails too, the FIRST error is what
+         *    the author gets — never the second form's. */
+        let bytecode = match unsafe { compile_source(&source, entry) } {
+            Ok(bc) => bc,
+            Err(first) => {
+                let retry = bundle_entry(true)
+                    .ok()
+                    .and_then(|awaiting| unsafe { compile_source(&awaiting, entry) }.ok());
+                match retry {
+                    Some(bc) => bc,
+                    None => return Err(err("E_COMPILE", first)),
+                }
+            }
+        };
         let bytecode_raw = bytecode.len() as u64;
 
         /* 3. Store the bytecode compressed when that actually saves bytes.
@@ -889,7 +968,7 @@ pub fn compile(entry: &str, opts: &CompileOptions) -> Result<CompileReport, Comp
         .map_err(|e| err("E_SELF", format!("cannot read {}: {e}", self_path.display())))?;
 
     let (base_source_bytes, profile_str, base_source_desc) =
-        resolve_base_binary(opts, &self_path, &self_bytes);
+        resolve_base_binary(opts, &self_path, &self_bytes)?;
 
     /* Refuse to clobber the binary we are running from: the rename would
      * succeed on Unix and leave the process mapped to a replaced inode. */
@@ -1190,13 +1269,18 @@ unsafe fn compile_source(src: &str, name: &str) -> Result<Vec<u8>, String> {
         let c_src = CString::new(src)
             .map_err(|_| "the bundle contains a NUL byte".to_string())?;
         let c_name = CString::new(name).unwrap_or_default();
+        /* CP-008: the entry is an ES module (that is what `sofuu run` evals),
+         * so its program is compiled the same way. Module scope is where a
+         * top-level `await` and `import.meta` are legal at all, and
+         * `eval_compiled_and_run` links + evaluates module bytecode through
+         * JS_EvalFunction, which handles JS_TAG_MODULE natively. */
         let fun = unsafe {
             qjs::JS_Eval(
                 ctx,
                 c_src.as_ptr(),
                 src.len(),
                 c_name.as_ptr(),
-                qjs::JS_EVAL_TYPE_GLOBAL | qjs::JS_EVAL_FLAG_COMPILE_ONLY,
+                qjs::JS_EVAL_TYPE_MODULE | qjs::JS_EVAL_FLAG_COMPILE_ONLY,
             )
         };
         if unsafe { qjs::is_exception(fun) } {
@@ -1636,28 +1720,39 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     }}
 
     function bindPositionals(targetArgs) {{
-        if (positionals.length > 0) {{
-            var combined = positionals.join(' ');
-            if (targetArgs['query'] === undefined) targetArgs['query'] = combined;
-            if (targetArgs['prompt'] === undefined) targetArgs['prompt'] = combined;
-            if (targetArgs['input'] === undefined) targetArgs['input'] = combined;
+        if (positionals.length === 0) return;
 
-            var expected = routineSignatures[entryRoutine] || [];
-            for (var p = 0; p < positionals.length; p++) {{
-                var pKey = '' + p;
-                var rawPos = positionals[p];
-                var parsedVal;
-                try {{ parsedVal = JSON.parse(rawPos); }} catch (_) {{ parsedVal = rawPos; }}
-                if (targetArgs[pKey] === undefined) {{
-                    targetArgs[pKey] = parsedVal;
-                }}
-                if (p < expected.length) {{
-                    var paramName = expected[p];
-                    if (targetArgs[paramName] === undefined) {{
-                        targetArgs[paramName] = parsedVal;
-                    }}
+        /* CP-034/CP-035/CP-040 (AUDIT-2026-11-08): positionals are CLI input,
+         * so they outrank the environment and the config file, and each one
+         * binds to ONE routine parameter by position. The old code joined
+         * every positional into a single space-separated string on 'query'
+         * AND only filled names that were still undefined, so
+         * AGENT_QUERY=fromenv agent cli-pos 500 BTC ran query=fromenv
+         * (and query="cli-pos 500 BTC" when no env was set). A named --arg
+         * for the same parameter still wins: it is the more specific
+         * spelling of the same tier. */
+        var expected = routineSignatures[entryRoutine] || [];
+        for (var p = 0; p < positionals.length; p++) {{
+            var pKey = '' + p;
+            var rawPos = positionals[p];
+            var parsedVal;
+            try {{ parsedVal = JSON.parse(rawPos); }} catch (_) {{ parsedVal = rawPos; }}
+            targetArgs[pKey] = parsedVal;
+            if (p < expected.length) {{
+                var paramName = expected[p];
+                if (cliArgs[paramName] === undefined) {{
+                    targetArgs[paramName] = parsedVal;
                 }}
             }}
+        }}
+        /* A routine with no declared parameters is the script-shaped agent:
+         * its single positional is the task text. Only the first one names the
+         * conventional aliases — never a joined string. */
+        if (expected.length === 0) {{
+            var first = targetArgs['0'];
+            if (targetArgs['query'] === undefined) targetArgs['query'] = first;
+            if (targetArgs['prompt'] === undefined) targetArgs['prompt'] = first;
+            if (targetArgs['input'] === undefined) targetArgs['input'] = first;
         }}
     }}
 
@@ -1971,6 +2066,30 @@ mod tests {
         img[n - 16..n - 8].copy_from_slice(&bogus);
         let e = embedded_payload(&img).unwrap_err();
         assert!(e.contains("truncated"), "{e}");
+    }
+
+    #[test]
+    fn a_truncated_trailer_is_refused_not_taken_for_a_plain_binary() {
+        /* MEM-065/CP-024: a copy cut short inside its trailer still ends with
+         * the trailer's magic, so it is a DAMAGED artifact. Parsed in memory:
+         * on macOS the kernel kills a modified Mach-O before main() runs, so
+         * executing a corrupted artifact can never prove this. */
+        let base = fake_base(64);
+        let payload = encode_payload("cut.js", b"bc", false, None, 0);
+        let img = assemble(&base, &payload);
+        /* 1..=20 bytes off the end leaves 31..=12 bytes of the 32-byte
+         * trailer — the whole magic is still there, the trailer is not. */
+        for cut in [1usize, 7, 20] {
+            let e = embedded_payload(&img[..img.len() - cut]).unwrap_err();
+            assert!(
+                e.contains("ERR_BINARY_CORRUPTED") && e.contains("truncated"),
+                "cut {cut}: {e}"
+            );
+        }
+        /* Cutting the magic away too leaves nothing to prove: still "not an
+         * artifact", and never a panic on a short buffer. */
+        assert!(embedded_payload(&img[..img.len() - TRAILER_LEN]).unwrap().is_none());
+        assert!(embedded_payload(&img[..4]).unwrap().is_none());
     }
 
     #[test]

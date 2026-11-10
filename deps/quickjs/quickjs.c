@@ -286,6 +286,7 @@ struct JSRuntime {
     void *host_promise_rejection_tracker_opaque;
     
     struct list_head job_list; /* list of JSJobEntry.link */
+    int job_enqueue_oom; /* continuations dropped because a job could not be allocated */
 
     JSModuleNormalizeFunc *module_normalize_func;
     JSModuleLoaderFunc *module_loader_func;
@@ -1853,8 +1854,13 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     int i;
 
     e = js_malloc(ctx, sizeof(*e) + argc * sizeof(JSValue));
-    if (!e)
+    if (!e) {
+        /* AUDIT-2026-11-08 CLI-054: a continuation that cannot be enqueued is
+         * dropped inside QuickJS with no signal to the embedder. Count it so
+         * the runtime can refuse to exit 0 after losing work. */
+        rt->job_enqueue_oom++;
         return -1;
+    }
     e->ctx = ctx;
     e->job_func = job_func;
     e->async_context = JS_DupValue(ctx, rt->current_async_context);
@@ -1869,6 +1875,20 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
 BOOL JS_IsJobPending(JSRuntime *rt)
 {
     return !list_empty(&rt->job_list);
+}
+
+/* Number of promise continuations dropped because the job entry could not be
+ * allocated (0 in a healthy run). The embedder treats a non-zero count as a
+ * fatal overflow: the work is gone, so the process must not report success. */
+int sofuu_qjs_job_oom_count(JSRuntime *rt)
+{
+    return rt ? rt->job_enqueue_oom : 0;
+}
+
+void sofuu_qjs_job_oom_reset(JSRuntime *rt)
+{
+    if (rt)
+        rt->job_enqueue_oom = 0;
 }
 
 /* return < 0 if exception, 0 if no job pending, 1 if a job was

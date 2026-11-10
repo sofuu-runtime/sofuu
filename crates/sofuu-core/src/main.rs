@@ -15,6 +15,75 @@ use std::ffi::{CString, c_char, c_int};
 use std::process::ExitCode;
 
 use sofuu_ffi::SofuuRuntime;
+
+/// CLI-011/CLI-023..024 (AUDIT-2026-11-08): does fd N want ANSI colour?
+///
+/// One rule for every formatter in this file: colour only on a real terminal,
+/// never when NO_COLOR (https://no-color.org) or SOFUU_NO_COLOR is set, never
+/// for TERM=dumb, and forced on by CLICOLOR_FORCE. Before this the CLI painted
+/// escapes into pipes and CI captures, so its output could not be diffed
+/// against node's.
+fn cli_color_enabled(fd: i32) -> bool {
+    if std::env::var_os("NO_COLOR").is_some() || std::env::var_os("SOFUU_NO_COLOR").is_some() {
+        return false;
+    }
+    if let Ok(term) = std::env::var("TERM") {
+        if term == "dumb" {
+            return false;
+        }
+    }
+    if let Ok(force) = std::env::var("CLICOLOR_FORCE") {
+        if force != "0" && !force.is_empty() {
+            return true;
+        }
+    }
+    // SAFETY: isatty has no preconditions and no side effects.
+    unsafe { libc::isatty(fd) == 1 }
+}
+
+/// Write to stdout, dropping SGR whenever colour is not allowed.
+fn emit_stdout(text: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    let body = if cli_color_enabled(1) {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(strip_sgr(text))
+    };
+    let _ = out.write_all(body.as_bytes());
+    let _ = out.flush();
+}
+
+/// Write to stderr, dropping SGR whenever colour is not allowed.
+fn emit_stderr(text: &str) {
+    use std::io::Write as _;
+    let mut err = std::io::stderr().lock();
+    let body = if cli_color_enabled(2) {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(strip_sgr(text))
+    };
+    let _ = err.write_all(body.as_bytes());
+    let _ = err.flush();
+}
+
+/// Every print in this file goes through emit_stdout/emit_stderr, so colour
+/// follows the environment in one place instead of 227 literal escapes.
+macro_rules! print {
+    ($($arg:tt)*) => {{ $crate::emit_stdout(&format!($($arg)*)); }};
+}
+macro_rules! println {
+    () => {{ $crate::emit_stdout("\n"); }};
+    ($($arg:tt)*) => {{ $crate::emit_stdout(&format!("{}\n", format!($($arg)*))); }};
+}
+macro_rules! eprint {
+    ($($arg:tt)*) => {{ $crate::emit_stderr(&format!($($arg)*)); }};
+}
+macro_rules! eprintln {
+    () => {{ $crate::emit_stderr("\n"); }};
+    ($($arg:tt)*) => {{ $crate::emit_stderr(&format!("{}\n", format!($($arg)*))); }};
+}
+
 /// Skip a test that needs the QTSQ codec when this build has none.
 ///
 /// Some binary-side features are wired THROUGH the codec rather than gated on
@@ -234,6 +303,24 @@ fn wants_help(args: &[String]) -> bool {
         Some(first) if first.starts_with('-') => {
             args[2..].iter().any(|a| a == "-h" || a == "--help")
         }
+        Some(first) => {
+            /* CLI-007..009/CLI-075 (AUDIT-2026-11-08): 35 subcommands ignored
+             * a trailing --help, and 'plugin init --help' scaffolded a plugin
+             * literally named --help.ts. A management subcommand answers
+             * --help from ANY position; the commands whose remaining words are
+             * user code (a script path, source text, a prompt) keep passing it
+             * through exactly as before. */
+            const CODE_COMMANDS: &[&str] = &[
+                "run", "eval", "script", "chat", "compile", "bundle", "serve", "infer", "dev",
+                "web", "repl",
+            ];
+            /* The command name is args[1]; args[2] is its first argument. */
+            let cmd_name = args.get(1).map(String::as_str).unwrap_or("");
+            if CODE_COMMANDS.contains(&cmd_name) {
+                return false;
+            }
+            args[3..].iter().any(|a| a == "-h" || a == "--help")
+        }
         _ => false,
     }
 }
@@ -363,7 +450,9 @@ fn print_serve_help() {
                --host <addr>      listen address (default: 127.0.0.1)\n\
            -t, --token <secret>   Bearer token; SOFUU_SERVE_TOKEN (env) wins and is\n\
                                   preferred, because --token is visible in `ps`\n\
-               --policy <file>    policy file applied before the server starts\n\n\
+               --policy <file>    policy file applied before the server starts\n\
+               --public-health    answer GET /health without a token, for container\n\
+                                  probes (tokenless /healthz and /livez always work)\n\n\
          \x1b[1mEnvironment:\x1b[0m\n\
            SOFUU_SERVE_TOKEN       auth token (takes precedence over --token)\n\
            SOFUU_HTTP_HEADERS_MS   pre-auth header deadline (default: 30000)\n\
@@ -617,7 +706,33 @@ fn print_version() {
 /// `eval` is indistinguishable from a broken one and useless for exactly the
 /// quick check the command exists for. `-q` / `--no-print` restores the old
 /// silent form for scripts that only want the code's side effects.
+/// JR-030 (AUDIT-2026-11-08): does this eval string look like TypeScript?
+/// A cheap shape test - a type annotation, an interface/type alias, or an
+/// (as T) cast. Used only to ADD a hint to a failure, never to change one.
+fn looks_like_typescript(code: &str) -> bool {
+    let markers = [
+        ("interface "),
+        (": string"),
+        (": number"),
+        (": boolean"),
+        (": void"),
+        ("satisfies "),
+        ("export type "),
+    ];
+    markers.iter().any(|m| code.contains(m))
+}
+
 fn cmd_eval(rt: &SofuuRuntime, code: &str, print_value: bool) -> i32 {
+    let rc = eval_impl(rt, code, print_value);
+    if rc != 0 && looks_like_typescript(code) {
+        eprintln!(
+            "Note: sofuu eval evaluates JS. For TS, use sofuu run <file.ts>."
+        );
+    }
+    rc
+}
+
+fn eval_impl(rt: &SofuuRuntime, code: &str, print_value: bool) -> i32 {
     if !print_value {
         // Byte-identical to the pre-PC-09 command: evaluate the string as
         // given and add nothing of our own to stdout.
@@ -703,6 +818,16 @@ fn take_policy_arg(args: &[String]) -> (Option<String>, Vec<String>) {
         } else {
             out.push(args[i].clone());
             i += 1;
+        }
+    }
+    /* CLI-075 (AUDIT-2026-11-08): the flag is not the only spelling. SOFUU_POLICY
+     * is the 12-factor form, read only when no --policy was given. */
+    if path.is_none() {
+        if let Ok(from_env) = std::env::var("SOFUU_POLICY") {
+            let trimmed = from_env.trim();
+            if !trimmed.is_empty() {
+                path = Some(trimmed.to_string());
+            }
         }
     }
     (path, out)
@@ -900,7 +1025,7 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String], on_error: Option<&str>) -> i32 
     if args.len() < 3 {
         eprintln!("\x1b[1mUsage:\x1b[0m");
         eprintln!("  sofuu agent list");
-        eprintln!("  sofuu agent run <name> <task…> [--json]");
+        eprintln!("  sofuu agent run <name> <task…> [--json] [--log]");
         eprintln!("  sofuu agent init <name>          (scaffold ~/.sofuu/agents/<name>.js)");
         eprintln!("  sofuu agent validate <file.js>   (define dry-run, precise errors)");
         return 1;
@@ -1050,10 +1175,15 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String], on_error: Option<&str>) -> i32 
             }
             let name = args[3].clone();
             let mut json = false;
+            /* AG-101 (AUDIT-2026-11-08): disk logging is opt-in, so the CLI
+             * needs the switch that turns it on. */
+            let mut log = false;
             let mut parts: Vec<String> = Vec::new();
             for a in &args[4..] {
                 if a == "--json" {
                     json = true;
+                } else if a == "--log" {
+                    log = true;
                 } else {
                     parts.push(a.clone());
                 }
@@ -1108,10 +1238,18 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String], on_error: Option<&str>) -> i32 
                               r.usage.completionTokens + ' tk' +
                               (r.stopped ? ' · stopped: ' + r.stopped : ''));"#
             };
+            let log_js = if log { "true" } else { "false" };
             let code = format!(
                 r#"(async function () {{
   const ld = await sofuu.agent.loadDir();
   for (const b of (ld && ld.broken) || []) console.error('⚠ ' + b.file + ': ' + b.error);
+  /* PL-075/L-02b: the CLI agent run boots the plugin tree (./plugins,
+   * ~/.sofuu/plugins, ./sofuu.json) and STARTS its services, so a Category 4
+   * onStart/onTurnStart/onToolCall/onTurnEnd hook sees this run. The driver
+   * does it once per process and logs a broken plugin file instead of
+   * pretending it loaded; a failing boot is advice, never a failed run. */
+  try {{ if (sofuu.plugins && typeof sofuu.plugins.autoload === 'function') await sofuu.plugins.autoload(); }}
+  catch (ePlug) {{ console.error('⚠ plugins: ' + String((ePlug && ePlug.message) || ePlug)); }}
   function archiveAgent(kind, status, source, content, metadata) {{
     if (content === undefined || content === null || !String(content).trim()) return;
     try {{
@@ -1123,6 +1261,7 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String], on_error: Option<&str>) -> i32 
   }}
   try {{
     const r = await sofuu.agent.run({name_js}, {task_js}, {{
+      logs: {log_js},
       {on_error_js}
       {on_step}
     }});
@@ -1395,6 +1534,9 @@ fn cmd_resume(rt: &SofuuRuntime, args: &[String]) -> i32 {
     const lc = host('lastCheckpoint', {{ project: '.', run_id: runId }});
     if (lc && lc.ok && lc.found && lc.checkpoint && typeof lc.checkpoint === 'object') {{
       cp = lc.checkpoint;
+    }} else if (lc && lc.code === 'E_CAPABILITY') {{
+      console.error('resume: checkpoint was redacted or incomplete and cannot be resumed safely; start a new run with the required inputs');
+      process.exit(1);
     }} else {{
       console.error('resume: sofuu.observability.lastCheckpoint is unavailable in this build; scanning the log directly');
     }}
@@ -1411,6 +1553,10 @@ fn cmd_resume(rt: &SofuuRuntime, args: &[String]) -> i32 {
     console.error(wantStep === null
       ? 'resume: run ' + runId + ' has no checkpoint (' + loc.path + '); a run writes one per completed turn'
       : 'resume: run ' + runId + ' has no checkpoint at step ' + String(wantStep) + ' (' + loc.path + ')');
+    process.exit(1);
+  }}
+  if (cp._sofuu_resume_unavailable === true) {{
+    console.error('resume: checkpoint was redacted or incomplete and cannot be resumed safely; start a new run with the required inputs');
     process.exit(1);
   }}
 
@@ -1581,6 +1727,17 @@ fn cmd_plugin(rt: &SofuuRuntime, args: &[String]) -> i32 {
 
 /// `sofuu run <file>` — run a JS/TS file.
 fn cmd_run(rt: &SofuuRuntime, path: &str) -> i32 {
+    /* JR-027..029 (AUDIT-2026-11-08): constructs the TypeScript stripper
+     * cannot lower must name themselves. The eval-file path belongs to the
+     * engine shim, so the check happens here, before it is handed over. */
+    if path.ends_with(".ts") || path.ends_with(".tsx") {
+        if let Ok(src) = std::fs::read_to_string(path) {
+            if let Some((what, line)) = sofuu_core::ts::unsupported_construct(&src) {
+                eprintln!("error: {}", sofuu_core::ts::unsupported_message(what, line));
+                return 1;
+            }
+        }
+    }
     rt.eval_file(path)
 }
 
@@ -1932,6 +2089,27 @@ fn repl_shim(rt: &SofuuRuntime) -> i32 {
     println!("\n\x1b[1;36m  Sofuu (素風) REPL\x1b[0m  \x1b[2mv{VERSION}\x1b[0m");
     println!("\x1b[2m  Type .help for commands, Ctrl-D to exit\x1b[0m\n");
 
+    /* CLI-062: a Ctrl-C during a synchronous eval can only reach QuickJS
+     * through its interrupt poll, which reads this flag. The handler is one
+     * atomic store — async-signal-safe — and SA_RESTART keeps a Ctrl-C at the
+     * idle prompt from ending read_line. Installing it also replaces main's
+     * stop-the-process handler: interrupting the REPL never kills it. */
+    #[cfg(not(target_os = "windows"))]
+    {
+        extern "C" fn repl_sigint(_sig: c_int) {
+            sofuu_ffi::request_user_interrupt();
+        }
+        // SAFETY: a zeroed sigaction + sigemptyset + sigaction is the POSIX
+        // install path; the handler only stores an atomic.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = repl_sigint as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        }
+    }
+
     let stdin = io::stdin();
     let mut accum = String::new();
 
@@ -2002,9 +2180,18 @@ fn repl_shim(rt: &SofuuRuntime) -> i32 {
         }
 
         if !needs_more(&accum) {
+            /* Drop a Ctrl-C that landed at the prompt: only one pressed
+             * DURING this eval may abort it. */
+            sofuu_ffi::take_user_interrupt();
             let out = rt.eval_repl(&accum);
             accum.clear();
-            if let Some(s) = out {
+            let interrupted = sofuu_ffi::take_user_interrupt_fired();
+            sofuu_ffi::take_user_interrupt();
+            if interrupted {
+                /* QuickJS's own text for a poll abort is "InternalError:
+                 * interrupted"; name the real cause and drop the stack. */
+                println!("InternalError: Interrupted by user");
+            } else if let Some(s) = out {
                 if !(s.contains("undefined") && s.len() < 30) {
                     println!("{s}");
                 }
@@ -2531,6 +2718,7 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     // wins when set; --token stays for scripts but prints a warning.
     let mut token = std::env::var("SOFUU_SERVE_TOKEN").unwrap_or_default();
     let mut token_from_argv = false;
+    let mut public_health = false;
 
     let mut i = 2;
     while i < args.len() {
@@ -2572,6 +2760,15 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
                 }
             },
             "--infer" => {
+                i += 1;
+            },
+            /* SV-02 (AUDIT-2026-11-08): container probes (k8s, compose,
+             * fly.io) hit GET /health with no token, and the H2 hardening had
+             * made /health authenticated. /healthz and /livez stay public
+             * always; this flag opts /health into the same posture for the
+             * probes that only know the conventional path. */
+            "--public-health" => {
+                public_health = true;
                 i += 1;
             },
             "--port" | "-p" => match value_arg(args, i) {
@@ -2732,6 +2929,7 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
         "host": host,
         "port": port,
         "version": VERSION,
+        "publicHealth": public_health,
     });
     let serve_js = format!("sofuu.serve.start({});", cfg);
     rt.eval_string(&serve_js, "<serve>")
@@ -2747,7 +2945,10 @@ fn cmd_bundle(_rt: &SofuuRuntime, args: &[String]) -> i32 {
         return 1;
     }
     let entry = std::path::PathBuf::from(&args[2]);
-    let mut output = "bundle.js".to_string();
+    /* CP-069 (AUDIT-2026-11-08): without --out the bundle goes to STDOUT,
+     * not to a surprise ./bundle.js next to the entry. A file is written only
+     * when the operator names one. */
+    let mut output: Option<String> = None;
     let mut i = 3;
     /* P3-6 (AUDIT-2026-09-01): a TRAILING `-o` with no value used to be
      * skipped by `i + 1 < len` and silently wrote bundle.js. Error loudly. */
@@ -2758,29 +2959,42 @@ fn cmd_bundle(_rt: &SofuuRuntime, args: &[String]) -> i32 {
     }
     while i + 1 < args.len() {
         if args[i] == "-o" || args[i] == "--out" {
-            output = args[i + 1].clone();
+            output = Some(args[i + 1].clone());
         }
         i += 1;
     }
 
     match sofuu_core::bundler::bundle(&entry, &sofuu_core::npm::npm_resolve) {
-        Ok(src) => {
-            if let Err(e) = std::fs::write(&output, &src) {
-                eprintln!("\x1b[31mError:\x1b[0m cannot write {}: {}", output, e);
-                return 1;
+        Ok(src) => match output.as_deref() {
+            None => {
+                /* stdout form: the code and nothing else, so it can be piped
+                 * (sofuu bundle entry.js | sofuu run -). */
+                print!("{}", src);
+                0
             }
-            println!("\x1b[1msofuu bundle\x1b[0m");
-            println!("  Entry: {}", entry.display());
-            println!(
-                "\x1b[32m✓\x1b[0m Bundle written: \x1b[1m{}\x1b[0m ({} B)",
-                output,
-                src.len()
-            );
-            println!("\x1b[90mRun with: sofuu run {}\x1b[0m", output);
-            0
-        }
+            Some(path) => {
+                if let Err(e) = std::fs::write(path, &src) {
+                    eprintln!("\x1b[31mError:\x1b[0m cannot write {}: {}", path, e);
+                    return 1;
+                }
+                println!("\x1b[1msofuu bundle\x1b[0m");
+                println!("  Entry: {}", entry.display());
+                println!(
+                    "\x1b[32m✓\x1b[0m Bundle written: \x1b[1m{}\x1b[0m ({} B)",
+                    path,
+                    src.len()
+                );
+                println!("\x1b[90mRun with: sofuu run {}\x1b[0m", path);
+                0
+            }
+        },
         Err(e) => {
-            eprintln!("\x1b[31mError:\x1b[0m bundle failed: {}", e);
+            /* A missing import is the operator's to fix, and the message is
+             * the same one sofuu compile prints (CP-075/CP-068). */
+            match e.strip_prefix("E_COMPILE: ") {
+                Some(rest) => eprintln!("\x1b[31mError:\x1b[0m E_COMPILE — {rest}"),
+                None => eprintln!("\x1b[31mError:\x1b[0m bundle failed: {}", e),
+            }
             1
         }
     }
@@ -3032,9 +3246,24 @@ fn main() -> ExitCode {
                     code = Some(a.as_str());
                 }
             }
-            let Some(code) = code else {
-                eprintln!("\x1b[31mError:\x1b[0m 'sofuu eval' requires a code string argument");
-                return ExitCode::FAILURE;
+            /* CLI-037: no code argument is legal when standard input is
+             * piped (sofuu eval <<EOF) — the program comes from stdin. */
+            let code = match code {
+                Some(c) => c.to_string(),
+                None if unsafe { libc::isatty(0) } == 0 => {
+                    use std::io::Read as _;
+                    let mut src = String::new();
+                    if std::io::stdin().read_to_string(&mut src).is_ok() && !src.trim().is_empty() {
+                        src
+                    } else {
+                        eprintln!("Error: 'sofuu eval' requires a code string argument");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                None => {
+                    eprintln!("Error: 'sofuu eval' requires a code string argument");
+                    return ExitCode::FAILURE;
+                }
             };
             let rt = match SofuuRuntime::init() {
                 Some(rt) => rt,
@@ -3043,7 +3272,21 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let rc = cmd_eval(&rt, code, print_value);
+            /* CLI-037: 'sofuu eval' with no code argument but a piped stdin
+             * reads the program from it (sofuu eval <<EOF). */
+            let rc = if code.is_empty() {
+                use std::io::Read as _;
+                let mut src = String::new();
+                match std::io::stdin().read_to_string(&mut src) {
+                    Ok(_) if !src.trim().is_empty() => cmd_eval(&rt, &src, print_value),
+                    _ => {
+                        eprintln!("Error: 'sofuu eval' requires a code string argument");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else {
+                cmd_eval(&rt, &code, print_value)
+            };
             js_exit_code(&rt, rc)
         }
         "dev" | "web" => {
@@ -3839,7 +4082,46 @@ fn main() -> ExitCode {
                 eprintln!("\x1b[31mError:\x1b[0m {e}");
                 return ExitCode::FAILURE;
             }
-            let rc = cmd_run(&rt, &clean[2]);
+            /* PL-009 (AUDIT-2026-11-08): a program run through 'sofuu run' saw
+             * an empty plugin tree — ./plugins, ~/.sofuu/plugins and
+             * ./sofuu.json were only discovered by the agent and chat paths, so
+             * a script that used a project plugin got "unknown tool" while the
+             * same plugin worked under 'sofuu agent run'. Boot the tree here
+             * too (idempotent, bounded), and let SOFUU_NO_PLUGIN_AUTOLOAD=1
+             * turn it off for a sandboxed run. */
+            if std::env::var_os("SOFUU_NO_PLUGIN_AUTOLOAD").is_none() {
+                let _ = rt.eval_string(
+                    "(function(){try{if(sofuu.plugins&&typeof sofuu.plugins.autoload==='function'){sofuu.plugins.autoload().catch(function(e){console.error('\u{26a0} plugins: '+String((e&&e.message)||e));});}}catch(eP){}})();",
+                    "<plugins-autoload>",
+                );
+                rt.run_jobs();
+            }
+            /* CLI-037 (AUDIT-2026-11-08): 'sofuu run -' reads the program
+             * from standard input, the usual way to pipe a script in. */
+            /* CLI-023 (AUDIT-2026-11-08): 'sofuu run -e <code>' is the form
+             * every other script runner accepts, and the audit's own recipes
+             * used it. Same runtime path as a file, just an inline source. */
+            let rc = if clean[2] == "-e" || clean[2] == "--eval" {
+                match clean.get(3) {
+                    Some(code) => rt.eval_string(code, "<eval>"),
+                    None => {
+                        eprintln!("\x1b[31mError:\x1b[0m 'sofuu run -e' needs a code argument");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            } else if clean[2] == "-" {
+                use std::io::Read as _;
+                let mut src = String::new();
+                match std::io::stdin().read_to_string(&mut src) {
+                    Ok(_) => rt.eval_string(&src, "<stdin>"),
+                    Err(e) => {
+                        eprintln!("\x1b[31mError:\x1b[0m cannot read stdin: {e}");
+                        1
+                    }
+                }
+            } else {
+                cmd_run(&rt, &clean[2])
+            };
             js_exit_code(&rt, rc)
         }
         "bundle" => {
@@ -3898,6 +4180,23 @@ fn main() -> ExitCode {
             && flag != "-V"
             && flag != "--version" =>
         {
+            /* CLI-055..058 (AUDIT-2026-11-08): a bare leading flag means a
+             * chat invocation ONLY when it is a chat flag. Before this every
+             * unknown flag (--bogus, --verbsoe) was swallowed as a provider
+             * name and the run continued with defaults. */
+            const CHAT_FLAGS: &[&str] = &[
+                "--provider", "-p", "--model", "-m", "--base-url", "--temperature",
+                "--system", "--brain", "--json", "--read-only", "--no-net",
+                "--confirm-all", "--policy", "--config", "--on-error", "--tools",
+                "--max-steps", "--session", "--resume", "--no-color", "--quiet", "-q",
+            ];
+            let known = CHAT_FLAGS
+                .iter()
+                .any(|f| flag == *f || flag.strip_prefix(f).map(|r| r.starts_with('=')).unwrap_or(false));
+            if !known {
+                eprintln!("Error: Unrecognized flag '{}'", flag);
+                return ExitCode::FAILURE;
+            }
             let mut chat_args: Vec<String> = args.clone();
             chat_args.insert(1, "chat".to_string());
             run_chat(&chat_args)

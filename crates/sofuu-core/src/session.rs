@@ -636,6 +636,47 @@ pub fn load_session_data(project: &Path, id: &str) -> Option<SessionData> {
     serde_json::from_slice(&bytes).ok()
 }
 
+
+/// GL-03b (AUDIT-2026-11-08): the schema this build writes and can read.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// GL-03b: refuse a session that declares a schema this build does not know
+/// instead of silently reading half of it. The error carries the typed
+/// `E_SCHEMA` prefix the CLI surfaces.
+pub fn validate_schema(data: &SessionData) -> Result<(), String> {
+    if data.schema > SCHEMA_VERSION {
+        return Err(format!(
+            "E_SCHEMA: session '{}' declares schema {} but this build reads schema {} (it was written by a newer Sofuu)",
+            data.id, data.schema, SCHEMA_VERSION
+        ));
+    }
+    Ok(())
+}
+
+/// GL-03b: read a session with typed failures — a corrupted payload is an
+/// E_SCHEMA the operator can act on, not a silent None that reads as
+/// "no such session".
+pub fn load_session_checked(project: &Path, id: &str) -> Result<SessionData, String> {
+    if session_store::has_manifest(project, id) {
+        return match session_store::load_full(project, id) {
+            Some(d) => validate_schema(&d).map(|_| d),
+            None => Err(format!(
+                "E_SCHEMA: session '{}' has a manifest but its segments could not be read (corrupted or truncated)",
+                id
+            )),
+        };
+    }
+    let path = session_file(project, id);
+    let path_s = path.to_string_lossy();
+    let bytes = sofuu_ffi::qtsq_session_load(&path_s, &session_password(project)).ok_or_else(|| {
+        format!("E_SCHEMA: session '{}' could not be decoded (missing key or corrupted payload)", id)
+    })?;
+    let data: SessionData = serde_json::from_slice(&bytes).map_err(|e| {
+        format!("E_SCHEMA: session '{}' is not a valid session document: {}", id, e)
+    })?;
+    validate_schema(&data)?;
+    Ok(data)
+}
 fn load_recent_session_data(project: &Path, id: &str, limit: usize) -> Option<SessionData> {
     if session_store::has_manifest(project, id) {
         return session_store::load_tail(project, id, limit);
@@ -1088,11 +1129,12 @@ fn print_legacy_stats(project: &Path, full: &str) -> i32 {
         ));
         return 1;
     }
-    let Some(data) = load_session_data(project, full) else {
-        sout(&format!(
-            "  Legacy session '{full}' exists but its QTSQ payload is unreadable.\n"
-        ));
-        return 1;
+    let data = match load_session_checked(project, full) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("\x1b[31mError:\x1b[0m {e}");
+            return 1;
+        }
     };
     let encrypted = path
         .to_str()

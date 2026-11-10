@@ -3596,6 +3596,43 @@ unsafe extern "C" fn js_io_prompt(
 
 // ── process.exit / cwd / chdir / on / off ────────────────────────────
 
+thread_local! {
+    /// True once this context has dispatched its process.on exit handlers.
+    /// Natural exit and process.exit() must not both fire them.
+    static EXIT_HOOK_FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Dispatch process.on exit handlers at the natural end of a run.
+///
+/// AUDIT-2026-11-08: the hook was stored and only ever dispatched from
+/// process.exit(), so a script could not observe its own completion —
+/// a registered exit handler printed nothing. Node runs these handlers once,
+/// after the event loop drains; this is that path.
+///
+/// # Safety
+/// ctx must be the live runtime context.
+pub unsafe fn emit_exit_hooks_once(ctx: *mut JSContext) {
+    if ctx.is_null() {
+        return;
+    }
+    let already = EXIT_HOOK_FIRED.with(|f| f.replace(true));
+    if already {
+        return;
+    }
+    let exit_cb = get_process_cb(ctx, "__exit_handler");
+    if qjs::JS_IsFunction(ctx, exit_cb) != 0 {
+        dispatch_signal_cb(ctx, "__exit_handler", "exit");
+    }
+    qjs::sofuu_js_free_value(ctx, exit_cb);
+}
+
+/// Reset the once-per-context flag; the engine calls this when it installs a
+/// fresh context so a second engine in the same process starts clean.
+pub fn reset_exit_hook_state() {
+    EXIT_HOOK_FIRED.with(|f| f.set(false));
+}
+
+
 unsafe extern "C" fn js_process_exit(
     ctx: *mut JSContext,
     _this: JSValueConst,
@@ -3608,6 +3645,7 @@ unsafe extern "C" fn js_process_exit(
     }
 
     let gctx = CTX.with(|c| c.get());
+    EXIT_HOOK_FIRED.with(|f| f.set(true));
     if !gctx.is_null() {
         let exit_cb = get_process_cb(gctx, "__exit_handler");
         if qjs::JS_IsFunction(gctx, exit_cb) != 0 {

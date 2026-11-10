@@ -476,6 +476,15 @@ pub fn build_graph(
         transformed: None,
     });
 
+    /* CP-075/CP-068 (AUDIT-2026-11-08): a FILE import that does not resolve
+     * used to be skipped, and the bundle embedded a stub that printed
+     * "[sofuu bundle] missing module:" at runtime and handed back an empty
+     * object — so compile and bundle exited 0 and the artifact failed in the
+     * field. Collect every unresolved file specifier and fail the build.
+     * Bare specifiers stay runtime-resolved on purpose: npm packages and
+     * host-injected modules (sofuu, kaze, zod, node:*) are legitimately
+     * absent at build time and have a runtime fallback. */
+    let mut unresolved: Vec<(String, String)> = Vec::new();
     let mut head = 0usize;
     while head < graph.mods.len() {
         let m = graph.mods[head].clone();
@@ -500,19 +509,35 @@ pub fn build_graph(
         let specs = collect_specifiers(&src);
         let mod_dir = m.abs_path.parent().unwrap_or(Path::new(".")).to_path_buf();
         for spec in &specs {
-            if let Some((dep_abs, dep_id)) =
-                resolve_specifier(&spec.spec, &mod_dir, &root_dir, npm_resolve)
-            {
-                if !graph.mods.iter().any(|x| x.abs_path == dep_abs) {
-                    graph.mods.push(BundleMod {
-                        abs_path: dep_abs,
-                        id: dep_id,
-                        source: String::new(),
-                        transformed: None,
-                    });
+            match resolve_specifier(&spec.spec, &mod_dir, &root_dir, npm_resolve) {
+                Some((dep_abs, dep_id)) => {
+                    if !graph.mods.iter().any(|x| x.abs_path == dep_abs) {
+                        graph.mods.push(BundleMod {
+                            abs_path: dep_abs,
+                            id: dep_id,
+                            source: String::new(),
+                            transformed: None,
+                        });
+                    }
                 }
+                None if path_is_relative(&spec.spec) || spec.spec.starts_with('/') => {
+                    unresolved.push((spec.spec.clone(), m.abs_path.display().to_string()));
+                }
+                None => {}
             }
         }
+    }
+    if !unresolved.is_empty() {
+        let mut detail = String::new();
+        for (i, (spec, importer)) in unresolved.iter().enumerate() {
+            if i > 0 {
+                detail.push_str("; ");
+            }
+            detail.push_str(&format!(
+                "Cannot resolve module '{spec}' from '{importer}'"
+            ));
+        }
+        return Err(format!("E_COMPILE: {detail}"));
     }
     Ok(graph)
 }
@@ -1094,6 +1119,8 @@ function __r(id){\n\
     if(clean==='sofuu'&&typeof globalThis!=='undefined'&&globalThis.sofuu)return (__m[id]=globalThis.sofuu);\n\
     if(clean==='kaze'&&typeof globalThis!=='undefined'&&globalThis.sofuu&&globalThis.sofuu.kaze)return (__m[id]=globalThis.sofuu.kaze);\n\
     if(clean==='zod'&&typeof globalThis!=='undefined'&&globalThis.sofuu&&globalThis.sofuu.plugins)return (__m[id]=globalThis.sofuu.plugins.z);\n\
+    var vm=/^@sofuu\\/([A-Za-z_][A-Za-z0-9_]*)$/.exec(id||'');\n\
+    if(vm&&typeof globalThis!=='undefined'&&globalThis.sofuu){var ns=(vm[1]==='runtime')?globalThis.sofuu:(globalThis.sofuu[vm[1]]||globalThis.sofuu);var w={default:ns};w[vm[1]]=ns;for(var k in ns){w[k]=ns[k];}return (__m[id]=w);}\n\
     var exp={};\n\
     __m[id]=exp;\n\
     console.error('[sofuu bundle] missing module:',id);\n\
@@ -1107,17 +1134,38 @@ function __r(id){\n\
 
 /// Emit the full bundle string for a graph.
 pub fn emit_bundle(graph: &Graph) -> String {
+    emit_bundle_with(graph, false)
+}
+
+/// Emit a graph, optionally with the ENTRY emitted as an async factory.
+///
+/// A module body sits inside its `__d(...)` factory, so a top-level `await`
+/// in the entry is an `await` inside a plain function — a syntax error no
+/// eval flag can rescue (CP-007). `async_entry` makes that one factory async,
+/// which is exactly the "can suspend" permission the entry needs; every other
+/// module keeps the synchronous factory, because `require()` must keep
+/// returning its exports synchronously.
+pub fn emit_bundle_with(graph: &Graph, async_entry: bool) -> String {
     let mut out = String::from(PREAMBLE);
     // Modules in reverse BFS order (deps before dependents).
     for m in graph.mods.iter().rev() {
         if let Some(t) = &m.transformed {
+            let factory = if async_entry && m.id == graph.entry_id {
+                "async function"
+            } else {
+                "function"
+            };
             out.push_str(&format!("\n/* === module: {} === */\n", m.id));
-            out.push_str(&format!("__d('{}',function(exports,require){{\n", m.id));
+            out.push_str(&format!("__d('{}',{factory}(exports,require){{\n", m.id));
             out.push_str(t);
             out.push_str("\n});\n");
         }
     }
     out.push_str(&format!("\n/* === entry === */\nvar __entry=__r('{}');\n", graph.entry_id));
+    /* An async entry factory returns its promise to __r, which drops it: the
+     * body still runs (synchronously up to the first await, then on the job
+     * queue), and a rejection surfaces through the runtime's unhandled-
+     * rejection path, exactly like a rejected module in ESM. */
     out.push_str("if(typeof __entry==='function')__entry();\n})();\n");
     out
 }
@@ -1126,6 +1174,25 @@ pub fn emit_bundle(graph: &Graph) -> String {
 pub fn bundle(
     entry: &Path,
     npm_resolve: &dyn Fn(&Path, &str) -> Option<PathBuf>,
+) -> Result<String, String> {
+    bundle_with(entry, npm_resolve, false)
+}
+
+/// The same pipeline with the entry emitted as an async factory (CP-007).
+/// `sofuu compile` asks for this only after the ordinary bundle fails to
+/// parse, so an entry that never awaits keeps its synchronous entry factory
+/// (and its synchronous throw).
+pub fn bundle_await(
+    entry: &Path,
+    npm_resolve: &dyn Fn(&Path, &str) -> Option<PathBuf>,
+) -> Result<String, String> {
+    bundle_with(entry, npm_resolve, true)
+}
+
+fn bundle_with(
+    entry: &Path,
+    npm_resolve: &dyn Fn(&Path, &str) -> Option<PathBuf>,
+    async_entry: bool,
 ) -> Result<String, String> {
     let mut graph = build_graph(entry, npm_resolve)?;
     for i in 0..graph.mods.len() {
@@ -1138,7 +1205,7 @@ pub fn bundle(
         let transformed = transform_module(&graph, &m, &src, npm_resolve);
         graph.mods[i].transformed = Some(transformed);
     }
-    Ok(emit_bundle(&graph))
+    Ok(emit_bundle_with(&graph, async_entry))
 }
 
 #[cfg(test)]

@@ -50,6 +50,24 @@
   if (capped) return;
 
   var live = [];
+  /* MEM-027 (AUDIT-2026-11-08): remember() buffers rows and only a flush or
+   * close() writes them, so a script that forgot both lost every record at
+   * exit. One exit hook flushes whatever is still open and writable; a
+   * readonly handle or an already-closed one throws and is ignored. */
+  var exitFlushArmed = false;
+  function armExitFlush() {
+    if (exitFlushArmed) return;
+    if (typeof process === "undefined" || !process || typeof process.on !== "function") return;
+    exitFlushArmed = true;
+    process.on("exit", function () {
+      for (var i = 0; i < live.length; i++) {
+        var h = live[i];
+        if (h && typeof h.flush === "function") {
+          try { h.flush(); } catch (eFlush) { /* readonly or closed */ }
+        }
+      }
+    });
+  }
   var realOpen = M.open;
 
   /* ── Pluggable adapter layer (PLAN-PLUGGABLE-MEMORY-ADAPTERS) ─────
@@ -197,6 +215,7 @@
         };
       }
     } catch (e) { /* sealed object — the handle registry still works */ }
+    armExitFlush();
     return inst;
   };
 
@@ -387,7 +406,11 @@
   M.recall = invoke('recall', function (a) {
     var q = a.text !== undefined ? a.text : a.query;
     var k = a.k === undefined ? (a.top_k !== undefined ? (a.top_k | 0) : 5) : (a.k | 0);
-    if (!a.vec && q !== undefined && q !== null) return [String(q), k];
+    /* MEM-020: recall({query, diversity: false}) asks for a strictly monotone
+     * similarity order; the native call takes that as its third argument. */
+    if (!a.vec && q !== undefined && q !== null) {
+      return (a.diversity === false) ? [String(q), k, { diversity: false }] : [String(q), k];
+    }
     var args = [f32(a.vec), k];
     if (q !== undefined && q !== null) args.push(String(q));
     return args;

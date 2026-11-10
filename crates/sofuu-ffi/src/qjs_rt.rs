@@ -157,6 +157,12 @@ struct InterruptState {
 }
 
 unsafe extern "C" fn interrupt_cb(_rt: *mut JSRuntime, opaque: *mut c_void) -> c_int {
+    /* CLI-062: a REPL Ctrl-C arrives while the engine's own eval is parked
+     * inside this sandbox run, so this poll is the only one that can fire —
+     * abort here or the sandbox outlives the interrupt. */
+    if crate::poll_user_interrupt() {
+        return 1;
+    }
     if opaque.is_null() {
         return 0;
     }

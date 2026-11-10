@@ -27,7 +27,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 | **D02** | **Cognitive Vector Memory** | In-process QTSQ engine, SIMD cosine recall, CMA memory, deterministic embedder | `crates/sofuu-core/src/domains/memory/`, `crates/sofuu-core/src/embedding/` | Core | `cargo test -p sofuu-core --lib domains::memory` |
 | **D03** | **Autonomous AI Agents** | Turn-block context retention, sub-agent delegation, reflection, agent routines | `src/js/agent.js`, `crates/sofuu-core/src/chat.rs` | Core | `make bc-check` |
 | **D04** | **Tool Belt & Protocol Gates** | Sandboxed in-process tools, SSRF firewall, native MCP client & host | `crates/sofuu-core/src/mcp/`, `crates/sofuu-core/src/rt/policy.rs` | Core | `cargo test -p sofuu-core --lib mcp` |
-| **D05** | **Kaze Language & Compiler** | Declarative `.kaze` AST, linear arena VM, capability gates, supervisor daemon | `kaze/`, `crates/sofuu-core/src/compiler.rs`, `example-agents/` | Core | `cargo test --manifest-path kaze/Cargo.toml` |
+| **D05** | **Kaze Language & Compiler** | Declarative `.kaze` AST, linear arena VM, capability gates, supervisor daemon | `kaze/`, `crates/sofuu-core/src/domains/kaze/`, `crates/sofuu-core/src/compiler.rs`, `example-agents/` | Core | Policy-compliant Kaze checks (see D05) |
 | **D06** | **Hardware Inference Engine** | GGUF/SafeTensors loaders, Metal GPU shaders, NEON/AVX2 kernels, quantization | `crates/sofuu-core/src/domains/infer/`, `crates/sofuu-core/src/ml/` | Experimental Preview | `cargo test -p sofuu-core --lib domains::infer` |
 | **D07** | **Robotics, Drones & Edge** | MAVLink 2.0 protocol, GPIO pulse timers, physical safety gates, telemetry | `crates/sofuu-core/src/domains/robotics/`, `kaze/src/hardware.rs` | Core | `cargo test -p sofuu-core --lib domains::robotics` |
 | **D08** | **CLI, Interactive TUI & REPL** | `sofuu` CLI flags, full-screen `chat` TUI, interactive REPL, inspector | `src/js/chat_tui.js`, `crates/sofuu-core/src/main.rs` | Core | `./sofuu doctor` |
@@ -54,6 +54,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [x] Enforce fail-fast runtime panic on subsystem initialization failure (F-06).
   - [x] Optimize QuickJS microtask queue drain latency under saturated event loops.
   - [x] PLAN-UNIFIED-DIAGNOSTICS: versioned diagnostic contract, uncaught/rejection rendering, and shared event-string redaction (`rt/diag_contract.rs`).
+  - [x] AUDIT-REMEDIATION-2026-11-08: Complete core substrate tasks — microtask queue drainage on 1M chained promises (CLI-054), native `node:crypto` hashing (SHA-1/MD5/SHA-256/SHA-512/HMAC via `rt/digest.rs`) (JR-053), and `sofuu.spawn()` handle contract with ENOENT rejection (JR-073, JR-077).
 
 ---
 
@@ -70,6 +71,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 * **Active Tasks**:
   - [x] Standardize offline deterministic 768-dimension embedding API.
   - [x] Implement memory compaction and retention decay curve algorithms.
+  - [x] AUDIT-REMEDIATION-2026-11-08: Complete memory integrity tasks — path validation rejecting empty/directory paths (MEM-003, MEM-004), corrupt file preservation (MEM-013), post-close access `E_LOCKED` protection (MEM-024), and immediate 65KB record ceiling validation.
   - [ ] Add zero-copy memory-mapped QTSQ persistence validation for multi-process concurrency.
 
 ---
@@ -87,6 +89,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 * **Active Tasks**:
   - [x] Purge outdated branding comments in favor of "turn-block context retention" (F-08).
   - [x] Recompile and lock QuickJS bytecode snapshots (11/11 match verified).
+  - [x] AUDIT-REMEDIATION-2026-11-08: Complete agent loop hardening — turn-block context retention with consolidated parallel tool call emission (AG-025b), `maxDepth=0` preservation (AG-044/049), provider latency accounting against `maxWallMs` (AG-043), and sensitive credential / home directory path redaction in run logs (AG-101/102).
   - [ ] Expand sub-agent result synthesis protocol for parallel delegation trees.
 
 ---
@@ -104,6 +107,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 * **Active Tasks**:
   - [x] Fix SSRF private subnet check ordering when loopback testing mode is active (F-14).
   - [x] Eliminate unchecked binary payload decodes in tool communication (F-05).
+  - [x] AUDIT-REMEDIATION-2026-11-08: Complete tool belt and protocol gates — SSRF loopback alignment across URL filters and socket gates with strict private/metadata blocking (JR-090, JR-092), MCP disconnect idempotency and process-group signal isolation (MC-017), and dynamic MCP stdio line buffer up to 32MB (MC-019).
   - [ ] Add streaming MCP tool response pipes for large file operations.
 
 ---
@@ -111,17 +115,27 @@ Every division operates under strict architectural boundaries to guarantee that 
 ### Division 05: Kaze Language, VM & Standalone Compiler (D05)
 * **Mission**: Pure declarative agent routine language and linear arena VM for mission-critical, zero-GC edge intelligence.
 * **Owned Files**:
-  * `kaze/` (Standalone parser, AST, bytecompiler, arena VM, CLI)
+  * `kaze/` (Separate standalone Kaze 1.0 repository, CLI, compiler, VM, and documentation)
+  * `crates/sofuu-core/src/domains/kaze/` (Shipped parser, checker, bytecode compiler, arena VM, capability gates, and runtime bridge; aliased as `crate::sfs`)
+  * `crates/sofuu-core/src/script_cmd.rs` (`sofuu script` CLI, including `.kazebc` compilation and execution)
   * `crates/sofuu-core/src/compiler.rs` (Runtime standalone binary compiler)
-  * `crates/sofuu-core/src/domains/kaze/` (In-process Kaze runtime bridge)
   * `example-agents/` (`quant_sentinel/`, `med_protocol/`, `agri_sentinel/`, `paper_trader/`)
+* **Implementation and Verification**:
+  * Standalone Kaze reports language version `1.0` and uses bytecode format `4`; its dated implementation reference is [`kaze/docs/KAZE-1.0-REFERENCE.md`](kaze/docs/KAZE-1.0-REFERENCE.md). The separate engine embedded in Sofuu reports language version `0.1` and uses format `1`; its dated local source/binary inventory is [`docs/KAZE-CURRENT-SURFACE.md`](docs/KAZE-CURRENT-SURFACE.md). The two engines have different feature sets and incompatible artifacts. `docs/KAZE-SPEC.md` is a historical embedded-engine specification with known stale claims.
+  * The current standalone source still skips the policy layer when `policy.json` is absent and retains simulated non-robotics host paths; see the 1.0 reference before applying the completed task labels below to that separate implementation.
+  * `sofuu script compile` emits Kaze bytecode, while `sofuu compile` creates a standalone executable. The in-process APIs are exposed as `sofuu.kaze` and `sofuu.sfs`.
+  * Inspect and migrate tests that simulate non-robotics operations before running the Kaze suites under `RULES.md` §1.9. Relevant suites include `cargo test -p sofuu-core --lib domains::kaze`, local `cargo test -p sofuu-core --test kaze_language`, and the separate prototype's `cargo test --manifest-path kaze/Cargo.toml`; individual compliant checks can be run meanwhile. Run `make kaze-drift-check` to report differences from the prototype.
+  * `kaze/`, both local Kaze documents under `docs/`, `crates/sofuu-core/tests/`, and `examples/kaze/` are gitignored local resources and may be absent in a clean checkout.
 * **Architectural Boundaries**:
   * Compiler must remain 100% domain-agnostic; zero hardcoding of parameter names or external endpoints.
   * Standalone compiled binaries must support production 12-factor configuration resolution.
   * Agents must run on pure Kaze with zero auxiliary `.js` or `.sh` wrapper scripts.
   * Missing parameters must trigger structured diagnostic guidance, not runtime crashes.
 * **Active Tasks**:
-  - [x] Enforce fail-closed capability gates on missing or empty policies (`E_CAP_DENIED`) (F-04).
+  - [x] K0 inventory in progress: local Kaze source and binary behavior documented; published artifact, real backend/policy paths, and applicable model coverage remain to be verified.
+  - [x] Address missing/empty policy handling in the standalone prototype (F-04).
+  - [x] K1: eliminate non-robotics simulated responses and enforce explicit grants and fail-closed policy across all shipped Kaze execution surfaces (`sofuu script run|check|repl`, `E_CAP_DENIED` on malformed/non-object policy) (KZ-051/052).
+  - [x] AUDIT-REMEDIATION-2026-11-08: Complete Kaze VM and Compiler remediation — recursion depth ceiling $\le 256$ (KZ-095/099), modulo-by-zero trap `error[E_KAZE_DIV0]` (KZ-035), 12-factor configuration resolution for routine parameters (KZ-079/082/084), standalone compiler unresolved import failure scrubbing (CP-075/068), and standalone top-level await (CP-007/008).
   - [x] Build and verify 4 showcase agents in `example-agents/` with automated build harness.
   - [x] PLAN-UNIFIED-DIAGNOSTICS: verified Kaze parser/checker/VM locations and an additive versioned `diagnostic` in `script run --json` (excerpts deferred under the size cap).
   - [ ] Implement incremental AST caching for sub-millisecond Kaze routine compilation.
@@ -175,6 +189,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [x] Align TUI banner with brand voice ("runtime for AI") (F-07).
   - [x] Verify CLI argument parsing matches 12-factor configuration hierarchy.
   - [x] PLAN-UNIFIED-DIAGNOSTICS: concise/full diagnostic rendering on stderr, `SOFUU_DIAGNOSTICS=full`, and unchanged exit status/argument passthrough.
+  - [x] AUDIT-REMEDIATION-2026-11-08: Complete CLI polish — read-only `--help` with zero disk side-effects (CLI-008/009), strict ANSI scrubbing under `NO_COLOR=1` / `TERM=dumb` (CLI-023/024), `sofuu run -` / `eval <<EOF` stdin execution (CLI-055–057), and `sofuu bundle` stdout streaming (CP-069).
   - [ ] Add interactive debugging hooks (`--inspect-brk`) for Kaze VM step execution.
 
 ---

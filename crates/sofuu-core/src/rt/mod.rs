@@ -50,6 +50,7 @@ pub mod events; // P2 (R6): the unified event envelope + session event log
 pub mod observability; // OBSERVABILITY: run logs, checkpoints, crash cards (reads `events`)
 pub mod async_contract; // P2 (R2): one error taxonomy, nested deadlines, queue bounds
 pub mod crypto; // sofuu.crypto: SHA-256/base64url + RS256 JWT verification
+pub mod digest; // MD5/SHA-1/SHA-256/SHA-512 + RFC 2104 HMAC (JR-053)
 pub mod session_doc; // P3 (R4): the §5.2 session document — one export/import format
 pub mod syntax; // Phase 5 (agent plan): sofuu.parse - parse-only gate for file edits
 pub mod bytecode; // Phase 6 (agent plan): sofuu.aotEval - AOT bytecode snapshots for agent scripts

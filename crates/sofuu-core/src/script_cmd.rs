@@ -47,6 +47,49 @@ pub fn print_help() {
     );
 }
 
+/// KZ-011 (AUDIT-2026-11-08): `--help` AFTER a subcommand used to repeat the
+/// whole surface, so `sofuu script run --help` never told you what run does
+/// or which flags it takes. Each subcommand now answers for itself.
+fn print_subcommand_help(sub: &str) {
+    match sub {
+        "run" => println!(
+            "Usage: sofuu script run <file.kaze> [options]\n\n\
+             Check, compile and run one script in the shared VM.\n\n\
+             Options:\n\
+             \x20 --cap <family>[=<device>]  Grant a backend (sim, udp:HOST:PORT, uart:PATH@BAUD)\n\
+             \x20 --entry <name>             Routine to run (default: main)\n\
+             \x20 --arg <name>=<json>        Bind a parameter (repeatable)\n\
+             \x20 --fuel <n>                 Instruction budget (default 200000)\n\
+             \x20 --heap-kb <n>              List/record budget in KiB (default 4096)\n\
+             \x20 --ticks <n> --tick-ms <n>  Supervisor ticks after the entry\n\
+             \x20 --sim <k=v,k=v>            Initial machine state\n\
+             \x20 --policy <file>            Operator policy layer\n\
+             \x20 --no-policy                Skip the on-disk R7 policy layer\n\
+             \x20 --json                     Machine-readable report\n"
+        ),
+        "check" => println!(
+            "Usage: sofuu script check <file.kaze> [options]\n\n\
+             Parse and check only — no execution, no capabilities granted.\n\n\
+             Options:\n\
+             \x20 --json     Machine-readable report (items, caps, consts, bytes)\n"
+        ),
+        "compile" => println!(
+            "Usage: sofuu script compile <file.kaze> [-o <out.kazebc>] [--disasm]\n\n\
+             Emit the deterministic .kazebc module.\n\n\
+             Options:\n\
+             \x20 -o, --out <path>  Output path (default <file>.kazebc)\n\
+             \x20 --disasm          Print the instruction listing\n\
+             \x20 --plain           Uncoloured canonical text trace\n"
+        ),
+        "repl" => println!(
+            "Usage: sofuu script repl [options]\n\n\
+             Interactive session: define routines, inspect capabilities, then .run.\n\n\
+             Commands inside the session: .help  .items  .run <name>  .quit\n"
+        ),
+        _ => print_help(),
+    }
+}
+
 /// Parse `--flag value` pairs into a map; the runner owns validation.
 struct Flags {
     positional: Vec<String>,
@@ -68,6 +111,10 @@ struct Flags {
     /// The canonical text trace, uncoloured: what the golden corpus stores.
     plain: bool,
     no_policy: bool,
+    /// KZ-051/KZ-052: an explicit operator policy file. `sofuu script`
+    /// advertised the flag but never parsed it, so `--policy bad.json` became
+    /// a positional and the run used the default-allow document.
+    policy_file: Option<String>,
     want_help: bool,
 }
 
@@ -89,6 +136,7 @@ fn parse_flags(argv: &[String]) -> Result<Flags, String> {
         json: false,
         plain: false,
         no_policy: false,
+        policy_file: None,
         want_help: false,
     };
     let mut i = 0;
@@ -159,7 +207,15 @@ fn parse_flags(argv: &[String]) -> Result<Flags, String> {
             "--json" => f.json = true,
             "--plain" => f.plain = true,
             "--no-policy" => f.no_policy = true,
+            "--policy" => f.policy_file = Some(next("--policy")?),
             "-h" | "--help" | "help" => f.want_help = true,
+            other if other.starts_with("--policy=") => {
+                let v = other.trim_start_matches("--policy=").to_string();
+                if v.is_empty() {
+                    return Err("--policy= needs a file path".to_string());
+                }
+                f.policy_file = Some(v);
+            }
             other => f.positional.push(other.to_string()),
         }
         i += 1;
@@ -167,21 +223,92 @@ fn parse_flags(argv: &[String]) -> Result<Flags, String> {
     Ok(f)
 }
 
-fn policy_layer(no_policy: bool) -> Option<serde_json::Value> {
-    if no_policy {
-        return None;
-    }
-    crate::rt::policy::layered_policy_from_disk().ok()
+/// Why an options build failed, so the caller can tell a usage mistake from a
+/// policy that refused the run.
+///
+/// AUDIT-2026-11-08 KZ-051/KZ-052 (RULES 3.5.4): a policy file that exists but
+/// cannot be parsed is FATAL. Dropping it and running with the default-allow
+/// document is the failure the audit found: the operator wrote a guard, the
+/// runtime ignored it, and the script armed a drone with exit 0.
+enum OptErr {
+    /// Bad flags or arguments: exit 2, "Error:" prefix.
+    Usage(String),
+    /// A policy layer exists but does not apply: exit 1, E_CAP_DENIED.
+    Policy(String),
 }
 
-fn options_from(f: &Flags) -> Result<RunOptions, String> {
+impl OptErr {
+    fn exit_code(&self) -> i32 {
+        match self {
+            OptErr::Usage(_) => 2,
+            OptErr::Policy(_) => 1,
+        }
+    }
+    fn code(&self) -> &'static str {
+        match self {
+            OptErr::Usage(_) => "E_USAGE",
+            OptErr::Policy(_) => "E_CAP_DENIED",
+        }
+    }
+    fn message(&self) -> &str {
+        match self {
+            OptErr::Usage(msg) | OptErr::Policy(msg) => msg,
+        }
+    }
+}
+
+fn policy_layer(f: &Flags) -> Result<Option<serde_json::Value>, OptErr> {
+    if f.no_policy {
+        if f.policy_file.is_some() {
+            return Err(OptErr::Usage(
+                "--policy and --no-policy are mutually exclusive".to_string(),
+            ));
+        }
+        return Ok(None);
+    }
+    /* KZ-051/KZ-052: an operator policy file is parsed here and a document
+     * that cannot be understood is FATAL (exit 1, E_CAP_DENIED). Skipping it
+     * is the audited failure: the guard existed, the runtime ran anyway. */
+    if let Some(path) = &f.policy_file {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| OptErr::Policy(format!("--policy {path}: {e}")))?;
+        let v: serde_json::Value = serde_json::from_str(&raw)
+            .map_err(|e| OptErr::Policy(format!("--policy {path}: not valid JSON: {e}")))?;
+        if !v.is_object() {
+            return Err(OptErr::Policy(format!(
+                "--policy {path}: must be a JSON object"
+            )));
+        }
+        return Ok(Some(v));
+    }
+    crate::rt::policy::layered_policy_from_disk()
+        .map(Some)
+        .map_err(OptErr::Policy)
+}
+
+fn options_from(f: &Flags) -> Result<RunOptions, OptErr> {
     let mut sim = SimState::default();
     if !f.sim.is_empty() {
-        sim.apply_overrides(&f.sim)?;
+        sim.apply_overrides(&f.sim).map_err(OptErr::Usage)?;
+    }
+    /* KZ-035 (AUDIT-2026-11-08): the guided E_KAZE_PARAM message offers
+     * "or positional argument", so the runner honours it: after the script
+     * path, each positional binds to the next routine parameter (by index, the
+     * same keys bind_args consults for --arg-less calls). A named --arg always
+     * wins over the positional in the same slot. */
+    let mut args = f.args.clone();
+    for (i, raw) in f.positional.iter().skip(1).enumerate() {
+        let key = i.to_string();
+        if args.contains_key(&key) {
+            continue;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(raw)
+            .unwrap_or_else(|_| serde_json::Value::String(raw.clone()));
+        args.insert(key, value);
     }
     Ok(RunOptions {
         entry: f.entry.clone(),
-        args: f.args.clone(),
+        args,
         grants: f.caps.clone(),
         fuel: f.fuel.unwrap_or(sfs::vm::Limits::default().fuel),
         heap_bytes: f
@@ -191,7 +318,7 @@ fn options_from(f: &Flags) -> Result<RunOptions, String> {
         ticks: f.ticks.unwrap_or(0),
         tick_ms: f.tick_ms.unwrap_or(100),
         sim,
-        policy: policy_layer(f.no_policy),
+        policy: policy_layer(f)?,
         backend: f.backend.clone(),
         pins: f.pins.clone(),
     })
@@ -227,16 +354,9 @@ pub fn run(argv: &[String]) -> i32 {
 
 /// Render a Kaze failure through the shared diagnostic contract.
 ///
-/// The original source is used only when the entry is still source (a
-/// `.kazebc` artifact has none), and only for a local, masked snippet. The
-/// exit status is decided by the caller, exactly as before.
-fn print_kaze_error(err: &sfs::KazeError, path: &str) {
-    let source = if is_compiled_module(path) {
-        None
-    } else {
-        std::fs::read_to_string(path).ok()
-    };
-    let diag = err.diagnostic(source.as_deref());
+/// The reporter never reopens source paths; the caller owns the exit status.
+fn print_kaze_error(err: &sfs::KazeError, _path: &str) {
+    let diag = err.diagnostic(None);
     let full = crate::rt::diag_contract::full_detail_requested();
     eprint!(
         "{}",
@@ -244,68 +364,77 @@ fn print_kaze_error(err: &sfs::KazeError, path: &str) {
     );
 }
 
+/// Inspect flag positions without treating an option's value as `--json`.
+fn requested_json(argv: &[String]) -> bool {
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--json" { return true; }
+        if matches!(argv[i].as_str(), "--cap" | "--pin" | "--entry" | "--arg" |
+            "--fuel" | "--heap-kb" | "--ticks" | "--tick-ms" | "--sim" |
+            "--out" | "-o" | "--policy") { i += 1; }
+        i += 1;
+    }
+    false
+}
+
+fn report_cli_failure(code: &str, message: &str, json: bool) {
+    let err = sfs::KazeError::new(code, message);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&kaze_error_json(&err, "")).unwrap_or_default());
+    } else {
+        print_kaze_error(&err, "");
+    }
+}
+
 /// The machine-readable half of the same failure. `code` and `error` keep
 /// their published meaning; `diagnostic` is the additive versioned view.
-fn kaze_error_json(err: &sfs::KazeError, path: &str) -> serde_json::Value {
-    let source = if is_compiled_module(path) {
-        None
-    } else {
-        std::fs::read_to_string(path).ok()
-    };
+fn kaze_error_json(err: &sfs::KazeError, _path: &str) -> serde_json::Value {
+    let error = crate::rt::diag_contract::redact_event_text(
+        &crate::rt::diag_contract::truncate_chars(&err.message, 64 * 1024),
+    );
     serde_json::json!({
         "ok": false,
         "code": &err.code,
-        "error": &err.message,
-        "diagnostic": err.diagnostic(source.as_deref()).to_json(),
+        "error": error,
+        "diagnostic": err.diagnostic(None).to_json(),
     })
-}
-
-/// A compiled module ends in `.kazebc`, or starts with the `KAZEBC1` magic
-/// (a renamed artifact still runs).
-fn is_compiled_module(path: &str) -> bool {
-    if path.ends_with(".kazebc") {
-        return true;
-    }
-    let mut head = [0u8; 8];
-    let opened = std::fs::File::open(path)
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head));
-    opened.is_ok() && &head == b"KAZEBC1\0"
 }
 
 fn cmd_run(argv: &[String]) -> i32 {
     let flags = match parse_flags(argv) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("\x1b[31mError:\x1b[0m {}", e);
+            report_cli_failure("E_USAGE", &e, requested_json(argv));
             return 2;
         }
     };
     if flags.want_help {
-        print_help();
+        print_subcommand_help("run");
         return 0;
     }
     let Some(path) = flags.positional.first() else {
-        eprintln!("\x1b[31mError:\x1b[0m 'sofuu script run' needs a .kaze file");
+        report_cli_failure("E_USAGE", "'sofuu script run' needs a .kaze file", flags.json);
         return 2;
     };
     let opts = match options_from(&flags) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("\x1b[31mError:\x1b[0m {}", e);
-            return 2;
+            report_cli_failure(e.code(), e.message(), flags.json);
+            return e.exit_code();
         }
     };
-    // A `.kazebc` artifact runs without the front end: deserialize, execute.
-    let outcome = if is_compiled_module(path) {
-        std::fs::read(path)
-            .map_err(|e| sfs::KazeError::new("E_KAZE_IO", format!("cannot read '{}': {}", path, e)))
-            .and_then(|bytes| {
+    // Read the input once: probing a pipe and reopening it can consume input
+    // and hang before either execution or diagnostic reporting begins.
+    let outcome = std::fs::read(path)
+        .map_err(|e| sfs::KazeError::new("E_KAZE_IO", format!("cannot read '{}': {}", path, e)))
+        .and_then(|bytes| {
+            if path.ends_with(".kazebc") || bytes.starts_with(b"KAZEBC1\0") {
                 isa::deserialize(&bytes).map_err(|e| sfs::KazeError::new("E_KAZE_BADCODE", e))
-            })
-            .and_then(|module| sfs::run_module(module, path, &opts))
-    } else {
-        sfs::run_file(path, &opts)
-    };
+                    .and_then(|module| sfs::run_module(module, path, &opts))
+            } else {
+                sfs::decode_source(bytes, path).and_then(|src| sfs::run_source(&src, path, &opts))
+            }
+        });
     match outcome {
         Ok(report) => {
             if flags.json {
@@ -333,16 +462,16 @@ fn cmd_check(argv: &[String]) -> i32 {
     let flags = match parse_flags(argv) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("\x1b[31mError:\x1b[0m {}", e);
+            report_cli_failure("E_USAGE", &e, requested_json(argv));
             return 2;
         }
     };
     if flags.want_help {
-        print_help();
+        print_subcommand_help("check");
         return 0;
     }
     let Some(path) = flags.positional.first() else {
-        eprintln!("\x1b[31mError:\x1b[0m 'sofuu script check' needs a .kaze file");
+        report_cli_failure("E_USAGE", "'sofuu script check' needs a .kaze file", flags.json);
         return 2;
     };
     match sfs::prepare_file(path) {
@@ -369,7 +498,11 @@ fn cmd_check(argv: &[String]) -> i32 {
             0
         }
         Err(err) => {
-            print_kaze_error(&err, path);
+            if flags.json {
+                println!("{}", serde_json::to_string_pretty(&kaze_error_json(&err, path)).unwrap_or_default());
+            } else {
+                print_kaze_error(&err, path);
+            }
             1
         }
     }
@@ -379,22 +512,26 @@ fn cmd_compile(argv: &[String]) -> i32 {
     let flags = match parse_flags(argv) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("\x1b[31mError:\x1b[0m {}", e);
+            report_cli_failure("E_USAGE", &e, requested_json(argv));
             return 2;
         }
     };
     if flags.want_help {
-        print_help();
+        print_subcommand_help("compile");
         return 0;
     }
     let Some(path) = flags.positional.first() else {
-        eprintln!("\x1b[31mError:\x1b[0m 'sofuu script compile' needs a .kaze file");
+        report_cli_failure("E_USAGE", "'sofuu script compile' needs a .kaze file", flags.json);
         return 2;
     };
     let prepared = match sfs::prepare_file(path) {
         Ok(p) => p,
         Err(err) => {
-            print_kaze_error(&err, path);
+            if flags.json {
+                println!("{}", serde_json::to_string_pretty(&kaze_error_json(&err, path)).unwrap_or_default());
+            } else {
+                print_kaze_error(&err, path);
+            }
             return 1;
         }
     };
@@ -414,7 +551,7 @@ fn cmd_compile(argv: &[String]) -> i32 {
                 0
             }
             Err(e) => {
-                eprintln!("\x1b[31mE_KAZE_IO\x1b[0m: cannot write '{}': {}", out, e);
+                report_cli_failure("E_KAZE_IO", &format!("cannot write '{}': {}", out, e), flags.json);
                 1
             }
         },
@@ -485,7 +622,7 @@ fn cmd_repl(argv: &[String]) -> i32 {
     let flags = match parse_flags(argv) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("\x1b[31mError:\x1b[0m {}", e);
+            report_cli_failure("E_USAGE", &e, false);
             return 2;
         }
     };
@@ -623,6 +760,21 @@ fn handle_repl_command(
                 })
                 .unwrap_or_default();
             let src = format!("{}{}", needs_line(needs), body);
+            let policy = match policy_layer(&flags) {
+                Ok(p) => p,
+                Err(e) => {
+                    /* REPL: report and stay open — a bad guard file must not
+                     * take the session down, but it must also never be
+                     * silently skipped (KZ-051/KZ-052). */
+                    let tag = if matches!(e, OptErr::Usage(_)) {
+                        "E_USAGE"
+                    } else {
+                        "E_CAP_DENIED"
+                    };
+                    eprintln!("\x1b[31m{tag}\x1b[0m: {}", e.message());
+                    return ReplFlow::Continue;
+                }
+            };
             let opts = RunOptions {
                 entry: Some(name.to_string()),
                 args,
@@ -635,7 +787,7 @@ fn handle_repl_command(
                 ticks: flags.ticks.unwrap_or(0),
                 tick_ms: flags.tick_ms.unwrap_or(100),
                 sim: SimState::default(),
-                policy: policy_layer(flags.no_policy),
+                policy,
                 backend: flags.backend.clone(),
                 pins: flags.pins.clone(),
             };

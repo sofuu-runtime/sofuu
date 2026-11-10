@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use sofuu_ffi::qjs::JSContext;
 use sofuu_ffi::uv::{self, UvHandle, UvLoop, UV_RUN_NOWAIT, UV_RUN_ONCE};
 
-use crate::rt::promise::{sofuu_flush_jobs, sofuu_flush_jobs_bounded};
+use crate::rt::promise::{sofuu_flush_jobs, sofuu_flush_jobs_bounded, sofuu_flush_jobs_ceiling};
 
 /// The global libuv loop (`static uv_loop_t g_loop` in the retired loop.c).
 /// Sized via a C shim — uv_loop_t is opaque to Rust.
@@ -228,6 +228,12 @@ pub(crate) const MICROTASK_BATCH: usize = 256;
 pub(crate) const MICROTASK_BATCH_MAX: usize = 1024;
 pub(crate) const MICROTASK_BATCH_MIN: usize = 64;
 
+/// Continuations one drain may run before the queue counts as runaway
+/// (PLAN-AUDIT-REMEDIATION Task 1.3: 10,000,000 jobs or a wall timeout).
+/// Reaching it is a script bug — a continuation that re-queues itself — and is
+/// reported as RangeError + exit 1 rather than silently starving I/O.
+pub(crate) const MICROTASK_CEILING: usize = 10_000_000;
+
 /// Calculate adaptive microtask batch size based on libuv event loop latency pressure.
 ///
 /// Under saturated event loops:
@@ -328,11 +334,14 @@ pub(crate) unsafe fn sofuu_loop_run_bounded(
         if crate::rt::engine::run_status(ctx).fatal {
             break;
         }
-        /* First: pump immediately-available JS microtasks, bounded adaptively
-         * so a long promise chain cannot starve libuv's timers, while allowing
-         * saturated microtask drains to run at high throughput when no I/O is pending. */
-        let batch = adaptive_microtask_batch(loop_ptr());
-        let drained = sofuu_flush_jobs_bounded(ctx, batch);
+        /* Node ordering: a continuation queued before a timer must run before
+         * that timer's callback. The old per-round batch (R-14) let a 400 ms
+         * timer fire while 199,936 of 200,000 continuations were still queued
+         * (AUDIT-2026-11-08 CLI-054), so the callback observed a half-empty
+         * world. The drain is now exhaustive, with a 10M-continuation ceiling
+         * that reports a RangeError instead of starving the loop forever
+         * (only a continuation that re-queues itself can reach it). */
+        let drained = sofuu_flush_jobs_ceiling(ctx, MICROTASK_CEILING);
         if !drained {
             /* Starvation escape: poll libuv without blocking so timers/I/O run */
             begin_round();

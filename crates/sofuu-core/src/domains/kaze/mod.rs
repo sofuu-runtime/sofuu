@@ -48,6 +48,8 @@ pub struct KazeLocation {
     pub source: String,
     pub line: u32,
     pub column: Option<u32>,
+    /// The stored line is the routine start, not the failing instruction.
+    pub routine_start: bool,
 }
 
 impl KazeError {
@@ -65,7 +67,7 @@ impl KazeError {
         KazeError {
             code: code.to_string(),
             message: message.into(),
-            location: Some(KazeLocation { source: source.into(), line, column }),
+            location: Some(KazeLocation { source: source.into(), line, column, routine_start: false }),
         }
     }
 
@@ -73,9 +75,7 @@ impl KazeError {
         format!("{}: {}", self.code, self.message)
     }
 
-    /// The shared diagnostic view. `source_text` is the original script when
-    /// the caller has it; it is used only for a local, masked snippet and is
-    /// never serialized.
+    /// The shared diagnostic view. Source excerpts are not emitted here.
     pub fn diagnostic(
         &self,
         _source_text: Option<&str>,
@@ -83,11 +83,15 @@ impl KazeError {
         let mut d =
             crate::rt::diag_contract::Diagnostic::from_code(&self.code, self.detail());
         if let Some(loc) = self.location.as_ref() {
-            d = d.with_location(crate::rt::diag_contract::SourceLocation::at(
+            let mut location = crate::rt::diag_contract::SourceLocation::at(
                 loc.source.clone(),
                 loc.line,
                 loc.column,
-            ));
+            );
+            if loc.routine_start {
+                location.label = Some("routine start; instruction line unavailable".into());
+            }
+            d = d.with_location(location);
         }
         /* A checker failure can carry several errors, newline-joined in the
          * legacy `message`. The versioned message is the first one; that is
@@ -145,15 +149,46 @@ pub struct Prepared {
 }
 
 /// Read a script from disk.
+///
+/// KZ-041 (AUDIT-2026-11-08): a UTF-8 BOM is not Kaze syntax, but every editor
+/// on Windows writes one, and the parser then reported a parse error on line 1
+/// column 1 of an otherwise valid script. The BOM is dropped here, and CRLF is
+/// normalised so line numbers match what the operator sees.
 pub fn read_source(path: &str) -> Result<String, KazeError> {
-    std::fs::read_to_string(path)
-        .map_err(|e| KazeError::new("E_KAZE_IO", format!("cannot read '{}': {}", path, e)))
+    let bytes = std::fs::read(path)
+        .map_err(|e| KazeError::new("E_KAZE_IO", format!("cannot read '{}': {}", path, e)))?;
+    decode_source(bytes, path)
+}
+
+/// Decode an already-read source, including named-pipe input, exactly once.
+pub fn decode_source(bytes: Vec<u8>, path: &str) -> Result<String, KazeError> {
+    /* KZ-092 (AUDIT-2026-11-08): invalid UTF-8 used to surface as an E_KAZE_IO
+     * "stream did not contain valid UTF-8" — i.e. an I/O failure for what is a
+     * parse problem in the file itself. Report the byte offset as a parse
+     * error so the operator knows where to look. */
+    let mut src = match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            let at = e.utf8_error().valid_up_to();
+            return Err(KazeError::new(
+                "E_KAZE_PARSE",
+                format!(
+                    "'{}' is not valid UTF-8: the first bad byte is at offset {} (Kaze sources are UTF-8)",
+                    path, at
+                ),
+            ));
+        }
+    };
+    if let Some(rest) = src.strip_prefix('\u{feff}') {
+        src = rest.to_string();
+    }
+    Ok(src)
 }
 
 /// Parse, check and compile. This is the whole front end in one call.
 pub fn prepare(src: &str, name: &str) -> Result<Prepared, KazeError> {
     let program = parser::parse(src).map_err(|e| {
-        KazeError::at("E_KAZE_PARSE", e.render(name), name, e.line, Some(e.col))
+        KazeError::at(e.code, e.render(name), name, e.line, Some(e.col))
     })?;
     checker::check(&program).map_err(|errors| {
         let mut message = String::new();
@@ -290,6 +325,17 @@ pub fn run_module(module: Module, name: &str, opts: &RunOptions) -> Result<RunRe
 fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, KazeError> {
     let module = prepared.module;
     let declared = module.needs.clone();
+    // RB-08 (AUDIT-2026-11-08): every `--cap` backend is judged at GRANT time,
+    // before the script runs, so `--cap sensor=bogus` fails as E_CAP_INVALID
+    // instead of being accepted and then answered by the simulator.
+    for (family, backend) in &opts.backend {
+        if let Err(d) = crate::rt::hardware::validate_grant(family, backend) {
+            return Err(KazeError::new(
+                d.code,
+                format!("{}: {} ({})", prepared.name, d.reason, d.rule),
+            ));
+        }
+    }
     // v0.2 (P-K1): a family granted a real device runs live; every other
     // family keeps the deterministic simulator.
     let live = opts.backend.iter().any(|(_, d)| !d.is_empty() && d != "sim") || !opts.pins.is_empty();
@@ -323,18 +369,23 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
             let item = module
                 .item(name)
                 .ok_or_else(|| KazeError::new("E_KAZE_ENTRY", format!("there is no '{}' in this script", name)))?;
-            let args = bind_args(item.params.as_slice(), &opts.args, &mut vm)
-                .map_err(|e| KazeError::new("E_KAZE_MEMORY", format!("{}: {}", prepared.name, e)))?;
+            let merged = layered_args(opts, item.params.as_slice());
+            let args = bind_args(item.params.as_slice(), &merged, &mut vm)
+                .map_err(|e| KazeError::new(&e.code, format!("{}: {}", prepared.name, e.message)))?;
             let value = vm
                 .run_item(item, &args)
                 .map_err(|e| {
-                    KazeError::at(
+                    let mut err = KazeError::at(
                         e.code,
                         format!("{}: {} (line {})", prepared.name, e.msg, e.line),
                         &prepared.name,
                         e.line,
                         None,
-                    )
+                    );
+                    if e.line != 0 && e.line == item.line {
+                        if let Some(loc) = &mut err.location { loc.routine_start = true; }
+                    }
+                    err
                 })?;
             report.value = caps::render_value(value, &vm.arena, &vm.heap);
             report.verdict = vm.take_verdict();
@@ -353,13 +404,17 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
                     continue;
                 }
                 vm.run_item(item, &[]).map_err(|e| {
-                    KazeError::at(
+                    let mut err = KazeError::at(
                         e.code,
                         format!("{}: {} (line {})", prepared.name, e.msg, e.line),
                         &prepared.name,
                         e.line,
                         None,
-                    )
+                    );
+                    if e.line != 0 && e.line == item.line {
+                        if let Some(loc) = &mut err.location { loc.routine_start = true; }
+                    }
+                    err
                 })?;
             }
             report.ticks += 1;
@@ -404,20 +459,90 @@ fn resolve_entry(module: &Module, opts: &RunOptions) -> Result<Option<String>, K
     ))
 }
 
+/// Bind the entry routine's parameters, refusing a run that is missing one.
+///
+/// KZ-035 (AUDIT-2026-11-08): an unbound parameter used to become nothing,
+/// so the script ran on a silent hole (and often died later on an arithmetic
+/// crash far from the cause). Every parameter without a value is now named
+/// up front, with the three ways to supply it.
 fn bind_args(
     params: &[String],
     args: &serde_json::Map<String, serde_json::Value>,
     vm: &mut Vm,
-) -> Result<Vec<value::Value>, String> {
+) -> Result<Vec<value::Value>, KazeError> {
+    let missing: Vec<&String> = params
+        .iter()
+        .enumerate()
+        .filter(|(i, p)| args.get(*p).is_none() && args.get(&i.to_string()).is_none())
+        .map(|(_, p)| p)
+        .collect();
+    if !missing.is_empty() {
+        return Err(KazeError::new("E_KAZE_PARAM", missing_param_message(&missing)));
+    }
     let mut out = Vec::with_capacity(params.len());
     for (i, p) in params.iter().enumerate() {
-        let json = args
-            .get(p)
-            .or_else(|| args.get(&i.to_string()))
-            .unwrap_or(&serde_json::Value::Null);
-        out.push(json_to_value(json, &mut vm.arena, &mut vm.heap)?);
+        let json = args.get(p).or_else(|| args.get(&i.to_string())).expect("checked above");
+        out.push(json_to_value(json, &mut vm.arena, &mut vm.heap)
+            .map_err(|e| KazeError::new("E_KAZE_MEMORY", e))?);
     }
     Ok(out)
+}
+
+/// The E_KAZE_PARAM message: which parameter is missing and the three tiers
+/// that could have supplied it (CLI > AGENT_<NAME> > config file).
+fn missing_param_message(missing: &[&String]) -> String {
+    let names: Vec<String> = missing.iter().map(|n| format!("'{}'", n)).collect();
+    let plural = missing.len() > 1;
+    let first = missing[0];
+    let env_name = first.to_ascii_uppercase().replace('-', "_");
+    format!(
+        "missing required parameter{s} {list}. Supply via:\n           1. CLI flag: --arg {first}=<value> or positional argument\n           2. Environment variable: AGENT_{env_name}=<value>\n           3. Configuration file: --config <path> or ./agent.config.json",
+        s = if plural { "s" } else { "" },
+        list = names.join(", "),
+    )
+}
+
+/// Merge the parameter tiers for one run, lowest first: ./agent.config.json,
+/// then AGENT_<NAME> / SOFUU_<NAME>, then the CLI arguments already parsed into
+/// opts.args (CP-037, KZ-035).
+///
+/// The file tier is read fresh on every run and never required: a missing or
+/// malformed agent.config.json is simply no config, because the CLI already
+/// said what it wanted.
+fn layered_args(
+    opts: &RunOptions,
+    params: &[String],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    if let Ok(text) = std::fs::read_to_string("agent.config.json") {
+        if let Ok(serde_json::Value::Object(mut cfg)) = serde_json::from_str::<serde_json::Value>(&text) {
+            let nested = cfg.remove("args");
+            let source = match nested {
+                Some(v) if v.is_object() => v,
+                _ => serde_json::Value::Object(cfg),
+            };
+            if let serde_json::Value::Object(map) = source {
+                for (k, v) in map {
+                    out.insert(k, v);
+                }
+            }
+        }
+    }
+    for p in params {
+        let env_name = p.to_ascii_uppercase().replace('-', "_");
+        for key in [format!("AGENT_{env_name}"), format!("SOFUU_{env_name}")] {
+            if let Ok(raw) = std::env::var(&key) {
+                let v = serde_json::from_str(&raw)
+                    .unwrap_or(serde_json::Value::String(raw));
+                out.insert(p.clone(), v);
+                break;
+            }
+        }
+    }
+    for (k, v) in &opts.args {
+        out.insert(k.clone(), v.clone());
+    }
+    out
 }
 
 fn json_to_value(
@@ -768,6 +893,28 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_parameter_keeps_all_three_configuration_tiers() {
+        let err = run_source(
+            "needs: log\naction main(question):\n    log question\n",
+            "<param>",
+            &RunOptions::default(),
+        )
+        .expect_err("a required parameter with no value must be refused");
+        assert_eq!(err.code, "E_KAZE_PARAM");
+        let diag = err.diagnostic(None);
+        /* The guidance is deliberately multi-line in the legacy message; the
+         * diagnostic flattens it, but must not drop tiers. Only the checker's
+         * multi-error message is truncated to its first line. */
+        for tier in ["CLI flag", "AGENT_QUESTION", "--config"] {
+            assert!(
+                diag.message.contains(tier),
+                "missing {tier} in {:?}",
+                diag.message
+            );
+        }
+    }
+
+    #[test]
     fn a_wholesale_free_gives_the_whole_budget_back() {
         let mut heap = value::Heap::new(256);
         heap.push_array(vec![value::Value::Num(1.0); 4]).expect("fits");
@@ -931,6 +1078,29 @@ mod tests {
         let opts = RunOptions { grants: grants(&["sensor"]), ..Default::default() };
         let report = run(src, &opts);
         assert_eq!(report.value, "22");
+    }
+
+    /// RB-08 (AUDIT-2026-11-08): `--cap sensor=bogus` was accepted at grant
+    /// time, the run proceeded, and the simulator answered for a backend nobody
+    /// had implemented. The grant is judged here, before the script runs.
+    #[test]
+    fn a_bogus_backend_grant_is_refused_before_the_script_runs() {
+        let src = "needs: sensor\naction main():\n    let t = sensor.read(\"temperature\")\n    return t\n";
+        let opts = RunOptions {
+            grants: grants(&["sensor"]),
+            backend: vec![("sensor".to_string(), "bogus".to_string())],
+            ..Default::default()
+        };
+        let err = run_source(src, "<grant>", &opts).unwrap_err();
+        assert_eq!(err.code, "E_CAP_INVALID", "{}", err.message);
+        assert!(err.message.contains("bogus"), "{}", err.message);
+        // The same grant on a backend that exists still runs the script.
+        let opts = RunOptions {
+            grants: grants(&["sensor"]),
+            backend: vec![("sensor".to_string(), "sim".to_string())],
+            ..Default::default()
+        };
+        assert_eq!(run(src, &opts).value, "22");
     }
 
     #[test]

@@ -257,6 +257,42 @@ pub fn sandbox_error_code(error_type: &str) -> &'static str {
  * sofuu-ffi qjs module) because the sandbox is its only caller. */
 extern "C" {
     fn JS_GetInterruptPollSource(rt: *mut JSRuntime) -> c_int;
+    /// deps/quickjs/quickjs.c — fills the allocator totals. malloc_limit is
+    /// the JS_SetMemoryLimit value (0 = unmetered).
+    fn JS_ComputeMemoryUsage(rt: *mut JSRuntime, s: *mut JsMemoryUsage);
+}
+
+/// JSMemoryUsage (deps/quickjs/quickjs.h). Only the first two fields are read;
+/// the rest are spelled out so the C layout stays byte-exact.
+#[repr(C)]
+#[allow(dead_code)]
+struct JsMemoryUsage {
+    malloc_size: i64,
+    malloc_limit: i64,
+    memory_used_size: i64,
+    malloc_count: i64,
+    memory_used_count: i64,
+    atom_count: i64,
+    atom_size: i64,
+    str_count: i64,
+    str_size: i64,
+    obj_count: i64,
+    obj_size: i64,
+    prop_count: i64,
+    prop_size: i64,
+    shape_count: i64,
+    shape_size: i64,
+    js_func_count: i64,
+    js_func_size: i64,
+    js_func_code_size: i64,
+    js_func_pc2line_count: i64,
+    js_func_pc2line_size: i64,
+    c_func_count: i64,
+    array_count: i64,
+    fast_array_count: i64,
+    fast_array_elements: i64,
+    binary_object_count: i64,
+    binary_object_size: i64,
 }
 
 /* Must match LRE_INTERRUPT_POLL_STEPS in deps/quickjs/libregexp.h: the
@@ -923,6 +959,54 @@ impl SandboxSession {
         }
     }
 
+    /// The realm's malloc limit when it is parked at that limit, else None.
+    ///
+    /// When the heap is already full QuickJS cannot allocate the InternalError
+    /// that carries "out of memory" either, so the failed run leaves no
+    /// exception text behind and the message tells us nothing (JR-108: the run
+    /// reported E_SANDBOX / "Unknown sandbox exception"). The allocator totals
+    /// are then the only evidence left: an exhausted run still owns every
+    /// object that exhausted it, so malloc_size sits at malloc_limit. The 10%
+    /// slack covers the allocation that was refused (a failed 32 KB array is
+    /// 3% of a 1 MB cap) and allocator rounding.
+    unsafe fn memory_cap_hit(&self) -> Option<i64> {
+        if self.rt.is_null() {
+            return None;
+        }
+        let mut usage = std::mem::MaybeUninit::<JsMemoryUsage>::zeroed();
+        unsafe { JS_ComputeMemoryUsage(self.rt, usage.as_mut_ptr()) };
+        let usage = unsafe { usage.assume_init() };
+        let limit = usage.malloc_limit;
+        if limit > 0 && usage.malloc_size >= limit - limit / 10 {
+            Some(limit)
+        } else {
+            None
+        }
+    }
+
+    /// classify_error plus the memory-cap refinement that both failure paths
+    /// (a thrown value and a rejected promise) need. Returns (message, type).
+    ///
+    /// Only a message that carries no evidence at all is re-read as an OOM: a
+    /// message QuickJS did manage to build ("InternalError: out of memory", or
+    /// a user's "Error: nope") is classified on its own text, so the cap check
+    /// can never turn a real runtime error into E_OOM.
+    fn failure_kind(&self, msg: &str) -> (String, String) {
+        let etype = classify_error(msg);
+        if etype == "runtime" && blank_exception_message(msg) {
+            if let Some(limit) = unsafe { self.memory_cap_hit() } {
+                return (
+                    format!(
+                        "E_OOM: sandbox memory cap exceeded ({:.0} MB limit)",
+                        limit as f64 / (1024.0 * 1024.0)
+                    ),
+                    "oom".to_string(),
+                );
+            }
+        }
+        (msg.to_string(), etype)
+    }
+
     fn logs(&self) -> Vec<String> {
         if self.context_state.is_null() {
             Vec::new()
@@ -988,6 +1072,12 @@ impl SandboxSession {
         cfg: &SandboxConfig,
     ) -> Result<JSValue, String> {
         let stripped = if cfg.ts_mode == TsMode::Auto {
+            /* JR-027..029: an unsupported construct gets the actionable
+             * message on the retry path too, not a raw QuickJS SyntaxError. */
+            if let Some((what, line)) = crate::ts::unsupported_construct(src) {
+                let msg = crate::ts::unsupported_message(what, line);
+                return Err(msg);
+            }
             let s = crate::ts::strip(src);
             if s == src { None } else { Some(s) }
         } else {
@@ -1198,8 +1288,8 @@ impl SandboxSession {
                 true,
             ),
             InterruptReason::None => {
-                let etype = classify_error(&msg);
-                (msg, etype, false)
+                let (message, etype) = self.failure_kind(&msg);
+                (message, etype, false)
             }
         };
         SandboxRunResult {
@@ -1241,13 +1331,14 @@ impl SandboxSession {
                 }
             }
             PumpOutcome::Rejected(v) => {
-                let msg = unsafe { js_to_rust_string(self.ctx, v) };
+                let raw = unsafe { js_to_rust_string(self.ctx, v) };
                 unsafe { qjs::sofuu_js_free_value(self.ctx, v) };
+                let (msg, etype) = self.failure_kind(&raw);
                 SandboxRunResult {
                     success: false,
                     result_json: None,
-                    error: Some(msg.clone()),
-                    error_type: Some(classify_error(&msg)),
+                    error: Some(msg),
+                    error_type: Some(etype),
                     interrupted: false,
                     fuel_used: fuel,
                     elapsed_ms,
@@ -1289,8 +1380,8 @@ impl SandboxSession {
                         true,
                     ),
                     InterruptReason::None => {
-                        let etype = classify_error(&msg);
-                        (msg, etype, false)
+                        let (message, etype) = self.failure_kind(&msg);
+                        (message, etype, false)
                     }
                 };
                 SandboxRunResult {
@@ -1376,6 +1467,15 @@ impl Drop for SandboxSession {
     }
 }
 
+/// True when the failure text is QuickJS's stand-in for "no exception was
+/// available": an unallocatable throw lands as JS_NULL/JS_UNDEFINED, which
+/// js_to_rust_string renders as "null"/"undefined", and a missing value lands
+/// as the placeholder from take_exception_message.
+fn blank_exception_message(msg: &str) -> bool {
+    let text = msg.trim();
+    text.is_empty() || text == "Unknown sandbox exception" || text == "null" || text == "undefined"
+}
+
 fn classify_error(msg: &str) -> String {
     if msg.contains("out of memory") {
         "oom".to_string()
@@ -1405,6 +1505,14 @@ fn prepare_source(code: &str, cfg: &SandboxConfig) -> String {
         }
     }
     if cfg.ts_mode == TsMode::Always {
+        /* JR-027..029 (AUDIT-2026-11-08): a construct the stripper cannot
+         * lower must say so, not surface as "expecting ';'". The script still
+         * fails (exit 1), with the actionable message as the thrown error. */
+        if let Some((what, line)) = crate::ts::unsupported_construct(&src) {
+            let msg = crate::ts::unsupported_message(what, line);
+            let escaped = msg.replace(char::from(92), "\\").replace('"', "\"");
+            return format!("throw new Error(\"{escaped}\");");
+        }
         src = crate::ts::strip(&src);
     }
     src

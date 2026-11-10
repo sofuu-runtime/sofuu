@@ -196,6 +196,16 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
         println!("\x1b[1msofuu doctor\x1b[0m — v{} · {}", crate::VERSION, std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into()));
     }
 
+    /* CLI-025: the probes below are this build's own diagnostics — a
+     * temp-dir reader jail, an in-process sandbox run, a policy round-trip —
+     * and a project policy that confines fs to its roots (`sofuu policy
+     * init` writes exactly that) refused the temp-dir reads, so doctor
+     * failed on a healthy install. Diagnostics run in their own realm: park
+     * the effective policy on the global, install the permissive default for
+     * the probes, and restore the operator's document before the verdict. */
+    rt.eval_string("globalThis.__sofuu_doctor_policy = sofuu.policy.get()", "<doctor>");
+    rt.eval_string("sofuu.policy.clear()", "<doctor>");
+
     // ── 1. QTSQ + brain (the silent-failure pair) ──────────────────
     section("QTSQ / brain");
     /* PC-06 (audit 2026-10-29, Pi 5): a diagnostic must not tidy up the
@@ -215,8 +225,17 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
      * process.env object is a snapshot taken at engine init, so a var set
      * afterwards is invisible to JS (it would open the literal path
      * "undefined" and quietly write a brain file with that name). */
-    let tmp_brain = std::env::temp_dir().join("sofuu-doctor-probe.qtsq");
-    let _ = std::fs::remove_file(&tmp_brain);
+    /* CLI-089: the probe store is per-process, in a per-process DIRECTORY.
+     * One shared name meant 30 concurrent `sofuu doctor` runs fought over the
+     * same exclusive lock (25 failed a healthy build); a PID-scoped file in
+     * the shared temp dir was not enough either, because the write-ahead
+     * journal is created BESIDE the store (.sofuu-wal.json) — 6 of 30 then
+     * failed the manifest rename. The directory keeps store, lock and journal
+     * to this process. */
+    let probe_dir = std::env::temp_dir().join(format!("sofuu-doctor-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&probe_dir);
+    let _ = std::fs::create_dir_all(&probe_dir);
+    let tmp_brain = probe_dir.join("probe.qtsq");
     let tmp_brain_js = tmp_brain.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
     let probe = format!(
         r#"(function () {{
@@ -278,7 +297,9 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
     } else {
         warn("brain round-trip skipped (QTSQ not linked)");
     }
-    let _ = std::fs::remove_file(&tmp_brain);
+    /* Store, lock and journal all live in probe_dir: remove the directory,
+     * not just the store file. */
+    let _ = std::fs::remove_dir_all(&probe_dir);
 
     // ── 2. The real brain file ──────────────────────────────────────
     let bp = brain_path(&cfg);
@@ -730,6 +751,33 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
     // ── 6. Protocols, sandbox, policy (D2) ─────────────────────────
     section("protocols / sandbox");
     let jail_ok = protocol_probes(rt, &mut failures);
+    /* The diagnostics are done: put the operator's policy back. */
+    rt.eval_string(
+        "sofuu.policy.set(globalThis.__sofuu_doctor_policy || '{}'); delete globalThis.__sofuu_doctor_policy;",
+        "<doctor>",
+    );
+    /* GL-09 (AUDIT-2026-11-08): the default posture is ALLOW — a tool runs
+     * unless a policy denies it — and a fully green doctor run read as "this
+     * box is hardened". Say the posture out loud so nobody assumes it. */
+    let posture_raw = rt
+        .eval_repl(
+            "(function(){try{var p=(sofuu.policy&&sofuu.policy.get)?sofuu.policy.get():null;\
+             var k=p&&typeof p==='object'?Object.keys(p):[];\
+             return k.length?('configured: '+k.join(',')):'default';}\
+             catch(e){return 'unknown';}})()",
+        )
+        .unwrap_or_default();
+    let posture = strip_ansi(&posture_raw)
+        .trim()
+        .trim_matches(|c| c == '\'' || c == '"')
+        .to_string();
+    if posture == "default" {
+        warn(
+            "default policy posture: tools are ALLOWED unless a policy denies them — this run is not hardened (write a policy file or pass --policy to confine tools/fs/http)",
+        );
+    } else if !posture.is_empty() {
+        info(&format!("policy posture: {posture}"));
+    }
 
     // ── 7. Capability manifest (R1, T1.4) ──────────────────────────
     // Doctor asserts the build's own claims: a declared feature that fails

@@ -235,6 +235,12 @@
   function isTransientProviderError(msg) {
     return STREAM_TRANSIENT_RE.test(String(msg == null ? '' : msg));
   }
+  /* A 400 that blames the context window: the request can be made to fit.
+   * Every provider spells it differently, so the match is on the shape. */
+  var CTX_OVERFLOW_RE = /context[_ ]?length|context window|prompt is too long|maximum context|too many tokens|input is too long|exceeds? the (?:model'?s )?context|E_CTX/i;
+  function isContextOverflowError(msg) {
+    return CTX_OVERFLOW_RE.test(String(msg == null ? '' : msg));
+  }
   /* ── Observability seam + error policy (OBSERVABILITY-SPEC §0/§3) ─────
    * ONE emission point for the run's JSONL trace and ONE error-policy
    * engine. Both are best-effort by contract: a logging failure must never
@@ -287,6 +293,35 @@
     return String(env('SOFUU_PROJECT') || '.');
   }
   /* The one capability probe: no binding = no logging, silently. */
+  /* AG-101 (AUDIT-2026-11-08): disk logging is OPT-IN. Nothing under
+   * .sofuu/logs is written unless the run asked for it (opts.log /
+   * opts.logs / opts.logDir) or the operator set SOFUU_LOG=1. */
+  var OBS_DISK = false;
+  function diskLoggingEnabled(opts) {
+    if (OBS_DISK) return true;
+    if (opts && (opts.log === true || opts.logs === true || opts.logDir)) return true;
+    try {
+      if (typeof process !== 'undefined' && process.env) {
+        var v = String(process.env.SOFUU_LOG || '').toLowerCase();
+        if (v === '1' || v === 'true' || v === 'yes') return true;
+      }
+    } catch (e) { /* no process.env on this host: the flag stays off. */ }
+    return false;
+  }
+  /* AG-101/AG-102: the same shapes the Rust event seam scrubs. Run logs are
+   * read by humans and copied into tickets, so a credential or a private
+   * home path must never reach the file in the first place. */
+  var LOG_SECRET_RE = /(sk-|sk_|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[bpars]-|glpat-|AKIA|ASIA|AIza)[A-Za-z0-9_\-]{8,}/g;
+  var LOG_BEARER_RE = /Bearer\s+[A-Za-z0-9._\-]{20,}/gi;
+  var LOG_HOME_RE = /\/(?:Users|home)\/[^\s\/]+/g;
+  function redactLogText(s) {
+    if (s === null || s === undefined) return s;
+    return String(s)
+      .replace(LOG_SECRET_RE, '[REDACTED]')
+      .replace(LOG_BEARER_RE, 'Bearer [REDACTED]')
+      .replace(LOG_HOME_RE, '~');
+  }
+
   function obsEnabled() {
     try {
       return !!(typeof sofuu !== 'undefined' && sofuu.events &&
@@ -314,6 +349,7 @@
   function obsEmit(runId, path, kind, step, payload, durable) {
     try {
       if (!obsEnabled()) return false;
+      if (!OBS_DISK) return false;
       var sid = obsRunId(runId);
       var st = obsState(runId);
       if (kind === 'turn_start') st.turn = (st.turn | 0) + 1;
@@ -546,8 +582,9 @@
       if (m.tool_call_id) copy.tool_call_id = m.tool_call_id;
       var n = 0;
       try { n = JSON.stringify(copy).length; } catch (eS) { n = 0; }
-      if (n <= 0) continue;
+      if (n <= 0) { out._sofuu_incomplete = true; continue; }
       if (total + n > limit) {
+        out._sofuu_incomplete = true;
         /* A single oversized message still rehydrates the run better than
          * nothing, so the FIRST kept message is clipped to fit instead. */
         if (out.length === 0 && typeof copy.content === 'string') {
@@ -1036,7 +1073,12 @@
     };
     var b = def.budget && typeof def.budget === 'object' ? def.budget : {};
     d.budget.maxSteps = (b.maxSteps | 0) || BUDGET_DEFAULTS.maxSteps;
-    d.budget.maxDepth = (b.maxDepth | 0) || BUDGET_DEFAULTS.maxDepth;
+    /* AG-044/AG-049 (AUDIT-2026-11-08): maxDepth 0 means "no delegation",
+     * so it must survive normalization. The old || turned it into the
+     * default 2 and sub-agents stayed reachable. */
+    d.budget.maxDepth = (b.maxDepth === undefined || b.maxDepth === null)
+      ? BUDGET_DEFAULTS.maxDepth
+      : Math.max(0, b.maxDepth | 0);
     d.budget.maxTokens = (b.maxTokens | 0) || BUDGET_DEFAULTS.maxTokens;
     d.budget.maxWallMs = (b.maxWallMs | 0) || BUDGET_DEFAULTS.maxWallMs;
     /* Per-def tool-result context cap — 0 = scale with the model window. */
@@ -2837,6 +2879,9 @@
    */
   function run(target, task, opts) {
     opts = opts || {};
+    if (opts.resumeFrom && opts.resumeFrom._sofuu_resume_unavailable === true) {
+      throw makeError('E_CAPABILITY', 'The checkpoint was redacted or incomplete and cannot be resumed safely; start a new run with the required inputs.');
+    }
     var d = resolveDef(target);
     /* SPEC §3: resolve the error policy BEFORE the run registers itself
      * (ACTIVE/SIGNALS/run counter) — an unknown mode is REFUSED here, so a
@@ -2867,6 +2912,7 @@
     if (opts.budget && typeof opts.budget === 'object') {
       d = Object.assign({}, d, { budget: Object.assign({}, d.budget, opts.budget) });
     }
+    if (diskLoggingEnabled(opts)) OBS_DISK = true;
     var depth = opts.depth || 0;
     var chain = opts.chain || [d.name];
     var started = Date.now();
@@ -3169,20 +3215,54 @@
      * between an assistant tool_call and its result orphans the pairing and
      * the provider rejects the whole request (this is the same invariant
      * chat.js enforces in isProtectedBlock). */
-    function compactLoop() {
+    /* hard=true keeps only the recent tail: the provider already said the
+     * request did not fit, so the polite thresholds do not apply (AG-081). */
+    function compactLoop(hard) {
       var total = 0, i, j;
       for (i = 0; i < loopMsgs.length; i++) total += msgChars(loopMsgs[i]);
       /* Too small to be worth the churn — do not drop a short transcript
        * just because a budget tripped; the model still needs it. */
-      if (total < 12000) return null;
+      if (total < (hard ? 2000 : 12000)) return null;
       var cut = -1;
-      for (var k = loopMsgs.length - 1; k >= 1; k--) {
-        if (loopMsgs[k].role === 'tool') continue;
-        if (loopMsgs[k - 1].role === 'tool') continue;
-        cut = k;
-        break;
+      if (hard) {
+        /* Deepest legal cut: the earliest boundary whose left and right
+         * neighbours are not a tool result (that keeps the
+         * assistant(tool_calls)/tool(result) pairing intact). */
+        for (var hk = 1; hk < loopMsgs.length; hk++) {
+          if (loopMsgs[hk].role === 'tool') continue;
+          if (loopMsgs[hk - 1].role === 'tool') continue;
+          cut = hk;
+          break;
+        }
+      } else {
+        for (var k = loopMsgs.length - 1; k >= 1; k--) {
+          if (loopMsgs[k].role === 'tool') continue;
+          if (loopMsgs[k - 1].role === 'tool') continue;
+          cut = k;
+          break;
+        }
       }
-      if (cut <= 0) return null;
+      if (cut <= 0) {
+        if (!hard) return null;
+        /* A hard compaction of a single exchange has no legal message
+         * boundary to cut at: clip the big tool results in place instead. */
+        var savedH = 0, clippedH = 0;
+        for (var hm = 0; hm < loopMsgs.length; hm++) {
+          var mh = loopMsgs[hm];
+          if (!mh || mh.role !== 'tool' || typeof mh.content !== 'string') continue;
+          if (mh.content.length <= 800) continue;
+          var copyH = {};
+          for (var mk in mh) copyH[mk] = mh[mk];
+          savedH += mh.content.length - 800;
+          copyH.content = mh.content.slice(0, 800) +
+            ' …[truncated to fit the context window]';
+          loopMsgs[hm] = copyH;
+          clippedH++;
+        }
+        if (!clippedH) return null;
+        return { msgs: loopMsgs, droppedMsgs: 0, calls: 0,
+                 savedChars: savedH, totalChars: total };
+      }
       var head = loopMsgs.slice(0, cut), tail = loopMsgs.slice(cut);
       var dropped = 0, calls = 0, hist = {};
       for (i = 0; i < head.length; i++) {
@@ -3195,8 +3275,10 @@
           calls++;
         }
       }
-      /* Must actually buy something. */
-      if (dropped < 4000) return null;
+      /* Must actually buy something. A hard compaction is already the last
+       * resort after the provider refused the request, so it accepts a
+       * smaller win than the staged (opportunistic) one. */
+      if (dropped < (hard ? 500 : 4000)) return null;
       var names = [];
       for (var n2 in hist) names.push(n2 + '×' + hist[n2]);
       names.sort();
@@ -3404,6 +3486,9 @@
              { role: 'assistant', content: clip(String(answer || ''), 8000) }];
         obsEmit(runId, obsPath, 'checkpoint', stepsTotal, {
           messages: obsSeedMsgs,
+          _sofuu_resume_unavailable: obsSeedMsgs._sofuu_incomplete === true ||
+            String(task == null ? '' : task).length > 2000 ||
+            (!(loopMsgs && loopMsgs.length) && String(answer || '').length > 8000),
           task: clip(String(task == null ? '' : task), 2000),
           /* The EFFECTIVE model, not just the def's. A headless caller passes
            * opts.model, so recording only d.model checkpoints an empty model
@@ -3425,7 +3510,7 @@
         try { sofuu.ml.track(JSON.stringify({ kind: 'run_end', run: String(runId) })); }
         catch (eMl) { /* telemetry: a failed track loses a counter, never a result. */ }
       }
-      if (opts.logs) logRun(res, task, wall);
+      if (diskLoggingEnabled(opts)) logRun(res, task, wall);
       /* T4: close code_eval realms and drop the per-run todo namespace. */
       try { if (sofuu.tools && sofuu.tools.endRunScope) sofuu.tools.endRunScope(String(runId)); } catch (eSc) { /* scope teardown runs after the answer exists; a failure here cannot change it. */ }
       try {
@@ -4288,9 +4373,23 @@
       var hasDelegate = false;
       if (!opts.plain) {
         toolset = await resolveTools(d, emit);
+        /* AG-068 (AUDIT-2026-11-08): memory:'off' means no memory surface at
+         * all. The code toolpack brings remember/memory_* in with it, so the
+         * removal has to happen after resolution, not only at injection. */
+        if (d.memory === 'off') {
+          toolset.specs = toolset.specs.filter(function (sp) {
+            return !sp || (sp.name !== 'remember' && sp.name !== 'memory_remember' &&
+                           sp.name !== 'memory_search');
+          });
+          delete toolset.exec['remember'];
+          delete toolset.exec['memory_remember'];
+          delete toolset.exec['memory_search'];
+        }
         /* Memory tool: persists facts to the agent's QTSQ cognitive brain
          * (and to AGENTS.md only when in coding preset or explicitly opted in). */
-        if (!toolset.exec['remember']) {
+        /* AG-068 (AUDIT-2026-11-08): memory:'off' means no memory surface at
+         * all — the default remember tool used to be injected anyway. */
+        if (d.memory !== 'off' && !toolset.exec['remember']) {
           var isCoding = d.preset === 'coding' || d.profile === 'coding';
           toolset.specs.push({
             name: 'remember',
@@ -5340,6 +5439,14 @@
       }
 
       async function execDelegate(args) {
+        /* AG-045 (AUDIT-2026-11-08): maxDepth 0 disables delegation
+         * outright, even when the def lists the tool explicitly or the
+         * model calls it by name anyway. */
+        if (d.budget.maxDepth <= 0 || depth >= d.budget.maxDepth) {
+          throw makeError('E_BUDGET_DEPTH',
+            'delegation is disabled for this run (budget.maxDepth = ' + d.budget.maxDepth +
+            ', depth = ' + depth + '); answer directly instead of delegating');
+        }
         var childName = String((args && args.agent) || '');
         if (d.agents.indexOf(childName) < 0) {
           return 'tool error: unknown sub-agent \'' + childName + '\' (allowed: ' + d.agents.join(', ') + ')';
@@ -5693,6 +5800,22 @@
            * (session-scoped), and retry ONCE PER KIND (a turn can breach
            * the output cap and the window in sequence) — every later
            * request is prevented outright. */
+          /* AG-081 (AUDIT-2026-11-08): a provider 400 that names the context
+           * window is recoverable — compact the transcript hard (keep only
+           * the recent tail) and retry once instead of failing the run. */
+          if (isContextOverflowError(String((eS && eS.message) || eS)) && !state.ctxCompactRetried) {
+            state.ctxCompactRetried = true;
+            var hardCompact = compactLoop(true);
+            if (hardCompact) {
+              loopMsgs = hardCompact.msgs;
+              ledgerClearAll();
+              prefixRewritten = true;
+              emit('plan', { compacted: true, hard: true,
+                             droppedMsgs: hardCompact.droppedMsgs,
+                             savedChars: hardCompact.savedChars });
+              continue;
+            }
+          }
           if (!state.allocRetriedKinds) state.allocRetriedKinds = {};
           var learnedKind = allocNoteLimit(d, (eS && eS.message) || eS);
           if (learnedKind && !state.allocRetriedKinds[learnedKind]) {
@@ -5748,6 +5871,19 @@
         tree.cacheReadTokens += su.cacheReadTokens || 0;
         tree.cacheWriteTokens += su.cacheWriteTokens || 0;
         own.llmCalls++; tree.llmCalls++;
+        /* AG-043 (AUDIT-2026-11-08): the wall budget did not see provider
+         * latency — a 400s call against a 300s wall still ran its tool round
+         * and only stopped at the next loop-top check. The clock is read the
+         * moment the call returns: a run past its wall is finalised here as
+         * stopped: budget_wall (a no-tool round keeps its answer; a
+         * tool round stops before spending more wall time on tools). */
+        if (Date.now() - started > d.budget.maxWallMs) {
+          state.wallOverrun = true;
+          stopped = stopped || 'budget_wall';
+          emit('tool_result', { name: 'system',
+                                result: 'wall budget of ' + d.budget.maxWallMs +
+                                        'ms reached during the provider call' });
+        }
         /* alloc gate output history: length-stops and answer sizes feed the
          * next plan's pressure + output-reserve features. */
         if (String(su.finishReason || '') === 'length') allocMem.sawLengthStop = true;
@@ -5783,6 +5919,19 @@
             state.progressiveRetriesRound = (state.progressiveRetriesRound | 0) + 1;
             absorbUsage(st);
             own.llmCalls++; tree.llmCalls++;
+        /* AG-043 (AUDIT-2026-11-08): the wall budget did not see provider
+         * latency — a 400s call against a 300s wall still ran its tool round
+         * and only stopped at the next loop-top check. The clock is read the
+         * moment the call returns: a run past its wall is finalised here as
+         * stopped: budget_wall (a no-tool round keeps its answer; a
+         * tool round stops before spending more wall time on tools). */
+        if (Date.now() - started > d.budget.maxWallMs) {
+          state.wallOverrun = true;
+          stopped = stopped || 'budget_wall';
+          emit('tool_result', { name: 'system',
+                                result: 'wall budget of ' + d.budget.maxWallMs +
+                                        'ms reached during the provider call' });
+        }
             for (var escJ = 0; escJ < needFull.length; escJ++) {
               progressiveEscalated[needFull[escJ]] = 1;
             }
@@ -5911,6 +6060,16 @@
          * Every tool's assistant/tool transcript pair is emitted in exact
          * issue order so the persisted shape [assistant(tool_calls_i), tool(result_i)]
          * is byte-identical to the sequential path. */
+        /* AG-025b (AUDIT-2026-11-08): the provider sent ONE assistant turn
+         * carrying both tool_calls, so the transcript has to go back that way.
+         * The old code pushed assistant(tool_call_i) + tool(result_i) per
+         * call: the next request claimed the model had made two separate
+         * single-call turns, and every tool_call_id had been renamed to a
+         * synthesised one. Execution still partitions into contiguous
+         * parallel/sequential batches (the scheduling win is unchanged) —
+         * only the transcript shape is fixed: ONE assistant message with
+         * every tool_call of the turn, then one tool message per result in
+         * issue order. */
         var toolChunks = [];
         var curToolChunk = null;
         for (var tci = 0; tci < stcs.length; tci++) {
@@ -5926,16 +6085,16 @@
             idx: tci,
             name: tsname,
             args: (tstc.arguments && typeof tstc.arguments === 'object') ? tstc.arguments : {},
-            cid: 'call_' + runId + '_' + steps + '_' + tci + '_' + tsname
+            /* Keep the provider's id: endpoints match tool replies by it. */
+            cid: tstc.id ? String(tstc.id) : ('call_' + runId + '_' + steps + '_' + tci + '_' + tsname)
           });
         }
-
+        var turnResults = new Array(stcs.length);
         for (var chi = 0; chi < toolChunks.length; chi++) {
           if (state.cancelled) { stopped = stopped || 'cancelled'; break; }
           var cchunk = toolChunks[chi];
           if (cchunk.isPar && cchunk.items.length > 1) {
             var cLimit = Math.min(Math.max(1, (opts.toolConcurrency | 0) || 4), cchunk.items.length);
-            var parResults = new Array(cchunk.items.length);
             var parNext = 0;
             var parWorkers = [];
             for (var pw = 0; pw < cLimit; pw++) {
@@ -5947,44 +6106,51 @@
                   var pItem = cchunk.items[pIdx];
                   try {
                     var pRes = await execToolWithPolicy(pItem.name, pItem.args, pItem.cid);
-                    parResults[pIdx] = { id: pItem.cid, name: pItem.name, args: pItem.args, result: String(pRes == null ? '' : pRes) };
+                    turnResults[pItem.idx] = { id: pItem.cid, name: pItem.name, args: pItem.args, result: String(pRes == null ? '' : pRes) };
                   } catch (e) {
-                    parResults[pIdx] = { id: pItem.cid, name: pItem.name, args: pItem.args,
-                                         result: 'tool error: ' + String((e && e.message) || e) };
+                    turnResults[pItem.idx] = { id: pItem.cid, name: pItem.name, args: pItem.args,
+                                               result: 'tool error: ' + String((e && e.message) || e) };
                   }
                 }
               })());
             }
             await Promise.all(parWorkers);
-            for (var pri = 0; pri < parResults.length; pri++) {
-              var prItem = parResults[pri];
-              if (!prItem) continue;
-              loopMsgs.push({ role: 'assistant', content: null,
-                              tool_calls: [{ id: prItem.id, type: 'function',
-                                             function: { name: prItem.name, arguments: JSON.stringify(prItem.args) } }] });
-              loopMsgs.push({ role: 'tool', tool_call_id: prItem.id, content: prItem.result });
-            }
-            if (state.cancelled) { stopped = stopped || 'cancelled'; break; }
           } else {
             for (var si = 0; si < cchunk.items.length; si++) {
               if (state.cancelled) { stopped = stopped || 'cancelled'; break; }
               var sItem = cchunk.items[si];
               var stRes = await execToolWithPolicy(sItem.name, sItem.args, sItem.cid);
-              loopMsgs.push({ role: 'assistant', content: null,
-                              tool_calls: [{ id: sItem.cid, type: 'function',
-                                             function: { name: sItem.name, arguments: JSON.stringify(sItem.args) } }] });
-              loopMsgs.push({ role: 'tool', tool_call_id: sItem.cid, content: stRes });
+              turnResults[sItem.idx] = { id: sItem.cid, name: sItem.name, args: sItem.args,
+                                         result: String(stRes == null ? '' : stRes) };
             }
-            if (state.cancelled) { stopped = stopped || 'cancelled'; break; }
           }
+        }
+        /* Emit the turn AFTER it ran: one assistant message, then the
+         * results in the order the model asked for them. A cancelled turn
+         * keeps the calls that actually produced a result. */
+        var emitCalls = [];
+        var emitResults = [];
+        for (var eii = 0; eii < turnResults.length; eii++) {
+          var eItem = turnResults[eii];
+          if (!eItem) continue;
+          emitCalls.push({ id: eItem.id, type: 'function',
+                           function: { name: eItem.name, arguments: JSON.stringify(eItem.args) } });
+          emitResults.push({ role: 'tool', tool_call_id: eItem.id, content: eItem.result });
+        }
+        if (emitCalls.length) {
+          loopMsgs.push({ role: 'assistant', content: null, tool_calls: emitCalls });
+          for (var ri = 0; ri < emitResults.length; ri++) loopMsgs.push(emitResults[ri]);
         }
         /* SPEC §3 checkpoint — after a COMPLETED step, i.e. every tool
          * pair of this round is in the transcript. This payload IS the
          * rehydration unit opts.resumeFrom consumes, so the messages are
          * the loop's real ones (size-capped, oldest dropped first) and
          * the tokens are live. Durable: this is the resume point. */
+        var checkpointMessages = obsCapMessages(loopMsgs, OBS_CHECKPOINT_CAP);
         obsEmit(runId, obsPath, 'checkpoint', stepsTotal, {
-          messages: obsCapMessages(loopMsgs, OBS_CHECKPOINT_CAP),
+          messages: checkpointMessages,
+          _sofuu_resume_unavailable: checkpointMessages._sofuu_incomplete === true ||
+            String(task == null ? '' : task).length > 2000,
           task: clip(String(task == null ? '' : task), 2000),
           /* The EFFECTIVE model, not just the def's. A headless caller passes
            * opts.model, so recording only d.model checkpoints an empty model
@@ -6078,6 +6244,19 @@
         tree.cacheReadTokens += u.cacheReadTokens || 0;
         tree.cacheWriteTokens += u.cacheWriteTokens || 0;
         own.llmCalls++; tree.llmCalls++;
+        /* AG-043 (AUDIT-2026-11-08): the wall budget did not see provider
+         * latency — a 400s call against a 300s wall still ran its tool round
+         * and only stopped at the next loop-top check. The clock is read the
+         * moment the call returns: a run past its wall is finalised here as
+         * stopped: budget_wall (a no-tool round keeps its answer; a
+         * tool round stops before spending more wall time on tools). */
+        if (Date.now() - started > d.budget.maxWallMs) {
+          state.wallOverrun = true;
+          stopped = stopped || 'budget_wall';
+          emit('tool_result', { name: 'system',
+                                result: 'wall budget of ' + d.budget.maxWallMs +
+                                        'ms reached during the provider call' });
+        }
         emit('llm', { round: own.llmCalls, usage: {
           promptTokens: u.promptTokens || 0, completionTokens: u.completionTokens || 0,
           cacheReadTokens: u.cacheReadTokens || 0, cacheWriteTokens: u.cacheWriteTokens || 0 } });
@@ -6279,6 +6458,19 @@
         tree.cacheReadTokens += u.cacheReadTokens || 0;
         tree.cacheWriteTokens += u.cacheWriteTokens || 0;
         own.llmCalls++; tree.llmCalls++;
+        /* AG-043 (AUDIT-2026-11-08): the wall budget did not see provider
+         * latency — a 400s call against a 300s wall still ran its tool round
+         * and only stopped at the next loop-top check. The clock is read the
+         * moment the call returns: a run past its wall is finalised here as
+         * stopped: budget_wall (a no-tool round keeps its answer; a
+         * tool round stops before spending more wall time on tools). */
+        if (Date.now() - started > d.budget.maxWallMs) {
+          state.wallOverrun = true;
+          stopped = stopped || 'budget_wall';
+          emit('tool_result', { name: 'system',
+                                result: 'wall budget of ' + d.budget.maxWallMs +
+                                        'ms reached during the provider call' });
+        }
         emit('llm', { round: own.llmCalls, usage: {
           promptTokens: u.promptTokens || 0, completionTokens: u.completionTokens || 0,
           cacheReadTokens: u.cacheReadTokens || 0, cacheWriteTokens: u.cacheWriteTokens || 0 },
@@ -6832,7 +7024,8 @@
          still gets appended to, which is better than dropping the record. */ }
       var line = JSON.stringify({
         t: Date.now(), runId: res.runId, name: res.name,
-        task: clip(task, 500), answer: clip(res.answer, 500),
+        task: redactLogText(clip(task, 500)),
+        answer: redactLogText(clip(res.answer, 500)),
         steps: res.steps, stopped: res.stopped,
         usage: res.usage, subRuns: (res.subRuns || []).length,
         /* transcript is deliberately absent: run logs are a usage ledger,

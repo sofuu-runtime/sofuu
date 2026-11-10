@@ -24,6 +24,14 @@
 
 const BLOB_MAGIC: u32 = u32::from_le_bytes(*b"SML1");
 const BLOB_VERSION: u32 = 1;
+/// AUDIT-2026-11-08 §1 (binary budget): the same container with the weights
+/// stored as IEEE half precision. The five advisory gates (alloc, freshness,
+/// compaction, relevance, supervisor) are MLPs whose scores move by well under
+/// a percent at a 10-bit mantissa, and this halves ~250 KB of committed
+/// weights. Build-time conversion only — the committed .f32 files stay the
+/// source of truth, and version 1 blobs still load (the integrity test reads
+/// one).
+pub const BLOB_VERSION_F16: u32 = 2;
 const HEADER_LEN: usize = 7 * 4;
 
 #[derive(Clone, Debug)]
@@ -42,6 +50,41 @@ pub const fn param_count(in_dim: u32, h1: u32, h2: u32) -> u32 {
 
 /// Standard CRC32 (IEEE 802.3, reflected, poly 0xEDB88320) — bitwise, no
 /// table: runs once per model load over ~34 KiB, speed is irrelevant.
+/// IEEE 754 half -> single. Every f16 value has an exact f32 value, so this
+/// reconstructs it rather than approximating: normals are 1.mant * 2^(e-15)
+/// (a power-of-two scale, which is exact), subnormals are mant * 2^-24, and
+/// the special encodings map to inf / NaN. Written with magnitudes instead of
+/// hand-rolled exponent rebiasing, which got the subnormal bias wrong once
+/// (the round-trip test caught it).
+pub fn f16_to_f32(h: u16) -> f32 {
+    let neg = h & 0x8000 != 0;
+    let exp = (h >> 10) & 0x1f;
+    let mant = (h & 0x3ff) as f32;
+    let mag = match exp {
+        0 => mant * 5.960_464_5e-8, // subnormal: mant * 2^-24
+        0x1f => {
+            if mant == 0.0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        }
+        _ => (1.0 + mant / 1024.0) * exp2i(exp as i32 - 15),
+    };
+    if neg {
+        -mag
+    } else {
+        mag
+    }
+}
+
+/// 2^n for the small n an f16 exponent can hold (|n| <= 24). A table-free
+/// power of two is exact, unlike powi's libm path on some targets.
+fn exp2i(n: i32) -> f32 {
+    debug_assert!((-126..=127).contains(&n));
+    f32::from_bits(((n + 127) as u32) << 23)
+}
+
 pub fn crc32_ieee(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
@@ -200,9 +243,11 @@ impl TinyMlp {
         if magic != BLOB_MAGIC {
             return Err("bad magic");
         }
-        if version != BLOB_VERSION {
-            return Err("unsupported version");
-        }
+        let half = match version {
+            BLOB_VERSION => false,
+            BLOB_VERSION_F16 => true,
+            _ => return Err("unsupported version"),
+        };
         if in_dim == 0 || h1 == 0 || h2 == 0 {
             return Err("zero dimension");
         }
@@ -210,19 +255,30 @@ impl TinyMlp {
             return Err("param count does not match dims");
         }
         let weight_bytes = &bytes[HEADER_LEN..];
-        if weight_bytes.len() != params as usize * 4 {
+        let width = if half { 2 } else { 4 };
+        if weight_bytes.len() != params as usize * width {
             return Err("truncated weights");
         }
         if crc32_ieee(weight_bytes) != crc {
             return Err("crc mismatch");
         }
         let mut w = Vec::with_capacity(params as usize);
-        for c in weight_bytes.chunks_exact(4) {
-            let v = f32::from_le_bytes(c.try_into().unwrap());
-            if !v.is_finite() {
-                return Err("non-finite weight");
+        if half {
+            for c in weight_bytes.chunks_exact(2) {
+                let v = f16_to_f32(u16::from_le_bytes([c[0], c[1]]));
+                if !v.is_finite() {
+                    return Err("non-finite weight");
+                }
+                w.push(v);
             }
-            w.push(v);
+        } else {
+            for c in weight_bytes.chunks_exact(4) {
+                let v = f32::from_le_bytes(c.try_into().unwrap());
+                if !v.is_finite() {
+                    return Err("non-finite weight");
+                }
+                w.push(v);
+            }
         }
         Ok(Self { in_dim, h1, h2, w })
     }
@@ -267,6 +323,40 @@ pub fn clamp_trust_region(w: &mut [f32], w0: &[f32], rel: f32) -> bool {
 mod tests {
     use super::*;
 
+    /// f32 -> f16 (round to nearest even). Test-only twin of the encoder in
+    /// build.rs: the build script cannot import the crate, and the decoder
+    /// must be exercised against a real encoding rather than a hand-made one.
+    fn f16_bits(v: f32) -> u16 {
+        let bits = v.to_bits();
+        let sign = ((bits >> 16) & 0x8000) as u16;
+        let exp = ((bits >> 23) & 0xff) as i32;
+        let mant = bits & 0x007f_ffff;
+        if exp == 0xff {
+            return sign | 0x7c00 | if mant != 0 { 0x200 } else { 0 };
+        }
+        let e = exp - 127 + 15;
+        if e >= 0x1f {
+            return sign | 0x7c00;
+        }
+        if e <= 0 {
+            if e < -10 {
+                return sign;
+            }
+            let m = mant | 0x0080_0000;
+            let shift = (14 - e) as u32;
+            let half = (m >> shift) as u16;
+            let rem = m & ((1u32 << shift) - 1);
+            let halfway = 1u32 << (shift - 1);
+            let up = rem > halfway || (rem == halfway && (half & 1) == 1);
+            return sign | half | up as u16;
+        }
+        let mut half = ((e as u16) << 10) | (mant >> 13) as u16;
+        let rem = mant & 0x1fff;
+        if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) {
+            half += 1;
+        }
+        sign | half
+    }
     fn demo_net() -> TinyMlp {
         // 4 → 3 → 2 → 1 = 3*4+3 + 2*3+2 + 2+1 = 26 params
         let w: Vec<f32> = (0..26).map(|i| (i as f32) * 0.05 - 0.6).collect();
@@ -291,6 +381,130 @@ mod tests {
         assert_eq!(back.h2, 2);
     }
 
+
+    /// AUDIT-2026-11-08 §1: the shipped blobs are version 2 (f16 weights).
+    /// Nothing else exercises that decoder at runtime — the committed .f32
+    /// files are version 1 — so pin it here: a v2 container must load, expose
+    /// the same architecture, and land within f16 rounding of the f32 net.
+    #[test]
+    fn f16_blob_loads_and_tracks_the_f32_net() {
+        let net = demo_net();
+        let f32_blob = net.to_blob();
+        let mut weights = Vec::new();
+        for v in &net.w {
+            weights.extend_from_slice(&f16_bits(*v).to_le_bytes());
+        }
+        let mut blob = Vec::new();
+        for v in [
+            BLOB_MAGIC,
+            BLOB_VERSION_F16,
+            net.in_dim,
+            net.h1,
+            net.h2,
+            net.w.len() as u32,
+            crc32_ieee(&weights),
+        ] {
+            blob.extend_from_slice(&v.to_le_bytes());
+        }
+        blob.extend_from_slice(&weights);
+        let back = TinyMlp::from_blob(&blob).expect("v2 blob loads");
+        assert_eq!((back.in_dim, back.h1, back.h2), (4, 3, 2));
+        assert_eq!(back.w.len(), net.w.len());
+        for (a, b) in back.w.iter().zip(net.w.iter()) {
+            let tol = a.abs().max(1.0) * 1e-3;
+            assert!((a - b).abs() <= tol, "f16 weight diverged: {a} vs {b}");
+        }
+        // Same scores: a forward pass over the two nets agrees to ~1e-3.
+        let x = [0.2f32, -0.4, 0.7, 0.1];
+        assert!((back.forward(&x) - net.forward(&x)).abs() < 5e-3);
+        assert_eq!(f32_blob.len(), 28 + net.w.len() * 4);
+    }
+
+    /// Round-trip through half precision, and the subnormal / zero / sign
+    /// edges the decoder has to special-case.
+    #[test]
+    fn f16_decoder_roundtrip() {
+        /* Half the f16 grid: relative for normals, absolute for the subnormal
+         * range (1e-5 sits at ~168 steps of 2^-24, so its error is 4.6e-8). */
+        for v in [0.0f32, -0.0, 1.0, -1.0, 0.5, 65_504.0, 1e-5, -1e-5, 0.333_251_95] {
+            let back = f16_to_f32(f16_bits(v));
+            let tol = v.abs().max(1e-4) * 1e-3;
+            assert!((back - v).abs() <= tol, "{v} -> {back}");
+        }
+        assert_eq!(f16_to_f32(0x0000), 0.0);
+        assert!(f16_to_f32(0x8000).is_sign_negative());
+        assert!(f16_to_f32(0x7c00).is_infinite());
+        assert!(f16_to_f32(0xfc00).is_infinite() && f16_to_f32(0xfc00).is_sign_negative());
+        assert!(f16_to_f32(0x7e00).is_nan());
+        // Smallest positive subnormal is exactly 2^-24.
+        assert_eq!(f16_to_f32(0x0001), f32::from_bits(0x3380_0000));
+    }
+
+    /// The shipped blobs are version 2 (f16) conversions of the committed
+    /// .f32 files (AUDIT-2026-11-08 §1, binary budget). Nothing else in the
+    /// test suite reads a v2 blob, so this is the guard that the conversion
+    /// did not change any model: every weight must sit within one f16 ulp of
+    /// the committed value, and a forward pass must agree to ~1e-2 (the nets
+    /// are advisory scorers; a decode bug would show up as a wild delta).
+    #[test]
+    fn shipped_f16_blobs_track_the_committed_f32_blobs() {
+        let cases: [(&str, &[u8], &[u8]); 5] = [
+            (
+                "alloc",
+                include_bytes!("alloc/weights_v2.f32"),
+                include_bytes!(concat!(env!("OUT_DIR"), "/ml_alloc_weights_v2.f32.gz")),
+            ),
+            (
+                "relevance",
+                include_bytes!("relevance/weights_v2.f32"),
+                include_bytes!(concat!(env!("OUT_DIR"), "/ml_relevance_weights_v2.f32.gz")),
+            ),
+            (
+                "compaction",
+                include_bytes!("compaction/weights_v2.f32"),
+                include_bytes!(concat!(env!("OUT_DIR"), "/ml_compaction_weights_v2.f32.gz")),
+            ),
+            (
+                "freshness",
+                include_bytes!("freshness/weights_v2.f32"),
+                include_bytes!(concat!(env!("OUT_DIR"), "/ml_freshness_weights_v2.f32.gz")),
+            ),
+            (
+                "supervisor",
+                include_bytes!("supervisor/weights_v2.f32"),
+                include_bytes!(concat!(env!("OUT_DIR"), "/ml_supervisor_weights_v2.f32.gz")),
+            ),
+        ];
+        for (name, raw, gz) in cases {
+            let want = TinyMlp::from_blob(raw).unwrap_or_else(|e| panic!("{name}: committed blob: {e}"));
+            let shipped = crate::shipped::inflate_static(gz, "ml weights");
+            let got = TinyMlp::from_blob(shipped).unwrap_or_else(|e| panic!("{name}: shipped v2 blob: {e}"));
+            assert_eq!(
+                (got.in_dim, got.h1, got.h2),
+                (want.in_dim, want.h1, want.h2),
+                "{name}: architecture changed"
+            );
+            assert_eq!(got.w.len(), want.w.len(), "{name}: param count changed");
+            let mut worst = 0.0f32;
+            for (a, b) in got.w.iter().zip(want.w.iter()) {
+                assert!(a.is_finite(), "{name}: decoded a non-finite weight");
+                let scale = b.abs().max(1e-3);
+                worst = worst.max((a - b).abs() / scale);
+            }
+            assert!(worst < 1e-2, "{name}: worst relative weight drift {worst}");
+            /* Same story through the network: zero input, then a mid-range
+             * one. The outputs are advisory scores, so 1e-2 absolute is
+             * generous and still catches an index/stride mistake. */
+            let mut x = vec![0.0f32; got.in_dim as usize];
+            let z0 = (got.forward(&x), want.forward(&x));
+            assert!((z0.0 - z0.1).abs() < 1e-2, "{name}: zero-input drift {z0:?}");
+            for (i, v) in x.iter_mut().enumerate() {
+                *v = 0.1 + (i as f32) * 0.03;
+            }
+            let z1 = (got.forward(&x), want.forward(&x));
+            assert!((z1.0 - z1.1).abs() < 1e-2, "{name}: mid-range drift {z1:?}");
+        }
+    }
     #[test]
     fn blob_corruption_refused() {
         let net = demo_net();

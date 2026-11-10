@@ -101,6 +101,12 @@ unsafe extern "C" fn engine_interrupt_cb(
     _rt: *mut JSRuntime,
     _opaque: *mut std::ffi::c_void,
 ) -> c_int {
+    /* CLI-062: the REPL's SIGINT handler only parks a flag in sofuu-ffi
+     * (async-signal-safe); this poll is the one place it can abort the
+     * script. Checked first so a user Ctrl-C is never reported as E_TIMEOUT. */
+    if sofuu_ffi::poll_user_interrupt() {
+        return 1;
+    }
     if deadline::poll_expired() != 0 {
         return 1;
     }

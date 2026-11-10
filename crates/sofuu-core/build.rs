@@ -88,6 +88,103 @@ fn build_stamp(repo: &Path) -> String {
     }
 }
 
+
+// ── f16 compaction of the TinyMlp weight blobs (AUDIT-2026-11-08 §1) ─────
+// The container is a 7 x u32 little-endian header (magic "SML1", version,
+// in_dim, h1, h2, params, crc32) followed by params f32 weights. Version 2
+// stores the same weights as IEEE half precision: half the bytes, and the five
+// advisory gates are unaffected at a 10-bit mantissa. Conversion happens here
+// so the committed .f32 files stay the source of truth for the tests.
+const ML_BLOB_HEADER: usize = 7 * 4;
+const ML_BLOB_MAGIC: u32 = u32::from_le_bytes(*b"SML1");
+const ML_BLOB_VERSION: u32 = 1;
+const ML_BLOB_VERSION_F16: u32 = 2;
+
+fn blob_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
+
+/// Round-to-nearest-even f32 -> f16. The trainer emits no NaNs; from_blob
+/// rejects one if it ever appeared.
+fn f32_to_f16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if mant != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        let m = mant | 0x0080_0000;
+        let shift = (14 - e) as u32;
+        let half = (m >> shift) as u16;
+        let rem = m & ((1u32 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        let up = rem > halfway || (rem == halfway && (half & 1) == 1);
+        return sign | half | up as u16;
+    }
+    let mut half = ((e as u16) << 10) | (mant >> 13) as u16;
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) {
+        half += 1;
+    }
+    sign | half
+}
+
+/// Rewrite one TinyMlp blob with f16 weights. None when the input is not a
+/// version-1 TinyMlp blob (the caller then refuses to stage it).
+fn f16_blob(raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.len() < ML_BLOB_HEADER {
+        return None;
+    }
+    let mut hdr = [0u32; 7];
+    for (i, h) in hdr.iter_mut().enumerate() {
+        *h = u32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().ok()?);
+    }
+    let [magic, version, in_dim, h1, h2, params, crc] = hdr;
+    if magic != ML_BLOB_MAGIC || version != ML_BLOB_VERSION {
+        return None;
+    }
+    let body = &raw[ML_BLOB_HEADER..];
+    if body.len() != params as usize * 4 || blob_crc32(body) != crc {
+        return None;
+    }
+    let mut weights = Vec::with_capacity(body.len() / 2);
+    for c in body.chunks_exact(4) {
+        let v = f32::from_le_bytes(c.try_into().ok()?);
+        weights.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+    }
+    let mut out = Vec::with_capacity(ML_BLOB_HEADER + weights.len());
+    for v in [
+        ML_BLOB_MAGIC,
+        ML_BLOB_VERSION_F16,
+        in_dim,
+        h1,
+        h2,
+        params,
+        blob_crc32(&weights),
+    ] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&weights);
+    Some(out)
+}
+
 fn main() {
     // Declare the cfg so the `unexpected_cfgs` lint stays quiet in both
     // configurations (see Cargo's check-cfg docs).
@@ -281,10 +378,13 @@ fn main() {
 
     // ── Learned-model weight blobs, embedded gzipped ─────────────────────
     // ~320 KB of committed weights sat raw in .rodata. They compress poorly
-    // (5% for the f32 nets, 21% for the .sem projectors) but against a 5.5 MiB
-    // cap that is ~23 KB of headroom, and each blob is inflated once, lazily,
-    // behind the OnceLock that already guards its model. Five modules ship a
-    // file called weights_v2.f32, so the staged names are made unique.
+    // (5% for the f32 nets, 21% for the .sem projectors), so each blob is
+    // gzipped here and inflated once, lazily, behind the OnceLock that already
+    // guards its model. The five TinyMlp nets are additionally stored as f16
+    // (see f16_blob below): halving 250 KB of weights bought back more than
+    // the 5.5 MiB cap could absorb after the 2026-11 audit remediation, and a
+    // 10-bit mantissa is invisible to advisory gates. Five modules ship a file
+    // called weights_v2.f32, so the staged names are made unique.
     for (src, dst) in [
         ("src/ml/relevance/weights_v2.f32", "ml_relevance_weights_v2.f32.gz"),
         ("src/ml/supervisor/weights_v2.f32", "ml_supervisor_weights_v2.f32.gz"),
@@ -300,6 +400,15 @@ fn main() {
         let raw = read_stable(&path).unwrap_or_else(|e| {
             panic!("{src} must exist (embedded by the binary): {e}")
         });
+        /* The five TinyMlp nets ship as v2 (f16) blobs; the .sem projectors
+         * keep their own format and are staged as-is. */
+        let raw = if src.ends_with("weights_v2.f32") {
+            f16_blob(&raw).unwrap_or_else(|| {
+                panic!("{src} must be a version-1 TinyMlp blob with a valid CRC")
+            })
+        } else {
+            raw
+        };
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
         enc.write_all(&raw).expect("gzip embedded weights");
         let gz = enc.finish().expect("finish gzip embedded weights");

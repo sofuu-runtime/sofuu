@@ -43,6 +43,7 @@ ENTRIES=(
     sofuu_add_f32
     sofuu_gemm_q4_k_b8
     sofuu_gemm_q4_k_b8_q8
+    sofuu_gemm_q4_k_b8_q8_t4
     sofuu_gemm_q6_k_b8
     sofuu_gemm_q8_0_b8
     sofuu_gemm_f32_b8

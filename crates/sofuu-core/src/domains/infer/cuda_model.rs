@@ -712,8 +712,17 @@ impl CudaModel {
             let n_vals = n_tokens * cols;
             e.quantize_q8_1(x, self.xq_b, self.xd_b, self.xs_b, self.xs16_b, n_vals)
                 .map_err(|err| format!("prefill quantize ({n_vals}): {err}"))?;
+            // SOFUU_CUDA_PREFILL_TILE=0 selects the older row-quad tiling; the
+            // four-rows-by-four-tokens tile reuses each weight load across four
+            // tokens, but it is the riskier register budget, so keep the
+            // measured fallback one environment variable away.
+            let tiled = std::env::var("SOFUU_CUDA_PREFILL_TILE")
+                .map(|v| v != "0")
+                .unwrap_or(true);
             return e
-                .gemm_q4_k_b8_q8(w, self.xq_b, self.xd_b, self.xs_b, y, rows, cols, n_tokens)
+                .gemm_q4_k_b8_q8(
+                    w, self.xq_b, self.xd_b, self.xs_b, y, rows, cols, n_tokens, tiled,
+                )
                 .map_err(|err| format!("gemm q4_K b8 x q8_1: {err}"));
         }
         e.gemm_b8(quant, w, x, y, rows, cols, n_tokens)

@@ -21,7 +21,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 /// Every kernel name the checked-in PTX must export. Kept in one place so the
 /// generator script, the Rust init check and the tests cannot drift.
-pub const PTX_ENTRIES: [&str; 30] = [
+pub const PTX_ENTRIES: [&str; 31] = [
     "sofuu_gemv_q8_0",
     "sofuu_gemv_q4_k",
     "sofuu_gemv_q6_k",
@@ -45,6 +45,7 @@ pub const PTX_ENTRIES: [&str; 30] = [
     "sofuu_add_f32",
     "sofuu_gemm_q4_k_b8",
     "sofuu_gemm_q4_k_b8_q8",
+    "sofuu_gemm_q4_k_b8_q8_t4",
     "sofuu_gemm_q6_k_b8",
     "sofuu_gemm_q8_0_b8",
     "sofuu_gemm_f32_b8",
@@ -2225,6 +2226,7 @@ mod imp {
             rows: usize,
             cols: usize,
             n_tokens: usize,
+            tiled: bool,
         ) -> Result<(), CudaError> {
             let Some(row_bytes) = Quant::Q4K.row_bytes(cols) else {
                 return Err(CudaError(format!("q4_K does not accept cols={cols}")));
@@ -2277,21 +2279,31 @@ mod imp {
                 &mut c as *mut i32 as *mut c_void,
                 &mut n as *mut i32 as *mut c_void,
             ];
-            // One warp per (token, row-quad), eight warps per block.
-            let quads = (rows + 3) / 4;
-            let blocks = n_tokens
-                .checked_mul(quads)
-                .and_then(|v| v.checked_add(7))
-                .map(|v| v / 8)
-                .ok_or_else(|| CudaError("gemm_q4_k_b8_q8 grid overflow".into()))?;
+            let blocks = if tiled {
+                // Four rows x four tokens per warp.
+                let rq = (rows + 3) / 4;
+                let tq = (n_tokens + 3) / 4;
+                rq.checked_mul(tq)
+                    .and_then(|v| v.checked_add(7))
+                    .map(|v| v / 8)
+                    .ok_or_else(|| CudaError("gemm_q4_k_b8_q8_t4 grid overflow".into()))?
+            } else {
+                // One warp per (token, row-quad), eight warps per block.
+                let quads = (rows + 3) / 4;
+                n_tokens
+                    .checked_mul(quads)
+                    .and_then(|v| v.checked_add(7))
+                    .map(|v| v / 8)
+                    .ok_or_else(|| CudaError("gemm_q4_k_b8_q8 grid overflow".into()))?
+            };
             let grid = u32::try_from(blocks)
                 .map_err(|_| CudaError(format!("gemm_q4_k_b8_q8 grid {blocks} exceeds u32")))?;
-            self.launch(
-                "sofuu_gemm_q4_k_b8_q8",
-                (grid, 1, 1),
-                (256, 1, 1),
-                &mut params,
-            )
+            let entry = if tiled {
+                "sofuu_gemm_q4_k_b8_q8_t4"
+            } else {
+                "sofuu_gemm_q4_k_b8_q8"
+            };
+            self.launch(entry, (grid, 1, 1), (256, 1, 1), &mut params)
         }
 
         /// RMSNorm over `rows` consecutive rows of `n` values.
@@ -2924,6 +2936,7 @@ mod imp {
             _rows: usize,
             _cols: usize,
             _n_tokens: usize,
+            _tiled: bool,
         ) -> Result<(), CudaError> {
             Err(CudaError("CUDA backend is Linux-only".into()))
         }

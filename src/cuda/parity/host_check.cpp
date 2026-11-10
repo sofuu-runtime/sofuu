@@ -754,8 +754,8 @@ void test_gemm_q4_k_b8_q8(uint32_t &seed) {
         sofuu_ref::quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(),
                                  xs16.data(), n_tokens * cols);
         std::vector<float> got((size_t)n_tokens * rows, 0.0f);
-        sofuu_host_gemm_q4_k_b8_q8(w.data(), xq.data(), xd.data(), xs.data(),
-                                   got.data(), rows, cols, n_tokens);
+        sofuu_host_gemm_q4_k_b8_q8_t4(w.data(), xq.data(), xd.data(), xs.data(),
+                                      got.data(), rows, cols, n_tokens);
         int worst = 0;
         for (int t = 0; t < n_tokens; ++t) {
             for (int r = 0; r < rows; ++r) {
@@ -768,7 +768,7 @@ void test_gemm_q4_k_b8_q8(uint32_t &seed) {
             }
         }
         char name[64];
-        std::snprintf(name, sizeof(name), "b8_q4_k_q8(%dtok)", n_tokens);
+        std::snprintf(name, sizeof(name), "b8_q4_k_q8_t4(%dtok)", n_tokens);
         report(name, worst == 0, (double)worst, 0.0, (double)got[0]);
     }
 }

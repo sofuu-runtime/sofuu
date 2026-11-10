@@ -1712,6 +1712,117 @@ void sofuu_gemm_q4_k_b8_q8(const unsigned char *__restrict__ w,
     }
 }
 
+// ── Prefill q4_K, R rows x T tokens per warp ───────────────────────────────
+//
+// The row-quad kernel above reads every weight row once per token: with T=1 a
+// chunk of n tokens makes n passes over the matrix, so prefill traffic is
+// prompt_len x matrix size. A naive "one row, one accumulator per token" cut
+// that traffic 8x and came out SLOWER (26.8 -> 17.5 GB/s), because it left one
+// weight load in flight where the decode kernel keeps six -- a memory-bound
+// kernel turned latency-bound.
+//
+// This one tiles both axes and keeps the loads in flight: a warp owns R=4 rows
+// and T=4 tokens, issues all four weight chunks back to back, then walks the
+// tokens loading their activation chunks. Traffic per warp is 4 weight rows and
+// 4 activation rows for 16 dots -- (R+T)/(R*T) = 0.5 units per dot against 1.25
+// for the row-quad and 2.0 for a single (token, row) -- which puts the weights
+// at one read per chunk instead of one per token.
+//
+// Registers: 4 weight u128 (16) + one token's activation pair (8) + R*T
+// accumulators (16) + 4 row bases. That is the whole budget, so the token loop
+// reloads its activation pair per token instead of holding four of them.
+extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4)
+void sofuu_gemm_q4_k_b8_q8_t4(const unsigned char *__restrict__ w,
+                              const signed char *__restrict__ xq,
+                              const float *__restrict__ xd,
+                              const int *__restrict__ xs,
+                              float *__restrict__ y, int rows, int cols,
+                              int n_tokens) {
+    const int R = 4, T = 4;
+    if (n_tokens <= 0) return;
+    unsigned int tid = sofuu_tid_x();
+    int warp = (int)(tid >> 5);
+    int lane = (int)(tid & 31u);
+    int idx = (int)sofuu_ctaid_x() * 8 + warp;
+    int tquads = (n_tokens + T - 1) / T;
+    int tq = idx % tquads;
+    int rq = idx / tquads;
+    int row0 = rq * R;
+    int tok0 = tq * T;
+    if (row0 >= rows) return;
+    int nrows = rows - row0;
+    if (nrows > R) nrows = R;
+    int ntok = n_tokens - tok0;
+    if (ntok > T) ntok = T;
+    int nb = cols / SOFUU_QK_K;
+    const int nb32 = cols / 32;
+    const int chunk = lane & 7;
+    const int bgrp = lane >> 3;
+    const int k = chunk >> 1;
+
+    const unsigned char *roww[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        roww[r] = w + (unsigned long long)(row0 + r) *
+                          (unsigned long long)nb * SOFUU_Q4_K_BYTES;
+
+    float acc[R][T];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < T; ++t) acc[r][t] = 0.0f;
+
+    for (int b = bgrp; b < nb; b += 4) {
+        // Every row's weight chunk issues before the first dp4a, so the warp
+        // has R independent loads covering DRAM latency.
+        sofuu_u128 wq[R];
+        const sofuu_block_q4_K *blk[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (r >= nrows) break;
+            blk[r] = (const sofuu_block_q4_K *)(
+                roww[r] + (unsigned long long)b * SOFUU_Q4_K_BYTES);
+            sofuu_q4k_w_load(blk[r], chunk, &wq[r]);
+        }
+        int ilo = b * 8 + 2 * k;
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            if (t >= ntok) break;
+            int tok = tok0 + t;
+            sofuu_u128 xlo, xhi;
+            sofuu_q4k_x_load(xq + (unsigned long long)tok *
+                                      (unsigned long long)cols +
+                                 (unsigned long long)b * 256,
+                             0, chunk, &xlo, &xhi);
+            const float *xdt = xd + (unsigned long long)tok *
+                                        (unsigned long long)nb32;
+            const int *xst = xs + (unsigned long long)tok *
+                                      (unsigned long long)nb32;
+            float sx0 = xdt[ilo], sx1 = xdt[ilo + 1];
+            int si0 = xst[ilo], si1 = xst[ilo + 1];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                if (r >= nrows) break;
+                acc[r][t] += sofuu_q4k_chunk32_compute(wq[r], xlo, xhi, blk[r],
+                                                       chunk, sx0, si0, sx1, si1);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (r >= nrows) break;
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            if (t >= ntok) break;
+            float total = sofuu_warp_sum(acc[r][t]);
+            if (lane == 0)
+                y[(unsigned long long)(tok0 + t) * (unsigned long long)rows +
+                  (unsigned long long)(row0 + r)] = total;
+        }
+    }
+}
+
 // One block = eight warps = eight (token, row) dots.
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4)
 void sofuu_gemm_q4_k_b8(const unsigned char *__restrict__ w, const float *__restrict__ x, float *__restrict__ y,
@@ -2070,6 +2181,20 @@ extern "C" float sofuu_host_q4_k_dot_q8(const void *w, const signed char *xq,
 // Prefill rows-per-warp mirror: the mapping and the output indexing are the new
 // part, so build it from the already-proven per-row dot rather than restating
 // the nibble math.
+// Same outputs, same reference: the tile only changes which warp does the dot.
+extern "C" void sofuu_host_gemm_q4_k_b8_q8(const unsigned char *w,
+                                           const signed char *xq,
+                                           const float *xd, const int *xs,
+                                           float *y, int rows, int cols,
+                                           int n_tokens);
+extern "C" void sofuu_host_gemm_q4_k_b8_q8_t4(const unsigned char *w,
+                                              const signed char *xq,
+                                              const float *xd, const int *xs,
+                                              float *y, int rows, int cols,
+                                              int n_tokens) {
+    sofuu_host_gemm_q4_k_b8_q8(w, xq, xd, xs, y, rows, cols, n_tokens);
+}
+
 extern "C" void sofuu_host_gemm_q4_k_b8_q8(const unsigned char *w,
                                            const signed char *xq,
                                            const float *xd, const int *xs,

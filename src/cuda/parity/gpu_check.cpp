@@ -1864,7 +1864,7 @@ void test_gemm_q4_k_b8_q8(void *fn_gemm, uint32_t &seed) {
             int r = rows, c = cols, nt = n_tokens;
             std::vector<void *> params = {&dw, &dq, &dd, &ds, &dy,
                                           (void *)&r, (void *)&c, (void *)&nt};
-            unsigned grid = (unsigned)((n_tokens * ((rows + 3) / 4) + 7) / 8);
+            unsigned grid = (unsigned)((rows + 7) / 8);
             if (!launch(fn_gemm, grid, 256, params) ||
                 !download(dy, got.data(), (size_t)n_tokens * rows * sizeof(float))) {
                 return;
@@ -1927,7 +1927,7 @@ void bench_b8_q4_k(void *fn_old, void *fn_new, uint32_t &seed) {
     std::vector<void *> new_params = {&dw, &dq, &dd, &ds, &dy, (void *)&r,
                                       (void *)&c, (void *)&nt};
     unsigned old_grid = (unsigned)((n_tokens * rows + 7) / 8);
-    unsigned new_grid = (unsigned)((n_tokens * ((rows + 3) / 4) + 7) / 8);
+    unsigned new_grid = (unsigned)((rows + 7) / 8);
     const int iters = 20;
     for (int i = 0; i < 2; ++i) {
         if (!launch_async(fn_old, old_grid, 256, old_params) ||

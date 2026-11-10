@@ -70,6 +70,10 @@ data class SoapBubbleSettings(
     val paused: Boolean = false,
     val seed: Float = 7f,
     val maxDpr: Float = 2f,
+    /** Dark page: the film refracts a dark wash and skips the light-theme
+     *  oil coating. Sofuu's dark theme sets this; the reference default is
+     *  light (its app was light-only). */
+    val dark: Boolean = false,
 ) {
     fun normalized(): SoapBubbleSettings = copy(
         radius = radius.clamp(0f, 9999f, 9999f),

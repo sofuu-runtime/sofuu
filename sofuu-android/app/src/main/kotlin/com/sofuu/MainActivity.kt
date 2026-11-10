@@ -28,6 +28,39 @@ import com.sofuu.ui.theme.SofuuTheme
 import java.io.File
 
 /**
+ * The film runs CLEAR — the developer's call after seeing the port live
+ * (2026-11-11): no rainbow iridescence, no chromatic edge fringes, while
+ * the lens effect itself stays (bevel, refraction, white key highlights,
+ * press swell). Mechanism: at iridescence 0 the shader's film term
+ * collapses to neutral Fresnel gray (colour = vec3(incoherent) at strength
+ * 0), and dispersion 0 zeroes the 0.12·glass·dispersion RGB edge split.
+ *
+ * wobble is calmed from the web's 0.4 to 0.15: on formal rows/cards the
+ * ambient breathing read as wavy, misaligned borders on the device.
+ * Press swell is a separate mechanism and keeps the exact web physics.
+ *
+ * ClearDark additionally sets dark=true: the renderer then refracts a
+ * dark page wash and runs the shader's dark-theme path, so cream text
+ * stays legible on the film (the reference hardcoded light because its
+ * app was light-only).
+ *
+ * Both are pure settings overrides — the ported shader/component logic
+ * is untouched, and the selected-state tint washes (accent on active
+ * rows, send button) are deliberate and remain.
+ */
+private val ClearLight = SoapBubbleSettings.lightPreset.copy(
+    iridescence = 0f,
+    dispersion = 0f,
+    wobble = 0.15f,
+)
+private val ClearDark = SoapBubbleSettings().copy(
+    iridescence = 0f,
+    dispersion = 0f,
+    wobble = 0.15f,
+    dark = true,
+)
+
+/**
  * The single activity. Edge-to-edge; the Compose tree insets itself from
  * the system bars. It hosts the Sofuu shell (drawer + chat + composer +
  * settings) over the in-process Sofuu engine (started by the ViewModel).
@@ -77,10 +110,11 @@ class MainActivity : ComponentActivity() {
         setContent {
             val dark = store.resolvedDark(isSystemInDarkTheme())
             SofuuTheme(dark = dark) {
-                // The soap-bubble material wraps the whole shell: light theme
-                // gets the approved light-glass preset, dark theme the web's
-                // rainbow defaults. Every clickable below inherits it.
-                SoapBubbleMaterial(settings = if (dark) SoapBubbleSettings() else SoapBubbleSettings.lightPreset) {
+                // The soap-bubble material wraps the whole shell: clear film
+                // (no rainbow) on both themes — light theme keeps the
+                // light-glass shape, dark theme the web defaults' lens. Every
+                // clickable below inherits it.
+                SoapBubbleMaterial(settings = if (dark) ClearDark else ClearLight) {
                     Surface(color = LocalSofuuColors.current.bgApp, modifier = Modifier.fillMaxSize()) {
                         SofuuApp(store, onPickFiles = ::launchFilePicker, onRequestMic = ::ensureMic)
                     }

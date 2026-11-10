@@ -76,6 +76,7 @@ internal object SoapBubbleGl {
     private var noiseTexture = 0
     private var emptyTexture = 0
     private var lightBackdrop = 0
+    private var darkBackdrop = 0
     private var fbo = 0
     private var colorTexture = 0
     private var atlasWidth = ATLAS_START
@@ -271,7 +272,8 @@ internal object SoapBubbleGl {
         filmTexture = uploadFilmTable()
         noiseTexture = uploadNoise()
         emptyTexture = uploadEmpty()
-        lightBackdrop = uploadBackdrop()
+        lightBackdrop = uploadBackdrop(0xFFFFFF, 0xFAF7F2)
+        darkBackdrop = uploadBackdrop(0x211D19, 0x262219)
         if (!createAtlas(ATLAS_START)) return fail("atlas failed")
 
         GLES30.glDisable(GLES30.GL_DEPTH_TEST)
@@ -404,10 +406,12 @@ internal object SoapBubbleGl {
         return ids[0]
     }
 
-    /** A 64 x 64 light card wash used as the mirrored surroundings behind a control. */
-    private fun uploadBackdrop(): Int {
-        val top = Color.rgb(0xFF, 0xFF, 0xFF)
-        val bottom = Color.rgb(0xFA, 0xF7, 0xF2)
+    /** A 64 x 64 card wash used as the mirrored surroundings behind a control.
+     *  Light pages get the reference's near-white wash; dark pages get a dark
+     *  wash so the film reads as dark glass and light text stays legible. */
+    private fun uploadBackdrop(topColor: Int, bottomColor: Int): Int {
+        val top = topColor
+        val bottom = bottomColor
         val bitmap = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bitmap)
         val paint = Paint().apply {
@@ -614,7 +618,7 @@ internal object SoapBubbleGl {
 
         GLES30.glViewport(item.x, item.y, item.canvasW, item.canvasH)
         GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, lightBackdrop)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, if (s.dark) darkBackdrop else lightBackdrop)
 
         uniform.f2("uResolution", atlasWidth.toFloat(), atlasHeight.toFloat())
         uniform.f2("uCenter", centerX, centerY)
@@ -665,7 +669,7 @@ internal object SoapBubbleGl {
         uniform.f4("uSoapPaletteCyan", paint.paletteCyan)
         uniform.f4("uSoapPaletteBlue", paint.paletteBlue)
         uniform.f4("uSoapPaletteViolet", paint.paletteViolet)
-        uniform.i1("uLightTheme", 1)
+        uniform.i1("uLightTheme", if (s.dark) 0 else 1)
         uniform.i1("uWindowLight", if (s.windowLight) 1 else 0)
         uniform.i1("uKeyLight", if (s.keyLight) 1 else 0)
         uniform.i1("uWindowTwin", if (s.windowTwin) 1 else 0)

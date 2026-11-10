@@ -182,7 +182,7 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
                             .fillMaxWidth()
                             .horizontalScroll(rememberScrollState())
                             .padding(horizontal = 16.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
                         TABS.forEach { t ->
                             val active = t == tab
@@ -289,8 +289,8 @@ private fun Segmented(options: List<String>, selected: String, onSelect: (String
             .clip(RoundedCornerShape(10.dp))
             .background(c.monoFieldBg)
             .border(1.dp, c.border, RoundedCornerShape(10.dp))
-            .padding(3.dp),
-        horizontalArrangement = Arrangement.spacedBy(3.dp),
+            .padding(4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         options.forEach { o ->
@@ -1166,6 +1166,7 @@ private fun ModelsPane(store: AppStore) {
                                 .fillMaxWidth()
                                 .heightIn(max = 220.dp)
                                 .verticalScroll(rememberScrollState()),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
                             models.forEach { m ->
                                 val active = m == p.model && p.name == state.config?.active
@@ -1383,7 +1384,7 @@ private fun ProvidersPane(store: AppStore) {
                                 )
                             }
                         }
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             if (!isActive) {
                                 SoapBubbleButton(
                                     onClick = { removeNote = store.removeProvider(p.name) },
@@ -1447,7 +1448,7 @@ private fun ProvidersPane(store: AppStore) {
                         Spacer(Modifier.height(10.dp))
                         TextFieldRow("endpoint", ep, "https://…", { ep = it }, Modifier.padding(bottom = 10.dp))
                         TextFieldRow("model", md, "model id", { md = it }, Modifier.padding(bottom = 12.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             SmallButton(c.accent, c.accentContrast, "Save Changes") {
                                 if (ep.isNotBlank()) {
                                     store.patchProvider(p.name, model = md, endpoint = ep, profile = pf)
@@ -1493,7 +1494,7 @@ private fun ProvidersPane(store: AppStore) {
                         }
                     } else {
                         TextFieldRow("key", keyText, "paste new API key", { keyText = it }, Modifier.padding(bottom = 12.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             SmallButton(c.accent, c.accentContrast, "Save key") {
                                 if (keyText.isNotBlank()) {
                                     store.setProviderKey(p.name, keyText.trim())
@@ -1825,7 +1826,7 @@ private fun BrainPane(store: AppStore) {
                     )
                 }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 SmallButton(c.accent, c.accentContrast, "Refresh") { reload++ }
                 SmallButton(c.accent, c.accentContrast, "Consolidate") {
                     scope.launch {
@@ -1977,7 +1978,7 @@ private fun BrainPane(store: AppStore) {
                     )
                 }
                 CardDivider()
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     SmallButton(c.accent, c.accentContrast, "Label wrong") {
                         scope.launch {
                             val r = withContext(Dispatchers.IO) { surface.mlFeedback("wrong") }
@@ -2251,7 +2252,7 @@ private fun AgentsPane(store: AppStore) {
                 fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.textMuted,
                 modifier = Modifier.padding(bottom = 8.dp),
             )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 listOf("sensitive" to "Writes + shell", "all" to "Every tool", "none" to "Never").forEach { (v, label) ->
                     SmallButton(
                         if (approveMode == v) c.accent else c.bgCardHover,
@@ -2302,7 +2303,7 @@ private fun AgentsPane(store: AppStore) {
                 modifier = Modifier.padding(bottom = 8.dp),
             )
             TextFieldRow("task", task, "a task to hand the agent", onChange = { task = it }, modifier = Modifier.padding(bottom = 12.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 SmallButton(
                     if (running) c.bgCardHover else c.accent,
                     if (running) c.textFaint else c.accentContrast,
@@ -2357,7 +2358,7 @@ private fun AgentsPane(store: AppStore) {
                     fontSize = 13.sp, fontWeight = FontWeight.Bold, color = c.warn,
                 )
                 Spacer(Modifier.height(6.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     SmallButton(c.bgCardHover, c.text, "Deny") {
                         scope.launch(Dispatchers.IO) { runCatching { surface.resolveAgentApproval(pid, false, false) } }
                         pending = null

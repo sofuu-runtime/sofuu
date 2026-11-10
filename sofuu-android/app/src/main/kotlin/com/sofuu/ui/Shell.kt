@@ -202,9 +202,9 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
             Row(
                 Modifier
                     .weight(1f)
-                    .padding(horizontal = 4.dp)
+                    .padding(horizontal = 10.dp)
                     .horizontalScroll(rememberScrollState()),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 // Pills follow creation order (desktop: task || "Chat N"),
@@ -272,9 +272,9 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                     }
                 }
             }
-            Spacer(Modifier.width(4.dp))
+            Spacer(Modifier.width(12.dp))
             BarIcon(Icons2.Plus, "New chat") { store.newChat() }
-            Spacer(Modifier.width(2.dp))
+            Spacer(Modifier.width(12.dp))
             BarIcon(Icons2.MoreVert, "More") { store.openHistory() }
         }
 
@@ -405,7 +405,7 @@ private fun HomePrompt(subtitle: String?, onPromptSelect: (String) -> Unit = {})
         }
         Column(
             Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             starters.forEach { (title, desc) ->
                 SoapBubbleSurface(
@@ -611,7 +611,7 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                     iconSize = 22.dp,
                 )
             }
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(14.dp))
 
             // Action 1: Create brand new workspace folder on phone
             SoapBubbleSurface(
@@ -634,7 +634,7 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                 }
             }
 
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(14.dp))
 
             // Action 2: Open existing phone folder via DocumentTree picker
             SoapBubbleSurface(
@@ -654,7 +654,7 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                 }
             }
 
-            Spacer(Modifier.height(12.dp))
+            Spacer(Modifier.height(14.dp))
 
             Column(Modifier.verticalScroll(rememberScrollState())) {
                 if (state.workspaces.isEmpty()) {
@@ -662,7 +662,7 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                 }
                 for (ws in state.workspaces) {
                     val active = ws == state.projectDir
-                    Spacer(Modifier.height(2.dp))
+                    Spacer(Modifier.height(12.dp))
                     val rowSettings = if (active) {
                         LocalSoapBubbleSettings.current.copy(tint = c.bgSidebarActive.toCssRgb(), opacity = 0.6f)
                     } else {
@@ -763,6 +763,7 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                     .fillMaxWidth()
                     .heightIn(max = 340.dp)
                     .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
                 state.sessions.sortedByDescending { it.lastSeen }.forEach { s ->
                     Row(
@@ -790,7 +791,7 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                                 Text(ageOf(s.lastSeen), fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
                             }
                         }
-                        Spacer(Modifier.width(6.dp))
+                        Spacer(Modifier.width(12.dp))
                         SoapBubbleButton(
                             onClick = {
                                 onClose()
@@ -915,7 +916,7 @@ private fun ApprovalSheet(approval: Approval, queued: Int = 0, onResolve: (Boole
                 )
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 10.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.padding(top = 10.dp)) {
             SheetButton("Deny", c.bgCardHover, c.text) { onResolve(false, false) }
             SheetButton("Always", c.bgCardHover, c.text) { onResolve(true, true) }
             SheetButton("Allow once", c.accent, Color.White) { onResolve(true, false) }

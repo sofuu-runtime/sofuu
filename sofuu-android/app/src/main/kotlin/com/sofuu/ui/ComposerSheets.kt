@@ -172,20 +172,26 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
         // but not being listed here meant the model sheet could never reach
         // them, and a local-only setup saw just "＋ Add provider".
         if (state.localModels.isNotEmpty()) {
-            state.localModels.forEach { path ->
-                val label = state.localModelLabels[path] ?: fallbackModelLabel(path)
-                SheetRow(label, null, path == state.config?.model) {
-                    store.pickLocalModel(path)
-                    onClose()
+            // 12dp between bubble rows: each film's halo bleeds ~12dp past its
+            // layout, so tighter gaps make adjacent films merge.
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                state.localModels.forEach { path ->
+                    val label = state.localModelLabels[path] ?: fallbackModelLabel(path)
+                    SheetRow(label, null, path == state.config?.model) {
+                        store.pickLocalModel(path)
+                        onClose()
+                    }
                 }
             }
-            Spacer(Modifier.height(4.dp))
+            Spacer(Modifier.height(12.dp))
         }
         if (providers.isNotEmpty()) SheetTitle("Cloud providers")
-        providers.forEach { p ->
-            SheetRow(p.name, p.model.ifEmpty { null }, p.name == state.config?.active) { provider = p.name }
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            providers.forEach { p ->
+                SheetRow(p.name, p.model.ifEmpty { null }, p.name == state.config?.active) { provider = p.name }
+            }
         }
-        Spacer(Modifier.height(4.dp))
+        Spacer(Modifier.height(12.dp))
         // Always offered, not only when the list is empty — otherwise a
         // configured provider leaves no way to add a second one from here.
         SheetRow("＋ Add provider", null, false) { onCloseSheet(store) }
@@ -200,7 +206,7 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
         val prov = provider!!
         val entry = providers.firstOrNull { it.name == prov }
         SheetRow("‹ Providers", null, false) { provider = null }
-        Spacer(Modifier.height(4.dp))
+        Spacer(Modifier.height(12.dp))
         SheetTitle(prov)
         val cached = state.modelsCache[prov]
         val saved = entry?.model.orEmpty()
@@ -209,7 +215,7 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
         cached?.models?.forEach { m -> if (rows.none { it.first == m }) rows.add(m to null) }
         val filtered = rows.filter { search.isEmpty() || it.first.contains(search, ignoreCase = true) }
         if (rows.size > 1) {
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.height(12.dp))
             androidx.compose.foundation.text.BasicTextField(
                 value = search,
                 onValueChange = { search = it },
@@ -261,7 +267,10 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
             )
         }
         if (rows.isNotEmpty()) {
-            LazyColumn(Modifier.heightIn(max = 320.dp).padding(top = 4.dp)) {
+            LazyColumn(
+                Modifier.heightIn(max = 320.dp).padding(top = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
                 items(filtered) { (model, hint) ->
                     SheetRow(model, hint, model == saved && prov == state.config?.active) {
                         store.pickModel(prov, model)
@@ -278,7 +287,7 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
         // LIST exists, and also offer it whenever a search matches nothing,
         // so a typo can never strand the user.
         if (rows.size <= 1 || (filtered.isEmpty() && search.isNotEmpty())) {
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(12.dp))
             SheetTitle("Set a model by hand")
             androidx.compose.foundation.text.BasicTextField(
                 value = manual,
@@ -313,7 +322,7 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
                     }
                 },
             )
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(12.dp))
             SheetButton("Use this model", c.accent, Color.White) {
                 if (manual.isNotBlank()) {
                     store.pickModel(prov, manual.trim())
@@ -335,14 +344,18 @@ private fun onCloseSheet(store: AppStore) {
 @Composable
 private fun EffortSheet(store: AppStore, onClose: () -> Unit = {}) {
     SheetTitle("Thinking effort", onClose)
-    listOf("off", "low", "medium", "high", "max").forEach { e ->
-        SheetRow(
-            if (e == "off") "Off" else e.replaceFirstChar { it.uppercase() },
-            null,
-            store.state.config?.effort == e || (store.state.config?.effort == "" && e == "off"),
-        ) {
-            store.patchConfig(JSONObject().put("effort", if (e == "off") "" else e))
-            onClose()
+    // 12dp between bubble rows: each film's halo bleeds ~12dp past its layout,
+    // so tighter gaps make adjacent films merge.
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        listOf("off", "low", "medium", "high", "max").forEach { e ->
+            SheetRow(
+                if (e == "off") "Off" else e.replaceFirstChar { it.uppercase() },
+                null,
+                store.state.config?.effort == e || (store.state.config?.effort == "" && e == "off"),
+            ) {
+                store.patchConfig(JSONObject().put("effort", if (e == "off") "" else e))
+                onClose()
+            }
         }
     }
 }
@@ -352,15 +365,17 @@ private fun LayersSheet(store: AppStore, onClose: () -> Unit = {}) {
     val state = store.state
     val cfg = state.config
     SheetTitle("Context layers", onClose)
-    ToggleRow("Project memory", "Recall relevant saved memories", cfg?.brain != false) {
-        store.patchConfig(JSONObject().put("brain", !(cfg?.brain != false)))
-    }
-    ToggleRow("Smart context filters", "Adaptive context relevance & compaction", cfg?.ml != false) {
-        store.patchConfig(JSONObject().put("ml", !(cfg?.ml != false)))
-    }
-    val rlm = cfg?.rlm ?: "off"
-    ToggleRow("Reasoning sandbox", rlm, rlm == "on") {
-        store.patchConfig(JSONObject().put("rlm", if (rlm == "on") "off" else "on"))
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        ToggleRow("Project memory", "Recall relevant saved memories", cfg?.brain != false) {
+            store.patchConfig(JSONObject().put("brain", !(cfg?.brain != false)))
+        }
+        ToggleRow("Smart context filters", "Adaptive context relevance & compaction", cfg?.ml != false) {
+            store.patchConfig(JSONObject().put("ml", !(cfg?.ml != false)))
+        }
+        val rlm = cfg?.rlm ?: "off"
+        ToggleRow("Reasoning sandbox", rlm, rlm == "on") {
+            store.patchConfig(JSONObject().put("rlm", if (rlm == "on") "off" else "on"))
+        }
     }
 }
 
@@ -395,13 +410,15 @@ private fun ToggleRow(label: String, hint: String, on: Boolean, onToggle: () -> 
 private fun ModeSheet(store: AppStore, onClose: () -> Unit = {}) {
     val state = store.state
     SheetTitle("Turn mode", onClose)
-    SheetRow("Agent", "Autonomous tools & file edits", state.mode == "agent") {
-        store.setMode("agent")
-        onClose()
-    }
-    SheetRow("Chat only", "Conversation only, no tools", state.mode == "chat") {
-        store.setMode("chat")
-        onClose()
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        SheetRow("Agent", "Autonomous tools & file edits", state.mode == "agent") {
+            store.setMode("agent")
+            onClose()
+        }
+        SheetRow("Chat only", "Conversation only, no tools", state.mode == "chat") {
+            store.setMode("chat")
+            onClose()
+        }
     }
 }
 
@@ -409,20 +426,22 @@ private fun ModeSheet(store: AppStore, onClose: () -> Unit = {}) {
 private fun PermissionsSheet(store: AppStore, onClose: () -> Unit = {}) {
     val state = store.state
     SheetTitle("Tool permissions", onClose)
-    SheetRow("Full access", "All tools run automatically", state.permissions == "full") {
-        store.setPermissions("full")
-        onClose()
-    }
-    SheetRow("Edit only", "Read files & apply edits", state.permissions == "edit") {
-        store.setPermissions("edit")
-        onClose()
-    }
-    SheetRow("Plan mode", "Plan & analyze, no changes", state.permissions == "plan") {
-        store.setPermissions("plan")
-        onClose()
-    }
-    SheetRow("Ask me", "Approve each tool execution", state.permissions == "prompt") {
-        store.setPermissions("prompt")
-        onClose()
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        SheetRow("Full access", "All tools run automatically", state.permissions == "full") {
+            store.setPermissions("full")
+            onClose()
+        }
+        SheetRow("Edit only", "Read files & apply edits", state.permissions == "edit") {
+            store.setPermissions("edit")
+            onClose()
+        }
+        SheetRow("Plan mode", "Plan & analyze, no changes", state.permissions == "plan") {
+            store.setPermissions("plan")
+            onClose()
+        }
+        SheetRow("Ask me", "Approve each tool execution", state.permissions == "prompt") {
+            store.setPermissions("prompt")
+            onClose()
+        }
     }
 }

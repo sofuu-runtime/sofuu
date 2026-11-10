@@ -139,7 +139,7 @@ fun Composer(
                     .fillMaxWidth()
                     .horizontalScroll(rememberScrollState())
                     .padding(bottom = 8.dp),
-                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 images.forEachIndexed { i, url ->
                     Box {
@@ -169,7 +169,7 @@ fun Composer(
 
         // Mode + permissions pills — their own row, just ABOVE the input
         // card (never inside the text field).
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
             Pill(if (mode == "chat") "Chat only" else "Agent", Icons2.Chat) { onSheet(ComposerSheet.Mode) }
             Pill(permissionsLabel(permissions), Icons2.Shield) { onSheet(ComposerSheet.Permissions) }
         }
@@ -248,13 +248,13 @@ fun Composer(
                         modifier = Modifier.weight(1f, fill = false),
                         flexibleLabel = true,
                     ) { onSheet(ComposerSheet.Model) }
-                    Spacer(Modifier.width(6.dp))
+                    Spacer(Modifier.width(12.dp))
                     Pill(effortLabel, null) { onSheet(ComposerSheet.Effort) }
                     Spacer(Modifier.weight(1f))
                     IconAction(Icons2.Attach, "Attach") { onAttach() }
-                    Spacer(Modifier.width(2.dp))
+                    Spacer(Modifier.width(12.dp))
                     IconAction(Icons2.Layers, "Context layers") { onSheet(ComposerSheet.Layers) }
-                    Spacer(Modifier.width(2.dp))
+                    Spacer(Modifier.width(12.dp))
                     // Dictation. Shown only when the active provider could
                     // actually serve audio — Anthropic and local models have
                     // no audio API, so offering the mic there would be a
@@ -266,11 +266,11 @@ fun Composer(
                             if (dictating) "Stop dictation" else "Dictate",
                             active = dictating,
                         ) { onMic() }
-                        Spacer(Modifier.width(2.dp))
+                        Spacer(Modifier.width(12.dp))
                     }
                     Spacer(Modifier.width(8.dp))
                     CtxRing(ctx)
-                    Spacer(Modifier.width(10.dp))
+                    Spacer(Modifier.width(12.dp))
                     if (streaming) {
                         SendButton(Icons2.Stop, c.errStrong) { onCancel() }
                     } else {
@@ -435,7 +435,10 @@ private fun SlashPalette(commands: List<com.sofuu.store.SlashCommand>, activeIdx
             .border(1.dp, c.border, RoundedCornerShape(10.dp))
             .padding(vertical = 4.dp),
     ) {
-        LazyColumn(Modifier.heightIn(max = 190.dp)) {
+        LazyColumn(
+            Modifier.heightIn(max = 190.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             items(commands) { cmd ->
                 val active = commands.indexOf(cmd) == activeIdx
                 val s = LocalSoapBubbleSettings.current

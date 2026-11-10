@@ -21,6 +21,8 @@ import androidx.core.content.ContextCompat
 import com.sofuu.store.AppStore
 import com.sofuu.ui.Notifier
 import com.sofuu.ui.SofuuApp
+import com.sofuu.ui.soapbubble.SoapBubbleMaterial
+import com.sofuu.ui.soapbubble.SoapBubbleSettings
 import com.sofuu.ui.theme.LocalSofuuColors
 import com.sofuu.ui.theme.SofuuTheme
 import java.io.File
@@ -75,8 +77,13 @@ class MainActivity : ComponentActivity() {
         setContent {
             val dark = store.resolvedDark(isSystemInDarkTheme())
             SofuuTheme(dark = dark) {
-                Surface(color = LocalSofuuColors.current.bgApp, modifier = Modifier.fillMaxSize()) {
-                    SofuuApp(store, onPickFiles = ::launchFilePicker, onRequestMic = ::ensureMic)
+                // The soap-bubble material wraps the whole shell: light theme
+                // gets the approved light-glass preset, dark theme the web's
+                // rainbow defaults. Every clickable below inherits it.
+                SoapBubbleMaterial(settings = if (dark) SoapBubbleSettings() else SoapBubbleSettings.lightPreset) {
+                    Surface(color = LocalSofuuColors.current.bgApp, modifier = Modifier.fillMaxSize()) {
+                        SofuuApp(store, onPickFiles = ::launchFilePicker, onRequestMic = ::ensureMic)
+                    }
                 }
             }
         }

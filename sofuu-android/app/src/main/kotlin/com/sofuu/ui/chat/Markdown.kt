@@ -2,10 +2,10 @@ package com.sofuu.ui.chat
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -43,6 +43,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sofuu.ui.components.Icons2
+import com.sofuu.ui.soapbubble.SoapBubbleButton
 import com.sofuu.ui.theme.LocalSofuuColors
 import com.sofuu.ui.theme.SofuuColors
 import kotlin.math.max
@@ -153,15 +154,16 @@ private fun CodeBlock(code: String, lang: String, fontSize: Int, bg: Color, fg: 
                 fontFamily = FontFamily.Monospace,
                 modifier = Modifier.weight(1f),
             )
-            Row(
-                Modifier
-                    .clip(RoundedCornerShape(4.dp))
-                    .clickable {
-                        clipboard.setText(AnnotatedString(code.trimEnd()))
-                        copied = true
-                    }
-                    .padding(horizontal = 6.dp, vertical = 3.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            SoapBubbleButton(
+                onClick = {
+                    clipboard.setText(AnnotatedString(code.trimEnd()))
+                    copied = true
+                },
+                fontSize = 11.sp,
+                minHeight = 26.dp,
+                fillWidth = false,
+                radius = 999f,
+                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 3.dp),
             ) {
                 Icon(
                     if (copied) Icons2.Check else Icons2.Copy,

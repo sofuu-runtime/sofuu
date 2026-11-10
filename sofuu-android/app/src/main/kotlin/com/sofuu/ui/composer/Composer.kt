@@ -2,11 +2,11 @@ package com.sofuu.ui.composer
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -37,6 +37,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -47,6 +48,10 @@ import com.sofuu.store.CtxMeter
 import com.sofuu.store.SLASH_COMMANDS
 import com.sofuu.store.SofuuConfig
 import com.sofuu.ui.components.Icons2
+import com.sofuu.ui.soapbubble.LocalSoapBubbleSettings
+import com.sofuu.ui.soapbubble.SoapBubbleButton
+import com.sofuu.ui.soapbubble.SoapBubbleSurface
+import com.sofuu.ui.soapbubble.toCssRgb
 import com.sofuu.ui.theme.LocalSofuuColors
 
 /**
@@ -143,15 +148,19 @@ fun Composer(
                             contentDescription = null,
                             modifier = Modifier.size(44.dp).clip(RoundedCornerShape(8.dp)),
                         )
-                        Box(
-                            Modifier
-                                .size(18.dp)
-                                .align(Alignment.TopEnd)
-                                .background(c.errStrong, RoundedCornerShape(9.dp))
-                                .clickable { onRemoveImage(i) },
-                            contentAlignment = Alignment.Center,
+                        SoapBubbleSurface(
+                            onClick = { onRemoveImage(i) },
+                            role = Role.Button,
+                            radius = 999f,
+                            settings = LocalSoapBubbleSettings.current.copy(
+                                tint = c.errStrong.toCssRgb(),
+                                opacity = 0.9f,
+                            ),
+                            modifier = Modifier.size(18.dp).align(Alignment.TopEnd),
                         ) {
-                            Text("×", color = androidx.compose.ui.graphics.Color.White, fontSize = 11.sp)
+                            Box(Modifier.fillMaxWidth().height(18.dp), contentAlignment = Alignment.Center) {
+                                Text("×", color = androidx.compose.ui.graphics.Color.White, fontSize = 11.sp)
+                            }
                         }
                     }
                 }
@@ -276,7 +285,8 @@ fun Composer(
 /** A composer bar icon: ONE touch target and ONE glyph size, so every
  *  action in the bar is pixel-identical (a per-icon padding drift is
  *  exactly what made the paperclip and layers icons render at different
- *  sizes). */
+ *  sizes). Rendered as a soap bubble; the active state is an accent wash
+ *  under the film. */
 @Composable
 private fun IconAction(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
@@ -285,15 +295,20 @@ private fun IconAction(
     onClick: () -> Unit,
 ) {
     val c = LocalSofuuColors.current
-    Box(
-        Modifier
-            .size(40.dp)
-            .clip(RoundedCornerShape(20.dp))
-            .background(if (active) c.accent.copy(alpha = 0.16f) else androidx.compose.ui.graphics.Color.Transparent)
-            .clickable { onClick() },
-        contentAlignment = Alignment.Center,
+    val s = LocalSoapBubbleSettings.current
+    SoapBubbleSurface(
+        onClick = onClick,
+        role = Role.Button,
+        radius = 999f,
+        settings = if (active) s.copy(tint = c.accent.toCssRgb(), opacity = 0.3f) else s,
+        modifier = Modifier.size(40.dp),
     ) {
-        Icon(icon, description, tint = if (active) c.accent else c.textMuted, modifier = Modifier.size(20.dp))
+        Icon(
+            icon,
+            description,
+            tint = if (active) c.accent else c.textMuted,
+            modifier = Modifier.size(40.dp).padding(10.dp),
+        )
     }
 }
 
@@ -326,15 +341,16 @@ private fun Pill(
     onClick: () -> Unit,
 ) {
     val c = LocalSofuuColors.current
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        modifier = modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(c.bgCardHover.copy(alpha = 0.85f))
-            .border(0.5.dp, c.border.copy(alpha = 0.70f), RoundedCornerShape(999.dp))
-            .clickable { onClick() }
-            .heightIn(min = 40.dp)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
+    SoapBubbleButton(
+        onClick = onClick,
+        settings = LocalSoapBubbleSettings.current.copy(tint = c.bgCardHover.toCssRgb(), opacity = 0.85f),
+        contentColor = c.text,
+        fontSize = 13.sp,
+        minHeight = 40.dp,
+        fillWidth = false,
+        radius = 999f,
+        modifier = modifier,
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
     ) {
         if (icon != null) {
             Icon(icon, null, tint = c.accent, modifier = Modifier.size(14.dp))
@@ -356,15 +372,21 @@ private fun Pill(
 
 @Composable
 private fun SendButton(icon: androidx.compose.ui.graphics.vector.ImageVector, tint: androidx.compose.ui.graphics.Color, onClick: () -> Unit) {
-    Box(
-        Modifier
-            .size(42.dp)
-            .clip(RoundedCornerShape(21.dp))
-            .background(tint)
-            .clickable { onClick() },
-        contentAlignment = Alignment.Center,
+    // A strongly tinted bubble: the accent (or stop-red) wash reads like the
+    // old solid circle while the film still lenses and swells.
+    SoapBubbleSurface(
+        onClick = onClick,
+        role = Role.Button,
+        radius = 999f,
+        settings = LocalSoapBubbleSettings.current.copy(tint = tint.toCssRgb(), opacity = 0.9f),
+        modifier = Modifier.size(42.dp),
     ) {
-        Icon(icon, null, tint = androidx.compose.ui.graphics.Color.White, modifier = Modifier.size(20.dp))
+        Icon(
+            icon,
+            null,
+            tint = androidx.compose.ui.graphics.Color.White,
+            modifier = Modifier.size(42.dp).padding(11.dp),
+        )
     }
 }
 
@@ -416,23 +438,27 @@ private fun SlashPalette(commands: List<com.sofuu.store.SlashCommand>, activeIdx
         LazyColumn(Modifier.heightIn(max = 190.dp)) {
             items(commands) { cmd ->
                 val active = commands.indexOf(cmd) == activeIdx
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(6.dp))
-                        .clickable { onPick(cmd) }
-                        .background(if (active) c.bgCardHover else androidx.compose.ui.graphics.Color.Transparent)
-                        .heightIn(min = 40.dp)
-                        .padding(horizontal = 12.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                val s = LocalSoapBubbleSettings.current
+                val rowSettings = if (active) {
+                    s.copy(tint = c.bgCardHover.toCssRgb(), opacity = 0.7f)
+                } else s
+                SoapBubbleSurface(
+                    onClick = { onPick(cmd) },
+                    role = Role.Button,
+                    radius = 6f,
+                    settings = rowSettings,
+                    modifier = Modifier.fillMaxWidth().heightIn(min = 40.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                 ) {
-                    Text("/${cmd.name}", color = c.accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace)
-                    if (cmd.arg != null) {
-                        Spacer(Modifier.width(4.dp))
-                        Text(cmd.arg, color = c.textFaint, fontSize = 13.sp, fontFamily = FontFamily.Monospace)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("/${cmd.name}", color = c.accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace)
+                        if (cmd.arg != null) {
+                            Spacer(Modifier.width(4.dp))
+                            Text(cmd.arg, color = c.textFaint, fontSize = 13.sp, fontFamily = FontFamily.Monospace)
+                        }
+                        Spacer(Modifier.width(8.dp))
+                        Text(cmd.desc, color = c.textMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
-                    Spacer(Modifier.width(8.dp))
-                    Text(cmd.desc, color = c.textMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
         }

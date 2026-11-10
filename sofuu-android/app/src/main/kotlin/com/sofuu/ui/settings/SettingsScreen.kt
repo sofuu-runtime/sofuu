@@ -9,13 +9,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -35,8 +35,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Switch
-import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -53,6 +51,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -60,6 +59,11 @@ import androidx.compose.ui.unit.sp
 import com.sofuu.store.AppStore
 import com.sofuu.ui.CloudBackground
 import com.sofuu.ui.components.Icons2
+import com.sofuu.ui.soapbubble.LocalSoapBubbleSettings
+import com.sofuu.ui.soapbubble.SoapBubbleButton
+import com.sofuu.ui.soapbubble.SoapBubbleSurface
+import com.sofuu.ui.soapbubble.SoapBubbleToggle
+import com.sofuu.ui.soapbubble.toCssRgb
 import com.sofuu.ui.theme.LocalSofuuColors
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -163,16 +167,14 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
                         color = c.text,
                         modifier = Modifier.weight(1f),
                     )
-                    Icon(
-                        Icons2.Close,
-                        "Close",
-                        tint = c.textMuted,
-                        modifier = Modifier
-                            .size(36.dp)
-                            .clip(RoundedCornerShape(18.dp))
-                            .clickable { onClose() }
-                            .padding(8.dp),
-                    )
+                    SoapBubbleSurface(
+                        onClick = onClose,
+                        role = Role.Button,
+                        radius = 999f,
+                        modifier = Modifier.size(36.dp),
+                    ) {
+                        Icon(Icons2.Close, "Close", tint = c.textMuted, modifier = Modifier.size(36.dp).padding(8.dp))
+                    }
                 }
                 Box(Modifier.padding(bottom = 6.dp)) {
                     Row(
@@ -184,22 +186,29 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
                     ) {
                         TABS.forEach { t ->
                             val active = t == tab
-                            Text(
-                                t.replaceFirstChar { it.uppercase() },
+                            // Active tab: accent wash under the film (the old
+                            // solid accent pill); inactive: plain glass.
+                            SoapBubbleButton(
+                                onClick = { tab = t; store.setSettingsTab(t) },
+                                settings = if (active) {
+                                    LocalSoapBubbleSettings.current.copy(tint = c.accent.toCssRgb(), opacity = 0.85f)
+                                } else {
+                                    LocalSoapBubbleSettings.current
+                                },
+                                contentColor = if (active) c.accentContrast else c.textMuted,
                                 fontSize = 13.5.sp,
-                                fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
-                                color = if (active) c.accentContrast else c.textMuted,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(999.dp))
-                                    .background(if (active) c.accent else c.bgCard.copy(alpha = 0.85f))
-                                    .border(
-                                        0.5.dp,
-                                        if (active) c.accent else c.border.copy(alpha = 0.70f),
-                                        RoundedCornerShape(999.dp),
-                                    )
-                                    .clickable { tab = t; store.setSettingsTab(t) }
-                                    .padding(horizontal = 15.dp, vertical = 8.dp),
-                            )
+                                minHeight = 34.dp,
+                                fillWidth = false,
+                                radius = 999f,
+                                contentPadding = PaddingValues(horizontal = 15.dp, vertical = 8.dp),
+                            ) {
+                                Text(
+                                    t.replaceFirstChar { it.uppercase() },
+                                    fontSize = 13.5.sp,
+                                    fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
+                                    color = if (active) c.accentContrast else c.textMuted,
+                                )
+                            }
                         }
                     }
                     Box(
@@ -293,14 +302,22 @@ private fun Segmented(options: List<String>, selected: String, onSelect: (String
                 "local" -> "Local"
                 else -> o.replaceFirstChar { it.uppercase() }
             }
-            Box(
-                Modifier
-                    .weight(1f, fill = false)
-                    .clip(RoundedCornerShape(7.dp))
-                    .background(if (active) c.accent else Color.Transparent)
-                    .clickable { onSelect(o) }
-                    .padding(horizontal = 14.dp, vertical = 7.dp),
-                contentAlignment = Alignment.Center,
+            // Selected segment: accent wash under the film (the reference's
+            // .btn-toggle); the rest are plain glass in the same track.
+            SoapBubbleButton(
+                onClick = { onSelect(o) },
+                settings = if (active) {
+                    LocalSoapBubbleSettings.current.copy(tint = c.accent.toCssRgb(), opacity = 0.85f)
+                } else {
+                    LocalSoapBubbleSettings.current
+                },
+                contentColor = if (active) c.accentContrast else c.textMuted,
+                fontSize = 13.sp,
+                minHeight = 32.dp,
+                fillWidth = false,
+                radius = 7f,
+                modifier = Modifier.weight(1f, fill = false),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 7.dp),
             ) {
                 Text(
                     label,
@@ -394,14 +411,15 @@ private fun AppliedFieldRow(
         Box(Modifier.weight(1f)) {
             TextFieldRow(label, text, placeholder, { text = it })
         }
-        Box(
-            Modifier
-                .height(44.dp)
-                .clip(RoundedCornerShape(8.dp))
-                .background(c.accent)
-                .clickable { onApply(text) }
-                .padding(horizontal = 16.dp),
-            contentAlignment = Alignment.Center,
+        SoapBubbleButton(
+            onClick = { onApply(text) },
+            settings = LocalSoapBubbleSettings.current.copy(tint = c.accent.toCssRgb(), opacity = 0.9f),
+            contentColor = c.accentContrast,
+            fontSize = 13.5.sp,
+            minHeight = 44.dp,
+            fillWidth = false,
+            radius = 8f,
+            contentPadding = PaddingValues(horizontal = 16.dp),
         ) {
             Text(
                 "Apply",
@@ -650,28 +668,30 @@ private fun GeneralPane(store: AppStore) {
                 if (hasAllFiles) {
                     Text("Granted", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = c.ok)
                 } else {
-                    Row(
-                        Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(c.accent)
-                            .clickable {
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                                    try {
-                                        val intent = Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                                            data = Uri.parse("package:" + context.packageName)
-                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                        }
-                                        context.startActivity(intent)
-                                    } catch (_: Exception) {
-                                        val intent = Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION).apply {
-                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                        }
-                                        context.startActivity(intent)
+                    SoapBubbleButton(
+                        onClick = {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                try {
+                                    val intent = Intent(android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                                        data = Uri.parse("package:" + context.packageName)
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                     }
+                                    context.startActivity(intent)
+                                } catch (_: Exception) {
+                                    val intent = Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION).apply {
+                                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    }
+                                    context.startActivity(intent)
                                 }
                             }
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically
+                        },
+                        settings = LocalSoapBubbleSettings.current.copy(tint = c.accent.toCssRgb(), opacity = 0.9f),
+                        contentColor = c.accentContrast,
+                        fontSize = 13.sp,
+                        minHeight = 36.dp,
+                        fillWidth = false,
+                        radius = 8f,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     ) {
                         Text("Grant access", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = c.accentContrast)
                     }
@@ -927,31 +947,30 @@ private fun EngineEnvCard(store: AppStore) {
 @Composable
 private fun ToggleRow(label: String, desc: String, checked: Boolean, onChange: (Boolean) -> Unit) {
     val c = LocalSofuuColors.current
-    Row(
-        Modifier
-            .fillMaxWidth()
-            .heightIn(min = 44.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .clickable { onChange(!checked) }
-            .padding(vertical = 4.dp, horizontal = 2.dp),
-        verticalAlignment = Alignment.CenterVertically,
+    SoapBubbleSurface(
+        onClick = { onChange(!checked) },
+        role = Role.Button,
+        radius = 8f,
+        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+        contentPadding = PaddingValues(vertical = 4.dp, horizontal = 2.dp),
     ) {
-        Column(Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(label, fontSize = 14.5.sp, fontWeight = FontWeight.Bold, color = c.text)
-            Text(desc, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(top = 2.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(Modifier.weight(1f).padding(end = 12.dp)) {
+                Text(label, fontSize = 14.5.sp, fontWeight = FontWeight.Bold, color = c.text)
+                Text(desc, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(top = 2.dp))
+            }
+            // The bubble switch: flat track, thumb is a real lens.
+            SoapBubbleToggle(
+                checked = checked,
+                onCheckedChange = onChange,
+                color = c.accent,
+                scale = 0.85f,
+                contentDescription = label,
+            )
         }
-        Switch(
-            checked = checked,
-            onCheckedChange = onChange,
-            colors = SwitchDefaults.colors(
-                checkedThumbColor = c.accentContrast,
-                checkedTrackColor = c.accent,
-                checkedBorderColor = Color.Transparent,
-                uncheckedThumbColor = c.textFaint,
-                uncheckedTrackColor = c.toggleOff,
-                uncheckedBorderColor = c.border,
-            ),
-        )
     }
 }
 
@@ -1035,65 +1054,69 @@ private fun ModelsPane(store: AppStore) {
                     if (idx > 0) CardDivider()
                     val label = state.localModelLabels[path] ?: com.sofuu.store.fallbackModelLabel(path)
                     val active = state.config?.model == path
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(if (active) c.bgCardHover else Color.Transparent)
-                            .clickable { store.pickLocalModel(path) }
-                            .padding(horizontal = 8.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    val rowSettings = if (active) {
+                        LocalSoapBubbleSettings.current.copy(tint = c.bgCardHover.toCssRgb(), opacity = 0.7f)
+                    } else {
+                        LocalSoapBubbleSettings.current
+                    }
+                    SoapBubbleSurface(
+                        onClick = { store.pickLocalModel(path) },
+                        role = Role.Button,
+                        radius = 8f,
+                        settings = rowSettings,
+                        modifier = Modifier.fillMaxWidth(),
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 8.dp),
                     ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                label,
-                                fontSize = 13.5.sp,
-                                fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
-                                color = if (active) c.accent else c.text,
-                                fontFamily = FontFamily.Monospace,
-                            )
-                            if (active) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(top = 2.dp),
-                                ) {
-                                    Box(
-                                        Modifier
-                                            .size(6.dp)
-                                            .clip(RoundedCornerShape(3.dp))
-                                            .background(c.ok),
-                                    )
-                                    Spacer(Modifier.width(6.dp))
-                                    Text("Active · running on device", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = c.ok)
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    label,
+                                    fontSize = 13.5.sp,
+                                    fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
+                                    color = if (active) c.accent else c.text,
+                                    fontFamily = FontFamily.Monospace,
+                                )
+                                if (active) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(top = 2.dp),
+                                    ) {
+                                        Box(
+                                            Modifier
+                                                .size(6.dp)
+                                                .clip(RoundedCornerShape(3.dp))
+                                                .background(c.ok),
+                                        )
+                                        Spacer(Modifier.width(6.dp))
+                                        Text("Active · running on device", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = c.ok)
+                                    }
                                 }
                             }
-                        }
-                        if (active) {
-                            Text("✓", color = c.accent, fontSize = 15.sp, fontWeight = FontWeight.Bold)
-                        } else {
-                            Icon(
-                                Icons2.Delete,
-                                "Remove",
-                                tint = c.textFaint,
-                                modifier = Modifier
-                                    .size(36.dp)
-                                    .clip(RoundedCornerShape(18.dp))
-                                    .clickable { store.deleteLocalModel(path) }
-                                    .padding(8.dp),
-                            )
+                            if (active) {
+                                Text("✓", color = c.accent, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                            } else {
+                                SoapBubbleSurface(
+                                    onClick = { store.deleteLocalModel(path) },
+                                    role = Role.Button,
+                                    radius = 999f,
+                                    modifier = Modifier.size(36.dp),
+                                ) {
+                                    Icon(Icons2.Delete, "Remove", tint = c.textFaint, modifier = Modifier.size(36.dp).padding(8.dp))
+                                }
+                            }
                         }
                     }
                 }
             }
             Spacer(Modifier.height(12.dp))
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .height(44.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(c.accent)
-                    .clickable { pickModelFile.launch(arrayOf("*/*")) },
-                contentAlignment = Alignment.Center,
+            SoapBubbleButton(
+                onClick = { pickModelFile.launch(arrayOf("*/*")) },
+                settings = LocalSoapBubbleSettings.current.copy(tint = c.accent.toCssRgb(), opacity = 0.9f),
+                contentColor = c.accentContrast,
+                fontSize = 13.5.sp,
+                minHeight = 44.dp,
+                fillWidth = true,
+                radius = 8f,
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons2.Folder, null, tint = c.accentContrast, modifier = Modifier.size(18.dp))
@@ -1146,25 +1169,31 @@ private fun ModelsPane(store: AppStore) {
                         ) {
                             models.forEach { m ->
                                 val active = m == p.model && p.name == state.config?.active
-                                Row(
-                                    Modifier
-                                        .fillMaxWidth()
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .background(if (active) c.bgCardHover else Color.Transparent)
-                                        .clickable { store.pickModel(p.name, m) }
-                                        .padding(horizontal = 8.dp, vertical = 7.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
+                                val rowSettings = if (active) {
+                                    LocalSoapBubbleSettings.current.copy(tint = c.bgCardHover.toCssRgb(), opacity = 0.7f)
+                                } else {
+                                    LocalSoapBubbleSettings.current
+                                }
+                                SoapBubbleSurface(
+                                    onClick = { store.pickModel(p.name, m) },
+                                    role = Role.Button,
+                                    radius = 6f,
+                                    settings = rowSettings,
+                                    modifier = Modifier.fillMaxWidth(),
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 7.dp),
                                 ) {
-                                    Text(
-                                        m,
-                                        fontSize = 13.sp,
-                                        fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
-                                        color = if (active) c.accent else c.text,
-                                        fontFamily = FontFamily.Monospace,
-                                        modifier = Modifier.weight(1f),
-                                    )
-                                    if (active) {
-                                        Text("✓", color = c.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                        Text(
+                                            m,
+                                            fontSize = 13.sp,
+                                            fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
+                                            color = if (active) c.accent else c.text,
+                                            fontFamily = FontFamily.Monospace,
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                        if (active) {
+                                            Text("✓", color = c.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                        }
                                     }
                                 }
                             }
@@ -1236,39 +1265,39 @@ private fun ProvidersPane(store: AppStore) {
             TextFieldRow("model", newModel, modelPlaceholder, { newModel = it }, fieldGap)
             TextFieldRow("key", newKey, keyPlaceholder, { newKey = it }, Modifier.padding(bottom = 12.dp))
 
-            Box(
-                Modifier
-                    .fillMaxWidth()
-                    .height(44.dp)
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(c.accent)
-                    .clickable {
-                        val name = newName.trim()
-                        val endpoint = newEndpoint.trim().ifEmpty { endpointPlaceholder }
-                        val model = newModel.trim()
-                        addNote = null
-                        if (name.isEmpty() || endpoint.isEmpty()) {
-                            addError = "Name is required."
+            SoapBubbleButton(
+                onClick = {
+                    val name = newName.trim()
+                    val endpoint = newEndpoint.trim().ifEmpty { endpointPlaceholder }
+                    val model = newModel.trim()
+                    addNote = null
+                    if (name.isEmpty() || endpoint.isEmpty()) {
+                        addError = "Name is required."
+                    } else {
+                        val providers = (state.config?.providers ?: emptyList()).map { it.toJson() }.toMutableList()
+                        providers.add(
+                            JSONObject().put("name", name).put("endpoint", endpoint)
+                                .put("model", model).put("profile", newProfile),
+                        )
+                        val patch = JSONObject().put("providers", org.json.JSONArray(providers))
+                        if (model.isNotEmpty()) {
+                            patch.put("active", name).put("provider", name).put("model", model)
+                            addNote = null
                         } else {
-                            val providers = (state.config?.providers ?: emptyList()).map { it.toJson() }.toMutableList()
-                            providers.add(
-                                JSONObject().put("name", name).put("endpoint", endpoint)
-                                    .put("model", model).put("profile", newProfile),
-                            )
-                            val patch = JSONObject().put("providers", org.json.JSONArray(providers))
-                            if (model.isNotEmpty()) {
-                                patch.put("active", name).put("provider", name).put("model", model)
-                                addNote = null
-                            } else {
-                                addNote = "Added $name ($newProfile) — open the model sheet in the composer, pick one of its models, and it becomes active."
-                            }
-                            store.patchConfig(patch)
-                            if (newKey.isNotBlank()) store.setProviderKey(name, newKey.trim())
-                            newName = ""; newEndpoint = ""; newModel = ""; newKey = ""
-                            addError = null
+                            addNote = "Added $name ($newProfile) — open the model sheet in the composer, pick one of its models, and it becomes active."
                         }
-                    },
-                contentAlignment = Alignment.Center,
+                        store.patchConfig(patch)
+                        if (newKey.isNotBlank()) store.setProviderKey(name, newKey.trim())
+                        newName = ""; newEndpoint = ""; newModel = ""; newKey = ""
+                        addError = null
+                    }
+                },
+                settings = LocalSoapBubbleSettings.current.copy(tint = c.accent.toCssRgb(), opacity = 0.9f),
+                contentColor = c.accentContrast,
+                fontSize = 14.sp,
+                minHeight = 44.dp,
+                fillWidth = true,
+                radius = 8f,
             ) {
                 Text("Add Provider", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.accentContrast)
             }
@@ -1356,29 +1385,41 @@ private fun ProvidersPane(store: AppStore) {
                         }
                         Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                             if (!isActive) {
+                                SoapBubbleButton(
+                                    onClick = { removeNote = store.removeProvider(p.name) },
+                                    contentColor = c.errStrong,
+                                    fontSize = 13.sp,
+                                    minHeight = 30.dp,
+                                    fillWidth = false,
+                                    radius = 999f,
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                                ) {
+                                    Text(
+                                        "Remove",
+                                        fontSize = 13.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = c.errStrong,
+                                    )
+                                }
+                            }
+                            SoapBubbleButton(
+                                onClick = {
+                                    editing = if (isEditing) editing - p.name else editing + p.name
+                                },
+                                contentColor = c.accent,
+                                fontSize = 13.sp,
+                                minHeight = 30.dp,
+                                fillWidth = false,
+                                radius = 999f,
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                            ) {
                                 Text(
-                                    "Remove",
+                                    if (isEditing) "Cancel" else "Edit",
                                     fontSize = 13.sp,
                                     fontWeight = FontWeight.SemiBold,
-                                    color = c.errStrong,
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .clickable { removeNote = store.removeProvider(p.name) }
-                                        .padding(horizontal = 8.dp, vertical = 6.dp),
+                                    color = c.accent,
                                 )
                             }
-                            Text(
-                                if (isEditing) "Cancel" else "Edit",
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = c.accent,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .clickable {
-                                        editing = if (isEditing) editing - p.name else editing + p.name
-                                    }
-                                    .padding(horizontal = 8.dp, vertical = 6.dp),
-                            )
                         }
                     }
 
@@ -1433,16 +1474,22 @@ private fun ProvidersPane(store: AppStore) {
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text("API Key", fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.textMuted)
-                            Text(
-                                "Replace key",
+                            SoapBubbleButton(
+                                onClick = { keyText = " " },
+                                contentColor = c.accent,
                                 fontSize = 13.sp,
-                                color = c.accent,
-                                fontWeight = FontWeight.SemiBold,
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .clickable { keyText = " " }
-                                    .padding(horizontal = 6.dp, vertical = 4.dp),
-                            )
+                                minHeight = 30.dp,
+                                fillWidth = false,
+                                radius = 999f,
+                                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 4.dp),
+                            ) {
+                                Text(
+                                    "Replace key",
+                                    fontSize = 13.sp,
+                                    color = c.accent,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                            }
                         }
                     } else {
                         TextFieldRow("key", keyText, "paste new API key", { keyText = it }, Modifier.padding(bottom = 12.dp))
@@ -1836,21 +1883,21 @@ private fun BrainPane(store: AppStore) {
                             )
                         }
                         if (id >= 0) {
-                            Icon(
-                                Icons2.Delete, "Forget", tint = c.textFaint,
-                                modifier = Modifier
-                                    .size(32.dp)
-                                    .clip(RoundedCornerShape(16.dp))
-                                    .clickable {
-                                        scope.launch {
-                                            val r = withContext(Dispatchers.IO) { surface.brainForget(id) }
-                                            err = r?.optString("error")?.takeIf { it.isNotEmpty() }
-                                            hits = null
-                                            reload++
-                                        }
+                            SoapBubbleSurface(
+                                onClick = {
+                                    scope.launch {
+                                        val r = withContext(Dispatchers.IO) { surface.brainForget(id) }
+                                        err = r?.optString("error")?.takeIf { it.isNotEmpty() }
+                                        hits = null
+                                        reload++
                                     }
-                                    .padding(6.dp),
-                            )
+                                },
+                                role = Role.Button,
+                                radius = 999f,
+                                modifier = Modifier.size(32.dp),
+                            ) {
+                                Icon(Icons2.Delete, "Forget", tint = c.textFaint, modifier = Modifier.size(32.dp).padding(6.dp))
+                            }
                         }
                     }
                 }
@@ -2067,14 +2114,16 @@ private fun SpaceLine(text: Color, err: Color, faint: Color, label: String, dim:
 
 @Composable
 private fun SmallButton(bg: Color, fg: Color, label: String, onClick: () -> Unit) {
-    Box(
-        Modifier
-            .height(38.dp)
-            .clip(RoundedCornerShape(8.dp))
-            .background(bg)
-            .clickable { onClick() }
-            .padding(horizontal = 14.dp),
-        contentAlignment = Alignment.Center,
+    // The old solid tile colour becomes a tinted wash under the film.
+    SoapBubbleButton(
+        onClick = onClick,
+        settings = LocalSoapBubbleSettings.current.copy(tint = bg.toCssRgb(), opacity = 0.8f),
+        contentColor = fg,
+        fontSize = 13.sp,
+        minHeight = 38.dp,
+        fillWidth = false,
+        radius = 8f,
+        contentPadding = PaddingValues(horizontal = 14.dp),
     ) {
         Text(
             label,
@@ -2133,22 +2182,24 @@ private fun AgentsPane(store: AppStore) {
                 val a = l.optJSONObject(i) ?: continue
                 val agentName = a.optString("name")
                 SettingsCard(modifier = Modifier.padding(bottom = 12.dp)) {
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .clickable { runAgentName = agentName },
-                        verticalAlignment = Alignment.CenterVertically,
+                    SoapBubbleSurface(
+                        onClick = { runAgentName = agentName },
+                        role = Role.Button,
+                        radius = 8f,
+                        modifier = Modifier.fillMaxWidth(),
                     ) {
-                        Text(
-                            agentName,
-                            fontSize = 15.sp, fontWeight = FontWeight.Bold, color = c.text,
-                            fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
-                        )
-                        Text(
-                            if (runAgentName == agentName) "run target" else "select",
-                            fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
-                            color = if (runAgentName == agentName) c.accent else c.textFaint,
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                agentName,
+                                fontSize = 15.sp, fontWeight = FontWeight.Bold, color = c.text,
+                                fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                if (runAgentName == agentName) "run target" else "select",
+                                fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+                                color = if (runAgentName == agentName) c.accent else c.textFaint,
+                            )
+                        }
                     }
                     // A.list() reports `tools` as a COUNT and `agents` as an
                     // ARRAY; the old reader expected an array of tool names

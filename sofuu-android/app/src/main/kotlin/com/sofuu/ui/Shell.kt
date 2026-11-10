@@ -11,7 +11,6 @@ import androidx.compose.ui.platform.LocalContext
 import java.io.File
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.TextButton
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -19,6 +18,7 @@ import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
@@ -54,7 +54,9 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sofuu.store.AppStore
@@ -65,6 +67,11 @@ import com.sofuu.ui.chat.PhaseLine
 import com.sofuu.ui.components.Icons2
 import com.sofuu.ui.composer.Composer
 import com.sofuu.ui.settings.SettingsScreen
+import com.sofuu.ui.soapbubble.LocalSoapBubbleSettings
+import com.sofuu.ui.soapbubble.SoapBubbleButton
+import com.sofuu.ui.soapbubble.SoapBubbleIconButton
+import com.sofuu.ui.soapbubble.SoapBubbleSurface
+import com.sofuu.ui.soapbubble.toCssRgb
 import com.sofuu.ui.theme.LocalSofuuColors
 
 /** The app shell: drawer + topbar + chat + composer + overlays — the
@@ -214,42 +221,53 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                     val active = sid == state.activeSessionId
                     val s = ordered.firstOrNull { it.id == sid }
                     val label = if (sid == null) "New chat" else (s?.labelOf(ordered.indexOf(s)) ?: "Chat")
-                    Row(
-                        Modifier
-                            .clip(RoundedCornerShape(999.dp))
-                            .background(if (active) c.bgCardHover.copy(alpha = 0.85f) else Color.Transparent)
-                            .border(
-                                if (active) 0.5.dp else 0.dp,
-                                if (active) c.border.copy(alpha = 0.60f) else Color.Transparent,
-                                RoundedCornerShape(999.dp),
-                            )
-                            .clickable {
-                                if (sid == null) store.newChat()
-                                else store.setActiveSession(sid)
-                            }
-                            .heightIn(min = 36.dp)
-                            .padding(start = 12.dp, end = if (active && sid != null) 6.dp else 12.dp, top = 6.dp, bottom = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    // Active pill carries a soft card-tint wash under the film;
+                    // inactive pills are plain glass.
+                    val pillSettings = if (active) {
+                        LocalSoapBubbleSettings.current.copy(tint = c.bgCardHover.toCssRgb(), opacity = 0.6f)
+                    } else {
+                        LocalSoapBubbleSettings.current
+                    }
+                    SoapBubbleSurface(
+                        onClick = {
+                            if (sid == null) store.newChat()
+                            else store.setActiveSession(sid)
+                        },
+                        role = Role.Button,
+                        radius = 999f,
+                        settings = pillSettings,
+                        modifier = Modifier.heightIn(min = 36.dp),
+                        contentPadding = PaddingValues(
+                            start = 12.dp,
+                            end = if (active && sid != null) 6.dp else 12.dp,
+                            top = 6.dp,
+                            bottom = 6.dp,
+                        ),
                     ) {
-                        Text(
-                            label,
-                            fontSize = 13.sp,
-                            fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
-                            color = if (active) c.text else c.textMuted,
-                            maxLines = 1,
-                        )
-                        if (active && sid != null) {
-                            Spacer(Modifier.width(4.dp))
-                            Icon(
-                                Icons2.Close,
-                                "Delete chat",
-                                tint = c.textFaint,
-                                modifier = Modifier
-                                    .size(24.dp)
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable { store.deleteSession(sid) }
-                                    .padding(5.dp),
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                label,
+                                fontSize = 13.sp,
+                                fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
+                                color = if (active) c.text else c.textMuted,
+                                maxLines = 1,
                             )
+                            if (active && sid != null) {
+                                Spacer(Modifier.width(4.dp))
+                                SoapBubbleSurface(
+                                    onClick = { store.deleteSession(sid) },
+                                    role = Role.Button,
+                                    radius = 999f,
+                                    modifier = Modifier.size(24.dp),
+                                ) {
+                                    Icon(
+                                        Icons2.Close,
+                                        "Delete chat",
+                                        tint = c.textFaint,
+                                        modifier = Modifier.size(24.dp).padding(5.dp),
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -335,19 +353,18 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
 }
 
 /** A top-bar icon button: one target, one glyph size — the same rule the
- *  composer's bar uses, so both bars read at one scale. */
+ *  composer's bar uses, so both bars read at one scale. Rendered as a soap
+ *  bubble (44dp, film bleeds past the layout while pressed). */
 @Composable
 private fun BarIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, description: String, onClick: () -> Unit) {
     val c = LocalSofuuColors.current
-    Box(
-        Modifier
-            .size(44.dp)
-            .clip(RoundedCornerShape(22.dp))
-            .clickable { onClick() },
-        contentAlignment = Alignment.Center,
-    ) {
-        Icon(icon, description, tint = c.textMuted, modifier = Modifier.size(20.dp))
-    }
+    SoapBubbleIconButton(
+        icon = icon,
+        contentDescription = description,
+        onClick = onClick,
+        contentColor = c.textMuted,
+        iconSize = 20.dp,
+    )
 }
 
 @Composable
@@ -391,21 +408,20 @@ private fun HomePrompt(subtitle: String?, onPromptSelect: (String) -> Unit = {})
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
             starters.forEach { (title, desc) ->
-                Row(
-                    Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(c.bgCard)
-                        .border(1.dp, c.border, RoundedCornerShape(12.dp))
-                        .clickable { onPromptSelect(title) }
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                SoapBubbleSurface(
+                    onClick = { onPromptSelect(title) },
+                    role = Role.Button,
+                    radius = 12f,
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
                 ) {
-                    Column(Modifier.weight(1f)) {
-                        Text(title, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text)
-                        Text(desc, fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(title, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text)
+                            Text(desc, fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                        }
+                        Icon(Icons2.ChevronRight, null, tint = c.textFaint, modifier = Modifier.size(16.dp))
                     }
-                    Icon(Icons2.ChevronRight, null, tint = c.textFaint, modifier = Modifier.size(16.dp))
                 }
             }
         }
@@ -422,7 +438,14 @@ private fun PreviewBar(label: String, onClose: () -> Unit) {
         Icon(Icons2.Clock, null, tint = c.accent, modifier = Modifier.size(15.dp))
         Spacer(Modifier.width(6.dp))
         Text("Read-only · $label", fontSize = 13.sp, color = c.textMuted, modifier = Modifier.weight(1f))
-        Icon(Icons2.Close, "Close", tint = c.textFaint, modifier = Modifier.size(18.dp).clickable { onClose() })
+        SoapBubbleSurface(
+            onClick = onClose,
+            role = Role.Button,
+            radius = 999f,
+            modifier = Modifier.size(24.dp),
+        ) {
+            Icon(Icons2.Close, "Close", tint = c.textFaint, modifier = Modifier.size(24.dp).padding(5.dp))
+        }
     }
 }
 
@@ -499,24 +522,21 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                 }
             },
             confirmButton = {
-                TextButton(
-                    onClick = {
-                        val name = newWorkspaceNameInput.trim()
-                        if (name.isNotEmpty()) {
-                            showNewWorkspaceDialog = false
-                            onClose()
-                            store.createAndAddNewWorkspace(name)
-                        }
-                    },
+                DialogBubble(
+                    "Create",
+                    if (newWorkspaceNameInput.isNotBlank()) c.accent else c.textFaint,
                     enabled = newWorkspaceNameInput.isNotBlank(),
                 ) {
-                    Text("Create", fontWeight = FontWeight.Bold, color = if (newWorkspaceNameInput.isNotBlank()) c.accent else c.textFaint)
+                    val name = newWorkspaceNameInput.trim()
+                    if (name.isNotEmpty()) {
+                        showNewWorkspaceDialog = false
+                        onClose()
+                        store.createAndAddNewWorkspace(name)
+                    }
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showNewWorkspaceDialog = false }) {
-                    Text("Cancel", color = c.textMuted)
-                }
+                DialogBubble("Cancel", c.textMuted) { showNewWorkspaceDialog = false }
             },
         )
     }
@@ -555,21 +575,17 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                 }
             },
             confirmButton = {
-                TextButton(onClick = {
+                DialogBubble("Open", c.accent) {
                     val path = customPathInput.trim()
                     if (path.isNotEmpty()) {
                         showCustomPathDialog = false
                         onClose()
                         store.addWorkspace(path)
                     }
-                }) {
-                    Text("Open", fontWeight = FontWeight.Bold, color = c.accent)
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showCustomPathDialog = false }) {
-                    Text("Cancel", color = c.textMuted)
-                }
+                DialogBubble("Cancel", c.textMuted) { showCustomPathDialog = false }
             }
         )
     }
@@ -587,57 +603,54 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("Workspaces", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = c.text, modifier = Modifier.weight(1f))
-                Icon(
-                    Icons2.Gear,
-                    "Settings",
-                    tint = c.textMuted,
-                    modifier = Modifier
-                        .size(44.dp)
-                        .clip(RoundedCornerShape(22.dp))
-                        .clickable { onClose(); store.openSettings(true) }
-                        .padding(11.dp),
+                SoapBubbleIconButton(
+                    icon = Icons2.Gear,
+                    contentDescription = "Settings",
+                    onClick = { onClose(); store.openSettings(true) },
+                    contentColor = c.textMuted,
+                    iconSize = 22.dp,
                 )
             }
             Spacer(Modifier.height(10.dp))
 
             // Action 1: Create brand new workspace folder on phone
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(c.bgRaised)
-                    .clickable {
-                        newWorkspaceNameInput = ""
-                        showNewWorkspaceDialog = true
-                    }
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            SoapBubbleSurface(
+                onClick = {
+                    newWorkspaceNameInput = ""
+                    showNewWorkspaceDialog = true
+                },
+                role = Role.Button,
+                radius = 8f,
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
             ) {
-                Icon(Icons2.Plus, null, tint = c.accent, modifier = Modifier.size(20.dp))
-                Spacer(Modifier.width(10.dp))
-                Column {
-                    Text("New workspace", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.accent)
-                    Text("Creates a new folder on phone", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons2.Plus, null, tint = c.accent, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Column {
+                        Text("New workspace", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.accent)
+                        Text("Creates a new folder on phone", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                    }
                 }
             }
 
             Spacer(Modifier.height(8.dp))
 
             // Action 2: Open existing phone folder via DocumentTree picker
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(c.bgRaised)
-                    .clickable { pickFolderLauncher.launch(null) }
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            SoapBubbleSurface(
+                onClick = { pickFolderLauncher.launch(null) },
+                role = Role.Button,
+                radius = 8f,
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
             ) {
-                Icon(Icons2.Folder, null, tint = c.accent, modifier = Modifier.size(20.dp))
-                Spacer(Modifier.width(10.dp))
-                Column(Modifier.weight(1f)) {
-                    Text("Open existing folder", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.text)
-                    Text("Choose any folder on phone", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons2.Folder, null, tint = c.accent, modifier = Modifier.size(20.dp))
+                    Spacer(Modifier.width(10.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Open existing folder", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.text)
+                        Text("Choose any folder on phone", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                    }
                 }
             }
 
@@ -650,44 +663,52 @@ private fun WorkspaceDrawer(store: AppStore, onClose: () -> Unit) {
                 for (ws in state.workspaces) {
                     val active = ws == state.projectDir
                     Spacer(Modifier.height(2.dp))
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(if (active) c.bgSidebarActive else Color.Transparent)
-                            .clickable { onClose(); store.openWorkspace(ws) }
-                            .heightIn(min = 48.dp)
-                            .padding(horizontal = 10.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    val rowSettings = if (active) {
+                        LocalSoapBubbleSettings.current.copy(tint = c.bgSidebarActive.toCssRgb(), opacity = 0.6f)
+                    } else {
+                        LocalSoapBubbleSettings.current
+                    }
+                    SoapBubbleSurface(
+                        onClick = { onClose(); store.openWorkspace(ws) },
+                        role = Role.Button,
+                        radius = 8f,
+                        settings = rowSettings,
+                        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
                     ) {
-                        Icon(Icons2.Folder, null, tint = if (active) c.accent else c.textFaint, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                ws.substringAfterLast('/'),
-                                fontSize = 14.sp,
-                                fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
-                                color = c.text
-                            )
-                            Text(
-                                ws,
-                                fontSize = 10.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = if (active) c.textMuted else c.textFaint,
-                                maxLines = 1
-                            )
-                        }
-                        if (state.workspaces.size > 1) {
-                            Icon(
-                                Icons2.Close,
-                                "Remove",
-                                tint = c.textFaint,
-                                modifier = Modifier
-                                    .size(28.dp)
-                                    .clip(RoundedCornerShape(14.dp))
-                                    .clickable { store.removeWorkspace(ws) }
-                                    .padding(6.dp),
-                            )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons2.Folder, null, tint = if (active) c.accent else c.textFaint, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    ws.substringAfterLast('/'),
+                                    fontSize = 14.sp,
+                                    fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
+                                    color = c.text
+                                )
+                                Text(
+                                    ws,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    color = if (active) c.textMuted else c.textFaint,
+                                    maxLines = 1
+                                )
+                            }
+                            if (state.workspaces.size > 1) {
+                                SoapBubbleSurface(
+                                    onClick = { store.removeWorkspace(ws) },
+                                    role = Role.Button,
+                                    radius = 999f,
+                                    modifier = Modifier.size(28.dp),
+                                ) {
+                                    Icon(
+                                        Icons2.Close,
+                                        "Remove",
+                                        tint = c.textFaint,
+                                        modifier = Modifier.size(28.dp).padding(6.dp),
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -724,16 +745,14 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Text("Chat history", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.text, modifier = Modifier.weight(1f))
-                Icon(
-                    Icons2.Close,
-                    "Close",
-                    tint = c.textMuted,
-                    modifier = Modifier
-                        .size(28.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .clickable { onClose() }
-                        .padding(5.dp),
-                )
+                SoapBubbleSurface(
+                    onClick = { onClose() },
+                    role = Role.Button,
+                    radius = 999f,
+                    modifier = Modifier.size(28.dp),
+                ) {
+                    Icon(Icons2.Close, "Close", tint = c.textMuted, modifier = Modifier.size(28.dp).padding(6.dp))
+                }
             }
             if (state.sessions.isEmpty()) {
                 Text("No chats yet", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(12.dp))
@@ -756,65 +775,78 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                     ) {
                         // Tap the label = read-only preview (never touches the
                         // active chat); "Open" resumes it.
-                        Column(
-                            Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(6.dp))
-                                .clickable {
-                                    onClose()
-                                    store.openPreview(s)
-                                }
-                                .padding(vertical = 4.dp),
+                        SoapBubbleSurface(
+                            onClick = {
+                                onClose()
+                                store.openPreview(s)
+                            },
+                            role = Role.Button,
+                            radius = 6f,
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(vertical = 4.dp),
                         ) {
-                            Text(s.labelOf(ordered.indexOf(s)), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, maxLines = 1)
-                            Text(ageOf(s.lastSeen), fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                            Column {
+                                Text(s.labelOf(ordered.indexOf(s)), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, maxLines = 1)
+                                Text(ageOf(s.lastSeen), fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                            }
                         }
                         Spacer(Modifier.width(6.dp))
-                        Text(
-                            "Open",
+                        SoapBubbleButton(
+                            onClick = {
+                                onClose()
+                                store.closePreview()
+                                store.setActiveSession(s.id)
+                            },
                             fontSize = 11.5.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = c.accent,
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .clickable {
-                                    onClose()
-                                    store.closePreview()
-                                    store.setActiveSession(s.id)
-                                }
-                                .padding(horizontal = 8.dp, vertical = 6.dp),
-                        )
-                        Text(
-                            if (deleteArmed == s.id) "sure?" else "×",
-                            fontSize = if (deleteArmed == s.id) 11.5.sp else 16.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = if (deleteArmed == s.id) c.errStrong else c.textFaint,
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .clickable {
-                                    if (deleteArmed == s.id) {
-                                        deleteArmed = null
-                                        store.deleteSession(s.id)
-                                    } else deleteArmed = s.id
-                                }
-                                .padding(horizontal = 8.dp, vertical = 6.dp),
-                        )
+                            minHeight = 30.dp,
+                            fillWidth = false,
+                            radius = 999f,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                        ) {
+                            Text("Open", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = c.accent)
+                        }
+                        SoapBubbleButton(
+                            onClick = {
+                                if (deleteArmed == s.id) {
+                                    deleteArmed = null
+                                    store.deleteSession(s.id)
+                                } else deleteArmed = s.id
+                            },
+                            fontSize = 11.5.sp,
+                            minHeight = 30.dp,
+                            fillWidth = false,
+                            radius = 999f,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                        ) {
+                            Text(
+                                if (deleteArmed == s.id) "sure?" else "×",
+                                fontSize = if (deleteArmed == s.id) 11.5.sp else 16.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (deleteArmed == s.id) c.errStrong else c.textFaint,
+                            )
+                        }
                     }
                 }
             }
             if (state.sessions.isNotEmpty()) {
                 Spacer(Modifier.height(6.dp))
                 Box(Modifier.fillMaxWidth().height(1.dp).background(c.separator))
-                Text(
-                    if (clearArmed) "Click again to confirm" else "Delete all chats in workspace",
+                SoapBubbleButton(
+                    onClick = { if (clearArmed) { onClose(); store.clearSessions() } else clearArmed = true },
                     fontSize = 12.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = c.errStrong,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { if (clearArmed) { onClose(); store.clearSessions() } else clearArmed = true }
-                        .padding(10.dp),
-                )
+                    minHeight = 36.dp,
+                    fillWidth = true,
+                    radius = 8f,
+                    contentPadding = PaddingValues(10.dp),
+                ) {
+                    Text(
+                        if (clearArmed) "Click again to confirm" else "Delete all chats in workspace",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = c.errStrong,
+                        textAlign = TextAlign.Center,
+                    )
+                }
             }
         }
     }
@@ -902,12 +934,35 @@ private fun ApprovalSheet(approval: Approval, queued: Int = 0, onResolve: (Boole
 
 @Composable
 private fun SheetButton(label: String, bg: Color, fg: Color, onClick: () -> Unit) {
-    Box(
-        Modifier
-            .clip(RoundedCornerShape(999.dp))
-            .background(bg)
-            .clickable { onClick() }
-            .padding(horizontal = 14.dp, vertical = 10.dp),
+    // The old solid pill colour becomes a tinted wash under the film.
+    SoapBubbleButton(
+        onClick = onClick,
+        settings = LocalSoapBubbleSettings.current.copy(tint = bg.toCssRgb(), opacity = 0.8f),
+        contentColor = fg,
+        fontSize = 13.sp,
+        minHeight = 38.dp,
+        fillWidth = false,
+        radius = 999f,
+        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
+    ) {
+        Text(label, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = fg)
+    }
+}
+
+/** AlertDialog confirm/dismiss as a bubble (M3 TextButton replacement). */
+@Composable
+private fun DialogBubble(label: String, fg: Color, enabled: Boolean = true, onClick: () -> Unit) {
+    val c = LocalSofuuColors.current
+    SoapBubbleButton(
+        onClick = onClick,
+        enabled = enabled,
+        settings = LocalSoapBubbleSettings.current.copy(tint = c.bgCardHover.toCssRgb(), opacity = 0.8f),
+        contentColor = fg,
+        fontSize = 13.sp,
+        minHeight = 36.dp,
+        fillWidth = false,
+        radius = 999f,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
     ) {
         Text(label, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = fg)
     }

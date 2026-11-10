@@ -34,6 +34,16 @@ the slash-command surface, and the same cream/warm-dark design language.
 └──────────────────────────────────────────────────────────┘
 ```
 
+Every clickable control — buttons, icon buttons, pills, toggles, segmented
+controls, and list/option rows — is a **soap bubble**: a shared offscreen
+GLES3 renderer (`ui/soapbubble/`, ported from the ReactDrops soap-bubble
+component) draws each control as an iridescent film into one atlas, and
+Compose crops the regions. Light theme uses the light-glass preset, dark
+theme the rainbow defaults; a frosted card wash renders before GL is ready
+and motion freezes under the system's reduced-motion setting (animator
+scale 0). Scrim taps, panel click-absorbers, markdown links, and message
+long-press selection stay non-bubble on purpose.
+
 Turn driving mirrors the desktop backend but without the WebView:
 `sofuu.chat.submit(text, {onEvent})` is fired as a promise; a pump
 drains the engine's event queue every ≤50 ms (each drain also advances

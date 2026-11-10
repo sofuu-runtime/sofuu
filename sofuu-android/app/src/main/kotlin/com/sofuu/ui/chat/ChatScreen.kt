@@ -9,11 +9,11 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -41,6 +41,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -53,6 +54,8 @@ import com.sofuu.store.Timeline
 import com.sofuu.store.TimelineEntry
 import com.sofuu.ui.components.Icons2
 import com.sofuu.ui.components.iconFor
+import com.sofuu.ui.soapbubble.SoapBubbleButton
+import com.sofuu.ui.soapbubble.SoapBubbleSurface
 import com.sofuu.ui.theme.LocalSofuuColors
 
 /** The message list: user bubbles, assistant markdown + activity
@@ -237,15 +240,16 @@ private fun MessageRow(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Row(
-                        Modifier
-                            .clip(RoundedCornerShape(999.dp))
-                            .clickable {
-                                clipboard.setText(AnnotatedString(m.content))
-                                copied = true
-                            }
-                            .padding(horizontal = 8.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    SoapBubbleButton(
+                        onClick = {
+                            clipboard.setText(AnnotatedString(m.content))
+                            copied = true
+                        },
+                        fontSize = 12.sp,
+                        minHeight = 30.dp,
+                        fillWidth = false,
+                        radius = 999f,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
                     ) {
                         Icon(
                             if (copied) Icons2.Check else Icons2.Copy,
@@ -257,12 +261,13 @@ private fun MessageRow(
                         Text(if (copied) "Copied" else "Copy", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = if (copied) c.ok else c.textFaint)
                     }
                     if (voiceCapable) {
-                        Row(
-                            Modifier
-                                .clip(RoundedCornerShape(999.dp))
-                                .clickable { onSpeak(m.content) }
-                                .padding(horizontal = 8.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically,
+                        SoapBubbleButton(
+                            onClick = { onSpeak(m.content) },
+                            fontSize = 12.sp,
+                            minHeight = 30.dp,
+                            fillWidth = false,
+                            radius = 999f,
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
                         ) {
                             Icon(Icons2.Volume, "Read aloud", tint = c.textFaint, modifier = Modifier.size(15.dp))
                             Spacer(Modifier.width(4.dp))
@@ -380,13 +385,16 @@ private fun TimelineRow(
         }
     }
 
-    Column(
-        Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(6.dp))
-            .clickable(enabled = onToggle != null) { onToggle?.invoke() }
-            .padding(horizontal = 4.dp, vertical = 6.dp),
+    // The whole tool row is one bubble when it can expand (onToggle != null);
+    // summary rows stay inert.
+    SoapBubbleSurface(
+        onClick = onToggle,
+        enabled = onToggle != null,
+        radius = 6f,
+        modifier = Modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(horizontal = 4.dp, vertical = 6.dp),
     ) {
+        Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(
                 iconFor(icon),
@@ -442,15 +450,16 @@ private fun TimelineRow(
                     horizontalArrangement = Arrangement.End,
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Row(
-                        Modifier
-                            .clip(RoundedCornerShape(4.dp))
-                            .clickable {
-                                clipboard.setText(AnnotatedString(detail))
-                                copiedDetail = true
-                            }
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                        verticalAlignment = Alignment.CenterVertically,
+                    SoapBubbleButton(
+                        onClick = {
+                            clipboard.setText(AnnotatedString(detail))
+                            copiedDetail = true
+                        },
+                        fontSize = 11.sp,
+                        minHeight = 26.dp,
+                        fillWidth = false,
+                        radius = 999f,
+                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp),
                     ) {
                         Icon(
                             if (copiedDetail) Icons2.Check else Icons2.Copy,
@@ -475,6 +484,7 @@ private fun TimelineRow(
                     fontFamily = FontFamily.Monospace,
                 )
             }
+        }
         }
     }
 }

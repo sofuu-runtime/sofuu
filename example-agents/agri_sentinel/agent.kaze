@@ -1,18 +1,6 @@
-# Agri Sentinel — Autonomous Precision Greenhouse Climate & Irrigation AI Agent
-#
-# Programmed 100% in Kaze. Zero JS or TS required.
-# Compile to a standalone single-binary agent with:
-#   sofuu compile examples/agents/agri_sentinel/agent.kaze -o agri-sentinel
-#
-# Capabilities:
-#   sensor: Ambient temperature and humidity telemetry
-#   device: Physical actuator control for fans, mister pumps, and motorized valves
-#   ai: Agronomy crop models, vapor pressure deficit (VPD) optimization, and harvest advisory
-#   tool: Field telemetry logging and weather station integration
-#   policy: Environmental guardrails and physical duty-cycle safety gates
-#   memory: Historical crop health metrics and soil condition recall
-#   log: Farm operations audit logging
-#   alert: Frost alerts, drought warnings, and heatwave alarms
+# Agri Sentinel — illustrative Kaze language example.
+# AI, tool, memory, and alert capabilities can currently use synthetic results;
+# this is not a verified integration or a real-world deployment.
 
 needs: sensor, device, ai, tool, policy, memory, log, alert
 

@@ -185,7 +185,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 * **Architectural Boundaries**:
   * Brand voice must describe Sofuu as a "runtime for AI", avoiding legacy phrases (F-07).
   * Zero decorative emojis in banners, progress bars, or error messages.
-  * Fast path execution (`sofuu eval`, `sofuu run`) must preserve sub-25ms cold start.
+  * Fast path execution (`sofuu eval`, `sofuu run`): target sub-25ms for a specified workload and hardware; track measured results and conditions in BENCHMARKS.md.
 * **Active Tasks**:
   - [x] Align TUI banner with brand voice ("runtime for AI") (F-07).
   - [x] Verify CLI argument parsing matches 12-factor configuration hierarchy.

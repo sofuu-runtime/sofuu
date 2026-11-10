@@ -14,7 +14,7 @@
 //   Shield 2: Security & network jailing (E_DENIED per R7 policy and private IP / SSRF egress guard)
 //   Shield 3: Automated circuit breakers (CLOSED / OPEN / HALF_OPEN, E_CIRCUIT_OPEN)
 //   Shield 4: Hardware timer watchdog with signal abort (timeoutMs, E_TIMEOUT)
-//   Shield 5: Isolated JS execution / panic guard (E_TOOL, host process never crashes)
+//   Shield 5: Wrapper converts supported exceptions to E_TOOL; plugins run in-process.
 //
 // Conforms to normative Sofuu error taxonomy:
 //   E_SCHEMA | E_TIMEOUT | E_DENIED | E_CIRCUIT_OPEN | E_TOOL | E_CAPABILITY
@@ -827,23 +827,44 @@
     };
   }
 
-  /* R7 policy evaluator (host-provided). Returns a denial result or null. */
-  function policyDenial(name) {
+  /* R7 policy evaluator (host-provided). An 'ask' is handled by the
+   * invoking host's approval gate, as in tools.js. */
+  function policyUnavailable() {
+    return {
+      ok: false,
+      source: 'plugin',
+      error: { code: 'E_DENIED', rule: 'R7/evaluator', message: 'Policy evaluation unavailable or invalid; tool was not run' },
+      text: 'tool error [E_DENIED]: policy evaluation unavailable or invalid'
+    };
+  }
+  function policyDecision(name) {
     try {
-      if (sofuu.policy && typeof sofuu.policy.evaluate === 'function') {
-        var polRaw = sofuu.policy.evaluate({ surface: 'js', op: 'tool.run', tool: name });
-        var polDec = polRaw ? (typeof polRaw === 'string' ? JSON.parse(polRaw) : polRaw) : null;
-        if (polDec && polDec.decision === 'deny') {
-          return {
-            ok: false,
-            source: 'plugin',
-            error: { code: 'E_DENIED', message: polDec.reason || ('Tool ' + name + ' denied by security policy') },
-            text: 'tool error [E_DENIED]: denied by policy'
-          };
-        }
+      if (!sofuu.policy || typeof sofuu.policy.evaluate !== 'function') {
+        return null;
       }
-    } catch (ePol) { /* the policy probe is advisory; a policy that will not evaluate leaves the call allowed in the default posture. */ }
-    return null;
+      var polRaw = sofuu.policy.evaluate({ surface: 'js', op: 'tool.run', tool: name });
+      var polDec = typeof polRaw === 'string' ? JSON.parse(polRaw) : polRaw;
+      if (!polDec || typeof polDec !== 'object' || Array.isArray(polDec) ||
+          (polDec.decision !== 'allow' && polDec.decision !== 'deny' && polDec.decision !== 'ask') ||
+          typeof polDec.rule !== 'string' || !polDec.rule || typeof polDec.reason !== 'string') {
+        return null;
+      }
+      return polDec;
+    } catch (ePol) {
+      /* Do not expose evaluator exceptions (they can contain sensitive data). */
+      return null;
+    }
+  }
+  function policyDenial(name, polDec) {
+    if (!polDec) return policyUnavailable();
+    if (polDec.decision !== 'deny') return null;
+    return {
+      ok: false,
+      source: 'plugin',
+      error: { code: 'E_DENIED', rule: typeof polDec.rule === 'string' ? polDec.rule : 'R7/default',
+               message: typeof polDec.reason === 'string' ? polDec.reason : ('Tool ' + name + ' denied by security policy') },
+      text: 'tool error [E_DENIED]: denied by policy'
+    };
   }
 
 /* ══ module: breaker ═════════════════════════════════════════════════
@@ -1256,7 +1277,7 @@
           if (!inCheck.ok) return schemaFailure(inCheck.message, inCheck.path);
           args = inCheck.data;
 
-          var denied = policyDenial(name);
+          var denied = policyDenial(name, policyDecision(name));
           if (denied) return denied;
 
           var cbCheck = checkCircuit(name, cbConfig);
@@ -1441,13 +1462,9 @@
    * prompt at all — the gate existed everywhere except the path the plugin SDK
    * documents. Ask the same question here, and fail CLOSED when there is no
    * terminal to ask, because an unattended run must never imply approval. */
-  function approvalReason(tool) {
+  function approvalReason(tool, polDec) {
     if (tool && tool.requiresApproval === true) return 'the plugin declared requiresApproval';
-    try {
-      var p = (sofuu.policy && typeof sofuu.policy.get === 'function') ? sofuu.policy.get() : null;
-      var mode = p && p.approval && p.approval.mode;
-      if (mode === 'always' || mode === 'every') return 'approval.mode is "' + mode + '" (--confirm-all)';
-    } catch (e) { /* an unreadable policy cannot approve anything; fall through */ }
+    if (polDec && polDec.decision === 'ask') return 'the security policy requires approval';
     return null;
   }
   async function confirmInvoke(name, args, why) {
@@ -1477,10 +1494,13 @@
         text: 'tool error [E_CAPABILITY]: plugin tool not found'
       };
     }
+    var polDec = policyDecision(name);
+    var denied = policyDenial(name, polDec);
+    if (denied) return denied;
     /* A host that already asked (chat's approval UI, the agent loop) passes
      * ctx.approved — never ask the same human twice. */
     var alreadyApproved = !!(ctx && ctx.approved === true);
-    var why = alreadyApproved ? null : approvalReason(tool);
+    var why = alreadyApproved ? null : approvalReason(tool, polDec);
     if (why && !(await confirmInvoke(name, args, why))) {
       return {
         ok: false,

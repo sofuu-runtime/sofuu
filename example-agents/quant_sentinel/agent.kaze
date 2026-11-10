@@ -1,16 +1,6 @@
-# Quant Sentinel — High-Frequency Trading Risk & Execution AI Agent
-#
-# Programmed 100% in Kaze. Zero JS or TS required.
-# Compile to a standalone single-binary agent with:
-#   sofuu compile examples/agents/quant_sentinel/agent.kaze -o quant-sentinel
-#
-# Capabilities:
-#   ai: LLM reasoning and trade thesis synthesis
-#   tool: Direct execution through order router and exchange feeds
-#   policy: R7 hardware safety guardrails and credential firewalls
-#   memory: Long-term trade thesis recall and pattern matching
-#   log: Formal audit logging
-#   alert: Risk and margin notifications
+# Quant Sentinel — illustrative Kaze language example.
+# AI, tool, memory, and alert capabilities can currently use synthetic results;
+# this is not a verified integration or a real-world deployment.
 
 needs: ai, tool, policy, memory, log, alert
 

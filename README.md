@@ -2,7 +2,7 @@
 
 # Sofuu (素風)
 
-> *A lightweight native runtime for AI applications, tools, and agents (under 10 MB). Written in Rust, QuickJS, and libuv. Unites autonomous agent loops, declarative Kaze routines, on-device vector memory (QTSQ), and native Model Context Protocol (MCP) in a single binary — zero Python environments, zero external daemons.*
+> *An early-stage native runtime for AI applications and agents. Written in Rust, QuickJS, and libuv, Sofuu includes JS/TS agent loops, Kaze scripting, QTSQ vector memory, and Model Context Protocol (MCP) support. Some workflows require model files, external services, or system libraries.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0--beta-orange.svg)](https://github.com/sofuu-runtime/sofuu/releases)
@@ -19,18 +19,16 @@
 
 ## Why Sofuu?
 
-Today's AI development stack is fragmented: running an agent or workflow typically requires Python virtualenvs, Node.js packages, external vector databases (Chroma/Pinecone), background servers (Ollama/vLLM), and multi-gigabyte Docker containers.
+Sofuu brings agent loops, tools, local vector memory, and MCP into a native runtime for AI applications. Selected local workflows can run in one process; cloud models, remote tools, MCP servers, and some inference providers require external services.
 
-**Sofuu collapses this entire stack into a single lightweight binary (< 10 MB).**
+The project is beta. Features and evidence vary by platform and execution path:
 
-Whether you write in modern **TypeScript/JavaScript** or declare autonomous agents in **Kaze (`.kaze`)**, Sofuu executes everything in-process with zero external dependencies:
-
-* **Instant Cold Starts (< 20 ms):** Single native Mach-O / ELF binary without JIT warmup delays. Complies with strict execution environments like the iOS App Store and RTOS.
-* **On-Device Vector Memory (QTSQ):** Persistent semantic memory stored in encrypted `.qtsq` files. Zero-byte offline embeddings and sub-2ms SIMD vector search without running database servers.
-* **Autonomous Agents & Kaze Language:** Multi-step agent loops, cooperative scheduling, domain toolpacks, fail-closed capability gates (`needs: ...`), and single-binary compilation (`sofuu compile`).
-* **Native Model Context Protocol (MCP):** Complete client and server implementation supporting stdio, HTTP, SSE, and in-memory direct transports with zero Node.js/npx overhead.
-* **Deterministic Sandboxing:** Fine-grained policy gates governing tool execution, filesystem access, network egress, and shell commands.
-* **Universal Deployment (`libsofuu`):** Cloud servers, workstations, Raspberry Pi 5, edge IoT devices, and mobile apps (iOS & Android).
+* **Native runtime:** QuickJS runs without a JIT. See [BENCHMARKS.md](BENCHMARKS.md) for measured startup conditions, not a universal latency bound.
+* **On-Device Vector Memory (QTSQ):** Local vector storage is encrypted by default; plaintext mode and unencrypted exports are available. `embedLocal` uses a 768-dimensional trigram hash, not a trained semantic model.
+* **Agents & Kaze:** JS/TS agent loops and domain toolpacks; Kaze routines and standalone compilation. The real Kaze model-and-tool execution path remains an open milestone.
+* **Model Context Protocol (MCP):** Client and server support for selected protocol versions and transports; see the limitations below.
+* **Policy and sandbox tools:** Selected tool, filesystem, network, and shell paths have policy checks; boundaries and approval handling depend on the execution surface.
+* **Embedding:** A C ABI and mobile wrappers are available; support and testing vary by platform. Hardware and app-store acceptance are not universally established.
 
 ---
 
@@ -52,20 +50,20 @@ Official pre-compiled single binaries are available for macOS (Apple Silicon) an
 
 ### 2. Everything in One Process: Write AI as Normal Code
 
-Sofuu collapses vector databases, agent orchestrators, and tool sandboxes into standard JavaScript / TypeScript inside a single lightweight binary (< 10 MB):
+The following JavaScript example creates local vector memory, calls a native tool, and defines an agent. It does not invoke a model:
 
 ```javascript
 // quickstart.js - memory · native tools · agents · zero daemons
 const brain = sofuu.memory.open("./brain.qtsq", 768);
 brain.remember(sofuu.ai.embedLocal("runtime"), "AI runtime. Under 10 MB.");
 
-// Microsecond SIMD vector recall (< 2ms, zero database servers)
+// Recall from local memory using the same embedding space
 const [hit] = brain.recall(sofuu.ai.embedLocal("speed"), 1);
 
-// Sandboxed native tool executed in-process with policy gates
+// Native tool executed in-process
 const sys = sofuu.tools.execute("system_info", {});
 
-// Autonomous agent - define once with memory & tools (0 models needed to test)
+// Define an agent; invoking it requires a configured model provider
 const agent = sofuu.agent.define({
   name: "assistant",
   system: "Cite sources.",
@@ -76,20 +74,20 @@ console.log(hit.text, "•", sys.platform || process.platform, "• agent:", age
 // -> AI runtime. Under 10 MB. · darwin · agent: assistant
 ```
 
-*Install with line 1 · run with line 2 · memory, tools, and agents — all in-process, zero daemons, 22.5 ms median cold start measured on macOS arm64 (31 runs, wall clock incl. spawn).*
+*This example does not invoke an agent or model. Local memory does not require a database server.*
 
 Run it immediately with zero setup, or compile it into a standalone native executable:
 
 ```bash
-# 1. Run directly with sub-20ms cold start
+# 1. Run directly
 $ sofuu run quickstart.js
 
-# 2. Compile into a standalone native executable with zero dependencies
+# 2. Compile into a native executable
 $ sofuu compile quickstart.js -o my-agent
 $ ./my-agent
 ```
 
-> *Vector memory (`brain.remember` / `brain.recall`) and native tool execution run 100% offline with zero external servers. When invoking `sofuu.agent.run()`, connect your local GGUF/llama.cpp model or any standard remote streaming provider.*
+> Local memory and selected local tools can work offline. Model-backed agents need a supported local model/backend or a configured remote provider; remote services need network access.
 
 ---
 
@@ -102,88 +100,45 @@ You can also test Sofuu's capabilities directly from your terminal:
 $ sofuu chat
 
 # One-liner vector memory test
-$ sofuu eval 'const b = sofuu.memory.open("./brain.qtsq", 768); b.remember(sofuu.ai.embedLocal("fast"), "Sofuu starts in <20ms"); console.log(b.recall(sofuu.ai.embedLocal("speed"), 1)[0].text);'
+$ sofuu eval 'const b = sofuu.memory.open("./brain.qtsq", 768); b.remember(sofuu.ai.embedLocal("fast"), "Local vector memory"); console.log(b.recall(sofuu.ai.embedLocal("speed"), 1)[0].text);'
 ```
 
 ---
 
-### 4. Prefer Pure Declarative Agents? Try Kaze (`.kaze`)
+### 4. Kaze: a domain-specific scripting language
 
-For declarative autonomous agents with zero JavaScript or Python, define capability gates (`needs: ...`) and compile directly into native binaries:
+Kaze provides a parser, checker, VM, capability declarations and standalone compilation for bounded agent and device routines. It is not a general-purpose language. **The real model-and-authorized-tool journey is not yet established**: the embedded engine can select a simulated host for AI, tools and memory. Do not use the examples for real-world actions or treat their output as evidence of live integrations.
 
-```kaze
-# agent.kaze — Declarative Autonomous Agent
-needs: ai, tool, policy, memory, log
-
-filter monitor_and_act(source, metric_val, threshold):
-    log.info("Telemetry ingest: " + source + " = " + metric_val)
-
-    # 1. Fail-closed policy check: block credential leaks before execution
-    if policy detects secrets in source:
-        reject "Security refusal: credential leak in source"
-
-    # 2. Reasoning with continuous on-device vector memory
-    if metric_val > threshold:
-        let analysis = ai.prompt("Synthesize incident analysis for " + source)
-        remember analysis as source + "_incident"
-        tool.call("notifier", source + ":DISPATCH_ALERT")
-        allow "Alert dispatched"
-
-    allow "Nominal telemetry"
-```
+The [Kaze examples](example-agents/README.md) can be inspected and checked without running their simulated operations:
 
 ```bash
-# Compile pure Kaze directly into a standalone single-file binary:
-$ sofuu compile agent.kaze -o my-agent
-
-# Run anywhere with CLI flags or 12-factor config:
-$ ./my-agent --config agent.config.json
+sofuu script check example-agents/quant_sentinel/agent.kaze
 ```
 
----
+Compilation packages supported routines as one executable; system libraries and any real backends needed by the workload remain separate.
 
-### 5. Pure Kaze Showcase Agents (`example-agents/`)
+## Platform evidence (2026-11-10)
 
-The repository includes pre-built showcase agents written 100% in pure Kaze (zero JavaScript, zero package dependencies):
-
-* **Quant Sentinel (`quant_sentinel/`):** Algorithmic risk sentinel enforcing leverage hard-caps and secret-leak detection.
-* **Med Protocol (`med_protocol/`):** Clinical triage agent automating ESI emergency escalations from patient vitals.
-* **Agri Sentinel (`agri_sentinel/`):** Autonomous greenhouse climate monitor controlling irrigation and heat relays.
-* **Paper Trader (`paper_trader/`):** Simulated multi-asset exchange with portfolio risk guardrails.
-
-Compile all agents in one step, or test their standalone native executables:
-
-```bash
-# 1. Compile all showcase agents with one command:
-$ ./example-agents/build.sh
-
-# 2. Test Quant Sentinel (Within 3.0x leverage cap -> Order Routed):
-$ ./example-agents/quant_sentinel/quant-sentinel --arg ticker=BTC --arg signal=BUY --arg leverage=2 --arg price=65000
-# -> [VERDICT] ALLOW "Synthesized market thesis: BTC target $68,200..."
-
-# 3. Test Risk Policy Gate (Leverage > 3.0x -> Instant Fail-Closed Rejection):
-$ ./example-agents/quant_sentinel/quant-sentinel --arg ticker=BTC --arg signal=BUY --arg leverage=5 --arg price=65000
-# -> [VERDICT] REJECT Risk policy violation: leverage 5 exceeds hard cap of 3.0x
-
-# 4. Test Clinical Vitals Triage (Hypoxia + Tachycardia -> ESI Level 1 Escalation):
-$ ./example-agents/med_protocol/med-protocol --arg patient_id=P101 --arg heart_rate=145 --arg spo2=88 --arg systolic_bp=85
-# -> [VERDICT] REJECT CRITICAL: Severe vitals decompensation -> Emergency code triggered
-```
-
----
+| Platform | Available evidence | Limits |
+| :--- | :--- | :--- |
+| macOS arm64 | Published CLI archive and local build; startup and size measurements in [BENCHMARKS.md](BENCHMARKS.md). | An inspected compiled executable dynamically links system libraries. Measurements apply only to the recorded workload. |
+| Linux arm64 and x86_64 | Published CLI archives and local builds are listed in [BENCHMARKS.md](BENCHMARKS.md). | Published Linux artifacts exceed the project's size cap; re-release and platform-specific verification are pending. |
+| Android | Android source and an SDK package are described at [sofuu.xyz/embed](https://sofuu.xyz/embed). | Capability coverage varies by device and build; verify the artifact and device before use. |
+| iOS / macOS SDK | C ABI and Swift wrapper sources exist. | SwiftPM/CocoaPods coordinates at the cited 0.3.0-beta tag were not installable in the 2026-10-31 site audit; verify a current release before using them. No app-store approval is claimed. |
+| Watches, rings, RTOS, other smart devices | Future targets. | No device, OS, or app-store acceptance evidence established in this audit. |
 
 ## Core Runtime vs. Experimental Preview
 
-Sofuu maintains a clear demarcation between core guaranteed subsystems and preview modules:
+Sofuu groups the main runtime surfaces and experimental modules below. Core means included in the product; it does not imply production readiness or a security guarantee.
 
 | Subsystem | Status | Description |
 | :--- | :---: | :--- |
 | **Autonomous Agent Engine** | **Core** | `sofuu.agent`, cooperative scheduling (`scheduler.yield`), step budgets, resilient editing (`smart_edit`), and real-time trace streaming. |
 | **Domain Toolpacks** | **Core** | Modular toolpacks (`coding`, `web`, `memory`, `system`), single-instruction fuel sandbox, numbered unified diffs. |
-| **Standalone Compiler** | **Core** | `sofuu compile`: native executables (under 10 MB) with 32-byte `SOFUU_BIN_V1` trailer, ad-hoc signing, sub-5ms cold starts. |
+| **Standalone Compiler** | **Core** | `sofuu compile`: native executables with a 32-byte `SOFUU_BIN_V1` trailer; signing and dependencies vary by platform. |
 | **Vector Memory (QTSQ)** | **Core** | On-device `.qtsq` vector containers, cached KDF v2, plaintext zero-KDF mode, hardware SIMD search. |
 | **Model Context Protocol (MCP)** | **Core** | Native client & server supporting stdio, HTTP, SSE, and direct in-process transports; dynamic tool discovery. |
-| **Kaze Agent Language** | **Core** | Declarative agent language, linear arena VM, zero GC pauses, fail-closed policy gates, 12-factor configuration. |
+| **Kaze Agent Language** | **Core** | Domain-specific scripting language and VM; real model and tool integration remains incomplete. |
 | **Security Sandbox** | **Core** | Deterministic path traversal blocking, private CIDR SSRF filtering, credential shielding (`.env`, `id_rsa`). |
 | **Local Inference Engine** | **Preview** | Built-in custom GGUF/SafeTensors engine. (For deployed local inference, use `sofuu-plugin-llamacpp` or remote providers). |
 | **Robotics & MAVLink** | **Preview** | `sofuu drone`, MAVLink v2 codec, and GPIO line timers through hardware safety gates. |
@@ -195,7 +150,7 @@ Sofuu maintains a clear demarcation between core guaranteed subsystems and previ
 
 ### 1. Model Context Protocol (MCP)
 
-Sofuu provides a complete native MCP client and server implementation (protocols `2025-06-18` and `2024-11-05`) with **zero external dependencies** — no Node.js, Python, or `npx` required.
+Sofuu provides native MCP client and server support for protocol versions `2025-06-18` and `2024-11-05`. Client transports include stdio, Streamable HTTP, legacy SSE, and in-process direct transport. Server behavior varies by transport; stdio resource and prompt handlers must be synchronous. External servers have their own requirements: the `npx` example below needs Node.js, npx, and access to the package.
 
 #### MCP Client
 Connect to local or remote MCP servers to discover tools, read resources, and execute actions:
@@ -221,23 +176,28 @@ Build standalone or in-process MCP servers in TypeScript or JavaScript:
 
 ```javascript
 const server = sofuu.mcp.serve({ name: "math-service", version: "1.0.0" });
+const fib = n => {
+  let a = 0, b = 1;
+  for (let i = 0; i < n; i++) [a, b] = [b, a + b];
+  return a;
+};
 
 // Register tools with schema validation
 server.tool("fibonacci", {
   description: "Calculate the nth Fibonacci number",
-  schema: { type: "object", properties: { n: { type: "number" } }, required: ["n"] }
+  schema: { type: "object", properties: { n: { type: "integer", minimum: 0, maximum: 78 } }, required: ["n"] }
 }, async ({ n }) => {
   return { result: fib(n) };
 });
 
 // Register resources and prompts
-server.resource("system://metrics", { mimeType: "application/json" }, async () => {
-  return JSON.stringify({ cpu: process.cpuUsage(), memory: process.memoryUsage() });
+server.resource("system://platform", { mimeType: "application/json" }, () => {
+  return JSON.stringify({ platform: process.platform });
 });
 
 // Composable onion middleware
 server.use(async (ctx, next) => {
-  console.log(`[MCP] Invoking ${ctx.toolName}`);
+  console.error(`[MCP] Invoking ${ctx.toolName}`);
   await next();
 });
 
@@ -274,7 +234,7 @@ sofuu mcp build server.ts -o dist/my-mcp-server
 ```
 
 * **Micro-Profile Optimization (`sofuu-micro` base):** `sofuu mcp build` automatically targets the minimal `micro` compilation profile (~2 MB). It strips out cognitive agent loops, chat TUI, and local inference machinery, keeping only QuickJS, libuv, and the streamable MCP protocol engine.
-* **Instant Start & Zero Dependencies:** The resulting standalone executable runs with `< 5 ms` cold start and `< 5 MB` idle RSS, completely eliminating Node.js, `npx`, and Python dependencies from your MCP toolchain.
+* **Deployment:** The compiled executable does not need a separate Node.js or Python installation for supported code. It may still depend on OS libraries and any external servers or services it calls.
 
 Documentation: [sofuu.xyz/mcp](https://sofuu.xyz/mcp)
 
@@ -310,11 +270,15 @@ export default defineTool({
 ```
 
 #### Fault Isolation & Execution Safety
-Every plugin runs with isolated boundaries:
+Plugin tools run in-process and must be trusted as code; their helpers provide checks but are not an OS-level sandbox:
 * **Input & Output Validation:** Arguments are validated against the schema before handler execution (`E_SCHEMA`).
-* **Resource Sandboxing:** `ctx.fs` is scoped to the project directory, and network access is restricted to declared hosts (`E_DENIED`).
-* **Timeouts & Circuit Breakers:** Execution is bounded by hardware deadlines (`E_TIMEOUT`), and failing services trip circuit breakers to prevent request stalls (`E_CIRCUIT_OPEN`).
-* **Error Containment:** Exceptions, rejected promises, or circular references return typed error structures without crashing the host process (`E_TOOL`).
+* **Guarded helpers:** `ctx.fs` scopes supported operations to the project directory, and `ctx.fetch` checks declared network hosts (`E_DENIED`).
+* **Timeouts & Circuit Breakers:** Watchdogs report timeouts and signal cancellation; repeated failures can open a circuit. In-process code may not cooperate with cancellation.
+* **Error Handling:** The wrapper converts supported exceptions and rejected promises to typed results (`E_TOOL`); it cannot contain every crash or resource exhaustion.
+
+The plugin tool wrapper rejects missing, invalid, or failed policy evaluation.
+`sofuu.plugins.invoke` handles policy approval requests; callers using a tool's
+`execute` method directly are responsible for handling an `ask` decision.
 
 #### CLI Workflow
 ```bash
@@ -367,14 +331,14 @@ console.log(report.fuelUsed); // instructions charged
 
 ---
 
-### 5. 24/7 Agent Observability & Crash Recovery
+### 5. Agent Observability & Recovery
 
 Built-in append-only JSONL tracing designed for autonomous supervisor loops:
 
 * **Append-Only Traces:** Turns and tool steps append to `.sofuu/logs/agent-<run_id>.jsonl` with total-order sequence numbers.
-* **Secret Redaction:** API keys, authorization tokens, and private paths are automatically scrubbed at the write choke point before touching disk.
-* **Crash Post-Mortems:** Unhandled crashes generate diagnostic cards in `.sofuu/crashes/<crash_id>.json` capturing the failed step and suggested fixes.
-* **Resumable Execution:** Transparently resume interrupted runs with `sofuu resume <run_id>`.
+* **Secret Redaction:** Recognized credential and path patterns are redacted in supported diagnostic paths; coverage is not exhaustive.
+* **Crash Post-Mortems:** Diagnostic cards may be written to `.sofuu/crashes/<crash_id>.json` on a best-effort basis.
+* **Resumable Execution:** `sofuu resume <run_id>` requires a usable checkpoint; redacted or truncated checkpoints can be refused.
 
 ```bash
 sofuu logs                     # List past agent runs
@@ -387,18 +351,18 @@ sofuu resume <run_id>          # Resume an interrupted run from its last checkpo
 
 ### 6. Continuous Context Persistence & Local Model Reliability
 
-Running multi-step agents against local inference servers (`llama.cpp`, Ollama, vLLM) with MCP tools often breaks on conventional runtimes due to schema token bloat and KV cache limits. Sofuu provides a native continuous context engine for zero-interruption agent loops:
+Running multi-step agents against local inference servers (`llama.cpp`, Ollama, vLLM) with MCP tools often breaks on conventional runtimes due to schema token bloat and KV cache limits. Sofuu includes context-management techniques that may help within a model's limits; neither retention nor uninterrupted execution is guaranteed:
 
 * **Real KV Cache Discovery:** Discovers active `meta.n_ctx` limits directly from local `/v1/models` endpoints, ensuring prompt budgeting aligns with true server KV cache allocation.
-* **90% MCP Schema Slimming:** When context is tight ($\le 16384$ tokens), tool descriptions and parameter schemas are automatically compacted ($\le 130$ and $\le 80$ chars), reducing 24 MCP tools from $\approx 7,500$ tokens to $\approx 720$ tokens without losing argument validation.
-* **Small Model Tool Steering:** Directs local models (0.6B–3B) to execute native tool calls rather than reciting markdown descriptions of available functions.
-* **Proactive Budgeting & Self-Healing:** Preflight budgeting includes tool overhead and live calibration. If an endpoint breaches its context limit (HTTP 400), Sofuu dynamically caches the ceiling limit, auto-compacts earlier history into a distilled memory gist, and retries seamlessly with zero interruption.
+* **MCP Schema Slimming:** Under tight context budgets, tool descriptions and parameter schemas can be compacted; savings vary with the tool set and model.
+* **Small Model Tool Steering:** Attempts to help supported local models produce tool calls; results depend on the model and task.
+* **Budgeting & Retry:** Preflight budgeting includes tool overhead; some context-limit errors can trigger compaction and a retry. A retry can still fail or lose context.
 
 ---
 
 ### 7. Standalone Compiler & Minimum Size Profiles (`sofuu compile`)
 
-Sofuu can compile any JavaScript, TypeScript, or Kaze (`.kaze`) agent directly into a self-contained single-file executable with **zero external dependencies**. Standalone binaries append bytecode and metadata behind a 32-byte `SOFUU_BIN_V1` trailer with automatic Mach-O / ELF ad-hoc signing and sub-5ms cold starts.
+Sofuu can compile supported JavaScript, TypeScript, and Kaze (`.kaze`) programs into a single executable with a 32-byte `SOFUU_BIN_V1` trailer. A separate Node.js or Python installation is not needed for supported code; OS libraries and workflow-specific models, servers, or providers may still be required.
 
 To achieve minimal binary sizes across different deployment targets, Sofuu provides dedicated compiler profiles:
 
@@ -440,7 +404,7 @@ sofuu repl                     # Interactive JS/TS REPL
 sofuu agent run <name> "task"  # Run an autonomous agent headless
 sofuu script run <file.kaze>   # Run a pure Kaze agent routine
 sofuu compile <file.kaze|ts>   # Compile agent into standalone native binary (under 10 MB)
-sofuu daemon install|run       # Manage 24/7 autonomous supervisor daemon
+sofuu daemon install|run       # Manage a supervisor daemon
 
 # Model Context Protocol (MCP)
 sofuu mcp list                      # List configured MCP servers
@@ -504,13 +468,12 @@ sofuu_rt_free(rt);
 
 | Metric | Measured Value | Comparison / Notes |
 | :--- | :--- | :--- |
-| **Binary Size** | **Under 10 MB** (single binary) | macOS Apple Silicon (~5.4 MiB), Linux (~4.9–5.5 MiB). Bundles QuickJS, libuv, Rust core, QTSQ memory. |
-| **Cold Start** | **14.6 ms median** (wall clock) | `sofuu eval "1+1"` including process spawn (Apple M2 Pro). Process floor `sofuu version` is 5.0 ms. |
-| **HTTP Time to First Response** | **39.4 ms measured** | Native in-process server (Node 22: 32.4 ms, Bun 1.3: 25.8 ms). |
-| **Idle Memory (RSS)** | **~14.9 MB measured** | Clean process footprint with zero background daemons. |
-| **Vector Memory Query** | **< 2 ms** | In-process SIMD cosine/L2 search over encrypted `.qtsq` files. |
+| **Binary Size** | Varies by artifact | Published macOS arm64: 5.39 MiB; published Linux arm64: 5.88 MiB, x86_64: 6.80 MiB. See [BENCHMARKS.md](BENCHMARKS.md). |
+| **Startup** | **14.58 ms p50** | `sofuu eval "1+1"`, 500 runs, macOS arm64, warm page cache, including process spawn, 2026-11-06; see [conditions and revisions](BENCHMARKS.md). |
+| **Encrypted first flush** | **79.84 MB peak RSS** | One record, 64-dimensional store, fresh process, macOS arm64, 2026-11-05; see [BENCHMARKS.md](BENCHMARKS.md). |
+| **Vector Memory Query** | Varies by device | See the 10,000-vector results and their limitations in [BENCHMARKS.md](BENCHMARKS.md). |
 
-> *For complete hardware benchmark receipts across 40+ local models, Apple Silicon Metal GPU kernels, and Raspberry Pi 5 runs, see [BENCHMARKS.md](BENCHMARKS.md).*
+> *For benchmark conditions, historical measurements, and limitations, see [BENCHMARKS.md](BENCHMARKS.md).*
 
 ---
 

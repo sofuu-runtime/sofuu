@@ -1,18 +1,6 @@
-# Paper Trader — Autonomous Simulated Crypto & Stock Market Analysis & Paper Execution AI Agent
-#
-# Programmed 100% in Kaze. Zero JS or TS required.
-# Strictly paper trading and simulated execution (NO REAL MONEY).
-#
-# Compile to a standalone single-binary agent with:
-#   sofuu compile example-agents/paper_trader/agent.kaze -o example-agents/paper_trader/paper-trader
-#
-# Capabilities:
-#   ai: Technical price analysis, sentiment evaluation, and autonomous trade rationale
-#   tool: Simulated paper exchange execution, orderbook polling, and portfolio sync
-#   policy: R7 hardware safety guardrails, credential leak checks, and allocation limits
-#   memory: Historical paper trade journal, strategy performance, and thesis retention
-#   log: Detailed simulation trade audit logging
-#   alert: Volatility warnings and simulated trade execution notifications
+# Paper Trader — illustrative Kaze language example.
+# AI, tool, memory, and alert capabilities can currently use synthetic results;
+# this is not a verified integration or a real-world deployment.
 
 needs: ai, tool, policy, memory, log, alert
 

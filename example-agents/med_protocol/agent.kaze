@@ -1,16 +1,6 @@
-# Med Protocol — Clinical Patient Triage & Emergency Response AI Agent
-#
-# Programmed 100% in Kaze. Zero JS or TS required.
-# Compile to a standalone single-binary agent with:
-#   sofuu compile examples/agents/med_protocol/agent.kaze -o med-protocol
-#
-# Capabilities:
-#   ai: LLM clinical protocol analysis & triage recommendation
-#   tool: EHR database integration and vital sign recording
-#   policy: HIPAA compliance, privacy filter, and medical safety guardrails
-#   memory: Patient historical vitals and treatment plan recall
-#   log: Formal hospital audit logging
-#   alert: Emergency medical staff paging and red-alert escalation
+# Med Protocol — illustrative Kaze language example.
+# AI, tool, memory, and alert capabilities can currently use synthetic results;
+# this is not a verified integration or a real-world deployment.
 
 needs: ai, tool, policy, memory, log, alert
 
@@ -19,7 +9,7 @@ filter triage_patient(patient_id, heart_rate, bp_systolic, bp_diastolic, symptom
     
     # 1. Privacy & PHI Protection Guardrail
     if policy detects secrets in symptoms:
-        reject "HIPAA compliance refusal: unredacted credential or private key in clinical notes"
+        reject "Credential pattern detected in notes"
         
     # 2. Critical Physiological Safety Guardrails
     if heart_rate > 160:

@@ -18,11 +18,11 @@
 
 ---
 
-## 🟢 1. Completed & Shipped (Production Ready Core vs. Experimental Preview)
+## 1. Implemented Surfaces and Experimental Modules
 
-> **Launch Scope Alignment:** To provide maximum enterprise reliability for our Hacker News launch, Sofuu divides its delivered features into **Production-Ready Core** (gated, mathematically stable, zero-leak) and **Experimental Preview Modules** (specialized hardware/swarms).
+> **Status:** Sofuu is beta. Implementation of a feature is not proof of production readiness, complete security, or an uptime guarantee. The current Kaze host can return synthetic non-robotics results; the real model-and-tool milestone remains open.
 
-### ⚡ Production-Ready Core Subsystems
+### ⚡ Main Runtime Subsystems
 
 #### Runtime Substrate & Event Loop
 - [x] **QuickJS (ES2023) + libuv core**: JIT-free, lightweight JS execution; measured **14.58 ms p50 / 15.33 ms p95** cold start wall-clock incl. process spawn over 500 runs (Apple M2 Pro, 2026-11-06 — see BENCHMARKS.md; the 22.5 ms and 3.8 ms figures from earlier methodologies are historical).
@@ -33,15 +33,15 @@
 
 #### 🧠 Cognitive Vector Memory (CMA v2)
 - [x] **Encrypted `.qtsq` Containers**: On-device vector storage with zero external database dependencies.
-- [x] **Cached KDF v2 Master Key**: Derived key cached in memory, eliminating historical 64 MB Argon2id spikes on segment access.
+- [x] **Cached KDF v2 Master Key**: Derived key cached after the first 64 MiB Argon2id derivation per process/password; the measured encrypted first-flush peak was 79.84 MB RSS (BENCHMARKS.md, 2026-11-05).
 - [x] **Zero-KDF Plaintext Mode**: `{ plaintext: true }` open for hardware-protected edge storage (12.63 MB peak RSS).
-- [x] **Hardware SIMD Acceleration**: ARM NEON and x86 AVX2 vector math for sub-2ms top-$K$ cosine similarity.
+- [x] **Hardware SIMD Acceleration**: ARM NEON and x86 AVX2 vector math; latency depends on hardware and workload (see BENCHMARKS.md).
 - [x] **Cross-Session Recall**: Automatic memory persistence across runs with `/remember` and `/recall`.
-- [x] **Portable Brain Cards**: Shareable vector cards (`/share` and `/import`) with cryptographic checksums.
+- [x] **Portable Brain Cards**: Shareable vector cards (`/share` and `/import`) with cryptographic checksums; exports are unencrypted.
 
 #### 🤖 Autonomous Agents & Sandboxed Toolpacks
 - [x] **Autonomous Agent Loops**: Multi-step reasoning loops with prompt sovereignty and budget limits.
-- [x] **Model Context Protocol (MCP)**: Native zero-dependency client and server implementation over `stdio` and `SSE`.
+- [x] **Model Context Protocol (MCP)**: Native client and server support with transport-specific limitations; stdio resources and prompts require synchronous handlers.
 - [x] **Deterministic Sandboxed Tools**: `sofuu.tools.PACKS` (`coding`, `web`, `memory`, `system`) with single-instruction fuel metering.
 - [x] **Resilient File Editing**: `smart_edit` with whitespace tolerance and AST syntax dry-runs (`JS_DetectScriptOrModule`).
 - [x] **Sandbox v2 (R7 Policy)**: Strict filesystem jailing, domain network allowlisting, credential shielding (`.ssh`, `.aws`, `.env`), and instruction fuel metering.

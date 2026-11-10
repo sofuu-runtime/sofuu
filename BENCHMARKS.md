@@ -230,7 +230,7 @@ Measured 2026-11-06 (`stat -f%z` on each file; cap is 5,767,168 B):
 The **local `dist/` artifacts are now under the cap on every platform**; the
 published Linux archives on the download page still need a re-cut release.
 
-*Every release binary includes QuickJS (ES2023), libuv event loop, QTSQ cognitive vector memory codec, native MCP client/server, and built-in coding toolpacks with zero external shared library dependencies.*
+*Release binaries include runtime components such as QuickJS, libuv and QTSQ. Dependencies vary by artifact and OS: an inspected macOS Kaze executable dynamically linked system libraries. Models, providers and external servers may add workflow dependencies.*
 
 ---
 

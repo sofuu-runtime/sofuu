@@ -21,7 +21,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 /// Every kernel name the checked-in PTX must export. Kept in one place so the
 /// generator script, the Rust init check and the tests cannot drift.
-pub const PTX_ENTRIES: [&str; 29] = [
+pub const PTX_ENTRIES: [&str; 30] = [
     "sofuu_gemv_q8_0",
     "sofuu_gemv_q4_k",
     "sofuu_gemv_q6_k",
@@ -44,6 +44,7 @@ pub const PTX_ENTRIES: [&str; 29] = [
     "sofuu_attn_combine",
     "sofuu_add_f32",
     "sofuu_gemm_q4_k_b8",
+    "sofuu_gemm_q4_k_b8_q8",
     "sofuu_gemm_q6_k_b8",
     "sofuu_gemm_q8_0_b8",
     "sofuu_gemm_f32_b8",
@@ -2208,6 +2209,91 @@ mod imp {
             self.launch(quant.batch_entry(), (grid, 1, 1), (256, 1, 1), &mut params)
         }
 
+        /// q4_K prefill GEMV on q8_1 activations, four rows per warp: the
+        /// caller quantizes the chunk's activations ONCE (`n_tokens * cols`
+        /// values, per-32-block d/s laid out token-major) and every row of the
+        /// same matrix reuses that load, which is what the f32 b8 kernel could
+        /// not do.
+        #[allow(clippy::too_many_arguments)]
+        pub fn gemm_q4_k_b8_q8(
+            &self,
+            weights: DeviceBuf,
+            xq: DeviceBuf,
+            xd: DeviceBuf,
+            xs: DeviceBuf,
+            y: DeviceBuf,
+            rows: usize,
+            cols: usize,
+            n_tokens: usize,
+        ) -> Result<(), CudaError> {
+            let Some(row_bytes) = Quant::Q4K.row_bytes(cols) else {
+                return Err(CudaError(format!("q4_K does not accept cols={cols}")));
+            };
+            if n_tokens == 0 || rows == 0 {
+                return Err(CudaError(format!(
+                    "gemm_q4_k_b8_q8 rejects rows={rows} n_tokens={n_tokens}"
+                )));
+            }
+            let need_w = row_bytes
+                .checked_mul(rows)
+                .ok_or_else(|| CudaError("gemm_q4_k_b8_q8 weight size overflow".into()))?;
+            let n_vals = n_tokens
+                .checked_mul(cols)
+                .ok_or_else(|| CudaError("gemm_q4_k_b8_q8 activation size overflow".into()))?;
+            let n_blk = n_vals / 32;
+            let need_d = n_blk
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| CudaError("gemm_q4_k_b8_q8 scale size overflow".into()))?;
+            let need_y = n_tokens
+                .checked_mul(rows)
+                .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| CudaError("gemm_q4_k_b8_q8 y size overflow".into()))?;
+            if weights.bytes < need_w
+                || xq.bytes < n_vals
+                || xd.bytes < need_d
+                || xs.bytes < need_d
+                || y.bytes < need_y
+            {
+                return Err(CudaError(format!(
+                    "gemm_q4_k_b8_q8 buffers too small: w {}<{need_w}, xq {}<{n_vals}, xd {}<{need_d}, xs {}<{need_d}, y {}<{need_y}",
+                    weights.bytes, xq.bytes, xd.bytes, xs.bytes, y.bytes
+                )));
+            }
+            let mut wp = weights.ptr;
+            let mut xqp = xq.ptr;
+            let mut xdp = xd.ptr;
+            let mut xsp = xs.ptr;
+            let mut yp = y.ptr;
+            let mut r = rows as i32;
+            let mut c = cols as i32;
+            let mut n = n_tokens as i32;
+            let mut params: [*mut c_void; 8] = [
+                &mut wp as *mut u64 as *mut c_void,
+                &mut xqp as *mut u64 as *mut c_void,
+                &mut xdp as *mut u64 as *mut c_void,
+                &mut xsp as *mut u64 as *mut c_void,
+                &mut yp as *mut u64 as *mut c_void,
+                &mut r as *mut i32 as *mut c_void,
+                &mut c as *mut i32 as *mut c_void,
+                &mut n as *mut i32 as *mut c_void,
+            ];
+            // One warp per (token, row-quad), eight warps per block.
+            let quads = (rows + 3) / 4;
+            let blocks = n_tokens
+                .checked_mul(quads)
+                .and_then(|v| v.checked_add(7))
+                .map(|v| v / 8)
+                .ok_or_else(|| CudaError("gemm_q4_k_b8_q8 grid overflow".into()))?;
+            let grid = u32::try_from(blocks)
+                .map_err(|_| CudaError(format!("gemm_q4_k_b8_q8 grid {blocks} exceeds u32")))?;
+            self.launch(
+                "sofuu_gemm_q4_k_b8_q8",
+                (grid, 1, 1),
+                (256, 1, 1),
+                &mut params,
+            )
+        }
+
         /// RMSNorm over `rows` consecutive rows of `n` values.
         pub fn rmsnorm_batch(
             &self,
@@ -2827,6 +2913,21 @@ mod imp {
         }
 
         #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::too_many_arguments)]
+        pub fn gemm_q4_k_b8_q8(
+            &self,
+            _weights: DeviceBuf,
+            _xq: DeviceBuf,
+            _xd: DeviceBuf,
+            _xs: DeviceBuf,
+            _y: DeviceBuf,
+            _rows: usize,
+            _cols: usize,
+            _n_tokens: usize,
+        ) -> Result<(), CudaError> {
+            Err(CudaError("CUDA backend is Linux-only".into()))
+        }
+
         pub fn gemm_b8(
             &self,
             _quant: Quant,

@@ -1834,6 +1834,131 @@ void bench_attn_decoders(void *fn_old, void *fn_split, void *fn_combine,
     sofuu_cuda_ctx_free(g_ctx, da16);
 }
 
+// Prefill q4_K on q8_1 activations, rows per warp: each (token, row) output must
+// match the per-row reference, and rows=5 keeps the last quad partial.
+void test_gemm_q4_k_b8_q8(void *fn_gemm, uint32_t &seed) {
+    for (int n_tokens : {1, 8}) {
+        const int rows = 5, cols = 2048;
+        const int nblk = cols / 32;
+        std::vector<uint8_t> w;
+        fill_q4_k(w, rows, cols, seed);
+        std::vector<float> x = random_vec(n_tokens * cols, seed, -1.0f, 1.0f);
+        std::vector<int8_t> xq((size_t)n_tokens * cols);
+        std::vector<float> xd((size_t)n_tokens * nblk);
+        std::vector<int32_t> xs((size_t)n_tokens * nblk), xs16((size_t)n_tokens * nblk * 2);
+        sofuu_ref::quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(),
+                                 xs16.data(), n_tokens * cols);
+        unsigned long long dw = 0, dq = 0, dd = 0, ds = 0, d16 = 0, dy = 0;
+        if (!alloc_upload(w.data(), w.size(), &dw) ||
+            !alloc_upload(xq.data(), xq.size(), &dq) ||
+            !alloc_upload(xd.data(), (size_t)n_tokens * nblk * 4, &dd) ||
+            !alloc_upload(xs.data(), (size_t)n_tokens * nblk * 4, &ds) ||
+            !alloc_upload(xs16.data(), (size_t)n_tokens * nblk * 8, &d16) ||
+            !alloc_only((unsigned long long)n_tokens * rows * sizeof(float), &dy)) {
+            fail_msg("alloc");
+            ++g_failures;
+            return;
+        }
+        std::vector<float> got((size_t)n_tokens * rows, 0.0f);
+        {
+            int r = rows, c = cols, nt = n_tokens;
+            std::vector<void *> params = {&dw, &dq, &dd, &ds, &dy,
+                                          (void *)&r, (void *)&c, (void *)&nt};
+            unsigned grid = (unsigned)((n_tokens * ((rows + 3) / 4) + 7) / 8);
+            if (!launch(fn_gemm, grid, 256, params) ||
+                !download(dy, got.data(), (size_t)n_tokens * rows * sizeof(float))) {
+                return;
+            }
+        }
+        double worst = 0.0, bound = 0.0, worst_ref = 0.0;
+        for (int t = 0; t < n_tokens; ++t) {
+            for (int r = 0; r < rows; ++r) {
+                const uint8_t *row = w.data() + (size_t)r * (cols / 256) * 144;
+                sofuu_ref::Dot want = sofuu_ref::dot_q4_k_q8(
+                    row, xq.data() + (size_t)t * cols,
+                    xd.data() + (size_t)t * nblk,
+                    xs.data() + (size_t)t * nblk, cols);
+                double e = std::fabs((double)got[(size_t)t * rows + r] - want.value);
+                double b = 1e-5 * (want.l1 > 1.0 ? want.l1 : 1.0) + 1e-6;
+                if (e > worst) { worst = e; worst_ref = want.value; }
+                if (b > bound) bound = b;
+            }
+        }
+        char name[64];
+        std::snprintf(name, sizeof(name), "b8_q4_k_q8(%dtok)", n_tokens);
+        report(name, worst <= bound, worst, bound, worst_ref);
+        sofuu_cuda_ctx_free(g_ctx, dw);
+        sofuu_cuda_ctx_free(g_ctx, dq);
+        sofuu_cuda_ctx_free(g_ctx, dd);
+        sofuu_cuda_ctx_free(g_ctx, ds);
+        sofuu_cuda_ctx_free(g_ctx, d16);
+        sofuu_cuda_ctx_free(g_ctx, dy);
+    }
+}
+
+// The prefill GEMV pair on the model's real FFN shape and chunk: the f32 b8
+// kernel re-reads an activation row per output row, this one does not, so the
+// row is the whole story behind a 17 s prompt.
+void bench_b8_q4_k(void *fn_old, void *fn_new, uint32_t &seed) {
+    const int rows = 8192, cols = 2048, n_tokens = 8;
+    const int nblk = cols / 32;
+    std::vector<uint8_t> w;
+    fill_q4_k(w, rows, cols, seed);
+    std::vector<float> x = random_vec(n_tokens * cols, seed, -1.0f, 1.0f);
+    std::vector<int8_t> xq((size_t)n_tokens * cols);
+    std::vector<float> xd((size_t)n_tokens * nblk);
+    std::vector<int32_t> xs((size_t)n_tokens * nblk), xs16((size_t)n_tokens * nblk * 2);
+    sofuu_ref::quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(),
+                             xs16.data(), n_tokens * cols);
+    unsigned long long dw = 0, dx = 0, dq = 0, dd = 0, ds = 0, dy = 0;
+    if (!alloc_upload(w.data(), w.size(), &dw) ||
+        !alloc_upload(x.data(), x.size() * sizeof(float), &dx) ||
+        !alloc_upload(xq.data(), xq.size(), &dq) ||
+        !alloc_upload(xd.data(), (size_t)n_tokens * nblk * 4, &dd) ||
+        !alloc_upload(xs.data(), (size_t)n_tokens * nblk * 4, &ds) ||
+        !alloc_only((unsigned long long)n_tokens * rows * sizeof(float), &dy)) {
+        fail_msg("alloc");
+        ++g_failures;
+        return;
+    }
+    int r = rows, c = cols, nt = n_tokens;
+    std::vector<void *> old_params = {&dw, &dx, &dy, (void *)&r, (void *)&c,
+                                      (void *)&nt};
+    std::vector<void *> new_params = {&dw, &dq, &dd, &ds, &dy, (void *)&r,
+                                      (void *)&c, (void *)&nt};
+    unsigned old_grid = (unsigned)((n_tokens * rows + 7) / 8);
+    unsigned new_grid = (unsigned)((n_tokens * ((rows + 3) / 4) + 7) / 8);
+    const int iters = 20;
+    for (int i = 0; i < 2; ++i) {
+        if (!launch_async(fn_old, old_grid, 256, old_params) ||
+            !launch_async(fn_new, new_grid, 256, new_params))
+            return;
+    }
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) return;
+    auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i)
+        if (!launch_async(fn_old, old_grid, 256, old_params)) return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) return;
+    auto t1 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i)
+        if (!launch_async(fn_new, new_grid, 256, new_params)) return;
+    if (sofuu_cuda_ctx_sync(g_ctx) != 0) return;
+    auto t2 = std::chrono::steady_clock::now();
+    double wbytes = (double)rows * (double)(cols / 256) * 144.0;
+    double old_s = std::chrono::duration<double>(t1 - t0).count() / iters;
+    double new_s = std::chrono::duration<double>(t2 - t1).count() / iters;
+    std::printf("[bench] b8_q4_k  %dx%d x%dtok  f32 %.1f GB/s  q8_rpw %.1f GB/s  "
+                "%.1fx\n",
+                rows, cols, n_tokens, wbytes / old_s / 1e9, wbytes / new_s / 1e9,
+                new_s > 0.0 ? old_s / new_s : 0.0);
+    sofuu_cuda_ctx_free(g_ctx, dw);
+    sofuu_cuda_ctx_free(g_ctx, dx);
+    sofuu_cuda_ctx_free(g_ctx, dq);
+    sofuu_cuda_ctx_free(g_ctx, dd);
+    sofuu_cuda_ctx_free(g_ctx, ds);
+    sofuu_cuda_ctx_free(g_ctx, dy);
+}
+
 // The prefill attention pair at the shape that hurts: a chunk of 8 tokens at
 // position 2400, i.e. what the 300th chunk of a 2402-token prompt costs.
 void bench_attn_prefill_kernels(void *fn_old, void *fn_split, void *fn_combine,
@@ -1999,6 +2124,7 @@ int main(int argc, char **argv) {
     void *f_rope_kv = nullptr;
     void *f_attn_split = nullptr, *f_attn_combine = nullptr;
     void *f_attn_psplit = nullptr;
+    void *f_b8_q4q8 = nullptr;
     void *f_attn = nullptr, *f_add = nullptr;
     void *f_b8_q4 = nullptr, *f_b8_q6 = nullptr, *f_b8_q8 = nullptr;
     void *f_b8_f32 = nullptr, *f_rms_b = nullptr, *f_attn_p = nullptr;
@@ -2024,6 +2150,7 @@ int main(int argc, char **argv) {
         !get_function("sofuu_attn_combine", &f_attn_combine) ||
         !get_function("sofuu_add_f32", &f_add) ||
         !get_function("sofuu_gemm_q4_k_b8", &f_b8_q4) ||
+        !get_function("sofuu_gemm_q4_k_b8_q8", &f_b8_q4q8) ||
         !get_function("sofuu_gemm_q6_k_b8", &f_b8_q6) ||
         !get_function("sofuu_gemm_q8_0_b8", &f_b8_q8) ||
         !get_function("sofuu_gemm_f32_b8", &f_b8_f32) ||
@@ -2039,6 +2166,7 @@ int main(int argc, char **argv) {
         test_gemv_q6_k(f_q6, seed, cols);
     }
     test_gemv_q4_k_q8(f_quant, f_q4q8, seed);
+    test_gemm_q4_k_b8_q8(f_b8_q4q8, seed);
     test_gemv_q4_k_q8_x2(f_quant, f_q4q8x2, seed);
     test_gemv_q6_k_q8(f_quant, f_q6q8, seed);
     test_fused_q8(f_rms_q8, f_rmsadd_q8, f_swiglu_q8, seed);
@@ -2056,6 +2184,7 @@ int main(int argc, char **argv) {
     test_add(f_add, seed);
     bench_attn_decoders(f_attn, f_attn_split, f_attn_combine, seed);
     bench_attn_prefill_kernels(f_attn_p, f_attn_psplit, f_attn_combine, seed);
+    bench_b8_q4_k(f_b8_q4, f_b8_q4q8, seed);
     for (int cols : {1024, 4096}) test_gemm_b8(f_b8_q8, seed, 0, cols);
     for (int cols : {2048, 8192}) {
         test_gemm_b8(f_b8_q4, seed, 1, cols);

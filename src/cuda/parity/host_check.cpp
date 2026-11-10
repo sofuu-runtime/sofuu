@@ -737,6 +737,42 @@ void test_batch_paths(uint32_t &seed) {
     }
 }
 
+// Prefill chunks through the rows-per-warp q4_K kernel: rows deliberately not a
+// multiple of the four-row group, so the clamp on the last quad is covered, and
+// two chunk sizes so the (token, row-quad) mapping is exercised.
+void test_gemm_q4_k_b8_q8(uint32_t &seed) {
+    for (int n_tokens : {1, 8}) {
+        const int rows = 5, cols = 2048;
+        const int nb32 = cols / 32;
+        std::vector<uint8_t> w;
+        fill_q4_k(w, rows, cols, seed);
+        std::vector<float> x = random_vec(n_tokens * cols, seed, -1.0f, 1.0f);
+        std::vector<int8_t> xq((size_t)n_tokens * cols);
+        std::vector<float> xd((size_t)n_tokens * nb32);
+        std::vector<int32_t> xs((size_t)n_tokens * nb32);
+        std::vector<int32_t> xs16((size_t)n_tokens * nb32 * 2);
+        sofuu_ref::quantize_q8_1(x.data(), xq.data(), xd.data(), xs.data(),
+                                 xs16.data(), n_tokens * cols);
+        std::vector<float> got((size_t)n_tokens * rows, 0.0f);
+        sofuu_host_gemm_q4_k_b8_q8(w.data(), xq.data(), xd.data(), xs.data(),
+                                   got.data(), rows, cols, n_tokens);
+        int worst = 0;
+        for (int t = 0; t < n_tokens; ++t) {
+            for (int r = 0; r < rows; ++r) {
+                float want = sofuu_host_q4_k_dot_q8(
+                    w.data() + (size_t)r * (cols / 256) * 144,
+                    xq.data() + (size_t)t * cols,
+                    xd.data() + (size_t)t * nb32,
+                    xs.data() + (size_t)t * nb32, cols);
+                if (got[(size_t)t * rows + r] != want) ++worst;
+            }
+        }
+        char name[64];
+        std::snprintf(name, sizeof(name), "b8_q4_k_q8(%dtok)", n_tokens);
+        report(name, worst == 0, (double)worst, 0.0, (double)got[0]);
+    }
+}
+
 // The q4_K kernel reads eight qs bytes as one little-endian uint64. Verify the
 // shift/nibble extraction against the per-byte definition on the host.
 void test_q4_vector_extract(uint32_t &seed) {
@@ -780,6 +816,7 @@ int main(void) {
     test_attn_split(seed);
     test_add(seed);
     test_tiled_gemv(seed);
+    test_gemm_q4_k_b8_q8(seed);
     test_q4_vector_extract(seed);
     test_b8_gemm(seed);
     test_batch_paths(seed);

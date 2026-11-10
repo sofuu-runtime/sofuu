@@ -120,6 +120,12 @@ pub struct CudaModel {
     // kernels use one warp per token, so the cap of eight is a kernel contract,
     // not a tuning knob.
     xb: DeviceBuf,
+    /// q8_1 encodings of a prefill chunk's activations: one byte per
+    /// value plus the per-32-block scale/sum arrays, token-major.
+    xq_b: DeviceBuf,
+    xd_b: DeviceBuf,
+    xs_b: DeviceBuf,
+    xs16_b: DeviceBuf,
     x_norm_b: DeviceBuf,
     q_b: DeviceBuf,
     k_b: DeviceBuf,
@@ -445,6 +451,11 @@ impl CudaModel {
             .map_err(|e| format!("position buffer: allocate 8 B: {e}"))?;
 
         let xb = alloc_f32!(PREFILL_BATCH * dim, "x_batch");
+        let q8_pref = PREFILL_BATCH * cfg.hidden_dim.max(dim);
+        let xq_b = alloc_f32!(q8_pref / 4, "x_batch_q8");
+        let xd_b = alloc_f32!(q8_pref / 32, "x_batch_d");
+        let xs_b = alloc_f32!(q8_pref / 32, "x_batch_s");
+        let xs16_b = alloc_f32!(q8_pref / 16, "x_batch_s16");
         let x_norm_b = alloc_f32!(PREFILL_BATCH * dim, "x_norm_batch");
         let q_b = alloc_f32!(PREFILL_BATCH * q_dim, "q_batch");
         let k_b = alloc_f32!(PREFILL_BATCH * kv_dim, "k_batch");
@@ -525,6 +536,10 @@ impl CudaModel {
             logits_host: vec![0.0; cfg.vocab_size],
             rope_host: vec![0.0; cfg.head_dim],
             xb,
+            xq_b,
+            xd_b,
+            xs_b,
+            xs16_b,
             x_norm_b,
             q_b,
             k_b,
@@ -669,6 +684,33 @@ impl CudaModel {
             e.gemv(quant, w, x, y, rows, cols)
                 .map_err(|err| format!("gemv: {err}"))
         }
+    }
+
+    /// Prefill GEMV: quantize the chunk's activations once, then let the
+    /// rows-per-warp q4_K kernel reuse that load across four rows. Everything
+    /// else keeps the f32 b8 kernel, which is correct but re-reads a full
+    /// activation row per output row (14 GB/s of weights on a 6-token chunk).
+    fn gemm_b8_act(
+        &self,
+        e: &CudaEngine,
+        quant: Quant,
+        w: DeviceBuf,
+        x: DeviceBuf,
+        y: DeviceBuf,
+        rows: usize,
+        cols: usize,
+        n_tokens: usize,
+    ) -> Result<(), String> {
+        if quant == Quant::Q4K && cols.is_multiple_of(32) {
+            let n_vals = n_tokens * cols;
+            e.quantize_q8_1(x, self.xq_b, self.xd_b, self.xs_b, self.xs16_b, n_vals)
+                .map_err(|err| format!("prefill quantize ({n_vals}): {err}"))?;
+            return e
+                .gemm_q4_k_b8_q8(w, self.xq_b, self.xd_b, self.xs_b, y, rows, cols, n_tokens)
+                .map_err(|err| format!("gemm q4_K b8 x q8_1: {err}"));
+        }
+        e.gemm_b8(quant, w, x, y, rows, cols, n_tokens)
+            .map_err(|err| format!("gemm_b8: {err}"))
     }
 
     /// Split-K covers head_dim 32/64/128 with up to eight query heads per KV
@@ -1192,7 +1234,8 @@ impl CudaModel {
                 n,
             )
             .map_err(|err| format!("layer {li} attn_norm batch: {err}"))?;
-            e.gemm_b8(
+            self.gemm_b8_act(
+                e,
                 l.attn_q_quant,
                 l.attn_q,
                 self.x_norm_b,
@@ -1202,7 +1245,8 @@ impl CudaModel {
                 n,
             )
             .map_err(|err| format!("layer {li} attn_q batch: {err}"))?;
-            e.gemm_b8(
+            self.gemm_b8_act(
+                e,
                 l.attn_k_quant,
                 l.attn_k,
                 self.x_norm_b,
@@ -1212,7 +1256,8 @@ impl CudaModel {
                 n,
             )
             .map_err(|err| format!("layer {li} attn_k batch: {err}"))?;
-            e.gemm_b8(
+            self.gemm_b8_act(
+                e,
                 l.attn_v_quant,
                 l.attn_v,
                 self.x_norm_b,
@@ -1304,7 +1349,8 @@ impl CudaModel {
                 )
                 .map_err(|err| format!("layer {li} prefill attention: {err}"))?;
             }
-            e.gemm_b8(
+            self.gemm_b8_act(
+                e,
                 l.attn_output_quant,
                 l.attn_output,
                 self.attn_b,
@@ -1326,7 +1372,8 @@ impl CudaModel {
                 n,
             )
             .map_err(|err| format!("layer {li} ffn_norm batch: {err}"))?;
-            e.gemm_b8(
+            self.gemm_b8_act(
+                e,
                 l.ffn_gate_quant,
                 l.ffn_gate,
                 self.x_norm_b,
@@ -1336,7 +1383,8 @@ impl CudaModel {
                 n,
             )
             .map_err(|err| format!("layer {li} ffn_gate batch: {err}"))?;
-            e.gemm_b8(
+            self.gemm_b8_act(
+                e,
                 l.ffn_up_quant,
                 l.ffn_up,
                 self.x_norm_b,
@@ -1353,7 +1401,8 @@ impl CudaModel {
                 n * self.hidden_dim,
             )
             .map_err(|err| format!("layer {li} swiglu batch: {err}"))?;
-            e.gemm_b8(
+            self.gemm_b8_act(
+                e,
                 l.ffn_down_quant,
                 l.ffn_down,
                 self.act_b,

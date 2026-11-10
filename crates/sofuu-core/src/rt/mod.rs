@@ -39,6 +39,7 @@ pub mod memory_adapters; // PLAN-PLUGGABLE-MEMORY-ADAPTERS: the lazily compiled 
 pub mod zerocopy; // Phase 3: Zero-Copy TypedArray & Native Memory Bridge
 pub mod view_guard; // R7.P2: the validated JS-view → native-pointer window (bounds/alignment/dim)
 pub mod diagnostics; // PLAN-MODERN-NPM: actionable failures (native addons, absent Node APIs, resolution)
+pub mod diag_contract; // PLAN-UNIFIED-DIAGNOSTICS: one versioned diagnostic model + renderers
 pub mod async_context; // Phase 4: Native AsyncLocalStorage & Agent Context Propagation
 pub mod sandbox; // Phase 5: Deterministic Agent Sandboxing & Fuel Meters
 pub mod policy; // S4 (R7): one policy evaluator for tools/shell/fs/net/MCP

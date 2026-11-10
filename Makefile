@@ -64,6 +64,13 @@ all: $(TARGET)
 # why the script also emits the generic prefixes the config carries.
 SOFUU_REMAP_FLAGS := $(shell bash scripts/cross/remap_flags.sh 2>/dev/null)
 
+# PLAN-UNIFIED-DIAGNOSTICS size trade (2026-11-10): ld64 emits an
+# LC_FUNCTION_STARTS table (~26 KB in this binary) that only sampling
+# profilers and external symbolication read. Release builds keep the 5.5 MiB
+# gate instead; native abort backtraces are already documented as best-effort.
+# Darwin-only: `-no_function_starts` is an Apple ld option.
+SOFUU_LINK_FLAGS := $(shell [ "$$(uname -s)" = Darwin ] && echo "-C link-arg=-Wl,-no_function_starts")
+
 cargo-build:
 	@if [ -z "$(SOFUU_QTSQ_DIR)" ]; then \
 		echo "  \033[31m✗ SOFUU_QTSQ_DIR is not set.\033[0m"; \
@@ -76,7 +83,7 @@ cargo-build:
 		echo "    QTSQ is a mandatory core component of Sofuu."; \
 		exit 1; \
 	fi
-	RUSTFLAGS="$(SOFUU_REMAP_FLAGS) $$RUSTFLAGS" cargo build --release
+	RUSTFLAGS="$(SOFUU_REMAP_FLAGS) $(SOFUU_LINK_FLAGS) $$RUSTFLAGS" cargo build --release
 
 $(TARGET): cargo-build
 	@echo "  \033[36mCARGO\033[0m  $@  [arch=$(ARCH)]"

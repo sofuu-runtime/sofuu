@@ -1569,6 +1569,64 @@ export interface SofuuObservability {
   readonly VERSION?: string;
 }
 
+/* ==================================================================
+ * sofuu.diagnostics — PLAN-UNIFIED-DIAGNOSTICS
+ * ================================================================== */
+
+/**
+ * One failure in the versioned diagnostic shape (rt/diag_contract.rs).
+ * Every field beyond `code`, `severity` and `message` is optional: an absent
+ * field means "not available", never "guessed".
+ */
+export interface DiagnosticLocation {
+  /** The original source identity, when the runtime observed one. */
+  source?: string;
+  /** 1-based; absent when the front end did not track it. */
+  line?: number;
+  column?: number;
+  end_line?: number;
+  end_column?: number;
+  /** True when this names generated/transformed code, not the user source. */
+  generated?: boolean;
+  /** E.g. "type-stripped source". */
+  label?: string;
+}
+
+export type DiagnosticSeverity = 'error' | 'warning' | 'rejection' | 'cancellation';
+
+export interface Diagnostic {
+  diagnostic_version: 1;
+  /** The surface's existing stable code; never silently renamed. */
+  code: string;
+  severity: DiagnosticSeverity;
+  message: string;
+  operation?: string;
+  subsystem?: string;
+  location?: DiagnosticLocation;
+  /** A known explanation, separate from observed causality. */
+  reason?: string;
+  hints?: string[];
+}
+
+/**
+ * The unified diagnostic surface. Every function takes ONE JSON string and
+ * answers with JSON TEXT, matching sofuu.events / sofuu.observability.
+ * Rendering never changes exit status, retries or authorization.
+ */
+export interface SofuuDiagnostics {
+  /** The diagnostic shape version (currently 1). */
+  version(): number;
+  /**
+   * Human text: concise by default (one hint). SOFUU_DIAGNOSTICS=full or
+   * verbose shows every hint. Takes one JSON string, like the rest.
+   */
+  render(input: string): string;
+  /** Build the shape from a live Error (values in this realm, not serialized). */
+  fromError(err: unknown): string;
+  /** The shared text sanitizer: ANSI, control characters, secret-shaped strings. */
+  redact(text: string): string;
+}
+
 /**
  * The Sofuu runtime as a plugin sees it. Only namespaces the drivers actually
  * install are listed; anything else is undefined at runtime.
@@ -1591,6 +1649,8 @@ export interface SofuuRuntime {
   agent?: SofuuAgent;
   /** Run logs, checkpoints and crash cards (src/js/observability.js). */
   observability?: SofuuObservability;
+  /** The versioned diagnostic view over every surface's existing codes. */
+  diagnostics: SofuuDiagnostics;
   /** The deterministic in-process execution sandbox (rt/sandbox.rs). */
   sandbox: SofuuSandbox;
   /**

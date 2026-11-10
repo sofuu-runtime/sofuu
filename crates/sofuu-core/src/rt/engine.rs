@@ -444,6 +444,8 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         // over the same envelope, for `sofuu logs` and `sofuu resume`.
         crate::rt::observability::mod_observability_register(ctx);
         crate::rt::async_contract::mod_async_contract_register(ctx);
+        // PLAN-UNIFIED-DIAGNOSTICS: the versioned view over existing codes.
+        crate::rt::diag_contract::mod_diag_contract_register(ctx);
         // Hosted-auth primitive: RS256 JWT verification against a JWKS
         // (OIDC/JWT providers). Registered after `sofuu` exists, before the
         // shipped drivers so application code sees it at startup.
@@ -551,6 +553,7 @@ unsafe fn engine_register_micro_builtins(eng: *mut SofuuEngine) {
         crate::capabilities::mod_capabilities_register(ctx);
         crate::rt::events::mod_events_register(ctx);
         crate::rt::async_contract::mod_async_contract_register(ctx);
+        crate::rt::diag_contract::mod_diag_contract_register(ctx);
         crate::rt::async_context::mod_async_context_register(ctx);
         crate::rt::sandbox::mod_sandbox_register(ctx);
         crate::rt::policy::mod_policy_register(ctx);
@@ -1381,18 +1384,19 @@ pub(crate) unsafe fn report_uncaught(ctx: *mut qjs::JSContext, reason: qjs::JSVa
         .or_else(|| crate::rt::deadline::classify_interrupted(&msg_s))
     {
         Some(named) => eprintln!("{}", paint("31", &format!("[sofuu] {}", named))),
-        None => eprintln!("{}", paint("31", &format!("[sofuu] UncaughtException: {}", msg_s))),
-    }
-    let stack = unsafe { qjs::sofuu_js_get_property_str(ctx, reason, c"stack".as_ptr()) };
-    if !unsafe { qjs::is_undefined(stack) } && !unsafe { qjs::is_null(stack) } {
-        let ss = unsafe { qjs::sofuu_js_to_cstring(ctx, stack) };
-        if !ss.is_null() {
-            eprintln!("{}", unsafe { CStr::from_ptr(ss) }.to_string_lossy());
-            // SAFETY: ss came from to_cstring on this ctx.
-            unsafe { qjs::sofuu_js_free_cstring(ctx, ss) };
+        None => {
+            /* PLAN-UNIFIED-DIAGNOSTICS: one concise block — code, message,
+             * verified location, known reason, one safe next step, and only
+             * the frames QuickJS actually printed. The stack is no longer
+             * printed twice. SOFUU_DIAGNOSTICS=full expands causes/evidence
+             * and every observed frame. */
+            let diag = unsafe {
+                crate::rt::diag_contract::from_js_exception_message(ctx, reason, &msg_s)
+            };
+            let full = crate::rt::diag_contract::full_detail_requested();
+            eprint!("{}", diag.render_human(full, stderr_wants_color()));
         }
     }
-    unsafe { qjs::sofuu_js_free_value(ctx, stack) };
     unsafe { qjs::sofuu_js_free_value(ctx, str_v) };
     note_uncaught_error(ctx);
 }

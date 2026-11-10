@@ -4,6 +4,19 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Unified Diagnostics — 2026-11-10
+
+One versioned diagnostic contract across the CLI, JavaScript, Kaze, events and crash cards (`docs/PLAN-UNIFIED-DIAGNOSTICS.md`):
+
+- **Shared model (`rt/diag_contract.rs`):** `diagnostic_version`, stable `code`, `severity`, bounded `message`/`hints`, optional verified location, and a known `reason`. Unknown failures stay `UNCLASSIFIED`; known codes gain one safe explanation and next step, never a guessed cause. `sofuu.diagnostics.*` exposes `render`, `fromError`, `redact` and `version`.
+- **Human and machine adapters:** `sofuu eval`/`run` uncaught exceptions and unhandled rejections now print one concise block (location, reason, help); `SOFUU_DIAGNOSTICS=full` expands the hints. `sofuu script run --json` keeps its `{ok, code, error}` fields and adds the versioned `diagnostic`.
+- **Kaze source attribution:** parser errors keep line + column, and checker/compiler/VM errors keep their line. The VM's item-level line limitation is reported honestly; instruction-level spans would require a versioned bytecode migration.
+- **Privacy:** the event writer’s existing redaction seam now sanitizes every free-form string (ANSI/OSC, C0/C1/bidi controls, Bearer/Basic credentials, secret-shaped key/value pairs, private home paths). Crash cards are redacted before disk.
+- **Compatibility:** existing codes, event kinds, exit status, retries, approvals, C ABI status/envelope and protocol stdout are unchanged. Legacy codes map into the event taxonomy with the original retained in `legacy_code`.
+- **Context-limit finding:** regression tests prove the configured short model name resolves a local listing's full-path `.gguf` id, and that learned-limit keys are case- and endpoint-normalized.
+
+Verification: `cargo test -p sofuu-core --lib rt::diag_contract`, `rt::events`, `rt::observability`, `domains::kaze`, plus `cargo test -p sofuu-core --test diagnostics_contract` (all passing locally), and real `sofuu eval` / `sofuu script run|check` receipts. Binary size: this contract measured 5,750,928 B (cap 5,767,168 B) before concurrent audit edits to `main.rs`/`engine.rs` landed; the combined tree now measures 5,783,984 B, so `make size-check` is red for the shared tree, not attributable to this module alone (see `docs/DIAGNOSTICS.md` §8).
+
 ## Enterprise Hardening & Linux Cross-Compile Static TLS Integration — 2026-11-09
 
 Reliability, networking, and cross-platform transport hardening across Linux, enterprise schemas, and zero-crash invariants:

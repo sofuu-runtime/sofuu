@@ -53,6 +53,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [x] Integrate CMake fallback for vendored libuv builds on clean clones (F-15).
   - [x] Enforce fail-fast runtime panic on subsystem initialization failure (F-06).
   - [x] Optimize QuickJS microtask queue drain latency under saturated event loops.
+  - [x] PLAN-UNIFIED-DIAGNOSTICS: versioned diagnostic contract, uncaught/rejection rendering, and shared event-string redaction (`rt/diag_contract.rs`).
 
 ---
 
@@ -122,6 +123,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 * **Active Tasks**:
   - [x] Enforce fail-closed capability gates on missing or empty policies (`E_CAP_DENIED`) (F-04).
   - [x] Build and verify 4 showcase agents in `example-agents/` with automated build harness.
+  - [x] PLAN-UNIFIED-DIAGNOSTICS: verified Kaze parser/checker/VM locations and an additive versioned `diagnostic` in `script run --json` (excerpts deferred under the size cap).
   - [ ] Implement incremental AST caching for sub-millisecond Kaze routine compilation.
 
 ---
@@ -172,6 +174,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 * **Active Tasks**:
   - [x] Align TUI banner with brand voice ("runtime for AI") (F-07).
   - [x] Verify CLI argument parsing matches 12-factor configuration hierarchy.
+  - [x] PLAN-UNIFIED-DIAGNOSTICS: concise/full diagnostic rendering on stderr, `SOFUU_DIAGNOSTICS=full`, and unchanged exit status/argument passthrough.
   - [ ] Add interactive debugging hooks (`--inspect-brk`) for Kaze VM step execution.
 
 ---
@@ -225,6 +228,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [x] Release and publish `sofuu@0.3.0-beta.3` to npm registry.
   - [x] Deploy updated release tarballs and static site to Cloudflare Pages (`sofuu.xyz`).
   - [x] Optimize landing and documentation responsive layout for mobile viewports (360px-480px).
+  - [x] PLAN-UNIFIED-DIAGNOSTICS: publish `docs/DIAGNOSTICS.md` (contract, mapping, privacy, division gaps) and `sofuu.d.ts` diagnostic types.
 
 ---
 

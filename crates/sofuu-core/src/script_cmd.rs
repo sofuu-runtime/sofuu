@@ -225,6 +225,41 @@ pub fn run(argv: &[String]) -> i32 {
     }
 }
 
+/// Render a Kaze failure through the shared diagnostic contract.
+///
+/// The original source is used only when the entry is still source (a
+/// `.kazebc` artifact has none), and only for a local, masked snippet. The
+/// exit status is decided by the caller, exactly as before.
+fn print_kaze_error(err: &sfs::KazeError, path: &str) {
+    let source = if is_compiled_module(path) {
+        None
+    } else {
+        std::fs::read_to_string(path).ok()
+    };
+    let diag = err.diagnostic(source.as_deref());
+    let full = crate::rt::diag_contract::full_detail_requested();
+    eprint!(
+        "{}",
+        diag.render_human(full, crate::rt::engine::stderr_wants_color())
+    );
+}
+
+/// The machine-readable half of the same failure. `code` and `error` keep
+/// their published meaning; `diagnostic` is the additive versioned view.
+fn kaze_error_json(err: &sfs::KazeError, path: &str) -> serde_json::Value {
+    let source = if is_compiled_module(path) {
+        None
+    } else {
+        std::fs::read_to_string(path).ok()
+    };
+    serde_json::json!({
+        "ok": false,
+        "code": &err.code,
+        "error": &err.message,
+        "diagnostic": err.diagnostic(source.as_deref()).to_json(),
+    })
+}
+
 /// A compiled module ends in `.kazebc`, or starts with the `KAZEBC1` magic
 /// (a renamed artifact still runs).
 fn is_compiled_module(path: &str) -> bool {
@@ -284,14 +319,10 @@ fn cmd_run(argv: &[String]) -> i32 {
         }
         Err(err) => {
             if flags.json {
-                let json = serde_json::json!({
-                    "ok": false,
-                    "code": err.code,
-                    "error": err.message,
-                });
+                let json = kaze_error_json(&err, path);
                 println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
             } else {
-                eprintln!("\x1b[31m{}\x1b[0m: {}", err.code, err.message);
+                print_kaze_error(&err, path);
             }
             1
         }
@@ -338,7 +369,7 @@ fn cmd_check(argv: &[String]) -> i32 {
             0
         }
         Err(err) => {
-            eprintln!("\x1b[31m{}\x1b[0m: {}", err.code, err.message);
+            print_kaze_error(&err, path);
             1
         }
     }
@@ -363,7 +394,7 @@ fn cmd_compile(argv: &[String]) -> i32 {
     let prepared = match sfs::prepare_file(path) {
         Ok(p) => p,
         Err(err) => {
-            eprintln!("\x1b[31m{}\x1b[0m: {}", err.code, err.message);
+            print_kaze_error(&err, path);
             return 1;
         }
     };

@@ -377,27 +377,21 @@ unsafe fn print_rejection(ctx: *mut JSContext, reason: JSValueConst, promise: JS
         // SAFETY: msg valid until freed below.
         CStr::from_ptr(msg).to_string_lossy().into_owned()
     };
-    eprintln!(
+    /* PLAN-UNIFIED-DIAGNOSTICS: the rejection goes through the same contract
+     * as a sync uncaught exception — code, message, verified location, known
+     * reason, one safe next step, and only the frames QuickJS printed. The
+     * old `[sofuu] UnhandledPromiseRejection:` prefix is replaced by the
+     * severity label; exit status is still decided by the caller. */
+    let diag =
+        crate::rt::diag_contract::from_js_exception_message(ctx, reason, &msg_s);
+    let full = crate::rt::diag_contract::full_detail_requested();
+    eprint!(
         "{}",
-        crate::rt::engine::paint(
-            "31",
-            &format!("[sofuu] UnhandledPromiseRejection: {}", msg_s)
-        )
+        diag.render_human(full, crate::rt::engine::stderr_wants_color())
     );
     if !msg.is_null() {
         qjs::sofuu_js_free_cstring(ctx, msg);
     }
-    let stack = qjs::sofuu_js_get_property_str(ctx, reason, c"stack".as_ptr());
-    if !qjs::is_undefined(stack) && !qjs::is_null(stack) {
-        // SAFETY: ss valid until freed below.
-        let ss = qjs::sofuu_js_to_cstring(ctx, stack);
-        if !ss.is_null() {
-            let st = CStr::from_ptr(ss).to_string_lossy();
-            eprintln!("{}", st);
-            qjs::sofuu_js_free_cstring(ctx, ss);
-        }
-    }
-    qjs::sofuu_js_free_value(ctx, stack);
     qjs::sofuu_js_free_value(ctx, str_v);
     // C-01: an unhandled rejection is a fatal script error for the process
     // status, even though the event loop keeps running to idle.

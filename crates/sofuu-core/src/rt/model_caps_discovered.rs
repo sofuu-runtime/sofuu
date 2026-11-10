@@ -690,4 +690,33 @@ mod tests {
         assert!(lookup_any_root("z-ai/glm-4.5-air").is_none());
         clear();
     }
+
+    /// PLAN-UNIFIED-DIAGNOSTICS Phase 2, context-limit finding: a local
+    /// server publishes the FULL FILE PATH as the model id while the user
+    /// configured the short family name. The ladder must still find the
+    /// endpoint's 8,192-token truth — otherwise the meter reports a registry
+    /// guess (32k) and the first real request overflows.
+    #[test]
+    fn a_listing_path_id_matches_the_configured_short_name_and_case() {
+        let _store = lock();
+        clear();
+        let listed =
+            "/Users/example/Downloads/Qwen-3-0.6B-Claude-4.7-Opus-Distilled.i1-Q4_K_M.gguf";
+        let entry = serde_json::json!({ "id": listed, "meta": { "n_ctx": 8192 } });
+        assert!(ingest_one("http://127.0.0.1:8080/v1", listed, &entry));
+        let configured = "Qwen-3-0.6B-Claude-4.7-Opus-Distilled";
+        let c = lookup("http://127.0.0.1:8080/v1", configured)
+            .expect("the configured short name must find the listing path id");
+        assert_eq!(c.ctx_window, 8192);
+        // The lowercased spelling agent.js passes resolves identically.
+        assert_eq!(
+            lookup(
+                "http://127.0.0.1:8080/v1",
+                "qwen-3-0.6b-claude-4.7-opus-distilled"
+            )
+            .map(|c| c.ctx_window),
+            Some(8192)
+        );
+        clear();
+    }
 }

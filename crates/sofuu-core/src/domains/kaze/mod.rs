@@ -35,16 +35,107 @@ pub const VERSION: &str = "0.1";
 pub struct KazeError {
     pub code: String,
     pub message: String,
+    /// Verified source location when the parser, checker, compiler or VM had
+    /// one. `None` when the failure is not tied to a source line.
+    pub location: Option<KazeLocation>,
+}
+
+/// A Kaze source location. `column` is present only where the front end
+/// actually tracked one (the lexer/parser); a checker/compiler/VM error keeps
+/// its line and honestly reports the column as unavailable.
+#[derive(Debug, Clone)]
+pub struct KazeLocation {
+    pub source: String,
+    pub line: u32,
+    pub column: Option<u32>,
 }
 
 impl KazeError {
     pub fn new(code: &str, message: impl Into<String>) -> Self {
-        KazeError { code: code.to_string(), message: message.into() }
+        KazeError { code: code.to_string(), message: message.into(), location: None }
+    }
+
+    pub fn at(
+        code: &str,
+        message: impl Into<String>,
+        source: impl Into<String>,
+        line: u32,
+        column: Option<u32>,
+    ) -> Self {
+        KazeError {
+            code: code.to_string(),
+            message: message.into(),
+            location: Some(KazeLocation { source: source.into(), line, column }),
+        }
     }
 
     pub fn render(&self) -> String {
         format!("{}: {}", self.code, self.message)
     }
+
+    /// The shared diagnostic view. `source_text` is the original script when
+    /// the caller has it; it is used only for a local, masked snippet and is
+    /// never serialized.
+    pub fn diagnostic(
+        &self,
+        _source_text: Option<&str>,
+    ) -> crate::rt::diag_contract::Diagnostic {
+        let mut d =
+            crate::rt::diag_contract::Diagnostic::from_code(&self.code, self.detail());
+        if let Some(loc) = self.location.as_ref() {
+            d = d.with_location(crate::rt::diag_contract::SourceLocation::at(
+                loc.source.clone(),
+                loc.line,
+                loc.column,
+            ));
+        }
+        /* A checker failure can carry several errors, newline-joined in the
+         * legacy `message`. The versioned message is the first one; that is
+         * single-line and cannot embed a second location. The legacy field
+         * keeps every error for callers that print it. */
+        d
+    }
+
+    /// The message without the legacy `source:line:col: ` prefix, so the
+    /// diagnostic does not print the location twice. The legacy `message`
+    /// field is untouched for callers that already print it.
+    fn detail(&self) -> String {
+        /* Only the checker aggregates several errors into one message. Its
+         * first error is the versioned message; every other Kaze failure
+         * keeps its full, possibly multi-line, guidance. */
+        let first = if self.code == "E_KAZE_CHECK" {
+            self.message.lines().next().unwrap_or("")
+        } else {
+            self.message.as_str()
+        };
+        if let Some(loc) = self.location.as_ref() {
+            let with_col = format!(
+                "{}:{}:{}: ",
+                loc.source,
+                loc.line,
+                loc.column.unwrap_or(0)
+            );
+            let line_only = format!("{}:{}: ", loc.source, loc.line);
+            let source_only = format!("{}: ", loc.source);
+            for prefix in [with_col, line_only, source_only] {
+                if let Some(rest) = first.strip_prefix(&prefix) {
+                    return strip_line_suffix(rest, loc.line);
+                }
+            }
+        }
+        strip_line_suffix(first, self.location.as_ref().map_or(0, |l| l.line))
+    }
+}
+
+/// Remove the legacy ` (line N)` suffix once the location is carried as its
+/// own field. Only the exact line number is removed; a message that happens
+/// to mention another line stays untouched.
+fn strip_line_suffix(msg: &str, line: u32) -> String {
+    if line == 0 {
+        return msg.to_string();
+    }
+    let suffix = format!(" (line {line})");
+    msg.strip_suffix(&suffix).unwrap_or(msg).to_string()
 }
 
 /// A compiled script plus the source name it came from.
@@ -62,7 +153,7 @@ pub fn read_source(path: &str) -> Result<String, KazeError> {
 /// Parse, check and compile. This is the whole front end in one call.
 pub fn prepare(src: &str, name: &str) -> Result<Prepared, KazeError> {
     let program = parser::parse(src).map_err(|e| {
-        KazeError::new("E_KAZE_PARSE", e.render(name))
+        KazeError::at("E_KAZE_PARSE", e.render(name), name, e.line, Some(e.col))
     })?;
     checker::check(&program).map_err(|errors| {
         let mut message = String::new();
@@ -72,10 +163,11 @@ pub fn prepare(src: &str, name: &str) -> Result<Prepared, KazeError> {
             }
             message.push_str(&err.render(name));
         }
-        KazeError::new("E_KAZE_CHECK", message)
+        let first_line = errors.first().map(|e| e.line).unwrap_or(0);
+        KazeError::at("E_KAZE_CHECK", message, name, first_line, None)
     })?;
     let module = compiler::compile(&program)
-        .map_err(|e| KazeError::new("E_KAZE_COMPILE", e.render(name)))?;
+        .map_err(|e| KazeError::at("E_KAZE_COMPILE", e.render(name), name, e.line, None))?;
     Ok(Prepared { module, name: name.to_string() })
 }
 
@@ -235,7 +327,15 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
                 .map_err(|e| KazeError::new("E_KAZE_MEMORY", format!("{}: {}", prepared.name, e)))?;
             let value = vm
                 .run_item(item, &args)
-                .map_err(|e| KazeError::new(e.code, format!("{}: {} (line {})", prepared.name, e.msg, e.line)))?;
+                .map_err(|e| {
+                    KazeError::at(
+                        e.code,
+                        format!("{}: {} (line {})", prepared.name, e.msg, e.line),
+                        &prepared.name,
+                        e.line,
+                        None,
+                    )
+                })?;
             report.value = caps::render_value(value, &vm.arena, &vm.heap);
             report.verdict = vm.take_verdict();
         }
@@ -253,7 +353,13 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
                     continue;
                 }
                 vm.run_item(item, &[]).map_err(|e| {
-                    KazeError::new(e.code, format!("{}: {} (line {})", prepared.name, e.msg, e.line))
+                    KazeError::at(
+                        e.code,
+                        format!("{}: {} (line {})", prepared.name, e.msg, e.line),
+                        &prepared.name,
+                        e.line,
+                        None,
+                    )
                 })?;
             }
             report.ticks += 1;

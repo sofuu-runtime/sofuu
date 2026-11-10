@@ -1062,4 +1062,23 @@ mod tests {
         crate::rt::model_caps_discovered::clear();
         clear_learned();
     }
+
+    /// PLAN-UNIFIED-DIAGNOSTICS Phase 2, context-limit finding: the JS ladder
+    /// lowercases the model name before asking for caps, while a 400 can be
+    /// learned under the spelling the request carried. One key must serve
+    /// both spellings, or the learned limit silently disappears.
+    #[test]
+    fn learned_key_is_case_and_endpoint_normalized() {
+        assert_eq!(
+            learned_key(None, "Qwen-3-0.6B-Claude-4.7-Opus-Distilled"),
+            learned_key(None, "qwen-3-0.6b-claude-4.7-opus-distilled")
+        );
+        assert_eq!(
+            learned_key(
+                Some("https://API.example.com/v1/chat/completions"),
+                "Some/Model"
+            ),
+            learned_key(Some("https://api.example.com/v1"), "some/model")
+        );
+    }
 }

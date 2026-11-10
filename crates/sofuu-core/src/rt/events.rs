@@ -121,8 +121,21 @@ fn redact_value(v: &mut Value) {
                 redact_value(it);
             }
         }
+        /* PLAN-UNIFIED-DIAGNOSTICS: key-name redaction alone does not protect
+         * a credential embedded in a message, URL, header, stack or provider
+         * body. Every free-form string goes through the ONE shared text
+         * sanitizer (also used by diagnostic rendering). */
+        Value::String(s) => {
+            *s = crate::rt::diag_contract::redact_text(s);
+        }
         _ => {}
     }
+}
+
+/// The shared text redactor, for callers that already hold a string and want
+/// the same policy the event writer applies.
+pub fn redact_text(s: &str) -> String {
+    crate::rt::diag_contract::redact_text(s)
 }
 
 /// Validate one event against §7.2. Returns the list of violations (empty ok).

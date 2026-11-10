@@ -377,9 +377,9 @@ pub unsafe fn is_oom_reason(ctx: *mut JSContext, reason: JSValueConst) -> bool {
     if qjs::is_undefined(reason) {
         return false;
     }
-    let name_s = crate::rt::diag_contract::js_error_own_string(ctx, reason, c"name").unwrap_or_default();
     let msg_s = crate::rt::diag_contract::js_error_own_string(ctx, reason, c"message").unwrap_or_default();
-    name_s == "InternalError" && msg_s.to_ascii_lowercase().contains("out of memory")
+    qjs::sofuu_js_is_internal_error(ctx, reason) != 0
+        && msg_s.to_ascii_lowercase().contains("out of memory")
 }
 
 /// Report the C-03 substrate failure LOUDLY and once: a real, catchable
@@ -589,6 +589,37 @@ mod tests {
     use super::*;
     use sofuu_ffi::qjs::{self, CtxPtr, JSCFunction, JSValueConst};
     use sofuu_ffi::uv::{self, UvTimer};
+
+    #[test]
+    fn oom_detection_uses_the_intrinsic_error_without_running_getters() {
+        unsafe {
+            let rt = qjs::JS_NewRuntime();
+            let ctx = qjs::JS_NewContext(rt);
+            qjs::JS_ThrowInternalError(ctx, c"out of memory".as_ptr());
+            let native = qjs::JS_GetException(ctx);
+            assert!(is_oom_reason(ctx, native));
+            qjs::sofuu_js_free_value(ctx, native);
+
+            let eval = |source: &std::ffi::CStr| {
+                qjs::JS_Eval(ctx, source.as_ptr(), source.to_bytes().len(),
+                    c"<oom-detection-test>".as_ptr(), qjs::JS_EVAL_TYPE_GLOBAL)
+            };
+            let generic = eval(c"new Error('out of memory')");
+            assert!(!is_oom_reason(ctx, generic));
+            qjs::sofuu_js_free_value(ctx, generic);
+
+            let getter = eval(c"globalThis.calls=0; var e=new Error(); Object.defineProperty(e, 'message', {get(){ calls++; return 'out of memory'; }}); e");
+            assert!(!is_oom_reason(ctx, getter));
+            qjs::sofuu_js_free_value(ctx, getter);
+            let calls = eval(c"calls");
+            let mut count = -1;
+            assert!(qjs::to_int32(CtxPtr::new(ctx), calls, &mut count));
+            assert_eq!(count, 0);
+            qjs::sofuu_js_free_value(ctx, calls);
+            qjs::JS_FreeContext(ctx);
+            qjs::JS_FreeRuntime(rt);
+        }
+    }
 
     /// libuv handles start with `data` — the only field we touch.
     #[repr(C)]

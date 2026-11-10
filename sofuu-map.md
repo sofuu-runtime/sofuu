@@ -121,7 +121,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   * `crates/sofuu-core/src/compiler.rs` (Runtime standalone binary compiler)
   * `example-agents/` (`quant_sentinel/`, `med_protocol/`, `agri_sentinel/`, `paper_trader/`)
 * **Implementation and Verification**:
-  * Standalone Kaze reports language version `1.0` and uses bytecode format `4`; its dated implementation reference is [`kaze/docs/KAZE-1.0-REFERENCE.md`](kaze/docs/KAZE-1.0-REFERENCE.md). The separate engine embedded in Sofuu reports language version `0.1` and uses format `1`; its dated local source/binary inventory is [`docs/KAZE-CURRENT-SURFACE.md`](docs/KAZE-CURRENT-SURFACE.md). The two engines have different feature sets and incompatible artifacts. `docs/KAZE-SPEC.md` is a historical embedded-engine specification with known stale claims.
+  * Standalone Kaze reports language version `1.0` and uses bytecode format `4`; its dated implementation reference is [`kaze/docs/KAZE-1.0-REFERENCE.md`](kaze/docs/KAZE-1.0-REFERENCE.md). The separate engine embedded in Sofuu reports language version `0.1`, writes format `2` with statement-line metadata and reads legacy format `1`; its dated format-1 local source/binary inventory is [`docs/KAZE-CURRENT-SURFACE.md`](docs/KAZE-CURRENT-SURFACE.md). The two engines have different feature sets and incompatible artifacts. `docs/KAZE-SPEC.md` is a historical embedded-engine specification with known stale claims.
   * The current standalone source still skips the policy layer when `policy.json` is absent and retains simulated non-robotics host paths; see the 1.0 reference before applying the completed task labels below to that separate implementation.
   * `sofuu script compile` emits Kaze bytecode, while `sofuu compile` creates a standalone executable. The in-process APIs are exposed as `sofuu.kaze` and `sofuu.sfs`.
   * Inspect and migrate tests that simulate non-robotics operations before running the Kaze suites under `RULES.md` §1.9. Relevant suites include `cargo test -p sofuu-core --lib domains::kaze`, local `cargo test -p sofuu-core --test kaze_language`, and the separate prototype's `cargo test --manifest-path kaze/Cargo.toml`; individual compliant checks can be run meanwhile. Run `make kaze-drift-check` to report differences from the prototype.
@@ -134,10 +134,10 @@ Every division operates under strict architectural boundaries to guarantee that 
 * **Active Tasks**:
   - [x] K0 inventory in progress: local Kaze source and binary behavior documented; published artifact, real backend/policy paths, and applicable model coverage remain to be verified.
   - [x] Address missing/empty policy handling in the standalone prototype (F-04).
-  - [x] K1: eliminate non-robotics simulated responses and enforce explicit grants and fail-closed policy across all shipped Kaze execution surfaces (`sofuu script run|check|repl`, `E_CAP_DENIED` on malformed/non-object policy) (KZ-051/052).
+  - [ ] K1: eliminate non-robotics simulated responses and enforce explicit grants and fail-closed policy across all shipped Kaze execution surfaces. Malformed-policy checks have been improved, but `SimHost` and fallback paths still need the real-execution remediation; do not claim this milestone complete.
   - [x] AUDIT-REMEDIATION-2026-11-08: Complete Kaze VM and Compiler remediation — recursion depth ceiling $\le 256$ (KZ-095/099), modulo-by-zero trap `error[E_KAZE_DIV0]` (KZ-035), 12-factor configuration resolution for routine parameters (KZ-079/082/084), standalone compiler unresolved import failure scrubbing (CP-075/068), and standalone top-level await (CP-007/008).
   - [x] Build and verify 4 showcase agents in `example-agents/` with automated build harness.
-  - [x] PLAN-UNIFIED-DIAGNOSTICS: verified Kaze parser/checker/VM locations and an additive versioned `diagnostic` in `script run --json` (excerpts deferred under the size cap).
+  - [ ] PLAN-UNIFIED-DIAGNOSTICS: Kaze parser/checker and statement-level VM locations, version-2 bytecode mapping with version-1 reader, and run/check JSON diagnostics are in source. A local release-profile standalone arithmetic failure uses the shared renderer. Expression spans, Kaze call frames, source excerpts and broader standalone/release evidence remain open.
   - [ ] Implement incremental AST caching for sub-millisecond Kaze routine compilation.
 
 ---
@@ -188,7 +188,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 * **Active Tasks**:
   - [x] Align TUI banner with brand voice ("runtime for AI") (F-07).
   - [x] Verify CLI argument parsing matches 12-factor configuration hierarchy.
-  - [x] PLAN-UNIFIED-DIAGNOSTICS: concise/full diagnostic rendering on stderr, `SOFUU_DIAGNOSTICS=full`, and unchanged exit status/argument passthrough.
+  - [ ] PLAN-UNIFIED-DIAGNOSTICS: concise/full error rendering and bounded reported JS frames are implemented in source; audit remaining TUI/REPL, ABI, protocol and release surfaces before claiming complete coverage.
   - [x] AUDIT-REMEDIATION-2026-11-08: Complete CLI polish — read-only `--help` with zero disk side-effects (CLI-008/009), strict ANSI scrubbing under `NO_COLOR=1` / `TERM=dumb` (CLI-023/024), `sofuu run -` / `eval <<EOF` stdin execution (CLI-055–057), and `sofuu bundle` stdout streaming (CP-069).
   - [ ] Add interactive debugging hooks (`--inspect-brk`) for Kaze VM step execution.
 

@@ -4,6 +4,33 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Unified Diagnostics Review Fixes — 2026-11-10
+
+- Sanitization handles ordered and quoted key/value pairs, common token
+  prefixes, private-key blocks and URL userinfo. JS error locations and frames
+  are bounded/sanitized, and inspecting Errors avoids getters and proxies.
+  Pattern-based redaction cannot guarantee discovery of every secret.
+- Event redaction preserves multiline and long non-secret content. Checkpoints
+  altered by redaction or known producer truncation are marked and rejected
+  for automatic resume. Historical checkpoints are not retroactively repaired.
+- Full-detail JS diagnostics retain bounded reported frames. Kaze errors avoid
+  reopening inputs; run/check JSON errors sanitize the legacy message, and
+  check failures honor `--json`.
+- The embedded Kaze engine writes bytecode format 2 with statement-line maps;
+  its reader accepts format 1 with a labelled routine-start fallback. Older
+  runtimes that only read format 1 reject format 2. Original source identity,
+  expression spans and Kaze call frames remain incomplete.
+- Kaze JS failure objects now carry a diagnostic, which the headless standalone
+  executable renders for runtime failures; its legacy JS `error` remains raw.
+  Native QuickJS OOM detection avoids executing JavaScript getters.
+- Focused checks passed, including Kaze source/bytecode, a standalone
+  arithmetic failure, redaction and checkpoint recovery. The macOS arm64
+  release-profile primary binary measured 5,668,432 bytes against the
+  5,767,168-byte cap. This is source-tree evidence, not a published release.
+- The product-wide plan remains incomplete, including source excerpts, Kaze
+  call frames, broader privacy coverage and real agent/model/tool integration.
+  See local `docs/DIAGNOSTICS.md` for details and unverified surfaces.
+
 ## Audit Remediation — 2026-11-08/10
 
 All 32 tasks of `docs/PLAN-AUDIT-REMEDIATION-2026-11-08.md` (150 findings across the P0 security gates, Kaze/QuickJS isolation, CLI truthfulness and the 12-factor surface) are implemented, with the plan's four gates green:

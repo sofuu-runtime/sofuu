@@ -43,6 +43,8 @@ pub fn compile(program: &Program) -> Result<Module, CompileError> {
             consts: &mut module.consts,
             caps: &mut module.caps,
             code: Vec::new(),
+            line_map: Vec::new(),
+            current_line: item.line,
             scopes: vec![Vec::new()],
             next_slot: 0,
             item_name: item.name.clone(),
@@ -80,6 +82,7 @@ pub fn compile(program: &Program) -> Result<Module, CompileError> {
             params: item.params.clone(),
             code: std::mem::take(&mut cx.code),
             line: item.line,
+            line_map: std::mem::take(&mut cx.line_map),
             period_ms: period,
             slots,
         });
@@ -91,6 +94,8 @@ struct Cx<'a> {
     consts: &'a mut Vec<Const>,
     caps: &'a mut Vec<CapRef>,
     code: Vec<u32>,
+    line_map: Vec<u32>,
+    current_line: u32,
     scopes: Vec<Vec<(String, u8)>>,
     next_slot: u8,
     item_name: String,
@@ -107,6 +112,8 @@ impl<'a> Cx<'a> {
     }
 
     fn stmt(&mut self, stmt: &Stmt) -> Result<(), CompileError> {
+        let previous_line = self.current_line;
+        if stmt.line() > 0 { self.current_line = stmt.line(); }
         match stmt {
             Stmt::Let(name, value, _line) => {
                 self.expr(value)?;
@@ -205,6 +212,7 @@ impl<'a> Cx<'a> {
                 }
             },
         }
+        self.current_line = previous_line;
         Ok(())
     }
 
@@ -346,6 +354,7 @@ impl<'a> Cx<'a> {
     fn emit(&mut self, op: Op, a: u8, b: u8, c: u8) -> usize {
         let at = self.code.len();
         self.code.push(word(op, a, b, c));
+        self.line_map.push(self.current_line);
         at
     }
 
@@ -353,6 +362,8 @@ impl<'a> Cx<'a> {
         let at = self.code.len();
         self.code.push(word(op, a, 0, 0));
         self.code.push(imm);
+        self.line_map.push(self.current_line);
+        self.line_map.push(self.current_line);
         at
     }
 
@@ -367,9 +378,8 @@ impl<'a> Cx<'a> {
     /// Emit a backward jump to `head`.
     fn jump_back_to(&mut self, head: usize) {
         let at = self.code.len();
-        self.code.push(word(Op::Jmp, 0, 0, 0));
         let rel = head as i64 - (at as i64 + 2);
-        self.code.push(rel as u32);
+        self.emit_wide(Op::Jmp, 0, rel as u32);
     }
 
     fn push_const(&mut self, c: Const) -> Result<u32, CompileError> {

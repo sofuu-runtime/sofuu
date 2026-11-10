@@ -9855,6 +9855,18 @@ BOOL JS_IsError(JSContext *ctx, JSValueConst val)
     return (p->class_id == JS_CLASS_ERROR);
 }
 
+/* Check the intrinsic prototype directly: JS property access could execute a
+   getter or proxy trap while the host is already reporting an exception. */
+int sofuu_js_is_internal_error(JSContext *ctx, JSValueConst val)
+{
+    JSObject *p;
+    if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
+        return FALSE;
+    p = JS_VALUE_GET_OBJ(val);
+    return p->class_id == JS_CLASS_ERROR &&
+        p->shape->proto == JS_VALUE_GET_OBJ(ctx->native_error_proto[JS_INTERNAL_ERROR]);
+}
+
 /* used to avoid catching interrupt exceptions */
 BOOL JS_IsUncatchableError(JSContext *ctx, JSValueConst val)
 {

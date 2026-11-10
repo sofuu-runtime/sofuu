@@ -221,6 +221,8 @@ pub struct ItemCode {
     pub params: Vec<String>,
     pub code: Vec<u32>,
     pub line: u32,
+    /// Source line per code word. Empty for legacy version-1 bytecode.
+    pub line_map: Vec<u32>,
     /// Period in milliseconds; 0 for everything but `every`.
     pub period_ms: f64,
     /// Number of local slots the item uses (parameters occupy the first ones).
@@ -247,7 +249,7 @@ impl Module {
 }
 
 const MAGIC: &[u8; 8] = b"KAZEBC1\0";
-const VERSION: u16 = 1;
+const VERSION: u16 = 2;
 
 struct Writer {
     out: Vec<u8>,
@@ -356,6 +358,10 @@ pub fn serialize(m: &Module) -> Vec<u8> {
         for word in &it.code {
             w.u32(*word);
         }
+        w.u32(it.line_map.len() as u32);
+        for line in &it.line_map {
+            w.u32(*line);
+        }
     }
     w.out
 }
@@ -367,11 +373,11 @@ pub fn deserialize(bytes: &[u8]) -> Result<Module, String> {
         return Err("not a Kaze module: the magic number does not match".to_string());
     }
     r.at = 8;
-    match r.u16() {
-        Some(VERSION) => {}
-        Some(other) => return Err(format!("this module was built by Kaze version {}, not {}", other, VERSION)),
+    let version = match r.u16() {
+        Some(v @ (1 | VERSION)) => v,
+        Some(other) => return Err(format!("unsupported Kaze bytecode version {}; supported versions are 1 and {}", other, VERSION)),
         None => return Err("truncated module header".to_string()),
-    }
+    };
     let mut m = Module::default();
     let needs = r.u32().ok_or("truncated needs table")?;
     for _ in 0..needs {
@@ -410,7 +416,21 @@ pub fn deserialize(bytes: &[u8]) -> Result<Module, String> {
         for _ in 0..ncode {
             code.push(r.u32().ok_or("truncated code word")?);
         }
-        m.items.push(ItemCode { name, tag, params, code, line, period_ms, slots });
+        let mut line_map = Vec::new();
+        if version >= 2 {
+            let nlines = r.u32().ok_or("truncated source-line table")? as usize;
+            if nlines != 0 && nlines != code.len() {
+                return Err("source-line table does not match the code length".into());
+            }
+            if nlines > bytes.len().saturating_sub(r.at) / 4 {
+                return Err("truncated source-line table".into());
+            }
+            line_map.reserve(nlines);
+            for _ in 0..nlines {
+                line_map.push(r.u32().ok_or("truncated source-line table")?);
+            }
+        }
+        m.items.push(ItemCode { name, tag, params, code, line, line_map, period_ms, slots });
     }
     Ok(m)
 }
@@ -476,6 +496,7 @@ mod tests {
                 params: vec!["points".into()],
                 code: vec![word(Op::Const, 0, 0, 0), 0, word(Op::Halt, 0, 0, 0)],
                 line: 3,
+                line_map: vec![3, 3, 4],
                 period_ms: 0.0,
                 slots: 2,
             }],
@@ -484,6 +505,7 @@ mod tests {
         let back = deserialize(&bytes).unwrap();
         assert_eq!(back.needs, m.needs);
         assert_eq!(back.items[0].code, m.items[0].code);
+        assert_eq!(back.items[0].line_map, m.items[0].line_map);
         assert_eq!(back.consts, m.consts);
     }
 
@@ -499,6 +521,7 @@ mod tests {
                 params: vec![],
                 code: vec![word(Op::RetUnit, 0, 0, 0)],
                 line: 1,
+                line_map: vec![1],
                 period_ms: 0.0,
                 slots: 0,
             }],
@@ -512,6 +535,22 @@ mod tests {
         let mut bytes = serialize(&Module::default());
         bytes[0] = b'X';
         assert!(deserialize(&bytes).is_err());
+    }
+
+    #[test]
+    fn malformed_line_table_is_rejected() {
+        let m = Module {
+            items: vec![ItemCode {
+                name: "a".into(), tag: ItemTag::Action, params: vec![],
+                code: vec![word(Op::RetUnit, 0, 0, 0)], line: 1,
+                line_map: vec![1], period_ms: 0.0, slots: 0,
+            }],
+            ..Module::default()
+        };
+        let mut bytes = serialize(&m);
+        let table_start = bytes.len() - 8;
+        bytes[table_start..table_start + 4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(deserialize(&bytes).unwrap_err().contains("source-line table"));
     }
 
     #[test]

@@ -1898,7 +1898,15 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
 
         var res = sofuu.kaze.run(kazeSource, args, opts);
         if (!res.ok) {{
-            console.error("\x1b[31m[Agent Error]\x1b[0m " + (res.error || res.code));
+            var diagnostic = res.diagnostic && sofuu.diagnostics && sofuu.diagnostics.render;
+            var detail = diagnostic
+                ? sofuu.diagnostics.render(JSON.stringify(res.diagnostic))
+                : 'Kaze execution failed (diagnostic unavailable).';
+            if (typeof process !== 'undefined' && process.stderr && process.stderr.write) {{
+                process.stderr.write(detail + (detail.endsWith('\n') ? '' : '\n'));
+            }} else {{
+                console.error(detail);
+            }}
             if (typeof process !== 'undefined' && process.exit) process.exit(1);
             return;
         }}

@@ -459,6 +459,7 @@ extern "C" {
     // ── M4: HTTP client (Response.body accessor + SSE) ──
     pub fn JS_NewAtom(ctx: *mut JSContext, str_: *const c_char) -> JSAtom;
     pub fn JS_IsError(ctx: *mut JSContext, val: JSValueConst) -> c_int;
+    pub fn sofuu_js_is_internal_error(ctx: *mut JSContext, val: JSValueConst) -> c_int;
     pub fn JS_GetOwnProperty(
         ctx: *mut JSContext,
         desc: *mut JSPropertyDescriptor,

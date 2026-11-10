@@ -50,6 +50,8 @@ pub struct KazeLocation {
     pub column: Option<u32>,
     /// The stored line is the routine start, not the failing instruction.
     pub routine_start: bool,
+    /// The source line was loaded from a bytecode artifact, not its source.
+    pub bytecode_source: bool,
 }
 
 impl KazeError {
@@ -67,7 +69,7 @@ impl KazeError {
         KazeError {
             code: code.to_string(),
             message: message.into(),
-            location: Some(KazeLocation { source: source.into(), line, column, routine_start: false }),
+            location: Some(KazeLocation { source: source.into(), line, column, routine_start: false, bytecode_source: false }),
         }
     }
 
@@ -88,9 +90,12 @@ impl KazeError {
                 loc.line,
                 loc.column,
             );
-            if loc.routine_start {
-                location.label = Some("routine start; instruction line unavailable".into());
-            }
+            location.label = match (loc.routine_start, loc.bytecode_source) {
+                (true, true) => Some("bytecode routine start; instruction line and original source unavailable".into()),
+                (true, false) => Some("routine start; instruction line unavailable".into()),
+                (false, true) => Some("source line stored in bytecode; original source unavailable".into()),
+                (false, false) => None,
+            };
             d = d.with_location(location);
         }
         /* A checker failure can carry several errors, newline-joined in the
@@ -146,6 +151,7 @@ fn strip_line_suffix(msg: &str, line: u32) -> String {
 pub struct Prepared {
     pub module: Module,
     pub name: String,
+    pub from_bytecode: bool,
 }
 
 /// Read a script from disk.
@@ -203,7 +209,7 @@ pub fn prepare(src: &str, name: &str) -> Result<Prepared, KazeError> {
     })?;
     let module = compiler::compile(&program)
         .map_err(|e| KazeError::at("E_KAZE_COMPILE", e.render(name), name, e.line, None))?;
-    Ok(Prepared { module, name: name.to_string() })
+    Ok(Prepared { module, name: name.to_string(), from_bytecode: false })
 }
 
 pub fn prepare_file(path: &str) -> Result<Prepared, KazeError> {
@@ -319,7 +325,7 @@ pub fn run_file(path: &str, opts: &RunOptions) -> Result<RunReport, KazeError> {
 /// Run a compiled module directly: no lexer, no parser, no checker. This is the
 /// path a `.kazebc` artifact takes, so a deployed script needs no front end.
 pub fn run_module(module: Module, name: &str, opts: &RunOptions) -> Result<RunReport, KazeError> {
-    run_prepared(Prepared { module, name: name.to_string() }, opts)
+    run_prepared(Prepared { module, name: name.to_string(), from_bytecode: true }, opts)
 }
 
 fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, KazeError> {
@@ -382,8 +388,9 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
                         e.line,
                         None,
                     );
-                    if e.line != 0 && e.line == item.line {
-                        if let Some(loc) = &mut err.location { loc.routine_start = true; }
+                    if let Some(loc) = &mut err.location {
+                        loc.routine_start = item.line_map.is_empty() && e.line != 0 && e.line == item.line;
+                        loc.bytecode_source = prepared.from_bytecode;
                     }
                     err
                 })?;
@@ -411,8 +418,9 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
                         e.line,
                         None,
                     );
-                    if e.line != 0 && e.line == item.line {
-                        if let Some(loc) = &mut err.location { loc.routine_start = true; }
+                    if let Some(loc) = &mut err.location {
+                        loc.routine_start = item.line_map.is_empty() && e.line != 0 && e.line == item.line;
+                        loc.bytecode_source = prepared.from_bytecode;
                     }
                     err
                 })?;
@@ -674,6 +682,13 @@ fn error_to_js(ctx: *mut JSContext, err: &KazeError) -> JSValue {
         set_bool(ctx, obj, c"ok", false);
         set_str(ctx, obj, c"code", &err.code);
         set_str(ctx, obj, c"error", &err.message);
+        let diagnostic = err.diagnostic(None).to_json().to_string();
+        let value = qjs::JS_ParseJSON(ctx, diagnostic.as_ptr().cast(), diagnostic.len(), c"<kaze-diagnostic>".as_ptr());
+        if qjs::is_exception(value) {
+            qjs::sofuu_js_free_value(ctx, obj);
+            return value;
+        }
+        qjs::sofuu_js_set_property_str(ctx, obj, c"diagnostic".as_ptr(), value);
         obj
     }
 }
@@ -875,6 +890,50 @@ impl crate::domains::Subsystem for KazeSubsystem {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn js_kaze_failure_exposes_the_diagnostic_contract() {
+        let _guard = crate::rt::test_loop_lock();
+        let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
+        let rc = rt.eval_string(
+            r#"
+            const source = 'needs: policy\nfilter main():\n    let z = 0\n    let y = 1 / z\n    allow "ok"\n';
+            const result = sofuu.kaze.run(source, {}, {grants: ['policy']});
+            if (result.ok || result.code !== 'E_KAZE_DIV0') throw new Error('missing failure');
+            if (!result.diagnostic || result.diagnostic.code !== result.code ||
+                result.diagnostic.location.line !== 4) throw new Error('missing location');
+            if (!sofuu.diagnostics.render(JSON.stringify(result.diagnostic)).includes('error[E_KAZE_DIV0]'))
+                throw new Error('not rendered');
+            "#,
+            "<kaze-diagnostic-test>",
+        );
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn vm_diagnostics_keep_statement_lines_across_bytecode_versions() {
+        let src = "needs: policy\nfilter main():\n    if true:\n        let z = 0\n        let y = 1 / z\n    allow \"ok\"\n";
+        let opts = RunOptions::default();
+        let err = run_source(src, "agent.kaze", &opts).unwrap_err();
+        assert_eq!(err.code, "E_KAZE_DIV0");
+        assert_eq!(err.diagnostic(None).location.unwrap().line, Some(5));
+
+        let prepared = prepare(src, "agent.kaze").unwrap();
+        let mut bytes = isa::serialize(&prepared.module);
+        let result = run_module(isa::deserialize(&bytes).unwrap(), "agent.kazebc", &opts).unwrap_err();
+        let location = result.diagnostic(None).location.unwrap();
+        assert_eq!(location.line, Some(5));
+        assert!(location.label.unwrap().contains("bytecode"));
+
+        // This fixture has one item, whose v2 line table is last in the file.
+        let nlines = prepared.module.items[0].line_map.len();
+        bytes.truncate(bytes.len() - 4 - nlines * 4);
+        bytes[8..10].copy_from_slice(&1u16.to_le_bytes());
+        let result = run_module(isa::deserialize(&bytes).unwrap(), "legacy.kazebc", &opts).unwrap_err();
+        let location = result.diagnostic(None).location.unwrap();
+        assert_eq!(location.line, Some(2));
+        assert!(location.label.unwrap().contains("routine start"));
+    }
 
     #[test]
     fn lists_compare_by_content_not_by_identity() {

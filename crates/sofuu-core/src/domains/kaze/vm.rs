@@ -116,6 +116,8 @@ impl<'a> Vm<'a> {
         let mut pc = 0usize;
         while pc < code.len() {
             let w = code[pc];
+            let current_line = item.line_map.get(pc).copied()
+                .filter(|line| *line > 0).unwrap_or(item.line);
             let Some(op) = Op::from_u8(opcode(w)) else {
                 return Err(VmError::new("E_KAZE_BADCODE", "this module has an unknown instruction"));
             };
@@ -123,17 +125,17 @@ impl<'a> Vm<'a> {
             // A loop head carries its own source line in the immediate word, so
             // an exhausted budget blames the loop rather than the routine.
             let step_line = if matches!(op, Op::FuelTick) {
-                code.get(pc).copied().unwrap_or(item.line)
+                code.get(pc).copied().unwrap_or(current_line)
             } else {
-                item.line
+                current_line
             };
             self.charge(step_line)?;
             match op {
                 Op::Const => {
-                    let imm = self.imm(code, pc, item.line)?;
+                    let imm = self.imm(code, pc, current_line)?;
                     pc += 1;
-                    let v = self.constant(imm as usize, item.line)?;
-                    self.push(v, item.line)?;
+                    let v = self.constant(imm as usize, current_line)?;
+                    self.push(v, current_line)?;
                 }
                 Op::LoadLocal => {
                     let slot = field_a(w) as usize;
@@ -141,11 +143,11 @@ impl<'a> Vm<'a> {
                         .locals
                         .get(slot)
                         .ok_or_else(|| VmError::new("E_KAZE_BADCODE", "LOAD from a missing slot"))?;
-                    self.push(v, item.line)?;
+                    self.push(v, current_line)?;
                 }
                 Op::StoreLocal => {
                     let slot = field_a(w) as usize;
-                    let v = self.pop(item.line)?;
+                    let v = self.pop(current_line)?;
                     if let Some(dst) = self.locals.get_mut(slot) {
                         *dst = v;
                     } else {
@@ -156,60 +158,60 @@ impl<'a> Vm<'a> {
                     let n = field_a(w) as usize;
                     let mut items = Vec::with_capacity(n);
                     for _ in 0..n {
-                        items.push(self.pop(item.line)?);
+                        items.push(self.pop(current_line)?);
                     }
                     items.reverse();
                     let v = self
                         .heap
                         .push_array(items)
-                        .map_err(|msg| VmError { code: "E_KAZE_MEMORY", msg, line: item.line })?;
-                    self.push(v, item.line)?;
+                        .map_err(|msg| VmError { code: "E_KAZE_MEMORY", msg, line: current_line })?;
+                    self.push(v, current_line)?;
                 }
                 Op::GetIndex => {
-                    let idx = self.pop(item.line)?;
-                    let coll = self.pop(item.line)?;
-                    let v = self.index(coll, idx, item.line)?;
-                    self.push(v, item.line)?;
+                    let idx = self.pop(current_line)?;
+                    let coll = self.pop(current_line)?;
+                    let v = self.index(coll, idx, current_line)?;
+                    self.push(v, current_line)?;
                 }
                 Op::Len => {
-                    let v = self.pop(item.line)?;
-                    let n = self.length(v, item.line)?;
-                    self.push(Value::Num(n), item.line)?;
+                    let v = self.pop(current_line)?;
+                    let n = self.length(v, current_line)?;
+                    self.push(Value::Num(n), current_line)?;
                 }
                 Op::GetField => {
-                    let field = self.pop(item.line)?;
-                    let base = self.pop(item.line)?;
-                    let v = self.field(base, field, item.line)?;
-                    self.push(v, item.line)?;
+                    let field = self.pop(current_line)?;
+                    let base = self.pop(current_line)?;
+                    let v = self.field(base, field, current_line)?;
+                    self.push(v, current_line)?;
                 }
                 Op::Jeq | Op::Jne => {
-                    let imm = self.imm(code, pc, item.line)? as i32;
+                    let imm = self.imm(code, pc, current_line)? as i32;
                     pc += 1;
-                    let b = self.pop(item.line)?;
-                    let a = self.pop(item.line)?;
+                    let b = self.pop(current_line)?;
+                    let a = self.pop(current_line)?;
                     let eq = crate::sfs::arena::values_equal(a, b, &self.arena, &self.heap);
                     let taken = if op == Op::Jeq { eq } else { !eq };
                     if taken {
-                        pc = jump(pc, imm, code.len(), item.line)?;
+                        pc = jump(pc, imm, code.len(), current_line)?;
                     }
                 }
                 Op::Pop => {
-                    self.pop(item.line)?;
+                    self.pop(current_line)?;
                 }
                 Op::Add => {
-                    let b = self.pop(item.line)?;
-                    let a = self.pop(item.line)?;
-                    let v = self.add(a, b, item.line)?;
-                    self.push(v, item.line)?;
+                    let b = self.pop(current_line)?;
+                    let a = self.pop(current_line)?;
+                    let v = self.add(a, b, current_line)?;
+                    self.push(v, current_line)?;
                 }
-                Op::Sub => self.arith(Op::Sub, item.line)?,
-                Op::Mul => self.arith(Op::Mul, item.line)?,
-                Op::Div => self.arith(Op::Div, item.line)?,
-                Op::Mod => self.arith(Op::Mod, item.line)?,
+                Op::Sub => self.arith(Op::Sub, current_line)?,
+                Op::Mul => self.arith(Op::Mul, current_line)?,
+                Op::Div => self.arith(Op::Div, current_line)?,
+                Op::Mod => self.arith(Op::Mod, current_line)?,
                 Op::Neg => {
-                    let v = self.pop(item.line)?;
+                    let v = self.pop(current_line)?;
                     match v {
-                        Value::Num(n) => self.push(Value::Num(-n), item.line)?,
+                        Value::Num(n) => self.push(Value::Num(-n), current_line)?,
                         other => {
                             return Err(VmError::new(
                                 "E_KAZE_TYPE",
@@ -219,52 +221,52 @@ impl<'a> Vm<'a> {
                     }
                 }
                 Op::CmpLt | Op::CmpLe | Op::CmpGt | Op::CmpGe => {
-                    let b = self.pop(item.line)?;
-                    let a = self.pop(item.line)?;
-                    let v = self.compare(op, a, b, item.line)?;
-                    self.push(Value::Bool(v), item.line)?;
+                    let b = self.pop(current_line)?;
+                    let a = self.pop(current_line)?;
+                    let v = self.compare(op, a, b, current_line)?;
+                    self.push(Value::Bool(v), current_line)?;
                 }
                 Op::CmpEq | Op::CmpNe => {
-                    let b = self.pop(item.line)?;
-                    let a = self.pop(item.line)?;
+                    let b = self.pop(current_line)?;
+                    let a = self.pop(current_line)?;
                     let eq = crate::sfs::arena::values_equal(a, b, &self.arena, &self.heap);
-                    self.push(Value::Bool(if op == Op::CmpEq { eq } else { !eq }), item.line)?;
+                    self.push(Value::Bool(if op == Op::CmpEq { eq } else { !eq }), current_line)?;
                 }
                 Op::Not => {
-                    let v = self.pop(item.line)?;
-                    self.push(Value::Bool(!v.is_truthy()), item.line)?;
+                    let v = self.pop(current_line)?;
+                    self.push(Value::Bool(!v.is_truthy()), current_line)?;
                 }
                 Op::Jmp => {
-                    let imm = self.imm(code, pc, item.line)? as i32;
-                    pc = jump(pc + 1, imm, code.len(), item.line)?;
+                    let imm = self.imm(code, pc, current_line)? as i32;
+                    pc = jump(pc + 1, imm, code.len(), current_line)?;
                 }
                 Op::JmpIfFalse | Op::JmpIfTrue => {
-                    let imm = self.imm(code, pc, item.line)? as i32;
+                    let imm = self.imm(code, pc, current_line)? as i32;
                     pc += 1;
-                    let v = self.pop(item.line)?;
+                    let v = self.pop(current_line)?;
                     let taken = if op == Op::JmpIfTrue { v.is_truthy() } else { !v.is_truthy() };
                     if taken {
-                        pc = jump(pc, imm, code.len(), item.line)?;
+                        pc = jump(pc, imm, code.len(), current_line)?;
                     }
                 }
                 Op::CallCap => {
-                    let imm = self.imm(code, pc, item.line)? as usize;
+                    let imm = self.imm(code, pc, current_line)? as usize;
                     pc += 1;
-                    self.call_cap(imm, field_a(w) as usize, item.line)?;
+                    self.call_cap(imm, field_a(w) as usize, current_line)?;
                 }
                 Op::PolicyStop => {
-                    let v = self.pop(item.line)?;
+                    let v = self.pop(current_line)?;
                     return Ok(v);
                 }
                 Op::Ret => {
-                    let v = self.pop(item.line)?;
+                    let v = self.pop(current_line)?;
                     return Ok(v);
                 }
                 Op::RetUnit => return Ok(Value::Unit),
                 Op::FuelTick => {
                     // The pre-charge above already paid for this tick; the
                     // immediate only names the loop for error reporting.
-                    let line = self.imm(code, pc, item.line)?;
+                    let line = self.imm(code, pc, current_line)?;
                     pc += 1;
                     // A JS host may have armed a deadline for this whole call.
                     if crate::rt::deadline::poll_expired() != 0 {
@@ -283,12 +285,12 @@ impl<'a> Vm<'a> {
                     }
                 }
                 Op::Trap => {
-                    let imm = self.imm(code, pc, item.line)? as usize;
+                    let imm = self.imm(code, pc, current_line)? as usize;
                     let msg = match self.module.consts.get(imm) {
                         Some(Const::Str(s)) => s.clone(),
                         _ => "the script stopped".to_string(),
                     };
-                    return Err(VmError { code: "E_KAZE_TRAP", msg, line: item.line });
+                    return Err(VmError { code: "E_KAZE_TRAP", msg, line: current_line });
                 }
                 Op::Halt => return Ok(Value::Unit),
             }

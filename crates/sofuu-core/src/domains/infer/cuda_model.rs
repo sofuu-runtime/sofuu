@@ -701,7 +701,14 @@ impl CudaModel {
         cols: usize,
         n_tokens: usize,
     ) -> Result<(), String> {
-        if quant == Quant::Q4K && cols.is_multiple_of(32) {
+        // SOFUU_CUDA_PREFILL_Q8=0 keeps f32 prefill activations: the q8_1 path
+        // is ~1.6x faster but every later token's KV derives from 8-bit
+        // activations, which moved the CPU/GPU logit gate from 7.6e-06 to 0.17
+        // (same argmax and top-10). Numbers over speed: set it to 0.
+        let q8_ok = std::env::var("SOFUU_CUDA_PREFILL_Q8")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if q8_ok && quant == Quant::Q4K && cols.is_multiple_of(32) {
             let n_vals = n_tokens * cols;
             e.quantize_q8_1(x, self.xq_b, self.xd_b, self.xs_b, self.xs16_b, n_vals)
                 .map_err(|err| format!("prefill quantize ({n_vals}): {err}"))?;

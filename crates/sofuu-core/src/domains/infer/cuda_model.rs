@@ -686,10 +686,10 @@ impl CudaModel {
         }
     }
 
-    /// Prefill GEMV: quantize the chunk's activations once, then let the q4_K
-    /// kernel reuse each weight load across every token in the chunk (prefill
-    /// weight traffic is prompt_len x matrix size, so tokens-per-load is the
-    /// only lever that moves it). Other layouts keep the f32 b8 kernel.
+    /// Prefill GEMV: quantize the chunk's activations once, then let the
+    /// rows-per-warp q4_K kernel reuse that load across four rows. Everything
+    /// else keeps the f32 b8 kernel, which is correct but re-reads a full
+    /// activation row per output row (14 GB/s of weights on a 6-token chunk).
     fn gemm_b8_act(
         &self,
         e: &CudaEngine,

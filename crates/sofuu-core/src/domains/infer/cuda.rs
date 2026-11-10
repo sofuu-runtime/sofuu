@@ -2209,10 +2209,11 @@ mod imp {
             self.launch(quant.batch_entry(), (grid, 1, 1), (256, 1, 1), &mut params)
         }
 
-        /// q4_K prefill GEMV on q8_1 activations: one row per warp with an
-        /// accumulator per token, so a weight chunk loaded once feeds up to
-        /// eight dots. The caller quantizes the chunk's activations once
-        /// (`n_tokens * cols` values, per-32-block d/s token-major).
+        /// q4_K prefill GEMV on q8_1 activations, four rows per warp: the
+        /// caller quantizes the chunk's activations ONCE (`n_tokens * cols`
+        /// values, per-32-block d/s laid out token-major) and every row of the
+        /// same matrix reuses that load, which is what the f32 b8 kernel could
+        /// not do.
         #[allow(clippy::too_many_arguments)]
         pub fn gemm_q4_k_b8_q8(
             &self,
@@ -2276,10 +2277,11 @@ mod imp {
                 &mut c as *mut i32 as *mut c_void,
                 &mut n as *mut i32 as *mut c_void,
             ];
-            // One warp per row (it holds an accumulator per token), eight
-            // warps per block.
-            let blocks = rows
-                .checked_add(7)
+            // One warp per (token, row-quad), eight warps per block.
+            let quads = (rows + 3) / 4;
+            let blocks = n_tokens
+                .checked_mul(quads)
+                .and_then(|v| v.checked_add(7))
                 .map(|v| v / 8)
                 .ok_or_else(|| CudaError("gemm_q4_k_b8_q8 grid overflow".into()))?;
             let grid = u32::try_from(blocks)

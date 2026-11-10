@@ -1627,24 +1627,22 @@ void sofuu_rope_kv_f32(float *q, float *k, const float *v, float *k_cache,
 // helpers. There are no block barriers: each warp reduces its own row sum with
 // shuffles and writes its token's output.
 
-// ── Prefill q4_K: one row per warp, ALL tokens per row ─────────────────────
+// ── Prefill q4_K, rows per warp on q8_1 activations ────────────────────────
 //
-// Prefill weight traffic is prompt_len x matrix size no matter how the chunk is
-// cut -- a chunk of n tokens makes n passes over the weights, so the only lever
-// that moves the number is reusing ONE weight load across tokens inside the
-// warp. Measured, in order:
-//   * the (token, row) kernel above, f32 activations: 16.4 GB/s of unique
-//     weights on 8192x2048 x8 tokens (it re-read a full activation row per
-//     output row);
-//   * four ROWS per warp on q8_1 activations: 26.8 GB/s -- a 1.6x that turned
-//     out to be the DRAM wall, not a win: 9.4 MB of unique weights meant 75 MB
-//     of actual loads (one read per token) and the kernel was running at
-//     214 GB/s of real traffic. It had tiled the activation side, which L2 was
-//     already absorbing, instead of the weight side.
-// So: a warp owns one row and keeps an accumulator per token, loading the
-// weight chunk once and feeding it n_tokens dots. Weight traffic drops by
-// n_tokens (8x for a full chunk); the per-token activation chunks are 16 bytes
-// against an L1-resident 16 KB working set, so they cost almost nothing.
+// The (token, row) mapping above gives every warp its own row, which means
+// every warp streams the token's whole activation row through L1: at 8192 rows
+// a 6-token chunk moved ~67 MB of activations against 9.4 MB of weights, so the
+// kernel measured ~14 GB/s of weight throughput and a chunk cost 37-56 ms where
+// one pass over the weights is 3.3 ms.
+//
+// This variant fixes the ratio twice over:
+//   * the activations are q8_1 (one byte per value, quantized ONCE per chunk by
+//     the caller) instead of f32, and dp4a consumes them directly;
+//   * one warp walks FOUR rows of the same matrix for the same token, so an
+//     activation chunk load feeds four dots. Traffic per warp becomes 4 rows x
+//     1152 B of weights against 2 KB of activations -- ~1.4x the weights, where
+//     it was 7x.
+// A block is still eight warps, each on its own (token, row-quad).
 extern "C" SOFUU_GLOBAL SOFUU_LAUNCH_BOUNDS_MIN(256, 4)
 void sofuu_gemm_q4_k_b8_q8(const unsigned char *__restrict__ w,
                            const signed char *__restrict__ xq,
@@ -1652,53 +1650,65 @@ void sofuu_gemm_q4_k_b8_q8(const unsigned char *__restrict__ w,
                            const int *__restrict__ xs,
                            float *__restrict__ y, int rows, int cols,
                            int n_tokens) {
-    if (n_tokens <= 0 || n_tokens > 8) return;
+    if (n_tokens <= 0) return;
+    const int RPW = 4;
     unsigned int tid = sofuu_tid_x();
     int warp = (int)(tid >> 5);
     int lane = (int)(tid & 31u);
-    int row = (int)sofuu_ctaid_x() * 8 + warp;
-    if (row >= rows) return;
+    int idx = (int)sofuu_ctaid_x() * 8 + warp;
+    int token = idx % n_tokens;
+    int rblk = idx / n_tokens;
+    int row0 = rblk * RPW;
+    if (row0 >= rows) return;
     int nb = cols / SOFUU_QK_K;
-    const int nb32 = cols / 32;
     const int chunk = lane & 7;
     const int bgrp = lane >> 3;
     const int k = chunk >> 1;
-    const unsigned char *roww =
-        w + (unsigned long long)row * (unsigned long long)nb * SOFUU_Q4_K_BYTES;
+    const signed char *xq_t = xq + (unsigned long long)token *
+                                       (unsigned long long)cols;
+    // Per-token q8_1 side arrays: (cols/32) entries for d/s, laid out per token
+    // the same way the row is.
+    const int nb32 = cols / 32;
+    const float *xd_t = xd + (unsigned long long)token * (unsigned long long)nb32;
+    const int *xs_t = xs + (unsigned long long)token * (unsigned long long)nb32;
 
-    float acc[8];
+    const unsigned char *roww[4];
+    int nrows = rows - row0;
+    if (nrows > RPW) nrows = RPW;
 #pragma unroll
-    for (int t = 0; t < 8; ++t) acc[t] = 0.0f;
+    for (int r = 0; r < RPW; ++r)
+        roww[r] = w + (unsigned long long)(row0 + r) *
+                          (unsigned long long)nb * SOFUU_Q4_K_BYTES;
+
+    float acc[RPW];
+#pragma unroll
+    for (int r = 0; r < RPW; ++r) acc[r] = 0.0f;
 
     for (int b = bgrp; b < nb; b += 4) {
-        const sofuu_block_q4_K *p = (const sofuu_block_q4_K *)(
-            roww + (unsigned long long)b * SOFUU_Q4_K_BYTES);
-        sofuu_u128 wq;
-        sofuu_q4k_w_load(p, chunk, &wq);
+        sofuu_u128 xlo, xhi;
+        sofuu_q4k_x_load(xq_t + (unsigned long long)b * 256, 0, chunk, &xlo,
+                         &xhi);
         int ilo = b * 8 + 2 * k;
+        float sx0 = xd_t[ilo], sx1 = xd_t[ilo + 1];
+        int si0 = xs_t[ilo], si1 = xs_t[ilo + 1];
 #pragma unroll
-        for (int t = 0; t < 8; ++t) {
-            if (t >= n_tokens) break;
-            sofuu_u128 xlo, xhi;
-            sofuu_q4k_x_load(xq + (unsigned long long)t * (unsigned long long)cols +
-                                 (unsigned long long)b * 256,
-                             0, chunk, &xlo, &xhi);
-            const float *xdt = xd + (unsigned long long)t *
-                                        (unsigned long long)nb32;
-            const int *xst = xs + (unsigned long long)t *
-                                      (unsigned long long)nb32;
-            acc[t] += sofuu_q4k_chunk32_compute(wq, xlo, xhi, p, chunk,
-                                                xdt[ilo], xst[ilo], xdt[ilo + 1],
-                                                xst[ilo + 1]);
+        for (int r = 0; r < RPW; ++r) {
+            if (r >= nrows) break;
+            const sofuu_block_q4_K *p = (const sofuu_block_q4_K *)(
+                roww[r] + (unsigned long long)b * SOFUU_Q4_K_BYTES);
+            sofuu_u128 wq;
+            sofuu_q4k_w_load(p, chunk, &wq);
+            acc[r] += sofuu_q4k_chunk32_compute(wq, xlo, xhi, p, chunk, sx0,
+                                                si0, sx1, si1);
         }
     }
 #pragma unroll
-    for (int t = 0; t < 8; ++t) {
-        if (t >= n_tokens) break;
-        float total = sofuu_warp_sum(acc[t]);
+    for (int r = 0; r < RPW; ++r) {
+        if (r >= nrows) break;
+        float total = sofuu_warp_sum(acc[r]);
         if (lane == 0)
-            y[(unsigned long long)t * (unsigned long long)rows +
-              (unsigned long long)row] = total;
+            y[(unsigned long long)token * (unsigned long long)rows +
+              (unsigned long long)(row0 + r)] = total;
     }
 }
 

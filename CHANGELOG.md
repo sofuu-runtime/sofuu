@@ -15,7 +15,7 @@ One versioned diagnostic contract across the CLI, JavaScript, Kaze, events and c
 - **Compatibility:** existing codes, event kinds, exit status, retries, approvals, C ABI status/envelope and protocol stdout are unchanged. Legacy codes map into the event taxonomy with the original retained in `legacy_code`.
 - **Context-limit finding:** regression tests prove the configured short model name resolves a local listing's full-path `.gguf` id, and that learned-limit keys are case- and endpoint-normalized.
 
-Verification: `cargo test -p sofuu-core --lib rt::diag_contract`, `rt::events`, `rt::observability`, `domains::kaze`, plus `cargo test -p sofuu-core --test diagnostics_contract` (all passing locally), and real `sofuu eval` / `sofuu script run|check` receipts. Binary size: this contract measured 5,750,928 B (cap 5,767,168 B) before concurrent audit edits to `main.rs`/`engine.rs` landed; the combined tree now measures 5,783,984 B, so `make size-check` is red for the shared tree, not attributable to this module alone (see `docs/DIAGNOSTICS.md` §8).
+Verification: `cargo test -p sofuu-core --lib rt::diag_contract`, `rt::events`, `rt::observability`, `domains::kaze`, plus `cargo test -p sofuu-core --test diagnostics_contract` (all passing locally), and real `sofuu eval` / `sofuu script run|check` receipts. Binary size: the isolated landing commit measures 5,717,776 B (cap 5,767,168 B). The shared working tree measured 5,783,984 B after concurrent uncommitted audit edits added ~24 KB of `__text`, so `make size-check` is red there, not in this commit (see `docs/DIAGNOSTICS.md` §8).
 
 ## Enterprise Hardening & Linux Cross-Compile Static TLS Integration — 2026-11-09
 

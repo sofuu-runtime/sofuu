@@ -58,7 +58,7 @@
 #### 💨 Kaze (風) Zero-GC Deterministic Guardrail Engine
 - [x] **Small Typed Language**: Fixed-size arena allocation, zero-GC pauses in the hot path, bytecode compilation.
 - [x] **Capability Gates**: Fail-closed access-control policies enforcing declared hardware/system permissions.
-- [ ] **Real Kaze backends**: The embedded source requires explicit grants and tool policy, and refuses unavailable AI, tool, memory and alert operations. Complete real adapters, remaining execution-path checks and release verification; see [Kaze embedded status](KAZE-EMBEDDED.md).
+- [ ] **Real Kaze backends**: The embedded source includes explicitly selected per-run CMA memory and refuses unavailable AI, tool, persistent Kaze memory and alert operations. Complete real adapters, remaining execution-path checks and release verification; see [Kaze embedded status](KAZE-EMBEDDED.md).
 
 ---
 
@@ -87,6 +87,48 @@
 ---
 
 ## 🟡 2. In Progress (Active Sprint — Weeks 1–2)
+
+### Real-execution remediation — in progress (2026-11-11)
+
+This is a partial remediation, not evidence that simulated non-robotics
+behavior has been removed throughout Sofuu. The current source:
+
+- Requires explicit Kaze grants and policy, and fails closed for unavailable
+  AI, tool, persistent memory, alert and physical-device backends. An
+  explicitly selected `memory=ephemeral` backend provides isolated per-run
+  CMA storage; it is not durable or shared with QTSQ. Kaze file access and
+  embedded calls also respect the host's filesystem and runtime policy. See
+  [Kaze embedded status](KAZE-EMBEDDED.md) for the supported surface.
+- Applies CLI argument, environment and config-file precedence for Kaze, and
+  checks MCP policy and reconnect behavior. A potentially completed MCP call
+  with a lost response is reported as outcome unknown rather than replayed;
+  approval-required tool calls fail closed until approval receipts are carried
+  through dispatch.
+- Requires real local model execution for the updated inference smoke, HTTP
+  serving checks and event-loop benchmark. Missing resources block coverage;
+  the synthetic GGUF remains a format fixture, not inference evidence.
+
+On 2026-11-11, macOS debug checks passed 73 Kaze and 16 hardware-gate unit
+tests, plus the [Kaze fail-closed](scripts/test-kaze-fail-closed.py),
+[embedded boundary](scripts/test-kaze-js-boundaries.py),
+[per-run memory](scripts/test-kaze-memory-real.py),
+[real MCP](scripts/test-real-mcp-file.py) and
+[QTSQ storage](scripts/test-real-memory.py) checks. The same integration
+checks, an inference smoke and eight HTTP serving checks also passed on a
+temporary release candidate using an existing SmolLM2 model. That candidate
+measured 5,651,920 bytes against the 5,767,168-byte cap; this manual result is
+not a `make size-check` or published-artifact verification. No physical
+hardware was tested, and the results do not establish other platforms or
+releases.
+
+Remaining work includes a pure-Kaze real model-plus-MCP journey, approval
+receipts, durable Kaze memory and acknowledged alerts, physical-simulator
+safety, migration of remaining simulated test providers, broader surface and
+release-artifact audits, and the applicable release gates. `make test-rust`,
+the aggregate tests and preflight are blocked until their simulated providers
+are migrated. The main CI job therefore currently stops at `make test-rust`;
+model-dependent CI gates also require an existing compatible model on the
+runner. A blocked gate is not a pass.
 
 ### ✅ The "Killer Wedge": Standalone Agent Compiler (`sofuu compile`) — SHIPPED 2026-10-30
 *See detailed specification in [`docs/STANDALONE_COMPILER_PLAN.md`](docs/STANDALONE_COMPILER_PLAN.md). Shipped and verified — see CHANGELOG.*
@@ -132,7 +174,7 @@ Rust panic is survivable — see the open item below.
 - [x] **Pass 2.2 — zero-KDF plaintext store**: `memory.open(..., { plaintext: true })` skips the vault entirely (79.84 MB → **12.63 MB** peak RSS), persists the mode in the manifest, and covers segments, manifests and legacy single-file saves.
 - [x] **Pass 2.3 — bounded streaming**: 64 KiB chunk buffers in `agent.js` / `serve.js`; serve no longer accumulates thinking text nobody reads.
 - [x] **Pass 2.4 — turn-boundary reclamation**: root-run GC in `agent.js`, per-request GC for alloc-heavy serve routes, `malloc_trim` on glibc, and `sofuu.gc()`.
-- [x] **Pass 3 — concurrency**: `make event-loop-check` drives the shipped serve handler; **1 ms max lag** at 64 concurrent turns × 256 chunks (16 ms ceiling).
+- [ ] **Pass 3 — concurrency**: the historical 1 ms result used a generated stream and does not establish latency during real inference. `make event-loop-check` now requires a compatible local model; the current release workload still needs a real-inference receipt.
 - [x] **Pass 4 — binary budget**: macOS **5,628,208 B**, Linux arm64 **5,117,296 B**, Linux x86_64 **5,751,616 B** — all under 5,767,168 B.
 - [x] **Extreme cold start**: 500 engine boots, 1,000-run spawn floor, bursts to 200 processes — **14.58 ms p50 / 15.33 ms p95**, statistically identical to the pre-freeze artifact. Reproduce: `make cold-start-bench`.
 

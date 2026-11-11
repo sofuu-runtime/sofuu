@@ -79,17 +79,14 @@ jobs:
         # module registers as a no-op and sessions do not persist.
         run: make
 
+      - name: Kaze embedded boundary checks
+        # This uses real temporary files and in-process CMA; no model provider.
+        run: SOFUU_BIN=./sofuu make kaze-js-boundary-check
+
       - name: Rust unit tests
-        # --test-threads=1 is deliberate. The runtime has ONE process-global
-        # libuv loop, so the tests that pump it serialize on TEST_LOOP_LOCK.
-        # On Linux runners that serialization deadlocked: a sofuu-core test
-        # binary sat in "Rust unit tests" for 20+ minutes with 17 loop-locked
-        # tests (mcp / process_spawn / promise / timer / http_client) never
-        # started, while the capi binary right before it passed 36/36. Running
-        # the suite on one thread removes the cross-thread interleaving that
-        # the lock exists to manage, so the deadlock cannot form at all. It
-        # costs ~1s (376 tests in 2.8s locally).
-        run: SOFUU_ALLOW_LOOPBACK=1 cargo test --release -- --test-threads=1
+        # Block the aggregate while it includes scripted model execution.
+        # Individual audited pure tests can still run during migration.
+        run: make test-rust
 
       - name: Phase exit gates (QTSQ_UPGRADE_PLAN.md)
         # The plan's Phase 1/2 exit gates were never measured, so they were
@@ -249,18 +246,22 @@ jobs:
           fi
 
       # ── R3: determinism gate (SPEC-RUNTIME-CONTRACT §4) ──────────
-      # The receipt schema is validated on every push, then the committed
-      # 77 KB fixture model runs the full two-route gate: the default CPU
-      # route must equal the SOFUU_NO_TILES reference exactly. FORK — or any
-      # non-identical exact-tier verdict — fails the job and blocks a default
-      # flip (R3.2/R3.6). Regenerating the fixture in CI also proves the
-      # committed bytes still match the generator.
+      # The fixture may validate the GGUF format, but its synthetic weights
+      # are not inference evidence. The two-route gate requires an existing
+      # compatible real-weight model on the runner; never download one here.
       - name: Determinism gate (R3)
         run: |
           python3 scripts/text_gate.py --self-check
           python3 scripts/contract/make_fixture_gguf.py contract/fixtures/sofuu-fixture.gguf
           git diff --exit-code -- contract/fixtures/sofuu-fixture.gguf
-          python3 scripts/text_gate.py contract/fixtures/sofuu-fixture.gguf \
+          if [ -z "${SOFUU_CONTRACT_MODEL:-}" ] || [ ! -f "$SOFUU_CONTRACT_MODEL" ]; then
+            echo "::error title=Determinism gate blocked::Set SOFUU_CONTRACT_MODEL to an existing compatible real-weight GGUF on this runner."
+            exit 2
+          fi
+          case "$SOFUU_CONTRACT_MODEL" in
+            */sofuu-fixture.gguf|sofuu-fixture.gguf) echo "::error::Synthetic fixture cannot provide inference evidence."; exit 2 ;;
+          esac
+          python3 scripts/text_gate.py "$SOFUU_CONTRACT_MODEL" \
             "Write three sentences about Paris." \
             --max-tokens 8 --tier exact --require-identical \
             --cpu-env "" --gpu-env "SOFUU_NO_TILES=1" \
@@ -281,8 +282,8 @@ jobs:
             ALLOW_BLOCKED=1 \
             bash scripts/contract/run_contract_tests.sh
 
-      - name: 32-token tiny-model smoke (P5)
-        run: bash scripts/smoke32.sh ./sofuu contract/fixtures/sofuu-fixture.gguf
+      - name: Real-model inference smoke (P5)
+        run: bash scripts/smoke32.sh ./sofuu
 
       - name: Conformance report (P5)
         run: |
@@ -486,9 +487,9 @@ jobs:
           bash scripts/contract/run_contract_tests.sh \
             || echo "contract suite: report recorded (non-blocking on a new platform)"
 
-      - name: 32-token tiny-model smoke
+      - name: Real-model inference smoke
         shell: bash
-        run: bash scripts/smoke32.sh ./sofuu contract/fixtures/sofuu-fixture.gguf
+        run: bash scripts/smoke32.sh ./sofuu
 
       - name: Conformance report
         shell: bash

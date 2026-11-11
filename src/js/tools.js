@@ -169,9 +169,9 @@
    * NOT rewritten to call the wrapper: its check also runs before approval.mode
    * handling and lives in a file outside this change's scope.
    *
-   * `ask` is passed THROUGH the wrapper: approval is the caller's job (the
-   * loop prompts, a host may run unattended). The wrapper never invents an
-   * approval UI and never turns `ask` into a silent allow of a DENY. */
+   * A caller's prompt does not by itself provide a verifiable receipt at this
+   * boundary. An `ask` decision therefore fails closed until that handoff is
+   * implemented; a direct call cannot silently bypass required approval. */
   var POLICY_ARG_KEYS = ['command', 'path', 'cwd', 'host', 'url', 'server'];
   var POLICY_ARG_MAX = 8192;
 
@@ -215,6 +215,45 @@
     } catch (e) { return null; }
   }
 
+  // MCP connects and network setup have no interactive approval channel.
+  // An unavailable or unreadable policy decision cannot authorize dispatch.
+  function requireMcpPolicy(op, fields) {
+    var d = policyDecision(op, fields);
+    if (!d || (d.decision !== 'allow' && d.decision !== 'deny' && d.decision !== 'ask')) {
+      throw makeError('E_POLICY_UNAVAILABLE', op + ': policy decision is unavailable');
+    }
+    if (d.decision !== 'allow') {
+      var err = makeError(d.decision === 'ask' ? 'E_POLICY_APPROVAL_REQUIRED' : 'E_POLICY_DENIED',
+        op + ': ' + (d.decision === 'ask' ? 'approval required' : 'denied by policy') + ' (' + (d.rule || 'R7') + ')');
+      err.rule = d.rule || 'R7';
+      err.decision = d.decision;
+      throw err;
+    }
+  }
+
+  function checkMcpToolPolicy(method, params) {
+    var m = String(method);
+    var name = m === 'tools/call' ? params && params.name :
+      (m.indexOf('/') < 0 && m !== 'ping' ? m : null);
+    if (name === null || name === undefined) {
+      if (m === 'tools/call') throw makeError('E_SCHEMA', 'MCP tools/call requires a tool name');
+      return;
+    }
+    if (typeof name !== 'string' || !name) throw makeError('E_SCHEMA', 'MCP tool name must be nonempty text');
+    var args = m === 'tools/call' ? params && params.arguments : params;
+    var d = toolPolicyDecision(name, args);
+    if (!d || (d.decision !== 'allow' && d.decision !== 'deny' && d.decision !== 'ask')) {
+      throw makeError('E_POLICY_UNAVAILABLE', 'MCP tool policy decision is unavailable');
+    }
+    if (d.decision === 'deny') throw policyDeniedError(name, d);
+    if (d.decision === 'ask') {
+      var err = makeError('E_POLICY_APPROVAL_REQUIRED', 'MCP tool requires approval, but this dispatch has no verifiable approval receipt');
+      err.rule = d.rule || 'R7';
+      err.decision = 'ask';
+      throw err;
+    }
+  }
+
   /* The typed denial H-01 asks for, carrying the R7.3 rule id in the message
    * AND as properties so a driver can branch without parsing text. The shape
    * keeps the pre-existing "denied by policy (<rule>)" substring the contract
@@ -248,24 +287,37 @@
     try { globalThis.__sofuu_tool_active = TOOL_ACTIVE; } catch (e) { /* the counter is mirrored onto globalThis for embedders; a frozen global must not break dispatch accounting. */ }
   }
 
+  // Keep the implementations in this closure, not on the publicly exposed
+  // tool specifications: exposing a raw executor lets callers skip policy.
+  var TOOL_IMPLEMENTATIONS = Object.create(null);
+
   /* The single enforcement point. Works when copied off the object and called
    * unbound (`const f = TOOLS.edit_file.execute; f(...)`), which a host is
    * allowed to do — no `this`. */
   function executeWithPolicy(toolName, params, ctx) {
     var name = String(toolName == null ? '' : toolName);
-    var spec = TOOLS[name];
-    if (!spec || typeof spec.__exec !== 'function') {
+    var implementation = TOOL_IMPLEMENTATIONS[name];
+    if (typeof implementation !== 'function') {
       var e = new Error('E_TOOL: unknown tool \'' + name + '\'');
       e.code = 'E_TOOL';
       e.tool = name;
       throw e;
     }
     var d = toolPolicyDecision(name, params);
-    if (d && d.decision === 'deny') throw policyDeniedError(name, d);
+    if (!d || (d.decision !== 'allow' && d.decision !== 'deny' && d.decision !== 'ask')) {
+      throw makeError('E_POLICY_UNAVAILABLE', 'Tool policy decision is unavailable');
+    }
+    if (d.decision === 'deny') throw policyDeniedError(name, d);
+    if (d.decision === 'ask') {
+      var approval = makeError('E_POLICY_APPROVAL_REQUIRED', 'Tool requires approval, but this dispatch has no verifiable approval receipt');
+      approval.rule = d.rule || 'R7';
+      approval.decision = 'ask';
+      throw approval;
+    }
     toolDispatchBegin();
     var out;
     try {
-      out = spec.__exec(params, ctx);
+      out = implementation(params, ctx);
     } catch (err) {
       toolDispatchEnd();
       throw err;
@@ -2103,7 +2155,7 @@
     }
 
     /* In-Memory Direct MCP Transport client constructor */
-    sofuu.mcp._connectDirect = function (srv) {
+    var connectDirect = function (srv) {
       if (!srv) return Promise.reject(new Error('mcp.connect: target server is required for direct transport'));
       var disconnected = false;
 
@@ -2476,16 +2528,14 @@
       if (!f) throw makeError('E_MCP_FETCH_UNAVAILABLE', 'mcp http: fetch is unavailable in this build');
       return f(url, init);
     }
-    sofuu.mcp._connectHttp = function (cfg) {
+    var connectHttp = function (cfg) {
       cfg = cfg || {};
       var url = String(cfg.url || '');
       if (!url) return Promise.reject(new Error('mcp.connect: url required for the HTTP transport'));
       var host = httpHostOf(url);
       var serverId = cfg.name ? String(cfg.name) : url;
-      var pdNet = policyDecision('net.fetch', { host: host });
-      if (pdNet && pdNet.decision === 'deny') {
-        return Promise.reject(new Error('mcp.connect: denied by policy (' + pdNet.rule + '): ' + (pdNet.reason || host)));
-      }
+      try { requireMcpPolicy('net.fetch', { host: host }); }
+      catch (eNet) { return Promise.reject(eNet); }
       var baseHeaders = { 'content-type': 'application/json', 'accept': 'application/json, text/event-stream' };
       if (cfg.headers && typeof cfg.headers === 'object') {
         for (var hk in cfg.headers) {
@@ -2600,12 +2650,16 @@
           if (timeoutMs > 0) {
             pending[id].timer = setTimeout(function () {
               if (!pending[id]) return;
-              var err = new Error('MCP call timed out after ' + timeoutMs + ' ms');
+              var err = makeError('E_MCP_TIMEOUT', 'MCP call timed out after ' + timeoutMs + ' ms');
               settle(id, false, err);
             }, timeoutMs);
           }
-          postMessage(msg).then(consumeResponse, function (e) { settle(id, false, e); })
-            .then(function () {}, function (e2) { settle(id, false, e2); });
+          postMessage(msg).then(consumeResponse, function () {
+            settle(id, false, makeError('E_MCP_TRANSPORT', 'MCP request transport failed after dispatch'));
+          })
+            .then(function () {}, function (e2) {
+              settle(id, false, e2 && e2.code ? e2 : makeError('E_MCP_TRANSPORT', 'MCP response transport failed after dispatch'));
+            });
         });
       }
       var client = {
@@ -2622,7 +2676,7 @@
             timeout = Math.min(600000, Math.floor(opts.timeoutMs));
           }
           var m = String(method), p = (params === undefined ? {} : params);
-          if (m.indexOf('/') < 0) { p = { name: m, arguments: p || {} }; m = 'tools/call'; }
+          if (m.indexOf('/') < 0 && m !== 'ping') { p = { name: m, arguments: p || {} }; m = 'tools/call'; }
           return rpc(m, p, timeout);
         },
         listTools: function () { return rpc('tools/list', {}); },
@@ -2631,7 +2685,7 @@
           if (closed) return;
           closed = true;
           var sids = Object.keys(pending);
-          for (var i = 0; i < sids.length; i++) settle(Number(sids[i]), false, new Error('mcp: disconnected'));
+          for (var i = 0; i < sids.length; i++) settle(Number(sids[i]), false, makeError('E_MCP_DISCONNECTED', 'mcp: disconnected'));
           if (sessionId) {
             try { mcpFetch(url, { method: 'DELETE', headers: wireHeaders() }).catch(function () { /* a server that refuses the session delete is allowed to. */ }); } catch (e) { /* and a fetch that throws synchronously is equally harmless here. */ }
           }
@@ -2658,15 +2712,13 @@
      * server notification) arrives as an "event: message" frame on that GET
      * stream. Streamable HTTP multiplexes one POST; this transport cannot, so
      * connect has to hold the stream open before it can initialize. */
-    sofuu.mcp._connectSse = function (cfg) {
+    var connectSse = function (cfg) {
       cfg = cfg || {};
       var url = String(cfg.url || '');
       if (!url) return Promise.reject(new Error('mcp.connect: url required for the SSE transport'));
       var host = httpHostOf(url);
-      var pdNet = policyDecision('net.fetch', { host: host });
-      if (pdNet && pdNet.decision === 'deny') {
-        return Promise.reject(new Error('mcp.connect: denied by policy (' + pdNet.rule + '): ' + (pdNet.reason || host)));
-      }
+      try { requireMcpPolicy('net.fetch', { host: host }); }
+      catch (eNet) { return Promise.reject(eNet); }
       var streamHeaders = { accept: 'text/event-stream', 'cache-control': 'no-cache' };
       var postHeaders = { 'content-type': 'application/json', accept: 'application/json' };
       if (cfg.headers && typeof cfg.headers === 'object') {
@@ -2756,10 +2808,12 @@
           if (timeoutMs > 0) {
             pending[id].timer = setTimeout(function () {
               if (!pending[id]) return;
-              settle(id, false, new Error('MCP call timed out after ' + timeoutMs + ' ms'));
+              settle(id, false, makeError('E_MCP_TIMEOUT', 'MCP call timed out after ' + timeoutMs + ' ms'));
             }, timeoutMs);
           }
-          postMessage(msg).catch(function (e) { settle(id, false, e); });
+          postMessage(msg).catch(function (e) {
+            settle(id, false, e && e.code ? e : makeError('E_MCP_TRANSPORT', 'MCP request transport failed after dispatch'));
+          });
         });
       }
       async function readStream(res) {
@@ -2830,7 +2884,7 @@
             timeout = Math.min(600000, Math.floor(opts.timeoutMs));
           }
           var m = String(method), p = (params === undefined ? {} : params);
-          if (m.indexOf('/') < 0) { p = { name: m, arguments: p || {} }; m = 'tools/call'; }
+          if (m.indexOf('/') < 0 && m !== 'ping') { p = { name: m, arguments: p || {} }; m = 'tools/call'; }
           return rpc(m, p, timeout);
         },
         listTools: function () { return rpc('tools/list', {}); },
@@ -2838,7 +2892,7 @@
         disconnect: function () {
           if (closed) return;
           closed = true;
-          failAll(new Error('mcp: disconnected'));
+          failAll(makeError('E_MCP_DISCONNECTED', 'mcp: disconnected'));
           if (endpoint) {
             /* Legacy SSE has no delete verb; a cooperating server drops the
              * session, a spec-only one answers 404/405. Best effort only. */
@@ -2870,7 +2924,10 @@
         epTimer = setTimeout(function () {
           finishEndpoint(new Error('mcp sse: the server sent no endpoint event within 15000 ms'));
         }, 15000);
-        readStream(res).catch(function (eS) { failAll(eS); finishEndpoint(eS); });
+        readStream(res).catch(function (eS) {
+          var err = eS && eS.code ? eS : makeError('E_MCP_TRANSPORT', 'MCP event stream transport failed');
+          failAll(err); finishEndpoint(err);
+        });
         try {
           await epWait;
           var init = await rpc('initialize', {
@@ -2928,11 +2985,8 @@
           ? String(arg.server) : cfg.command));
       /* S6/S4: the MCP allowlist is a policy decision on the server id (or
        * the raw command for a plain-script caller). */
-      var pd = policyDecision('mcp.connect', { server: server, command: cfg.command || '' });
-      if (pd && pd.decision === 'deny') {
-        return Promise.reject(new Error('mcp.connect: denied by policy (' + pd.rule + '): ' +
-          (pd.reason || '')));
-      }
+      try { requireMcpPolicy('mcp.connect', { server: server, command: cfg.command || '' }); }
+      catch (ePolicy) { return Promise.reject(ePolicy); }
       try { cfg.env = resolveSecretEnv(cfg.env); }
       catch (eSec) { return Promise.reject(eSec); }
       function isTransportLoss(err) {
@@ -2949,11 +3003,31 @@
         );
       }
 
+      /* Only these inventory/health requests are safe to replay without an
+       * explicit idempotency contract. A bare method name may denote a tool
+       * call, and every other method is conservatively treated as an effect. */
+      function mayHaveEffects(method) {
+        return ['ping', 'tools/list', 'resources/list', 'prompts/list'].indexOf(String(method)) < 0;
+      }
+      function isUncertainTransportFailure(err) {
+        if (isTransportLoss(err)) return true;
+        var code = err && err.code;
+        if (code === -32001 || code === -32005 || code === 'E_TIMEOUT' || code === 'ETIMEDOUT' ||
+            code === 'E_NETWORK' || code === 'E_MCP_TIMEOUT' || code === 'E_MCP_TRANSPORT' ||
+            code === 'E_MCP_HTTP_ERROR' || code === 'E_MCP_JSON_ERROR' ||
+            code === 'E_MCP_PROTOCOL_ERROR' || code === 'E_MCP_STREAM_ERROR' ||
+            code === 'E_MCP_STREAM_CLOSED') return true;
+        return /\b(timeout|timed out|connection reset|broken pipe)\b/i.test(String((err && err.message) || err || ''));
+      }
+      function unknownCompletion() {
+        return makeError('E_MCP_OUTCOME_UNKNOWN', 'MCP request lost its response; completion is unknown. Check the operation before retrying.');
+      }
+
       function createRawClient() {
-        if (isDirect) return Promise.resolve(sofuu.mcp._connectDirect(directServer, cfg));
-        if (useSse) return Promise.resolve(sofuu.mcp._connectSse(cfg));
+        if (isDirect) return Promise.resolve(connectDirect(directServer, cfg));
+        if (useSse) return Promise.resolve(connectSse(cfg));
         if (useHttp) {
-          return Promise.resolve(sofuu.mcp._connectHttp(cfg)).catch(function (eHttp) {
+          return Promise.resolve(connectHttp(cfg)).catch(function (eHttp) {
             /* Transport 'auto' with a command: fall back to stdio. */
             if (transport === 'auto' && cfg.command) {
               var spec = { command: cfg.command, server: server };
@@ -2990,6 +3064,20 @@
         var replayQueue = [];
         var reconnectingPromise = null;
 
+        function enqueueRequest(method, params, copts, resolve, reject) {
+          var item = { method: method, params: params, copts: copts,
+                       resolve: resolve, reject: reject, enqueuedAt: Date.now(), timer: null };
+          replayQueue.push(item);
+          if (copts && typeof copts.timeoutMs === 'number' && copts.timeoutMs > 0) {
+            item.timer = setTimeout(function () {
+              var index = replayQueue.indexOf(item);
+              if (index < 0) return;
+              replayQueue.splice(index, 1);
+              reject(makeError('E_TIMEOUT', 'MCP request timed out while waiting for reconnection'));
+            }, Math.min(600000, Math.floor(copts.timeoutMs)));
+          }
+        }
+
         /* Pillar 1 §3.3: Remote Transport Circuit Breaker */
         var circuitState = 'CLOSED';
         var circuitFailures = 0;
@@ -3002,10 +3090,25 @@
             for (var attempt = 1; attempt <= maxRetries; attempt++) {
               var backoff = Math.min(maxBackoffMs, initialBackoffMs * Math.pow(2, attempt - 1));
               await new Promise(function (res) { setTimeout(res, backoff); });
+              if (clientState === 'CLOSED') { reconnectingPromise = null; return; }
               try {
+                // Reconnection launches a new server/transport. A policy that
+                // changed since the original connection must be rechecked
+                // before any new process or network connection is opened.
+                requireMcpPolicy('mcp.connect', { server: server, command: cfg.command || '' });
                 var freshClient = await createRawClient();
+                if (clientState === 'CLOSED') {
+                  if (freshClient && typeof freshClient.disconnect === 'function') freshClient.disconnect();
+                  reconnectingPromise = null;
+                  return;
+                }
                 clientState = 'REPLAYING';
                 var toolsRes = await all(freshClient, 'tools/list', 'tools').catch(function () { return { tools: [] }; });
+                if (clientState === 'CLOSED') {
+                  if (freshClient && typeof freshClient.disconnect === 'function') freshClient.disconnect();
+                  reconnectingPromise = null;
+                  return;
+                }
                 var toolNames = {};
                 var tArr = (toolsRes && toolsRes.tools) || [];
                 for (var ti = 0; ti < tArr.length; ti++) {
@@ -3023,6 +3126,7 @@
                 replayQueue = [];
                 for (var q = 0; q < queued.length; q++) {
                   var item = queued[q];
+                  if (item.timer) clearTimeout(item.timer);
                   if (item.method === 'tools/call' && item.params && item.params.name && !toolNames[item.params.name]) {
                     var missingErr = new Error("MCP tool '" + item.params.name + "' not found on reconnected server");
                     missingErr.code = 'E_SCHEMA';
@@ -3047,12 +3151,43 @@
                     callOpts.timeoutMs = remainingMs;
                   }
                   (function (it, cOpts) {
-                    Promise.resolve(curClient.call(it.method, it.params, cOpts)).then(it.resolve, it.reject);
+                    var dispatched = false;
+                    Promise.resolve().then(function () {
+                      if (clientState === 'CLOSED') throw makeError('E_MCP_DISCONNECTED', 'MCP client was disconnected before dispatch');
+                      checkMcpToolPolicy(it.method, it.params);
+                      dispatched = true;
+                      return curClient.call(it.method, it.params, cOpts);
+                    }).then(it.resolve, function (err) {
+                      // A request queued during reconnection has not been sent
+                      // before. Once dispatched, it has the same uncertain
+                      // completion semantics as a normal call.
+                      if (dispatched && mayHaveEffects(it.method) && isUncertainTransportFailure(err)) {
+                        if (!useHttp && !useSse && isTransportLoss(err) && reconnectEnabled && clientState === 'CONNECTED') {
+                          clientState = 'RECONNECTING';
+                          startReconnectLoop();
+                        }
+                        it.reject(unknownCompletion());
+                      } else {
+                        it.reject(err);
+                      }
+                    });
                   })(item, callOpts);
                 }
                 return;
               } catch (eRetry) {
                 lastErr = eRetry;
+                if (eRetry && (eRetry.code === 'E_POLICY_DENIED' ||
+                    eRetry.code === 'E_POLICY_APPROVAL_REQUIRED' || eRetry.code === 'E_POLICY_UNAVAILABLE')) {
+                  clientState = 'CLOSED';
+                  reconnectingPromise = null;
+                  var deniedQueue = replayQueue.slice();
+                  replayQueue = [];
+                  for (var di = 0; di < deniedQueue.length; di++) {
+                    if (deniedQueue[di].timer) clearTimeout(deniedQueue[di].timer);
+                    deniedQueue[di].reject(eRetry);
+                  }
+                  return;
+                }
                 /* retry next backoff iteration */
               }
             }
@@ -3063,6 +3198,7 @@
             var failed = replayQueue.slice();
             replayQueue = [];
             for (var f = 0; f < failed.length; f++) {
+              if (failed[f].timer) clearTimeout(failed[f].timer);
               failed[f].reject(discErr);
             }
           })();
@@ -3166,7 +3302,10 @@
             replayQueue = [];
             var closedErr = new Error('MCP client was disconnected by caller');
             closedErr.code = 'E_MCP_DISCONNECTED';
-            for (var f = 0; f < failed.length; f++) failed[f].reject(closedErr);
+            for (var f = 0; f < failed.length; f++) {
+              if (failed[f].timer) clearTimeout(failed[f].timer);
+              failed[f].reject(closedErr);
+            }
             if (curClient && typeof curClient.disconnect === 'function') {
               try { curClient.disconnect(); } catch (eDisc) { /* best-effort child termination */ }
             }
@@ -3187,6 +3326,8 @@
             }
 
             function execCall(m, p, co) {
+              try { checkMcpToolPolicy(m, p); }
+              catch (ePolicy) { return Promise.reject(ePolicy); }
               /* Remote Circuit Breaker evaluation */
               if (useHttp || useSse) {
                 var now = Date.now();
@@ -3223,14 +3364,7 @@
                   return Promise.reject(ovfErr);
                 }
                 return new Promise(function (res, rej) {
-                  replayQueue.push({
-                    method: m,
-                    params: p,
-                    copts: co,
-                    resolve: res,
-                    reject: rej,
-                    enqueuedAt: Date.now()
-                  });
+                  enqueueRequest(m, p, co, res, rej);
                 });
               }
 
@@ -3244,7 +3378,8 @@
                 }, function (err) {
                   if (useHttp || useSse) {
                     var emsg = String((err && err.message) || err || '');
-                    if (/status\s*5\d\d|5\d\d|timeout|ETIMEDOUT/i.test(emsg) || (err && err.code === 'ETIMEDOUT')) {
+                    if (/status\s*5\d\d|5\d\d|timeout|timed out|ETIMEDOUT/i.test(emsg) ||
+                        (err && (err.code === 'ETIMEDOUT' || err.code === 'E_MCP_TIMEOUT'))) {
                       circuitFailures++;
                       if (circuitFailures >= 2 || circuitState === 'HALF_OPEN') {
                         circuitState = 'OPEN';
@@ -3252,6 +3387,21 @@
                         circuitFailures = 0;
                       }
                     }
+                  }
+                  /* A lost reply or deadline after dispatch does not tell us
+                   * whether a side effect happened. Never replay that request,
+                   * including a bare tool-name alias. Reconnect the transport
+                   * for later calls when applicable, but return uncertainty
+                   * to this caller without exposing request contents. */
+                  if (mayHaveEffects(m) && isUncertainTransportFailure(err)) {
+                    if (!useHttp && !useSse && isTransportLoss(err) && reconnectEnabled && clientState === 'CONNECTED') {
+                      clientState = 'RECONNECTING';
+                      startReconnectLoop();
+                    }
+                    reject(unknownCompletion());
+                    return;
+                  }
+                  if (useHttp || useSse) {
                     reject(err);
                     return;
                   }
@@ -3265,14 +3415,7 @@
                       reject(qErr);
                       return;
                     }
-                    replayQueue.push({
-                      method: m,
-                      params: p,
-                      copts: co,
-                      resolve: resolve,
-                      reject: reject,
-                      enqueuedAt: Date.now()
-                    });
+                    enqueueRequest(m, p, co, resolve, reject);
                     startReconnectLoop();
                     return;
                   }
@@ -3573,9 +3716,8 @@
   /* ── H-01: install the one policy wrapper on EVERY executor ──────────
    * Runs last, after every TOOLS.* definition in this file (todo_write,
    * system_info and memory_* are added below the SOFUU_TOOLS section), so no
-   * executor can escape it. Each spec keeps its body as __exec and exposes
-   * execute = the wrapper. Idempotent: re-loading the driver (hot reload)
-   * must not stack wrappers on wrappers.
+   * executor can escape it. Each implementation stays in the private closure;
+   * the exposed specification contains only the policy-checked wrapper.
    *
    * sofuu.tools.execute(name, params) is the documented public entry — the
    * remediation plan's validation uses it — and it goes through exactly the
@@ -3585,9 +3727,8 @@
     for (var i = 0; i < names.length; i++) {
       var n = names[i];
       var spec = TOOLS[n];
-      if (!spec || typeof spec.execute !== 'function' || spec.__policyWrapped) continue;
-      spec.__exec = spec.execute;
-      spec.__policyWrapped = true;
+      if (!spec || typeof spec.execute !== 'function') continue;
+      TOOL_IMPLEMENTATIONS[n] = spec.execute;
       spec.execute = (function (toolName) {
         return function (params, ctx) { return executeWithPolicy(toolName, params, ctx); };
       })(n);

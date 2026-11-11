@@ -107,7 +107,7 @@ $ sofuu eval 'const b = sofuu.memory.open("./brain.qtsq", 768); b.remember(sofuu
 
 ### 4. Kaze: a domain-specific scripting language
 
-Kaze provides a parser, checker, VM, capability declarations and standalone compilation for bounded agent and device routines. It is not a general-purpose language. **The real model-and-authorized-tool journey is not yet established.** Current embedded source refuses unavailable AI, tool, memory and alert operations; physical simulation is explicitly selected for drone or rover testing. Released binaries and live hardware still need separate verification. Do not use the examples for real-world actions or treat their output as evidence of live integrations.
+Kaze provides a parser, checker, VM, capability declarations and standalone compilation for bounded agent and device routines. It is not a general-purpose language. **The real model-and-authorized-tool journey is not yet established.** Current source includes an explicitly selected, per-run in-memory CMA backend; unavailable AI, tool, persistent Kaze memory and alert operations fail. Physical simulation is explicitly selected for drone or rover testing. Released binaries and live hardware still need separate verification. Do not use the examples for real-world actions or treat their output as evidence of live integrations.
 
 See [embedded Kaze capability status](KAZE-EMBEDDED.md) for policy, backend and verification details.
 
@@ -172,6 +172,7 @@ client.disconnect();
 
 * **Transports Supported:** `stdio` (command spawning with newline-delimited JSON-RPC), `http` (Streamable HTTP with session handling), `sse` (HTTP+SSE), and `direct` (in-memory).
 * **Configuration & Policy (`~/.sofuu/mcp.json`):** Configure persistent servers with per-server tool allow/deny filters (`tools: { allow: ["read_file"], deny: ["write_file"] }`) and secret store resolution (`TOKEN: { secret: "MCP_TOKEN" }`).
+* **Current tool limitations:** A lost MCP response or deadline after a potentially effectful call is reported as `E_MCP_OUTCOME_UNKNOWN`; inspect the operation before retrying. Built-in and MCP calls requiring `approval.mode: "always"` currently fail with `E_POLICY_APPROVAL_REQUIRED`, even after an agent prompt, until approval receipts are propagated to the dispatch boundaries.
 
 #### MCP Server
 Build standalone or in-process MCP servers in TypeScript or JavaScript:

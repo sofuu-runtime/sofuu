@@ -1,126 +1,168 @@
-/* scripts/bench/event_loop_latency.js — Stabilization Freeze Pass 3.1
+/* Measure the event loop during real local inference over Sofuu's HTTP server.
  *
- * Measures the primary QuickJS+libuv event loop while `sofuu.serve`'s REAL
- * HTTP handler drives many concurrent streaming turns. The inference seam is
- * the only fake: each chunk resolves on a macrotask, like a real provider
- * stream, so the test measures the handler's own blocking behaviour rather
- * than a model.
+ * Requires an existing, compatible GGUF with weights. This benchmark never
+ * downloads a model or substitutes a model response. The client and server
+ * share this process and communicate over a loopback TCP connection; the
+ * reported delay therefore includes client, server, inference and GC work.
  *
- * Gate: the loop must never go >16 ms without servicing timers (the 60 FPS /
- * hard-realtime heartbeat ceiling in RULES.md §3.6).
+ *   SOFUU_ALLOW_LOOPBACK=1 SOFUU_LOOP_MODEL=/path/to/model.gguf \
+ *     make event-loop-check
  *
- *   ./sofuu run scripts/bench/event_loop_latency.js
- *
- * Knobs (environment):
- *   SOFUU_LOOP_CONCURRENCY  concurrent turns (default 32)
- *   SOFUU_LOOP_CHUNKS       chunks per turn (default 128)
- *   SOFUU_LOOP_CHUNK_MS     per-chunk delay in ms (default 1)
- *   SOFUU_LOOP_BUDGET_MS    pass threshold (default 16)
+ * Optional: SOFUU_LOOP_CONCURRENCY (default 2), SOFUU_LOOP_MAX_TOKENS (24),
+ * SOFUU_LOOP_BUDGET_MS (16), SOFUU_LOOP_TIMEOUT_MS (120000), SOFUU_LOOP_PORT.
+ * Missing prerequisites exit 2 (blocked), not 0. A failed request or a budget
+ * violation exits 1. Historical fake-stream measurements are not comparable.
  */
 (function () {
   'use strict';
 
-  var CONCURRENCY = parseInt(typeof process !== 'undefined' && process.env.SOFUU_LOOP_CONCURRENCY || '32', 10);
-  var CHUNKS = parseInt(typeof process !== 'undefined' && process.env.SOFUU_LOOP_CHUNKS || '128', 10);
-  var CHUNK_MS = parseInt(typeof process !== 'undefined' && process.env.SOFUU_LOOP_CHUNK_MS || '1', 10);
-  var BUDGET_MS = parseInt(typeof process !== 'undefined' && process.env.SOFUU_LOOP_BUDGET_MS || '16', 10);
-  var SAMPLE_MS = 5;
+  var env = typeof process !== 'undefined' && process.env ? process.env : {};
+  var modelPath = env.SOFUU_LOOP_MODEL || '';
 
-  function mkRes() {
-    var out = { status: 0, headers: {}, chunks: [], ended: false };
-    return {
-      writeHead: function (s, h) { out.status = s; out.headers = h || {}; },
-      write: function (s) { out.chunks.push(String(s)); },
-      end: function (s) { if (s !== undefined) out.chunks.push(String(s)); out.ended = true; },
-      _out: out,
-    };
+  function blocked(message) {
+    console.error('BLOCKED: event-loop benchmark: ' + message);
+    process.exit(2);
   }
 
-  function mkReq(body) {
-    return {
-      method: 'POST',
-      url: '/v1/chat/completions',
-      body: body,
-      headers: { authorization: 'Bearer tok' },
-    };
+  function integer(name, fallback, min, max) {
+    var raw = env[name];
+    if (raw === undefined || raw === '') return fallback;
+    var value = Number(raw);
+    if (!/^\d+$/.test(String(raw)) || value < min || value > max || !Number.isInteger(value)) {
+      blocked(name + ' must be an integer from ' + min + ' to ' + max);
+    }
+    return value;
   }
 
-  /* The only substitution: an async stream whose chunks arrive on macrotasks,
-   * exactly as a provider stream's I/O wakeups do. */
-  sofuu.ai.stream = function () {
-    var i = 0;
-    return {
-      next: function () {
-        if (i >= CHUNKS) return Promise.resolve({ value: undefined, done: true });
-        i++;
-        var text = 'chunk-' + i + ':' + new Array(48).join('x');
-        return new Promise(function (resolve) {
-          setTimeout(function () {
-            resolve({ value: { text: text, think: '' }, done: false });
-          }, CHUNK_MS);
-        });
-      },
-      get usage() { return { promptTokens: 12, completionTokens: CHUNKS }; },
-      get toolCalls() { return []; },
-      get aborted() { return false; },
-    };
-  };
-
-  var handler = sofuu.serve.createHandler({
-    modelPath: '/tmp/sofuu-loop.gguf',
-    models: [{ id: 'loop.gguf', path: '/tmp/sofuu-loop.gguf' }],
-    token: 'tok',
-    host: '127.0.0.1',
-    port: 0,
-    version: 'bench',
-    brainPath: '',
-  });
-
-  var last = Date.now();
-  var maxLag = 0;
-  var samples = [];
-  var timer = setInterval(function () {
-    var now = Date.now();
-    var lag = now - last - SAMPLE_MS;
-    if (lag < 0) lag = 0;
-    if (lag > maxLag) maxLag = lag;
-    samples.push(lag);
-    last = now;
-  }, SAMPLE_MS);
-
-  var body = JSON.stringify({
-    model: 'loop.gguf',
-    messages: [{ role: 'user', content: 'measure the loop' }],
-    stream: true,
-  });
-
-  var started = Date.now();
-  var jobs = [];
-  for (var i = 0; i < CONCURRENCY; i++) {
-    jobs.push(handler(mkReq(body), mkRes()));
+  if (!modelPath) blocked('set SOFUU_LOOP_MODEL to an existing GGUF with real weights');
+  if (!/\.gguf$/i.test(modelPath)) blocked('SOFUU_LOOP_MODEL must name a GGUF file with real weights');
+  if (!sofuu.fs || typeof sofuu.fs.existsSync !== 'function' || !sofuu.fs.existsSync(modelPath)) {
+    blocked('model file does not exist or cannot be accessed: ' + modelPath);
+  }
+  if (!sofuu.serve || typeof sofuu.serve.start !== 'function' || typeof sofuu.fetch !== 'function') {
+    blocked('this Sofuu build does not expose the HTTP server and fetch APIs');
+  }
+  if (typeof performance === 'undefined' || typeof performance.now !== 'function') {
+    blocked('this Sofuu build does not expose a monotonic performance clock');
   }
 
-  Promise.all(jobs).then(function () {
-    clearInterval(timer);
-    var elapsed = Date.now() - started;
-    samples.sort(function (a, b) { return a - b; });
-    var p95 = samples.length ? samples[Math.floor(samples.length * 0.95)] : 0;
-    var mean = 0;
-    for (var s = 0; s < samples.length; s++) mean += samples[s];
-    mean = samples.length ? Math.round((mean / samples.length) * 10) / 10 : 0;
-    console.log('event-loop latency: ' + CONCURRENCY + ' concurrent turns × ' +
-      CHUNKS + ' chunks, ' + elapsed + ' ms wall');
-    console.log('  samples=' + samples.length + ' mean=' + mean + ' ms p95=' + p95 +
-      ' ms max=' + maxLag + ' ms (budget ' + BUDGET_MS + ' ms)');
-    if (maxLag > BUDGET_MS) {
-      console.log('FAIL: the event loop was blocked for ' + maxLag + ' ms');
+  var concurrency = integer('SOFUU_LOOP_CONCURRENCY', 2, 1, 32);
+  var maxTokens = integer('SOFUU_LOOP_MAX_TOKENS', 24, 1, 256);
+  var budgetMs = integer('SOFUU_LOOP_BUDGET_MS', 16, 1, 60000);
+  var timeoutMs = integer('SOFUU_LOOP_TIMEOUT_MS', 120000, 1000, 600000);
+  var port = integer('SOFUU_LOOP_PORT', 20000 + Math.floor(Math.random() * 30000), 1024, 65535);
+  var sampleMs = 5;
+  var instance = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  var modelId = 'loop-bench-' + instance;
+  var token = 'loop-bench-' + instance;
+  var base = 'http://127.0.0.1:' + port;
+  var timer = null;
+
+  function errorText(error) {
+    return String(error && error.message || error);
+  }
+
+  function countTextFrames(body) {
+    var textFrames = 0;
+    var done = false;
+    var lines = body.split(/\r?\n/);
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i].slice(0, 5) !== 'data:') continue;
+      var data = lines[i].slice(5).trim();
+      if (data === '[DONE]') { done = true; continue; }
+      var frame;
+      try { frame = JSON.parse(data); }
+      catch (e) { throw new Error('invalid SSE JSON frame'); }
+      if (frame.error) throw new Error('server returned an inference error');
+      if (frame.model && frame.model !== modelId) throw new Error('response came from an unexpected model');
+      var choice = frame.choices && frame.choices[0];
+      if (choice && choice.delta && typeof choice.delta.content === 'string' && choice.delta.content.length) {
+        textFrames++;
+      }
+    }
+    if (!done || !textFrames) throw new Error('stream did not finish with model-generated text');
+    return textFrames;
+  }
+
+  async function main() {
+    try {
+      sofuu.serve.start({
+        modelPath: modelPath,
+        models: [{ id: modelId, path: modelPath }],
+        token: token,
+        host: '127.0.0.1',
+        port: port,
+        version: 'real-inference-benchmark',
+        brainPath: '',
+      });
+      // Listen is asynchronous; give it a turn before checking its identity.
+      await new Promise(function (resolve) { setTimeout(resolve, 100); });
+      var check = await sofuu.fetch(base + '/v1/models', {
+        headers: { authorization: 'Bearer ' + token }, timeoutMs: 5000, maxBodyBytes: 65536,
+      });
+      var listing = await check.json();
+      var found = listing && Array.isArray(listing.data) && listing.data.some(function (m) { return m.id === modelId; });
+      if (check.status !== 200 || !found) throw new Error('the benchmark server did not identify its configured model');
+
+      var body = JSON.stringify({
+        model: modelId,
+        messages: [{ role: 'user', content: 'Explain why reliable error messages help software developers in one sentence.' }],
+        stream: true,
+        max_tokens: maxTokens,
+        temperature: 0,
+      });
+      var samples = [];
+      var last = performance.now();
+      var started = last;
+      timer = setInterval(function () {
+        var now = performance.now();
+        samples.push(Math.max(0, now - last - sampleMs));
+        last = now;
+      }, sampleMs);
+      var jobs = [];
+      for (var i = 0; i < concurrency; i++) {
+        jobs.push(sofuu.fetch(base + '/v1/chat/completions', {
+          method: 'POST',
+          headers: { authorization: 'Bearer ' + token, 'content-type': 'application/json' },
+          body: body,
+          timeoutMs: timeoutMs,
+          maxBodyBytes: 1024 * 1024,
+        }).then(async function (response) {
+          var text = await response.text();
+          if (response.status !== 200) throw new Error('inference request returned HTTP ' + response.status);
+          return countTextFrames(text);
+        }));
+      }
+      var frames = await Promise.all(jobs);
+      var finished = performance.now();
+      // Include the final interval even if the loop was blocked until completion.
+      samples.push(Math.max(0, finished - last - sampleMs));
+      clearInterval(timer);
+      timer = null;
+      samples.sort(function (a, b) { return a - b; });
+      var total = samples.reduce(function (sum, value) { return sum + value; }, 0);
+      var p95 = samples[Math.max(0, Math.ceil(samples.length * 0.95) - 1)];
+      var max = samples[samples.length - 1];
+      var frameCount = frames.reduce(function (sum, value) { return sum + value; }, 0);
+      console.log('event-loop latency: real local inference over loopback HTTP');
+      console.log('  model=' + modelPath + ' platform=' + process.platform + '/' + process.arch +
+        ' concurrency=' + concurrency + ' max_tokens=' + maxTokens + ' temperature=0');
+      console.log('  wall_ms=' + (finished - started).toFixed(3) + ' text_frames=' + frameCount +
+        ' samples=' + samples.length + ' sample_interval_ms=' + sampleMs + ' clock=performance.now');
+      console.log('  mean_ms=' + (total / samples.length).toFixed(3) + ' p95_ms=' + p95.toFixed(3) +
+        ' max_ms=' + max.toFixed(3) + ' budget_ms=' + budgetMs);
+      if (max > budgetMs) {
+        console.error('FAIL: observed loop delay exceeded the configured budget');
+        process.exit(1);
+      }
+      console.log('PASS: all requests produced text and the observed delay stayed within budget');
+      process.exit(0);
+    } catch (error) {
+      if (timer !== null) clearInterval(timer);
+      console.error('FAIL: real inference benchmark did not complete: ' + errorText(error));
       process.exit(1);
     }
-    console.log('PASS: no turn blocked the loop beyond the ' + BUDGET_MS + ' ms ceiling');
-    process.exit(0);
-  }, function (e) {
-    clearInterval(timer);
-    console.log('FAIL: handler rejected: ' + String((e && e.message) || e));
-    process.exit(1);
-  });
+  }
+
+  main();
 })();

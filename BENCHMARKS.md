@@ -252,9 +252,19 @@ hyperfine --warmup 10 --runs 100 './sofuu eval "1+1"'
 # 4. Run the extreme cold-start characterization (~7k process launches)
 make cold-start-bench
 
-# 5. Run the concurrent serve event-loop ceiling (16 ms)
-make event-loop-check
+# 5. Measure event-loop delay during actual local inference over loopback HTTP.
+# Use an already-present compatible GGUF with weights; no model is downloaded.
+SOFUU_ALLOW_LOOPBACK=1 SOFUU_LOOP_MODEL=/absolute/path/to/model.gguf make event-loop-check
 
 # 6. Run the memory & vector doctor suite
 ./sofuu doctor
 ```
+
+The event-loop benchmark reports the model path, platform, concurrency, token
+limit, elapsed time, timer sample count and delay statistics. Its client and
+server share a process; measurements include model loading, inference,
+HTTP, client and garbage-collection work. The default budget is 16 ms, but a
+pass only describes the selected run and is not a physical real-time guarantee.
+Without a compatible local model or backend the gate is blocked or fails; it
+does not use a substitute stream. Older generated-stream measurements are not
+comparable to real-inference results.

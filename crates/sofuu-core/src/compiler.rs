@@ -1479,7 +1479,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
 (function() {{
     // A separately installed lean/custom base may be older than the compiler.
     // Do not let it execute this agent with the old fabricated-result host.
-    if (typeof sofuu === 'undefined' || !sofuu.kaze || sofuu.kaze.capabilityGate !== 'fail-closed-1') {{
+    if (typeof sofuu === 'undefined' || !sofuu.kaze || sofuu.kaze.capabilityGate !== 'fail-closed-1' || sofuu.kaze.embeddedBoundary !== 'fs-and-args-1') {{
         console.error('E_KAZE_RUNTIME: incompatible Kaze runtime; rebuild the Sofuu base binary');
         if (typeof process !== 'undefined' && process.exit) process.exit(1);
         return;

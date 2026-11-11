@@ -238,7 +238,7 @@ fn fs_contained(p: &std::path::Path, root: &str) -> bool {
 
 /// Resolve a JS path argument under the active root and the active POLICY.
 /// Err carries a THROWN JS value (the caller returns it verbatim).
-unsafe fn fs_path_arg(
+pub(crate) unsafe fn fs_path_arg(
     ctx: *mut JSContext,
     v: JSValueConst,
     label: &str,

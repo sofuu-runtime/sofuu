@@ -36,7 +36,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check cold-start-bench all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
+.PHONY: real-mcp-check real-memory-check real-kaze-memory-check kaze-js-boundary-check js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check cold-start-bench all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
 	kaze-drift-check kaze-drift-strict clippy-ratchet \
 	observability-stress asan fuzz-simd policy-dx modern-npm sbom sign-dist \
         deps scoreboard scoreboard-check cuda-check \
@@ -364,15 +364,29 @@ clean:
 # and for a single area:
 #   SOFUU_ALLOW_LOOPBACK=1 cargo test --release -p sofuu-core --lib rt::policy
 test-rust:
-	SOFUU_ALLOW_LOOPBACK=1 cargo test --release --all
+	@echo "BLOCKED: the full Rust suite includes scripted model execution; migrate or separate those tests before running it."
+	@exit 2
+
+# These targeted checks use real temporary resources. Set SOFUU_BIN to the
+# candidate under test; missing prerequisites are reported as blocked.
+real-mcp-check:
+	@python3 scripts/test-real-mcp-file.py
+
+real-memory-check:
+	@python3 scripts/test-real-memory.py
+
+real-kaze-memory-check:
+	@python3 scripts/test-kaze-memory-real.py "$(if $(SOFUU_BIN),$(SOFUU_BIN),target/debug/sofuu)"
+
+kaze-js-boundary-check:
+	@python3 scripts/test-kaze-js-boundaries.py "$(if $(SOFUU_BIN),$(SOFUU_BIN),target/debug/sofuu)"
 
 test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check
 	@echo ""
 	@echo "\033[1m=== Sofuu Test Suite ===\033[0m"
 	@echo ""
-	@if [ ! -f tests/run_js_tests.sh ]; then \
-		echo "\033[33m— tests/ is local-only (gitignored); nothing to run\033[0m"; \
-	else bash tests/run_js_tests.sh; fi
+	@echo "BLOCKED: the local JS suite contains non-robotics simulated providers; see ROADMAP.md for the unverified coverage."
+	@exit 2
 
 # The Kaze surface gate (PLAN-AUDIT-REMEDIATION §4 Task 2.1).
 # Two Kaze engines live in this tree and drifted silently once already, so this
@@ -410,10 +424,10 @@ kaze-drift-strict:
 clippy-ratchet:
 	@scripts/check-clippy-ratchet.sh
 
-# Stabilization Freeze Pass 3.1: concurrent serve turns must not block the
-# primary QuickJS+libuv loop beyond the 16 ms hard-realtime ceiling
-# (RULES.md §3.6). The inference seam is faked; the handler is the shipped
-# one. Knobs: SOFUU_LOOP_CONCURRENCY / _CHUNKS / _CHUNK_MS / _BUDGET_MS.
+# Real local inference through the HTTP server, with loop-delay sampling in
+# the same process. SOFUU_LOOP_MODEL must name an existing compatible GGUF;
+# missing prerequisites block the gate rather than substituting responses.
+# Knobs: SOFUU_LOOP_CONCURRENCY / _MAX_TOKENS / _BUDGET_MS / _TIMEOUT_MS / _PORT.
 event-loop-check: $(TARGET)
 	@$(TARGET) run scripts/bench/event_loop_latency.js
 
@@ -433,12 +447,11 @@ protocol-test: $(TARGET)
 		echo "\033[33m— tests/ is local-only (gitignored); nothing to run\033[0m"; \
 	else SOFUU=$(TARGET) tests/protocol_conformance_run.sh; fi
 
-# H1–H3 acceptance: drives sofuu.serve.createHandler() with a fake stream
-# (no model, no sockets) plus a doc↔code route check.
+# H1–H3's historical runner substitutes model streams. It is blocked until
+# its assertions are migrated to a real model or appropriate pure tests.
 serve-test: $(TARGET)
-	@if [ ! -x tests/serve_test_run.sh ]; then \
-		echo "\033[33m— tests/ is local-only (gitignored); nothing to run\033[0m"; \
-	else SOFUU=$(TARGET) tests/serve_test_run.sh; fi
+	@echo "BLOCKED: serve acceptance uses simulated model streams; migrate its assertions before running it."
+	@exit 2
 
 # ─── Cross-compilation (cargo + zig; local convenience) ────────────
 # Uses Zig as a zero-dependency cross-compiler (no Docker needed).
@@ -589,7 +602,8 @@ HEADLESS_SAMPLES := $(wildcard examples/headless/*.c)
 # .js → stale code ships with zero runtime signal (QTSQ Phase 6 guard).
 headless-test: libsofuu bc-check
 ifeq ($(strip $(HEADLESS_SAMPLES)),)
-	@echo "\033[33m— examples/ is local-only (gitignored); nothing to run\033[0m"
+	@echo "BLOCKED: headless examples are absent from this checkout (examples/ is ignored)."
+	@exit 2
 else
 	@echo ""
 	@echo "\033[1m=== Headless embedding test (H6) ===\033[0m"
@@ -612,22 +626,22 @@ else
 	@echo "\033[36m--- Run c_embed_vec against the library ---\033[0m"
 	@examples/headless/c_embed_vec
 	@echo ""
-	@echo "\033[36m--- Compile c_rlm.c against libsofuu ---\033[0m"
+	@echo "\033[36m--- Compile c_rlm.c against libsofuu (real endpoint required) ---\033[0m"
 	@cc examples/headless/c_rlm.c -Idist -Ldist -lsofuu -o examples/headless/c_rlm \
 		-Wl,-rpath,dist 2>&1 || \
 		(echo "\033[31m✗ Compile failed (c_rlm)\033[0m"; exit 1)
 	@echo "\033[32m✓ Compiled\033[0m"
 	@echo ""
-	@echo "\033[36m--- Run c_rlm against the library ---\033[0m"
+	@echo "\033[36m--- Run c_rlm against the configured real endpoint ---\033[0m"
 	@examples/headless/c_rlm
 	@echo ""
-	@echo "\033[36m--- Compile c_agent.c against libsofuu ---\033[0m"
+	@echo "\033[36m--- Compile c_agent.c against libsofuu (real endpoint required) ---\033[0m"
 	@cc examples/headless/c_agent.c -Idist -Ldist -lsofuu -o examples/headless/c_agent \
 		-Wl,-rpath,dist 2>&1 || \
 		(echo "\033[31m✗ Compile failed (c_agent)\033[0m"; exit 1)
 	@echo "\033[32m✓ Compiled\033[0m"
 	@echo ""
-	@echo "\033[36m--- Run c_agent against the library ---\033[0m"
+	@echo "\033[36m--- Run c_agent against the configured real endpoint ---\033[0m"
 	@examples/headless/c_agent
 	@echo ""
 	@echo "\033[36m--- Compile c_host_tool.c against libsofuu ---\033[0m"
@@ -639,13 +653,13 @@ else
 	@echo "\033[36m--- Run c_host_tool against the library (E2 host tools) ---\033[0m"
 	@examples/headless/c_host_tool
 	@echo ""
-	@echo "\033[36m--- Compile c_llm.c against libsofuu (real LLM, mock in CI) ---\033[0m"
+	@echo "\033[36m--- Compile c_llm.c against libsofuu (real endpoint required) ---\033[0m"
 	@cc examples/headless/c_llm.c -Idist -Ldist -lsofuu -o examples/headless/c_llm \
 		-Wl,-rpath,dist 2>&1 || \
 		(echo "\033[31m✗ Compile failed (c_llm)\033[0m"; exit 1)
 	@echo "\033[32m✓ Compiled\033[0m"
 	@echo ""
-	@echo "\033[36m--- Run c_llm against the library (no key → mock) ---\033[0m"
+	@echo "\033[36m--- Run c_llm against the configured real endpoint ---\033[0m"
 	@examples/headless/c_llm
 	@echo ""
 	@echo "\033[36m--- Compile c_soak.c against libsofuu (host-abuse soak) ---\033[0m"

@@ -36,7 +36,6 @@ make bc-check
 echo "==> [3/4] Verifying Binary Size Cap (<= 5.5 MiB)..."
 make size-check
 
-echo "==> [4/4] Running Core Subsystem Unit Tests..."
-cargo test -p sofuu-core --lib
-
-echo "🎉 All preflight invariants passed!"
+echo "==> [4/4] Core subsystem tests"
+echo "BLOCKED: the complete core suite includes scripted model execution; migrate or separate those tests before running it."
+exit 2

@@ -26,6 +26,9 @@ def main():
         (root / "pure.kaze").write_text("action main():\n    return 2 + 3\n")
         (root / "ai.kaze").write_text('needs: ai\naction main():\n    return ai.prompt("hello")\n')
         (root / "drone.kaze").write_text('needs: drone\naction main():\n    arm drone\n    return drone.telemetry("battery")\n')
+        (root / "bad-goto.kaze").write_text('needs: drone\naction main():\n    arm drone\n    takeoff to 15 meters\n    drone.goto(91, 0, 15)\n')
+        (root / "unknown-telemetry.kaze").write_text('needs: drone\naction main():\n    return drone.telemetry("unknown")\n')
+        (root / "mixed.kaze").write_text('needs: drone, ai\naction main():\n    arm drone\n    return ai.prompt("hello")\n')
         (root / "allow.json").write_text('{"tools":{"allow":["kaze.*"]}}')
         (root / "deny.json").write_text('{"tools":{"deny":["kaze.ai.*"]}}')
         (root / "invalid.json").write_text('{"tools":{"deny":[],"deny":[]}}')
@@ -55,6 +58,10 @@ def main():
         report = check_run("drone.kaze", ["--cap", "drone=sim", "--policy", "allow.json",
                                            "--sim", "battery=42"], result="41")
         assert report["simulated_families"] == ["drone"], report
+        physical_flags = ["--cap", "drone=sim", "--policy", "allow.json"]
+        check_run("bad-goto.kaze", physical_flags, "E_KAZE_RANGE")
+        check_run("unknown-telemetry.kaze", physical_flags, "E_CAP_MISSING")
+        check_run("mixed.kaze", physical_flags + ["--cap", "ai"], "E_CAP_MISSING")
 
         compiled = call(binary, "script", "compile", "ai.kaze", "-o", "ai.kazebc")
         assert compiled.returncode == 0, compiled.stderr

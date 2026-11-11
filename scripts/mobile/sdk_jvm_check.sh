@@ -19,6 +19,11 @@
 # Needs `make libsofuu` first (dist/libsofuu.{dylib,so}).
 set -euo pipefail
 
+# Check.kt currently substitutes a provider and camera results. Keep the
+# original assertions visible for migration; this is not device evidence.
+printf '%s\n' 'BLOCKED: JVM SDK harness uses simulated AI and host-tool results; real-execution replacement required.' >&2
+exit 2
+
 RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'; DIM=$'\033[2m'; RST=$'\033[0m'
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"

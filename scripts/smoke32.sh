@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# smoke32.sh — the P5 32-token tiny-model smoke: the committed 77 KB fixture
-# model must load and decode 32 tokens on ANY platform this runtime builds on.
-# Sub-30s, no network, no QTSQ (the fixture needs the engine, not the brain).
+# smoke32.sh — exercise local inference with an existing real-weight GGUF.
+# A maximum of 32 tokens is requested; the model may stop earlier. The
+# synthetic contract fixture is a format fixture, not an inference model.
 #
 # Usage: bash scripts/smoke32.sh [binary] [model]
 set -u
@@ -9,27 +9,30 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${1:-$ROOT/sofuu}"
 [ -x "$BIN" ] || BIN="$ROOT/target/release/sofuu"
-MODEL="${2:-$ROOT/contract/fixtures/sofuu-fixture.gguf}"
+MODEL="${2:-${SOFUU_CONTRACT_MODEL:-}}"
 
 if [ ! -x "$BIN" ]; then
     echo "FAIL smoke32: binary not found ($BIN)"; exit 1
 fi
-if [ ! -f "$MODEL" ]; then
-    echo "FAIL smoke32: fixture model not found ($MODEL)"; exit 1
+if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
+    echo "BLOCKED smoke32: supply an existing compatible real-weight GGUF as argument 2 or SOFUU_CONTRACT_MODEL"; exit 2
 fi
+case "$MODEL" in
+    */sofuu-fixture.gguf|sofuu-fixture.gguf)
+        echo "BLOCKED smoke32: the synthetic contract fixture is not real inference coverage"; exit 2 ;;
+esac
 
 OUT="$("$BIN" infer "$MODEL" "The quick brown fox" --max-tokens 32 2>&1)"
 rc=$?
 
 if [ $rc -ne 0 ]; then
-    echo "FAIL smoke32: infer exited $rc"; echo "$OUT" | tail -3; exit 1
+    echo "FAIL smoke32: infer exited $rc"; exit 1
 fi
 
-# The generated text after the header lines must be non-empty (tokens
-# decoded). The fixture is a real (if tiny) model: any string qualifies.
-TOKENS=$(printf '%s' "$OUT" | tail -c 400 | wc -c | awk '{print $1}')
-if [ "$TOKENS" -lt 10 ]; then
-    echo "FAIL smoke32: implausibly short output"; echo "$OUT" | tail -3; exit 1
+# The inference summary reports actual decoded tokens; banner and diagnostics
+# alone must not count as output. Do not print generated content in CI logs.
+if ! printf '%s\n' "$OUT" | grep -Eq 'decode: [1-9][0-9]* tk'; then
+    echo "FAIL smoke32: inference did not report any decoded tokens"; exit 1
 fi
 
-echo "OK  smoke32: 32 tokens from the fixture model on $(uname -s)-$(uname -m)"
+echo "OK  smoke32: real inference decoded at least one token (limit 32) on $(uname -s)-$(uname -m)"

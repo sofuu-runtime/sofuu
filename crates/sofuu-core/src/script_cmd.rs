@@ -33,10 +33,12 @@ pub fn print_help() {
          \x20 version              Print the Kaze language version\n\n\
          run options:\n\
          \x20 --cap <family>[=<device>]  Grant a family; drone=sim/rover=sim are tests\n\
+         \x20                       memory=ephemeral selects per-run CMA storage\n\
          \x20 --policy <file>        Operator R7 policy with tools.allow or tools.deny\n\
          \x20 --pin <name>=<line>  Configure a device pin (live devices disabled)\n\
          \x20 --entry <name>         Routine to run (default: main, or the only one)\n\
          \x20 --arg <name>=<json>    Bind a parameter (repeatable)\n\
+         \x20 --config <file>        Load routine arguments from a JSON file\n\
          \x20 --fuel <n>             Instruction budget (default 200000)\n\
          \x20 --heap-kb <n>          Budget for lists and records in KiB (default 4096)\n\
          \x20 --ticks <n>            Supervisor ticks after the entry (default 0)\n\
@@ -58,8 +60,10 @@ fn print_subcommand_help(sub: &str) {
              Check, compile and run one script in the shared VM.\n\n\
              Options:\n\
              \x20 --cap <family>[=<device>]  Grant a family; drone=sim/rover=sim are tests\n\
+             \x20                            memory=ephemeral selects per-run CMA\n\
              \x20 --entry <name>             Routine to run (default: main)\n\
              \x20 --arg <name>=<json>        Bind a parameter (repeatable)\n\
+             \x20 --config <file>            Load routine arguments from JSON\n\
              \x20 --fuel <n>                 Instruction budget (default 200000)\n\
              \x20 --heap-kb <n>              List/record budget in KiB (default 4096)\n\
              \x20 --ticks <n> --tick-ms <n>  Supervisor ticks after the entry\n\
@@ -100,6 +104,7 @@ struct Flags {
     /// `device -> pin` from `--pin` (Kaze v0.2 GPIO).
     pins: Vec<(String, u16)>,
     entry: Option<String>,
+    config_file: Option<String>,
     args: serde_json::Map<String, serde_json::Value>,
     fuel: Option<u64>,
     heap_kb: Option<u64>,
@@ -126,6 +131,7 @@ fn parse_flags(argv: &[String]) -> Result<Flags, String> {
         backend: Vec::new(),
         pins: Vec::new(),
         entry: None,
+        config_file: None,
         args: serde_json::Map::new(),
         fuel: None,
         heap_kb: None,
@@ -178,6 +184,11 @@ fn parse_flags(argv: &[String]) -> Result<Flags, String> {
                 f.pins.push((name.trim().to_string(), pin));
             }
             "--entry" => f.entry = Some(next("--entry")?),
+            "--config" | "-c" => {
+                let path = next("--config")?;
+                if path.is_empty() { return Err("--config needs a file path".into()); }
+                f.config_file = Some(path);
+            }
             "--arg" => {
                 let v = next("--arg")?;
                 let (k, raw) = v
@@ -217,6 +228,11 @@ fn parse_flags(argv: &[String]) -> Result<Flags, String> {
                     return Err("--policy= needs a file path".to_string());
                 }
                 f.policy_file = Some(v);
+            }
+            other if other.starts_with("--config=") => {
+                let path = other.trim_start_matches("--config=");
+                if path.is_empty() { return Err("--config= needs a file path".into()); }
+                f.config_file = Some(path.to_string());
             }
             other => f.positional.push(other.to_string()),
         }
@@ -317,6 +333,8 @@ fn options_from(f: &Flags) -> Result<RunOptions, OptErr> {
     Ok(RunOptions {
         entry: f.entry.clone(),
         args,
+        ambient_args: true,
+        config_path: f.config_file.clone(),
         grants: f.caps.clone(),
         fuel: f.fuel.unwrap_or(sfs::vm::Limits::default().fuel),
         heap_bytes: f
@@ -327,6 +345,7 @@ fn options_from(f: &Flags) -> Result<RunOptions, OptErr> {
         tick_ms: f.tick_ms.unwrap_or(100),
         sim,
         policy: policy_layer(f)?,
+        runtime_policy: None,
         backend: f.backend.clone(),
         pins: f.pins.clone(),
     })
@@ -379,7 +398,7 @@ fn requested_json(argv: &[String]) -> bool {
         if argv[i] == "--json" { return true; }
         if matches!(argv[i].as_str(), "--cap" | "--pin" | "--entry" | "--arg" |
             "--fuel" | "--heap-kb" | "--ticks" | "--tick-ms" | "--sim" |
-            "--out" | "-o" | "--policy") { i += 1; }
+            "--out" | "-o" | "--policy" | "--config" | "-c") { i += 1; }
         i += 1;
     }
     false

@@ -13,7 +13,9 @@
 #   CONTRACT_HTTP_URL=http://127.0.0.1:8080 \
 #   CONTRACT_LIBSOFUU=dist/libsofuu.dylib \
 #   SOFUU_BIN=target/release/sofuu \
+#   SOFUU_CONTRACT_MODEL=/path/to/existing/real-model.gguf \
 #     bash scripts/contract/run_contract_tests.sh
+#   SOFUU_CONTRACT_CASES=/absolute/path/to/cases.tsv  # optional subset
 #
 # No dependency beyond bash, grep, tail. Cases never mutate the repository.
 
@@ -30,7 +32,7 @@ if [ -n "$CONTRACT_TMP" ]; then
     trap 'rm -rf "$CONTRACT_TMP"' EXIT INT TERM
 fi
 GIT_BEFORE="$(cd "$ROOT" && git status --porcelain 2>/dev/null | sort)"
-CASES="$ROOT/scripts/contract/cases.tsv"
+CASES="${SOFUU_CONTRACT_CASES:-$ROOT/scripts/contract/cases.tsv}"
 SOFUU="${SOFUU_BIN:-$ROOT/sofuu}"
 HTTP_URL="${CONTRACT_HTTP_URL:-}"
 if [ -z "${CONTRACT_LIBSOFUU:-}" ]; then
@@ -49,7 +51,7 @@ if [ ! -f "$CASES" ]; then
     exit 2
 fi
 
-pass=0; fail=0; blocked=0
+pass=0; fail=0; blocked=0; real_execution_blocked=0
 declare -a failures=() blockers=()
 
 report_pass()  { pass=$((pass + 1));  printf 'PASS     %-6s %s\n' "$1" "$2"; }
@@ -100,6 +102,11 @@ run_cli_case() {
     # its checks to the captured stream; keep a short tail in the FAIL line so
     # the CI gate's report is diagnosable without a local rerun.
     out_tail="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 6 | tr '\n' '~' | cut -c1-400)"
+    if [ "$code" -eq 2 ] && printf '%s\n' "$out" | grep -q 'BLOCKED:'; then
+        report_block "$id" "$out_tail"
+        real_execution_blocked=$((real_execution_blocked + 1))
+        return
+    fi
     case "$expect" in
         exit:*)
             if [ "$code" = "${expect#exit:}" ]; then report_pass "$id" "exit $code"
@@ -192,6 +199,15 @@ run_cabi_case() {
 while IFS='|' read -r id rule clause kind envspec cmd expect prereq; do
     [ -z "${id:-}" ] && continue
     case "$id" in \#*) continue ;; esac
+    # Preserve these cases and their assertions in cases.tsv while preventing
+    # the aggregate runner from executing scripted providers or synthetic
+    # model inference. Each needs a real-resource replacement or a pure test.
+    case "$id" in
+        T2.2|T2.3|T2.4|T2.5|T2.6|T3.3|T3.5|T5.6|T6.1|T6.4|T6.5|T6.7|T7.3|T7.4|T7.8)
+            report_block "$id" "real execution replacement required; legacy assertions retained in cases.tsv"
+            real_execution_blocked=$((real_execution_blocked + 1))
+            continue ;;
+    esac
     case "$kind" in
         file)   run_file_case "$cmd" "$expect" ;;
         js)     run_js_case "$envspec" "$cmd" "$expect" ;;
@@ -216,6 +232,11 @@ if [ "$blocked" -gt 0 ]; then
 fi
 if [ "$fail" -gt 0 ]; then
     echo "contract suite FAILED ($fail failure(s))"
+    exit 1
+fi
+
+if [ "$real_execution_blocked" -gt 0 ]; then
+    echo "contract suite NOT green: $real_execution_blocked real-execution coverage gap(s) cannot be waived with ALLOW_BLOCKED"
     exit 1
 fi
 

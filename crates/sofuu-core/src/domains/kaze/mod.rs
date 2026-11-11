@@ -120,6 +120,21 @@ mod fail_closed_tests {
             assert!(opts_from_json(Some(invalid)).is_err());
         }
     }
+
+    #[test]
+    fn argument_conversion_refuses_text_that_exceeds_the_arena() {
+        let mut arena = arena::Arena::new(4);
+        let mut heap = value::Heap::new(1024);
+        assert!(json_to_value(&json!("too long"), &mut arena, &mut heap).is_err());
+
+        let mut arena = arena::Arena::new(4);
+        let mut heap = value::Heap::new(1024);
+        assert!(json_to_value(&json!({"too long": true}), &mut arena, &mut heap).is_err());
+
+        let mut arena = arena::Arena::new(4);
+        let mut heap = value::Heap::new(1024);
+        assert!(json_to_value(&json!(["ok", "long"]), &mut arena, &mut heap).is_err());
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +334,11 @@ pub struct RunOptions {
     /// Item to run first. Default: `main`, else the only routine in the file.
     pub entry: Option<String>,
     pub args: serde_json::Map<String, serde_json::Value>,
+    /// CLI-owned configuration and environment argument layers. Embedded JS
+    /// callers provide their arguments explicitly and must not inherit them.
+    pub ambient_args: bool,
+    /// CLI-selected parameter file; `None` uses the optional default file.
+    pub config_path: Option<String>,
     /// Capability families the host grants a backend for (`drone=sim` → "drone").
     pub grants: Vec<String>,
     pub fuel: u64,
@@ -331,6 +351,9 @@ pub struct RunOptions {
     pub sim: SimState,
     /// R7 policy layered over the capability gate. `None` denies capability calls.
     pub policy: Option<serde_json::Value>,
+    /// Additional host policy, evaluated as a separate restriction for each
+    /// capability; an embedded caller cannot broaden it with `policy`.
+    pub runtime_policy: Option<serde_json::Value>,
     /// `device name -> GPIO line` (`--pin fan=17`). Non-empty puts the real
     /// pins behind the `device` family (Kaze v0.2, P-K1).
     pub pins: Vec<(String, u16)>,
@@ -345,6 +368,8 @@ impl Default for RunOptions {
         RunOptions {
             entry: None,
             args: serde_json::Map::new(),
+            ambient_args: true,
+            config_path: None,
             grants: Vec::new(),
             fuel: Limits::default().fuel,
             heap_bytes: value::Heap::DEFAULT_LIMIT,
@@ -352,6 +377,7 @@ impl Default for RunOptions {
             tick_ms: 100,
             sim: SimState::default(),
             policy: None,
+            runtime_policy: None,
             backend: Vec::new(),
             pins: Vec::new(),
         }
@@ -445,18 +471,31 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
     // its own hardware policy. Keep those paths unavailable until the caller's
     // policy and physical safety checks are propagated and verified.
     let mut blocked_live: Vec<String> = opts.backend.iter()
-        .filter(|(_, backend)| !backend.is_empty() && backend != "sim")
+        .filter(|(family, backend)| matches!(caps::family_of(family), "drone" | "rover" | "sensor" | "device")
+            && !backend.is_empty() && backend != "sim")
         .map(|(family, _)| caps::family_of(family).to_string())
         .collect();
     if !opts.pins.is_empty() {
         blocked_live.push("device".to_string());
     }
-    let mut host: Box<dyn CapHost> = Box::new(SimHost::with_configuration(
+    let base_host = SimHost::with_configuration(
         opts.sim.clone(), simulated_families.clone(), blocked_live,
-    ));
+    );
+    let use_ephemeral_memory = opts.backend.iter().any(|(family, backend)|
+        caps::family_of(family) == "memory" && backend == "ephemeral");
+    let mut host: Box<dyn CapHost> = if use_ephemeral_memory {
+        Box::new(crate::rt::kaze_memory::EphemeralMemoryHost::new(base_host))
+    } else {
+        Box::new(base_host)
+    };
     let limits = Limits { fuel: opts.fuel.max(1), heap_bytes: opts.heap_bytes, ..Limits::default() };
 
     let entry = resolve_entry(&module, opts)?;
+    if entry.is_none() {
+        // Hooks-only programs have no entry parameters, but an explicitly
+        // selected or malformed default config must still fail before hooks.
+        layered_args(opts, &[])?;
+    }
 
     let mut report = RunReport {
         entry: entry.clone().unwrap_or_default(),
@@ -472,12 +511,13 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
 
     {
         let mut vm = Vm::new(&module, &mut *host, &declared, &opts.grants, opts.policy.as_ref(), limits);
+        vm.set_runtime_policy(opts.runtime_policy.as_ref());
 
         if let Some(name) = &entry {
             let item = module
                 .item(name)
                 .ok_or_else(|| KazeError::new("E_KAZE_ENTRY", format!("there is no '{}' in this script", name)))?;
-            let merged = layered_args(opts, item.params.as_slice());
+            let merged = layered_args(opts, item.params.as_slice())?;
             let args = bind_args(item.params.as_slice(), &merged, &mut vm)
                 .map_err(|e| KazeError::new(&e.code, format!("{}: {}", prepared.name, e.message)))?;
             let value = vm
@@ -616,27 +656,34 @@ fn missing_param_message(missing: &[&String]) -> String {
 /// then AGENT_<NAME> / SOFUU_<NAME>, then the CLI arguments already parsed into
 /// opts.args (CP-037, KZ-035).
 ///
-/// The file tier is read fresh on every run and never required: a missing or
-/// malformed agent.config.json is simply no config, because the CLI already
-/// said what it wanted.
+/// The default file is optional; explicitly selected files and malformed or
+/// unreadable existing files fail instead of silently changing configuration.
 fn layered_args(
     opts: &RunOptions,
     params: &[String],
-) -> serde_json::Map<String, serde_json::Value> {
+) -> Result<serde_json::Map<String, serde_json::Value>, KazeError> {
+    if !opts.ambient_args {
+        return Ok(opts.args.clone());
+    }
     let mut out = serde_json::Map::new();
-    if let Ok(text) = std::fs::read_to_string("agent.config.json") {
-        if let Ok(serde_json::Value::Object(mut cfg)) = serde_json::from_str::<serde_json::Value>(&text) {
-            let nested = cfg.remove("args");
-            let source = match nested {
-                Some(v) if v.is_object() => v,
-                _ => serde_json::Value::Object(cfg),
+    let config_path = opts.config_path.as_deref().unwrap_or("agent.config.json");
+    match std::fs::read_to_string(config_path) {
+        Ok(text) => {
+            let parsed: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|e| KazeError::new("E_KAZE_ARGS", format!("invalid configuration '{}': {}", config_path, e)))?;
+            let mut cfg = parsed.as_object().cloned()
+                .ok_or_else(|| KazeError::new("E_KAZE_ARGS", format!("configuration '{}' must be an object", config_path)))?;
+            let map = match cfg.remove("args") {
+                Some(serde_json::Value::Object(args)) => args,
+                Some(_) => return Err(KazeError::new("E_KAZE_ARGS", format!("configuration '{}' args must be an object", config_path))),
+                None => cfg,
             };
-            if let serde_json::Value::Object(map) = source {
-                for (k, v) in map {
-                    out.insert(k, v);
-                }
+            for (k, v) in map {
+                out.insert(k, v);
             }
         }
+        Err(e) if opts.config_path.is_none() && e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(KazeError::new("E_KAZE_IO", format!("cannot read configuration '{}': {}", config_path, e))),
     }
     for p in params {
         let env_name = p.to_ascii_uppercase().replace('-', "_");
@@ -649,13 +696,21 @@ fn layered_args(
             }
         }
     }
+    // CLI positionals are in opts.args under numeric keys. Resolve them to
+    // parameter names before overlaying named CLI arguments, so neither the
+    // environment nor config file can shadow a positional value.
+    for (i, p) in params.iter().enumerate() {
+        if let Some(v) = opts.args.get(&i.to_string()) {
+            out.insert(p.clone(), v.clone());
+        }
+    }
     for (k, v) in &opts.args {
         out.insert(k.clone(), v.clone());
     }
-    out
+    Ok(out)
 }
 
-fn json_to_value(
+pub(crate) fn json_to_value(
     j: &serde_json::Value,
     arena: &mut arena::Arena,
     heap: &mut value::Heap,
@@ -664,11 +719,9 @@ fn json_to_value(
     Ok(match j {
         J::Null => value::Value::Unit,
         J::Bool(b) => value::Value::Bool(*b),
-        J::Number(n) => value::Value::Num(n.as_f64().unwrap_or(0.0)),
-        J::String(s) => match arena.alloc(s) {
-            Ok(r) => value::Value::Str(r),
-            Err(_) => value::Value::Unit,
-        },
+        J::Number(n) => value::Value::Num(n.as_f64().filter(|v| v.is_finite())
+            .ok_or_else(|| "number cannot be represented as a finite Kaze value".to_string())?),
+        J::String(s) => value::Value::Str(arena.alloc(s)?),
         J::Array(items) => {
             let mut vals = Vec::with_capacity(items.len());
             for i in items {
@@ -679,10 +732,7 @@ fn json_to_value(
         J::Object(map) => {
             let mut entries = Vec::with_capacity(map.len());
             for (k, v) in map {
-                let key = match arena.alloc(k) {
-                    Ok(r) => value::Value::Str(r),
-                    Err(_) => value::Value::Unit,
-                };
+                let key = value::Value::Str(arena.alloc(k)?);
                 entries.push((key, json_to_value(v, arena, heap)?));
             }
             heap.push_map(entries)?
@@ -726,11 +776,41 @@ unsafe fn js_json(ctx: *mut JSContext, v: JSValueConst) -> Option<serde_json::Va
 }
 
 /// A script argument is a path, or the script itself when it holds a newline.
-fn source_of(text: &str) -> Result<(String, String), KazeError> {
-    let looks_like_path = !text.contains('\n')
-        && (text.ends_with(".kaze") || text.ends_with(".kz") || std::path::Path::new(text).exists());
-    if looks_like_path {
-        let src = read_source(text)?;
+unsafe fn js_source_of(ctx: *mut JSContext, input: JSValueConst, text: &str) -> Result<(String, String), KazeError> {
+    if text.contains('\n') {
+        return Ok((text.to_string(), "<inline>".to_string()));
+    }
+    let named_script = text.ends_with(".kaze") || text.ends_with(".kz");
+    // Resolve with the same native root and active filesystem policy used by
+    // sofuu.fs before checking existence or opening an embedded script path.
+    let path = match crate::rt::fs::fs_path_arg(ctx, input, "kaze", crate::rt::policy::FsKind::Read) {
+        Ok(path) => path,
+        Err(_) => {
+            // fs_path_arg throws; this API returns a structured report instead.
+            let exception = qjs::JS_GetException(ctx);
+            let code_value = qjs::sofuu_js_get_property_str(ctx, exception, c"code".as_ptr());
+            let code_text = js_text(ctx, code_value);
+            qjs::sofuu_js_free_value(ctx, code_value);
+            let message_value = qjs::sofuu_js_get_property_str(ctx, exception, c"message".as_ptr());
+            let message = js_text(ctx, message_value);
+            qjs::sofuu_js_free_value(ctx, message_value);
+            qjs::sofuu_js_free_value(ctx, exception);
+            // One-line inline source remains usable even when file reads are
+            // forbidden. It never causes a stat or open on this branch.
+            if !named_script && text.chars().any(char::is_whitespace) {
+                return Ok((text.to_string(), "<inline>".to_string()));
+            }
+            let code = match code_text.as_str() {
+                "E_PATH_OUTSIDE" => "E_PATH_OUTSIDE",
+                "E_PERMISSION_DENIED" => "E_PERMISSION_DENIED",
+                _ => "E_CAP_DENIED",
+            };
+            return Err(KazeError::new(code, format!("script file access denied: {message}")));
+        }
+    };
+    let resolved = path.to_string_lossy();
+    if named_script || std::path::Path::new(resolved.as_ref()).exists() {
+        let src = read_source(resolved.as_ref())?;
         Ok((src, text.to_string()))
     } else {
         Ok((text.to_string(), "<inline>".to_string()))
@@ -790,8 +870,13 @@ fn error_to_js(ctx: *mut JSContext, err: &KazeError) -> JSValue {
         set_bool(ctx, obj, c"ok", false);
         set_str(ctx, obj, c"code", &err.code);
         set_str(ctx, obj, c"error", &err.message);
-        let diagnostic = err.diagnostic(None).to_json().to_string();
-        let value = qjs::JS_ParseJSON(ctx, diagnostic.as_ptr().cast(), diagnostic.len(), c"<kaze-diagnostic>".as_ptr());
+        let mut diagnostic = err.diagnostic(None).to_json().to_string();
+        let len = diagnostic.len();
+        // QuickJS requires a NUL at buf[len], even though len is explicit.
+        // A bare Rust String can leave unrelated bytes there, turning valid
+        // diagnostics into an intermittent parse exception.
+        diagnostic.push('\0');
+        let value = qjs::JS_ParseJSON(ctx, diagnostic.as_ptr().cast(), len, c"<kaze-diagnostic>".as_ptr());
         if qjs::is_exception(value) {
             qjs::sofuu_js_free_value(ctx, obj);
             return value;
@@ -947,10 +1032,10 @@ unsafe extern "C" fn js_sfs_run(
             return error_to_js(ctx, &err);
         }
         let text = js_text(ctx, *argv);
-        let args = if argc > 1 {
+        let args = if argc > 1 && !qjs::is_undefined(*argv.add(1)) && !qjs::is_null(*argv.add(1)) {
             match js_json(ctx, *argv.add(1)) {
                 Some(serde_json::Value::Object(m)) => m,
-                _ => serde_json::Map::new(),
+                _ => return error_to_js(ctx, &KazeError::new("E_KAZE_ARGS", "routine arguments must be a JSON-compatible object")),
             }
         } else {
             serde_json::Map::new()
@@ -966,8 +1051,10 @@ unsafe extern "C" fn js_sfs_run(
             Err(err) => return error_to_js(ctx, &err),
         };
         opts.args = args;
+        opts.ambient_args = false;
+        opts.runtime_policy = Some(crate::rt::policy::policy_json(ctx));
 
-        let result = source_of(&text).and_then(|(src, name)| run_source(&src, &name, &opts));
+        let result = js_source_of(ctx, *argv, &text).and_then(|(src, name)| run_source(&src, &name, &opts));
         match result {
             Ok(report) => report_to_js(ctx, &report),
             Err(err) => error_to_js(ctx, &err),
@@ -987,7 +1074,7 @@ unsafe extern "C" fn js_sfs_check(
             return error_to_js(ctx, &err);
         }
         let text = js_text(ctx, *argv);
-        let result = source_of(&text).and_then(|(src, name)| check_source(&src, &name));
+        let result = js_source_of(ctx, *argv, &text).and_then(|(src, name)| check_source(&src, &name));
         match result {
             Ok(()) => {
                 let obj = qjs::sofuu_js_new_object(ctx);
@@ -1011,7 +1098,7 @@ unsafe extern "C" fn js_sfs_compile(
             return error_to_js(ctx, &err);
         }
         let text = js_text(ctx, *argv);
-        let result = source_of(&text).and_then(|(src, name)| prepare(&src, &name));
+        let result = js_source_of(ctx, *argv, &text).and_then(|(src, name)| prepare(&src, &name));
         match result {
             Ok(prepared) => {
                 let bytes = isa::serialize(&prepared.module);
@@ -1057,6 +1144,8 @@ pub unsafe fn mod_sfs_register(ctx: *mut JSContext) {
         qjs::sofuu_js_set_property_str(ctx, ns, c"version".as_ptr(), version);
         let gate = qjs::sofuu_js_new_string(ctx, c"fail-closed-1".as_ptr());
         qjs::sofuu_js_set_property_str(ctx, ns, c"capabilityGate".as_ptr(), gate);
+        let boundary = qjs::sofuu_js_new_string(ctx, c"fs-and-args-1".as_ptr());
+        qjs::sofuu_js_set_property_str(ctx, ns, c"embeddedBoundary".as_ptr(), boundary);
         qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"sfs".as_ptr(), qjs::sofuu_js_dup_value(ctx, ns));
         qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"kaze".as_ptr(), ns);
         qjs::sofuu_js_free_value(ctx, sofuu_obj);

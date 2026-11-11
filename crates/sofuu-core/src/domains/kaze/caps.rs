@@ -372,20 +372,18 @@ impl CapHost for SimHost {
             }
             ("drone", "goto") => {
                 if !self.state.on_ground {
-                    if let Some(Value::Map(m)) = args.first() {
-                        if let Some(lat) = heap.map_get(*m, Value::Num(0.0), arena) {
-                            self.state.lat = lat.as_num().unwrap_or(self.state.lat);
-                        }
-                    } else if let Some(n) = args.first().and_then(|v| v.as_num()) {
-                        self.state.lat = n;
-                    }
-                    if args.len() >= 3 {
-                        // The capability's own signature: goto(lat, lon, alt).
-                        self.state.lon = num_at(args, 1, self.state.lon);
-                        self.state.altitude_m = num_at(args, 2, self.state.altitude_m);
-                    } else if args.len() > 1 {
-                        self.state.altitude_m = num_at(args, 1, self.state.altitude_m);
-                    }
+                    let number = |idx: usize| args.get(idx).and_then(Value::as_num)
+                        .filter(|n| n.is_finite())
+                        .ok_or_else(|| format!("E_KAZE_RANGE: drone.goto requires finite numeric argument {}", idx + 1));
+                    let lat = number(0)?;
+                    let (lon, alt) = if args.len() >= 3 {
+                        (number(1)?, number(2)?)
+                    } else {
+                        (self.state.lon, number(1)?)
+                    };
+                    self.state.lat = lat;
+                    self.state.lon = lon;
+                    self.state.altitude_m = alt;
                     self.state.drain(1.0);
                     Ok(Value::Unit)
                 } else {

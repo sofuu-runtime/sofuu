@@ -66,6 +66,7 @@ pub struct Vm<'a> {
     declared: &'a [String],
     grants: &'a [String],
     policy: Option<&'a serde_json::Value>,
+    runtime_policy: Option<&'a serde_json::Value>,
     fuel_left: u64,
     pub fuel_used: u64,
     pub instructions: u64,
@@ -94,6 +95,7 @@ impl<'a> Vm<'a> {
             declared,
             grants,
             policy,
+            runtime_policy: None,
             fuel_left: limits.fuel,
             fuel_used: 0,
             instructions: 0,
@@ -101,6 +103,12 @@ impl<'a> Vm<'a> {
             locals: Vec::new(),
             verdict: None,
         }
+    }
+
+    /// Add the embedding runtime's restrictions without replacing the
+    /// Kaze-specific policy required for every capability call.
+    pub fn set_runtime_policy(&mut self, policy: Option<&'a serde_json::Value>) {
+        self.runtime_policy = policy;
     }
 
     /// Run one item to completion. `args` bind to `item.params` by position.
@@ -594,6 +602,10 @@ impl<'a> Vm<'a> {
             &cap.op,
         )
         .map_err(|d| VmError { code: d.code, msg: format!("{} ({})", d.reason, d.rule), line })?;
+        if let Some(policy) = self.runtime_policy {
+            crate::rt::hardware::authorise_runtime_policy(policy, &cap.family, &cap.op)
+                .map_err(|d| VmError { code: d.code, msg: format!("{} ({})", d.reason, d.rule), line })?;
+        }
         crate::rt::hardware::validate_arguments(&cap.family, &cap.op, &args, &self.arena)
             .map_err(|d| VmError { code: d.code, msg: format!("{} ({})", d.reason, d.rule), line })?;
 
@@ -637,6 +649,7 @@ const HOST_CODES: &[&str] = &[
     "E_CAP_MISSING",
     "E_CAP_DENIED",
     "E_KAZE_MEMORY",
+    "E_KAZE_RANGE",
     "E_KAZE_LINK",
     "E_KAZE_LINK_TIMEOUT",
     "E_COMMAND_REJECTED",

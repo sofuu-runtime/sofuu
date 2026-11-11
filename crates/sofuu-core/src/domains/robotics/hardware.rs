@@ -50,10 +50,9 @@ impl Denial {
 
 /// The backend names a `--cap <family>=<backend>` grant may carry.
 ///
-/// `sim` is an explicit drone/rover test simulator, `real` asks for the
-/// family's live hardware, `mavlink` for its MAVLink link. Anything else is a
-/// typo — and a typo used to be accepted at grant time, with the simulator
-/// answering every call behind a backend nobody implemented (RB-08).
+/// `sim` is an explicit drone/rover test simulator, `real` asks for live
+/// hardware, and `mavlink` for a MAVLink link. `memory=ephemeral` explicitly
+/// selects Kaze's per-run in-memory CMA; it is validated separately below.
 pub const BACKENDS: &[&str] = &["sim", "real", "mavlink"];
 
 /// The live backends a family actually has. A family missing from this table
@@ -97,6 +96,9 @@ pub fn validate_grant(family: &str, backend: &str) -> Result<(), Denial> {
         return Ok(());
     }
     let fam = crate::sfs::caps::family_of(family);
+    if fam == "memory" && name == "ephemeral" {
+        return Ok(());
+    }
     if name == "sim" {
         return if matches!(fam, "drone" | "rover") {
             Ok(())
@@ -127,7 +129,7 @@ pub fn validate_grant(family: &str, backend: &str) -> Result<(), Denial> {
         "E_CAP_INVALID",
         "H-2/backend",
         format!(
-            "'{}' is not a capability backend: a grant names sim, real or mavlink (a drone may also name udp:HOST:PORT, udpout:HOST:PORT or uart:PATH@BAUD)",
+            "'{}' is not a capability backend: choose an applicable sim, real, mavlink or memory=ephemeral backend (a drone may also name udp:HOST:PORT, udpout:HOST:PORT or uart:PATH@BAUD)",
             name
         ),
     ))
@@ -230,6 +232,17 @@ pub fn evaluate_verdict(decision: &serde_json::Value, family: &str, op: &str) ->
     }
 }
 
+/// Apply the embedding runtime's policy as an additional restriction. The
+/// host policy follows ordinary R7 defaults; it cannot replace the explicit
+/// Kaze policy, which has already passed `authorise` above.
+pub fn authorise_runtime_policy(policy: &Json, family: &str, op: &str) -> Result<(), Denial> {
+    crate::rt::policy::validate_policy(policy).map_err(|e| Denial::new(
+        "E_CAP_DENIED", "H-3/policy", format!("invalid runtime policy: {}", e)
+    ))?;
+    let req = json!({ "op": "tool.run", "tool": format!("kaze.{}.{}", family, op) });
+    evaluate_verdict(&crate::rt::policy::evaluate(&req, policy), family, op)
+}
+
 fn num_arg(args: &[Value], idx: usize) -> Option<f64> {
     args.get(idx).and_then(|v| v.as_num())
 }
@@ -271,8 +284,14 @@ pub fn validate_arguments(family: &str, op: &str, args: &[Value], _arena: &Arena
     match (family, op) {
         ("drone", "takeoff") => range(family, op, 0, args, 0.0, 500.0, "meters")?,
         ("drone", "goto") => {
-            // goto(lat, lon, alt) -> altitude at index 2 (sfs/caps.rs:357)
-            // goto(lat, alt)      -> altitude at index 1 (fly to X at Y)
+            // A position target needs valid coordinates as well as altitude.
+            // Until structured waypoints have a validated contract, refusing
+            // them is safer than using the previous or a default position.
+            range(family, op, 0, args, -90.0, 90.0, "latitude degrees")?;
+            if args.len() >= 3 {
+                range(family, op, 1, args, -180.0, 180.0, "longitude degrees")?;
+            }
+            // goto(lat, lon, alt) uses index 2; goto(lat, alt) uses index 1.
             let idx = if args.len() >= 3 { 2 } else { 1 };
             range(family, op, idx, args, 0.0, 500.0, "meters")?
         }
@@ -378,6 +397,23 @@ mod tests {
         let d = validate_arguments("drone", "goto", &[Value::Num(52.1), Value::Num(4.1), Value::Num(900.0)], &a).unwrap_err();
         assert_eq!(d.code, "E_KAZE_RANGE");
         assert_eq!(d.rule, "H-4/range");
+    }
+
+    #[test]
+    fn goto_rejects_invalid_or_missing_coordinates() {
+        let a = Arena::new(1024);
+        for args in [
+            vec![Value::Num(91.0), Value::Num(0.0), Value::Num(15.0)],
+            vec![Value::Num(-91.0), Value::Num(0.0), Value::Num(15.0)],
+            vec![Value::Num(0.0), Value::Num(181.0), Value::Num(15.0)],
+            vec![Value::Num(0.0), Value::Num(-181.0), Value::Num(15.0)],
+            vec![Value::Unit, Value::Num(15.0)],
+            vec![Value::Num(0.0), Value::Unit, Value::Num(15.0)],
+            vec![Value::Num(f64::NAN), Value::Num(15.0)],
+        ] {
+            assert_eq!(validate_arguments("drone", "goto", &args, &a).unwrap_err().code, "E_KAZE_RANGE");
+        }
+        assert!(validate_arguments("drone", "goto", &[Value::Num(-90.0), Value::Num(180.0), Value::Num(15.0)], &a).is_ok());
     }
 
     #[test]

@@ -33,17 +33,33 @@ or policy. Malformed policy and duplicate JSON keys are refused.
 
 `sofuu.kaze.run` and its `sofuu.sfs.run` alias accept `grants` or `caps`,
 `policy` or strict `policyJson`, and optional backend, pin and simulation
-settings. Compiled Kaze agents accept `--cap`, `--policy`, `--pin`, and
+settings. Capability calls must also pass the embedding runtime's active policy;
+the Kaze options cannot override a host denial or approval requirement. Script
+files passed to `run`, `check` or `compile` use the runtime filesystem policy
+and native root. JS callers supply routine arguments explicitly; they do not
+implicitly read `agent.config.json` or environment variables.
+
+For `sofuu script run`, named `--arg` and positional values take precedence
+over environment variables and the optional default `agent.config.json`.
+`--config <file>` selects another JSON configuration. An unreadable selected
+file or a malformed existing configuration is an error. Compiled agents apply
+their configuration tiers in their own bootstrap.
+
+Compiled Kaze agents accept `--cap`, `--policy`, `--pin`, and
 `--sim`; a newly compiled agent refuses an older runtime base that lacks the
-required capability gate.
+required capability and embedded-boundary gates.
 
 ## Available and unavailable operations
 
 - Local logging and the supported policy detectors execute in process.
   Unknown detector names fail; `allow` and `reject` produce VM verdicts.
-- Embedded AI, tool, memory, alert, sensor and device calls have no enabled
-  backend and return `E_CAP_MISSING` after authorization. They do not perform
-  model inference, MCP calls, storage, alert delivery or sensor reads.
+- `--cap memory=ephemeral` selects an in-process CMA store for that one run.
+  Without this explicit selection, Kaze memory calls return `E_CAP_MISSING`.
+  The store is isolated per run and is discarded on return; it is not durable
+  and is not shared with Sofuu's QTSQ stores or other agents.
+- Embedded AI, tool, alert, sensor and device calls have no enabled backend
+  and return `E_CAP_MISSING` after authorization. They do not perform model
+  inference, MCP calls, alert delivery or sensor reads.
 - Drone and rover simulation is available only when explicitly selected for
   testing, for example `--cap drone=sim`. Reports label simulated families.
   A bare `--cap drone` does not select a simulator.
@@ -51,28 +67,52 @@ required capability gate.
   and physical safety checks are verified. No physical-hardware result is
   claimed.
 
+### Per-run Kaze memory
+
+For the current source build, choose a policy such as
+`{"tools":{"allow":["kaze.memory.*"]}}` and run with
+`--cap memory=ephemeral --policy policy.json`. The JS API accepts
+`{caps: {memory: "ephemeral"}, policy: {tools: {allow: ["kaze.memory.*"]}}}`.
+
+`memory.save(label, value)` stores a JSON-compatible value under a nonempty
+text label; `memory.recall(label)` returns a list of values with that exact,
+case-sensitive label, in insertion order. Identical label/value pairs are
+deduplicated. Matching is exact, not semantic search. Values may include
+lists and text-keyed records, with finite numbers; labels are limited to 1,024
+bytes. A run accepts at most 256 records and 256 KiB of serialized writes;
+values are limited to 16 nesting levels and 4,096 nodes. A rejected write
+reports `E_KAZE_MEMORY`. The trace redacts memory labels and values; the
+script's returned result can still contain the values it requests.
+
+Each invocation creates its own in-memory CMA. Calls within that invocation
+and its supervisor ticks share the store; independent invocations do not.
+There is no disk reopen, cross-process sharing or storage encryption claim.
+
 Existing published binaries have not been verified against these changes and
 may behave differently. This work does not establish a real Kaze model-and-tool
 agent, a shared Kaze 1.0 core, or bytecode compatibility with standalone Kaze.
 
 ## Local verification and remaining work
 
-On 2026-11-11, a macOS debug build passed 72 embedded Kaze unit tests, 15
+On 2026-11-11, a macOS debug build passed 73 embedded Kaze unit tests, 16
 hardware-gate unit tests, and the cross-surface checks below. They cover pure
 computation, refusals and policy, source and bytecode, both JS aliases, REPL,
-compiled one-shot agents, an incompatible older runtime base and explicitly
-selected drone simulation. No model, external tool, or physical hardware was
-used.
+compiled one-shot agents, per-run CMA storage, and explicitly selected drone
+simulation. No model, external tool, or physical hardware was used in those
+Kaze checks.
 
 ```sh
 cargo build --offline -p sofuu-core --bin sofuu --bin sofuu-agent
 cargo test --offline -p sofuu-core --lib domains::kaze
 cargo test --offline -p sofuu-core --lib domains::robotics::hardware::tests
 python3 scripts/test-kaze-fail-closed.py target/debug/sofuu
+python3 scripts/test-kaze-memory-real.py target/debug/sofuu
+python3 scripts/test-kaze-js-boundaries.py target/debug/sofuu
 ```
 
-The ignored local Kaze integration suite and repository-wide mandatory gates
-still contain non-robotics stand-ins that need migration before compliant
-execution. Supervisor and interactive paths, release artifacts, real adapters,
-and physical hardware need further verification. Follow the remaining Kaze
-tasks in [sofuu-map.md](sofuu-map.md).
+The same boundary, fail-closed and ephemeral-memory checks also passed on a
+temporary release candidate. This does not establish published-artifact,
+supervisor or interactive coverage. The ignored local Kaze integration suite
+and repository-wide mandatory gates still contain non-robotics stand-ins that
+need migration. Real model/tool adapters and physical hardware need further
+work and verification. Follow the remaining Kaze tasks in [sofuu-map.md](sofuu-map.md).

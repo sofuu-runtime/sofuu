@@ -1,6 +1,6 @@
 # Agri Sentinel
 
-> **Language example only:** The current embedded Kaze host can return synthetic non-robotics capability results, contrary to the real-execution policy in [RULES.md](../../RULES.md). Do not use it to perform or verify real-world actions.
+> **Language example only:** Current embedded Kaze source refuses unavailable non-robotics capability calls; older published binaries may behave differently. Do not use it to perform or verify real-world actions.
 
 A greenhouse-themed routine illustrating sensor, device and AI capability syntax. It does not establish real sensor, model, irrigation or controller integration.
 

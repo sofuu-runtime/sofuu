@@ -634,6 +634,9 @@ impl<'a> Vm<'a> {
 /// Codes a capability host may raise. The list is closed on purpose: a host
 /// cannot invent an error the CLI has never been taught to explain.
 const HOST_CODES: &[&str] = &[
+    "E_CAP_MISSING",
+    "E_CAP_DENIED",
+    "E_KAZE_MEMORY",
     "E_KAZE_LINK",
     "E_KAZE_LINK_TIMEOUT",
     "E_COMMAND_REJECTED",

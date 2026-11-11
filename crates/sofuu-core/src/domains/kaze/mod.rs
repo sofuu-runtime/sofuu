@@ -31,6 +31,97 @@ use crate::sfs::vm::{Limits, Vm, Verdict};
 /// Language version reported by `sofuu.sfs.version` and `sofuu script --version`.
 pub const VERSION: &str = "0.1";
 
+#[cfg(test)]
+mod fail_closed_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn allowed(family: &str) -> RunOptions {
+        RunOptions {
+            grants: vec![family.into()],
+            policy: Some(json!({"tools": {"allow": ["kaze.*"]}})),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pure_program_needs_no_grant_policy_or_backend() {
+        let report = run_source("action main():\n    return 2 + 3\n", "<pure>", &RunOptions::default()).unwrap();
+        assert_eq!(report.value, "5");
+    }
+
+    #[test]
+    fn missing_backends_fail_for_source_and_bytecode() {
+        for (family, expression) in [
+            ("ai", "ai.prompt(\"hello\")"),
+            ("ai", "ai.complete(\"hello\")"),
+            ("ai", "ai.classify(\"hello\", [\"hello\"])"),
+            ("tool", "tool.call(\"lookup\")"),
+            ("tool", "tool.run(\"lookup\")"),
+            ("memory", "memory.save(\"key\", \"value\")"),
+            ("memory", "memory.recall(\"key\")"),
+            ("alert", "alert.send(\"message\")"),
+            ("sensor", "sensor.temperature()"),
+            ("device", "device.read_gpio(1)"),
+        ] {
+            let source = format!("needs: {family}\naction main():\n    return {expression}\n");
+            let opts = allowed(family);
+            let error = run_source(&source, "<source>", &opts).unwrap_err();
+            assert_eq!(error.code, "E_CAP_MISSING", "{expression}: {}", error.message);
+            assert!(error.message.contains(family));
+            let prepared = prepare(&source, "<source>").unwrap();
+            let module = isa::deserialize(&isa::serialize(&prepared.module)).unwrap();
+            let error = run_module(module, "<bytecode>", &opts).unwrap_err();
+            assert_eq!(error.code, "E_CAP_MISSING", "{expression}: {}", error.message);
+        }
+    }
+
+    #[test]
+    fn grants_and_valid_policy_are_required_before_dispatch() {
+        let source = "needs: ai\naction main():\n    return ai.prompt(\"hello\")\n";
+        let missing_grant = RunOptions { policy: Some(json!({"tools": {"deny": []}})), ..Default::default() };
+        assert_eq!(run_source(source, "<t>", &missing_grant).unwrap_err().code, "E_CAP_MISSING");
+        for policy in [None, Some(json!({})), Some(json!({"tools": {}})), Some(json!({"tools": {"allow": []}})), Some(json!({"fs": {"write": "off"}})), Some(json!({"tools": {"denny": []}})), Some(json!({"tools": {"deny": ["kaze.ai.*"]}}))] {
+            let opts = RunOptions { grants: vec!["ai".into()], policy, ..Default::default() };
+            assert_eq!(run_source(source, "<t>", &opts).unwrap_err().code, "E_CAP_DENIED");
+        }
+    }
+
+    #[test]
+    fn simulation_requires_selection_and_is_labelled() {
+        let source = "needs: drone\naction main():\n    arm drone\n    return 1\n";
+        let mut opts = allowed("drone");
+        assert_eq!(run_source(source, "<t>", &opts).unwrap_err().code, "E_CAP_MISSING");
+        opts.backend.push(("drone".into(), "sim".into()));
+        let report = run_source(source, "<t>", &opts).unwrap();
+        assert_eq!(report.simulated_families, vec!["drone"]);
+        assert!(report.render_plain().contains("simulation (testing): drone"));
+        assert_eq!(report.actions.len(), 1);
+        opts.backend[0].1 = "uart:/nonexistent".into();
+        assert_eq!(run_source(source, "<t>", &opts).unwrap_err().code, "E_CAP_DENIED");
+    }
+
+    #[test]
+    fn json_options_preserve_policy_grants_and_reject_invalid_overrides() {
+        let opts = opts_from_json(Some(json!({
+            "caps": {"drone": "sim"}, "grants": ["drone"],
+            "policy": {"tools": {"deny": []}}, "sim": {"battery": 42}
+        }))).unwrap();
+        assert_eq!(opts.backend, vec![("drone".into(), "sim".into())]);
+        assert_eq!(opts.sim.battery, 42.0);
+        for invalid in [
+            json!({"grants": [42]}),
+            json!({"caps": {"ai": "sim"}}),
+            json!({"sim": {"battery": 42}}),
+            json!({"caps": {"drone": "sim"}, "sim": {"ai": "answer"}}),
+            json!({"policy": {"tools": {"denny": []}}}),
+            json!({"policyJson": "{\"tools\":{\"deny\":[],\"deny\":[]}}"}),
+        ] {
+            assert!(opts_from_json(Some(invalid)).is_err());
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct KazeError {
     pub code: String,
@@ -238,15 +329,14 @@ pub struct RunOptions {
     pub ticks: u32,
     pub tick_ms: u64,
     pub sim: SimState,
-    /// R7 policy layered over the hardware gate. `None` means "declaration and
-    /// grant only", which is what the tests use.
+    /// R7 policy layered over the capability gate. `None` denies capability calls.
     pub policy: Option<serde_json::Value>,
     /// `device name -> GPIO line` (`--pin fan=17`). Non-empty puts the real
     /// pins behind the `device` family (Kaze v0.2, P-K1).
     pub pins: Vec<(String, u16)>,
     /// `family -> device`. A device other than `sim` (for example
     /// `drone -> udp:127.0.0.1:14550`) puts the live backend behind that family
-    /// (Kaze v0.2, P-K1). Empty means "everything simulated".
+    /// (Kaze v0.2, P-K1). An empty backend does not select a simulator.
     pub backend: Vec<(String, String)>,
 }
 
@@ -280,6 +370,8 @@ pub struct RunReport {
     pub instructions: u64,
     pub ticks: u32,
     pub verdict: Option<Verdict>,
+    /// Explicitly selected physical testing simulators, not real hardware.
+    pub simulated_families: Vec<String>,
 }
 
 impl RunReport {
@@ -288,6 +380,9 @@ impl RunReport {
     /// else about the shape changes.
     pub fn render_plain(&self) -> String {
         let mut out = String::new();
+        if !self.simulated_families.is_empty() {
+            out.push_str(&format!("simulation (testing): {}\n", self.simulated_families.join(", ")));
+        }
         if !self.entry.is_empty() {
             out.push_str(&format!("{} -> {}\n", self.entry, self.value));
         }
@@ -342,17 +437,23 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
             ));
         }
     }
-    // v0.2 (P-K1): a family granted a real device runs live; every other
-    // family keeps the deterministic simulator.
-    let live = opts.backend.iter().any(|(_, d)| !d.is_empty() && d != "sim") || !opts.pins.is_empty();
-    let mut host: Box<dyn CapHost> = if live {
-        match crate::rt::kaze_live::LiveHost::new(opts.sim.clone(), &opts.backend, &opts.pins) {
-            Ok(h) => Box::new(h),
-            Err(e) => return Err(KazeError::new("E_KAZE_LINK", format!("{}: {}", prepared.name, e))),
-        }
-    } else {
-        Box::new(SimHost::new(opts.sim.clone()))
-    };
+    let simulated_families: Vec<String> = opts.backend.iter()
+        .filter(|(_, backend)| backend == "sim")
+        .map(|(family, _)| caps::family_of(family).to_string())
+        .collect();
+    // The old live host opened hardware before the VM's policy gate and built
+    // its own hardware policy. Keep those paths unavailable until the caller's
+    // policy and physical safety checks are propagated and verified.
+    let mut blocked_live: Vec<String> = opts.backend.iter()
+        .filter(|(_, backend)| !backend.is_empty() && backend != "sim")
+        .map(|(family, _)| caps::family_of(family).to_string())
+        .collect();
+    if !opts.pins.is_empty() {
+        blocked_live.push("device".to_string());
+    }
+    let mut host: Box<dyn CapHost> = Box::new(SimHost::with_configuration(
+        opts.sim.clone(), simulated_families.clone(), blocked_live,
+    ));
     let limits = Limits { fuel: opts.fuel.max(1), heap_bytes: opts.heap_bytes, ..Limits::default() };
 
     let entry = resolve_entry(&module, opts)?;
@@ -366,6 +467,7 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
         instructions: 0,
         ticks: 0,
         verdict: None,
+        simulated_families,
     };
 
     {
@@ -644,6 +746,12 @@ fn report_to_js(ctx: *mut JSContext, report: &RunReport) -> JSValue {
         set_num(ctx, obj, c"fuel", report.fuel_used as f64);
         set_num(ctx, obj, c"instructions", report.instructions as f64);
         set_num(ctx, obj, c"ticks", report.ticks as f64);
+        let simulated = qjs::JS_NewArray(ctx);
+        for (i, family) in report.simulated_families.iter().enumerate() {
+            let v = qjs::sofuu_js_new_string(ctx, CString::new(family.as_str()).unwrap_or_default().as_ptr());
+            qjs::JS_SetPropertyUint32(ctx, simulated, i as u32, v);
+        }
+        qjs::sofuu_js_set_property_str(ctx, obj, c"simulated_families".as_ptr(), simulated);
         let actions = qjs::JS_NewArray(ctx);
         for (i, a) in report.actions.iter().enumerate() {
             let v = qjs::sofuu_js_new_string(ctx, CString::new(a.as_str()).unwrap_or_default().as_ptr());
@@ -709,34 +817,107 @@ unsafe fn set_num(ctx: *mut JSContext, obj: JSValue, key: &std::ffi::CStr, val: 
     unsafe { qjs::sofuu_js_set_property_str(ctx, obj, key.as_ptr(), v) };
 }
 
-fn opts_from_json(j: Option<serde_json::Value>) -> RunOptions {
+fn opts_from_json(j: Option<serde_json::Value>) -> Result<RunOptions, KazeError> {
     let mut opts = RunOptions::default();
-    let Some(serde_json::Value::Object(map)) = j else { return opts };
-    if let Some(entry) = map.get("entry").and_then(|v| v.as_str()) {
-        opts.entry = Some(entry.to_string());
+    let map = match j {
+        None | Some(serde_json::Value::Null) => return Ok(opts),
+        Some(serde_json::Value::Object(map)) => map,
+        Some(_) => return Err(KazeError::new("E_KAZE_ARGS", "run options must be an object")),
+    };
+    if let Some(entry) = map.get("entry") {
+        opts.entry = Some(entry.as_str().ok_or_else(|| KazeError::new("E_KAZE_ARGS", "entry must be text"))?.to_string());
     }
-    if let Some(fuel) = map.get("fuel").and_then(|v| v.as_u64()) {
-        opts.fuel = fuel;
+    if let Some(fuel) = map.get("fuel") {
+        opts.fuel = fuel.as_u64().ok_or_else(|| KazeError::new("E_KAZE_ARGS", "fuel must be a nonnegative integer"))?;
     }
-    if let Some(bytes) = map.get("heapBytes").and_then(|v| v.as_u64()) {
-        opts.heap_bytes = bytes as usize;
+    if let Some(bytes) = map.get("heapBytes") {
+        let bytes = bytes.as_u64().ok_or_else(|| KazeError::new("E_KAZE_ARGS", "heapBytes must be a nonnegative integer"))?;
+        opts.heap_bytes = usize::try_from(bytes).map_err(|_| KazeError::new("E_KAZE_ARGS", "heapBytes is too large"))?;
     }
-    if let Some(ticks) = map.get("ticks").and_then(|v| v.as_u64()) {
-        opts.ticks = ticks.min(10_000) as u32;
+    if let Some(ticks) = map.get("ticks") {
+        let ticks = ticks.as_u64().filter(|n| *n <= 10_000)
+            .ok_or_else(|| KazeError::new("E_KAZE_ARGS", "ticks must be an integer from 0 to 10000"))?;
+        opts.ticks = ticks as u32;
     }
-    if let Some(ms) = map.get("tickMs").and_then(|v| v.as_u64()) {
-        opts.tick_ms = ms.max(1);
+    if let Some(ms) = map.get("tickMs") {
+        opts.tick_ms = ms.as_u64().filter(|n| *n > 0)
+            .ok_or_else(|| KazeError::new("E_KAZE_ARGS", "tickMs must be a positive integer"))?;
     }
+    let add_grant = |opts: &mut RunOptions, raw: &str, explicit_backend: Option<&str>| -> Result<(), KazeError> {
+        let (family, backend) = if let Some(backend) = explicit_backend {
+            (raw.trim(), backend.trim())
+        } else if let Some((family, backend)) = raw.split_once('=') {
+            if backend.trim().is_empty() {
+                return Err(KazeError::new("E_CAP_INVALID", "a backend name cannot be empty"));
+            }
+            (family.trim(), backend.trim())
+        } else {
+            (raw.trim(), "")
+        };
+        if family.is_empty() {
+            return Err(KazeError::new("E_CAP_INVALID", "a capability grant needs a family"));
+        }
+        crate::rt::hardware::validate_grant(family, backend)
+            .map_err(|d| KazeError::new(d.code, d.reason))?;
+        if !opts.grants.iter().any(|g| g == family) {
+            opts.grants.push(family.to_string());
+        }
+        if !backend.is_empty() || !opts.backend.iter().any(|(f, _)| f == family) {
+            opts.backend.retain(|(f, _)| f != family);
+            opts.backend.push((family.to_string(), backend.to_string()));
+        }
+        Ok(())
+    };
     for key in ["caps", "grants"] {
         match map.get(key) {
-            Some(serde_json::Value::Object(o)) => opts.grants.extend(o.keys().cloned()),
-            Some(serde_json::Value::Array(a)) => {
-                opts.grants.extend(a.iter().filter_map(|v| v.as_str()).map(|s| s.to_string()))
+            Some(serde_json::Value::Object(o)) => {
+                for (family, backend) in o {
+                    match backend {
+                        serde_json::Value::String(value) if !value.trim().is_empty() => add_grant(&mut opts, family, Some(value))?,
+                        serde_json::Value::Bool(true) | serde_json::Value::Null => add_grant(&mut opts, family, None)?,
+                        _ => return Err(KazeError::new("E_CAP_INVALID", format!("{} backend for '{}' must be text or true", key, family))),
+                    }
+                }
             }
-            _ => {}
+            Some(serde_json::Value::Array(a)) => {
+                for grant in a {
+                    let grant = grant.as_str().ok_or_else(|| KazeError::new("E_CAP_INVALID", format!("{} entries must be text", key)))?;
+                    add_grant(&mut opts, grant, None)?;
+                }
+            }
+            None => {}
+            _ => return Err(KazeError::new("E_CAP_INVALID", format!("{} must be an array or object", key))),
         }
     }
-    if let Some(serde_json::Value::Object(sim)) = map.get("sim") {
+    if map.contains_key("policy") && map.contains_key("policyJson") {
+        return Err(KazeError::new("E_CAP_DENIED", "specify policy or policyJson, not both"));
+    }
+    let parsed_policy = if let Some(raw) = map.get("policyJson") {
+        let raw = raw.as_str().ok_or_else(|| KazeError::new("E_CAP_DENIED", "policyJson must be text"))?;
+        Some(crate::rt::policy::parse_policy_strict(raw)
+            .map_err(|e| KazeError::new("E_CAP_DENIED", format!("invalid policy JSON: {}", e)))?)
+    } else {
+        map.get("policy").cloned()
+    };
+    if let Some(policy) = parsed_policy {
+        crate::rt::policy::validate_policy(&policy)
+            .map_err(|e| KazeError::new("E_CAP_DENIED", format!("invalid policy: {}", e)))?;
+        opts.policy = Some(policy);
+    }
+    if let Some(pins) = map.get("pins") {
+        let pins = pins.as_object().ok_or_else(|| KazeError::new("E_KAZE_ARGS", "pins must be an object"))?;
+        for (name, value) in pins {
+            let line = value.as_u64().and_then(|n| u16::try_from(n).ok())
+                .ok_or_else(|| KazeError::new("E_KAZE_ARGS", format!("pin '{}' must be an unsigned 16-bit integer", name)))?;
+            opts.pins.push((name.clone(), line));
+        }
+    }
+    if let Some(value) = map.get("sim") {
+        let sim = value.as_object().ok_or_else(|| KazeError::new("E_KAZE_ARGS", "sim must be an object"))?;
+        if !opts.backend.iter().any(|(family, backend)| backend == "sim"
+            && matches!(caps::family_of(family), "drone" | "rover")) {
+            return Err(KazeError::new("E_CAP_INVALID", "sim requires an explicit drone=sim or rover=sim testing backend"));
+        }
         let mut spec = String::new();
         for (k, v) in sim {
             if !spec.is_empty() {
@@ -749,9 +930,9 @@ fn opts_from_json(j: Option<serde_json::Value>) -> RunOptions {
                 other => other.to_string(),
             });
         }
-        let _ = opts.sim.apply_overrides(&spec);
+        opts.sim.apply_overrides(&spec).map_err(|e| KazeError::new("E_CAP_INVALID", e))?;
     }
-    opts
+    Ok(opts)
 }
 
 unsafe extern "C" fn js_sfs_run(
@@ -774,8 +955,16 @@ unsafe extern "C" fn js_sfs_run(
         } else {
             serde_json::Map::new()
         };
-        let opts_json = if argc > 2 { js_json(ctx, *argv.add(2)) } else { None };
-        let mut opts = opts_from_json(opts_json);
+        let opts_json = if argc > 2 && !qjs::is_undefined(*argv.add(2)) && !qjs::is_null(*argv.add(2)) {
+            match js_json(ctx, *argv.add(2)) {
+                Some(value) => Some(value),
+                None => return error_to_js(ctx, &KazeError::new("E_KAZE_ARGS", "run options must be valid JSON-compatible values")),
+            }
+        } else { None };
+        let mut opts = match opts_from_json(opts_json) {
+            Ok(opts) => opts,
+            Err(err) => return error_to_js(ctx, &err),
+        };
         opts.args = args;
 
         let result = source_of(&text).and_then(|(src, name)| run_source(&src, &name, &opts));
@@ -866,6 +1055,8 @@ pub unsafe fn mod_sfs_register(ctx: *mut JSContext) {
         qjs::sofuu_js_set_property_str(ctx, ns, c"compile".as_ptr(), compile);
         let version = qjs::sofuu_js_new_string(ctx, c"0.1".as_ptr());
         qjs::sofuu_js_set_property_str(ctx, ns, c"version".as_ptr(), version);
+        let gate = qjs::sofuu_js_new_string(ctx, c"fail-closed-1".as_ptr());
+        qjs::sofuu_js_set_property_str(ctx, ns, c"capabilityGate".as_ptr(), gate);
         qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"sfs".as_ptr(), qjs::sofuu_js_dup_value(ctx, ns));
         qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"kaze".as_ptr(), ns);
         qjs::sofuu_js_free_value(ctx, sofuu_obj);
@@ -992,12 +1183,16 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    fn test_policy() -> Option<serde_json::Value> {
+        Some(serde_json::json!({"tools": {"allow": ["kaze.*"]}}))
+    }
+
     #[test]
     fn a_patrol_runs_end_to_end_with_a_deterministic_trace() {
         let src = "needs: drone, log\n\naction patrol(points):\n    log \"Starting patrol\"\n    arm drone\n    takeoff to 15 meters\n    for each point in points:\n        fly to point at 15 meters\n    return to launch\n";
         let mut args = serde_json::Map::new();
         args.insert("points".into(), serde_json::json!([1, 2, 3]));
-        let opts = RunOptions { args, grants: grants(&["drone"]), ..Default::default() };
+        let opts = RunOptions { args, grants: grants(&["drone", "log"]), backend: vec![("drone".into(), "sim".into())], policy: test_policy(), ..Default::default() };
         let report = run(src, &opts);
         assert_eq!(report.entry, "patrol");
         assert_eq!(
@@ -1018,8 +1213,8 @@ mod tests {
 
     #[test]
     fn the_same_run_twice_gives_the_same_trace() {
-        let src = "needs: rover, lidar\n\ncheck scan():\n    let d = lidar.front_distance()\n    if d < 1 meters:\n        stop rover\n    otherwise:\n        drive forward at 0.5 m/s\n";
-        let opts = RunOptions { grants: grants(&["rover", "lidar"]), ..Default::default() };
+        let src = "needs: rover\n\ncheck scan():\n    let d = rover.telemetry(\"distance\")\n    if d < 1 meters:\n        stop rover\n    otherwise:\n        drive forward at 0.5 m/s\n";
+        let opts = RunOptions { grants: grants(&["rover"]), backend: vec![("rover".into(), "sim".into())], policy: test_policy(), ..Default::default() };
         let a = run(src, &opts);
         let b = run(src, &opts);
         assert_eq!(a.actions, b.actions);
@@ -1031,13 +1226,13 @@ mod tests {
         let src = "needs: drone\naction main():\n    arm drone\n";
         let err = run_source(src, "<test>", &RunOptions::default()).unwrap_err();
         assert_eq!(err.code, "E_CAP_MISSING");
-        assert!(err.message.contains("--cap drone=sim"), "{}", err.message);
+        assert!(err.message.contains("--cap drone"), "{}", err.message);
     }
 
     #[test]
     fn fuel_stops_a_runaway_loop() {
         let src = "needs: log\naction main():\n    while true:\n        log \"spin\"\n";
-        let opts = RunOptions { fuel: 500, ..Default::default() };
+        let opts = RunOptions { fuel: 500, grants: grants(&["log"]), policy: test_policy(), ..Default::default() };
         let err = run_source(src, "<test>", &opts).unwrap_err();
         assert_eq!(err.code, "E_TIMEOUT");
     }
@@ -1047,11 +1242,11 @@ mod tests {
         let src = "needs: drone, log\n\naction main():\n    log \"patrol\"\n\nwhen battery < 20%:\n    log warning \"Battery critical\"\n    return to launch\n";
         let mut sim = SimState::default();
         sim.battery = 15.0;
-        let opts = RunOptions { grants: grants(&["drone"]), ticks: 1, sim, ..Default::default() };
+        let opts = RunOptions { grants: grants(&["drone", "log"]), backend: vec![("drone".into(), "sim".into())], policy: test_policy(), ticks: 1, sim, ..Default::default() };
         let hot = run(src, &opts);
         assert!(hot.actions.iter().any(|a| a.contains("drone.rtl")), "{:?}", hot.actions);
 
-        let opts2 = RunOptions { grants: grants(&["drone"]), ticks: 1, ..Default::default() };
+        let opts2 = RunOptions { grants: grants(&["drone", "log"]), backend: vec![("drone".into(), "sim".into())], policy: test_policy(), ticks: 1, ..Default::default() };
         let cold = run(src, &opts2);
         assert!(!cold.actions.iter().any(|a| a.contains("drone.rtl")), "{:?}", cold.actions);
     }
@@ -1059,7 +1254,7 @@ mod tests {
     #[test]
     fn every_hundred_ms_fires_on_a_hundred_ms_tick_grid() {
         let src = "needs: sensor, log\n\nevery 100ms:\n    log \"tick\"\n";
-        let opts = RunOptions { ticks: 3, tick_ms: 100, ..Default::default() };
+        let opts = RunOptions { grants: grants(&["log"]), policy: test_policy(), ticks: 3, tick_ms: 100, ..Default::default() };
         let report = run(src, &opts);
         assert_eq!(report.logs.len(), 3);
         assert_eq!(report.ticks, 3);
@@ -1067,15 +1262,15 @@ mod tests {
 
     #[test]
     fn a_guardrail_returns_a_verdict_instead_of_a_side_effect() {
-        let src = "needs: memory, policy\n\nfilter user_prompt(prompt):\n    if length of prompt > 20:\n        reject with \"too long\"\n    remember prompt as \"last\"\n    allow prompt\n";
+        let src = "needs: policy\n\nfilter user_prompt(prompt):\n    if length of prompt > 20:\n        reject with \"too long\"\n    allow prompt\n";
         let mut args = serde_json::Map::new();
         args.insert("prompt".into(), serde_json::json!("hello"));
-        let report = run(src, &RunOptions { args, ..Default::default() });
+        let report = run(src, &RunOptions { args, grants: grants(&["policy"]), policy: test_policy(), ..Default::default() });
         assert_eq!(report.verdict, Some(Verdict::Allow("\"hello\"".to_string())));
 
         let mut args = serde_json::Map::new();
         args.insert("prompt".into(), serde_json::json!("this prompt is definitely too long"));
-        let report = run(src, &RunOptions { args, ..Default::default() });
+        let report = run(src, &RunOptions { args, grants: grants(&["policy"]), policy: test_policy(), ..Default::default() });
         assert_eq!(report.verdict, Some(Verdict::Reject("too long".to_string())));
     }
 
@@ -1094,7 +1289,7 @@ mod tests {
     #[test]
     fn out_of_range_arguments_are_rejected_by_the_gate() {
         let src = "needs: drone\naction main():\n    arm drone\n    takeoff to 900 meters\n";
-        let opts = RunOptions { grants: grants(&["drone"]), ..Default::default() };
+        let opts = RunOptions { grants: grants(&["drone"]), backend: vec![("drone".into(), "sim".into())], policy: test_policy(), ..Default::default() };
         let err = run_source(src, "<test>", &opts).unwrap_err();
         assert_eq!(err.code, "E_KAZE_RANGE");
     }
@@ -1103,13 +1298,13 @@ mod tests {
     fn a_record_argument_is_read_by_field() {
         // Maps have no literal syntax in v0.1: they arrive as arguments, and
         // `record.field` is how a script reads one.
-        let src = "needs: alert\naction main(record):\n    if record.kind == \"fire\":\n        send alert \"evacuate\"\n    return record.level\n";
+        let src = "action main(record):\n    return record.level\n";
         let mut args = serde_json::Map::new();
         args.insert("record".into(), serde_json::json!({"kind": "fire", "level": 3}));
-        let opts = RunOptions { args, grants: grants(&["alert"]), ..Default::default() };
+        let opts = RunOptions { args, ..Default::default() };
         let report = run(src, &opts);
         assert_eq!(report.value, "3");
-        assert_eq!(report.actions.len(), 1, "{:?}", report.actions);
+        assert!(report.actions.is_empty());
 
         // A missing field reads as nothing, not as an error.
         let mut args = serde_json::Map::new();
@@ -1122,7 +1317,7 @@ mod tests {
     #[test]
     fn the_three_argument_goto_is_the_capability_signature() {
         let src = "needs: drone\naction main():\n    arm drone\n    takeoff to 5 meters\n    drone.goto(1, 2, 3)\n";
-        let opts = RunOptions { grants: grants(&["drone"]), ..Default::default() };
+        let opts = RunOptions { grants: grants(&["drone"]), backend: vec![("drone".into(), "sim".into())], policy: test_policy(), ..Default::default() };
         let report = run(src, &opts);
         assert!(
             report.actions.iter().any(|a| a == "drone.goto(1, 2, 3) -> nothing"),
@@ -1132,11 +1327,10 @@ mod tests {
     }
 
     #[test]
-    fn a_named_pin_reads_its_telemetry() {
+    fn a_named_sensor_without_a_backend_is_unavailable() {
         let src = "needs: sensor\naction main():\n    let t = sensor.read(\"temperature\")\n    return t\n";
-        let opts = RunOptions { grants: grants(&["sensor"]), ..Default::default() };
-        let report = run(src, &opts);
-        assert_eq!(report.value, "22");
+        let opts = RunOptions { grants: grants(&["sensor"]), policy: test_policy(), ..Default::default() };
+        assert_eq!(run_source(src, "<test>", &opts).unwrap_err().code, "E_CAP_MISSING");
     }
 
     /// RB-08 (AUDIT-2026-11-08): `--cap sensor=bogus` was accepted at grant
@@ -1153,13 +1347,13 @@ mod tests {
         let err = run_source(src, "<grant>", &opts).unwrap_err();
         assert_eq!(err.code, "E_CAP_INVALID", "{}", err.message);
         assert!(err.message.contains("bogus"), "{}", err.message);
-        // The same grant on a backend that exists still runs the script.
+        // Sensor simulation is not an allowed standalone sensor backend.
         let opts = RunOptions {
             grants: grants(&["sensor"]),
             backend: vec![("sensor".to_string(), "sim".to_string())],
             ..Default::default()
         };
-        assert_eq!(run(src, &opts).value, "22");
+        assert_eq!(run_source(src, "<grant>", &opts).unwrap_err().code, "E_CAP_INVALID");
     }
 
     #[test]
@@ -1193,39 +1387,15 @@ mod tests {
     }
 
     #[test]
-    fn a_pure_kaze_ai_agent_executes_end_to_end() {
-        let src = r#"needs: ai, tool, memory, policy, log
-
-filter evaluate_trade(ticker, signal, leverage, price):
-    log.info("Analyzing signal for " + ticker)
-    if policy detects secrets in ticker:
-        reject "leaked secrets in ticker symbol"
-    if leverage > 3:
-        reject "excessive leverage"
-    let reasoning = ai.prompt("Evaluate " + ticker + " with signal=" + signal)
-    remember ticker + "_eval" as reasoning
-    let order_status = tool.call("execute", ticker + ":" + signal)
-    log.info("Tool output: " + order_status)
-    allow reasoning
-"#;
-        let mut sim = SimState::default();
-        sim.ai_responses.push(("NVDA".to_string(), "Bullish momentum: target $160".to_string()));
-        sim.tool_responses.push(("execute".to_string(), "FILLED at $145.20".to_string()));
-
-        let mut args = serde_json::Map::new();
-        args.insert("ticker".into(), serde_json::json!("NVDA"));
-        args.insert("signal".into(), serde_json::json!("BUY"));
-        args.insert("leverage".into(), serde_json::json!(2));
-        args.insert("price".into(), serde_json::json!(145));
-
-        let opts = RunOptions { args, sim, ..Default::default() };
-        let report = run_source(src, "<test_agent>", &opts).expect("agent runs cleanly");
-
-        assert_eq!(report.entry, "evaluate_trade");
-        assert_eq!(report.verdict, Some(Verdict::Allow("\"Bullish momentum: target $160\"".to_string())));
-        assert!(report.actions.iter().any(|a| a.contains("ai.prompt")));
-        assert!(report.actions.iter().any(|a| a.contains("tool.call")));
-        assert!(report.actions.iter().any(|a| a.contains("memory.save")));
-        assert_eq!(report.logs.len(), 2);
+    fn unavailable_ai_backend_fails_instead_of_fabricating_a_response() {
+        let src = "needs: ai\naction main():\n    return ai.prompt(\"hello\")\n";
+        let opts = RunOptions {
+            grants: vec!["ai".into()],
+            policy: Some(serde_json::json!({"tools": {"deny": []}})),
+            ..Default::default()
+        };
+        let err = run_source(src, "<test_agent>", &opts).unwrap_err();
+        assert_eq!(err.code, "E_CAP_MISSING");
+        assert!(err.message.contains("ai.prompt"));
     }
 }

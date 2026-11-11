@@ -1,4 +1,4 @@
-// sfs/caps.rs — the capability registry and the deterministic simulation host.
+// sfs/caps.rs — capability registry and explicitly selected physical test host.
 //
 // PLAN-KAZE-LANGUAGE §3.3: "The Host is the Standard Library." A script names
 // what it needs; the host supplies exactly that. There is no ambient clock, no
@@ -6,10 +6,8 @@
 // unrepresentable, and one the host did not grant is refused by
 // `rt/hardware.rs` before this module is ever reached.
 //
-// The v1 backend is `sim`: a deterministic machine model with no timers and no
-// entropy, so a mission that passes here produces the same action trace on
-// every machine. A real MAVLink/serial backend implements the same `call`
-// shape (PLAN-DRONES-MAVLINK) without the language changing.
+// Non-robotics operations without a real backend fail rather than fabricate a
+// result. Drone and rover simulation is available only when selected for testing.
 
 use crate::sfs::arena::{fmt_num, Arena};
 use crate::sfs::value::{Heap, Value};
@@ -142,15 +140,6 @@ pub struct SimState {
     pub temperature: f64,
     pub humidity: f64,
     pub distance: f64,
-    pub relays: Vec<(String, bool)>,
-    /// PWM channels set by `device.set_duty`, as (channel, percent). The
-    /// shipping engine has no PWM backend yet, so this is the simulator's
-    /// record of the intent — the live bus refuses the verb rather than
-    /// pretending a duty cycle was written.
-    pub duties: Vec<(String, f64)>,
-    pub memory: Vec<(String, String)>,
-    pub ai_responses: Vec<(String, String)>,
-    pub tool_responses: Vec<(String, String)>,
 }
 
 impl Default for SimState {
@@ -167,11 +156,6 @@ impl Default for SimState {
             temperature: 22.0,
             humidity: 45.0,
             distance: 2.0,
-            relays: Vec::new(),
-            duties: Vec::new(),
-            memory: Vec::new(),
-            ai_responses: Vec::new(),
-            tool_responses: Vec::new(),
         }
     }
 }
@@ -190,19 +174,18 @@ impl SimState {
                 .ok_or_else(|| format!("--sim expects key=value, got '{}'", pair))?;
             let key = k.trim();
             let raw = v.trim();
-            if key == "ai" || key.starts_with("ai:") {
-                let pat = if key == "ai" { "*" } else { key.strip_prefix("ai:").unwrap_or("*") };
-                self.ai_responses.push((pat.to_string(), raw.to_string()));
-                continue;
-            }
-            if key == "tool" || key.starts_with("tool:") {
-                let pat = if key == "tool" { "*" } else { key.strip_prefix("tool:").unwrap_or("*") };
-                self.tool_responses.push((pat.to_string(), raw.to_string()));
-                continue;
-            }
             let numeric = |raw: &str| -> Result<f64, String> {
                 raw.parse::<f64>()
-                    .map_err(|_| format!("--sim {}: '{}' is not a number", key, raw))
+                    .ok()
+                    .filter(|n| n.is_finite())
+                    .ok_or_else(|| format!("--sim {}: '{}' is not a finite number", key, raw))
+            };
+            let boolean = |raw: &str| -> Result<bool, String> {
+                match raw {
+                    "true" | "1" | "yes" => Ok(true),
+                    "false" | "0" | "no" => Ok(false),
+                    _ => Err(format!("--sim {}: '{}' is not a boolean", key, raw)),
+                }
             };
             match key {
                 "battery" => self.battery = numeric(raw)?,
@@ -214,35 +197,12 @@ impl SimState {
                 "distance" | "front_distance" => self.distance = numeric(raw)?,
                 "lat" => self.lat = numeric(raw)?,
                 "lon" => self.lon = numeric(raw)?,
-                "armed" => self.armed = raw == "true" || raw == "1" || raw == "yes",
-                "on_ground" => self.on_ground = raw == "true" || raw == "1" || raw == "yes",
+                "armed" => self.armed = boolean(raw)?,
+                "on_ground" => self.on_ground = boolean(raw)?,
                 other => return Err(format!("--sim: unknown key '{}'", other)),
             }
         }
         Ok(())
-    }
-
-    pub fn ai_reply(&self, prompt: &str) -> String {
-        for (pattern, resp) in &self.ai_responses {
-            if pattern == "*" || prompt.to_lowercase().contains(&pattern.to_lowercase()) {
-                return resp.clone();
-            }
-        }
-        let brief = if prompt.len() > 60 {
-            format!("{}...", &prompt[..60])
-        } else {
-            prompt.to_string()
-        };
-        format!("Synthesized autonomous decision for: \"{}\"", brief)
-    }
-
-    pub fn tool_exec(&self, name: &str, arg: &str) -> String {
-        for (n, resp) in &self.tool_responses {
-            if n == "*" || n.eq_ignore_ascii_case(name) {
-                return resp.clone();
-            }
-        }
-        format!("OK: tool '{}' executed ({})", name, arg)
     }
 
     fn drain(&mut self, amount: f64) {
@@ -315,12 +275,22 @@ pub struct SimHost {
     pub state: SimState,
     pub actions: Vec<Action>,
     pub logs: Vec<(String, String)>,
+    physical_sim: Vec<String>,
+    blocked_live: Vec<String>,
     seq: u32,
 }
 
 impl SimHost {
     pub fn new(state: SimState) -> Self {
-        SimHost { state, actions: Vec::new(), logs: Vec::new(), seq: 0 }
+        Self::with_simulated(state, Vec::new())
+    }
+
+    pub fn with_simulated(state: SimState, physical_sim: Vec<String>) -> Self {
+        Self::with_configuration(state, physical_sim, Vec::new())
+    }
+
+    pub fn with_configuration(state: SimState, physical_sim: Vec<String>, blocked_live: Vec<String>) -> Self {
+        SimHost { state, actions: Vec::new(), logs: Vec::new(), physical_sim, blocked_live, seq: 0 }
     }
 
     /// Record a call the host answered elsewhere (the live backends in
@@ -340,33 +310,17 @@ impl SimHost {
         });
     }
 
-    fn duty(&mut self, name: &str) -> Option<&mut f64> {
-        self.state
-            .duties
-            .iter_mut()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v)
-    }
-
-    fn relay(&mut self, name: &str) -> Option<&mut bool> {
-        self.state
-            .relays
-            .iter_mut()
-            .find(|(n, _)| n == name)
-            .map(|(_, v)| v)
-    }
-
-    fn telemetry(&self, field: &str) -> Value {
+    fn telemetry(&self, field: &str) -> Result<Value, String> {
         match field {
-            "battery" => Value::Num(self.state.battery),
-            "altitude" => Value::Num(self.state.altitude_m),
-            "heading" => Value::Num(self.state.heading),
-            "speed" => Value::Num(self.state.speed),
-            "temperature" => Value::Num(self.state.temperature),
-            "humidity" => Value::Num(self.state.humidity),
-            "distance" => Value::Num(self.state.distance),
-            "armed" => Value::Bool(self.state.armed),
-            _ => Value::Num(0.0),
+            "battery" => Ok(Value::Num(self.state.battery)),
+            "altitude" => Ok(Value::Num(self.state.altitude_m)),
+            "heading" => Ok(Value::Num(self.state.heading)),
+            "speed" => Ok(Value::Num(self.state.speed)),
+            "temperature" => Ok(Value::Num(self.state.temperature)),
+            "humidity" => Ok(Value::Num(self.state.humidity)),
+            "distance" => Ok(Value::Num(self.state.distance)),
+            "armed" => Ok(Value::Bool(self.state.armed)),
+            _ => Err(format!("E_CAP_MISSING: simulated telemetry field '{}' is unavailable", field)),
         }
     }
 }
@@ -388,6 +342,17 @@ impl CapHost for SimHost {
         arena: &mut Arena,
         heap: &mut Heap,
     ) -> Result<Value, String> {
+        if self.blocked_live.iter().any(|selected| selected == family) {
+            return Err(format!(
+                "E_CAP_DENIED: live {}.{} is disabled until hardware policy and safety checks are verified",
+                family, op
+            ));
+        }
+        if matches!(family, "drone" | "rover")
+            && !self.physical_sim.iter().any(|selected| selected == family)
+        {
+            return Err(format!("E_CAP_MISSING: no backend selected for {}.{}; drone/rover simulation is available for tests with an explicit sim grant", family, op));
+        }
         let shown: Vec<String> = args.iter().map(|v| render_value(*v, arena, heap)).collect();
         let result: Result<Value, String> = match (family, op) {
             ("drone", "arm") => {
@@ -441,8 +406,8 @@ impl CapHost for SimHost {
                 self.state.speed = 0.0;
                 Ok(Value::Unit)
             }
-            ("drone", "telemetry") | ("rover", "telemetry") | ("sensor", "telemetry") => {
-                Ok(self.telemetry(&str_at(args, 0, arena)))
+            ("drone", "telemetry") | ("rover", "telemetry") => {
+                self.telemetry(&str_at(args, 0, arena))
             }
             ("rover", "forward") => {
                 self.state.speed = num_at(args, 0, 1.0);
@@ -460,61 +425,14 @@ impl CapHost for SimHost {
                 self.state.heading = (self.state.heading - num_at(args, 0, 0.0)) % 360.0;
                 Ok(Value::Unit)
             }
-            ("sensor", "temperature") => Ok(Value::Num(self.state.temperature)),
-            ("sensor", "humidity") => Ok(Value::Num(self.state.humidity)),
-            ("sensor", "distance") | ("sensor", "front_distance") => Ok(Value::Num(self.state.distance)),
-            // The simulator has no ADC: a named pin reads that telemetry field,
-            // a numeric pin reads 0. Deterministic either way, and a script that
-            // names what it wants gets a real answer.
-            ("sensor", "read") | ("device", "read_gpio") => {
-                let reading = match args.first() {
-                    Some(Value::Str(_)) => self.telemetry(&str_at(args, 0, arena)),
-                    _ => Value::Num(0.0),
-                };
-                Ok(reading)
-            }
-            ("device", "set_relay") => {
-                let name = str_at(args, 0, arena);
-                let on = matches!(args.get(1), Some(Value::Bool(true)))
-                    || matches!(args.get(1), Some(Value::Num(n)) if *n != 0.0);
-                match self.relay(&name) {
-                    Some(slot) => *slot = on,
-                    None => self.state.relays.push((name, on)),
-                }
-                Ok(Value::Unit)
-            }
-            ("device", "set_duty") => {
-                let name = str_at(args, 0, arena);
-                let percent = num_at(args, 1, 0.0);
-                match self.duty(&name) {
-                    Some(slot) => *slot = percent,
-                    None => self.state.duties.push((name, percent)),
-                }
-                Ok(Value::Unit)
-            }
-            ("device", "pulse") => Ok(Value::Unit),
-
-            ("memory", "save") => {
-                let key = str_at(args, 0, arena);
-                let value = args.get(1).map(|v| render_value(*v, arena, heap)).unwrap_or_default();
-                self.state.memory.push((key, value));
-                Ok(Value::Unit)
-            }
-            ("memory", "recall") => {
-                let query = str_at(args, 0, arena).to_lowercase();
-                let hits: Vec<Value> = self
-                    .state
-                    .memory
-                    .iter()
-                    .filter(|(k, v)| k.to_lowercase().contains(&query) || v.to_lowercase().contains(&query))
-                    .filter_map(|(_, v)| arena.alloc(v).ok().map(Value::Str))
-                    .collect();
-                heap.push_array(hits)
-            }
             ("policy", "detects") | ("policy", "detect") => {
                 let kind = str_at(args, 0, arena).to_lowercase();
                 let text = str_at(args, 1, arena);
-                Ok(Value::Bool(detect(&kind, &text)))
+                if matches!(kind.as_str(), "secrets" | "prompt_injection") {
+                    Ok(Value::Bool(detect(&kind, &text)))
+                } else {
+                    Err(format!("E_CAP_MISSING: unsupported policy detector '{}'", kind))
+                }
             }
             ("policy", "allow") => Ok(args.first().copied().unwrap_or(Value::Unit)),
             ("policy", "reject") => Ok(Value::Unit),
@@ -529,40 +447,7 @@ impl CapHost for SimHost {
                 self.logs.push((level.to_string(), msg.clone()));
                 Ok(Value::Unit)
             }
-            ("alert", "send") => Ok(Value::Unit),
-            ("ai", "prompt") | ("ai", "complete") => {
-                let prompt = str_at(args, 0, arena);
-                let reply = self.state.ai_reply(&prompt);
-                let r = arena.alloc(&reply).map_err(|e| format!("E_KAZE_MEMORY: {}", e))?;
-                Ok(Value::Str(r))
-            }
-            ("ai", "classify") => {
-                let text = str_at(args, 0, arena);
-                let mut best = "general".to_string();
-                if let Some(Value::Arr(arr_idx)) = args.get(1) {
-                    if let Some(items) = heap.array(*arr_idx) {
-                        for item in items {
-                            if let Value::Str(s) = item {
-                                let cat = arena.get(*s);
-                                if text.to_lowercase().contains(&cat.to_lowercase()) {
-                                    best = cat.to_string();
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                let r = arena.alloc(&best).map_err(|e| format!("E_KAZE_MEMORY: {}", e))?;
-                Ok(Value::Str(r))
-            }
-            ("tool", "call") | ("tool", "run") => {
-                let name = str_at(args, 0, arena);
-                let arg_str = args.get(1).map(|v| render_value(*v, arena, heap)).unwrap_or_default();
-                let output = self.state.tool_exec(&name, &arg_str);
-                let r = arena.alloc(&output).map_err(|e| format!("E_KAZE_MEMORY: {}", e))?;
-                Ok(Value::Str(r))
-            }
-            _ => Err(format!("{} is not a capability this host knows", family)),
+            _ => Err(format!("E_CAP_MISSING: embedded Kaze has no available backend for {}.{}", family, op)),
         };
         let rendered = match &result {
             Ok(v) => render_value(*v, arena, heap),
@@ -666,38 +551,38 @@ mod tests {
 
     #[test]
     fn the_simulation_records_a_deterministic_trace() {
-        let mut host = SimHost::new(SimState::default());
-        let mut arena = Arena::new(1024);
-        let mut heap = Heap::default();
-        host.call("drone", "arm", &[], &mut arena, &mut heap).unwrap();
-        host.call("drone", "takeoff", &[Value::Num(15.0)], &mut arena, &mut heap).unwrap();
-        let lines: Vec<String> = host.actions().iter().map(|a| a.render()).collect();
-        assert_eq!(lines[0], "drone.arm -> nothing");
-        assert_eq!(lines[1], "drone.takeoff(15) -> nothing");
-        assert_eq!(host.state.altitude_m, 15.0);
+        let opts = crate::sfs::RunOptions {
+            grants: vec!["drone".into()],
+            backend: vec![("drone".into(), "sim".into())],
+            policy: Some(serde_json::json!({"tools": {"allow": ["kaze.drone.*"]}})),
+            ..Default::default()
+        };
+        let report = crate::sfs::run_source("needs: drone\naction main():\n    arm drone\n    takeoff to 15 meters\n", "<sim-test>", &opts).unwrap();
+        assert_eq!(report.simulated_families, vec!["drone"]);
+        assert_eq!(report.actions, vec!["drone.arm -> nothing", "drone.takeoff(15) -> nothing"]);
     }
 
     #[test]
-    fn set_duty_records_the_requested_duty_cycle() {
+    fn unavailable_device_does_not_report_success() {
         let mut host = SimHost::new(SimState::default());
         let mut arena = Arena::new(1024);
         let mut heap = Heap::default();
         let name = arena.alloc("fan").unwrap();
-        host.call("device", "set_duty", &[Value::Str(name), Value::Num(40.0)], &mut arena, &mut heap)
-            .unwrap();
-        assert_eq!(host.state.duties, vec![("fan".to_string(), 40.0)]);
+        let error = host.call("device", "set_duty", &[Value::Str(name), Value::Num(40.0)], &mut arena, &mut heap)
+            .unwrap_err();
+        assert!(error.starts_with("E_CAP_MISSING:"));
     }
 
     #[test]
     fn taking_off_unarmed_is_a_typed_failure_not_a_silent_no_op() {
-        let mut host = SimHost::new(SimState::default());
-        let mut arena = Arena::new(1024);
-        let mut heap = Heap::default();
-        let e = host
-            .call("drone", "takeoff", &[Value::Num(15.0)], &mut arena, &mut heap)
-            .unwrap_err();
-        assert!(e.contains("armed"), "{}", e);
-        assert_eq!(host.state.altitude_m, 0.0);
+        let opts = crate::sfs::RunOptions {
+            grants: vec!["drone".into()],
+            backend: vec![("drone".into(), "sim".into())],
+            policy: Some(serde_json::json!({"tools": {"allow": ["kaze.drone.*"]}})),
+            ..Default::default()
+        };
+        let e = crate::sfs::run_source("needs: drone\naction main():\n    takeoff to 15 meters\n", "<sim-test>", &opts).unwrap_err();
+        assert!(e.message.contains("armed"), "{}", e.message);
     }
 
     #[test]

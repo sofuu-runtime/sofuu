@@ -11,7 +11,7 @@
 // consults:
 //
 //   H-1  the family is declared in the script's `needs:`          E_CAP_UNDECLARED
-//   H-2  an effector family has an explicit host backend grant     E_CAP_MISSING
+//   H-2  the family has an explicit host grant                     E_CAP_MISSING
 //        and the granted backend is one this runtime has          E_CAP_INVALID
 //   H-3  the host policy does not deny this exact operation        E_CAP_DENIED
 //   H-4  every numeric argument is inside its physical range       E_KAZE_RANGE
@@ -19,8 +19,8 @@
 // "Reject never clamp": a takeoff to 900 m does not quietly become 500 m. The
 // call fails, the message says what the limits are, and the script decides.
 //
-// In-process families (log, memory, policy) need a declaration but no backend
-// grant: declaring them is the whole opt-in, and they cannot move a machine.
+// A declaration is not a grant. Every capability call requires an explicit
+// family grant and a valid, nonempty policy before the host is reached.
 
 use serde_json::Value as Json;
 use serde_json::json;
@@ -28,9 +28,8 @@ use serde_json::json;
 use crate::sfs::arena::Arena;
 use crate::sfs::value::Value;
 
-/// Families that touch a machine or a human's attention. A host must grant
-/// each one explicitly (`--cap drone=sim`, `caps: { drone: 'sim' }`).
-pub const EFFECTOR_FAMILIES: &[&str] = &["drone", "rover", "sensor", "device", "alert"];
+/// Every registered family requires an explicit host grant.
+pub const EFFECTOR_FAMILIES: &[&str] = crate::sfs::caps::FAMILIES;
 
 pub fn needs_backend_grant(family: &str) -> bool {
     EFFECTOR_FAMILIES.contains(&family)
@@ -51,7 +50,7 @@ impl Denial {
 
 /// The backend names a `--cap <family>=<backend>` grant may carry.
 ///
-/// `sim` is the deterministic simulator (and the default), `real` asks for the
+/// `sim` is an explicit drone/rover test simulator, `real` asks for the
 /// family's live hardware, `mavlink` for its MAVLink link. Anything else is a
 /// typo — and a typo used to be accepted at grant time, with the simulator
 /// answering every call behind a backend nobody implemented (RB-08).
@@ -94,12 +93,19 @@ fn is_link_device(device: &str) -> bool {
 /// as E_CAP_INVALID instead.
 pub fn validate_grant(family: &str, backend: &str) -> Result<(), Denial> {
     let name = backend.trim();
-    // No device named (`--cap drone=`) means "the simulator", exactly as
-    // `--cap drone` does.
-    if name.is_empty() || name == "sim" {
+    if name.is_empty() {
         return Ok(());
     }
     let fam = crate::sfs::caps::family_of(family);
+    if name == "sim" {
+        return if matches!(fam, "drone" | "rover") {
+            Ok(())
+        } else {
+            Err(Denial::new("E_CAP_INVALID", "H-2/backend", format!(
+                "simulation is available only for explicitly selected drone or rover tests, not '{}'", fam
+            )))
+        };
+    }
     if BACKENDS.contains(&name) {
         return if live_backends(fam).contains(&name) {
             Ok(())
@@ -108,8 +114,8 @@ pub fn validate_grant(family: &str, backend: &str) -> Result<(), Denial> {
                 "E_CAP_INVALID",
                 "H-2/backend",
                 format!(
-                    "'{}' has no live backend, so --cap {}={} is refused rather than simulated; grant --cap {}=sim",
-                    fam, family, name, family
+                    "'{}' has no supported live backend for --cap {}={}",
+                    fam, family, name
                 ),
             ))
         };
@@ -156,16 +162,36 @@ pub fn authorise(
             "E_CAP_MISSING",
             "H-2/backend",
             format!(
-                "the host did not grant a backend for '{}'. Grant one explicitly, e.g. --cap {}=sim",
+                "the host did not grant '{}'. Grant it explicitly, e.g. --cap {}",
                 family, family
             ),
         ));
     }
-    if let Some(p) = policy {
-        let req = json!({ "op": "tool.run", "tool": format!("kaze.{}.{}", family, op) });
-        let decision = crate::rt::policy::evaluate(&req, p);
-        evaluate_verdict(&decision, family, op)?;
+    let p = policy.ok_or_else(|| Denial::new(
+        "E_CAP_DENIED", "H-3/policy", format!("no policy is configured for {}.{}", family, op)
+    ))?;
+    crate::rt::policy::validate_policy(p).map_err(|e| Denial::new(
+        "E_CAP_DENIED", "H-3/policy", format!("invalid policy: {}", e)
+    ))?;
+    // The R7 evaluator defaults to allow when no tools rules are supplied.
+    // An unrelated nonempty section must not implicitly authorize Kaze calls.
+    let has_tool_rules = p.get("tools").and_then(Json::as_object)
+        .is_some_and(|tools| tools.contains_key("allow") || tools.contains_key("deny"));
+    if !has_tool_rules {
+        return Err(Denial::new(
+            "E_CAP_DENIED", "H-3/policy", format!("policy needs tools.allow or tools.deny to authorize {}.{}", family, op)
+        ));
     }
+    // R7 normally treats an empty allowlist as absent. For Kaze an explicitly
+    // empty allowlist grants no operations; do not turn it into default allow.
+    if p.pointer("/tools/allow").and_then(Json::as_array).is_some_and(Vec::is_empty) {
+        return Err(Denial::new(
+            "E_CAP_DENIED", "H-3/policy", format!("tools.allow permits no capabilities, including {}.{}", family, op)
+        ));
+    }
+    let req = json!({ "op": "tool.run", "tool": format!("kaze.{}.{}", family, op) });
+    let decision = crate::rt::policy::evaluate(&req, p);
+    evaluate_verdict(&decision, family, op)?;
     Ok(())
 }
 
@@ -291,17 +317,21 @@ mod tests {
     fn declared_effector_without_backend_is_refused() {
         let d = authorise(&one("drone"), &[], None, "drone", "arm").unwrap_err();
         assert_eq!(d.code, "E_CAP_MISSING");
-        assert!(d.reason.contains("--cap drone=sim"), "{}", d.reason);
+        assert!(d.reason.contains("--cap drone"), "{}", d.reason);
     }
 
     #[test]
     fn declared_effector_with_backend_passes() {
-        assert!(authorise(&one("drone"), &one("drone"), None, "drone", "arm").is_ok());
+        let p = json!({"tools": {"allow": ["kaze.drone.*"]}});
+        assert!(authorise(&one("drone"), &one("drone"), Some(&p), "drone", "arm").is_ok());
     }
 
     #[test]
-    fn in_process_family_needs_no_backend_grant() {
-        assert!(authorise(&one("log"), &[], None, "log", "info").is_ok());
+    fn in_process_family_requires_a_grant_and_policy() {
+        let p = json!({"tools": {"allow": ["kaze.log.*"]}});
+        assert_eq!(authorise(&one("log"), &[], Some(&p), "log", "info").unwrap_err().code, "E_CAP_MISSING");
+        assert_eq!(authorise(&one("log"), &one("log"), None, "log", "info").unwrap_err().code, "E_CAP_DENIED");
+        assert!(authorise(&one("log"), &one("log"), Some(&p), "log", "info").is_ok());
     }
 
     #[test]
@@ -322,7 +352,7 @@ mod tests {
 
     #[test]
     fn an_ask_verdict_does_not_permit_a_hardware_call() {
-        let p = json!({ "approval": { "mode": "always" } });
+        let p = json!({ "tools": {"allow": ["kaze.drone.*"]}, "approval": { "mode": "always" } });
         let d = authorise(&one("drone"), &one("drone"), Some(&p), "drone", "arm").unwrap_err();
         assert_eq!(d.code, "E_CAP_APPROVAL_REQUIRED");
     }
@@ -425,13 +455,13 @@ mod tests {
         ] {
             let d = validate_grant(family, backend).unwrap_err();
             assert_eq!(d.code, "E_CAP_INVALID", "--cap {}={}", family, backend);
-            assert!(d.reason.contains("no live backend"), "{}", d.reason);
+            assert!(d.reason.contains("no supported live backend"), "{}", d.reason);
         }
         // Instance names (`lidar`, `fan`) resolve to their family first.
-        assert!(validate_grant("lidar", "sim").is_ok());
+        assert_eq!(validate_grant("lidar", "sim").unwrap_err().code, "E_CAP_INVALID");
         assert_eq!(validate_grant("lidar", "bogus").unwrap_err().code, "E_CAP_INVALID");
-        assert!(validate_grant("fan", "sim").is_ok());
-        // `--cap drone` and `--cap drone=` both mean the simulator.
+        assert_eq!(validate_grant("fan", "sim").unwrap_err().code, "E_CAP_INVALID");
+        // A bare grant does not select a backend.
         assert!(validate_grant("drone", "").is_ok());
     }
 }

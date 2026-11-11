@@ -107,9 +107,11 @@ $ sofuu eval 'const b = sofuu.memory.open("./brain.qtsq", 768); b.remember(sofuu
 
 ### 4. Kaze: a domain-specific scripting language
 
-Kaze provides a parser, checker, VM, capability declarations and standalone compilation for bounded agent and device routines. It is not a general-purpose language. **The real model-and-authorized-tool journey is not yet established**: the embedded engine can select a simulated host for AI, tools and memory. Do not use the examples for real-world actions or treat their output as evidence of live integrations.
+Kaze provides a parser, checker, VM, capability declarations and standalone compilation for bounded agent and device routines. It is not a general-purpose language. **The real model-and-authorized-tool journey is not yet established.** Current embedded source refuses unavailable AI, tool, memory and alert operations; physical simulation is explicitly selected for drone or rover testing. Released binaries and live hardware still need separate verification. Do not use the examples for real-world actions or treat their output as evidence of live integrations.
 
-The [Kaze examples](example-agents/README.md) can be inspected and checked without running their simulated operations:
+See [embedded Kaze capability status](KAZE-EMBEDDED.md) for policy, backend and verification details.
+
+The [Kaze examples](example-agents/README.md) can be inspected and checked without executing their capabilities:
 
 ```bash
 sofuu script check example-agents/quant_sentinel/agent.kaze

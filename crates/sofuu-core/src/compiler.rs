@@ -1451,19 +1451,6 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         })
         .unwrap_or("agent");
 
-    let declared_grants: Vec<String> = kaze_src
-        .lines()
-        .find(|l| l.trim_start().starts_with("needs:"))
-        .map(|l| {
-            l.trim_start()["needs:".len()..]
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let grants_json = serde_json::to_string(&declared_grants).unwrap_or_else(|_| "[]".to_string());
-
     let parsed_prog = crate::domains::kaze::parser::parse(&kaze_src).ok();
     let default_entry = parsed_prog.as_ref().and_then(|p| {
         if p.item("main").is_some() {
@@ -1490,9 +1477,21 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
 
     let bootstrap = format!(r##"
 (function() {{
+    // A separately installed lean/custom base may be older than the compiler.
+    // Do not let it execute this agent with the old fabricated-result host.
+    if (typeof sofuu === 'undefined' || !sofuu.kaze || sofuu.kaze.capabilityGate !== 'fail-closed-1') {{
+        console.error('E_KAZE_RUNTIME: incompatible Kaze runtime; rebuild the Sofuu base binary');
+        if (typeof process !== 'undefined' && process.exit) process.exit(1);
+        return;
+    }}
     var kazeSource = {kaze_source_json};
     var kazeName = {kaze_name_json};
-    var defaultGrants = {grants_json};
+    // Declarations in the agent source are not host grants.
+    var defaultGrants = [];
+    var policyPath = null;
+    var policyJson = null;
+    var pins = {{}};
+    var sim = null;
     var defaultEntry = {default_entry_json};
     var routineSignatures = {routine_signatures_json};
 
@@ -1509,6 +1508,9 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             "  --interval <interval>  Alias for --every\n" +
             "  --fuel <n>             Instruction budget limit (default: 200000)\n" +
             "  --cap <name>           Grant capability backend (e.g. drone=sim)\n" +
+            "  --policy <file>        Load the explicit capability policy\n" +
+            "  --pin <name>=<line>    Configure a device pin\n" +
+            "  --sim <key=value,...>   Physical test state; requires an explicit simulator\n" +
             "  -i, --interactive      Launch interactive Agent TUI shell\n" +
             "  -h, --help             Show this help message\n\n" +
             "Configuration Precedence (Production 12-Factor):\n" +
@@ -1590,9 +1592,32 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         }} else if (a.startsWith('--entry=')) {{
             entryRoutine = a.slice(8);
             explicitEntry = true;
-        }} else if (a.startsWith('--cap')) {{
+        }} else if (a === '--cap' || a.startsWith('--cap=')) {{
             var capVal = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
-            if (capVal) defaultGrants.push(capVal.split('=')[0].trim());
+            if (!capVal) {{ console.error('E_CAP_INVALID: --cap needs a family'); if (process.exit) process.exit(1); return; }}
+            defaultGrants.push(capVal.trim());
+        }} else if (a === '--policy' || a.startsWith('--policy=')) {{
+            policyPath = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
+            if (!policyPath) {{ console.error('E_CAP_DENIED: --policy needs a path'); if (process.exit) process.exit(1); return; }}
+        }} else if (a === '--pin' || a.startsWith('--pin=')) {{
+            var pinVal = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
+            var pinEq = pinVal ? pinVal.indexOf('=') : -1;
+            var pinName = pinEq > 0 ? pinVal.slice(0, pinEq).trim() : '';
+            var pinNumber = pinEq > 0 ? pinVal.slice(pinEq + 1).trim() : '';
+            if (!pinName || !/^\d+$/.test(pinNumber) || Number(pinNumber) > 65535) {{
+                console.error('E_KAZE_ARGS: --pin expects name=<0..65535>'); if (process.exit) process.exit(1); return;
+            }}
+            pins[pinName] = Number(pinNumber);
+        }} else if (a === '--sim' || a.startsWith('--sim=')) {{
+            var simVal = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
+            if (!simVal) {{ console.error('E_CAP_INVALID: --sim needs key=value'); if (process.exit) process.exit(1); return; }}
+            sim = sim || {{}};
+            var pairs = simVal.split(',');
+            for (var si = 0; si < pairs.length; si++) {{
+                var simEq = pairs[si].indexOf('=');
+                if (simEq <= 0) {{ console.error('E_CAP_INVALID: --sim expects key=value'); if (process.exit) process.exit(1); return; }}
+                sim[pairs[si].slice(0, simEq).trim()] = pairs[si].slice(simEq + 1).trim();
+            }}
         }} else if (a.startsWith('--arg')) {{
             var pair = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
             if (pair) {{
@@ -1609,6 +1634,26 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         }} else if (!a.startsWith('-')) {{
             positionals.push(a);
         }}
+    }}
+
+    if (policyPath) {{
+        try {{
+            if (!sofuu.fs || !sofuu.fs.readFileSync) throw new Error('policy file access is unavailable');
+            policyJson = '' + sofuu.fs.readFileSync(policyPath, 'utf8');
+        }} catch (policyErr) {{
+            console.error('E_CAP_DENIED: cannot read policy: ' + (policyErr && policyErr.message ? policyErr.message : policyErr));
+            if (typeof process !== 'undefined' && process.exit) process.exit(1);
+            return;
+        }}
+    }}
+
+    function runOptions() {{
+        var opts = {{ fuel: fuel, grants: defaultGrants }};
+        if (entryRoutine) opts.entry = entryRoutine;
+        if (policyJson !== null) opts.policyJson = policyJson;
+        if (Object.keys(pins).length) opts.pins = pins;
+        if (sim !== null) opts.sim = sim;
+        return opts;
     }}
 
     // --- Production Configuration Pipeline (Tiered Precedence) ---
@@ -1843,8 +1888,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
                 runArgs['cycle'] = cycles;
                 runArgs['timestamp'] = ts;
 
-                var opts = {{ fuel: fuel, grants: defaultGrants }};
-                if (entryRoutine) opts.entry = entryRoutine;
+                var opts = runOptions();
 
                 var res = sofuu.kaze.run(kazeSource, runArgs, opts);
                 if (!res.ok) {{
@@ -1852,6 +1896,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
                     badge('ERROR', "Cycle #" + cycles + " failed: " + (res.error || res.code));
                 }} else {{
                     successes++;
+                    if (res.simulated_families && res.simulated_families.length) badge('STATUS', 'Simulation (testing): ' + res.simulated_families.join(', '));
                     if (res.actions && res.actions.length > 0) {{
                         for (var j = 0; j < res.actions.length; j++) {{
                             var act = res.actions[j];
@@ -1874,10 +1919,10 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
                         }} else {{
                             badge('VERDICT', "\x1b[31mREJECT\x1b[0m " + res.verdict.reason);
                         }}
-                    }} else if (res.value && res.value !== 'nothing') {{
-                        badge('RESULT', res.value);
+                    }} else if (res.result && res.result !== 'nothing') {{
+                        badge('RESULT', res.result);
                     }}
-                    console.log("\x1b[90m" + (res.instructions || 0) + " instructions · " + (res.fuelUsed || 0) + " fuel\x1b[0m");
+                    console.log("\x1b[90m" + (res.instructions || 0) + " instructions · " + (res.fuel || 0) + " fuel\x1b[0m");
                 }}
             }} catch (ex) {{
                 failures++;
@@ -1893,8 +1938,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         bindPositionals(args);
         if (!validateParameters(args)) return;
 
-        var opts = {{ fuel: fuel, grants: defaultGrants }};
-        if (entryRoutine) opts.entry = entryRoutine;
+        var opts = runOptions();
 
         var res = sofuu.kaze.run(kazeSource, args, opts);
         if (!res.ok) {{
@@ -1912,6 +1956,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         }}
 
         badge('AGENT', kazeName + " :: " + res.entry);
+        if (res.simulated_families && res.simulated_families.length) badge('STATUS', 'Simulation (testing): ' + res.simulated_families.join(', '));
         if (res.actions && res.actions.length > 0) {{
             for (var j = 0; j < res.actions.length; j++) {{
                 var act = res.actions[j];
@@ -1934,10 +1979,10 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             }} else {{
                 badge('VERDICT', "\x1b[31mREJECT\x1b[0m " + res.verdict.reason);
             }}
-        }} else if (res.value && res.value !== 'nothing') {{
-            badge('RESULT', res.value);
+        }} else if (res.result && res.result !== 'nothing') {{
+            badge('RESULT', res.result);
         }}
-        console.log("\x1b[90m" + (res.instructions || 0) + " instructions · " + (res.fuelUsed || 0) + " fuel\x1b[0m");
+        console.log("\x1b[90m" + (res.instructions || 0) + " instructions · " + (res.fuel || 0) + " fuel\x1b[0m");
     }}
 
     function launchInteractiveTUI() {{
@@ -1952,10 +1997,10 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
                     runArgs['prompt'] = prompt;
                     runArgs['query'] = prompt;
                     runArgs['input'] = prompt;
-                    var opts = {{ fuel: fuel, grants: defaultGrants }};
-                    if (entryRoutine) opts.entry = entryRoutine;
+                    var opts = runOptions();
                     var res = sofuu.kaze.run(kazeSource, runArgs, opts);
                     if (!res.ok) throw new Error(res.error || res.code);
+                    if (res.simulated_families && res.simulated_families.length) badge('STATUS', 'Simulation (testing): ' + res.simulated_families.join(', '));
                     if (res.actions) {{
                         for (var a = 0; a < res.actions.length; a++) {{
                             var act = res.actions[a];
@@ -1967,7 +2012,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
                     if (res.verdict) {{
                         return (res.verdict.allow ? "VERDICT ALLOW: " : "VERDICT REJECT: ") + res.verdict.reason;
                     }}
-                    return res.value;
+                    return res.result;
                 }}
             }};
             sofuu.agent.interact(agentProxy, {{ title: kazeName }}).catch(function(err) {{

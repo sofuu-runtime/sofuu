@@ -52,7 +52,7 @@ fn install_compiled_prelude(
 /// silently swallowed. The artifact now answers for itself first: version and
 /// help are intercepted, and an unknown leading flag is refused with the
 /// list of what is accepted.
-fn artifact_arg_gate(args: &[String]) -> Option<ExitCode> {
+fn artifact_arg_gate(args: &[String], is_kaze: bool) -> Option<ExitCode> {
     let mut i = 1usize;
     while i < args.len() {
         let a = args[i].as_str();
@@ -64,6 +64,7 @@ fn artifact_arg_gate(args: &[String]) -> Option<ExitCode> {
                 println!("sofuu-artifact {}", env!("CARGO_PKG_VERSION"));
                 return Some(ExitCode::SUCCESS);
             }
+            "--help" | "-h" if is_kaze => return None,
             "--help" | "-h" => {
                 println!("Usage: {} [--arg name=value]... [--config <path>] [--json]\n\n\
                           A compiled Sofuu artifact: the program is embedded, so there is\n\
@@ -82,10 +83,27 @@ fn artifact_arg_gate(args: &[String]) -> Option<ExitCode> {
             }
             _ => {}
         }
-        let known = a.starts_with("--arg") || a.starts_with("--config") || a == "--json";
+        let takes_value = ["--arg", "--config", "-c", "--entry", "--cap", "--policy",
+            "--pin", "--sim", "--fuel", "--every", "--interval"];
+        if is_kaze && takes_value.contains(&a) {
+            if i + 1 >= args.len() || args[i + 1].starts_with("--") {
+                eprintln!("Error: {} needs a value", a);
+                return Some(ExitCode::from(2));
+            }
+            i += 2;
+            continue;
+        }
+        let known_kaze = is_kaze && (takes_value.iter().any(|flag| a.strip_prefix(flag)
+            .is_some_and(|rest| rest.starts_with('=')))
+            || matches!(a, "--interactive" | "-i" | "--daemon" | "-d"));
+        let known = known_kaze || a.starts_with("--arg") || a.starts_with("--config") || a == "--json";
         if a.starts_with('-') && !known {
             eprintln!("Error: Unrecognized flag '{}'", a);
-            eprintln!("  accepted: --arg name=value, --config <path>, --json, --version, --help, --");
+            if is_kaze {
+                eprintln!("  use --help for the Kaze agent options");
+            } else {
+                eprintln!("  accepted: --arg name=value, --config <path>, --json, --version, --help, --");
+            }
             return Some(ExitCode::from(2));
         }
         i += 1;
@@ -128,7 +146,8 @@ fn main() -> ExitCode {
         Ok(Some(payload)) => {
             /* CP-046/CP-047: answer for the artifact before the embedded
              * program ever runs. */
-            if let Some(code) = artifact_arg_gate(&args) {
+            let is_kaze = std::path::Path::new(&payload.entry).extension().is_some_and(|ext| ext == "kaze");
+            if let Some(code) = artifact_arg_gate(&args, is_kaze) {
                 return code;
             }
             let mut payload_argv: Vec<String> = Vec::with_capacity(args.len() + 1);

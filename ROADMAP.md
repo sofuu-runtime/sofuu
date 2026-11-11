@@ -20,7 +20,7 @@
 
 ## 1. Implemented Surfaces and Experimental Modules
 
-> **Status:** Sofuu is beta. Implementation of a feature is not proof of production readiness, complete security, or an uptime guarantee. The current Kaze host can return synthetic non-robotics results; the real model-and-tool milestone remains open.
+> **Status:** Sofuu is beta. Implementation of a feature is not proof of production readiness, complete security, or an uptime guarantee. Current embedded Kaze source refuses unavailable non-robotics capabilities; the real model-and-tool milestone and published-binary verification remain open.
 
 ### ⚡ Main Runtime Subsystems
 
@@ -58,6 +58,7 @@
 #### 💨 Kaze (風) Zero-GC Deterministic Guardrail Engine
 - [x] **Small Typed Language**: Fixed-size arena allocation, zero-GC pauses in the hot path, bytecode compilation.
 - [x] **Capability Gates**: Fail-closed access-control policies enforcing declared hardware/system permissions.
+- [ ] **Real Kaze backends**: The embedded source requires explicit grants and tool policy, and refuses unavailable AI, tool, memory and alert operations. Complete real adapters, remaining execution-path checks and release verification; see [Kaze embedded status](KAZE-EMBEDDED.md).
 
 ---
 
@@ -70,7 +71,7 @@
 - [x] **Autonomous Dead-Man Switch**: Runtime-scheduled 1 Hz heartbeat triggering ArduPilot native GCS failsafes upon interruption.
 - [x] **Drone Agent Tools & Mission DSL**: High-level `sofuu.drone`, `sofuu.mavlink`, `PACKS.drone` (6 agent tools), pre-flight mission validator, and survey grid generators.
 - [x] **Ground Rover & Linux GPIO**: Portable `/sys/class/gpio` and Raspberry Pi 5 chardev `/dev/gpiochip*` v2 line ABI with pulse timers; ground rover pre-flight test suite passing 5/5 cases.
-- [x] **Kaze Live Hardware Bridge**: Direct coupling between Kaze natural scripting and active flight links/GPIO buses.
+- [ ] **Kaze Live Hardware Bridge**: Embedded live flight links and GPIO dispatch are disabled pending verified policy propagation and physical safety checks.
 - [x] **Field CLI Toolchain**: `sofuu drone observe / status / send / mission / why / init`.
 
 #### 🧠 Built-in Local Inference Engine [Experimental - Preview]

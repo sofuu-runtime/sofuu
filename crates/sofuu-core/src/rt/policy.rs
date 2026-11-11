@@ -343,7 +343,7 @@ fn check_ty(path: &str, ty: Ty, v: &serde_json::Value, errs: &mut Vec<String>) {
 
 /// Refuse a policy that is not the documented R7 shape. An unknown section or
 /// key is an error, not a no-op — that is the whole point of the check.
-fn validate_policy(v: &serde_json::Value) -> Result<(), String> {
+pub(crate) fn validate_policy(v: &serde_json::Value) -> Result<(), String> {
     let Some(obj) = v.as_object() else {
         return Err("policy must be a JSON object".into());
     };
@@ -373,6 +373,49 @@ fn validate_policy(v: &serde_json::Value) -> Result<(), String> {
     } else {
         Err(errs.join("; "))
     }
+}
+
+/// Parse policy documents without accepting duplicate keys at any depth.
+/// Otherwise a later duplicate can silently discard an earlier deny rule.
+pub(crate) fn parse_policy_strict(text: &str) -> Result<serde_json::Value, String> {
+    use serde::de::{Deserialize, Deserializer, Error, MapAccess, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct Unique(serde_json::Value);
+    impl<'de> Deserialize<'de> for Unique {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = Unique;
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str("a JSON value with unique object keys") }
+                fn visit_bool<E: Error>(self, v: bool) -> Result<Unique, E> { Ok(Unique(v.into())) }
+                fn visit_i64<E: Error>(self, v: i64) -> Result<Unique, E> { Ok(Unique(v.into())) }
+                fn visit_u64<E: Error>(self, v: u64) -> Result<Unique, E> { Ok(Unique(v.into())) }
+                fn visit_f64<E: Error>(self, v: f64) -> Result<Unique, E> {
+                    serde_json::Number::from_f64(v).map(|n| Unique(n.into())).ok_or_else(|| E::custom("invalid number"))
+                }
+                fn visit_str<E: Error>(self, v: &str) -> Result<Unique, E> { Ok(Unique(v.into())) }
+                fn visit_string<E: Error>(self, v: String) -> Result<Unique, E> { Ok(Unique(v.into())) }
+                fn visit_none<E: Error>(self) -> Result<Unique, E> { Ok(Unique(serde_json::Value::Null)) }
+                fn visit_unit<E: Error>(self) -> Result<Unique, E> { Ok(Unique(serde_json::Value::Null)) }
+                fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Unique, A::Error> {
+                    let mut out = Vec::new();
+                    while let Some(Unique(value)) = seq.next_element()? { out.push(value); }
+                    Ok(Unique(out.into()))
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Unique, A::Error> {
+                    let mut out = serde_json::Map::new();
+                    while let Some((key, Unique(value))) = map.next_entry::<String, Unique>()? {
+                        if out.contains_key(&key) { return Err(A::Error::custom(format!("duplicate policy key '{}'", key))); }
+                        out.insert(key, value);
+                    }
+                    Ok(Unique(out.into()))
+                }
+            }
+            d.deserialize_any(V)
+        }
+    }
+    serde_json::from_str::<Unique>(text).map(|v| v.0).map_err(|e| e.to_string())
 }
 
 /// The fs.<key> mode and the roots it is bounded by — ONE resolver, shared by
@@ -911,6 +954,13 @@ pub fn layered_policy_from_disk() -> Result<serde_json::Value, String> {
     layered_policy_from_paths(user, project)
 }
 
+/// Kaze additionally rejects duplicate keys before merging policy layers.
+pub(crate) fn layered_kaze_policy_from_disk() -> Result<serde_json::Value, String> {
+    let user = std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(".sofuu/policy.json"));
+    let project = std::env::current_dir().ok().map(|cwd| cwd.join(".sofuu/policy.json"));
+    layered_policy_from_paths_inner(user, project, true)
+}
+
 /// The testable half of layered_policy_from_disk: merge the layers found at the
 /// given paths, in user-then-project order.
 ///
@@ -919,6 +969,14 @@ pub fn layered_policy_from_disk() -> Result<serde_json::Value, String> {
 pub fn layered_policy_from_paths(
     user: Option<std::path::PathBuf>,
     project: Option<std::path::PathBuf>,
+) -> Result<serde_json::Value, String> {
+    layered_policy_from_paths_inner(user, project, false)
+}
+
+fn layered_policy_from_paths_inner(
+    user: Option<std::path::PathBuf>,
+    project: Option<std::path::PathBuf>,
+    strict: bool,
 ) -> Result<serde_json::Value, String> {
     let mut layers: Vec<serde_json::Value> = Vec::new();
     let mut paths: Vec<(&str, std::path::PathBuf)> = Vec::new();
@@ -929,12 +987,18 @@ pub fn layered_policy_from_paths(
         paths.push(("project", p));
     }
     for (label, path) in paths {
-        if !path.is_file() {
+        if strict {
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("{label} policy {}: {e}", path.display())),
+            }
+        } else if !path.is_file() {
             continue;
         }
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("{label} policy {}: {e}", path.display()))?;
-        let v: serde_json::Value = serde_json::from_str(&text)
+        let v = (if strict { parse_policy_strict(&text) } else { serde_json::from_str(&text).map_err(|e| e.to_string()) })
             .map_err(|e| format!("{label} policy {}: not valid JSON: {e}", path.display()))?;
         if !v.is_object() {
             return Err(format!("{label} policy {}: must be a JSON object", path.display()));

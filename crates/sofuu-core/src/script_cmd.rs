@@ -32,8 +32,9 @@ pub fn print_help() {
          \x20 repl                 Interactive session: define routines, then .run\n\
          \x20 version              Print the Kaze language version\n\n\
          run options:\n\
-         \x20 --cap <family>[=<device>]  Grant a backend: sim (default),\n\
-         \x20                        udp:127.0.0.1:14550, or uart:/dev/ttyAMA0@921600\n\
+         \x20 --cap <family>[=<device>]  Grant a family; drone=sim/rover=sim are tests\n\
+         \x20 --policy <file>        Operator R7 policy with tools.allow or tools.deny\n\
+         \x20 --pin <name>=<line>  Configure a device pin (live devices disabled)\n\
          \x20 --entry <name>         Routine to run (default: main, or the only one)\n\
          \x20 --arg <name>=<json>    Bind a parameter (repeatable)\n\
          \x20 --fuel <n>             Instruction budget (default 200000)\n\
@@ -41,7 +42,7 @@ pub fn print_help() {
          \x20 --ticks <n>            Supervisor ticks after the entry (default 0)\n\
          \x20 --tick-ms <n>          Virtual tick period (default 100)\n\
          \x20 --sim <k=v,k=v>        Initial machine state (battery=15,armed=true)\n\
-         \x20 --no-policy            Skip the on-disk R7 policy layer\n\
+         \x20 --no-policy            Skip loading; capability calls are denied\n\
          \x20 --json                 Machine-readable report\n",
         sfs::VERSION
     );
@@ -56,7 +57,7 @@ fn print_subcommand_help(sub: &str) {
             "Usage: sofuu script run <file.kaze> [options]\n\n\
              Check, compile and run one script in the shared VM.\n\n\
              Options:\n\
-             \x20 --cap <family>[=<device>]  Grant a backend (sim, udp:HOST:PORT, uart:PATH@BAUD)\n\
+             \x20 --cap <family>[=<device>]  Grant a family; drone=sim/rover=sim are tests\n\
              \x20 --entry <name>             Routine to run (default: main)\n\
              \x20 --arg <name>=<json>        Bind a parameter (repeatable)\n\
              \x20 --fuel <n>                 Instruction budget (default 200000)\n\
@@ -64,7 +65,7 @@ fn print_subcommand_help(sub: &str) {
              \x20 --ticks <n> --tick-ms <n>  Supervisor ticks after the entry\n\
              \x20 --sim <k=v,k=v>            Initial machine state\n\
              \x20 --policy <file>            Operator policy layer\n\
-             \x20 --no-policy                Skip the on-disk R7 policy layer\n\
+             \x20 --no-policy                Skip loading; capability calls are denied\n\
              \x20 --json                     Machine-readable report\n"
         ),
         "check" => println!(
@@ -94,7 +95,7 @@ fn print_subcommand_help(sub: &str) {
 struct Flags {
     positional: Vec<String>,
     caps: Vec<String>,
-    /// `family -> device` from `--cap family=device`; empty device means sim.
+    /// `family -> device` from `--cap family=device`; empty means no backend.
     backend: Vec<(String, String)>,
     /// `device -> pin` from `--pin` (Kaze v0.2 GPIO).
     pins: Vec<(String, u16)>,
@@ -152,8 +153,9 @@ fn parse_flags(argv: &[String]) -> Result<Flags, String> {
             "--cap" => {
                 let v = next("--cap")?;
                 let (family, device) = match v.split_once('=') {
-                    Some((f, d)) => (f.trim().to_string(), d.trim().to_string()),
-                    None => (v.trim().to_string(), "sim".to_string()),
+                    Some((f, d)) if !d.trim().is_empty() => (f.trim().to_string(), d.trim().to_string()),
+                    Some(_) => return Err("--cap family= needs a backend name".to_string()),
+                    None => (v.trim().to_string(), String::new()),
                 };
                 if family.is_empty() {
                     return Err("--cap needs a family (drone=udp:127.0.0.1:14550)".to_string());
@@ -272,16 +274,18 @@ fn policy_layer(f: &Flags) -> Result<Option<serde_json::Value>, OptErr> {
     if let Some(path) = &f.policy_file {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| OptErr::Policy(format!("--policy {path}: {e}")))?;
-        let v: serde_json::Value = serde_json::from_str(&raw)
+        let v = crate::rt::policy::parse_policy_strict(&raw)
             .map_err(|e| OptErr::Policy(format!("--policy {path}: not valid JSON: {e}")))?;
         if !v.is_object() {
             return Err(OptErr::Policy(format!(
                 "--policy {path}: must be a JSON object"
             )));
         }
+        crate::rt::policy::validate_policy(&v)
+            .map_err(|e| OptErr::Policy(format!("--policy {path}: {e}")))?;
         return Ok(Some(v));
     }
-    crate::rt::policy::layered_policy_from_disk()
+    crate::rt::policy::layered_kaze_policy_from_disk()
         .map(Some)
         .map_err(OptErr::Policy)
 }
@@ -289,6 +293,10 @@ fn policy_layer(f: &Flags) -> Result<Option<serde_json::Value>, OptErr> {
 fn options_from(f: &Flags) -> Result<RunOptions, OptErr> {
     let mut sim = SimState::default();
     if !f.sim.is_empty() {
+        if !f.backend.iter().any(|(family, backend)| backend == "sim"
+            && matches!(sfs::caps::family_of(family), "drone" | "rover")) {
+            return Err(OptErr::Usage("--sim requires an explicit drone=sim or rover=sim testing backend".into()));
+        }
         sim.apply_overrides(&f.sim).map_err(OptErr::Usage)?;
     }
     /* KZ-035 (AUDIT-2026-11-08): the guided E_KAZE_PARAM message offers
@@ -563,6 +571,9 @@ fn cmd_compile(argv: &[String]) -> i32 {
 }
 
 fn print_report(report: &RunReport) {
+    if !report.simulated_families.is_empty() {
+        println!("simulation (testing): {}", report.simulated_families.join(", "));
+    }
     for (level, msg) in &report.logs {
         match level.as_str() {
             "error" => eprintln!("\x1b[31merror\x1b[0m: {}", msg),
@@ -607,6 +618,7 @@ fn report_json(report: &RunReport) -> String {
         "instructions": report.instructions,
         "ticks": report.ticks,
         "verdict": verdict,
+        "simulated_families": report.simulated_families,
     });
     serde_json::to_string_pretty(&json).unwrap_or_default()
 }
@@ -619,7 +631,7 @@ fn report_json(report: &RunReport) -> String {
 // visible in `.list`, which makes the REPL a usable scratchpad for a mission.
 
 fn cmd_repl(argv: &[String]) -> i32 {
-    let flags = match parse_flags(argv) {
+    let mut flags = match parse_flags(argv) {
         Ok(f) => f,
         Err(e) => {
             report_cli_failure("E_USAGE", &e, false);
@@ -651,7 +663,7 @@ fn cmd_repl(argv: &[String]) -> i32 {
         }
         let trimmed = line.trim_end();
         if pending.is_empty() && trimmed.starts_with('.') {
-            match handle_repl_command(trimmed, &mut needs, &mut grants, &body, &flags) {
+            match handle_repl_command(trimmed, &mut needs, &mut grants, &body, &mut flags) {
                 ReplFlow::Continue => continue,
                 ReplFlow::Exit => break,
             }
@@ -696,7 +708,7 @@ fn handle_repl_command(
     needs: &mut Vec<String>,
     grants: &mut Vec<String>,
     body: &str,
-    flags: &Flags,
+    flags: &mut Flags,
 ) -> ReplFlow {
     let mut parts = line.splitn(2, ' ');
     let cmd = parts.next().unwrap_or("");
@@ -707,7 +719,7 @@ fn handle_repl_command(
             println!(
                 ".list                 show the source added so far\n\
                  .needs <a, b>         declare capabilities for this session\n\
-                 .cap <family>         grant the sim backend for a family\n\
+                 .cap <family>[=sim]   grant a family; drone/rover sim is testing only\n\
                  .run <name> [json]    run a routine with optional arguments\n\
                  .clear                forget everything defined so far\n\
                  .exit                 leave"
@@ -735,11 +747,22 @@ fn handle_repl_command(
         }
         ".cap" => {
             for n in rest.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                if !grants.iter().any(|x| x == n) {
-                    grants.push(n.to_string());
+                let (family, backend) = match n.split_once('=') {
+                    Some((family, backend)) if !family.trim().is_empty() && !backend.trim().is_empty() => (family.trim(), backend.trim()),
+                    Some(_) => { eprintln!("E_CAP_INVALID: .cap needs a family and backend"); continue; }
+                    None => (n, ""),
+                };
+                if let Err(d) = crate::rt::hardware::validate_grant(family, backend) {
+                    eprintln!("{}: {}", d.code, d.reason);
+                    continue;
                 }
-                if !needs.iter().any(|x| x == n) {
-                    needs.push(n.to_string());
+                flags.backend.retain(|(f, _)| f != family);
+                flags.backend.push((family.to_string(), backend.to_string()));
+                if !grants.iter().any(|x| x == family) {
+                    grants.push(family.to_string());
+                }
+                if !needs.iter().any(|x| x == family) {
+                    needs.push(family.to_string());
                 }
             }
             println!("granted: {}", grants.join(", "));
@@ -760,8 +783,8 @@ fn handle_repl_command(
                 })
                 .unwrap_or_default();
             let src = format!("{}{}", needs_line(needs), body);
-            let policy = match policy_layer(&flags) {
-                Ok(p) => p,
+            let mut opts = match options_from(flags) {
+                Ok(opts) => opts,
                 Err(e) => {
                     /* REPL: report and stay open — a bad guard file must not
                      * take the session down, but it must also never be
@@ -775,22 +798,9 @@ fn handle_repl_command(
                     return ReplFlow::Continue;
                 }
             };
-            let opts = RunOptions {
-                entry: Some(name.to_string()),
-                args,
-                grants: grants.clone(),
-                fuel: flags.fuel.unwrap_or(sfs::vm::Limits::default().fuel),
-                heap_bytes: flags
-                    .heap_kb
-                    .map(|kb| (kb as usize).saturating_mul(1024))
-                    .unwrap_or(sfs::vm::Limits::default().heap_bytes),
-                ticks: flags.ticks.unwrap_or(0),
-                tick_ms: flags.tick_ms.unwrap_or(100),
-                sim: SimState::default(),
-                policy,
-                backend: flags.backend.clone(),
-                pins: flags.pins.clone(),
-            };
+            opts.entry = Some(name.to_string());
+            opts.args = args;
+            opts.grants = grants.clone();
             match sfs::run_source(&src, "<repl>", &opts) {
                 Ok(report) => print_report(&report),
                 Err(err) => eprintln!("\x1b[31m{}\x1b[0m: {}", err.code, err.message),

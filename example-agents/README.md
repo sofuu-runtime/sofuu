@@ -1,6 +1,6 @@
 # Kaze example routines
 
-> **Status:** Kaze language example only. The embedded host can return synthetic AI, tool, memory and alert results. A real model-and-authorized-tool workflow is not established, and the current non-robotics simulation conflicts with [RULES.md §1.9](../RULES.md). Do not execute these examples as evidence of a real action.
+> **Status:** Kaze language examples only. Current embedded source refuses unavailable AI, tool, memory and alert calls; older published binaries may behave differently. A real model-and-authorized-tool workflow is not established. Do not execute these examples as evidence of a real action.
 
 These four pure Kaze source files illustrate routine syntax and capability declarations. They are not deployable integrations or evidence of reliable autonomous behavior. The names and domain scenarios are illustrative.
 

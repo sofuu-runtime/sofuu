@@ -1,6 +1,6 @@
 # Med Protocol
 
-> **Language example only:** The current embedded Kaze host can return synthetic non-robotics capability results, contrary to the real-execution policy in [RULES.md](../../RULES.md). Do not use it to perform or verify real-world actions.
+> **Language example only:** Current embedded Kaze source refuses unavailable non-robotics capability calls; older published binaries may behave differently. Do not use it to perform or verify real-world actions.
 
 A clinical-themed language example only. It is not validated medical software, does not establish HIPAA compliance, and must not be used for patient triage, EHR updates or emergency alerts.
 

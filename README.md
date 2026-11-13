@@ -25,7 +25,7 @@ The project is beta. Features and evidence vary by platform and execution path:
 
 * **Native runtime:** QuickJS runs without a JIT. See [BENCHMARKS.md](BENCHMARKS.md) for measured startup conditions, not a universal latency bound.
 * **On-Device Vector Memory (QTSQ):** Local vector storage is encrypted by default; plaintext mode and unencrypted exports are available. `embedLocal` uses a 768-dimensional trigram hash, not a trained semantic model.
-* **Agents & Kaze:** JS/TS agent loops and domain toolpacks; Kaze routines and standalone compilation. The real Kaze model-and-tool execution path remains an open milestone.
+* **Agents & Kaze:** JS/TS agent loops and domain toolpacks; Kaze routines and standalone compilation. The current source has a real model-and-tool bridge for authorized async Kaze paths; released-artifact and local-GGUF verification remain open.
 * **Model Context Protocol (MCP):** Client and server support for selected protocol versions and transports; see the limitations below.
 * **Policy and sandbox tools:** Selected tool, filesystem, network, and shell paths have policy checks; boundaries and approval handling depend on the execution surface.
 * **Embedding:** A C ABI and mobile wrappers are available; support and testing vary by platform. Hardware and app-store acceptance are not universally established.
@@ -140,7 +140,7 @@ Sofuu groups the main runtime surfaces and experimental modules below. Core mean
 | **Standalone Compiler** | **Core** | `sofuu compile`: native executables with a 32-byte `SOFUU_BIN_V1` trailer; signing and dependencies vary by platform. |
 | **Vector Memory (QTSQ)** | **Core** | On-device `.qtsq` vector containers, cached KDF v2, plaintext zero-KDF mode, hardware SIMD search. |
 | **Model Context Protocol (MCP)** | **Core** | Native client & server supporting stdio, HTTP, SSE, and direct in-process transports; dynamic tool discovery. |
-| **Kaze Agent Language** | **Core** | Domain-specific scripting language and VM; real model and tool integration remains incomplete. |
+| **Kaze Agent Language** | **Core** | Domain-specific scripting language and VM with authorized async model/tool dispatch; released-artifact and local-GGUF verification remain open. |
 | **Security Sandbox** | **Core** | Deterministic path traversal blocking, private CIDR SSRF filtering, credential shielding (`.env`, `id_rsa`). |
 | **Local Inference Engine** | **Preview** | Built-in custom GGUF/SafeTensors engine. (For deployed local inference, use `sofuu-plugin-llamacpp` or remote providers). |
 | **Robotics & MAVLink** | **Preview** | `sofuu drone`, MAVLink v2 codec, and GPIO line timers through hardware safety gates. |

@@ -881,32 +881,25 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                  * coloring only future rows. TTY-gated inside: piped
                  * /theme stays byte-clean. */
                 if sofuu_ffi::tui_active() {
-                    unsafe {
-                        sofuu_core::rt::tui::tui_set_bg(t.bg as c_int);
-                        sofuu_core::rt::tui::tui_set_sel(
-                            theme::accent_index(t.accent).map(|v| v as c_int).unwrap_or(-1),
-                        );
-                        let c_panel = std::ffi::CString::new(t.panel).unwrap();
-                        sofuu_core::rt::tui::tui_set_panel(c_panel.as_ptr());
-                        let c_subtle = std::ffi::CString::new(t.subtle).unwrap();
-                        sofuu_core::rt::tui::tui_set_subtle(c_subtle.as_ptr());
-                    }
+                    sync_tui_theme(t);
                     let from = theme::lookup(&prev_name);
                     sofuu_core::rt::tui::tui_remap_rows(&theme::fg_remap_pairs(from, t));
                     unsafe {
-                        sofuu_core::rt::tui::tui_render_conversation();
+                        sofuu_core::rt::tui::tui_relayout();
                         sofuu_core::modules::process::tui_repaint_chrome();
                     }
                 }
                 chat_out(&format!(
-                    "  ✓ Theme → {} ({} of 13)\n",
+                    "  ✓ Theme → {} ({} of {})\n",
                     t.name,
-                    theme::THEMES.iter().position(|x| x.name == t.name).map(|i| i + 1).unwrap_or(1)
+                    theme::THEMES.iter().position(|x| x.name == t.name).map(|i| i + 1).unwrap_or(1),
+                    theme::THEMES.len()
                 ));
                 "ok"
             } else {
                 chat_out(&format!(
-                    "  Unknown theme '{arg}' — bare /theme lists all 13.\n"
+                    "  Unknown theme '{arg}' — bare /theme lists all {}.\n",
+                    theme::THEMES.len()
                 ));
                 "ok"
             }
@@ -1641,11 +1634,24 @@ fn print_help() {
         80
     };
 
+    let (hdr_sgr, dim_sgr) = if sofuu_ffi::tui_active() {
+        let th_name = CFG
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.theme.clone())
+            .unwrap_or_default();
+        let th = theme::lookup(&th_name);
+        (format!("\x1b[{}m", th.heading), format!("\x1b[{}m", th.subtle))
+    } else {
+        ("\x1b[1;36m".to_string(), "\x1b[2m".to_string())
+    };
+
     for row in &rows {
         match row {
             Row::Blank => chat_out(""),
-            Row::Header(s) => chat_out(&format!("\n\x1b[1;36m{s}\x1b[0m")),
-            Row::Note(s) => chat_out(&format!("\x1b[2m{s}\x1b[0m")),
+            Row::Header(s) => chat_out(&format!("\n{hdr_sgr}{s}\x1b[0m")),
+            Row::Note(s) => chat_out(&format!("{dim_sgr}{s}\x1b[0m")),
             Row::Cmd(cmd, desc) => {
                 // 4 indent + column + "— " puts the description at DESC_COL.
                 let desc_col = 4 + col + 2;
@@ -1666,9 +1672,9 @@ fn print_help() {
                 // soft-wrapping it mid-sentence.
                 for (i, chunk) in wrap_help_desc(desc, term_w.saturating_sub(desc_col)).iter().enumerate() {
                     if i == 0 {
-                        chat_out(&format!("{label}\x1b[2m— {chunk}\x1b[0m"));
+                        chat_out(&format!("{label}{dim_sgr}— {chunk}\x1b[0m"));
                     } else {
-                        chat_out(&format!("{}\x1b[2m{chunk}\x1b[0m", " ".repeat(desc_col)));
+                        chat_out(&format!("{}{dim_sgr}{chunk}\x1b[0m", " ".repeat(desc_col)));
                     }
                 }
             }
@@ -1912,6 +1918,22 @@ fn theme_accent(cfg: &ChatConfig) -> String {
 /// SGR open sequence for the active theme's subtle role (secondary text, labels, hints).
 fn theme_subtle(cfg: &ChatConfig) -> String {
     format!("\x1b[{}m", theme::lookup(&cfg.theme).subtle)
+}
+
+/// Sync all TUI theme registers (`bg`, `fg`, `sel`, `sel_fg`, `panel`, `subtle`).
+fn sync_tui_theme(t: &theme::Theme) {
+    unsafe {
+        sofuu_core::rt::tui::tui_set_bg(t.bg as c_int);
+        sofuu_core::rt::tui::tui_set_fg(t.fg as c_int);
+        sofuu_core::rt::tui::tui_set_sel(
+            theme::accent_index(t.accent).map(|v| v as c_int).unwrap_or(-1),
+        );
+        sofuu_core::rt::tui::tui_set_sel_fg(if t.dark { 16 } else { 231 });
+        let c_panel = std::ffi::CString::new(t.panel).unwrap_or_default();
+        sofuu_core::rt::tui::tui_set_panel(c_panel.as_ptr());
+        let c_subtle = std::ffi::CString::new(t.subtle).unwrap_or_default();
+        sofuu_core::rt::tui::tui_set_subtle(c_subtle.as_ptr());
+    }
 }
 
 /// One box row: `│  <content><pad>│` at exactly `width` cells.
@@ -2683,20 +2705,11 @@ unsafe extern "C" fn js_chat_theme(
         .map(|c| c.theme.clone())
         .unwrap_or_default();
     let t = theme::lookup(&name);
-    unsafe {
-        sofuu_core::rt::tui::tui_set_bg(t.bg as c_int);
-        sofuu_core::rt::tui::tui_set_sel(
-            theme::accent_index(t.accent).map(|v| v as c_int).unwrap_or(-1),
-        );
-        let c_panel = std::ffi::CString::new(t.panel).unwrap();
-        sofuu_core::rt::tui::tui_set_panel(c_panel.as_ptr());
-        let c_subtle = std::ffi::CString::new(t.subtle).unwrap();
-        sofuu_core::rt::tui::tui_set_subtle(c_subtle.as_ptr());
-    }
+    sync_tui_theme(t);
     let json = serde_json::json!({
-        "name": t.name, "dark": t.dark, "bg": t.bg,
+        "name": t.name, "dark": t.dark, "bg": t.bg, "fg": t.fg,
         "accent": t.accent, "tool": t.tool, "delegate": t.delegate,
-        "heading": t.heading, "code": t.code, "warn": t.warn,
+        "heading": t.heading, "code": t.code, "ok": t.ok, "warn": t.warn,
         "error": t.error, "add": t.add, "del": t.del,
         "hunk": t.hunk, "panel": t.panel, "subtle": t.subtle,
     })
@@ -3529,16 +3542,7 @@ static DRIVER: LazyLock<String> = LazyLock::new(|| {
 pub fn run_chat(rt: &SofuuRuntime, initial: ChatConfig) -> i32 {
     let theme_name = initial.theme.clone();
     let t = theme::lookup(&theme_name);
-    unsafe {
-        sofuu_core::rt::tui::tui_set_bg(t.bg as std::os::raw::c_int);
-        sofuu_core::rt::tui::tui_set_sel(
-            theme::accent_index(t.accent).map(|v| v as std::os::raw::c_int).unwrap_or(-1),
-        );
-        let c_panel = std::ffi::CString::new(t.panel).unwrap();
-        sofuu_core::rt::tui::tui_set_panel(c_panel.as_ptr());
-        let c_subtle = std::ffi::CString::new(t.subtle).unwrap();
-        sofuu_core::rt::tui::tui_set_subtle(c_subtle.as_ptr());
-    }
+    sync_tui_theme(t);
     *CFG.lock().unwrap() = Some(initial);
     *EXIT_REQUESTED.lock().unwrap() = false;
 

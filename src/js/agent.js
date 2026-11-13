@@ -4568,7 +4568,7 @@
           }
           return 'tool_schema: no such tool \'' + clip(nm, 60) + '\'';
         };
-        tools.push(metaSpec);
+        if (!tools) tools = toolset.specs;
         /* a slim list always names the meta-tool in full so the model can
          * discover the loader. */
         delete slimNames['tool_schema'];
@@ -4578,11 +4578,22 @@
        * provider prefix cache anchored (the slim/full flip changes bytes at
        * that row only). */
       function buildWireToolsNow() {
-        if (!progressive) return tools;
+        if (!progressive) {
+          if (!tools || !tools.length) return tools;
+          var uniq = [], seen0 = {};
+          for (var u = 0; u < tools.length; u++) {
+            var un = String(tools[u].name || '');
+            if (!seen0[un]) { seen0[un] = 1; uniq.push(tools[u]); }
+          }
+          return uniq;
+        }
         var wire = [];
+        var seen = {};
         for (var wi = 0; wi < tools.length; wi++) {
           var spec = tools[wi];
           var wn = String(spec.name || '');
+          if (seen[wn]) continue;
+          seen[wn] = 1;
           if (slimNames[wn] && !progressiveEscalated[wn]) {
             wire.push({
               name: spec.name,

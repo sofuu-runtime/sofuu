@@ -768,6 +768,7 @@
     }
     if (next.length !== S.mcpTools.length) changed = true;
     S.mcpTools = next;
+    S.warnedShadowed = {};
     emit({ kind: 'warn', payload: { message: 'mcp: inventory refreshed after list_changed (' +
            S.mcpTools.length + ' tools)' + (changed ? '' : '') } });
   }
@@ -975,8 +976,13 @@
     for (var i = 0; i < S.mcpTools.length; i++) {
       var mt = S.mcpTools[i];
       if (names[mt.name]) {
-        emit({ kind: 'warn', payload: { message: 'MCP tool ' + mt.name +
-               ' (' + mt.server + ') shadowed by a built-in tool' } });
+        if (!S.warnedShadowed) S.warnedShadowed = {};
+        var wk = mt.server + ':' + mt.name;
+        if (!S.warnedShadowed[wk]) {
+          S.warnedShadowed[wk] = 1;
+          emit({ kind: 'warn', payload: { message: 'MCP tool ' + mt.name +
+                 ' (' + mt.server + ') shadowed by a built-in tool' } });
+        }
         continue;
       }
       var desc = mt.description || ('MCP tool from ' + mt.server);

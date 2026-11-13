@@ -5,13 +5,10 @@
 //! terminal-themed 30–37 range — so a theme renders identically under any
 //! terminal theme, light or dark. All hues are muted (no neons).
 //!
-//! One dark family, opencode-style: every theme carries an explicit
-//! 256-palette window background (`bg`) in the dark range (near-black
-//! 233 up to bright steel 238, plus muted hue-tinted darks), and the TUI
-//! repaints the whole alt-screen window on a switch — the surface always
-//! blends, bright to dark, with no light/dark polarity flip. There are no
-//! light themes by design (2026-10-10: the white-window flip blended with
-//! nothing and stranded content).
+//! Includes both dark themes (233..=238, deep hue-tinted darks) and light
+//! themes (soft off-white/paper/cream/mist/stone, paired with explicit dark
+//! ink foreground `fg` so unstyled text stays sharp even inside dark-mode
+//! terminal emulators).
 //!
 //! Roles (precomposed with their conventional attributes, e.g. bold for
 //! headings/errors and the diff background tints baked into add/del):
@@ -20,12 +17,14 @@
 //!   delegate sub-agent names
 //!   heading  markdown headings
 //!   code     inline code spans
+//!   ok       confirmations, checkmarks, active indicators
 //!   warn     warnings (answer cap, cautions)
 //!   error    errors (tool failures)
 //!   add      added diff lines (fg + bg tint — always distinct from bg)
 //!   del      removed diff lines (fg + bg tint — always distinct from bg)
 //!   hunk     @@ hunk headers
-//!   panel    welcome-panel borders (dim + accent hue)
+//!   panel    welcome-panel and input box borders
+//!   subtle   hints, descriptions, secondary metrics
 //!
 //! The default theme ("sofuu", bg 235) is a faithful port of the
 //! pre-theme look, so upgrading changes nothing until the user runs
@@ -37,11 +36,15 @@ pub struct Theme {
     pub dark: bool,
     /// Window background, 256-palette index (dark themes 235, light 255).
     pub bg: u8,
+    /// Default text ink, 256-palette index (-1 keeps terminal fg for dark themes;
+    /// light themes carry explicit charcoal ink like 234 so dark terminals stay legible).
+    pub fg: i16,
     pub accent: &'static str,
     pub tool: &'static str,
     pub delegate: &'static str,
     pub heading: &'static str,
     pub code: &'static str,
+    pub ok: &'static str,
     pub warn: &'static str,
     pub error: &'static str,
     pub add: &'static str,
@@ -53,76 +56,100 @@ pub struct Theme {
 
 pub const DEFAULT_THEME: &str = "sofuu";
 
-/// All 13 themes: one dark family spanning near-black 233 to bright
-/// steel 238 plus muted hue-tinted darks — the window blends brighter or
-/// darker per theme, never flipping polarity.
+/// All 18 shipped themes: 13 dark themes + 5 light themes.
 pub const THEMES: &[Theme] = &[
     // ── dark ──────────────────────────────────────────────────────
-    Theme { name: "sofuu", dark: true, bg: 235, // faithful port of the classic look
+    Theme { name: "sofuu", dark: true, bg: 235, fg: -1, // faithful port of the classic look
         accent: "1;38;5;139", tool: "38;5;80", delegate: "38;5;140",
-        heading: "1;38;5;80", code: "38;5;180", warn: "38;5;173",
+        heading: "1;38;5;80", code: "38;5;180", ok: "38;5;114", warn: "38;5;173",
         error: "1;38;5;174", add: "1;38;5;157;48;5;28", del: "1;38;5;174;48;5;52",
         hunk: "38;5;80", panel: "2;38;5;139", subtle: "38;5;246" },
-    Theme { name: "slate", dark: true, bg: 236, // blue-gray monochrome calm
+    Theme { name: "slate", dark: true, bg: 236, fg: -1, // blue-gray monochrome calm
         accent: "1;38;5;110", tool: "38;5;109", delegate: "38;5;103",
-        heading: "1;38;5;110", code: "38;5;186", warn: "38;5;179",
+        heading: "1;38;5;110", code: "38;5;186", ok: "38;5;114", warn: "38;5;179",
         error: "1;38;5;174", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
         hunk: "38;5;109", panel: "2;38;5;110", subtle: "38;5;152" },
-    Theme { name: "moss", dark: true, bg: 22, // green-dominant, warm gray accents
+    Theme { name: "moss", dark: true, bg: 22, fg: -1, // green-dominant, warm gray accents
         accent: "1;38;5;150", tool: "38;5;108", delegate: "38;5;144",
-        heading: "1;38;5;150", code: "38;5;186", warn: "38;5;180",
+        heading: "1;38;5;150", code: "38;5;186", ok: "38;5;114", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;157;48;5;28", del: "1;38;5;181;48;5;52",
         hunk: "38;5;108", panel: "2;38;5;150", subtle: "38;5;151" },
-    Theme { name: "clay", dark: true, bg: 94, // terracotta warmth
+    Theme { name: "clay", dark: true, bg: 94, fg: -1, // terracotta warmth
         accent: "1;38;5;173", tool: "38;5;180", delegate: "38;5;174",
-        heading: "1;38;5;173", code: "38;5;186", warn: "38;5;179",
+        heading: "1;38;5;173", code: "38;5;186", ok: "38;5;114", warn: "38;5;179",
         error: "1;38;5;167", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
         hunk: "38;5;180", panel: "2;38;5;173", subtle: "38;5;187" },
-    Theme { name: "plum", dark: true, bg: 53, // muted purple, low saturation
+    Theme { name: "plum", dark: true, bg: 53, fg: -1, // muted purple, low saturation
         accent: "1;38;5;140", tool: "38;5;139", delegate: "38;5;183",
-        heading: "1;38;5;140", code: "38;5;186", warn: "38;5;180",
+        heading: "1;38;5;140", code: "38;5;186", ok: "38;5;114", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;151;48;5;22", del: "1;38;5;181;48;5;52",
         hunk: "38;5;139", panel: "2;38;5;140", subtle: "38;5;182" },
-    Theme { name: "tide", dark: true, bg: 23, // deep teal water
+    Theme { name: "tide", dark: true, bg: 23, fg: -1, // deep teal water
         accent: "1;38;5;115", tool: "38;5;80", delegate: "38;5;109",
-        heading: "1;38;5;115", code: "38;5;186", warn: "38;5;180",
+        heading: "1;38;5;115", code: "38;5;186", ok: "38;5;114", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;157;48;5;29", del: "1;38;5;174;48;5;52",
         hunk: "38;5;80", panel: "2;38;5;115", subtle: "38;5;116" },
-    Theme { name: "ember", dark: true, bg: 233, // ember orange on charcoal
+    Theme { name: "ember", dark: true, bg: 233, fg: -1, // ember orange on charcoal
         accent: "1;38;5;180", tool: "38;5;173", delegate: "38;5;174",
-        heading: "1;38;5;180", code: "38;5;186", warn: "38;5;179",
+        heading: "1;38;5;180", code: "38;5;186", ok: "38;5;114", warn: "38;5;179",
         error: "1;38;5;167", add: "1;38;5;151;48;5;22", del: "1;38;5;181;48;5;52",
         hunk: "38;5;173", panel: "2;38;5;180", subtle: "38;5;245" },
-    Theme { name: "dusk", dark: true, bg: 54, // dusky blue-violet evening
+    Theme { name: "dusk", dark: true, bg: 54, fg: -1, // dusky blue-violet evening
         accent: "1;38;5;140", tool: "38;5;110", delegate: "38;5;139",
-        heading: "1;38;5;140", code: "38;5;186", warn: "38;5;180",
+        heading: "1;38;5;140", code: "38;5;186", ok: "38;5;114", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
         hunk: "38;5;110", panel: "2;38;5;140", subtle: "38;5;189" },
-    Theme { name: "forest", dark: true, bg: 22, // deep pine, bark browns
+    Theme { name: "forest", dark: true, bg: 22, fg: -1, // deep pine, bark browns
         accent: "1;38;5;108", tool: "38;5;150", delegate: "38;5;144",
-        heading: "1;38;5;108", code: "38;5;186", warn: "38;5;180",
+        heading: "1;38;5;108", code: "38;5;186", ok: "38;5;114", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;157;48;5;28", del: "1;38;5;181;48;5;88",
         hunk: "38;5;150", panel: "2;38;5;108", subtle: "38;5;107" },
-    Theme { name: "wine", dark: true, bg: 52, // muted oxblood red family
+    Theme { name: "wine", dark: true, bg: 52, fg: -1, // muted oxblood red family
         accent: "1;38;5;174", tool: "38;5;181", delegate: "38;5;139",
-        heading: "1;38;5;174", code: "38;5;186", warn: "38;5;180",
+        heading: "1;38;5;174", code: "38;5;186", ok: "38;5;114", warn: "38;5;180",
         error: "1;38;5;167", add: "1;38;5;151;48;5;22", del: "1;38;5;181;48;5;88",
         hunk: "38;5;181", panel: "2;38;5;174", subtle: "38;5;181" },
-    Theme { name: "storm", dark: true, bg: 238, // cold steel gray-blue
+    Theme { name: "storm", dark: true, bg: 238, fg: -1, // cold steel gray-blue
         accent: "1;38;5;109", tool: "38;5;110", delegate: "38;5;103",
-        heading: "1;38;5;109", code: "38;5;186", warn: "38;5;179",
+        heading: "1;38;5;109", code: "38;5;186", ok: "38;5;114", warn: "38;5;179",
         error: "1;38;5;174", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
         hunk: "38;5;110", panel: "2;38;5;109", subtle: "38;5;249" },
-    Theme { name: "honey", dark: true, bg: 94, // warm amber, softened gold
+    Theme { name: "honey", dark: true, bg: 94, fg: -1, // warm amber, softened gold
         accent: "1;38;5;180", tool: "38;5;186", delegate: "38;5;173",
-        heading: "1;38;5;180", code: "38;5;223", warn: "38;5;179",
+        heading: "1;38;5;180", code: "38;5;223", ok: "38;5;114", warn: "38;5;179",
         error: "1;38;5;167", add: "1;38;5;151;48;5;22", del: "1;38;5;174;48;5;52",
         hunk: "38;5;186", panel: "2;38;5;180", subtle: "38;5;223" },
-    Theme { name: "lagoon", dark: true, bg: 24, // pale aqua on deep slate
+    Theme { name: "lagoon", dark: true, bg: 24, fg: -1, // pale aqua on deep slate
         accent: "1;38;5;116", tool: "38;5;115", delegate: "38;5;110",
-        heading: "1;38;5;116", code: "38;5;186", warn: "38;5;180",
+        heading: "1;38;5;116", code: "38;5;186", ok: "38;5;114", warn: "38;5;180",
         error: "1;38;5;174", add: "1;38;5;157;48;5;29", del: "1;38;5;181;48;5;52",
         hunk: "38;5;115", panel: "2;38;5;116", subtle: "38;5;153" },
+    // ── light ─────────────────────────────────────────────────────
+    Theme { name: "paper", dark: false, bg: 255, fg: 234, // neutral off-white daylight
+        accent: "1;38;5;54", tool: "38;5;30", delegate: "38;5;55",
+        heading: "1;38;5;24", code: "38;5;130", ok: "38;5;28", warn: "38;5;166",
+        error: "1;38;5;124", add: "1;38;5;22;48;5;194", del: "1;38;5;88;48;5;224",
+        hunk: "38;5;31", panel: "38;5;96", subtle: "38;5;241" },
+    Theme { name: "snow", dark: false, bg: 231, fg: 233, // crisp editorial pure white
+        accent: "1;38;5;25", tool: "38;5;31", delegate: "38;5;61",
+        heading: "1;38;5;25", code: "38;5;130", ok: "38;5;28", warn: "38;5;166",
+        error: "1;38;5;160", add: "1;38;5;22;48;5;194", del: "1;38;5;88;48;5;224",
+        hunk: "38;5;25", panel: "38;5;67", subtle: "38;5;242" },
+    Theme { name: "ivory", dark: false, bg: 230, fg: 235, // warm cream book paper
+        accent: "1;38;5;94", tool: "38;5;29", delegate: "38;5;95",
+        heading: "1;38;5;94", code: "38;5;131", ok: "38;5;22", warn: "38;5;130",
+        error: "1;38;5;124", add: "1;38;5;22;48;5;194", del: "1;38;5;88;48;5;224",
+        hunk: "38;5;29", panel: "38;5;137", subtle: "38;5;101" },
+    Theme { name: "frost", dark: false, bg: 195, fg: 234, // cool ice-blue daylight mist
+        accent: "1;38;5;24", tool: "38;5;23", delegate: "38;5;60",
+        heading: "1;38;5;24", code: "38;5;94", ok: "38;5;28", warn: "38;5;130",
+        error: "1;38;5;124", add: "1;38;5;22;48;5;194", del: "1;38;5;88;48;5;224",
+        hunk: "38;5;24", panel: "38;5;66", subtle: "38;5;60" },
+    Theme { name: "dawn", dark: false, bg: 254, fg: 233, // calm neutral stone-gray
+        accent: "1;38;5;89", tool: "38;5;30", delegate: "38;5;53",
+        heading: "1;38;5;24", code: "38;5;130", ok: "38;5;28", warn: "38;5;166",
+        error: "1;38;5;124", add: "1;38;5;22;48;5;194", del: "1;38;5;88;48;5;224",
+        hunk: "38;5;31", panel: "38;5;95", subtle: "38;5;240" },
 ];
 
 /// Palette index of a role's `38;5;N` foreground — feeds the selection
@@ -187,6 +214,7 @@ pub fn fg_remap_pairs(from: &Theme, to: &Theme) -> Vec<(&'static str, &'static s
         (from.delegate, to.delegate),
         (from.heading, to.heading),
         (from.code, to.code),
+        (from.ok, to.ok),
         (from.warn, to.warn),
         (from.error, to.error),
         (from.add, to.add),
@@ -205,16 +233,16 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    /// The contract: exactly 13 themes, unique names, all dark (one
-    /// family — no light/dark split), every slot a well-formed 256-palette
-    /// SGR param string.
+    /// The contract: 18 themes (13 dark + 5 light), unique names, every
+    /// slot a well-formed 256-palette SGR param string.
     #[test]
     fn theme_registry_shape() {
-        assert_eq!(THEMES.len(), 13, "must ship exactly 13 themes");
+        assert_eq!(THEMES.len(), 18, "must ship 18 themes (13 dark + 5 light)");
         let names: HashSet<&str> = THEMES.iter().map(|t| t.name).collect();
-        assert_eq!(names.len(), 13, "theme names must be unique");
+        assert_eq!(names.len(), 18, "theme names must be unique");
         assert_eq!(THEMES[0].name, DEFAULT_THEME);
-        assert!(THEMES.iter().all(|t| t.dark), "one dark family — no light themes");
+        assert_eq!(THEMES.iter().filter(|t| t.dark).count(), 13);
+        assert_eq!(THEMES.iter().filter(|t| !t.dark).count(), 5);
     }
 
     fn valid_params(s: &str) -> bool {
@@ -278,6 +306,7 @@ mod tests {
                 ("delegate", t.delegate),
                 ("heading", t.heading),
                 ("code", t.code),
+                ("ok", t.ok),
                 ("warn", t.warn),
                 ("error", t.error),
                 ("add", t.add),
@@ -299,13 +328,16 @@ mod tests {
     fn theme_lookup_falls_back_and_resolves() {
         assert_eq!(lookup("slate").name, "slate");
         assert_eq!(lookup("SLATE").name, "slate");
+        assert_eq!(lookup("paper").name, "paper");
+        assert_eq!(lookup("PAPER").name, "paper");
         assert_eq!(lookup("no-such-theme").name, DEFAULT_THEME);
         assert!(resolve("lagoon").is_some());
+        assert!(resolve("snow").is_some());
         assert!(resolve("nope").is_none());
     }
 
     /// Selection-bar derivation: the bar wears the accent's palette
-    /// index (bg) with near-black text — one rule for every theme.
+    /// index (bg) with near-black text (dark themes) or white text (light themes).
     #[test]
     fn accent_index_finds_the_256_foreground() {
         assert_eq!(accent_index("1;38;5;139"), Some(139));
@@ -325,20 +357,38 @@ mod tests {
         }
     }
 
-    /// Window-background contract: every theme blends the whole window in
-    /// a dark tint (near-black 233 … bright steel 238, plus muted
-    /// hue-tinted darks) — bright to dark per theme, never a white flip.
-    /// Plus the collision invariant that makes diffs readable: no theme's
-    /// add/del bg tint may equal its own window bg.
+    /// Window-background contract: dark themes carry curated dark bg + fg=-1;
+    /// light themes carry curated light bg + explicit charcoal ink fg (232..=236).
+    /// Plus no theme's add/del bg tint may equal its own window bg.
     #[test]
     fn theme_backgrounds_are_dark_and_tints_stay_visible() {
         const DARK_BGS: [u8; 13] = [22, 23, 24, 52, 53, 54, 94, 233, 234, 235, 236, 237, 238];
+        const LIGHT_BGS: [u8; 5] = [195, 230, 231, 254, 255];
         for t in THEMES {
-            assert!(
-                DARK_BGS.contains(&t.bg),
-                "theme {} must carry a curated dark bg, got {}",
-                t.name, t.bg
-            );
+            if t.dark {
+                assert!(
+                    DARK_BGS.contains(&t.bg),
+                    "dark theme {} must carry a curated dark bg, got {}",
+                    t.name, t.bg
+                );
+                assert_eq!(t.fg, -1, "dark theme {} keeps terminal default fg", t.name);
+            } else {
+                assert!(
+                    LIGHT_BGS.contains(&t.bg),
+                    "light theme {} must carry a curated light bg, got {}",
+                    t.name, t.bg
+                );
+                assert!(
+                    (232..=236).contains(&t.fg),
+                    "light theme {} must set dark charcoal ink fg (232..=236), got {}",
+                    t.name, t.fg
+                );
+                assert!(
+                    !t.panel.starts_with("2;") && !t.subtle.starts_with("2;"),
+                    "light theme {} must avoid terminal dim SGR 2 on panel/subtle",
+                    t.name
+                );
+            }
             for (role, v) in [("add", t.add), ("del", t.del)] {
                 // The bg tint is the trailing `48;5;N` of the role params.
                 let tint: u8 = v
@@ -355,6 +405,7 @@ mod tests {
         }
         // The default stays the classic neutral so upgrading changes nothing.
         assert_eq!(lookup("sofuu").bg, 235);
+        assert!(!lookup("paper").dark);
     }
 
     /// The remap used on a switch: role pairs, longest-first, disjoint
@@ -371,17 +422,9 @@ mod tests {
                 "pairs must be longest-old-first"
             );
         }
-        let olds: Vec<&str> = pairs.iter().map(|(a, _)| *a).collect();
-        let news: Vec<&str> = pairs.iter().map(|(_, b)| *b).collect();
-        // Identical pairs are dropped by fg_remap_pairs, so whatever is
-        // left must be strictly one-pass: no new sequence may equal a
-        // remaining old one (that would remap twice).
-        for o in &olds {
-            assert!(
-                !news.iter().any(|n| n == o),
-                "remap would double-apply on {o}"
-            );
-        }
+        // Check dark -> light yields pairs for every distinct role too.
+        let dl = fg_remap_pairs(lookup("sofuu"), lookup("paper"));
+        assert!(!dl.is_empty(), "dark->light must remap roles");
         // Same-theme remap is empty (nothing to do).
         assert!(fg_remap_pairs(from, from).is_empty());
     }

@@ -202,6 +202,7 @@
   let mcpConnected = 0;
   let mcpFailed = 0;
   let mcpConnecting = null; /* in-flight connect promise (dedupe) */
+  let warnedShadowed = {}; /* dedupe shadowed tool warnings per session/reload */
   function mcpServersList() {
     try { return JSON.parse(__chat_mcpservers() || '[]'); } catch (e) { return []; }
   }
@@ -476,7 +477,11 @@
     }
     for (const t of mcpTools) {
       if (names[t.name]) {
-        out('\x1b[33m  ⚠ MCP tool ' + t.name + ' (' + t.server + ') shadowed by a built-in tool\x1b[0m');
+        const wKey = t.server + ':' + t.name;
+        if (!warnedShadowed[wKey]) {
+          warnedShadowed[wKey] = 1;
+          out('\x1b[33m  ⚠ MCP tool ' + t.name + ' (' + t.server + ') shadowed by a built-in tool\x1b[0m');
+        }
         continue;
       }
       defs.push({
@@ -2296,7 +2301,7 @@
    * PAL resets after every slash command (theme switches apply to the
    * very next paint) and is otherwise cached for the session. */
   const THEME_FALLBACK = { accent: '1;35', tool: '36', delegate: '35',
-    heading: '1;36', code: '33', warn: '33', error: '1;31',
+    heading: '1;36', code: '33', ok: '32', warn: '33', error: '1;31',
     add: '1;32', del: '1;31', hunk: '36', panel: '2;38;5;139', subtle: '38;5;246' };
   let PAL = null;
   function pal() {
@@ -2311,23 +2316,43 @@
     return (p && typeof p[role] === 'string' && p[role]) ? p[role] : THEME_FALLBACK[role];
   }
 
-  /* Inline spans: code yellow, bold otherwise. Single pass split on
-   * backticks — even segments are prose (bold applies), odd closed ones
-   * are code (literal, so ** inside code never bolds). An unterminated
-   * backtick keeps its mark and stays prose; unpaired ** stays literal.
-   * Bold never spans segments, so markers can't merge across a span. */
+  /* Inline markdown formatting (TTY only):
+   * 1. Extract closed `code` spans into PUA sentinels so inner markers stay
+   *    literal while outer **bold** / *italic* can wrap code spans cleanly.
+   * 2. Format [links](url), **bold**, ~~strike~~, *italic*, and boundary-safe
+   *    _italic_ (preserving snake_case identifiers like get_addon_status).
+   * 3. Restore code spans with palette T('code'). */
   function fmtInline(t) {
-    const segs = String(t).split('`');
-    let r = '';
-    for (let i = 0; i < segs.length; i++) {
-      if (i % 2 === 1 && i !== segs.length - 1) {
-        r += '\x1b[' + T('code') + 'm' + segs[i] + '\x1b[0m';
-      } else {
-        if (i % 2 === 1) r += '`';
-        r += segs[i].replace(/\*\*([^*]+)\*\*/g, '\x1b[1m$1\x1b[0m');
-      }
+    const src = String(t == null ? '' : t);
+    const codes = [];
+    let outStr = '';
+    let i = 0;
+    while (i < src.length) {
+      const open = src.indexOf('`', i);
+      if (open === -1) { outStr += src.slice(i); break; }
+      const close = src.indexOf('`', open + 1);
+      if (close === -1) { outStr += src.slice(i); break; }
+      outStr += src.slice(i, open);
+      const id = codes.length;
+      codes.push(src.slice(open + 1, close));
+      outStr += '\uE000' + id + '\uE001';
+      i = close + 1;
     }
-    return r;
+    const subSgr = '\x1b[' + T('subtle') + 'm';
+    outStr = outStr.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+|file:\/\/[^\s)]+)\)/g, function (_, label, url) {
+      return label === url ? '\x1b[4m' + label + '\x1b[0m' : '\x1b[4m' + label + '\x1b[0m ' + subSgr + '(' + url + ')\x1b[0m';
+    });
+    outStr = outStr.replace(/\*\*([^*]+)\*\*/g, '\x1b[1m$1\x1b[0m');
+    outStr = outStr.replace(/~~([^~]+)~~/g, '\x1b[9m$1\x1b[0m');
+    outStr = outStr.replace(/\*([^\s*](?:[^*]*[^\s*])?)\*/g, '\x1b[3m$1\x1b[0m');
+    outStr = outStr.replace(/(^|[\s(>])_([^\s_](?:[^_]*[^\s_])?)_(?=[\s.,;:!?)]|$)/g, '$1\x1b[3m$2\x1b[0m');
+    if (codes.length) {
+      const codeSgr = '\x1b[' + T('code') + 'm';
+      outStr = outStr.replace(/\uE000(\d+)\uE001/g, function (_, idx) {
+        return codeSgr + codes[Number(idx)] + '\x1b[0m';
+      });
+    }
+    return outStr;
   }
 
   /* Markdown hierarchy for the final answer paint (TTY only). Model
@@ -2339,37 +2364,56 @@
    * removed, so soft-wrap row counts stay close to what streamed. */
   function formatMarkdown(s) {
     const lines = String(s == null ? '' : s).split('\n');
-    const out = [];
+    const outLines = [];
+    const sub = '\x1b[' + T('subtle') + 'm';
+    const bul = '\x1b[' + T('tool') + 'm';
     let inFence = false;
     for (const line of lines) {
-      /* Fence lines dim whole; content inside fences is left alone
-       * (code blocks are already visually distinct by indentation). */
-      if (/^\s*```/.test(line)) { inFence = !inFence; out.push('\x1b[2m' + line + '\x1b[0m'); continue; }
-      if (inFence) { out.push(line); continue; }
-      /* Setext/HR rules and quotes recede. */
-      if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) { out.push('\x1b[2m' + line + '\x1b[0m'); continue; }
-      if (/^\s>/.test(line)) { out.push('\x1b[2m' + line + '\x1b[0m'); continue; }
-      let t = line;
-      /* ATX headings: bold cyan, markers stripped. The body stays literal
-       * (no inline spans inside) so the whole title reads as one level —
-       * a reset mid-title would split it into two visual weights. */
-      const hm = t.match(/^(#{1,6})\s+(.*)$/);
-      if (hm) { out.push('\x1b[' + T('heading') + 'm' + hm[2] + '\x1b[0m'); continue; }
-      out.push(fmtInline(t));
+      const fm = line.match(/^(\s*)```(.*)$/);
+      if (fm) {
+        inFence = !inFence;
+        if (inFence) {
+          const lang = fm[2].trim();
+          outLines.push(fm[1] + (lang ? sub + '─── \x1b[0m' + bul + lang + '\x1b[0m' : sub + '────────\x1b[0m'));
+        } else {
+          outLines.push(fm[1] + sub + '────────\x1b[0m');
+        }
+        continue;
+      }
+      if (inFence) { outLines.push(line); continue; }
+      if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) { outLines.push(sub + '────────────────────────────────\x1b[0m'); continue; }
+      const qm = line.match(/^(\s*)>\s?(.*)$/);
+      if (qm) { outLines.push(qm[1] + sub + '│ \x1b[0m' + fmtInline(qm[2])); continue; }
+      const hm = line.match(/^(\s*)(#{1,6})\s+(.*)$/);
+      if (hm) { outLines.push(hm[1] + '\x1b[' + T('heading') + 'm' + hm[3] + '\x1b[0m'); continue; }
+      const tsep = line.match(/^(\s*)\|([\s\-:|]+)\|\s*$/);
+      if (tsep) { outLines.push(tsep[1] + sub + '│' + tsep[2].replace(/-/g, '─').replace(/\|/g, '┼') + '│\x1b[0m'); continue; }
+      const trow = line.match(/^(\s*)\|(.*)\|\s*$/);
+      if (trow) {
+        const cells = trow[2].split('|').map(fmtInline);
+        outLines.push(trow[1] + sub + '│\x1b[0m' + cells.join(sub + '│\x1b[0m') + sub + '│\x1b[0m');
+        continue;
+      }
+      const lm = line.match(/^(\s*)([-*+])\s+(.*)$/);
+      if (lm) { outLines.push(lm[1] + bul + '•\x1b[0m ' + fmtInline(lm[3])); continue; }
+      const om = line.match(/^(\s*)(\d+\.)\s+(.*)$/);
+      if (om) { outLines.push(om[1] + bul + om[2] + '\x1b[0m ' + fmtInline(om[3])); continue; }
+      outLines.push(fmtInline(line));
     }
-    return out.join('\n');
+    return outLines.join('\n');
   }
 
   /* Live todo checklist (2026-10-03): the agent maintains its plan via
    * todo_write on long tasks, and the checklist rides the tool_result
    * event — but the TUI never rendered it, so users never SAW a todo
-   * list. Painted here, every update: done dim ✓ (finished work
-   * recedes), doing cyan ▸ at full weight (the current step pops),
-   * queued dim ○. Bounded at 15 rows with a "+N more" tail so a 50-item
+   * list. Painted here, every update: done subtle ✓ (finished work
+   * recedes), doing accent/tool ▸ at full weight (the current step pops),
+   * queued subtle ○. Bounded at 15 rows with a "+N more" tail so a 50-item
    * list cannot flood the transcript. Replaces the one-row "checklist
    * updated (N steps)" summary — the list IS the result. */
   function paintChecklist(todos) {
     const list = Array.isArray(todos) ? todos : [];
+    const sub = '\x1b[' + T('subtle') + 'm';
     let done = 0;
     for (const t of list) if (t && t.status === 'done') done++;
     out('\x1b[1m  ☑ ' + done + '/' + list.length + '\x1b[0m');
@@ -2377,38 +2421,37 @@
     for (let i = 0; i < shown; i++) {
       const t = list[i] || {};
       const c = String(t.content || '').replace(/\s+/g, ' ').trim();
-      if (t.status === 'done') out('\x1b[2m    ✓ ' + c + '\x1b[0m');
+      if (t.status === 'done') out(sub + '    ✓ ' + c + '\x1b[0m');
       else if (t.status === 'doing') out('\x1b[' + T('tool') + 'm    ▸ ' + c + '\x1b[0m');
-      else out('\x1b[2m    ○ ' + c + '\x1b[0m');
+      else out(sub + '    ○ ' + c + '\x1b[0m');
     }
-    if (list.length > shown) out('\x1b[2m    +' + (list.length - shown) + ' more\x1b[0m');
+    if (list.length > shown) out(sub + '    +' + (list.length - shown) + ' more\x1b[0m');
   }
 
   /* Paint a unified diff from an edit_file/write_file tool_result event,
    * one row per diff line so the TUI shows WHAT changed, not just that
    * something did. Rows arrive as `NNNN mark content` (4-wide gutter,
    * mark in {'-','+',' '}, ANSI-free — the payload also travels to the
-   * model). The gutter paints dim; +/- rows get a full-row background
-   * tint (dark green / dark red) under bold bright text, difftool-style;
-   * hunk headers cyan; context, file markers and notes dim. Text-span
-   * tints only (no padding to terminal width — a padded row that wraps
-   * would tear the gutter on the continuation line). */
+   * model). The gutter paints subtle; +/- rows get a full-row background
+   * tint under bold text, difftool-style;
+   * hunk headers theme-colored; context, file markers and notes subtle. */
   function paintDiff(diff) {
     const rows = String(diff == null ? '' : diff).split('\n');
+    const sub = '\x1b[' + T('subtle') + 'm';
     for (const row of rows) {
       const t = row.replace(/^\s+/, '');
       if (t.indexOf('+++') === 0 || t.indexOf('---') === 0 || t.indexOf('...') === 0) {
-        out('\x1b[2m    ' + t + '\x1b[0m');
+        out(sub + '    ' + t + '\x1b[0m');
       } else if (t.indexOf('@@') === 0) {
         out('\x1b[' + T('hunk') + 'm    ' + t + '\x1b[0m');
       } else {
         const m = row.match(/^\s*(\d+)\s+([-+ ])\s?([\s\S]*)$/);
-        if (!m) { out('\x1b[2m    ' + row + '\x1b[0m'); continue; }
+        if (!m) { out(sub + '    ' + row + '\x1b[0m'); continue; }
         let g = m[1];
         while (g.length < 4) g = ' ' + g;
-        if (m[2] === '+') out('    \x1b[2m' + g + '\x1b[0m \x1b[' + T('add') + 'm+ ' + m[3] + '\x1b[0m');
-        else if (m[2] === '-') out('    \x1b[2m' + g + '\x1b[0m \x1b[' + T('del') + 'm- ' + m[3] + '\x1b[0m');
-        else out('\x1b[2m    ' + g + '   ' + m[3] + '\x1b[0m');
+        if (m[2] === '+') out('    ' + sub + g + '\x1b[0m \x1b[' + T('add') + 'm+ ' + m[3] + '\x1b[0m');
+        else if (m[2] === '-') out('    ' + sub + g + '\x1b[0m \x1b[' + T('del') + 'm- ' + m[3] + '\x1b[0m');
+        else out(sub + '    ' + g + '   ' + m[3] + '\x1b[0m');
       }
     }
   }
@@ -2434,29 +2477,49 @@
     if (typeof kind === 'string' && kind.indexOf('rlm:') === 0) return 'Working';
     return null;
   }
-  /* Renders `label` with one dim "cursor" letter at PHASE_FRAME, advances
-   * the cursor, and overlays the result above the input box. A single dim
-   * position sweeps left→right and loops — not a fading trail. */
-  function tickPhase() {
-    if (!CURRENT_PHASE) { try { __chat_phase(''); } catch (e) { /* the phase line is a status hint only */ } return; }
-    const label = CURRENT_PHASE;
-    let line = '';
-    for (let i = 0; i < label.length; i++) {
-      line += (i === PHASE_FRAME ? '\x1b[2m' + label[i] + '\x1b[0m' : label[i]);
+  /* Renders `label` with one subtle-tinted "cursor" letter at PHASE_FRAME,
+   * advances the cursor, and overlays the result above the input box. Frames are
+   * precomputed per active subtle SGR + label so ticking does zero heap allocations. */
+  const PHASE_FRAME_CACHE = {};
+  function phaseFramesFor(label) {
+    const sub = T('subtle');
+    const key = sub + ':' + label;
+    if (PHASE_FRAME_CACHE[key]) return PHASE_FRAME_CACHE[key];
+    const frames = [];
+    for (let f = 0; f < label.length; f++) {
+      frames.push('  ' + label.slice(0, f) + '\x1b[' + sub + 'm' + label[f] + '\x1b[0m' + label.slice(f + 1));
     }
-    PHASE_FRAME = (PHASE_FRAME + 1) % label.length;
-    try { __chat_phase('  ' + line); } catch (e) { /* the phase line is a status hint only */ }
+    PHASE_FRAME_CACHE[key] = frames;
+    return frames;
+  }
+  let LAST_PHASE_SENT = '';
+  function tickPhase() {
+    if (!CURRENT_PHASE) {
+      if (LAST_PHASE_SENT !== '') {
+        LAST_PHASE_SENT = '';
+        try { __chat_phase(''); } catch (e) { /* the phase line is a status hint only */ }
+      }
+      return;
+    }
+    const frames = phaseFramesFor(CURRENT_PHASE);
+    const frame = frames[PHASE_FRAME % frames.length] || '';
+    PHASE_FRAME = (PHASE_FRAME + 1) % frames.length;
+    if (frame !== LAST_PHASE_SENT) {
+      LAST_PHASE_SENT = frame;
+      try { __chat_phase(frame); } catch (e) { /* the phase line is a status hint only */ }
+    }
   }
   let phaseTimer = null;
   const startPhase = () => {
     if (!TTY || phaseTimer) return;
     PHASE_FRAME = 0;
     tickPhase();
-    phaseTimer = setInterval(tickPhase, 120);
+    phaseTimer = setInterval(tickPhase, 150);
   };
   function stopPhase() {
     if (phaseTimer) { clearInterval(phaseTimer); phaseTimer = null; }
     CURRENT_PHASE = null;
+    LAST_PHASE_SENT = '';
     if (TTY) { try { __chat_phase(''); } catch (e) { /* the phase line is a status hint only */ } }
   }
 
@@ -3286,8 +3349,8 @@
     // Deduplicate any re-appended /chat/completions (wizard guard: editing an
     // existing endpoint that already contains the suffix would 404).
     let bare = base.replace(/\/+$/, '').replace(/\/chat\/completions\/chat\/completions/g, '/chat/completions');
-    let hasChatSuffix = bare.endsWith('/chat/completions') || bare.endsWith('/completions') || bare.endsWith('/api/chat');
-    let endpoint = hasChatSuffix ? bare : (profile === 'local' ? bare + '/api/chat' : (profile === 'openai' ? bare + '/chat/completions' : bare));
+    let hasChatSuffix = bare.endsWith('/chat/completions') || bare.endsWith('/completions') || bare.endsWith('/api/chat') || bare.endsWith('/messages');
+    let endpoint = hasChatSuffix ? bare : (profile === 'local' ? bare + '/api/chat' : (profile === 'anthropic' ? bare + '/v1/messages' : bare + '/chat/completions'));
     try { __chat_apply_provider(name, endpoint, key, model, profile); } catch (e) { /* a provider switch that throws leaves the current provider in place */ }
     cfg = JSON.parse(__chat_getcfg());
     out('\n  \x1b[32m✓ Provider configured:\x1b[0m ' +
@@ -3405,10 +3468,10 @@
            * structure is leaking. */
           const warnMb = cfg.rss_warn_mb > 0 ? cfg.rss_warn_mb : 1024;
           if (mb >= warnMb) {
-            ramMet = '\x1b[33m' + ramMet + '\x1b[0m';
+            ramMet = '\x1b[' + T('warn') + 'm' + ramMet + '\x1b[0m';
             if (!rssWarned) {
               rssWarned = true;
-              out('\x1b[33m  ⚠ RAM usage crossed ' + warnMb + ' MB — watch the footer; persistent growth means something is leaking\x1b[0m');
+              out('\x1b[' + T('warn') + 'm  ⚠ RAM usage crossed ' + warnMb + ' MB — watch the footer; persistent growth means something is leaking\x1b[0m');
             }
           }
         }
@@ -3475,7 +3538,7 @@
         const gi = off + i, it = vis[i], curRow = gi === sel;
         rows.push((curRow ? '\x1b[' + T('accent') + 'm❯\x1b[0m \x1b[1m' : '  ') + it.label + (curRow ? '\x1b[0m' : '') +
                   (it.note ? '  \x1b[' + T('subtle') + 'm' + it.note + '\x1b[0m' : '') +
-                  (it.id === currentId ? ' \x1b[32m← current\x1b[0m' : ''));
+                  (it.id === currentId ? ' \x1b[' + T('ok') + 'm← current\x1b[0m' : ''));
       }
       if (list.length === 0) rows.push('  \x1b[' + T('subtle') + 'm(no matches)\x1b[0m');
       if (off + maxV < list.length) rows.push('  \x1b[' + T('subtle') + 'm▼ ' + (list.length - off - maxV) + ' more\x1b[0m');
@@ -3654,7 +3717,7 @@
       const name = it.id.slice('\x00select:'.length);
       try { __chat_select_provider(name); } catch (e) { /* a provider switch that throws leaves the current provider in place */ }
       try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
-      out('\x1b[32m  ✓ Active provider → ' + name + '\x1b[0m');
+      out('\x1b[' + T('ok') + 'm  ✓ Active provider → ' + name + '\x1b[0m');
     } else if (it.id.indexOf('\x00edit:') === 0) {
       const name = it.id.slice('\x00edit:'.length);
       const entry = provs.find(function(p){ return p.name === name; });
@@ -3680,13 +3743,13 @@
     const runtimeNoThink = (cfg.no_think_models || []).indexOf(cfg.model) >= 0;
     const isAnthropicWire = (cfg.profile === 'anthropic' || cfg.provider === 'anthropic');
     if (runtimeNoThink) {
-      out('\x1b[33m  ⓘ ' + cfg.model + ' does not support thinking — effort is not applicable.\x1b[0m\n');
+      out('\x1b[' + T('warn') + 'm  ⓘ ' + cfg.model + ' does not support thinking — effort is not applicable.\x1b[0m\n');
       return;
     }
     // Anthropic endpoint: 64k thinking is endpoint property, any model on it can use it
     // OpenAI endpoint: per-model ladder, generic for unknown models, none only for known non-reasoning
     if (!isAnthropicWire && caps && caps.thinking === 'none') {
-      out('\x1b[33m  ⓘ ' + cfg.model + ' does not support thinking — effort is not applicable.\x1b[0m\n');
+      out('\x1b[' + T('warn') + 'm  ⓘ ' + cfg.model + ' does not support thinking — effort is not applicable.\x1b[0m\n');
       return;
     }
     let order, notes;
@@ -3738,20 +3801,25 @@
     maybeRefreshPanel();
   }
   async function pickTheme() {
-    /* 13 dark-blend themes, independent of the terminal's own theme.
-     * Applies through /theme <name> (the Rust side validates + persists)
-     * so the picker and the typed command share one code path. */
+    /* 18 shipped themes (13 dark + 5 light), independent of the terminal's
+     * own theme. Applies through /theme <name> (the Rust side validates +
+     * persists) so the picker and the typed command share one code path. */
     let themes = [];
     try { themes = JSON.parse(__chat_themes()); } catch (e) { /* no theme table: the built-in palette stays in use */ }
-    if (!themes.length) { out('\x1b[90m  No themes available.\x1b[0m\n'); return; }
+    if (!themes.length) { out('\x1b[' + T('subtle') + 'm  No themes available.\x1b[0m\n'); return; }
     const it = await selectMenu({
       title: 'Theme',
-      hint: '↑↓ move · enter apply · esc cancel',
-      tabs: [],
-      items: themes.map(t => ({ id: t.name, label: t.name })),
+      hint: 'tab switch dark/light · ↑↓ move · enter apply · esc cancel',
+      tabs: ['all', 'dark', 'light'],
+      items: themes.map(t => ({
+        id: t.name,
+        label: t.name,
+        tab: t.dark ? 'dark' : 'light',
+        note: t.dark ? 'dark' : 'light',
+      })),
       currentId: cfg.theme || '',
     });
-    if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
+    if (!it) { outLast('\x1b[' + T('subtle') + 'm  (unchanged)\x1b[0m'); return; }
     __chat_slash('/theme ' + it.id);
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     PAL = null;
@@ -4052,10 +4120,10 @@
           else {
             let themes = [];
             try { themes = JSON.parse(__chat_themes()); } catch (e) { /* no theme table: the built-in palette stays in use */ }
-            out('\x1b[90m  Usage: /theme <name>  (current: ' + (cfg.theme || 'sofuu') + ')\x1b[0m');
+            out('\x1b[' + T('subtle') + 'm  Usage: /theme <name>  (current: ' + (cfg.theme || 'sofuu') + ')\x1b[0m');
             for (const th of themes) {
-              const cur = th.name === cfg.theme ? ' \x1b[32m← current\x1b[0m' : '';
-              out('  \x1b[36m' + th.name + '\x1b[0m' + cur);
+              const cur = th.name === cfg.theme ? ' \x1b[' + T('ok') + 'm← current\x1b[0m' : '';
+              out('  \x1b[' + T('tool') + 'm' + th.name + '\x1b[0m' + cur);
             }
             out('');
           }
@@ -4169,7 +4237,7 @@
              * no-op on the wire; every later turn repeated it too).
              * Reload the mirror, exactly like the provider wizard does. */
             try { cfg = JSON.parse(__chat_getcfg()); } catch (eCFG) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
-            out('\x1b[33m  ⓘ ' + curModel + ' rejected thinking (' + msg.slice(0, 160) +
+            out('\x1b[' + T('warn') + 'm  ⓘ ' + curModel + ' rejected thinking (' + msg.slice(0, 160) +
                 ') — disabling effort for this model and retrying.\x1b[0m\n');
             prepareArchiveRecovery(msg);
             archiveAttempt++;
@@ -4180,7 +4248,7 @@
             if (sofuu.ml && sofuu.ml.alloc && typeof sofuu.ml.alloc.noteLimit === 'function') {
               try { sofuu.ml.alloc.noteLimit(curModel, msg); } catch (eNL) { /* allocator limit learning is best-effort */ }
             }
-            out('\x1b[90m  ⚙ context limit exceeded (' + clip1(msg, 120) + ') — auto-compacting and continuing…\x1b[0m\n');
+            out('\x1b[' + T('subtle') + 'm  ⚙ context limit exceeded (' + clip1(msg, 120) + ') — auto-compacting and continuing…\x1b[0m\n');
             let compacted = false;
             if (history.length > 0) {
               try { compacted = !!(await summarizeHistory(0)); } catch (eSC) { /* fallback to drop turn block below */ }
@@ -4195,7 +4263,7 @@
           if (CAPACITY_ERR_RE.test(msg) && chainIdx + 1 < chain.length) {
             chainIdx++;
             const next = chain[chainIdx];
-            out('\x1b[33m  ⓘ ' + (chain[chainIdx - 1] ? chain[chainIdx - 1].name : cfg.provider) +
+            out('\x1b[' + T('warn') + 'm  ⓘ ' + (chain[chainIdx - 1] ? chain[chainIdx - 1].name : cfg.provider) +
                 ' unavailable (' + msg.slice(0, 120) + ') — failing over to ' +
                 next.name + ' / ' + next.model + '\x1b[0m\n');
             prepareArchiveRecovery(msg);
@@ -4207,7 +4275,7 @@
       }
       failoverTo = null;
       archiveLastFailure = null;
-      if (turnErr) out('\x1b[31m  ✗ ' + String((turnErr && turnErr.message) || turnErr) + '\x1b[0m\n');
+      if (turnErr) out('\x1b[' + T('error') + 'm  ✗ ' + String((turnErr && turnErr.message) || turnErr) + '\x1b[0m\n');
     }
     /* Brain flush happens per-store inside sofuu.agent.run (agent.js). */
     /* Disconnect every MCP server: their child processes hold ref'd libuv

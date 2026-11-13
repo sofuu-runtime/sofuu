@@ -53,7 +53,6 @@ extern "C" {
     fn tui_height() -> c_int;
     fn tui_disp_width(s: *const c_char, len: usize) -> c_int;
     fn tui_truncate_cells(s: *const c_char, max_cells: c_int) -> usize;
-    fn tui_render_conversation_range(bottom: c_int);
     fn tui_render_conversation();
     fn tui_place_cursor(col: usize);
 }
@@ -97,6 +96,7 @@ thread_local! {
     static TTY_CTX: Cell<*mut JSContext> = const { Cell::new(ptr::null_mut()) };
     static READLINE_PROMISE: Cell<*mut PromiseHandle> = const { Cell::new(ptr::null_mut()) };
     static LINE_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static LINE_CURSOR: Cell<usize> = const { Cell::new(0) };
     static LINE_TRUNCATED: Cell<c_int> = const { Cell::new(0) };
     static RL_PROMPT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 
@@ -1079,6 +1079,7 @@ fn chat_history_append(line: &[u8]) {
 ///
 /// Returns a byte index that is always a char boundary and never exceeds
 /// `bytes.len()` — callers slice with it directly.
+#[cfg(test)]
 fn cut_to_cells(bytes: &[u8], keep: usize) -> usize {
     let mut cells = 0usize;
     let mut cut = 0usize;
@@ -1101,6 +1102,7 @@ fn cut_to_cells(bytes: &[u8], keep: usize) -> usize {
 
 /// UTF-8 sequence length implied by a lead byte. Paired with the
 /// cell-aware truncation below (mirrors truncate_cells in rt/tui.rs).
+#[cfg(test)]
 fn utf8_len(c: u8) -> usize {
     if c >= 0xF0 {
         4
@@ -1138,6 +1140,204 @@ fn tty_disp_width(s: &[u8]) -> usize {
         i += 1;
     }
     w
+}
+
+fn prev_char_boundary(bytes: &[u8], pos: usize) -> usize {
+    let mut i = pos.min(bytes.len());
+    if i == 0 {
+        return 0;
+    }
+    i -= 1;
+    while i > 0 && (bytes[i] & 0xC0) == 0x80 {
+        i -= 1;
+    }
+    i
+}
+
+fn next_char_boundary(bytes: &[u8], pos: usize) -> usize {
+    let len = bytes.len();
+    let mut i = pos.min(len);
+    if i >= len {
+        return len;
+    }
+    i += 1;
+    while i < len && (bytes[i] & 0xC0) == 0x80 {
+        i += 1;
+    }
+    i
+}
+
+fn prev_word_boundary(bytes: &[u8], pos: usize) -> usize {
+    let mut i = pos.min(bytes.len());
+    while i > 0 && matches!(bytes[i - 1], b' ' | b'\t') {
+        i -= 1;
+    }
+    if i > 0 && bytes[i - 1] == b'\n' {
+        return i - 1;
+    }
+    while i > 0 && !matches!(bytes[i - 1], b' ' | b'\t' | b'\n') {
+        i = prev_char_boundary(bytes, i);
+    }
+    i
+}
+
+fn next_word_boundary(bytes: &[u8], pos: usize) -> usize {
+    let len = bytes.len();
+    let mut i = pos.min(len);
+    while i < len && matches!(bytes[i], b' ' | b'\t') {
+        i += 1;
+    }
+    if i < len && bytes[i] == b'\n' {
+        return i + 1;
+    }
+    while i < len && !matches!(bytes[i], b' ' | b'\t' | b'\n') {
+        i = next_char_boundary(bytes, i);
+    }
+    i
+}
+
+fn tail_start_for_cells(bytes: &[u8], keep: usize) -> usize {
+    let mut cells = 0usize;
+    let mut start = bytes.len();
+    let mut pos = bytes.len();
+    while pos > 0 {
+        let prev = prev_char_boundary(bytes, pos);
+        let ch = std::str::from_utf8(&bytes[prev..pos])
+            .ok()
+            .and_then(|s| s.chars().next())
+            .unwrap_or('\u{fffd}');
+        let w = crate::rt::tui::char_cells_pub(ch);
+        if cells + w > keep {
+            break;
+        }
+        cells += w;
+        start = prev;
+        pos = prev;
+    }
+    start
+}
+
+fn tail_window_for_cells(seg: &[u8], cur_in_row: usize, avail: usize) -> (usize, usize, bool, bool) {
+    if avail == 0 {
+        return (0, 0, false, !seg.is_empty());
+    }
+    let cur = cur_in_row.min(seg.len());
+    let cur_cells = unsafe {
+        tui_disp_width(seg.as_ptr() as *const c_char, cur)
+    } as usize;
+    if cur_cells <= avail.saturating_sub(1) {
+        let end = crate::rt::tui::truncate_cells(seg, avail.saturating_sub(1));
+        return (0, end, false, end < seg.len());
+    }
+    let text_avail = avail.saturating_sub(1);
+    if cur == seg.len() {
+        let start = tail_start_for_cells(seg, text_avail);
+        return (start, seg.len(), start > 0, false);
+    }
+    let left_budget = text_avail.saturating_sub(1);
+    let start = tail_start_for_cells(&seg[..cur], left_budget);
+    let mut end = start + crate::rt::tui::truncate_cells(&seg[start..], text_avail);
+    let mut right_ell = false;
+    if end < seg.len() {
+        end = start + crate::rt::tui::truncate_cells(&seg[start..], text_avail.saturating_sub(1));
+        right_ell = end < seg.len();
+    }
+    (start, end, start > 0, right_ell)
+}
+
+fn line_row_bounds(bytes: &[u8], cur: usize) -> (usize, usize) {
+    let c = cur.min(bytes.len());
+    let seg = bytes[..c].iter().rposition(|&b| b == b'\n').map(|i| i + 1).unwrap_or(0);
+    let seg_end = bytes[c..].iter().position(|&b| b == b'\n').map(|i| c + i).unwrap_or(bytes.len());
+    (seg, seg_end)
+}
+
+fn line_clear() {
+    LINE_BUF.with(|b| b.borrow_mut().clear());
+    LINE_CURSOR.with(|c| c.set(0));
+}
+
+fn line_set(bytes: Vec<u8>) {
+    let len = bytes.len();
+    LINE_BUF.with(|b| *b.borrow_mut() = bytes);
+    LINE_CURSOR.with(|c| c.set(len));
+}
+
+fn line_insert_byte(b: u8) -> bool {
+    let inserted = LINE_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if buf.len() >= LINE_BUF_CAP - 1 {
+            return false;
+        }
+        let cur = LINE_CURSOR.with(|c| c.get()).min(buf.len());
+        if cur == buf.len() {
+            buf.push(b);
+        } else {
+            buf.insert(cur, b);
+        }
+        LINE_CURSOR.with(|c| c.set(cur + 1));
+        true
+    });
+    inserted
+}
+
+fn line_backspace() -> bool {
+    LINE_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        let cur = LINE_CURSOR.with(|c| c.get()).min(buf.len());
+        if cur == 0 {
+            return false;
+        }
+        let prev = prev_char_boundary(&buf, cur);
+        buf.drain(prev..cur);
+        LINE_CURSOR.with(|c| c.set(prev));
+        true
+    })
+}
+
+fn line_delete() -> bool {
+    LINE_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        let cur = LINE_CURSOR.with(|c| c.get()).min(buf.len());
+        if cur >= buf.len() {
+            return false;
+        }
+        let next = next_char_boundary(&buf, cur);
+        buf.drain(cur..next);
+        true
+    })
+}
+
+fn line_kill_word() -> bool {
+    LINE_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        let cur = LINE_CURSOR.with(|c| c.get()).min(buf.len());
+        if cur == 0 {
+            return false;
+        }
+        let prev = prev_word_boundary(&buf, cur);
+        if prev == cur {
+            return false;
+        }
+        buf.drain(prev..cur);
+        LINE_CURSOR.with(|c| c.set(prev));
+        true
+    })
+}
+
+fn line_kill_to_start() -> bool {
+    LINE_BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        let cur = LINE_CURSOR.with(|c| c.get()).min(buf.len());
+        if cur == 0 {
+            return false;
+        }
+        let (seg, _) = line_row_bounds(&buf, cur);
+        let kill_from = if cur == seg && seg > 0 { seg - 1 } else { seg };
+        buf.drain(kill_from..cur);
+        LINE_CURSOR.with(|c| c.set(kill_from));
+        true
+    })
 }
 
 // ── slash-command completion (__chat_complete, registered by chat.rs) ──
@@ -1357,11 +1557,21 @@ unsafe fn render_box_row(
     let row_cells = tty_disp_width(seg);
     let mut used;
     if row_cells > avail && avail > 0 {
-        let keep = if avail >= 1 { avail - 1 } else { 0 };
-        let cut = cut_to_cells(seg, keep);
-        let _ = write!(out, "…");
-        let _ = out.write_all(&seg[cut..]);
-        used = inner as usize;
+        let (w_start, w_end, left_ell, right_ell) = tail_window_for_cells(seg, seg.len(), avail);
+        if left_ell {
+            let _ = write!(out, "…");
+        }
+        let _ = out.write_all(&seg[w_start..w_end]);
+        if right_ell {
+            let _ = write!(out, "…");
+        }
+        used = prow
+            + usize::from(left_ell)
+            + usize::from(right_ell)
+            + (unsafe { tui_disp_width(seg[w_start..].as_ptr() as *const c_char, w_end - w_start) } as usize);
+        if used > inner as usize {
+            used = inner as usize;
+        }
     } else {
         let _ = out.write_all(seg);
         used = prow + row_cells;
@@ -1403,7 +1613,7 @@ unsafe fn tty_render_line_ui(ctx: *mut JSContext, autocomplete: c_int) {
                 new_line.clear();
                 new_line.extend_from_slice(&mb[..mlen]);
                 new_line.push(b' ');
-                LINE_BUF.with(|b| *b.borrow_mut() = new_line);
+                line_set(new_line);
                 completed = 1;
             }
         }
@@ -1551,9 +1761,10 @@ unsafe fn tty_render_tui(
     let inner = W - 2 - gutter; // 1 left │ + GUTTER + text + 1 right │  ≡ W-4 when GUTTER=2
     let scrolled = crate::rt::tui::tui_scroll_pos();
     let mut out = std::io::stdout().lock();
+    let _ = write!(out, "\x1b[?2026h");
 
     /* While a picker overlay owns rows 1..H-3: footer only. */
-    let mut used = 0usize;
+    let mut cursor_col_offset = 0usize;
     if SELECTOR_ACTIVE.with(|a| a.get()) == 0 {
         let box_top = tui_box_top();
         let conv_bottom = tui_conv_bottom();
@@ -1655,7 +1866,10 @@ unsafe fn tty_render_tui(
         /* 2. Conversation viewport, shrunk by the suggestion rows PLUS the
          * info line (which sits one row above the list — inside the
          * conversation redraw range otherwise). */
-        tui_render_conversation_range(tui_conv_bottom() - (shown as c_int) - (info_shown as c_int));
+        let _ = out.flush();
+        crate::rt::tui::tui_render_conversation_range_unsynced(
+            tui_conv_bottom() - (shown as c_int) - (info_shown as c_int),
+        );
 
         /* 3. The input box at fixed rows (T, I, I+1) + footer (F). */
         let T = tui_box_top();
@@ -1674,21 +1888,18 @@ unsafe fn tty_render_tui(
         let mut prow = 0usize;
         let prompt = RL_PROMPT.with(|p| p.borrow().clone());
         if !prompt.is_empty() {
-            let _ = write!(out, "{}", String::from_utf8_lossy(&prompt));
+            let p_str = String::from_utf8_lossy(&prompt);
+            let p_norm = crate::rt::tui::tui_normalize_for_canvas(&p_str, &bg);
+            let _ = out.write_all(p_norm.as_bytes());
             prow = tui_disp_width(prompt.as_ptr() as *const c_char, prompt.len()) as usize;
         }
-        /* single input row: show the LAST segment of a multiline buffer */
+        /* Active segment of a multiline buffer (tracks whichever line holds LINE_CURSOR). */
         let line = LINE_BUF.with(|b| b.borrow().clone());
-        let mut seg = 0usize;
-        let mut newlines = 0usize;
-        for (k, &b) in line.iter().enumerate() {
-            if b == b'\n' {
-                seg = k + 1;
-                newlines += 1;
-            }
-        }
+        let cur = LINE_CURSOR.with(|c| c.get()).min(line.len());
+        let (seg, seg_end) = line_row_bounds(&line, cur);
+        let newlines = line.iter().filter(|&&b| b == b'\n').count();
         /* multi-line buffer (pasted text / Alt+Enter): prefix a dim marker so
-         * the row reads as "more above" instead of a lone orphan line. */
+         * the row reads as "more lines" instead of an orphan segment. */
         if newlines > 0 {
             let marker = if newlines > 1 {
                 format!("{subtle}[+{} lines]\x1b[0m{bg}", newlines)
@@ -1696,24 +1907,37 @@ unsafe fn tty_render_tui(
                 format!("{subtle}[+1 line]\x1b[0m{bg}")
             };
             let _ = write!(out, "{}", marker);
-            /* "[+N lines]" cells = 2 + digits + 7; "[+1 line]" = 9. */
             prow += if newlines > 1 { 9 + newlines.to_string().len() } else { 9 };
         }
-        let row_len = line.len() - seg;
+        let row_bytes = &line[seg..seg_end];
+        let cur_in_row = cur - seg;
         let avail = if inner > prow as c_int { (inner - prow as c_int) as usize } else { 0 };
-        let row_cells = tui_disp_width(line[seg..].as_ptr() as *const c_char, row_len) as usize;
+        let row_cells = tui_disp_width(row_bytes.as_ptr() as *const c_char, row_bytes.len()) as usize;
+        let used;
         if row_cells > avail && avail > 0 {
-            let keep = if avail >= 1 { avail - 1 } else { 0 };
-            let cut = cut_to_cells(&line[seg..], keep);
-            let _ = write!(out, "…");
-            let _ = out.write_all(&line[seg + cut..]);
-            used = inner as usize;
+            let (w_start, w_end, left_ell, right_ell) = tail_window_for_cells(row_bytes, cur_in_row, avail);
+            if left_ell {
+                let _ = write!(out, "…");
+            }
+            let _ = out.write_all(&row_bytes[w_start..w_end]);
+            if right_ell {
+                let _ = write!(out, "…");
+            }
+            let cur_offset_bytes = cur_in_row.saturating_sub(w_start).min(w_end - w_start);
+            let cur_vis_cells = tui_disp_width(
+                row_bytes[w_start..].as_ptr() as *const c_char,
+                cur_offset_bytes,
+            ) as usize;
+            cursor_col_offset = (prow + usize::from(left_ell) + cur_vis_cells).min(inner as usize);
+            let shown_cells = tui_disp_width(row_bytes[w_start..].as_ptr() as *const c_char, w_end - w_start) as usize;
+            used = (prow + usize::from(left_ell) + usize::from(right_ell) + shown_cells).min(inner as usize);
         } else {
-            let _ = out.write_all(&line[seg..]);
-            used = prow + row_cells;
+            let _ = out.write_all(row_bytes);
+            let cur_vis_cells = tui_disp_width(row_bytes.as_ptr() as *const c_char, cur_in_row) as usize;
+            cursor_col_offset = (prow + cur_vis_cells).min(inner as usize);
+            used = (prow + row_cells).min(inner as usize);
         }
-        /* Pad to the right border with a SEPARATE counter — `used` must
-         * keep the text-end column for cursor placement below. */
+        /* Pad to the right border cleanly. */
         let mut pad = used;
         while pad < inner as usize {
             let _ = write!(out, " ");
@@ -1727,12 +1951,23 @@ unsafe fn tty_render_tui(
         let _ = write!(out, "╯\x1b[0m{bg}");
     }
 
-    /* 4. Footer row F (H-2): left status, right subtle hints. */
+    /* 4. Footer row F (H-2): left status, right adaptive hints. */
     let F = tui_footer_row();
     let bg = crate::rt::tui::tui_bg_prefix();
     let subtle = crate::rt::tui::tui_subtle_sgr();
     let _ = write!(out, "\x1b[{};1H{}\x1b[K", F, bg);
-    let hints = HINTS.with(|h| h.borrow().clone());
+    let raw_hints = HINTS.with(|h| h.borrow().clone());
+    let hints: Vec<u8> = if raw_hints.as_slice() == b"/help \xc2\xb7 \xe2\x8f\x8e \xc2\xb7 esc \xc2\xb7 ctrl-k copy" {
+        if W < 60 {
+            b"? \xc2\xb7 \xe2\x8f\x8e".to_vec()
+        } else if W < 84 {
+            b"/help \xc2\xb7 \xe2\x8f\x8e \xc2\xb7 esc".to_vec()
+        } else {
+            raw_hints
+        }
+    } else {
+        raw_hints
+    };
     let status = STATUS.with(|s| s.borrow().clone());
     let hints_w = if !hints.is_empty() {
         tui_disp_width(hints.as_ptr() as *const c_char, hints.len()) as usize
@@ -1744,13 +1979,9 @@ unsafe fn tty_render_tui(
         if avail >= 1 {
             let bl = crate::rt::tui::truncate_cells(&status, avail as usize);
             let _ = write!(out, "\x1b[{};{}H", F, 1 + gutter);
-            if !bg.is_empty() && status[..bl].contains(&b'\x1b') {
-                let st_s = String::from_utf8_lossy(&status[..bl]);
-                let re = st_s.replace("\x1b[0m", &format!("\x1b[0m{bg}"));
-                let _ = out.write_all(re.as_bytes());
-            } else {
-                let _ = out.write_all(&status[..bl]);
-            }
+            let st_s = String::from_utf8_lossy(&status[..bl]);
+            let st_norm = crate::rt::tui::tui_normalize_for_canvas(&st_s, &bg);
+            let _ = out.write_all(st_norm.as_bytes());
         }
     }
     if hints_w > 0 {
@@ -1779,8 +2010,8 @@ unsafe fn tty_render_tui(
         let bl_l = if avail_l > 0 { crate::rt::tui::truncate_cells(&metric_l, avail_l as usize) } else { 0 };
         if bl_l > 0 {
             let ml_s = String::from_utf8_lossy(&metric_l[..bl_l]);
-            let re = if !bg.is_empty() { ml_s.replace("\x1b[0m", &format!("\x1b[0m{bg}")) } else { ml_s.to_string() };
-            let _ = write!(out, "\x1b[{};{}H{}{}\x1b[0m{bg}", tui_footer2_row(), 1+gutter, subtle, re);
+            let ml_norm = crate::rt::tui::tui_normalize_for_canvas(&ml_s, &bg);
+            let _ = write!(out, "\x1b[{};{}H{}{}\x1b[0m{bg}", tui_footer2_row(), 1+gutter, subtle, ml_norm);
         }
     }
     if !metric.is_empty() {
@@ -1789,19 +2020,20 @@ unsafe fn tty_render_tui(
         if mcol < 1 {
             mcol = 1;
         }
-        let _ = write!(out, "\x1b[{};{}H{}{}\x1b[0m{bg}", tui_footer2_row(), mcol, subtle, String::from_utf8_lossy(&metric));
+        let m_s = String::from_utf8_lossy(&metric);
+        let m_norm = crate::rt::tui::tui_normalize_for_canvas(&m_s, &bg);
+        let _ = write!(out, "\x1b[{};{}H{}{}\x1b[0m{bg}", tui_footer2_row(), mcol, subtle, m_norm);
     }
 
-    /* 6. Cursor: visible just AFTER the last typed char.
-     * Row: "│· ·❯·<text>│" with GUTTER spaces. The cursor must be one cell past
-     * the text (on the padding/closing-border side), not on the last glyph. */
+    /* 6. Cursor: positioned accurately at LINE_CURSOR within the visible row. */
     if READLINE_PROMISE.with(|p| p.get()).is_null() == false {
         let _ = write!(out, "\x1b[?25h");
-        let cursor_col = 1 + crate::rt::tui::GUTTER + used;
+        let cursor_col = 1 + crate::rt::tui::GUTTER + cursor_col_offset;
         tui_place_cursor(cursor_col);
     } else {
         let _ = write!(out, "\x1b[?25l");
     }
+    let _ = write!(out, "\x1b[?2026l");
     let _ = out.flush();
 }
 
@@ -2089,18 +2321,14 @@ unsafe extern "C" fn js_selector_draw(
     let top = zone_bottom - lines as c_int + 1;
     let sel_top = SEL_TOP.with(|t| t.get());
     let sel_rows = SEL_ROWS.with(|r| r.get());
+    let bg = crate::rt::tui::tui_bg_prefix();
+    let _ = write!(out, "\x1b[?2026h");
     if sel_top >= 0 {
         let last_old = sel_top + sel_rows - 1;
         let new_bottom = top + lines as c_int - 1;
-        // Clear the entire previous picker rectangle first, then the
-        // new one fully overwrites. This handles filter narrowing,
-        // expanding, and H/W changes without stranded rows.
         for r in sel_top..=last_old {
-            let _ = write!(out, "\x1b[{};1H{}\x1b[K", r, crate::rt::tui::tui_bg_prefix());
+            let _ = write!(out, "\x1b[{};1H{}\x1b[K", r, bg);
         }
-        // Bottom-tail when H shrank: old zone_bottom may be below new one,
-        // but that tail was part of the old rect already (cleared above).
-        // Keep top-gap handling via the full clear — no partial gap needed.
         let _ = new_bottom;
     }
     let mut p: &[u8] = s;
@@ -2110,8 +2338,10 @@ unsafe extern "C" fn js_selector_draw(
         let tmp = &p[..len];
         let tcs = CString::new(tmp).unwrap_or_default();
         let bl = tui_truncate_cells(tcs.as_ptr(), W);
-        let _ = write!(out, "\x1b[{};1H{}\x1b[K", top + i as c_int, crate::rt::tui::tui_bg_prefix());
-        let _ = out.write_all(&tmp[..bl.min(tmp.len())]);
+        let _ = write!(out, "\x1b[{};1H{}\x1b[K", top + i as c_int, bg);
+        let row_str = String::from_utf8_lossy(&tmp[..bl.min(tmp.len())]);
+        let row_norm = crate::rt::tui::tui_normalize_for_canvas(&row_str, &bg);
+        let _ = out.write_all(row_norm.as_bytes());
         p = match nl {
             None => &p[p.len()..],
             Some(i) => &p[i + 1..],
@@ -2119,6 +2349,7 @@ unsafe extern "C" fn js_selector_draw(
     }
     SEL_TOP.with(|t| t.set(top));
     SEL_ROWS.with(|r| r.set(lines as c_int));
+    let _ = write!(out, "\x1b[?2026l");
     let _ = out.flush();
     qjs::sofuu_js_free_cstring(ctx, s_ptr);
     qjs::sofuu_js_undefined()
@@ -2252,6 +2483,7 @@ unsafe fn tty_history_nav(ctx: *mut JSContext, dir: c_int) {
                 b.extend_from_slice(&entry);
             }
         }
+        LINE_CURSOR.with(|c| c.set(b.len()));
     });
     tty_render_line_ui(ctx, 0);
 }
@@ -2276,7 +2508,7 @@ unsafe extern "C" fn esc_timeout_cb(_t: *mut UvTimer) {
         selector_key(ctx, "esc", None);
     } else if !READLINE_PROMISE.with(|p| p.get()).is_null() {
         if LINE_BUF.with(|b| b.borrow().len()) > 0 {
-            LINE_BUF.with(|b| b.borrow_mut().clear());
+            line_clear();
             tty_render_line_ui(ctx, 0);
         }
     } else {
@@ -2319,10 +2551,7 @@ unsafe fn esc_timer_cancel() {
 /// storm; one redraw happens when ESC[201~ closes the paste.
 unsafe fn paste_push(c: u8) {
     let b = if c == b'\r' { b'\n' } else { c };
-    let len = LINE_BUF.with(|l| l.borrow().len());
-    if len < LINE_BUF_CAP - 1 {
-        LINE_BUF.with(|l| l.borrow_mut().push(b));
-    } else {
+    if !line_insert_byte(b) {
         LINE_TRUNCATED.with(|t| t.set(1));
     }
 }
@@ -2656,7 +2885,7 @@ unsafe fn completion_accept(ctx: *mut JSContext) {
     let mut new_line = line.clone();
     new_line.clear();
     new_line.extend_from_slice(choice);
-    LINE_BUF.with(|b| *b.borrow_mut() = new_line);
+    line_set(new_line);
     COMPLETE_SEL.with(|s| s.set(-1));
     tty_render_line_ui(ctx, 0);
     rl_submit(ctx);
@@ -2689,14 +2918,14 @@ unsafe fn rl_submit(ctx: *mut JSContext) {
     } else {
         rl_queue_push(&line);
     }
-    LINE_BUF.with(|b| b.borrow_mut().clear());
+    line_clear();
     COMPLETE_SEL.with(|s| s.set(-1));
     if STDIN_IS_TTY.with(|t| t.get()) != 0 {
         tty_render_line_ui(ctx, 0);
     }
 }
 
-/// tty_esc_step — ESC-sequence state machine, ported verbatim.
+/// tty_esc_step — ESC-sequence state machine.
 unsafe fn tty_esc_step(c: u8, ctx: *mut JSContext) -> c_int {
     let state = ESC_STATE.with(|s| s.get());
     match state {
@@ -2706,13 +2935,36 @@ unsafe fn tty_esc_step(c: u8, ctx: *mut JSContext) -> c_int {
                 ESC_STATE.with(|s| s.set(2));
                 return 2;
             }
+            if c == b'b' && SELECTOR_ACTIVE.with(|a| a.get()) == 0 {
+                /* Alt/Option+Left word back */
+                let moved = LINE_BUF.with(|b| {
+                    let buf = b.borrow();
+                    let cur = LINE_CURSOR.with(|p| p.get()).min(buf.len());
+                    let next = prev_word_boundary(&buf, cur);
+                    LINE_CURSOR.with(|p| p.set(next));
+                    next != cur
+                });
+                if moved { tty_render_line_ui(ctx, 0); }
+                return 0;
+            }
+            if c == b'f' && SELECTOR_ACTIVE.with(|a| a.get()) == 0 {
+                /* Alt/Option+Right word forward */
+                let moved = LINE_BUF.with(|b| {
+                    let buf = b.borrow();
+                    let cur = LINE_CURSOR.with(|p| p.get()).min(buf.len());
+                    let next = next_word_boundary(&buf, cur);
+                    LINE_CURSOR.with(|p| p.set(next));
+                    next != cur
+                });
+                if moved { tty_render_line_ui(ctx, 0); }
+                return 0;
+            }
             if c == b'\r' || c == b'\n' {
                 /* Alt+Enter → newline (ptys may deliver CR as LF) */
                 if SELECTOR_ACTIVE.with(|a| a.get()) != 0 {
                     return 0; /* no multi-line in pickers */
                 }
-                if LINE_BUF.with(|b| b.borrow().len()) < LINE_BUF_CAP - 1 {
-                    LINE_BUF.with(|b| b.borrow_mut().push(b'\n'));
+                if line_insert_byte(b'\n') {
                     tty_render_line_ui(ctx, 0);
                 }
                 return 0;
@@ -2726,7 +2978,7 @@ unsafe fn tty_esc_step(c: u8, ctx: *mut JSContext) -> c_int {
                 selector_key(ctx, "esc", None);
             } else if !READLINE_PROMISE.with(|p| p.get()).is_null() {
                 if LINE_BUF.with(|b| b.borrow().len()) > 0 {
-                    LINE_BUF.with(|b| b.borrow_mut().clear());
+                    line_clear();
                     tty_render_line_ui(ctx, 0);
                 }
             } else {
@@ -2769,12 +3021,56 @@ unsafe fn tty_esc_step(c: u8, ctx: *mut JSContext) -> c_int {
                 b'C' => {
                     if SELECTOR_ACTIVE.with(|a| a.get()) != 0 {
                         selector_key(ctx, "right", None);
+                    } else {
+                        let moved = LINE_BUF.with(|b| {
+                            let buf = b.borrow();
+                            let cur = LINE_CURSOR.with(|p| p.get()).min(buf.len());
+                            let next = next_char_boundary(&buf, cur);
+                            LINE_CURSOR.with(|p| p.set(next));
+                            next != cur
+                        });
+                        if moved { tty_render_line_ui(ctx, 0); }
                     }
                     0
                 }
                 b'D' => {
                     if SELECTOR_ACTIVE.with(|a| a.get()) != 0 {
                         selector_key(ctx, "left", None);
+                    } else {
+                        let moved = LINE_BUF.with(|b| {
+                            let buf = b.borrow();
+                            let cur = LINE_CURSOR.with(|p| p.get()).min(buf.len());
+                            let prev = prev_char_boundary(&buf, cur);
+                            LINE_CURSOR.with(|p| p.set(prev));
+                            prev != cur
+                        });
+                        if moved { tty_render_line_ui(ctx, 0); }
+                    }
+                    0
+                }
+                b'H' => {
+                    if SELECTOR_ACTIVE.with(|a| a.get()) == 0 {
+                        let moved = LINE_BUF.with(|b| {
+                            let buf = b.borrow();
+                            let cur = LINE_CURSOR.with(|p| p.get()).min(buf.len());
+                            let (seg, _) = line_row_bounds(&buf, cur);
+                            LINE_CURSOR.with(|p| p.set(seg));
+                            seg != cur
+                        });
+                        if moved { tty_render_line_ui(ctx, 0); }
+                    }
+                    0
+                }
+                b'F' => {
+                    if SELECTOR_ACTIVE.with(|a| a.get()) == 0 {
+                        let moved = LINE_BUF.with(|b| {
+                            let buf = b.borrow();
+                            let cur = LINE_CURSOR.with(|p| p.get()).min(buf.len());
+                            let (_, seg_end) = line_row_bounds(&buf, cur);
+                            LINE_CURSOR.with(|p| p.set(seg_end));
+                            seg_end != cur
+                        });
+                        if moved { tty_render_line_ui(ctx, 0); }
                     }
                     0
                 }
@@ -2784,7 +3080,9 @@ unsafe fn tty_esc_step(c: u8, ctx: *mut JSContext) -> c_int {
                     }
                     0
                 }
-                b'1' => 3, /* Shift+Enter? */
+                b'1' => 3, /* Shift+Enter / Home / Ctrl+Arrow */
+                b'3' => 40, /* Delete ESC[3~ */
+                b'4' => 41, /* End ESC[4~ */
                 b'5' => 7, /* PageUp? */
                 b'6' => 8, /* PageDown? */
                 b'<' => {
@@ -3031,9 +3329,91 @@ unsafe fn tty_esc_step(c: u8, ctx: *mut JSContext) -> c_int {
         3 => {
             if c == b'3' {
                 4
+            } else if c == b'~' {
+                if SELECTOR_ACTIVE.with(|a| a.get()) == 0 {
+                    let moved = LINE_BUF.with(|b| {
+                        let buf = b.borrow();
+                        let cur = LINE_CURSOR.with(|p| p.get()).min(buf.len());
+                        let (seg, _) = line_row_bounds(&buf, cur);
+                        LINE_CURSOR.with(|p| p.set(seg));
+                        seg != cur
+                    });
+                    if moved { tty_render_line_ui(ctx, 0); }
+                }
+                0
+            } else if c == b';' {
+                42
             } else {
                 0
             }
+        }
+        40 => {
+            if c == b'~' && SELECTOR_ACTIVE.with(|a| a.get()) == 0 {
+                COMPLETE_SEL.with(|s| s.set(-1));
+                if line_delete() {
+                    tty_render_line_ui(ctx, 0);
+                }
+            }
+            0
+        }
+        41 => {
+            if c == b'~' && SELECTOR_ACTIVE.with(|a| a.get()) == 0 {
+                let moved = LINE_BUF.with(|b| {
+                    let buf = b.borrow();
+                    let cur = LINE_CURSOR.with(|p| p.get()).min(buf.len());
+                    let (_, seg_end) = line_row_bounds(&buf, cur);
+                    LINE_CURSOR.with(|p| p.set(seg_end));
+                    seg_end != cur
+                });
+                if moved { tty_render_line_ui(ctx, 0); }
+            }
+            0
+        }
+        42 => {
+            if matches!(c, b'2' | b'3' | b'5') {
+                43
+            } else {
+                0
+            }
+        }
+        43 => {
+            if SELECTOR_ACTIVE.with(|a| a.get()) == 0 {
+                match c {
+                    b'C' => {
+                        let moved = LINE_BUF.with(|b| {
+                            let buf = b.borrow();
+                            let cur = LINE_CURSOR.with(|p| p.get()).min(buf.len());
+                            let next = next_word_boundary(&buf, cur);
+                            LINE_CURSOR.with(|p| p.set(next));
+                            next != cur
+                        });
+                        if moved { tty_render_line_ui(ctx, 0); }
+                    }
+                    b'D' => {
+                        let moved = LINE_BUF.with(|b| {
+                            let buf = b.borrow();
+                            let cur = LINE_CURSOR.with(|p| p.get()).min(buf.len());
+                            let next = prev_word_boundary(&buf, cur);
+                            LINE_CURSOR.with(|p| p.set(next));
+                            next != cur
+                        });
+                        if moved { tty_render_line_ui(ctx, 0); }
+                    }
+                    b'H' => {
+                        let moved = LINE_CURSOR.with(|p| p.replace(0)) != 0;
+                        if moved { tty_render_line_ui(ctx, 0); }
+                    }
+                    b'F' => {
+                        let moved = LINE_BUF.with(|b| {
+                            let len = b.borrow().len();
+                            LINE_CURSOR.with(|p| p.replace(len)) != len
+                        });
+                        if moved { tty_render_line_ui(ctx, 0); }
+                    }
+                    _ => {}
+                }
+            }
+            0
         }
         4 => {
             if c == b';' {
@@ -3052,8 +3432,7 @@ unsafe fn tty_esc_step(c: u8, ctx: *mut JSContext) -> c_int {
         6 => {
             if c == b'u' {
                 /* Shift+Enter → newline */
-                if LINE_BUF.with(|b| b.borrow().len()) < LINE_BUF_CAP - 1 {
-                    LINE_BUF.with(|b| b.borrow_mut().push(b'\n'));
+                if line_insert_byte(b'\n') {
                     tty_render_line_ui(ctx, 0);
                 }
             }
@@ -3149,6 +3528,7 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
     }
 
     /* Accumulate bytes, deliver each complete line */
+    let mut need_redraw = false;
     for i in 0..nread {
         let c = (*buf).base.add(i as usize).read() as u8;
 
@@ -3251,16 +3631,54 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
                 call_ui_hook(ctx, "__on_tab");
                 tty_render_line_ui(ctx, 0);
             }
+            need_redraw = false;
+            continue;
+        }
+        if c == 0x01 && STDIN_IS_TTY.with(|t| t.get()) != 0 {
+            /* Ctrl-A: move cursor to start of current row. */
+            let moved = LINE_BUF.with(|b| {
+                let buf = b.borrow();
+                let cur = LINE_CURSOR.with(|p| p.get()).min(buf.len());
+                let (seg, _) = line_row_bounds(&buf, cur);
+                LINE_CURSOR.with(|p| p.set(seg));
+                seg != cur
+            });
+            if moved { need_redraw = true; }
+            continue;
+        }
+        if c == 0x05 && STDIN_IS_TTY.with(|t| t.get()) != 0 {
+            /* Ctrl-E: move cursor to end of current row. */
+            let moved = LINE_BUF.with(|b| {
+                let buf = b.borrow();
+                let cur = LINE_CURSOR.with(|p| p.get()).min(buf.len());
+                let (_, seg_end) = line_row_bounds(&buf, cur);
+                LINE_CURSOR.with(|p| p.set(seg_end));
+                seg_end != cur
+            });
+            if moved { need_redraw = true; }
+            continue;
+        }
+        if c == 0x15 && STDIN_IS_TTY.with(|t| t.get()) != 0 {
+            /* Ctrl-U: kill backward to start of line. */
+            COMPLETE_SEL.with(|s| s.set(-1));
+            if line_kill_to_start() {
+                need_redraw = true;
+            }
+            continue;
+        }
+        if c == 0x17 && STDIN_IS_TTY.with(|t| t.get()) != 0 {
+            /* Ctrl-W: delete previous word. */
+            COMPLETE_SEL.with(|s| s.set(-1));
+            if line_kill_word() {
+                need_redraw = true;
+            }
             continue;
         }
         if c == 0x7f || c == 0x08 {
-            /* Backspace: drop the last char and redraw. */
+            /* Backspace: drop the UTF-8 char before cursor and redraw. */
             COMPLETE_SEL.with(|s| s.set(-1));
-            if LINE_BUF.with(|b| b.borrow().len()) > 0 {
-                LINE_BUF.with(|b| b.borrow_mut().pop());
-                if STDIN_IS_TTY.with(|t| t.get()) != 0 {
-                    tty_render_line_ui(ctx, 0);
-                }
+            if line_backspace() {
+                need_redraw = true;
             }
             continue;
         }
@@ -3329,8 +3747,9 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
                 /* No promise yet — queue the line */
                 rl_queue_push(&line);
             }
-            LINE_BUF.with(|b| b.borrow_mut().clear());
+            line_clear();
             COMPLETE_SEL.with(|s| s.set(-1));
+            need_redraw = false;
             /* Instantly redraw the input box EMPTY — the submitted text must
              * vanish from the field the moment Enter is pressed (the driver
              * re-renders again when it re-arms the next prompt). */
@@ -3341,16 +3760,19 @@ unsafe extern "C" fn tty_read_cb(stream: *mut UvStream, nread: isize, buf: *cons
                 eprintln!("[sofuu] input truncated at {} bytes", LINE_BUF_CAP - 1);
                 LINE_TRUNCATED.with(|t| t.set(0));
             }
-        } else if LINE_BUF.with(|b| b.borrow().len()) < LINE_BUF_CAP - 1 {
+        } else if line_insert_byte(c) {
             COMPLETE_SEL.with(|s| s.set(-1));
-            LINE_BUF.with(|b| b.borrow_mut().push(c));
-            /* TTY: redraw the live region after EVERY keystroke. */
-            if STDIN_IS_TTY.with(|t| t.get()) != 0 {
-                tty_render_line_ui(ctx, 0);
-            }
+            /* Defer the TTY redraw until the end of this read chunk so
+             * multi-byte UTF-8 sequences and fast keystroke bursts land
+             * atomically without partial codepoint replacement glyphs. */
+            need_redraw = true;
         } else {
             LINE_TRUNCATED.with(|t| t.set(1)); /* chars past LINE_BUF_CAP-1 (1 MiB) dropped — the old "8191" comment predated the cap raise */
         }
+    }
+
+    if need_redraw && STDIN_IS_TTY.with(|t| t.get()) != 0 {
+        tty_render_line_ui(ctx, 0);
     }
 
     if !(*buf).base.is_null() {
@@ -4428,5 +4850,28 @@ mod tests {
         assert_eq!(chat_history_trimmed("a\nb\nc", 10), "a\nb\nc\n");
         assert_eq!(chat_history_trimmed("", 5), "");
         assert_eq!(chat_history_trimmed("only", 0), "");
+    }
+
+    #[test]
+    fn utf8_cursor_and_window_helpers_stay_bounded() {
+        let s = "hello \u{1f389} world";
+        let b = s.as_bytes();
+        // Emoji 🎉 spans bytes 6..10
+        assert_eq!(prev_char_boundary(b, 10), 6);
+        assert_eq!(next_char_boundary(b, 6), 10);
+        assert_eq!(prev_word_boundary(b, b.len()), 11);
+        assert_eq!(next_word_boundary(b, 0), 5);
+
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa".as_bytes();
+        for cur in [0, 5, 25, long.len()] {
+            for avail in [6, 12, 24] {
+                let (ws, we, left_ell, right_ell) = tail_window_for_cells(long, cur, avail);
+                assert!(ws <= we && we <= long.len());
+                assert!(cur >= ws && cur <= we, "cursor {cur} outside [{ws}..{we}]");
+                let text_w = tty_disp_width(&long[ws..we]);
+                let total = text_w + usize::from(left_ell) + usize::from(right_ell);
+                assert!(total <= avail, "window width {total} > avail {avail}");
+            }
+        }
     }
 }

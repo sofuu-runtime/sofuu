@@ -110,9 +110,10 @@ establish a shared Kaze 1.0 core or bytecode compatibility with standalone Kaze.
 
 ## Local verification and remaining work
 
-On 2026-11-12, the macOS debug build with SHA-256
+On 2026-11-13, the macOS debug build with SHA-256
 `cd0a0abef7835aad1393a4d75e82362231d2768c1f18e92e1324b5d1749b0a21` passed the
-embedded Kaze unit suite and the cross-surface checks below. They cover pure
+99 focused embedded Kaze tests, 246 broader Kaze/compiler/memory/robotics tests,
+and the cross-surface checks below. They cover pure
 computation, refusals and policy, source and bytecode, both JS aliases, REPL,
 compiled one-shot agents, per-run CMA storage, explicitly selected drone
 simulation, missing-model classification, and output-label validation. A

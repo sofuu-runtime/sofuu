@@ -20,7 +20,7 @@
 
 ## 1. Implemented Surfaces and Experimental Modules
 
-> **Status:** Sofuu is beta. Implementation of a feature is not proof of production readiness, complete security, or an uptime guarantee. Current embedded Kaze source refuses unavailable non-robotics capabilities; the real model-and-tool milestone and published-binary verification remain open.
+> **Status:** Sofuu is beta. Implementation of a feature is not proof of production readiness, complete security, or an uptime guarantee. Current embedded Kaze source refuses unavailable non-robotics capabilities and serves authorized AI/tool calls through an async bridge on debug builds; released-artifact, local-GGUF and physical-hardware verification remain open.
 
 ### ⚡ Main Runtime Subsystems
 
@@ -58,7 +58,7 @@
 #### 💨 Kaze (風) Zero-GC Deterministic Guardrail Engine
 - [x] **Small Typed Language**: Fixed-size arena allocation, zero-GC pauses in the hot path, bytecode compilation.
 - [x] **Capability Gates**: Fail-closed access-control policies enforcing declared hardware/system permissions.
-- [ ] **Real Kaze backends**: The embedded source includes explicitly selected per-run CMA memory and refuses unavailable AI, tool, persistent Kaze memory and alert operations. Complete real adapters, remaining execution-path checks and release verification; see [Kaze embedded status](KAZE-EMBEDDED.md).
+- [ ] **Real Kaze backends**: The embedded source includes an authorized async bridge for AI and built-in/MCP tools, plus explicitly selected per-run CMA memory. Synchronous paths and unavailable persistent memory, alerts, sensors and devices fail closed. Complete cancellation and approval-receipt handling, local-GGUF coverage, released-artifact verification and the remaining execution-path audit; see [Kaze embedded status](KAZE-EMBEDDED.md).
 
 ---
 
@@ -121,10 +121,12 @@ not a `make size-check` or published-artifact verification. No physical
 hardware was tested, and the results do not establish other platforms or
 releases.
 
-Remaining work includes a pure-Kaze real model-plus-MCP journey, approval
-receipts, durable Kaze memory and acknowledged alerts, physical-simulator
-safety, migration of remaining simulated test providers, broader surface and
-release-artifact audits, and the applicable release gates. `make test-rust`,
+The pure-Kaze model-plus-MCP journey now passes on a debug build through
+`sofuu.kaze.runAsync`, a compiled agent and `sofuu script run` for source and
+`.kazebc`. Remaining work includes approval receipts, cancellation coverage,
+durable Kaze memory and acknowledged alerts, physical-simulator safety,
+migration of remaining simulated test providers, local-GGUF coverage, broader
+surface and release-artifact audits, and the applicable release gates. `make test-rust`,
 the aggregate tests and preflight are blocked until their simulated providers
 are migrated. The main CI job therefore currently stops at `make test-rust`;
 model-dependent CI gates also require an existing compatible model on the

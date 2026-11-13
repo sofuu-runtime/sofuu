@@ -139,6 +139,42 @@ fn provider_api_url(p: Provider, _model: Option<&str>) -> String {
     }
 }
 
+/// Resolves the full chat/completion/message endpoint URL, ensuring base URLs
+/// (e.g. `https://router-api.0g.ai/v1`) are cleanly suffixed and deduplicated.
+fn resolve_request_url(eff: Provider, base: Option<&str>, model: Option<&str>) -> String {
+    let raw = match base {
+        Some(u) if !u.trim().is_empty() => {
+            let trimmed = u.trim().trim_end_matches('/');
+            if trimmed.ends_with("/chat/completions")
+                || trimmed.ends_with("/completions")
+                || trimmed.ends_with("/messages")
+                || trimmed.ends_with("/api/chat")
+            {
+                trimmed.to_string()
+            } else if eff == Provider::Anthropic {
+                if trimmed.ends_with("/v1") {
+                    format!("{trimmed}/messages")
+                } else {
+                    format!("{trimmed}/v1/messages")
+                }
+            } else if eff == Provider::Local {
+                format!("{trimmed}/api/chat")
+            } else if trimmed.ends_with("/v1") {
+                format!("{trimmed}/chat/completions")
+            } else {
+                format!("{trimmed}/v1/chat/completions")
+            }
+        }
+        _ => provider_api_url(eff, model),
+    };
+    if raw.matches("/chat/completions").count() > 1 {
+        let first = raw.find("/chat/completions").unwrap();
+        raw[..first + "/chat/completions".len()].to_string()
+    } else {
+        raw
+    }
+}
+
 /// For PROVIDER_CUSTOM the wire format (request body + response parsing +
 /// auth header) comes from `profile`; everything else uses its own format.
 /// Profile NULL/""/unknown → OpenAI-compatible (the common case).
@@ -290,9 +326,17 @@ fn append_tools_openai(body: &mut String, cfg: &AiRequestConfig) {
     if cfg.tools.is_empty() {
         return;
     }
-    body.push_str(",\"tools\":[");
-    for (i, t) in cfg.tools.iter().enumerate() {
-        if i > 0 {
+    let mut seen = std::collections::HashSet::new();
+    let mut first = true;
+    for t in &cfg.tools {
+        let name_str = t.name.as_deref().unwrap_or("");
+        if !name_str.is_empty() && !seen.insert(name_str) {
+            continue;
+        }
+        if first {
+            body.push_str(",\"tools\":[");
+            first = false;
+        } else {
             body.push(',');
         }
         let d = json_escape(t.description.as_deref());
@@ -303,16 +347,29 @@ fn append_tools_openai(body: &mut String, cfg: &AiRequestConfig) {
             n, d, p
         ));
     }
-    body.push(']');
+    if !first {
+        body.push(']');
+    }
 }
 
 fn append_tools_anthropic(body: &mut String, cfg: &AiRequestConfig) {
     if cfg.tools.is_empty() {
         return;
     }
+    let mut unique_tools: Vec<&AiToolDef> = Vec::with_capacity(cfg.tools.len());
+    let mut seen = std::collections::HashSet::new();
+    for t in &cfg.tools {
+        let name_str = t.name.as_deref().unwrap_or("");
+        if name_str.is_empty() || seen.insert(name_str) {
+            unique_tools.push(t);
+        }
+    }
+    if unique_tools.is_empty() {
+        return;
+    }
     body.push_str(",\"tools\":[");
-    let last = cfg.tools.len() - 1;
-    for (i, t) in cfg.tools.iter().enumerate() {
+    let last = unique_tools.len() - 1;
+    for (i, t) in unique_tools.iter().enumerate() {
         if i > 0 {
             body.push(',');
         }
@@ -4541,19 +4598,7 @@ unsafe extern "C" fn js_ai_complete(
         );
     }
     let api_key: Option<String> = resolve_api_key(eff, cfg.api_key.as_deref());
-    /* A base_url override (self-hosted endpoints) wins over the provider's
-     * built-in endpoint. Normalize duplicated /chat/completions suffix — the
-     * config can re-corrupt if an old binary re-saves while editing. */
-    let url: String = {
-        let raw = match cfg.base_url.as_deref() {
-            Some(u) if !u.is_empty() => u.to_string(),
-            _ => provider_api_url(eff, cfg.model.as_deref()),
-        };
-        if raw.matches("/chat/completions").count() > 1 {
-            let first = raw.find("/chat/completions").unwrap();
-            raw[..first + "/chat/completions".len()].to_string()
-        } else { raw }
-    };
+    let url = resolve_request_url(eff, cfg.base_url.as_deref(), cfg.model.as_deref());
 
     let mut req = Box::new(AiCompleteReq {
         tag: REQ_TAG_COMPLETE,
@@ -4827,16 +4872,7 @@ unsafe extern "C" fn js_ai_stream(
         );
     }
     let api_key: Option<String> = resolve_api_key(eff, cfg.api_key.as_deref());
-    let url: String = {
-        let raw = match cfg.base_url.as_deref() {
-            Some(u) if !u.is_empty() => u.to_string(),
-            _ => provider_api_url(eff, cfg.model.as_deref()),
-        };
-        if raw.matches("/chat/completions").count() > 1 {
-            let first = raw.find("/chat/completions").unwrap();
-            raw[..first + "/chat/completions".len()].to_string()
-        } else { raw }
-    };
+    let url = resolve_request_url(eff, cfg.base_url.as_deref(), cfg.model.as_deref());
 
     let factory_c = CString::new(STREAM_FACTORY).unwrap();
     let factory = qjs::JS_Eval(

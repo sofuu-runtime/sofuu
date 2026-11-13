@@ -51,23 +51,30 @@ thread_local! {
      * \x1b[0m cannot break it: the erase already painted the full row,
      * and nothing repaints the tail after the content ends. */
     static G_BG: Cell<i32> = const { Cell::new(-1) };
+    /* Default text ink (256-palette index) for light themes (-1 leaves
+     * terminal default fg untouched for dark themes). */
+    static G_FG: Cell<i32> = const { Cell::new(-1) };
     /* Accent palette index for the selection bar (set alongside G_BG on
      * every theme sync), or -1 for the classic raw-inverse look. */
     static G_SEL: Cell<i32> = const { Cell::new(-1) };
+    /* Text ink on the selection bar (16 near-black on dark themes, 231 white on light themes). */
+    static G_SEL_FG: Cell<i32> = const { Cell::new(16) };
     /* Panel border SGR params for chrome borders */
     static G_PANEL: RefCell<String> = const { RefCell::new(String::new()) };
     /* Subtle text SGR params for hints, labels, and secondary metrics */
     static G_SUBTLE: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
-/// Background SGR for the active theme, or "" when unthemed (byte-exact
-/// classic output — themed painting must never perturb the default look).
+/// Canvas SGR (background + optional light-mode ink foreground) for the
+/// active theme, or "" when unthemed (byte-exact classic output on dark).
 pub fn tui_bg_prefix() -> String {
     let bg = G_BG.with(|g| g.get());
-    if (0..=255).contains(&bg) {
-        format!("\x1b[48;5;{bg}m")
-    } else {
-        String::new()
+    let fg = G_FG.with(|g| g.get());
+    match ((0..=255).contains(&bg), (0..=255).contains(&fg)) {
+        (true, true) => format!("\x1b[48;5;{bg};38;5;{fg}m"),
+        (true, false) => format!("\x1b[48;5;{bg}m"),
+        (false, true) => format!("\x1b[38;5;{fg}m"),
+        (false, false) => String::new(),
     }
 }
 
@@ -78,6 +85,12 @@ pub unsafe extern "C" fn tui_set_bg(idx: c_int) {
     G_BG.with(|g| g.set(idx));
 }
 
+/// Select the default text ink (0-255); -1 restores terminal default.
+#[no_mangle]
+pub unsafe extern "C" fn tui_set_fg(idx: c_int) {
+    G_FG.with(|g| g.set(idx));
+}
+
 /// Select the selection-bar accent (256-palette index from the theme's
 /// accent role); anything outside 16-255 falls back to raw inverse.
 /// Emits nothing itself — the next selection repaint wears it.
@@ -86,15 +99,19 @@ pub unsafe extern "C" fn tui_set_sel(accent_idx: c_int) {
     G_SEL.with(|g| g.set(accent_idx));
 }
 
-/// Selection-bar SGR: theme-accent background + near-black text, so a
-/// mouse drag blends like the rest of the window (opencode-style accent
-/// bar) instead of flashing raw inverse — black boxes on light themes,
-/// white boxes on dark ones. Falls back to plain inverse when no theme
-/// has been synced.
+/// Select the selection-bar foreground (16 on dark themes, 231 on light themes).
+#[no_mangle]
+pub unsafe extern "C" fn tui_set_sel_fg(fg_idx: c_int) {
+    G_SEL_FG.with(|g| g.set(if (0..=255).contains(&fg_idx) { fg_idx } else { 16 }));
+}
+
+/// Selection-bar SGR: theme-accent background + contrasting ink text, so a
+/// mouse drag blends cleanly on both dark and light themes without raw inverse.
 pub fn tui_sel_sgr() -> String {
     let n = G_SEL.with(|g| g.get());
+    let sfg = G_SEL_FG.with(|g| g.get());
     if (16..=255).contains(&n) {
-        format!("\x1b[38;5;16;48;5;{n}m")
+        format!("\x1b[38;5;{sfg};48;5;{n}m")
     } else {
         "\x1b[7m".to_string()
     }
@@ -140,8 +157,7 @@ pub fn tui_subtle_sgr() -> String {
 
 /// Remap already-painted buffer rows from one theme's foregrounds to
 /// another's (see theme::fg_remap_pairs): full `\x1b[<params>m` sequences
-/// only, longest-old-first. Display-only — the session transcript is
-/// untouched.
+/// only. Display-only — the session transcript is untouched.
 pub fn tui_remap_rows(map: &[(&str, &str)]) {
     if map.is_empty() {
         return;
@@ -155,14 +171,140 @@ pub fn tui_remap_rows(map: &[(&str, &str)]) {
     });
 }
 
+/// Single-pass SGR token scanner: replaces `\x1b[<old>m` with `\x1b[<new>m`
+/// without risking double-remapping when themes share overlapping palette slots.
 fn remap_row(row: &str, map: &[(&str, &str)]) -> String {
-    let mut out = row.to_string();
-    for (old, new) in map {
-        let from = format!("\x1b[{old}m");
-        if out.contains(&from) {
-            out = out.replace(&from, &format!("\x1b[{new}m"));
-        }
+    if !row.contains("\x1b[") {
+        return row.to_string();
     }
+    let bytes = row.as_bytes();
+    let mut out = String::with_capacity(row.len());
+    let mut i = 0usize;
+    let mut last = 0usize;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'm' {
+                let params = &row[i + 2..j];
+                if let Some((_, new_p)) = map.iter().find(|&&(old_p, _)| old_p == params) {
+                    out.push_str(&row[last..i]);
+                    out.push_str("\x1b[");
+                    out.push_str(new_p);
+                    out.push('m');
+                    last = j + 1;
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&row[last..]);
+    out
+}
+
+/// Prepare a single rendered line slice for display on the active canvas:
+/// - Restores `canvas` after every `\x1b[0m` so mid-line resets preserve theme bg/fg.
+/// - When light mode is active (`G_FG >= 0`), translates raw terminal-relative or
+///   dim/white escapes (`2m`, `90m`, `37m`, `97m`, `33m`, `36m`, `32m`, `31m`, `35m`)
+///   into crisp, high-contrast light-canvas equivalents so no text vanishes on light bg.
+pub fn tui_normalize_for_canvas(s: &str, canvas: &str) -> String {
+    let fg_idx = G_FG.with(|g| g.get());
+    let is_light = (0..=255).contains(&fg_idx);
+    if !s.contains("\x1b[") {
+        return s.to_string();
+    }
+    if !is_light {
+        return if !canvas.is_empty() && s.contains("\x1b[0m") {
+            s.replace("\x1b[0m", &format!("\x1b[0m{canvas}"))
+        } else {
+            s.to_string()
+        };
+    }
+    let fg_sgr = format!("\x1b[38;5;{fg_idx}m");
+    let subtle = tui_subtle_sgr();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + 32);
+    let mut i = 0usize;
+    let mut last = 0usize;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'm' {
+                let params = &s[i + 2..j];
+                let repl: Option<String> = match params {
+                    "" | "0" => Some(format!("\x1b[0m{canvas}")),
+                    "39" => Some(fg_sgr.clone()),
+                    "49" => {
+                        let bg = G_BG.with(|g| g.get());
+                        if (0..=255).contains(&bg) {
+                            Some(format!("\x1b[48;5;{bg}m"))
+                        } else {
+                            None
+                        }
+                    }
+                    "2" | "90" => Some(subtle.clone()),
+                    "37" | "97" => Some(fg_sgr.clone()),
+                    "33" | "93" => Some("\x1b[38;5;130m".to_string()),
+                    "1;33" | "1;93" => Some("\x1b[1;38;5;130m".to_string()),
+                    "36" | "96" => Some("\x1b[38;5;30m".to_string()),
+                    "1;36" | "1;96" => Some("\x1b[1;38;5;24m".to_string()),
+                    "32" | "92" => Some("\x1b[38;5;28m".to_string()),
+                    "1;32" | "1;92" => Some("\x1b[1;38;5;28m".to_string()),
+                    "31" | "91" => Some("\x1b[38;5;124m".to_string()),
+                    "1;31" | "1;91" => Some("\x1b[1;38;5;124m".to_string()),
+                    "35" | "95" => Some("\x1b[38;5;89m".to_string()),
+                    "1;35" | "1;95" => Some("\x1b[1;38;5;54m".to_string()),
+                    _ => None,
+                };
+                if let Some(r) = repl {
+                    out.push_str(&s[last..i]);
+                    out.push_str(&r);
+                    last = j + 1;
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// Strip `\x1b[<params>m` SGR sequences from a row slice so an active
+/// full-row highlight (like mouse selection) cannot be broken by inline
+/// `\x1b[0m` resets or foreground colors that match the highlight fill.
+fn strip_sgr(s: &str) -> String {
+    if !s.contains("\x1b[") {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    let mut last = 0usize;
+    while i + 2 < bytes.len() {
+        if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && (bytes[j].is_ascii_digit() || bytes[j] == b';') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'm' {
+                out.push_str(&s[last..i]);
+                last = j + 1;
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&s[last..]);
     out
 }
 
@@ -180,10 +322,10 @@ fn write_out(s: &str) {
 #[no_mangle]
 pub unsafe extern "C" fn tui_overlay_row(row: c_int, content: *const c_char) {
     let bytes = c_str(content);
-    write_out(&format!("\x1b[{};1H{}\x1b[K", row, tui_bg_prefix()));
-    let mut out = std::io::stdout();
-    let _ = out.write_all(bytes);
-    let _ = out.flush();
+    let bg = tui_bg_prefix();
+    let s = String::from_utf8_lossy(bytes);
+    let norm = tui_normalize_for_canvas(&s, &bg);
+    write_out(&format!("\x1b[{};1H{}\x1b[K{}", row, bg, norm));
 }
 
 fn c_str<'a>(s: *const c_char) -> &'a [u8] {
@@ -430,7 +572,9 @@ pub unsafe extern "C" fn tui_exit() {
      * user's own colors, then leave. */
     write_out("\x1b[0m");
     G_BG.with(|g| g.set(-1));
+    G_FG.with(|g| g.set(-1));
     G_SEL.with(|g| g.set(-1));
+    G_SEL_FG.with(|g| g.set(16));
     G_PANEL.with(|p| p.borrow_mut().clear());
     G_SUBTLE.with(|s| s.borrow_mut().clear());
     write_out("\x1b[?25h\x1b[?1049l"); /* cursor back, alt screen off */
@@ -672,6 +816,10 @@ pub unsafe extern "C" fn tui_truncate_cells(s: *const c_char, max_cells: c_int) 
 // once it overflows; g_scroll shifts the window up into history.
 
 unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
+    unsafe { render_rows_opts(top_row, bottom_row, true) };
+}
+
+unsafe fn render_rows_opts(top_row: c_int, bottom_row: c_int, sync: bool) {
     let mut active = 0;
     G_ACTIVE.with(|a| active = a.get());
     if active == 0 {
@@ -722,7 +870,10 @@ unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
     });
     let window_rows = lines.len();
     let bg = tui_bg_prefix();
-    let mut out = String::with_capacity(window_rows * 80);
+    let mut out = String::with_capacity(window_rows * 80 + 16);
+    if sync {
+        out.push_str("\x1b[?2026h");
+    }
     /* Every conversation row is indented by GUTTER cells so the text shares
      * the input box's left margin ("│ ··text") instead of touching the
      * screen edge; the truncation budget shrinks to match. */
@@ -760,31 +911,28 @@ unsafe fn render_rows(top_row: c_int, bottom_row: c_int) {
             }
             let selected = row >= sel_lo && row <= sel_hi;
             if selected {
-                /* Inverse video across the whole visible row (text +
-                 * trailing pad) so the selection reads as a solid block
-                 * like a native terminal selection. Theme-aware: the
-                 * accent bar, never raw inverse. */
+                /* Solid accent bar across the visible row (text + trailing
+                 * pad) so the selection reads like a native terminal highlight
+                 * without inner resets punching holes or accent-on-accent text. */
                 out.push_str(&tui_sel_sgr());
-                out.push_str(&l[..bl]);
+                out.push_str(&strip_sgr(&l[..bl]));
                 if bl < full {
                     out.push('…');
                 }
-                out.push_str("\x1b[0m");
+                out.push_str("\x1b[K\x1b[0m");
                 if !bg.is_empty() {
                     out.push_str(&bg);
                 }
             } else {
-                if !bg.is_empty() && l[..bl].contains("\x1b[0m") {
-                    let re_bg = l[..bl].replace("\x1b[0m", &format!("\x1b[0m{bg}"));
-                    out.push_str(&re_bg);
-                } else {
-                    out.push_str(&l[..bl]);
-                }
+                out.push_str(&tui_normalize_for_canvas(&l[..bl], &bg));
                 if bl < full {
                     out.push('…'); /* only when truly truncated */
                 }
             }
         }
+    }
+    if sync {
+        out.push_str("\x1b[?2026l");
     }
     write_out(&out);
 }
@@ -809,6 +957,16 @@ unsafe fn screen_row_of(idx: i32) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn tui_render_conversation_range(bottom: c_int) {
     unsafe { render_rows(tui_conv_top(), bottom) };
+}
+
+/// Internal helper for callers (such as `tty_render_tui`) that already wrap the
+/// full terminal frame in DECSET 2026 synchronized output brackets.
+///
+/// # Safety
+/// Must be called on the main UI thread while the terminal size and thread-local
+/// TUI buffer are valid; caller owns any surrounding stdout/sync frame.
+pub(crate) unsafe fn tui_render_conversation_range_unsynced(bottom: c_int) {
+    unsafe { render_rows_opts(tui_conv_top(), bottom, false) };
 }
 
 #[no_mangle]
@@ -2024,5 +2182,41 @@ mod tests {
         assert_eq!(char_cells('日'), 2);
         assert_eq!(disp_width("日本語"), 6);
         assert_eq!(char_cells('a'), 1);
+    }
+
+    /// Light-mode normalization translates dim/white/default-fg escapes and
+    /// restores the explicit canvas after `\x1b[0m`; selection stripping drops
+    /// inner resets so the highlight bar stays unbroken.
+    #[test]
+    fn light_canvas_normalizes_escapes_and_selection_strips_sgr() {
+        let sub = std::ffi::CString::new("38;5;241").unwrap();
+        unsafe {
+            tui_set_bg(255);
+            tui_set_fg(234);
+            tui_set_sel_fg(231);
+            tui_set_subtle(sub.as_ptr());
+        }
+
+        let canvas = tui_bg_prefix();
+        assert_eq!(canvas, "\x1b[48;5;255;38;5;234m");
+
+        let rendered = tui_normalize_for_canvas(
+            "\x1b[2mdim\x1b[0m \x1b[37mwhite\x1b[39m \x1b[33mwarn",
+            &canvas,
+        );
+        assert!(rendered.contains("\x1b[38;5;241mdim\x1b[0m\x1b[48;5;255;38;5;234m"));
+        assert!(rendered.contains("\x1b[38;5;234mwhite\x1b[38;5;234m"));
+        assert!(rendered.contains("\x1b[38;5;130mwarn"));
+
+        assert_eq!(
+            strip_sgr("\x1b[1;38;5;54mWelcome!\x1b[0m plain"),
+            "Welcome! plain"
+        );
+
+        unsafe {
+            tui_set_bg(-1);
+            tui_set_fg(-1);
+            tui_set_sel_fg(16);
+        }
     }
 }

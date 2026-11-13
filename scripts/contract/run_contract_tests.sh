@@ -203,7 +203,7 @@ while IFS='|' read -r id rule clause kind envspec cmd expect prereq; do
     # the aggregate runner from executing scripted providers or synthetic
     # model inference. Each needs a real-resource replacement or a pure test.
     case "$id" in
-        T2.2|T2.3|T2.4|T2.5|T2.6|T3.3|T3.5|T5.6|T6.1|T6.4|T6.5|T6.7|T7.3|T7.4|T7.8)
+        T2.2|T2.3|T2.4|T2.5|T2.6|T3.3|T3.5|T6.1|T6.4|T6.5|T6.7|T7.3|T7.4|T7.8)
             report_block "$id" "real execution replacement required; legacy assertions retained in cases.tsv"
             real_execution_blocked=$((real_execution_blocked + 1))
             continue ;;

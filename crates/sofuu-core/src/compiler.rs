@@ -1472,6 +1472,11 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     }
     let routine_signatures_json = serde_json::to_string(&routine_signatures).unwrap_or_else(|_| "{}".to_string());
 
+    let kaze_needs: Vec<String> = parsed_prog
+        .as_ref()
+        .map(|p| p.needs.clone())
+        .unwrap_or_default();
+    let kaze_needs_json = serde_json::to_string(&kaze_needs).unwrap_or_else(|_| "[]".to_string());
     let kaze_source_json = serde_json::to_string(&kaze_src).unwrap_or_else(|_| "\"\"".to_string());
     let kaze_name_json = serde_json::to_string(file_stem).unwrap_or_else(|_| "\"agent\"".to_string());
 
@@ -1486,6 +1491,15 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     }}
     var kazeSource = {kaze_source_json};
     var kazeName = {kaze_name_json};
+    /* Declared families that need a real asynchronous backend. A routine that
+     * names ai or tool must never run through the synchronous host, which has
+     * no model or MCP connection and would refuse the call. */
+    var kazeNeeds = {kaze_needs_json};
+    var asyncFamilies = {{ ai: true, tool: true }};
+    var needsAsync = false;
+    for (var nf = 0; nf < kazeNeeds.length; nf++) {{
+        if (asyncFamilies[kazeNeeds[nf]]) {{ needsAsync = true; break; }}
+    }}
     // Declarations in the agent source are not host grants.
     var defaultGrants = [];
     var policyPath = null;
@@ -1644,6 +1658,27 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             console.error('E_CAP_DENIED: cannot read policy: ' + (policyErr && policyErr.message ? policyErr.message : policyErr));
             if (typeof process !== 'undefined' && process.exit) process.exit(1);
             return;
+        }}
+    }}
+    /* No --policy flag: use the same layered ~/.sofuu/policy.json +
+     * ./.sofuu/policy.json document that `sofuu script run` applies, so a
+     * compiled agent and its source behave alike. A file that exists but cannot
+     * be read is fatal rather than silently skipped (KZ-051/KZ-052). */
+    if (policyJson === null && sofuu.policy && typeof sofuu.policy.load === 'function') {{
+        try {{
+            var loadedPolicy = JSON.parse(sofuu.policy.load());
+            if (loadedPolicy && loadedPolicy.ok === false) {{
+                console.error('E_CAP_DENIED: ' + loadedPolicy.error);
+                if (typeof process !== 'undefined' && process.exit) process.exit(1);
+                return;
+            }}
+            if (loadedPolicy && loadedPolicy.ok === true && loadedPolicy.policy) {{
+                policyJson = JSON.stringify(loadedPolicy.policy);
+            }}
+        }} catch (loadErr) {{
+            /* An unreadable policy document stays "no policy": every Kaze
+             * capability then fails closed with H-3 instead of running. */
+            policyJson = null;
         }}
     }}
 
@@ -1831,6 +1866,32 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         return true;
     }}
 
+    /* One execution path for every mode. A script that declares ai or tool
+     * runs through the asynchronous coordinator so a real model or MCP call
+     * suspends the routine instead of blocking the event loop, and a failure
+     * comes back as one bounded, typed result. Pure and physical scripts keep
+     * the synchronous entry point. */
+    function executeKaze(runArgs, opts) {{
+        if (!needsAsync) return Promise.resolve(sofuu.kaze.run(kazeSource, runArgs, opts));
+        if (typeof sofuu.kaze.runAsync !== 'function') {{
+            return Promise.resolve({{
+                ok: false,
+                code: 'E_KAZE_RUNTIME',
+                error: 'this agent declares ai or tool capabilities, but the installed Sofuu runtime has no asynchronous Kaze bridge; rebuild the base binary'
+            }});
+        }}
+        return sofuu.kaze.runAsync(kazeSource, runArgs, opts).then(function (report) {{
+            return report;
+        }}, function (error) {{
+            return {{
+                ok: false,
+                code: (error && typeof error.code === 'string') ? error.code : 'E_KAZE_HOST',
+                error: (error && error.message) ? error.message : String(error),
+                diagnostic: error && error.diagnostic ? error.diagnostic : undefined
+            }};
+        }});
+    }}
+
     function runDaemon() {{
         bindPositionals(args);
         if (!validateParameters(args)) return;
@@ -1861,7 +1922,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             if (stopping) return;
             stopping = true;
             if (timerId !== null) {{
-                clearInterval(timerId);
+                clearTimeout(timerId);
                 timerId = null;
             }}
             var uptime = formatDuration(Date.now() - startTime);
@@ -1878,7 +1939,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             process.on('SIGTERM', shutdown);
         }}
 
-        function cycle() {{
+        async function cycle() {{
             if (stopping) return;
             cycles++;
             var ts = (new Date()).toISOString().replace('T', ' ').slice(0, 19);
@@ -1890,7 +1951,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
 
                 var opts = runOptions();
 
-                var res = sofuu.kaze.run(kazeSource, runArgs, opts);
+                var res = await executeKaze(runArgs, opts);
                 if (!res.ok) {{
                     failures++;
                     badge('ERROR', "Cycle #" + cycles + " failed: " + (res.error || res.code));
@@ -1930,17 +1991,26 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             }}
         }}
 
-        cycle();
-        timerId = setInterval(cycle, intervalMs);
+        function schedule() {{
+            if (stopping) return;
+            Promise.resolve(cycle()).catch(function (ex) {{
+                failures++;
+                badge('ERROR', "Cycle #" + cycles + " exception: " + (ex && ex.message ? ex.message : ex));
+            }}).then(function () {{
+                if (stopping) return;
+                timerId = setTimeout(schedule, intervalMs);
+            }});
+        }}
+        schedule();
     }}
 
-    function runHeadless() {{
+    async function runHeadless() {{
         bindPositionals(args);
         if (!validateParameters(args)) return;
 
         var opts = runOptions();
 
-        var res = sofuu.kaze.run(kazeSource, args, opts);
+        var res = await executeKaze(args, opts);
         if (!res.ok) {{
             var diagnostic = res.diagnostic && sofuu.diagnostics && sofuu.diagnostics.render;
             var detail = diagnostic
@@ -1998,7 +2068,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
                     runArgs['query'] = prompt;
                     runArgs['input'] = prompt;
                     var opts = runOptions();
-                    var res = sofuu.kaze.run(kazeSource, runArgs, opts);
+                    var res = await executeKaze(runArgs, opts);
                     if (!res.ok) throw new Error(res.error || res.code);
                     if (res.simulated_families && res.simulated_families.length) badge('STATUS', 'Simulation (testing): ' + res.simulated_families.join(', '));
                     if (res.actions) {{
@@ -2019,18 +2089,28 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
                 console.error(err);
             }});
         }} else {{
-            runHeadless();
+            runHeadless().catch(function(err) {{
+                console.error("\x1b[31m[Agent Error]\x1b[0m " + (err && err.message ? err.message : err));
+                if (typeof process !== 'undefined' && process.exit) process.exit(1);
+            }});
         }}
     }}
 
     var isTTY = typeof process !== 'undefined' && process.stdout && process.stdout.isTTY;
-    if (isDaemon) {{
-        runDaemon();
-    }} else if (isInteractive || (positionals.length === 0 && Object.keys(args).length === 0 && isTTY)) {{
-        launchInteractiveTUI();
-    }} else {{
-        runHeadless();
-    }}
+    (async function () {{
+        try {{
+            if (isDaemon) {{
+                runDaemon();
+            }} else if (isInteractive || (positionals.length === 0 && Object.keys(args).length === 0 && isTTY)) {{
+                launchInteractiveTUI();
+            }} else {{
+                await runHeadless();
+            }}
+        }} catch (err) {{
+            console.error("\x1b[31m[Agent Error]\x1b[0m " + (err && err.message ? err.message : err));
+            if (typeof process !== 'undefined' && process.exit) process.exit(1);
+        }}
+    }})();
 }})();
 "##);
 
@@ -2047,6 +2127,30 @@ mod tests {
 
     fn fake_base(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    #[test]
+    fn an_ai_agent_bootstrap_runs_through_the_async_bridge() {
+        let path = std::path::Path::new("/tmp/kaze-async-bootstrap.agent.kaze");
+        let ai = generate_kaze_agent_bootstrap(
+            path,
+            b"needs: ai\naction main():\n    return ai.prompt(\"hello\")\n",
+        )
+        .expect("an ai agent compiles");
+        /* A compiled agent declares ai/tool in its source; the bootstrap must
+         * hand that routine to the asynchronous coordinator instead of the
+         * synchronous host, which has no model or MCP backend. */
+        assert!(ai.contains("var kazeNeeds = [\"ai\"]"), "declared needs are recorded");
+        assert!(ai.contains("sofuu.kaze.runAsync(kazeSource, runArgs, opts)"), "ai agents use the async bridge");
+        assert!(ai.contains("await executeKaze(args, opts)"), "headless execution awaits the bridge");
+
+        let pure = generate_kaze_agent_bootstrap(
+            path,
+            b"needs: log\naction main():\n    return 1\n",
+        )
+        .expect("a pure agent compiles");
+        assert!(pure.contains("var kazeNeeds = [\"log\"]"), "declared physical needs are recorded");
+        assert!(pure.contains("Promise.resolve(sofuu.kaze.run(kazeSource, runArgs, opts))"), "pure agents keep the synchronous entry point");
     }
 
     #[test]

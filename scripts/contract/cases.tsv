@@ -41,7 +41,7 @@ T5.2|R5|R5.4|cli|-|./sofuu run scripts/contract/harness/t52_serve_v1.js|exit:0|G
 T5.3|R5|R5.4|cli|-|./sofuu run scripts/contract/harness/t52_serve_v1.js|exit:0|POST /v1/chat/completions stream:true yields SSE delta frames + [DONE]
 T5.4|R5|R5.4|cli|-|./sofuu run scripts/contract/harness/t52_serve_v1.js|exit:0|POST /v1/chat/completions JSON matches the OpenAI completion shape
 T5.5|R5|R5.5|cabi|-|sofuu_rt_call|present|the C ABI keeps the versioned symbol contract (make libsofuu + CONTRACT_LIBSOFUU)
-T5.6|R5|R5.6|cli|-|./sofuu run scripts/contract/harness/t56_mcp_parity.js|exit:0|MCP tools and built-ins share identical event/trace envelope shape
+T5.6|R5|R5.6|cli|-|python3 scripts/test-real-agent-mcp.py|exit:0|Real MCP and built-in file tools share event/trace envelope shape with a configured provider
 T5.7|R5|R5.5|file|-|.github/workflows/ci.yml|has:abi-check|gate exists
 T5.8|R5|R5.1|cli|-|./sofuu run scripts/contract/harness/t58_error_parity.js|exit:0|unified error envelope and taxonomy codes across JS, HTTP, and CABI
 T6.1|R6|R6.1|cli|-|./sofuu run scripts/contract/harness/t61_envelope.js|exit:0|envelope on real agent+chat events

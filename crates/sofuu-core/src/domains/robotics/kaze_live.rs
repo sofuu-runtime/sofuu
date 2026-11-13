@@ -8,9 +8,9 @@
 //!   command judged by `mavlink_gate` before it reaches the wire. Commands are
 //!   ACK-correlated: a Kaze action returns when the autopilot answered, not when
 //!   the bytes left.
-//! * [`LiveHost`] — a `CapHost` that routes the live family to its backend and
-//!   everything else to the deterministic simulator, so `log`, `memory` and
-//!   `policy` behave exactly as they did in v0.1.
+//! * [`LiveHost`] — a `CapHost` that routes live hardware to its backend and
+//!   other operations to the ordinary fail-closed runtime host. It does not
+//!   implicitly select a physical simulator.
 //!
 //! The invariant is unchanged: `rt::hardware` still judges H-1..H-4 *above* this
 //! trait, and `LinkCore::send` still refuses to encode a frame the MAVLink policy
@@ -28,7 +28,7 @@ use super::mavlink;
 use super::mavlink_gate::{self as gate, HardwarePolicy};
 use super::mavlink_link::{self as link, Event, Io, LinkCore};
 use crate::sfs::arena::Arena;
-use crate::sfs::caps::{render_value, CapHost, SimHost, SimState};
+use crate::sfs::caps::{render_value, CapHost, RuntimeHost, SimState};
 use crate::sfs::value::{Heap, Value};
 
 /// How often the receiver thread pumps the transport (20 Hz, inside the plan's
@@ -41,6 +41,9 @@ pub const WARMUP_MS: u64 = 30_000;
 /// How long a command waits for its COMMAND_ACK before the script is told the
 /// link did not answer.
 pub const DEFAULT_ACK_TIMEOUT_MS: u64 = 3_000;
+/// A cached reading is not evidence of the vehicle's current state forever.
+/// This is a conservative local limit, not a claim of physical safety.
+const TELEMETRY_MAX_AGE: Duration = Duration::from_secs(3);
 
 /// What the autopilot last told us. Updated by the receiver thread; read by
 /// `drone.telemetry(...)`, never invented.
@@ -60,56 +63,116 @@ pub struct DroneTelemetry {
     /// True once a HEARTBEAT has arrived: before that, every reading is a
     /// guess, and a script that acts on a guess is a bug.
     pub heard: bool,
+    observed: std::collections::HashMap<&'static str, Instant>,
 }
 
 impl DroneTelemetry {
     /// The value `drone.telemetry("<field>")` returns for `field`.
-    pub fn read(&self, field: &str) -> Value {
-        match field {
+    pub fn read(&self, field: &str) -> Result<Value, String> {
+        let field = match field {
+            "latitude" => "lat",
+            "longitude" => "lon",
+            "battery" | "altitude" | "altitude_msl" | "heading" | "lat" | "lon" | "speed" | "satellites" | "armed" => field,
+            _ => return Err("E_CAP_MISSING: unknown drone telemetry field".into()),
+        };
+        self.require_fresh("heartbeat")?;
+        self.require_fresh(field)?;
+        Ok(match field {
             "battery" => Value::Num(self.battery_pct),
             "altitude" => Value::Num(self.rel_alt_m),
             "altitude_msl" => Value::Num(self.alt_m),
             "heading" => Value::Num(self.heading_deg),
-            "lat" | "latitude" => Value::Num(self.lat),
-            "lon" | "longitude" => Value::Num(self.lon),
-            "speed" => Value::Num((self.vx_ms * self.vx_ms + self.vy_ms * self.vy_ms).sqrt()),
+            "lat" => Value::Num(self.lat),
+            "lon" => Value::Num(self.lon),
+            "speed" => Value::Num(self.vx_ms.hypot(self.vy_ms)),
             "satellites" => Value::Num(self.satellites),
             "armed" => Value::Bool(self.armed),
-            _ => Value::Num(0.0),
+            _ => unreachable!("fields were validated above"),
+        })
+    }
+
+    fn require_fresh(&self, field: &str) -> Result<(), String> {
+        if self.observed.get(field).is_some_and(|at| at.elapsed() <= TELEMETRY_MAX_AGE) {
+            Ok(())
+        } else {
+            Err(format!("E_KAZE_LINK: drone {} is missing or stale", field))
         }
     }
 
+    fn fresh_mode(&self) -> Result<&str, String> {
+        self.require_fresh("heartbeat")?;
+        self.require_fresh("mode")?;
+        Ok(&self.mode)
+    }
+
     fn apply(&mut self, event: &Event) {
+        let now = Instant::now();
         match event {
             Event::Telemetry { message, data } => match *message {
                 "HEARTBEAT" => {
-                    self.armed = data["base_mode"].as_u64().unwrap_or(0) & 128 != 0;
-                    if let Some(m) = data["mode"].as_str() {
-                        self.mode = m.to_string();
+                    if let Some(mode) = data["base_mode"].as_u64().filter(|m| *m <= u8::MAX as u64) {
+                        self.armed = mode & 128 != 0;
+                        self.heard = true;
+                        self.observed.insert("heartbeat", now);
+                        self.observed.insert("armed", now);
+                    } else {
+                        self.heard = false;
+                        self.observed.remove("heartbeat");
+                        self.observed.remove("armed");
                     }
-                    self.heard = true;
+                    if let Some(m) = data["mode"].as_str().filter(|m| !m.is_empty()) {
+                        self.mode = m.to_string();
+                        self.observed.insert("mode", now);
+                    } else {
+                        self.observed.remove("mode");
+                    }
                 }
                 "SYS_STATUS" => {
-                    if let Some(p) = data["battery_remaining_pct"].as_i64() {
-                        self.battery_pct = p as f64;
-                    }
+                    let value = data["battery_remaining_pct"].as_f64().filter(|v| (0.0..=100.0).contains(v));
+                    record_reading(&mut self.observed, "battery", &mut self.battery_pct, value, now);
                 }
                 "GLOBAL_POSITION_INT" => {
-                    self.lat = data["lat"].as_f64().unwrap_or(self.lat);
-                    self.lon = data["lon"].as_f64().unwrap_or(self.lon);
-                    self.alt_m = data["alt_m"].as_f64().unwrap_or(self.alt_m);
-                    self.rel_alt_m = data["relative_alt_m"].as_f64().unwrap_or(self.rel_alt_m);
-                    self.heading_deg = data["heading_deg"].as_f64().unwrap_or(self.heading_deg);
-                    self.vx_ms = data["vx_ms"].as_f64().unwrap_or(self.vx_ms);
-                    self.vy_ms = data["vy_ms"].as_f64().unwrap_or(self.vy_ms);
+                    record_reading(&mut self.observed, "lat", &mut self.lat, data["lat"].as_f64().filter(|v| (-90.0..=90.0).contains(v)), now);
+                    record_reading(&mut self.observed, "lon", &mut self.lon, data["lon"].as_f64().filter(|v| (-180.0..=180.0).contains(v)), now);
+                    record_reading(&mut self.observed, "altitude_msl", &mut self.alt_m, data["alt_m"].as_f64(), now);
+                    record_reading(&mut self.observed, "altitude", &mut self.rel_alt_m, data["relative_alt_m"].as_f64(), now);
+                    // MAVLink's 65535 sentinel is decoded as 655.35 degrees.
+                    record_reading(&mut self.observed, "heading", &mut self.heading_deg, data["heading_deg"].as_f64().filter(|v| (0.0..360.0).contains(v)), now);
+                    let velocity = data["vx_ms"].as_f64().zip(data["vy_ms"].as_f64())
+                        .filter(|(x, y)| x.is_finite() && y.is_finite() && x.hypot(*y).is_finite());
+                    if let Some((x, y)) = velocity {
+                        self.vx_ms = x;
+                        self.vy_ms = y;
+                        self.observed.insert("speed", now);
+                    } else {
+                        self.observed.remove("speed");
+                    }
                 }
                 "GPS_RAW_INT" => {
-                    self.satellites = data["satellites"].as_f64().unwrap_or(self.satellites);
+                    // MAVLink uses 255 for an unknown satellite count.
+                    let value = data["satellites"].as_f64().filter(|v| (0.0..255.0).contains(v));
+                    record_reading(&mut self.observed, "satellites", &mut self.satellites, value, now);
                 }
                 _ => {}
             },
             _ => {}
         }
+    }
+}
+
+fn record_reading(
+    observed: &mut std::collections::HashMap<&'static str, Instant>,
+    field: &'static str,
+    destination: &mut f64,
+    value: Option<f64>,
+    now: Instant,
+) {
+    if let Some(value) = value.filter(|n| n.is_finite()) {
+        *destination = value;
+        observed.insert(field, now);
+    } else {
+        // An explicit unknown or malformed update invalidates an older value.
+        observed.remove(field);
     }
 }
 
@@ -209,7 +272,7 @@ impl DroneLink {
             .map_err(|_| "E_KAZE_LINK: the link thread is gone".to_string())?;
         match reply_rx.recv_timeout(Duration::from_millis(self.ack_timeout_ms)) {
             Ok(result) => result,
-            Err(_) => Err("E_KAZE_LINK_TIMEOUT: the link did not send the target".to_string()),
+            Err(_) => Err("E_KAZE_LINK_TIMEOUT: target completion is unknown; the link did not return a result".to_string()),
         }
     }
 
@@ -243,7 +306,7 @@ impl DroneLink {
         match reply_rx.recv_timeout(wait) {
             Ok(result) => result,
             Err(_) => Err(format!(
-                "E_KAZE_LINK_TIMEOUT: the link never answered for {}",
+                "E_KAZE_LINK_TIMEOUT: completion of {} is unknown; the link did not return a result",
                 gate::command_name(command).unwrap_or("the command")
             )),
         }
@@ -365,7 +428,7 @@ fn run_link(
             if now.saturating_sub(*sent) > ack_timeout_ms {
                 let (command, reply, _) = pending.take().expect("checked above");
                 let _ = reply.send(Err(format!(
-                    "E_KAZE_LINK_TIMEOUT: no COMMAND_ACK for {} within {} ms",
+                    "E_KAZE_LINK_TIMEOUT: completion is unknown; no COMMAND_ACK for {} within {} ms",
                     gate::command_name(command).unwrap_or("the command"),
                     ack_timeout_ms
                 )));
@@ -438,17 +501,16 @@ fn open_device(device: &str) -> Result<Box<dyn Io>, String> {
     }
 }
 
-/// A `CapHost` with real hardware behind the families that have it and the
-/// deterministic simulator behind the rest.
+/// A `CapHost` with selected live hardware and a fail-closed runtime host.
 pub struct LiveHost {
-    sim: SimHost,
+    sim: RuntimeHost,
     live: Option<DroneLink>,
     gpio: Option<crate::rt::gpio::GpioBus>,
 }
 
 impl LiveHost {
-    /// `backends` is the `family -> device` map the host was granted. A family
-    /// whose device is `sim` (or absent) keeps the simulator.
+    /// `backends` is the `family -> device` map the host was granted. A missing
+    /// live backend does not select a simulator.
     pub fn new(
         sim: SimState,
         backends: &[(String, String)],
@@ -467,14 +529,14 @@ impl LiveHost {
             let root = std::env::var_os("KAZE_GPIO_ROOT").map(std::path::PathBuf::from);
             Some(crate::rt::gpio::GpioBus::new(pins, root.as_deref()))
         };
-        Ok(LiveHost { sim: SimHost::new(sim), live, gpio })
+        Ok(LiveHost { sim: RuntimeHost::new(sim, Vec::new(), Vec::new()), live, gpio })
     }
 
     /// A host around an already-open link. Tests use it to drive the real
     /// command path without a socket.
     #[cfg(test)]
     pub fn with_link(sim: SimState, link: DroneLink) -> LiveHost {
-        LiveHost { sim: SimHost::new(sim), live: Some(link), gpio: None }
+        LiveHost { sim: RuntimeHost::new(sim, Vec::new(), Vec::new()), live: Some(link), gpio: None }
     }
 
     /// The GPIO wiring, for `--json` reports and tests.
@@ -509,6 +571,7 @@ impl CapHost for LiveHost {
         heap: &mut Heap,
     ) -> Result<Value, String> {
         if family == "drone" && self.live.is_some() {
+            self.sim.check_trace_capacity()?;
             let shown: Vec<String> = args.iter().map(|v| render_value(*v, arena, heap)).collect();
             let mut link = self.live.take().expect("checked above");
             let result = live_drone(&mut link, op, args, arena);
@@ -522,6 +585,7 @@ impl CapHost for LiveHost {
             return result;
         }
         if family == "device" && self.gpio.is_some() {
+            self.sim.check_trace_capacity()?;
             let shown: Vec<String> = args.iter().map(|v| render_value(*v, arena, heap)).collect();
             let mut bus = self.gpio.take().expect("checked above");
             let result = live_device(&mut bus, op, args, arena, heap);
@@ -676,7 +740,7 @@ fn live_device(
 /// and NAV_WAYPOINT anywhere else. Switching is a gated command like any other,
 /// and it costs one frame only when the vehicle is somewhere else.
 fn ensure_guided(link: &mut DroneLink) -> Result<(), String> {
-    if link.telemetry().mode.eq_ignore_ascii_case("guided") {
+    if link.telemetry().fresh_mode()?.eq_ignore_ascii_case("guided") {
         return Ok(());
     }
     let guided = crate::rt::drone_ops::copter_mode("guided")
@@ -691,7 +755,7 @@ fn ensure_guided(link: &mut DroneLink) -> Result<(), String> {
     // its next loop, and a takeoff one tick early is refused. Wait for the
     // vehicle to say it is in GUIDED before the flight command goes out.
     for _ in 0..40 {
-        if link.telemetry().mode.eq_ignore_ascii_case("guided") {
+        if link.telemetry().fresh_mode().is_ok_and(|mode| mode.eq_ignore_ascii_case("guided")) {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(50));
@@ -701,29 +765,27 @@ fn ensure_guided(link: &mut DroneLink) -> Result<(), String> {
 
 /// The v0.2 command map: one Kaze verb, one MAV_CMD, through the gate.
 fn live_drone(link: &mut DroneLink, op: &str, args: &[Value], arena: &mut Arena) -> Result<Value, String> {
-    let num = |i: usize, fallback: f64| args.get(i).and_then(|v| v.as_num()).unwrap_or(fallback);
+    let num = |i: usize| args.get(i).and_then(|v| v.as_num()).filter(|n| n.is_finite())
+        .ok_or_else(|| "E_KAZE_RANGE: drone command requires finite numeric arguments".to_string());
     match op {
         "arm" => link
             .command(mavlink::cmd::COMPONENT_ARM_DISARM, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
             .map(|_| Value::Unit),
         "takeoff" => {
+            let alt = num(0)?;
             ensure_guided(link)?;
-            let alt = num(0, 10.0);
             link.command(mavlink::cmd::NAV_TAKEOFF, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, alt as f32])
                 .map(|_| Value::Unit)
         }
-        // goto(lat, lon, alt) is the capability's signature; goto(point, alt) is
-        // the sentence form the examples use.
+        // A live position target requires three explicit coordinates.
         "goto" => {
+            // There is no verified mapping from a Kaze point/index to a GPS
+            // position. Never fill in missing coordinates from cached data.
+            if args.len() != 3 {
+                return Err("E_CAP_MISSING: live drone.goto requires explicit latitude, longitude and altitude".into());
+            }
+            let (lat, lon, alt) = (num(0)?, num(1)?, num(2)?);
             ensure_guided(link)?;
-            let tel = link.telemetry();
-            let (lat, lon, alt) = if args.len() >= 3 {
-                (num(0, tel.lat), num(1, tel.lon), num(2, tel.rel_alt_m))
-            } else if args.len() == 2 {
-                (num(0, tel.lat), tel.lon, num(1, tel.rel_alt_m))
-            } else {
-                (num(0, tel.lat), tel.lon, tel.rel_alt_m)
-            };
             // ArduCopter answers UNSUPPORTED to NAV_WAYPOINT as a command (it
             // is a mission item, not a command), so guided flight is a position
             // target — the same frame `sofuu.drone` uses.
@@ -740,7 +802,7 @@ fn live_drone(link: &mut DroneLink, op: &str, args: &[Value], arena: &mut Arena)
         "telemetry" => {
             let field = args.first().map(|v| render_value(*v, arena, &Heap::empty())).unwrap_or_default();
             let field = field.trim_matches('"').to_string();
-            Ok(link.telemetry().read(&field))
+            link.telemetry().read(&field)
         }
         other => Err(format!("E_KAZE_LINK: the live drone link has no '{}'", other)),
     }
@@ -876,6 +938,7 @@ mod tests {
             .command(mavlink::cmd::NAV_LAND, [0.0; 7])
             .expect_err("nothing answered");
         assert!(err.starts_with("E_KAZE_LINK_TIMEOUT:"), "{err}");
+        assert!(err.contains("unknown"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(3), "the wait was bounded");
     }
 
@@ -889,7 +952,8 @@ mod tests {
         frame.set_i32_at(12, 512_500);
         frame.set_i32_at(16, 12_500);
         let wire = mavlink::encode(&frame).expect("encodes");
-        incoming.lock().unwrap().extend(wire);
+        let heartbeat = mavlink::encode(&mavlink::msg_heartbeat(0, 1, 1)).expect("heartbeat encodes");
+        incoming.lock().unwrap().extend(heartbeat.into_iter().chain(wire));
 
         let link = DroneLink::with_io(core(), Box::new(fc), DEV.to_string(), 1, 500).expect("link");
         let mut tele = DroneTelemetry::default();
@@ -903,7 +967,34 @@ mod tests {
         assert_eq!(tele.rel_alt_m, 12.5);
         assert_eq!(tele.lat, 47.6);
         assert_eq!(tele.lon, 8.5);
-        assert_eq!(tele.read("altitude"), Value::Num(12.5));
+        assert_eq!(tele.read("altitude").unwrap(), Value::Num(12.5));
+    }
+
+    #[test]
+    fn telemetry_rejects_unknown_missing_stale_and_sentinel_values() {
+        // Static protocol data exercises the decoder/cache rules; it is not a
+        // receipt for a real hardware connection or a physical simulation.
+        let mut tele = DroneTelemetry::default();
+        assert!(tele.read("not_a_field").unwrap_err().starts_with("E_CAP_MISSING:"));
+        assert!(tele.read("battery").unwrap_err().contains("missing or stale"));
+        tele.apply(&Event::Telemetry { message: "HEARTBEAT", data: serde_json::json!({"base_mode": 128, "mode": "guided"}) });
+        assert_eq!(tele.read("armed").unwrap(), Value::Bool(true));
+        assert!(tele.read("battery").unwrap_err().contains("missing or stale"));
+        tele.apply(&Event::Telemetry { message: "SYS_STATUS", data: serde_json::json!({"battery_remaining_pct": 42}) });
+        assert_eq!(tele.read("battery").unwrap(), Value::Num(42.0));
+        tele.apply(&Event::Telemetry { message: "SYS_STATUS", data: serde_json::json!({"battery_remaining_pct": -1}) });
+        assert!(tele.read("battery").is_err());
+        tele.apply(&Event::Telemetry { message: "GPS_RAW_INT", data: serde_json::json!({"satellites": 255}) });
+        assert!(tele.read("satellites").is_err());
+        tele.apply(&Event::Telemetry { message: "GLOBAL_POSITION_INT", data: serde_json::json!({"lat": 47.6, "lon": 8.5, "heading_deg": 655.35}) });
+        assert_eq!(tele.read("latitude").unwrap(), Value::Num(47.6));
+        assert!(tele.read("heading").is_err());
+        assert!(tele.read("altitude").is_err());
+        tele.observed.insert("lat", Instant::now() - TELEMETRY_MAX_AGE - Duration::from_secs(1));
+        assert!(tele.read("lat").unwrap_err().contains("missing or stale"));
+        tele.observed.insert("heartbeat", Instant::now() - TELEMETRY_MAX_AGE - Duration::from_secs(1));
+        assert!(tele.read("armed").unwrap_err().contains("heartbeat"));
+        assert!(tele.fresh_mode().is_err());
     }
 
     #[test]

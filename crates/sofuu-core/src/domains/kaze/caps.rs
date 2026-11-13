@@ -103,8 +103,9 @@ pub fn known_op(family: &str, op: &str) -> bool {
     op_arity(family, op).is_some()
 }
 
-/// One line of the execution trace. The trace is the evidence a mission review
-/// reads: every call, in order, with its arguments and its result.
+/// One line of the execution trace. Non-physical inputs and results, and
+/// physical text/collections, are redacted. Explicit log messages live in
+/// `logs`, which callers must treat as potentially sensitive.
 #[derive(Clone, Debug)]
 pub struct Action {
     pub seq: u32,
@@ -269,15 +270,153 @@ pub trait CapHost {
     ) -> Result<Value, String>;
     fn actions(&self) -> &[Action];
     fn logs(&self) -> &[(String, String)];
+
+    /// Reserve observability capacity before an asynchronous effect is sent.
+    fn check_async_dispatch(&self) -> Result<(), String> { Ok(()) }
+
+    /// Record only redacted completion metadata for an asynchronous operation.
+    fn note_async_completion(&mut self, _family: &str, _op: &str, _succeeded: bool) {}
+
+    /// Record when cancellation happens after dispatch and the external effect
+    /// may have completed without a result reaching this run.
+    fn note_async_unknown(&mut self, _family: &str, _op: &str) {}
 }
 
+/// The ordinary capability dispatcher. Physical simulation is a separate,
+/// explicitly selected backend; non-physical calls never reach it.
+pub struct RuntimeHost {
+    physical: Option<SimHost>,
+    blocked_live: Vec<String>,
+    pub(crate) actions: Vec<Action>,
+    pub(crate) logs: Vec<(String, String)>,
+    log_bytes: usize,
+    seq: u32,
+}
+
+const MAX_LOG_RECORDS: usize = 1024;
+const MAX_LOG_BYTES: usize = 256 * 1024;
+const MAX_ACTION_RECORDS: usize = 4096;
+
+impl RuntimeHost {
+    pub fn new(state: SimState, physical_sim: Vec<String>, blocked_live: Vec<String>) -> Self {
+        let physical = if physical_sim.is_empty() {
+            None
+        } else {
+            Some(SimHost::with_simulated(state, physical_sim))
+        };
+        Self { physical, blocked_live, actions: Vec::new(), logs: Vec::new(), log_bytes: 0, seq: 0 }
+    }
+
+    pub(crate) fn note(&mut self, family: &str, op: &str, args: &[String], result: String) {
+        self.seq += 1;
+        self.actions.push(Action {
+            seq: self.seq, family: family.to_string(), op: op.to_string(),
+            args: args.to_vec(), result,
+        });
+    }
+
+    /// Check trace capacity before dispatch, not after a side effect.
+    pub(crate) fn check_trace_capacity(&self) -> Result<(), String> {
+        if self.actions.len() >= MAX_ACTION_RECORDS {
+            Err("E_KAZE_MEMORY: per-run action trace limit reached".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl CapHost for RuntimeHost {
+    fn actions(&self) -> &[Action] { &self.actions }
+    fn logs(&self) -> &[(String, String)] { &self.logs }
+
+    fn check_async_dispatch(&self) -> Result<(), String> {
+        self.check_trace_capacity()
+    }
+
+    fn note_async_completion(&mut self, family: &str, op: &str, succeeded: bool) {
+        self.note(
+            family,
+            op,
+            &["<redacted>".to_string()],
+            if succeeded { "<redacted result>" } else { "<redacted error>" }.to_string(),
+        );
+    }
+
+    fn note_async_unknown(&mut self, family: &str, op: &str) {
+        self.note(
+            family,
+            op,
+            &["<redacted>".to_string()],
+            "<unknown outcome>".to_string(),
+        );
+    }
+
+    fn call(
+        &mut self, family: &str, op: &str, args: &[Value], arena: &mut Arena, heap: &mut Heap,
+    ) -> Result<Value, String> {
+        self.check_trace_capacity()?;
+        if self.blocked_live.iter().any(|selected| selected == family) {
+            return Err(format!(
+                "E_CAP_DENIED: live {}.{} is disabled until hardware policy and safety checks are verified",
+                family, op
+            ));
+        }
+        let is_physical = matches!(family, "drone" | "rover");
+        let shown: Vec<String> = if is_physical {
+            args.iter().map(|v| match v {
+                Value::Unit | Value::Num(_) | Value::Bool(_) => render_value(*v, arena, heap),
+                _ => "<redacted>".to_string(),
+            }).collect()
+        } else {
+            args.iter().map(|_| "<redacted>".to_string()).collect()
+        };
+        let result = match (family, op) {
+            ("drone" | "rover", _) => match &mut self.physical {
+                Some(host) => host.call(family, op, args, arena, heap),
+                None => Err(format!("E_CAP_MISSING: no backend selected for {}.{}; drone/rover simulation is available for tests with an explicit sim grant", family, op)),
+            },
+            ("policy", "detects" | "detect") => {
+                let kind = str_at(args, 0, arena).to_lowercase();
+                let text = str_at(args, 1, arena);
+                if matches!(kind.as_str(), "secrets" | "prompt_injection") {
+                    Ok(Value::Bool(detect(&kind, &text)))
+                } else {
+                    Err("E_CAP_MISSING: unsupported policy detector".to_string())
+                }
+            }
+            ("policy", "allow") => Ok(args.first().copied().unwrap_or(Value::Unit)),
+            ("policy", "reject") => Ok(Value::Unit),
+            ("log", "info" | "warn" | "error" | "debug") => {
+                let msg = str_at(args, 0, arena);
+                let level = match op { "warn" => "warning", "error" => "error", "debug" => "debug", _ => "info" };
+                if self.logs.len() >= MAX_LOG_RECORDS || self.log_bytes.saturating_add(msg.len()) > MAX_LOG_BYTES {
+                    Err("E_KAZE_MEMORY: per-run log limit reached".to_string())
+                } else {
+                    self.log_bytes += msg.len();
+                    self.logs.push((level.to_string(), msg));
+                    Ok(Value::Unit)
+                }
+            }
+            _ => Err(format!("E_CAP_MISSING: embedded Kaze has no available backend for {}.{}", family, op)),
+        };
+        let rendered = match &result {
+            Ok(Value::Unit) => "nothing".to_string(),
+            Ok(v) if is_physical => render_value(*v, arena, heap),
+            Ok(_) => "<redacted>".to_string(),
+            Err(e) if is_physical => format!("error: {}", e),
+            Err(_) => "error".to_string(),
+        };
+        self.note(family, op, &shown, rendered);
+        result
+    }
+}
+
+/// Physical test simulation only. This host cannot answer AI, tool, memory,
+/// policy, logging, alert, sensor or device operations.
 pub struct SimHost {
     pub state: SimState,
-    pub actions: Vec<Action>,
-    pub logs: Vec<(String, String)>,
     physical_sim: Vec<String>,
     blocked_live: Vec<String>,
-    seq: u32,
 }
 
 impl SimHost {
@@ -290,24 +429,7 @@ impl SimHost {
     }
 
     pub fn with_configuration(state: SimState, physical_sim: Vec<String>, blocked_live: Vec<String>) -> Self {
-        SimHost { state, actions: Vec::new(), logs: Vec::new(), physical_sim, blocked_live, seq: 0 }
-    }
-
-    /// Record a call the host answered elsewhere (the live backends in
-    /// `rt::kaze_live`), so the trace has one owner and one order.
-    pub(crate) fn note(&mut self, family: &str, op: &str, args: &[String], result: String) {
-        self.record(family, op, args, result);
-    }
-
-    fn record(&mut self, family: &str, op: &str, args: &[String], result: String) {
-        self.seq += 1;
-        self.actions.push(Action {
-            seq: self.seq,
-            family: family.to_string(),
-            op: op.to_string(),
-            args: args.to_vec(),
-            result,
-        });
+        SimHost { state, physical_sim, blocked_live }
     }
 
     fn telemetry(&self, field: &str) -> Result<Value, String> {
@@ -320,18 +442,18 @@ impl SimHost {
             "humidity" => Ok(Value::Num(self.state.humidity)),
             "distance" => Ok(Value::Num(self.state.distance)),
             "armed" => Ok(Value::Bool(self.state.armed)),
-            _ => Err(format!("E_CAP_MISSING: simulated telemetry field '{}' is unavailable", field)),
+            _ => Err("E_CAP_MISSING: simulated telemetry field is unavailable".to_string()),
         }
     }
 }
 
 impl CapHost for SimHost {
     fn actions(&self) -> &[Action] {
-        &self.actions
+        &[]
     }
 
     fn logs(&self) -> &[(String, String)] {
-        &self.logs
+        &[]
     }
 
     fn call(
@@ -340,8 +462,11 @@ impl CapHost for SimHost {
         op: &str,
         args: &[Value],
         arena: &mut Arena,
-        heap: &mut Heap,
+        _heap: &mut Heap,
     ) -> Result<Value, String> {
+        if !matches!(family, "drone" | "rover") {
+            return Err(format!("E_CAP_MISSING: physical simulator has no backend for {}.{}", family, op));
+        }
         if self.blocked_live.iter().any(|selected| selected == family) {
             return Err(format!(
                 "E_CAP_DENIED: live {}.{} is disabled until hardware policy and safety checks are verified",
@@ -353,8 +478,7 @@ impl CapHost for SimHost {
         {
             return Err(format!("E_CAP_MISSING: no backend selected for {}.{}; drone/rover simulation is available for tests with an explicit sim grant", family, op));
         }
-        let shown: Vec<String> = args.iter().map(|v| render_value(*v, arena, heap)).collect();
-        let result: Result<Value, String> = match (family, op) {
+        match (family, op) {
             ("drone", "arm") => {
                 self.state.armed = true;
                 self.state.drain(1.0);
@@ -423,36 +547,8 @@ impl CapHost for SimHost {
                 self.state.heading = (self.state.heading - num_at(args, 0, 0.0)) % 360.0;
                 Ok(Value::Unit)
             }
-            ("policy", "detects") | ("policy", "detect") => {
-                let kind = str_at(args, 0, arena).to_lowercase();
-                let text = str_at(args, 1, arena);
-                if matches!(kind.as_str(), "secrets" | "prompt_injection") {
-                    Ok(Value::Bool(detect(&kind, &text)))
-                } else {
-                    Err(format!("E_CAP_MISSING: unsupported policy detector '{}'", kind))
-                }
-            }
-            ("policy", "allow") => Ok(args.first().copied().unwrap_or(Value::Unit)),
-            ("policy", "reject") => Ok(Value::Unit),
-            ("log", "info") | ("log", "warn") | ("log", "error") | ("log", "debug") => {
-                let msg = str_at(args, 0, arena);
-                let level = match op {
-                    "warn" => "warning",
-                    "error" => "error",
-                    "debug" => "debug",
-                    _ => "info",
-                };
-                self.logs.push((level.to_string(), msg.clone()));
-                Ok(Value::Unit)
-            }
             _ => Err(format!("E_CAP_MISSING: embedded Kaze has no available backend for {}.{}", family, op)),
-        };
-        let rendered = match &result {
-            Ok(v) => render_value(*v, arena, heap),
-            Err(e) => format!("error: {}", e),
-        };
-        self.record(family, op, &shown, rendered);
-        result
+        }
     }
 }
 
@@ -569,6 +665,81 @@ mod tests {
         let error = host.call("device", "set_duty", &[Value::Str(name), Value::Num(40.0)], &mut arena, &mut heap)
             .unwrap_err();
         assert!(error.starts_with("E_CAP_MISSING:"));
+    }
+
+    #[test]
+    fn physical_simulator_refuses_every_nonphysical_family() {
+        let mut sim = SimHost::with_simulated(SimState::default(), vec!["drone".into()]);
+        let mut arena = Arena::new(1024);
+        let mut heap = Heap::default();
+        for (family, op) in [
+            ("ai", "prompt"), ("tool", "call"), ("memory", "save"),
+            ("alert", "send"), ("policy", "detects"), ("log", "info"),
+            ("sensor", "read"), ("device", "set_relay"),
+        ] {
+            let err = sim.call(family, op, &[], &mut arena, &mut heap).unwrap_err();
+            assert!(err.starts_with("E_CAP_MISSING:"), "{family}.{op}: {err}");
+        }
+    }
+
+    #[test]
+    fn runtime_host_owns_the_trace_for_mixed_physical_and_real_calls() {
+        let mut host = RuntimeHost::new(SimState::default(), vec!["drone".into()], Vec::new());
+        let mut arena = Arena::new(1024);
+        let mut heap = Heap::default();
+        let text = Value::Str(arena.alloc("message").unwrap());
+        host.call("log", "info", &[text], &mut arena, &mut heap).unwrap();
+        host.call("drone", "arm", &[], &mut arena, &mut heap).unwrap();
+        host.call("log", "warn", &[text], &mut arena, &mut heap).unwrap();
+        assert_eq!(host.actions().iter().map(|a| a.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(host.actions().iter().map(|a| a.family.as_str()).collect::<Vec<_>>(), vec!["log", "drone", "log"]);
+        assert_eq!(host.logs().len(), 2);
+    }
+
+    #[test]
+    fn nonphysical_traces_redact_inputs_and_log_storage_is_bounded() {
+        let mut host = RuntimeHost::new(SimState::default(), Vec::new(), Vec::new());
+        let mut arena = Arena::new(1024);
+        let mut heap = Heap::default();
+        let private = Value::Str(arena.alloc("private-marker").unwrap());
+        let detector = Value::Str(arena.alloc("secrets").unwrap());
+        host.call("log", "info", &[private], &mut arena, &mut heap).unwrap();
+        host.call("policy", "detects", &[detector, private], &mut arena, &mut heap).unwrap();
+        assert!(host.actions().iter().all(|action| !action.render().contains("private-marker")));
+        // A log call deliberately delivers its message to the local sink; the
+        // redaction above concerns the separate action trace.
+        assert_eq!(host.logs()[0].1, "private-marker");
+        for _ in 1..MAX_LOG_RECORDS {
+            host.call("log", "info", &[private], &mut arena, &mut heap).unwrap();
+        }
+        let err = host.call("log", "info", &[private], &mut arena, &mut heap).unwrap_err();
+        assert!(err.starts_with("E_KAZE_MEMORY:"));
+        assert_eq!(host.logs().len(), MAX_LOG_RECORDS);
+    }
+
+    #[test]
+    fn physical_trace_does_not_copy_text_arguments() {
+        let mut host = RuntimeHost::new(SimState::default(), vec!["drone".into()], Vec::new());
+        let mut arena = Arena::new(1024);
+        let mut heap = Heap::default();
+        let field = Value::Str(arena.alloc("battery").unwrap());
+        host.call("drone", "telemetry", &[field], &mut arena, &mut heap).unwrap();
+        assert_eq!(host.actions()[0].args, vec!["<redacted>"]);
+    }
+
+    #[test]
+    fn exhausted_trace_capacity_stops_before_a_log_is_delivered() {
+        let mut host = RuntimeHost::new(SimState::default(), Vec::new(), Vec::new());
+        let mut arena = Arena::new(1024);
+        let mut heap = Heap::default();
+        let detector = Value::Str(arena.alloc("secrets").unwrap());
+        let text = Value::Str(arena.alloc("hello").unwrap());
+        for _ in 0..MAX_ACTION_RECORDS {
+            host.call("policy", "detects", &[detector, text], &mut arena, &mut heap).unwrap();
+        }
+        let err = host.call("log", "info", &[text], &mut arena, &mut heap).unwrap_err();
+        assert!(err.starts_with("E_KAZE_MEMORY:"));
+        assert!(host.logs().is_empty());
     }
 
     #[test]

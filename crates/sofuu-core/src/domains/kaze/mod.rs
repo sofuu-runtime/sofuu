@@ -20,16 +20,49 @@ pub mod parser;
 pub mod value;
 pub mod vm;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{c_int, CString};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use sofuu_ffi::qjs::{self, JSContext, JSValue, JSValueConst};
 
-use crate::sfs::caps::{Action, CapHost, SimHost, SimState};
+use crate::sfs::caps::{Action, CapHost, RuntimeHost, SimState};
 use crate::sfs::isa::Module;
-use crate::sfs::vm::{Limits, Vm, Verdict};
+use crate::sfs::vm::{CapabilityRequest, ItemContinuation, Limits, SliceOutcome, Vm, VmError, Verdict};
 
 /// Language version reported by `sofuu.sfs.version` and `sofuu script --version`.
 pub const VERSION: &str = "0.1";
+
+const ASYNC_RUN_LIMIT: usize = 32;
+const ASYNC_INSTRUCTION_SLICE: usize = 256;
+const ASYNC_TIMEOUT_DEFAULT_MS: u64 = 120_000;
+const ASYNC_TIMEOUT_MAX_MS: u64 = 600_000;
+static NEXT_ASYNC_RUN_ID: AtomicU64 = AtomicU64::new(1);
+
+struct AsyncRun {
+    vm: Vm<'static>,
+    state: ItemContinuation,
+    source_name: String,
+    entry: String,
+    entry_result: Option<String>,
+    in_supervisor: bool,
+    hooks: Vec<isa::ItemCode>,
+    hook_index: usize,
+    tick_index: u32,
+    completed_ticks: u32,
+    requested_ticks: u32,
+    tick_ms: u64,
+    context_key: usize,
+    simulated_families: Vec<String>,
+    deadline: std::time::Instant,
+}
+
+thread_local! {
+    /// Runs never leave the thread that owns QuickJS. Only owned Rust values
+    /// live here; no JSValue, context, or VM pointer is sent to a worker.
+    static ASYNC_RUNS: RefCell<HashMap<u64, AsyncRun>> = RefCell::new(HashMap::new());
+}
 
 #[cfg(test)]
 mod fail_closed_tests {
@@ -99,6 +132,30 @@ mod fail_closed_tests {
         assert_eq!(report.actions.len(), 1);
         opts.backend[0].1 = "uart:/nonexistent".into();
         assert_eq!(run_source(source, "<t>", &opts).unwrap_err().code, "E_CAP_DENIED");
+    }
+
+    #[test]
+    fn json_options_read_the_cli_configuration_layers() {
+        // A JavaScript caller inherits nothing unless it asks; the CLI opts in
+        // so the documented CLI > environment > config > signature order
+        // applies to a bridged run exactly as it does to a synchronous one.
+        let quiet = opts_from_json(None).unwrap();
+        assert!(!quiet.ambient_args, "an embedded caller must not inherit ambient args");
+        let asking = opts_from_json(Some(json!({
+            "ambientArgs": true, "configPath": "agent.config.json", "sourceName": "agent.kaze"
+        }))).unwrap();
+        assert!(asking.ambient_args);
+        assert_eq!(asking.config_path.as_deref(), Some("agent.config.json"));
+        assert_eq!(asking.source_name.as_deref(), Some("agent.kaze"));
+        for invalid in [
+            json!({"ambientArgs": "yes"}),
+            json!({"configPath": 7}),
+            json!({"configPath": ""}),
+            json!({"sourceName": null}),
+            json!({"sourceName": ""}),
+        ] {
+            assert!(opts_from_json(Some(invalid.clone())).is_err(), "{invalid}");
+        }
     }
 
     #[test]
@@ -339,9 +396,16 @@ pub struct RunOptions {
     pub ambient_args: bool,
     /// CLI-selected parameter file; `None` uses the optional default file.
     pub config_path: Option<String>,
+    /// Name to report for an inline source. The CLI reads the file itself and
+    /// passes the text, so without this every diagnostic would name `<inline>`
+    /// instead of the file the operator ran.
+    pub source_name: Option<String>,
     /// Capability families the host grants a backend for (`drone=sim` → "drone").
     pub grants: Vec<String>,
     pub fuel: u64,
+    /// Overall asynchronous run deadline. Sync APIs continue to use the
+    /// existing host deadline contract.
+    pub timeout_ms: u64,
     /// Budget for arrays and maps, in bytes. The second meter: `fuel` bounds
     /// instructions, this bounds retained memory.
     pub heap_bytes: usize,
@@ -370,8 +434,10 @@ impl Default for RunOptions {
             args: serde_json::Map::new(),
             ambient_args: true,
             config_path: None,
+            source_name: None,
             grants: Vec::new(),
             fuel: Limits::default().fuel,
+            timeout_ms: ASYNC_TIMEOUT_DEFAULT_MS,
             heap_bytes: value::Heap::DEFAULT_LIMIT,
             ticks: 0,
             tick_ms: 100,
@@ -443,6 +509,13 @@ pub fn run_file(path: &str, opts: &RunOptions) -> Result<RunReport, KazeError> {
     run_prepared(prepared, opts)
 }
 
+/// Run a module the caller already prepared. The CLI compiles once so it can
+/// route `ai`/`tool` scripts to the asynchronous bridge without parsing the
+/// same source twice; every other caller wants [`run_source`].
+pub fn run_prepared_source(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, KazeError> {
+    run_prepared(prepared, opts)
+}
+
 /// Run a compiled module directly: no lexer, no parser, no checker. This is the
 /// path a `.kazebc` artifact takes, so a deployed script needs no front end.
 pub fn run_module(module: Module, name: &str, opts: &RunOptions) -> Result<RunReport, KazeError> {
@@ -478,7 +551,7 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
     if !opts.pins.is_empty() {
         blocked_live.push("device".to_string());
     }
-    let base_host = SimHost::with_configuration(
+    let base_host = RuntimeHost::new(
         opts.sim.clone(), simulated_families.clone(), blocked_live,
     );
     let use_ephemeral_memory = opts.backend.iter().any(|(family, backend)|
@@ -582,6 +655,216 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
     report.actions = host.actions().iter().map(|a: &Action| a.render()).collect();
     report.logs = host.logs().to_vec();
     Ok(report)
+}
+
+enum AsyncStep {
+    Yielded { remaining_ms: u64 },
+    Capability(CapabilityRequest, u64),
+    Complete(RunReport),
+    Failed(KazeError),
+}
+
+fn async_error(name: &str, error: VmError) -> KazeError {
+    KazeError::at(
+        error.code,
+        format!("{}: {} (line {})", name, error.msg, error.line),
+        name,
+        error.line,
+        None,
+    )
+}
+
+fn async_advance(run: &mut AsyncRun) -> AsyncStep {
+    if std::time::Instant::now() >= run.deadline {
+        return AsyncStep::Failed(KazeError::new("E_TIMEOUT", "the asynchronous Kaze run deadline elapsed"));
+    }
+    let remaining_ms = run.deadline.saturating_duration_since(std::time::Instant::now())
+        .as_millis().max(1).min(u64::MAX as u128) as u64;
+    match run.vm.run_slice(&mut run.state, ASYNC_INSTRUCTION_SLICE) {
+        Ok(SliceOutcome::Yielded) => AsyncStep::Yielded { remaining_ms },
+        Ok(SliceOutcome::Capability(request)) => AsyncStep::Capability(request, remaining_ms),
+        Ok(SliceOutcome::Complete(value)) => {
+            if !run.in_supervisor {
+                run.entry_result = Some(caps::render_value(value, &run.vm.arena, &run.vm.heap));
+                run.in_supervisor = true;
+            }
+            if let Some(item) = next_supervisor_item(run) {
+                match run.vm.start_item(&item, &[]) {
+                    Ok(state) => {
+                        run.state = state;
+                        return AsyncStep::Yielded { remaining_ms };
+                    }
+                    Err(error) => return AsyncStep::Failed(async_error(&run.source_name, error)),
+                }
+            }
+            AsyncStep::Complete(RunReport {
+                entry: run.entry.clone(),
+                value: run.entry_result.clone().unwrap_or_else(|| "nothing".to_string()),
+                actions: run.vm.actions().iter().map(Action::render).collect(),
+                logs: run.vm.logs().to_vec(),
+                fuel_used: run.vm.fuel_used,
+                instructions: run.vm.instructions,
+                ticks: run.completed_ticks,
+                verdict: run.vm.take_verdict(),
+                simulated_families: run.simulated_families.clone(),
+            })
+        }
+        Err(error) => AsyncStep::Failed(async_error(&run.source_name, error)),
+    }
+}
+
+/// Pick the next due supervisor block without running it inline. The caller
+/// starts it as a fresh owned VM continuation, so each block still suspends
+/// safely for asynchronous AI/tool operations and bounded instruction slices.
+fn next_supervisor_item(run: &mut AsyncRun) -> Option<isa::ItemCode> {
+    while run.tick_index < run.requested_ticks {
+        let t_ms = run.tick_index as f64 * run.tick_ms as f64;
+        while run.hook_index < run.hooks.len() {
+            let item = &run.hooks[run.hook_index];
+            run.hook_index += 1;
+            let due = match item.tag {
+                isa::ItemTag::When => true,
+                isa::ItemTag::Every => item.period_ms > 0.0 && (t_ms % item.period_ms) == 0.0,
+                _ => false,
+            };
+            if due {
+                return Some(item.clone());
+            }
+        }
+        run.completed_ticks = run.tick_index.saturating_add(1);
+        run.tick_index = run.tick_index.saturating_add(1);
+        run.hook_index = 0;
+    }
+    None
+}
+
+fn create_async_run(
+    ctx: *mut JSContext,
+    prepared: Prepared,
+    opts: &RunOptions,
+) -> Result<(u64, AsyncRun), KazeError> {
+    let module = prepared.module;
+    let selected_entry = resolve_entry(&module, opts)?;
+    let hooks: Vec<isa::ItemCode> = if opts.ticks > 0 {
+        module.items.iter()
+            .filter(|item| matches!(item.tag, isa::ItemTag::When | isa::ItemTag::Every))
+            .cloned().collect()
+    } else { Vec::new() };
+    let mut initial_hook_index = 0usize;
+    let in_supervisor = selected_entry.is_none();
+    let item = if let Some(entry) = &selected_entry {
+        module.item(entry)
+            .ok_or_else(|| KazeError::new("E_KAZE_ENTRY", format!("there is no '{}' in this script", entry)))?
+            .clone()
+    } else {
+        if opts.ticks == 0 {
+            return Err(KazeError::new("E_KAZE_ASYNC_UNSUPPORTED", "asynchronous Kaze run has no entry routine or requested supervisor tick"));
+        }
+        let mut found = None;
+        for (i, hook) in hooks.iter().enumerate() {
+            let due = match hook.tag {
+                isa::ItemTag::When => true,
+                isa::ItemTag::Every => hook.period_ms > 0.0,
+                _ => false,
+            };
+            if due { found = Some((i, hook.clone())); break; }
+        }
+        let Some((index, hook)) = found else {
+            return Err(KazeError::new("E_KAZE_ASYNC_UNSUPPORTED", "hook-only program has no supervisor block due on its first tick"));
+        };
+        initial_hook_index = index + 1;
+        hook
+    };
+    let entry = selected_entry.unwrap_or_else(|| "<supervisor>".to_string());
+    let mut map = ASYNC_RUNS.with(|runs| {
+        let runs = runs.borrow();
+        runs.len()
+    });
+    if map >= ASYNC_RUN_LIMIT {
+        return Err(KazeError::new("E_KAZE_BUSY", "the per-thread asynchronous Kaze run limit has been reached"));
+    }
+
+    for (family, backend) in &opts.backend {
+        if let Err(d) = crate::rt::hardware::validate_grant(family, backend) {
+            return Err(KazeError::new(d.code, format!("{}: {} ({})", prepared.name, d.reason, d.rule)));
+        }
+    }
+    let declared = module.needs.clone();
+    let simulated_families: Vec<String> = opts.backend.iter()
+        .filter(|(_, backend)| backend == "sim")
+        .map(|(family, _)| caps::family_of(family).to_string())
+        .collect();
+    let mut blocked_live: Vec<String> = opts.backend.iter()
+        .filter(|(family, backend)| matches!(caps::family_of(family), "drone" | "rover" | "sensor" | "device")
+            && !backend.is_empty() && backend != "sim")
+        .map(|(family, _)| caps::family_of(family).to_string())
+        .collect();
+    if !opts.pins.is_empty() {
+        blocked_live.push("device".to_string());
+    }
+    let base_host = RuntimeHost::new(opts.sim.clone(), simulated_families.clone(), blocked_live);
+    let host: Box<dyn CapHost> = if opts.backend.iter().any(|(family, backend)|
+        caps::family_of(family) == "memory" && backend == "ephemeral")
+    {
+        Box::new(crate::rt::kaze_memory::EphemeralMemoryHost::new(base_host))
+    } else {
+        Box::new(base_host)
+    };
+    let limits = Limits { fuel: opts.fuel.max(1), heap_bytes: opts.heap_bytes, ..Limits::default() };
+    let mut vm = Vm::new_owned(
+        module.clone(), host, declared, opts.grants.clone(), opts.policy.clone(), limits,
+    );
+    vm.set_runtime_policy(opts.runtime_policy.as_ref());
+    let args = if in_supervisor {
+        Vec::new()
+    } else {
+        let merged = layered_args(opts, &item.params)?;
+        bind_args(&item.params, &merged, &mut vm)?
+    };
+    let state = vm.start_item(&item, &args)
+        .map_err(|e| KazeError::at(e.code, e.msg, &prepared.name, e.line, None))?;
+    let id = NEXT_ASYNC_RUN_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| KazeError::new("E_KAZE_STATE", "asynchronous run identifiers exhausted"))?;
+    map = ASYNC_RUNS.with(|runs| runs.borrow().len());
+    if map >= ASYNC_RUN_LIMIT {
+        let mut state = state;
+        let _ = vm.cancel_item(&mut state);
+        return Err(KazeError::new("E_KAZE_BUSY", "the per-thread asynchronous Kaze run limit has been reached"));
+    }
+    Ok((id, AsyncRun {
+        vm,
+        state,
+        source_name: prepared.name,
+        entry,
+        entry_result: None,
+        in_supervisor,
+        hooks,
+        hook_index: initial_hook_index,
+        tick_index: 0,
+        completed_ticks: 0,
+        requested_ticks: opts.ticks,
+        tick_ms: opts.tick_ms,
+        context_key: ctx as usize,
+        simulated_families,
+        deadline: std::time::Instant::now() + std::time::Duration::from_millis(opts.timeout_ms),
+    }))
+}
+
+/// Drop any suspended runs before QuickJS tears down its context. This function
+/// runs on the context's owner thread and never calls into QuickJS.
+pub fn cancel_async_runs_for_context(ctx: *mut JSContext) {
+    let context_key = ctx as usize;
+    ASYNC_RUNS.with(|runs| {
+        let mut runs = runs.borrow_mut();
+        let ids: Vec<u64> = runs.iter()
+            .filter_map(|(id, run)| (run.context_key == context_key).then_some(*id))
+            .collect();
+        for id in ids {
+            if let Some(mut run) = runs.remove(&id) {
+                let _ = run.vm.cancel_item(&mut run.state);
+            }
+        }
+    });
 }
 
 fn resolve_entry(module: &Module, opts: &RunOptions) -> Result<Option<String>, KazeError> {
@@ -786,26 +1069,12 @@ unsafe fn js_source_of(ctx: *mut JSContext, input: JSValueConst, text: &str) -> 
     let path = match crate::rt::fs::fs_path_arg(ctx, input, "kaze", crate::rt::policy::FsKind::Read) {
         Ok(path) => path,
         Err(_) => {
-            // fs_path_arg throws; this API returns a structured report instead.
-            let exception = qjs::JS_GetException(ctx);
-            let code_value = qjs::sofuu_js_get_property_str(ctx, exception, c"code".as_ptr());
-            let code_text = js_text(ctx, code_value);
-            qjs::sofuu_js_free_value(ctx, code_value);
-            let message_value = qjs::sofuu_js_get_property_str(ctx, exception, c"message".as_ptr());
-            let message = js_text(ctx, message_value);
-            qjs::sofuu_js_free_value(ctx, message_value);
-            qjs::sofuu_js_free_value(ctx, exception);
             // One-line inline source remains usable even when file reads are
             // forbidden. It never causes a stat or open on this branch.
             if !named_script && text.chars().any(char::is_whitespace) {
                 return Ok((text.to_string(), "<inline>".to_string()));
             }
-            let code = match code_text.as_str() {
-                "E_PATH_OUTSIDE" => "E_PATH_OUTSIDE",
-                "E_PERMISSION_DENIED" => "E_PERMISSION_DENIED",
-                _ => "E_CAP_DENIED",
-            };
-            return Err(KazeError::new(code, format!("script file access denied: {message}")));
+            return Err(unsafe { js_fs_denial(ctx) });
         }
     };
     let resolved = path.to_string_lossy();
@@ -815,6 +1084,53 @@ unsafe fn js_source_of(ctx: *mut JSContext, input: JSValueConst, text: &str) -> 
     } else {
         Ok((text.to_string(), "<inline>".to_string()))
     }
+}
+
+/// Turn the pending filesystem-policy exception into a Kaze failure without
+/// leaking the raw exception object. Shared by every resolver.
+unsafe fn js_fs_denial(ctx: *mut JSContext) -> KazeError {
+    let exception = unsafe { qjs::JS_GetException(ctx) };
+    let code_value = unsafe { qjs::sofuu_js_get_property_str(ctx, exception, c"code".as_ptr()) };
+    let code_text = unsafe { js_text(ctx, code_value) };
+    unsafe { qjs::sofuu_js_free_value(ctx, code_value) };
+    let message_value = unsafe { qjs::sofuu_js_get_property_str(ctx, exception, c"message".as_ptr()) };
+    let message = unsafe { js_text(ctx, message_value) };
+    unsafe { qjs::sofuu_js_free_value(ctx, message_value) };
+    unsafe { qjs::sofuu_js_free_value(ctx, exception) };
+    let code = match code_text.as_str() {
+        "E_PATH_OUTSIDE" => "E_PATH_OUTSIDE",
+        "E_PERMISSION_DENIED" => "E_PERMISSION_DENIED",
+        _ => "E_CAP_DENIED",
+    };
+    KazeError::new(code, format!("script file access denied: {message}"))
+}
+
+/// Resolve an asynchronous run's input. A `.kazebc` path loads as a compiled
+/// module — the bridge has to accept the artifact the CLI itself accepts, so
+/// a deployed script keeps working when it declares `ai` or `tool`. Everything
+/// else is source, resolved exactly as the synchronous entry point resolves it.
+unsafe fn js_async_prepared_of(
+    ctx: *mut JSContext,
+    input: JSValueConst,
+    text: &str,
+    named: Option<&str>,
+) -> Result<Prepared, KazeError> {
+    if !text.contains('\n') && text.trim_end().ends_with(".kazebc") {
+        let path = match unsafe { crate::rt::fs::fs_path_arg(ctx, input, "kaze", crate::rt::policy::FsKind::Read) } {
+            Ok(path) => path,
+            Err(_) => return Err(unsafe { js_fs_denial(ctx) }),
+        };
+        let resolved = path.to_string_lossy().into_owned();
+        let bytes = std::fs::read(&resolved).map_err(|e| {
+            KazeError::new("E_KAZE_IO", format!("cannot read '{}': {}", resolved, e))
+        })?;
+        let module = isa::deserialize(&bytes).map_err(|e| KazeError::new("E_KAZE_BADCODE", e))?;
+        let name = named.map(str::to_string).unwrap_or(resolved);
+        return Ok(Prepared { module, name, from_bytecode: true });
+    }
+    let (source, default_name) = unsafe { js_source_of(ctx, input, text) }?;
+    let name = named.map(str::to_string).unwrap_or(default_name);
+    prepare(&source, &name)
 }
 
 fn report_to_js(ctx: *mut JSContext, report: &RunReport) -> JSValue {
@@ -902,8 +1218,65 @@ unsafe fn set_num(ctx: *mut JSContext, obj: JSValue, key: &std::ffi::CStr, val: 
     unsafe { qjs::sofuu_js_set_property_str(ctx, obj, key.as_ptr(), v) };
 }
 
+unsafe fn json_to_js(ctx: *mut JSContext, value: &serde_json::Value) -> JSValue {
+    let Ok(mut text) = serde_json::to_string(value) else {
+        return qjs::JS_ThrowInternalError(ctx, c"Kaze async result could not be serialized".as_ptr());
+    };
+    let len = text.len();
+    text.push('\0');
+    qjs::JS_ParseJSON(ctx, text.as_ptr().cast(), len, c"<kaze-async>".as_ptr())
+}
+
+unsafe fn async_state_only(ctx: *mut JSContext, state: &str) -> JSValue {
+    let obj = qjs::sofuu_js_new_object(ctx);
+    set_str(ctx, obj, c"state", state);
+    obj
+}
+
+unsafe fn async_step_value(ctx: *mut JSContext, run_id: Option<u64>, step: AsyncStep) -> JSValue {
+    match step {
+        AsyncStep::Yielded { remaining_ms } => {
+            let obj = async_state_only(ctx, "yield");
+            if let Some(id) = run_id { set_str(ctx, obj, c"runId", &id.to_string()); }
+            set_num(ctx, obj, c"remainingMs", remaining_ms as f64);
+            obj
+        }
+        AsyncStep::Capability(request, remaining_ms) => {
+            let obj = async_state_only(ctx, "capability");
+            if let Some(id) = run_id { set_str(ctx, obj, c"runId", &id.to_string()); }
+            set_str(ctx, obj, c"requestId", &request.id.to_string());
+            set_str(ctx, obj, c"family", &request.family);
+            set_str(ctx, obj, c"op", &request.op);
+            set_num(ctx, obj, c"line", request.line as f64);
+            set_num(ctx, obj, c"remainingMs", remaining_ms as f64);
+            let args = json_to_js(ctx, &request.args);
+            qjs::sofuu_js_set_property_str(ctx, obj, c"args".as_ptr(), args);
+            obj
+        }
+        AsyncStep::Complete(report) => {
+            let obj = report_to_js(ctx, &report);
+            set_str(ctx, obj, c"state", "complete");
+            if let Some(id) = run_id { set_str(ctx, obj, c"runId", &id.to_string()); }
+            obj
+        }
+        AsyncStep::Failed(error) => {
+            let obj = error_to_js(ctx, &error);
+            if !qjs::is_exception(obj) {
+                set_str(ctx, obj, c"state", "error");
+                if let Some(id) = run_id { set_str(ctx, obj, c"runId", &id.to_string()); }
+            }
+            obj
+        }
+    }
+}
+
 fn opts_from_json(j: Option<serde_json::Value>) -> Result<RunOptions, KazeError> {
     let mut opts = RunOptions::default();
+    // A JavaScript caller inherits no ambient configuration unless it asks for
+    // it, so an embedded run can never pick up a stray `agent.config.json` or
+    // `AGENT_*` variable. The CLI opts in, and the documented hierarchy
+    // (CLI > environment > config file > signature) then applies unchanged.
+    opts.ambient_args = false;
     let map = match j {
         None | Some(serde_json::Value::Null) => return Ok(opts),
         Some(serde_json::Value::Object(map)) => map,
@@ -914,6 +1287,30 @@ fn opts_from_json(j: Option<serde_json::Value>) -> Result<RunOptions, KazeError>
     }
     if let Some(fuel) = map.get("fuel") {
         opts.fuel = fuel.as_u64().ok_or_else(|| KazeError::new("E_KAZE_ARGS", "fuel must be a nonnegative integer"))?;
+    }
+    if let Some(ambient) = map.get("ambientArgs") {
+        opts.ambient_args = ambient.as_bool()
+            .ok_or_else(|| KazeError::new("E_KAZE_ARGS", "ambientArgs must be a boolean"))?;
+    }
+    if let Some(config) = map.get("configPath") {
+        let path = config.as_str()
+            .ok_or_else(|| KazeError::new("E_KAZE_ARGS", "configPath must be text"))?;
+        if path.is_empty() {
+            return Err(KazeError::new("E_KAZE_ARGS", "configPath must not be empty"));
+        }
+        opts.config_path = Some(path.to_string());
+    }
+    if let Some(name) = map.get("sourceName") {
+        let name = name.as_str()
+            .ok_or_else(|| KazeError::new("E_KAZE_ARGS", "sourceName must be text"))?;
+        if name.is_empty() {
+            return Err(KazeError::new("E_KAZE_ARGS", "sourceName must not be empty"));
+        }
+        opts.source_name = Some(name.to_string());
+    }
+    if let Some(timeout) = map.get("timeoutMs") {
+        opts.timeout_ms = timeout.as_u64().filter(|ms| *ms > 0 && *ms <= ASYNC_TIMEOUT_MAX_MS)
+            .ok_or_else(|| KazeError::new("E_KAZE_ARGS", format!("timeoutMs must be an integer from 1 to {}", ASYNC_TIMEOUT_MAX_MS)))?;
     }
     if let Some(bytes) = map.get("heapBytes") {
         let bytes = bytes.as_u64().ok_or_else(|| KazeError::new("E_KAZE_ARGS", "heapBytes must be a nonnegative integer"))?;
@@ -1051,7 +1448,6 @@ unsafe extern "C" fn js_sfs_run(
             Err(err) => return error_to_js(ctx, &err),
         };
         opts.args = args;
-        opts.ambient_args = false;
         opts.runtime_policy = Some(crate::rt::policy::policy_json(ctx));
 
         let result = js_source_of(ctx, *argv, &text).and_then(|(src, name)| run_source(&src, &name, &opts));
@@ -1060,6 +1456,179 @@ unsafe extern "C" fn js_sfs_run(
             Err(err) => error_to_js(ctx, &err),
         }
     }
+}
+
+unsafe fn js_async_prepare(
+    ctx: *mut JSContext,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> Result<(Prepared, RunOptions), KazeError> {
+    if argc < 1 {
+        return Err(KazeError::new("E_KAZE_ARGS", "sfs.runAsync(pathOrSource, args?, opts?) needs a script"));
+    }
+    let input = unsafe { js_text(ctx, *argv) };
+    let args = if argc > 1 && !unsafe { qjs::is_undefined(*argv.add(1)) || qjs::is_null(*argv.add(1)) } {
+        match unsafe { js_json(ctx, *argv.add(1)) } {
+            Some(serde_json::Value::Object(map)) => map,
+            _ => return Err(KazeError::new("E_KAZE_ARGS", "routine arguments must be a JSON-compatible object")),
+        }
+    } else {
+        serde_json::Map::new()
+    };
+    let opts_json = if argc > 2 && !unsafe { qjs::is_undefined(*argv.add(2)) || qjs::is_null(*argv.add(2)) } {
+        Some(unsafe { js_json(ctx, *argv.add(2)) }
+            .ok_or_else(|| KazeError::new("E_KAZE_ARGS", "run options must be valid JSON-compatible values"))?)
+    } else { None };
+    let mut opts = opts_from_json(opts_json)?;
+    opts.args = args;
+    opts.runtime_policy = Some(crate::rt::policy::policy_json(ctx));
+    // An inline source keeps the caller's name, so a diagnostic names the file
+    // the operator ran rather than `<inline>`.
+    let prepared = unsafe { js_async_prepared_of(ctx, *argv, &input, opts.source_name.as_deref()) }?;
+    Ok((prepared, opts))
+}
+
+unsafe extern "C" fn js_sfs_async_start(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let (prepared, opts) = match unsafe { js_async_prepare(ctx, argc, argv) } {
+        Ok(value) => value,
+        Err(error) => return unsafe { async_step_value(ctx, None, AsyncStep::Failed(error)) },
+    };
+    let (run_id, mut run) = match create_async_run(ctx, prepared, &opts) {
+        Ok(value) => value,
+        Err(error) => return unsafe { async_step_value(ctx, None, AsyncStep::Failed(error)) },
+    };
+    let step = async_advance(&mut run);
+    let pending = matches!(&step, AsyncStep::Yielded { .. } | AsyncStep::Capability(_, _));
+    if pending {
+        ASYNC_RUNS.with(|runs| { runs.borrow_mut().insert(run_id, run); });
+    }
+    unsafe { async_step_value(ctx, Some(run_id), step) }
+}
+
+unsafe extern "C" fn js_sfs_async_resume(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 2 {
+        return unsafe { async_step_value(ctx, None, AsyncStep::Failed(KazeError::new("E_KAZE_ARGS", "invalid async continuation response"))) };
+    }
+    let Some(run_id) = (unsafe { js_text(ctx, *argv) }).parse::<u64>().ok() else {
+        return unsafe { async_step_value(ctx, None, AsyncStep::Failed(KazeError::new("E_KAZE_ARGS", "invalid async run identifier"))) };
+    };
+    let Some(request_id) = (unsafe { js_text(ctx, *argv.add(1)) }).parse::<u64>().ok() else {
+        return unsafe { async_step_value(ctx, Some(run_id), AsyncStep::Failed(KazeError::new("E_KAZE_ARGS", "invalid async request identifier"))) };
+    };
+    let mut run = match ASYNC_RUNS.with(|runs| runs.borrow_mut().remove(&run_id)) {
+        Some(run) => run,
+        None => return unsafe { async_state_only(ctx, "late") },
+    };
+    if run.context_key != ctx as usize {
+        ASYNC_RUNS.with(|runs| { runs.borrow_mut().insert(run_id, run); });
+        return unsafe { async_step_value(ctx, Some(run_id), AsyncStep::Failed(KazeError::new("E_KAZE_STATE", "async continuation belongs to a different runtime context"))) };
+    }
+    if std::time::Instant::now() >= run.deadline {
+        let error = KazeError::at(
+            "E_TIMEOUT",
+            "the asynchronous Kaze run deadline elapsed; a dispatched effect may have an unknown outcome",
+            &run.source_name,
+            0,
+            None,
+        );
+        let _ = run.vm.cancel_item(&mut run.state);
+        return unsafe { async_step_value(ctx, Some(run_id), AsyncStep::Failed(error)) };
+    }
+
+    if request_id == 0 {
+        if run.vm.has_pending_capability(&run.state) {
+            ASYNC_RUNS.with(|runs| { runs.borrow_mut().insert(run_id, run); });
+            return unsafe { async_step_value(ctx, Some(run_id), AsyncStep::Failed(KazeError::new("E_KAZE_STATE", "cannot advance while a capability response is pending"))) };
+        }
+        let step = async_advance(&mut run);
+        let pending = matches!(&step, AsyncStep::Yielded { .. } | AsyncStep::Capability(_, _));
+        if pending {
+            ASYNC_RUNS.with(|runs| { runs.borrow_mut().insert(run_id, run); });
+        }
+        return unsafe { async_step_value(ctx, Some(run_id), step) };
+    }
+
+    let result = if argc > 3 && !unsafe { qjs::is_undefined(*argv.add(3)) || qjs::is_null(*argv.add(3)) } {
+        let error = unsafe { js_json(ctx, *argv.add(3)) }.unwrap_or(serde_json::Value::Null);
+        let code = error.get("code").and_then(serde_json::Value::as_str).unwrap_or("E_KAZE_HOST");
+        let message = error.get("message").and_then(serde_json::Value::as_str).unwrap_or("asynchronous capability failed");
+        Err(VmError { code: async_backend_error_code(code), msg: message.to_string(), line: 0 })
+    } else {
+        let value = if argc > 2 && !unsafe { qjs::is_undefined(*argv.add(2)) } {
+            unsafe { js_json(ctx, *argv.add(2)) }
+        } else {
+            Some(serde_json::Value::Null)
+        };
+        match value {
+            Some(value) => Ok(value),
+            None => Err(VmError { code: "E_KAZE_HOST", msg: "asynchronous capability returned a non-JSON result".into(), line: 0 }),
+        }
+    };
+
+    if let Err(error) = run.vm.resume_capability(&mut run.state, request_id, result) {
+        let source_name = run.source_name.clone();
+        if error.code == "E_KAZE_STATE" {
+            ASYNC_RUNS.with(|runs| { runs.borrow_mut().insert(run_id, run); });
+        }
+        let error = async_error(&source_name, error);
+        return unsafe { async_step_value(ctx, Some(run_id), AsyncStep::Failed(error)) };
+    }
+    let step = async_advance(&mut run);
+    let pending = matches!(&step, AsyncStep::Yielded { .. } | AsyncStep::Capability(_, _));
+    if pending {
+        ASYNC_RUNS.with(|runs| { runs.borrow_mut().insert(run_id, run); });
+    }
+    unsafe { async_step_value(ctx, Some(run_id), step) }
+}
+
+fn async_backend_error_code(code: &str) -> &'static str {
+    match code {
+        "E_CAP_MISSING" | "E_TOOL" | "E_MCP_CONFIG" | "E_MCP_SECRET_UNAVAILABLE" |
+        "E_MCP_SERVER_NOT_FOUND" | "E_MCP_TOOL_NOT_FOUND" | "E_MCP_AMBIGUOUS" |
+        "E_MCP_METHOD_NOT_SUPPORTED" | "E_MCP_FETCH_UNAVAILABLE" |
+        "E_MCP_HTTP_SERVER_UNAVAILABLE" => "E_CAP_MISSING",
+        "E_CAP_DENIED" | "E_POLICY_DENIED" | "E_POLICY_APPROVAL_REQUIRED" |
+        "E_POLICY_UNAVAILABLE" | "E_PERMISSION_DENIED" | "E_PATH_OUTSIDE" => "E_CAP_DENIED",
+        "E_KAZE_ARGS" | "E_SCHEMA" => "E_KAZE_ARGS",
+        "E_KAZE_RESULT" => "E_KAZE_RESULT",
+        "E_KAZE_MEMORY" => "E_KAZE_MEMORY",
+        "E_KAZE_OUTCOME_UNKNOWN" | "E_MCP_OUTCOME_UNKNOWN" => "E_KAZE_OUTCOME_UNKNOWN",
+        "E_TIMEOUT" | "E_MCP_TIMEOUT" => "E_TIMEOUT",
+        _ => "E_KAZE_HOST",
+    }
+}
+
+unsafe extern "C" fn js_sfs_async_cancel(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::sofuu_js_new_bool(ctx, 0);
+    }
+    let Some(run_id) = (unsafe { js_text(ctx, *argv) }).parse::<u64>().ok() else {
+        return qjs::sofuu_js_new_bool(ctx, 0);
+    };
+    let Some(mut run) = ASYNC_RUNS.with(|runs| runs.borrow_mut().remove(&run_id)) else {
+        return qjs::sofuu_js_new_bool(ctx, 0);
+    };
+    if run.context_key != ctx as usize {
+        ASYNC_RUNS.with(|runs| { runs.borrow_mut().insert(run_id, run); });
+        return qjs::sofuu_js_new_bool(ctx, 0);
+    }
+    let _ = run.vm.cancel_item(&mut run.state);
+    qjs::sofuu_js_new_bool(ctx, 1)
 }
 
 unsafe extern "C" fn js_sfs_check(
@@ -1136,6 +1705,12 @@ pub unsafe fn mod_sfs_register(ctx: *mut JSContext) {
         let ns = qjs::sofuu_js_new_object(ctx);
         let run = qjs::sofuu_js_new_cfunction(ctx, js_sfs_run, c"run".as_ptr(), 3);
         qjs::sofuu_js_set_property_str(ctx, ns, c"run".as_ptr(), run);
+        let async_start = qjs::sofuu_js_new_cfunction(ctx, js_sfs_async_start, c"_asyncStart".as_ptr(), 3);
+        qjs::sofuu_js_set_property_str(ctx, ns, c"_asyncStart".as_ptr(), async_start);
+        let async_resume = qjs::sofuu_js_new_cfunction(ctx, js_sfs_async_resume, c"_asyncResume".as_ptr(), 4);
+        qjs::sofuu_js_set_property_str(ctx, ns, c"_asyncResume".as_ptr(), async_resume);
+        let async_cancel = qjs::sofuu_js_new_cfunction(ctx, js_sfs_async_cancel, c"_asyncCancel".as_ptr(), 1);
+        qjs::sofuu_js_set_property_str(ctx, ns, c"_asyncCancel".as_ptr(), async_cancel);
         let check = qjs::sofuu_js_new_cfunction(ctx, js_sfs_check, c"check".as_ptr(), 1);
         qjs::sofuu_js_set_property_str(ctx, ns, c"check".as_ptr(), check);
         let compile = qjs::sofuu_js_new_cfunction(ctx, js_sfs_compile, c"compile".as_ptr(), 1);
@@ -1150,6 +1725,20 @@ pub unsafe fn mod_sfs_register(ctx: *mut JSContext) {
         qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"kaze".as_ptr(), ns);
         qjs::sofuu_js_free_value(ctx, sofuu_obj);
         qjs::sofuu_js_free_value(ctx, global);
+
+        let driver = CString::new(include_str!("../../../../../src/js/kaze_async.js"))
+            .unwrap_or_default();
+        let evaluated = qjs::JS_Eval(
+            ctx,
+            driver.as_ptr(),
+            driver.as_bytes().len(),
+            c"<kaze-async-driver>".as_ptr(),
+            qjs::JS_EVAL_TYPE_GLOBAL,
+        );
+        if qjs::is_exception(evaluated) {
+            qjs::js_std_dump_error(ctx);
+        }
+        qjs::sofuu_js_free_value(ctx, evaluated);
     }
 }
 
@@ -1186,6 +1775,276 @@ mod tests {
                 throw new Error('not rendered');
             "#,
             "<kaze-diagnostic-test>",
+        );
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn js_kaze_run_async_resumes_after_a_bounded_instruction_slice() {
+        let _guard = crate::rt::test_loop_lock();
+        let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
+        let rc = rt.eval_string(
+            r#"
+            globalThis.__kazeAsyncObserved = null;
+            sofuu.kaze.runAsync(
+              'action main():\n    let n = 0\n    while n < 400:\n        set n to n + 1\n    return n\n',
+              {}, { timeoutMs: 5000 }
+            ).then(function (report) { globalThis.__kazeAsyncObserved = report; }, function (error) {
+              globalThis.__kazeAsyncObserved = { error: error.code || error.message };
+            });
+            "#,
+            "<kaze-async-slice-test>",
+        );
+        assert_eq!(rc, 0);
+        let rc = rt.eval_string(
+            r#"if (!globalThis.__kazeAsyncObserved || globalThis.__kazeAsyncObserved.ok !== true ||
+                   globalThis.__kazeAsyncObserved.result !== '400' ||
+                   globalThis.__kazeAsyncObserved.instructions <= 256) {
+                 throw new Error('Kaze async slice did not complete with its retained VM state');
+               }"#,
+            "<kaze-async-slice-assert>",
+        );
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn async_backend_errors_keep_kaze_denial_and_completion_categories() {
+        assert_eq!(async_backend_error_code("E_POLICY_DENIED"), "E_CAP_DENIED");
+        assert_eq!(async_backend_error_code("E_POLICY_APPROVAL_REQUIRED"), "E_CAP_DENIED");
+        assert_eq!(async_backend_error_code("E_PERMISSION_DENIED"), "E_CAP_DENIED");
+        assert_eq!(async_backend_error_code("E_MCP_TOOL_NOT_FOUND"), "E_CAP_MISSING");
+        assert_eq!(async_backend_error_code("E_SCHEMA"), "E_KAZE_ARGS");
+        assert_eq!(async_backend_error_code("E_KAZE_RESULT"), "E_KAZE_RESULT");
+        assert_eq!(async_backend_error_code("E_MCP_TIMEOUT"), "E_TIMEOUT");
+        assert_eq!(async_backend_error_code("E_MCP_OUTCOME_UNKNOWN"), "E_KAZE_OUTCOME_UNKNOWN");
+        assert_eq!(async_backend_error_code("E_PROVIDER_INTERNAL"), "E_KAZE_HOST");
+    }
+
+    #[test]
+    fn js_kaze_run_async_names_an_inline_source_as_given() {
+        let _guard = crate::rt::test_loop_lock();
+        let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
+        let rc = rt.eval_string(
+            r#"
+            globalThis.__kazeNamedSource = null;
+            sofuu.kaze.runAsync(
+              'action main():\n    let z = 0\n    return 1 / z\n',
+              {}, { sourceName: 'operator-agent.kaze' }
+            ).then(function (report) {
+              globalThis.__kazeNamedSource = { ok: report.ok === true };
+            }, function (error) {
+              globalThis.__kazeNamedSource = {
+                code: error.code,
+                source: error.diagnostic && error.diagnostic.location
+                  ? error.diagnostic.location.source : null
+              };
+            });
+            "#,
+            "<kaze-source-name-test>",
+        );
+        assert_eq!(rc, 0);
+        let rc = rt.eval_string(
+            r#"var seen = globalThis.__kazeNamedSource;
+               if (!seen || seen.code !== 'E_KAZE_DIV0' || seen.source !== 'operator-agent.kaze') {
+                 throw new Error('inline source was not named as given: ' + JSON.stringify(seen));
+               }"#,
+            "<kaze-source-name-assert>",
+        );
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn js_kaze_classification_result_must_match_one_requested_label() {
+        let _guard = crate::rt::test_loop_lock();
+        let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
+        let rc = rt.eval_string(
+            r#"
+            var validate = sofuu.kaze._validateClassifyResult;
+            if (validate(' yes\n', ['yes', 'no']) !== 'yes')
+              throw new Error('valid classifier label was not normalized');
+            var rejected = false;
+            try { validate('maybe', ['yes', 'no']); }
+            catch (error) { rejected = error.code === 'E_KAZE_RESULT'; }
+            if (!rejected) throw new Error('out-of-set classifier result was accepted');
+            "#,
+            "<kaze-classification-result-test>",
+        );
+        assert_eq!(rc, 0);
+        let rc = rt.eval_string(
+            r#"
+            globalThis.__kazeClassifyArgsObserved = null;
+            sofuu.kaze.runAsync(
+              'needs: ai\naction main():\n    return ai.classify("sample", ["yes", "yes"])\n',
+              {}, { grants: ['ai'], policy: { tools: { allow: ['kaze.ai.*'] } },
+                    ai: { model: '' }, timeoutMs: 5000 }
+            ).then(function (report) {
+              globalThis.__kazeClassifyArgsObserved = { code: report.code };
+            }, function (error) {
+              globalThis.__kazeClassifyArgsObserved = { code: error.code, message: error.message };
+            });
+            "#,
+            "<kaze-classification-label-test>",
+        );
+        assert_eq!(rc, 0);
+        let rc = rt.eval_string(
+            r#"if (!globalThis.__kazeClassifyArgsObserved ||
+                   globalThis.__kazeClassifyArgsObserved.code !== 'E_KAZE_ARGS') {
+                 throw new Error('invalid classifier arguments reached the provider: ' +
+                   JSON.stringify(globalThis.__kazeClassifyArgsObserved));
+               }"#,
+            "<kaze-classification-args-assert>",
+        );
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn js_kaze_async_reports_a_missing_model_as_actionable_unavailability() {
+        let _guard = crate::rt::test_loop_lock();
+        let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
+        let rc = rt.eval_string(
+            r#"
+            globalThis.__kazeMissingModelObserved = null;
+            sofuu.kaze.runAsync(
+              'needs: ai\naction main():\n    return ai.prompt("hello")\n',
+              {}, { grants: ['ai'], policy: { tools: { allow: ['kaze.ai.*'] } },
+                    ai: { model: '' }, timeoutMs: 5000 }
+            ).then(function (report) {
+              globalThis.__kazeMissingModelObserved = { ok: report.ok, code: report.code };
+            }, function (error) {
+              globalThis.__kazeMissingModelObserved = { code: error.code, message: error.message };
+            });
+            "#,
+            "<kaze-async-missing-model-test>",
+        );
+        assert_eq!(rc, 0);
+        let rc = rt.eval_string(
+            r#"if (!globalThis.__kazeMissingModelObserved ||
+                   globalThis.__kazeMissingModelObserved.code !== 'E_CAP_MISSING' ||
+                   !globalThis.__kazeMissingModelObserved.message.includes('SOFUU_AI_MODEL')) {
+                 throw new Error('missing-model diagnostic was not actionable: ' +
+                   JSON.stringify(globalThis.__kazeMissingModelObserved));
+               }"#,
+            "<kaze-async-missing-model-assert>",
+        );
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn js_kaze_async_reads_the_documented_ai_environment() {
+        let _guard = crate::rt::test_loop_lock();
+        let saved: Vec<(&str, Option<String>)> = [
+            "SOFUU_AI_PROVIDER",
+            "SOFUU_AI_MODEL",
+            "SOFUU_AI_BASE_URL",
+            "SOFUU_AI_TEMPERATURE",
+            "SOFUU_AI_MAX_TOKENS",
+        ]
+        .iter()
+        .map(|key| (*key, std::env::var(key).ok()))
+        .collect();
+        std::env::set_var("SOFUU_AI_PROVIDER", "custom");
+        std::env::set_var("SOFUU_AI_MODEL", "test-model");
+        std::env::set_var("SOFUU_AI_BASE_URL", "https://example.invalid/v1/chat/completions");
+        std::env::set_var("SOFUU_AI_TEMPERATURE", "0.25");
+        std::env::set_var("SOFUU_AI_MAX_TOKENS", "2048");
+
+        let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
+        let rc = rt.eval_string(
+            r#"
+            var opts = sofuu.kaze._envAiOptions();
+            if (opts.provider !== 'custom' || opts.model !== 'test-model' ||
+                opts.base_url !== 'https://example.invalid/v1/chat/completions' ||
+                opts.temperature !== 0.25 || opts.maxTokens !== 2048) {
+                throw new Error('environment AI options were not read: ' + JSON.stringify(opts));
+            }
+            "#,
+            "<kaze-env-options-test>",
+        );
+        assert_eq!(rc, 0);
+
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn js_kaze_run_async_runs_supervisor_hooks_on_the_requested_ticks() {
+        let _guard = crate::rt::test_loop_lock();
+        let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
+        let rc = rt.eval_string(
+            r#"
+            globalThis.__kazeHookObserved = null;
+            sofuu.kaze.runAsync(
+              'needs: log\nevery 100ms:\n    log "tick"\n',
+              {}, { ticks: 2, tickMs: 100, timeoutMs: 5000,
+                    grants: ['log'], policy: { tools: { allow: ['kaze.*'] } } }
+            ).then(function (report) { globalThis.__kazeHookObserved = report; }, function (error) {
+              globalThis.__kazeHookObserved = { error: error.code || error.message };
+            });
+            "#,
+            "<kaze-async-hook-test>",
+        );
+        assert_eq!(rc, 0);
+        let rc = rt.eval_string(
+            r#"if (!globalThis.__kazeHookObserved || globalThis.__kazeHookObserved.ok !== true ||
+                   globalThis.__kazeHookObserved.ticks !== 2 ||
+                   !globalThis.__kazeHookObserved.logs.map(function (l) { return l.message; }).join("|").includes("tick")) {
+                 throw new Error('Kaze async supervisor ticks did not run: ' +
+                   JSON.stringify(globalThis.__kazeHookObserved));
+               }"#,
+            "<kaze-async-hook-assert>",
+        );
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn js_kaze_run_async_keeps_the_entry_result_while_hooks_run() {
+        let _guard = crate::rt::test_loop_lock();
+        let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
+        let rc = rt.eval_string(
+            r#"
+            globalThis.__kazeEntryObserved = null;
+            sofuu.kaze.runAsync(
+              'needs: log\naction main():\n    return 41\nevery 100ms:\n    log "tick"\n',
+              {}, { ticks: 2, tickMs: 100, timeoutMs: 5000,
+                    grants: ['log'], policy: { tools: { allow: ['kaze.*'] } } }
+            ).then(function (report) { globalThis.__kazeEntryObserved = report; }, function (error) {
+              globalThis.__kazeEntryObserved = { error: error.code || error.message };
+            });
+            "#,
+            "<kaze-async-entry-hook-test>",
+        );
+        assert_eq!(rc, 0);
+        let rc = rt.eval_string(
+            r#"if (!globalThis.__kazeEntryObserved || globalThis.__kazeEntryObserved.ok !== true ||
+                   globalThis.__kazeEntryObserved.entry !== 'main' ||
+                   globalThis.__kazeEntryObserved.result !== '41' ||
+                   globalThis.__kazeEntryObserved.ticks !== 2) {
+                 throw new Error('Kaze async entry result was replaced by a hook: ' +
+                   JSON.stringify(globalThis.__kazeEntryObserved));
+               }"#,
+            "<kaze-async-entry-hook-assert>",
+        );
+        assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn js_kaze_run_async_denies_before_any_backend_dispatch() {
+        let _guard = crate::rt::test_loop_lock();
+        let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
+        let rc = rt.eval_string(
+            r#"
+            var denied = sofuu.kaze._asyncStart(
+              'needs: ai\naction main():\n    return ai.prompt("must not be dispatched")\n',
+              {}, { grants: ['ai'], policy: { tools: { deny: ['kaze.ai.*'] } }, timeoutMs: 5000 }
+            );
+            if (!denied || denied.state !== 'error' || denied.code !== 'E_CAP_DENIED')
+              throw new Error('denied Kaze request reached its adapter: ' + JSON.stringify(denied));
+            "#,
+            "<kaze-async-denial-test>",
         );
         assert_eq!(rc, 0);
     }
@@ -1287,7 +2146,7 @@ mod tests {
         assert_eq!(
             report.actions,
             vec![
-                "log.info(\"Starting patrol\") -> nothing",
+                "log.info(<redacted>) -> nothing",
                 "drone.arm -> nothing",
                 "drone.takeoff(15) -> nothing",
                 "drone.goto(1, 15) -> nothing",
@@ -1467,7 +2326,7 @@ mod tests {
         let prepared = prepare(src, "<t>").unwrap();
         let bytes = isa::serialize(&prepared.module);
         let back = isa::deserialize(&bytes).unwrap();
-        let mut sim = SimHost::new(SimState::default());
+        let mut sim = RuntimeHost::new(SimState::default(), Vec::new(), Vec::new());
         let declared = back.needs.clone();
         let mut vm = Vm::new(&back, &mut sim, &declared, &[], None, Limits::default());
         let item = back.item("main").unwrap();

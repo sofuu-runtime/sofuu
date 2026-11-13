@@ -1,8 +1,15 @@
 // script_cmd.rs — `sofuu script`: the Kaze CLI.
 //
-// PLAN-KAZE-LANGUAGE §3.4. Four verbs, no engine boot: the Kaze pipeline has
-// no QuickJS dependency, so `sofuu script check` answers in a few milliseconds
-// and can run on a machine that has no model, no config and no network.
+// PLAN-KAZE-LANGUAGE §3.4. Four verbs, no engine boot for the front end: the
+// Kaze pipeline has no QuickJS dependency, so `sofuu script check` answers in a
+// few milliseconds and can run on a machine that has no model, no config and
+// no network.
+//
+// `sofuu script run` boots the JavaScript runtime only for a script (or
+// `.kazebc` artifact) that declares `ai` or `tool`: those calls are served by
+// the real provider and MCP adapters through the asynchronous Kaze bridge, the
+// same coordinator a compiled agent uses. Every other script keeps the
+// engine-free synchronous path.
 //
 //   sofuu script run <file> [--cap fam=sim] [--fuel N] [--ticks N] …
 //   sofuu script check <file>
@@ -18,6 +25,73 @@ use std::io::{BufRead, Write};
 use crate::sfs::caps::SimState;
 use crate::sfs::vm::Verdict;
 use crate::sfs::{self, isa, RunOptions, RunReport};
+
+/// A CLI failure from either execution path.
+///
+/// The synchronous runner reports a `KazeError`; the asynchronous bridge runs
+/// inside the JavaScript runtime and answers with that runtime's own versioned
+/// diagnostic object, which a `KazeError` has no field for. Both keep their
+/// real detail instead of being flattened into a string.
+enum CliFailure {
+    Kaze(sfs::KazeError),
+    Bridge {
+        code: String,
+        message: String,
+        diagnostic: Option<serde_json::Value>,
+    },
+}
+
+impl CliFailure {
+    fn kaze(err: sfs::KazeError) -> Self {
+        CliFailure::Kaze(err)
+    }
+
+    fn bridge(code: &str, message: impl Into<String>) -> Self {
+        CliFailure::Bridge {
+            code: code.to_string(),
+            message: message.into(),
+            diagnostic: None,
+        }
+    }
+
+    fn json(&self) -> serde_json::Value {
+        match self {
+            CliFailure::Kaze(err) => kaze_error_json(err, ""),
+            CliFailure::Bridge { code, message, diagnostic } => serde_json::json!({
+                "ok": false,
+                "code": code,
+                "error": crate::rt::diag_contract::redact_event_text(
+                    &crate::rt::diag_contract::truncate_chars(message, 64 * 1024),
+                ),
+                "diagnostic": diagnostic.clone().unwrap_or(serde_json::Value::Null),
+            }),
+        }
+    }
+
+    fn print(&self) {
+        match self {
+            CliFailure::Kaze(err) => print_kaze_error(err, ""),
+            CliFailure::Bridge { code, message, diagnostic } => match diagnostic {
+                Some(view) => eprint!(
+                    "{}",
+                    crate::rt::diag_contract::Diagnostic::from_json(view).render_human(
+                        crate::rt::diag_contract::full_detail_requested(),
+                        crate::rt::engine::stderr_wants_color(),
+                    )
+                ),
+                None => eprintln!("\x1b[31m{}\x1b[0m: {}", code, message),
+            },
+        }
+    }
+}
+
+/// A script whose first line declares `ai` or `tool` needs the JavaScript
+/// runtime: the real provider and MCP adapters live there, and the
+/// asynchronous bridge is what suspends the routine for a real call instead of
+/// blocking the loop. Every other script keeps the engine-free path.
+fn declares_async_capability(needs: &[String]) -> bool {
+    needs.iter().any(|name| matches!(sfs::caps::family_of(name), "ai" | "tool"))
+}
 
 pub fn print_help() {
     println!(
@@ -337,6 +411,7 @@ fn options_from(f: &Flags) -> Result<RunOptions, OptErr> {
         config_path: f.config_file.clone(),
         grants: f.caps.clone(),
         fuel: f.fuel.unwrap_or(sfs::vm::Limits::default().fuel),
+        timeout_ms: sfs::RunOptions::default().timeout_ms,
         heap_bytes: f
             .heap_kb
             .map(|kb| (kb as usize).saturating_mul(1024))
@@ -348,6 +423,7 @@ fn options_from(f: &Flags) -> Result<RunOptions, OptErr> {
         runtime_policy: None,
         backend: f.backend.clone(),
         pins: f.pins.clone(),
+        source_name: None,
     })
 }
 
@@ -452,16 +528,40 @@ fn cmd_run(argv: &[String]) -> i32 {
     };
     // Read the input once: probing a pipe and reopening it can consume input
     // and hang before either execution or diagnostic reporting begins.
-    let outcome = std::fs::read(path)
-        .map_err(|e| sfs::KazeError::new("E_KAZE_IO", format!("cannot read '{}': {}", path, e)))
-        .and_then(|bytes| {
+    let outcome: Result<RunReport, CliFailure> = match std::fs::read(path) {
+        Err(e) => Err(CliFailure::kaze(sfs::KazeError::new(
+            "E_KAZE_IO",
+            format!("cannot read '{}': {}", path, e),
+        ))),
+        Ok(bytes) => {
             if path.ends_with(".kazebc") || bytes.starts_with(b"KAZEBC1\0") {
-                isa::deserialize(&bytes).map_err(|e| sfs::KazeError::new("E_KAZE_BADCODE", e))
-                    .and_then(|module| sfs::run_module(module, path, &opts))
+                isa::deserialize(&bytes)
+                    .map_err(|e| CliFailure::kaze(sfs::KazeError::new("E_KAZE_BADCODE", e)))
+                    .and_then(|module| {
+                        if declares_async_capability(&module.needs) {
+                            // A compiled artifact that declares ai or tool runs
+                            // through the same bridge; the bridge resolves the
+                            // path itself, so the artifact the CLI accepted is
+                            // the artifact that runs.
+                            run_async_bridge(path, path, &opts, &flags)
+                        } else {
+                            sfs::run_module(module, path, &opts).map_err(CliFailure::kaze)
+                        }
+                    })
             } else {
-                sfs::decode_source(bytes, path).and_then(|src| sfs::run_source(&src, path, &opts))
+                sfs::decode_source(bytes, path)
+                    .and_then(|src| sfs::prepare(&src, path).map(|prepared| (src, prepared)))
+                    .map_err(CliFailure::kaze)
+                    .and_then(|(src, prepared)| {
+                        if declares_async_capability(&prepared.module.needs) {
+                            run_async_bridge(path, &src, &opts, &flags)
+                        } else {
+                            sfs::run_prepared_source(prepared, &opts).map_err(CliFailure::kaze)
+                        }
+                    })
             }
-        });
+        }
+    };
     match outcome {
         Ok(report) => {
             if flags.json {
@@ -475,13 +575,247 @@ fn cmd_run(argv: &[String]) -> i32 {
         }
         Err(err) => {
             if flags.json {
-                let json = kaze_error_json(&err, path);
-                println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&err.json()).unwrap_or_default()
+                );
             } else {
-                print_kaze_error(&err, path);
+                err.print();
             }
             1
         }
+    }
+}
+
+/// Run a declared-`ai`/`tool` script through the asynchronous Kaze bridge in
+/// the JavaScript runtime — the same coordinator a compiled agent uses.
+///
+/// `input` is the source text or, for a `.kazebc` artifact, its path. The
+/// bridge performs the real provider and MCP calls and returns either the
+/// runtime's `RunReport` shape or its versioned diagnostic. Nothing is
+/// synthesized here: a missing provider, a denied grant or a closed MCP
+/// connection comes back as a typed failure.
+fn run_async_bridge(
+    path: &str,
+    input: &str,
+    opts: &RunOptions,
+    flags: &Flags,
+) -> Result<RunReport, CliFailure> {
+    let options = bridge_options(path, opts, flags);
+    let runtime = sofuu_ffi::SofuuRuntime::init().ok_or_else(|| {
+        CliFailure::bridge(
+            "E_KAZE_RUNTIME",
+            "the JavaScript runtime could not be initialised for this ai/tool script",
+        )
+    })?;
+    let script = bridge_script(input, &options);
+    let rc = runtime.eval_string(&script, "<kaze-cli-bridge>");
+    if rc != 0 {
+        return Err(CliFailure::bridge(
+            "E_KAZE_HOST",
+            "the runtime failed while starting the asynchronous Kaze bridge for this script",
+        ));
+    }
+    let raw = read_global_string(&runtime, "__kazeCliOutcome").ok_or_else(|| {
+        CliFailure::bridge(
+            "E_KAZE_HOST",
+            "the asynchronous Kaze bridge left no outcome for this script",
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        CliFailure::bridge(
+            "E_KAZE_HOST",
+            format!("the asynchronous Kaze bridge returned an unreadable outcome: {}", e),
+        )
+    })?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        let report = value.get("report").cloned().unwrap_or(serde_json::Value::Null);
+        return Ok(report_from_bridge(&report));
+    }
+    let code = value.get("code").and_then(serde_json::Value::as_str)
+        .unwrap_or("E_KAZE_HOST").to_string();
+    let message = value.get("error").and_then(serde_json::Value::as_str)
+        .unwrap_or("the script did not run").to_string();
+    let diagnostic = match value.get("diagnostic") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(view) => Some(view.clone()),
+    };
+    Err(CliFailure::Bridge { code, message, diagnostic })
+}
+
+/// The options object the bridge accepts, built from the same parsed CLI flags
+/// the synchronous path uses, so both paths grant, deny and bind identically.
+fn bridge_options(
+    path: &str,
+    opts: &RunOptions,
+    flags: &Flags,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    out.insert("sourceName".into(), serde_json::json!(path));
+    out.insert("ambientArgs".into(), serde_json::json!(opts.ambient_args));
+    if let Some(entry) = &opts.entry {
+        out.insert("entry".into(), serde_json::json!(entry));
+    }
+    if let Some(config) = &opts.config_path {
+        out.insert("configPath".into(), serde_json::json!(config));
+    }
+    out.insert("fuel".into(), serde_json::json!(opts.fuel));
+    out.insert("heapBytes".into(), serde_json::json!(opts.heap_bytes));
+    out.insert("ticks".into(), serde_json::json!(opts.ticks));
+    out.insert("tickMs".into(), serde_json::json!(opts.tick_ms));
+    out.insert("timeoutMs".into(), serde_json::json!(opts.timeout_ms));
+    if !opts.grants.is_empty() {
+        out.insert("grants".into(), serde_json::json!(opts.grants));
+    }
+    if !opts.backend.is_empty() {
+        let mut caps = serde_json::Map::new();
+        for (family, backend) in &opts.backend {
+            caps.insert(
+                family.clone(),
+                if backend.is_empty() { serde_json::json!(true) } else { serde_json::json!(backend) },
+            );
+        }
+        out.insert("caps".into(), serde_json::Value::Object(caps));
+    }
+    if !opts.pins.is_empty() {
+        let mut pins = serde_json::Map::new();
+        for (name, line) in &opts.pins {
+            pins.insert(name.clone(), serde_json::json!(line));
+        }
+        out.insert("pins".into(), serde_json::Value::Object(pins));
+    }
+    if !flags.sim.is_empty() {
+        out.insert("sim".into(), bridge_sim(&flags.sim));
+    }
+    // `None` is a deliberate `--no-policy`: the bridge then denies every
+    // capability call, which is the same refusal the synchronous path gives.
+    if let Some(policy) = &opts.policy {
+        out.insert("policy".into(), policy.clone());
+    }
+    out
+}
+
+/// `--sim battery=15,armed=true` as an object, so the bridge applies the same
+/// overrides the synchronous path already parsed.
+fn bridge_sim(spec: &str) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for pair in spec.split(',').filter(|p| !p.trim().is_empty()) {
+        let (key, raw) = match pair.split_once('=') {
+            Some((k, v)) => (k.trim(), v.trim()),
+            None => (pair.trim(), ""),
+        };
+        let value = serde_json::from_str::<serde_json::Value>(raw)
+            .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+        map.insert(key.to_string(), value);
+    }
+    serde_json::Value::Object(map)
+}
+
+/// The bootstrap evaluated in the runtime. It only forwards arguments and
+/// returns what `runAsync` really produced.
+fn bridge_script(input: &str, options: &serde_json::Map<String, serde_json::Value>) -> String {
+    format!(
+        "(function () {{\n\
+         \x20 globalThis.__kazeCliOutcome = null;\n\
+         \x20 if (!sofuu.kaze || typeof sofuu.kaze.runAsync !== 'function') {{\n\
+         \x20   globalThis.__kazeCliOutcome = JSON.stringify({{ ok: false, code: 'E_KAZE_RUNTIME',\n\
+         \x20     error: 'this Sofuu runtime has no asynchronous Kaze bridge for ai/tool capabilities' }});\n\
+         \x20   return;\n\
+         \x20 }}\n\
+         \x20 sofuu.kaze.runAsync({source}, {{}}, {options}).then(function (report) {{\n\
+         \x20   globalThis.__kazeCliOutcome = JSON.stringify({{ ok: true, report: report }});\n\
+         \x20 }}, function (error) {{\n\
+         \x20   globalThis.__kazeCliOutcome = JSON.stringify({{\n\
+         \x20     ok: false,\n\
+         \x20     code: (error && typeof error.code === 'string') ? error.code : 'E_KAZE_HOST',\n\
+         \x20     error: (error && error.message) ? String(error.message) : String(error),\n\
+         \x20     diagnostic: (error && error.diagnostic) ? error.diagnostic : null\n\
+         \x20   }});\n\
+         \x20 }});\n\
+         }})();",
+        source = js_string_literal(input),
+        options = serde_json::Value::Object(options.clone()),
+    )
+}
+
+/// A JS string literal. `serde_json` already escapes quotes, backslashes and
+/// control characters; U+2028/U+2029 are legal inside a JSON string but only
+/// legal in a JS string literal from ES2019, so escape them explicitly.
+fn js_string_literal(text: &str) -> String {
+    serde_json::to_string(text)
+        .unwrap_or_else(|_| "\"\"".to_string())
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// Read a global string the bootstrap wrote. Only used on the owner thread,
+/// right after `eval_string` pumped the runtime to completion.
+fn read_global_string(runtime: &sofuu_ffi::SofuuRuntime, name: &str) -> Option<String> {
+    let ctx = runtime.engine_ctx() as *mut sofuu_ffi::qjs::JSContext;
+    if ctx.is_null() {
+        return None;
+    }
+    let key = std::ffi::CString::new(name).ok()?;
+    unsafe {
+        let global = sofuu_ffi::qjs::sofuu_js_get_global_object(ctx);
+        let value = sofuu_ffi::qjs::sofuu_js_get_property_str(ctx, global, key.as_ptr());
+        let text = if sofuu_ffi::qjs::is_undefined(value) || sofuu_ffi::qjs::is_null(value) {
+            None
+        } else {
+            let raw = sofuu_ffi::qjs::sofuu_js_to_cstring(ctx, value);
+            let out = if raw.is_null() {
+                None
+            } else {
+                let owned = std::ffi::CStr::from_ptr(raw).to_string_lossy().into_owned();
+                sofuu_ffi::qjs::sofuu_js_free_cstring(ctx, raw);
+                Some(owned)
+            };
+            out
+        };
+        sofuu_ffi::qjs::sofuu_js_free_value(ctx, value);
+        sofuu_ffi::qjs::sofuu_js_free_value(ctx, global);
+        text
+    }
+}
+
+/// The bridge reports the same fields the synchronous runner does.
+fn report_from_bridge(report: &serde_json::Value) -> RunReport {
+    let text = |key: &str| report.get(key).and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    let number = |key: &str| report.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+    let actions = report.get("actions").and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().filter_map(serde_json::Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    let logs = report.get("logs").and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items.iter().map(|entry| {
+                (
+                    entry.get("level").and_then(serde_json::Value::as_str).unwrap_or("info").to_string(),
+                    entry.get("message").and_then(serde_json::Value::as_str).unwrap_or("").to_string(),
+                )
+            }).collect()
+        })
+        .unwrap_or_default();
+    let simulated_families = report.get("simulated_families").and_then(serde_json::Value::as_array)
+        .map(|items| items.iter().filter_map(serde_json::Value::as_str).map(str::to_string).collect())
+        .unwrap_or_default();
+    let verdict = report.get("verdict").and_then(serde_json::Value::as_object).map(|v| {
+        let reason = v.get("reason").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+        if v.get("allow").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+            Verdict::Allow(reason)
+        } else {
+            Verdict::Reject(reason)
+        }
+    });
+    RunReport {
+        entry: text("entry"),
+        value: text("result"),
+        actions,
+        logs,
+        fuel_used: number("fuel"),
+        instructions: number("instructions"),
+        ticks: number("ticks") as u32,
+        verdict,
+        simulated_families,
     }
 }
 
@@ -828,4 +1162,119 @@ fn handle_repl_command(
         other => println!("unknown command '{}'; .help lists them", other),
     }
     ReplFlow::Continue
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flags() -> Flags {
+        parse_flags(&[]).expect("empty flag list")
+    }
+
+    #[test]
+    fn a_script_declaring_ai_or_tool_routes_to_the_async_bridge() {
+        // `ai` and `tool` need the JavaScript runtime; every other family is
+        // served in-process, so routing stays engine-free for those scripts.
+        assert!(declares_async_capability(&["ai".to_string()]));
+        assert!(declares_async_capability(&["tool".to_string()]));
+        assert!(declares_async_capability(&["log".into(), "ai".into()]));
+        for family in ["log", "policy", "memory", "alert", "drone", "sensor", "device"] {
+            assert!(!declares_async_capability(&[family.to_string()]), "{family}");
+        }
+        // A declaration of a device that resolves to another family must not
+        // be mistaken for an async capability.
+        assert!(!declares_async_capability(&["lidar".to_string()]));
+    }
+
+    #[test]
+    fn bridge_options_carry_the_same_grants_policy_and_configuration() {
+        let mut opts = match options_from(&flags()) {
+            Ok(opts) => opts,
+            Err(e) => panic!("default options: {}", e.message()),
+        };
+        opts.grants = vec!["ai".into(), "tool".into()];
+        opts.backend = vec![("ai".into(), String::new()), ("tool".into(), "mcp".into())];
+        opts.entry = Some("main".into());
+        opts.config_path = Some("agent.config.json".into());
+        opts.policy = Some(serde_json::json!({"tools": {"allow": ["kaze.*"]}}));
+
+        let built = bridge_options("agent.kaze", &opts, &flags());
+        assert_eq!(built["sourceName"], serde_json::json!("agent.kaze"));
+        assert_eq!(built["grants"], serde_json::json!(["ai", "tool"]));
+        // An empty backend means "granted, no device"; it must not become an
+        // empty-string backend, which the bridge rejects.
+        assert_eq!(built["caps"], serde_json::json!({"ai": true, "tool": "mcp"}));
+        assert_eq!(built["entry"], serde_json::json!("main"));
+        assert_eq!(built["configPath"], serde_json::json!("agent.config.json"));
+        assert_eq!(built["policy"], serde_json::json!({"tools": {"allow": ["kaze.*"]}}));
+        assert_eq!(built["fuel"], serde_json::json!(opts.fuel));
+        assert_eq!(built["heapBytes"], serde_json::json!(opts.heap_bytes));
+
+        // `--no-policy` is a deliberate refusal: the bridge must not be handed
+        // a policy document it never received.
+        opts.policy = None;
+        assert!(bridge_options("agent.kaze", &opts, &flags()).get("policy").is_none());
+    }
+
+    #[test]
+    fn bridge_sim_keeps_the_overrides_the_synchronous_path_parsed() {
+        assert_eq!(
+            bridge_sim("battery=15,armed=true"),
+            serde_json::json!({"battery": 15, "armed": true})
+        );
+        assert_eq!(bridge_sim("mode=auto"), serde_json::json!({"mode": "auto"}));
+        assert_eq!(bridge_sim(""), serde_json::json!({}));
+    }
+
+    #[test]
+    fn a_js_string_literal_cannot_break_out_of_the_bootstrap() {
+        let quoted = js_string_literal("needs: ai\naction main():\n    return \"x\"\n");
+        assert!(quoted.starts_with('"') && quoted.ends_with('"'));
+        assert!(!quoted.contains('\n'), "a raw newline would end the literal");
+        assert!(quoted.contains("\\n"));
+        // A JSON string literal is also a JS string literal, so the round
+        // trip is the property that matters: the text cannot close the
+        // literal early and start executing.
+        for raw in ["\" ] } ); run(); //", "\\", "line\nbreak", "tab\tx"] {
+            let literal = js_string_literal(raw);
+            let parsed: String = serde_json::from_str(&literal).expect("valid JSON literal");
+            assert_eq!(parsed, raw);
+            assert!(!literal.contains('\n'), "{literal}");
+        }
+        // U+2028/U+2029 are legal in JSON but must be escaped for older JS.
+        let separators = js_string_literal("a\u{2028}b\u{2029}c");
+        assert_eq!(separators, "\"a\\u2028b\\u2029c\"");
+    }
+
+    #[test]
+    fn the_bridge_report_matches_the_synchronous_shape() {
+        let report = report_from_bridge(&serde_json::json!({
+            "ok": true,
+            "entry": "main",
+            "result": "\"done\"",
+            "fuel": 12,
+            "instructions": 9,
+            "ticks": 2,
+            "simulated_families": ["drone"],
+            "actions": ["ai.prompt(<redacted>) -> <redacted result>"],
+            "logs": [{"level": "info", "message": "hello"}],
+            "verdict": {"allow": true, "reason": "operator"}
+        }));
+        assert_eq!(report.entry, "main");
+        assert_eq!(report.value, "\"done\"");
+        assert_eq!(report.fuel_used, 12);
+        assert_eq!(report.instructions, 9);
+        assert_eq!(report.ticks, 2);
+        assert_eq!(report.simulated_families, vec!["drone"]);
+        assert_eq!(report.logs, vec![("info".to_string(), "hello".to_string())]);
+        assert!(matches!(report.verdict, Some(Verdict::Allow(ref t)) if t == "operator"));
+        assert!(report.render_plain().contains("simulation (testing): drone"));
+
+        // An empty report is a real empty report, not a fabricated one.
+        let empty = report_from_bridge(&serde_json::Value::Null);
+        assert_eq!(empty.entry, "");
+        assert_eq!(empty.value, "");
+        assert!(empty.verdict.is_none());
+    }
 }

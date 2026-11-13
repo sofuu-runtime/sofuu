@@ -469,6 +469,18 @@ pub fn classify(code: &str) -> Option<CodeInfo> {
             "guard the divisor before dividing",
             Error,
         ),
+        "E_KAZE_RESULT" => (
+            "kaze",
+            "an asynchronous capability returned a value outside its contract",
+            "review the provider result and validate it before using it",
+            Error,
+        ),
+        "E_KAZE_OUTCOME_UNKNOWN" => (
+            "kaze",
+            "a dispatched tool may have completed without a received result",
+            "inspect the operation's actual state before deciding whether to retry",
+            Error,
+        ),
         "E_CONTEXT_CAP" => (
             "agent",
             "the agent's context budget was exceeded",
@@ -1211,6 +1223,17 @@ mod tests {
         assert!(d.reason.is_none());
         assert!(d.hints.is_empty());
         assert_eq!(d.severity, Severity::Error);
+    }
+
+    #[test]
+    fn async_kaze_failures_gain_safe_result_and_retry_guidance() {
+        let invalid_result = Diagnostic::from_code("E_KAZE_RESULT", "invalid category");
+        assert_eq!(invalid_result.subsystem.as_deref(), Some("kaze"));
+        assert!(invalid_result.reason.unwrap().contains("outside its contract"));
+
+        let unknown = Diagnostic::from_code("E_KAZE_OUTCOME_UNKNOWN", "result lost");
+        assert!(unknown.hints[0].contains("actual state"));
+        assert!(unknown.hints[0].contains("retry"));
     }
 
     #[test]

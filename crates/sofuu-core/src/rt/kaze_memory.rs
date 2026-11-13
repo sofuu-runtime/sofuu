@@ -9,7 +9,7 @@ use serde_json::{Map, Number, Value as Json};
 
 use crate::memory::cma::Cma;
 use crate::sfs::arena::Arena;
-use crate::sfs::caps::{Action, CapHost, SimHost};
+use crate::sfs::caps::{Action, CapHost, RuntimeHost};
 use crate::sfs::value::{Heap, Value};
 
 const DIM: usize = 64;
@@ -20,13 +20,13 @@ const MAX_VALUE_DEPTH: usize = 16;
 const MAX_VALUE_NODES: usize = 4096;
 
 pub(crate) struct EphemeralMemoryHost {
-    base: SimHost,
+    base: RuntimeHost,
     store: Cma,
     accepted_bytes: usize,
 }
 
 impl EphemeralMemoryHost {
-    pub(crate) fn new(base: SimHost) -> Self {
+    pub(crate) fn new(base: RuntimeHost) -> Self {
         let mut store = Cma::new(DIM);
         // Do not merge different values merely because their embeddings are
         // similar. Identical label/value records are still deduplicated by CMA.
@@ -127,8 +127,14 @@ impl CapHost for EphemeralMemoryHost {
         heap: &mut Heap,
     ) -> Result<Value, String> {
         match (family, op) {
-            ("memory", "save") => self.save(args, arena, heap),
-            ("memory", "recall") => self.recall(args, arena, heap),
+            ("memory", "save") => {
+                self.base.check_trace_capacity()?;
+                self.save(args, arena, heap)
+            }
+            ("memory", "recall") => {
+                self.base.check_trace_capacity()?;
+                self.recall(args, arena, heap)
+            }
             _ => self.base.call(family, op, args, arena, heap),
         }
     }
@@ -186,5 +192,33 @@ fn to_json(
             }
             Ok(Json::Object(result))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sfs::caps::SimState;
+
+    #[test]
+    fn a_full_trace_refuses_the_memory_write_before_it_occurs() {
+        let base = RuntimeHost::new(SimState::default(), Vec::new(), Vec::new());
+        let mut host = EphemeralMemoryHost::new(base);
+        let mut arena = Arena::new(1024);
+        let mut heap = Heap::default();
+        let detector = Value::Str(arena.alloc("secrets").unwrap());
+        let data = Value::Str(arena.alloc("value").unwrap());
+        let label = Value::Str(arena.alloc("label").unwrap());
+        let mut full = false;
+        for _ in 0..10_000 {
+            if host.call("policy", "detects", &[detector, data], &mut arena, &mut heap).is_err() {
+                full = true;
+                break;
+            }
+        }
+        assert!(full, "the trace must have a finite limit");
+        let error = host.call("memory", "save", &[label, data], &mut arena, &mut heap).unwrap_err();
+        assert!(error.starts_with("E_KAZE_MEMORY:"));
+        assert_eq!(host.store.len(), 0);
     }
 }

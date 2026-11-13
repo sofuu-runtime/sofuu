@@ -1938,6 +1938,9 @@ unsafe fn engine_destroy(eng: *mut SofuuEngine) {
     }
     // SAFETY: eng is live for the whole teardown sequence.
     unsafe { sofuu_rt_report_pending_rejections((*eng).ctx) };
+    // Drop suspended owned Kaze continuations before their QuickJS context
+    // disappears; no continuation retains a JSValue or crosses worker threads.
+    crate::domains::kaze::cancel_async_runs_for_context(unsafe { (*eng).ctx });
     // PLAN-DESKTOP A: close the poke handle before the loop walk so the
     // close callback frees its storage (the walk skips closing handles).
     // F-2: only if THIS engine owns it — a surviving engine still needs it.

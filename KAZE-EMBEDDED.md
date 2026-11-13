@@ -33,11 +33,15 @@ or policy. Malformed policy and duplicate JSON keys are refused.
 
 `sofuu.kaze.run` and its `sofuu.sfs.run` alias accept `grants` or `caps`,
 `policy` or strict `policyJson`, and optional backend, pin and simulation
-settings. Capability calls must also pass the embedding runtime's active policy;
-the Kaze options cannot override a host denial or approval requirement. Script
-files passed to `run`, `check` or `compile` use the runtime filesystem policy
-and native root. JS callers supply routine arguments explicitly; they do not
-implicitly read `agent.config.json` or environment variables.
+settings. `sofuu.kaze.runAsync` has the same Kaze authorization gates and
+suspends for asynchronous AI and tool operations. Capability calls must also
+pass the embedding runtime's active policy; Kaze options cannot override a host
+deny or approval requirement. Script files passed to `run`, `runAsync`, `check`
+or `compile` use the runtime filesystem policy and native root. JS callers
+supply routine arguments explicitly; they do not implicitly read
+`agent.config.json` or environment variables. For `runAsync`, AI settings may be
+passed in `options.ai`; compiled-agent bootstraps also resolve documented
+`SOFUU_AI_*` settings.
 
 For `sofuu script run`, named `--arg` and positional values take precedence
 over environment variables and the optional default `agent.config.json`.
@@ -57,9 +61,19 @@ required capability and embedded-boundary gates.
   Without this explicit selection, Kaze memory calls return `E_CAP_MISSING`.
   The store is isolated per run and is discarded on return; it is not durable
   and is not shared with Sofuu's QTSQ stores or other agents.
-- Embedded AI, tool, alert, sensor and device calls have no enabled backend
-  and return `E_CAP_MISSING` after authorization. They do not perform model
-  inference, MCP calls, alert delivery or sensor reads.
+- `sofuu.kaze.runAsync`, a compiled agent that declares `needs: ai` or
+  `needs: tool`, and `sofuu script run` for a source or `.kazebc` file that
+  declares either capability dispatch `ai.prompt`, `ai.complete`, and
+  `ai.classify` through the real `sofuu.ai.complete` API, and `tool.call` /
+  `tool.run` through Sofuu's built-in tool executor or configured MCP client.
+  The adapter validates returned classification labels and converts a missing
+  model to an actionable `E_CAP_MISSING`. Approval-required calls fail closed
+  because no verifiable approval receipt is available.
+- A real model-plus-MCP journey has been exercised on a debug build through all
+  three entry points; see the local verification section. A script or
+  `.kazebc` file that declares neither `ai` nor `tool` keeps the engine-free
+  synchronous runner. Alert, sensor, device, and persistent memory operations
+  remain unavailable unless explicitly documented above.
 - Drone and rover simulation is available only when explicitly selected for
   testing, for example `--cap drone=sim`. Reports label simulated families.
   A bare `--cap drone` does not select a simulator.
@@ -89,17 +103,23 @@ and its supervisor ticks share the store; independent invocations do not.
 There is no disk reopen, cross-process sharing or storage encryption claim.
 
 Existing published binaries have not been verified against these changes and
-may behave differently. This work does not establish a real Kaze model-and-tool
-agent, a shared Kaze 1.0 core, or bytecode compatibility with standalone Kaze.
+may behave differently. The async bridge is implemented and has passed a real
+model-plus-MCP journey on a debug build with a configured remote provider; local
+GGUF weights and released artifacts remain unverified. This work does not
+establish a shared Kaze 1.0 core or bytecode compatibility with standalone Kaze.
 
 ## Local verification and remaining work
 
-On 2026-11-11, a macOS debug build passed 73 embedded Kaze unit tests, 16
-hardware-gate unit tests, and the cross-surface checks below. They cover pure
+On 2026-11-12, the macOS debug build with SHA-256
+`cd0a0abef7835aad1393a4d75e82362231d2768c1f18e92e1324b5d1749b0a21` passed the
+embedded Kaze unit suite and the cross-surface checks below. They cover pure
 computation, refusals and policy, source and bytecode, both JS aliases, REPL,
-compiled one-shot agents, per-run CMA storage, and explicitly selected drone
-simulation. No model, external tool, or physical hardware was used in those
-Kaze checks.
+compiled one-shot agents, per-run CMA storage, explicitly selected drone
+simulation, missing-model classification, and output-label validation. A
+separate opt-in run exercised a configured remote model and a real stdio MCP
+server through `sofuu script run` (source and `.kazebc`), `sofuu.kaze.runAsync`
+and a compiled agent. It needs a provider configuration, is not part of the
+offline suite below, and downloaded no model weights.
 
 ```sh
 cargo build --offline -p sofuu-core --bin sofuu --bin sofuu-agent
@@ -108,11 +128,16 @@ cargo test --offline -p sofuu-core --lib domains::robotics::hardware::tests
 python3 scripts/test-kaze-fail-closed.py target/debug/sofuu
 python3 scripts/test-kaze-memory-real.py target/debug/sofuu
 python3 scripts/test-kaze-js-boundaries.py target/debug/sofuu
+# Opt-in, requires SOFUU_TEST_* provider configuration:
+python3 scripts/test-kaze-real-ai.py
+python3 scripts/test-kaze-cli-real-ai.py
 ```
 
 The same boundary, fail-closed and ephemeral-memory checks also passed on a
-temporary release candidate. This does not establish published-artifact,
-supervisor or interactive coverage. The ignored local Kaze integration suite
-and repository-wide mandatory gates still contain non-robotics stand-ins that
-need migration. Real model/tool adapters and physical hardware need further
-work and verification. Follow the remaining Kaze tasks in [sofuu-map.md](sofuu-map.md).
+temporary release candidate before the async bridge was added; that candidate
+does not contain the bridge. The real-provider journey above is a local
+debug-build result with one configured provider; it does not establish
+published-artifact, local-GGUF, supervisor, interactive, or cancellation
+coverage. The ignored local Kaze integration suite and repository-wide
+mandatory gates still contain non-robotics stand-ins that need migration.
+Follow the remaining Kaze tasks in [sofuu-map.md](sofuu-map.md).

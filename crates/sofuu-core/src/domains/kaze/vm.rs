@@ -19,6 +19,7 @@ use crate::sfs::arena::{fmt_num, Arena};
 use crate::sfs::caps::{self, CapHost};
 use crate::sfs::isa::{field_a, opcode, Const, ItemCode, Module, Op};
 use crate::sfs::value::{Heap, Value};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How much work one run may do before it is stopped.
 #[derive(Clone, Copy, Debug)]
@@ -58,21 +59,118 @@ pub enum Verdict {
     Reject(String),
 }
 
+/// A suspended item owns its bytecode and exact program counter. Host calls
+/// still complete synchronously; instruction slices are the scheduling
+/// foundation for an asynchronous driver.
+pub(crate) struct ItemContinuation {
+    item: ItemCode,
+    pc: usize,
+    token: u64,
+    finished: bool,
+    pending: Option<PendingCapability>,
+}
+
+struct PendingCapability {
+    id: u64,
+    line: u32,
+    family: String,
+    op: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CapabilityRequest {
+    pub id: u64,
+    pub family: String,
+    pub op: String,
+    pub args: serde_json::Value,
+    pub line: u32,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum SliceOutcome {
+    Yielded,
+    Capability(CapabilityRequest),
+    Complete(Value),
+}
+
+// Tokens prevent a continuation from being used with a different VM or after
+// its VM has started another item. Zero is reserved for exhaustion.
+static NEXT_CONTINUATION_TOKEN: AtomicU64 = AtomicU64::new(1);
+static NEXT_CAPABILITY_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+const MAX_CAPABILITY_JSON_BYTES: usize = 1024 * 1024;
+
+enum Host<'a> {
+    Borrowed(&'a mut dyn CapHost),
+    Owned(Box<dyn CapHost + 'a>),
+}
+
+impl CapHost for Host<'_> {
+    fn call(
+        &mut self,
+        family: &str,
+        op: &str,
+        args: &[Value],
+        arena: &mut Arena,
+        heap: &mut Heap,
+    ) -> Result<Value, String> {
+        match self {
+            Host::Borrowed(host) => host.call(family, op, args, arena, heap),
+            Host::Owned(host) => host.call(family, op, args, arena, heap),
+        }
+    }
+
+    fn actions(&self) -> &[crate::sfs::caps::Action] {
+        match self {
+            Host::Borrowed(host) => host.actions(),
+            Host::Owned(host) => host.actions(),
+        }
+    }
+
+    fn logs(&self) -> &[(String, String)] {
+        match self {
+            Host::Borrowed(host) => host.logs(),
+            Host::Owned(host) => host.logs(),
+        }
+    }
+
+    fn check_async_dispatch(&self) -> Result<(), String> {
+        match self {
+            Host::Borrowed(host) => host.check_async_dispatch(),
+            Host::Owned(host) => host.check_async_dispatch(),
+        }
+    }
+
+    fn note_async_completion(&mut self, family: &str, op: &str, succeeded: bool) {
+        match self {
+            Host::Borrowed(host) => host.note_async_completion(family, op, succeeded),
+            Host::Owned(host) => host.note_async_completion(family, op, succeeded),
+        }
+    }
+
+    fn note_async_unknown(&mut self, family: &str, op: &str) {
+        match self {
+            Host::Borrowed(host) => host.note_async_unknown(family, op),
+            Host::Owned(host) => host.note_async_unknown(family, op),
+        }
+    }
+}
+
 pub struct Vm<'a> {
-    pub module: &'a Module,
+    pub module: Module,
     pub arena: Arena,
     pub heap: Heap,
-    pub host: &'a mut dyn CapHost,
-    declared: &'a [String],
-    grants: &'a [String],
-    policy: Option<&'a serde_json::Value>,
-    runtime_policy: Option<&'a serde_json::Value>,
+    host: Host<'a>,
+    declared: Vec<String>,
+    grants: Vec<String>,
+    policy: Option<serde_json::Value>,
+    runtime_policy: Option<serde_json::Value>,
     fuel_left: u64,
     pub fuel_used: u64,
     pub instructions: u64,
     stack: Vec<Value>,
     locals: Vec<Value>,
     verdict: Option<Verdict>,
+    active_item: Option<u64>,
 }
 
 /// The stack is a fixed-size vector; a script cannot grow it without bound.
@@ -80,11 +178,42 @@ const MAX_STACK: usize = 256;
 
 impl<'a> Vm<'a> {
     pub fn new(
-        module: &'a Module,
+        module: &Module,
         host: &'a mut dyn CapHost,
-        declared: &'a [String],
-        grants: &'a [String],
-        policy: Option<&'a serde_json::Value>,
+        declared: &[String],
+        grants: &[String],
+        policy: Option<&serde_json::Value>,
+        limits: Limits,
+    ) -> Self {
+        Self::build(
+            module.clone(),
+            Host::Borrowed(host),
+            declared.to_vec(),
+            grants.to_vec(),
+            policy.cloned(),
+            limits,
+        )
+    }
+
+    /// Build a VM whose module, host and capability configuration are owned by
+    /// the run. This form can safely live across asynchronous JS callbacks.
+    pub(crate) fn new_owned(
+        module: Module,
+        host: Box<dyn CapHost + 'a>,
+        declared: Vec<String>,
+        grants: Vec<String>,
+        policy: Option<serde_json::Value>,
+        limits: Limits,
+    ) -> Self {
+        Self::build(module, Host::Owned(host), declared, grants, policy, limits)
+    }
+
+    fn build(
+        module: Module,
+        host: Host<'a>,
+        declared: Vec<String>,
+        grants: Vec<String>,
+        policy: Option<serde_json::Value>,
         limits: Limits,
     ) -> Self {
         Vm {
@@ -102,27 +231,193 @@ impl<'a> Vm<'a> {
             stack: Vec::with_capacity(32),
             locals: Vec::new(),
             verdict: None,
+            active_item: None,
         }
     }
 
     /// Add the embedding runtime's restrictions without replacing the
     /// Kaze-specific policy required for every capability call.
-    pub fn set_runtime_policy(&mut self, policy: Option<&'a serde_json::Value>) {
-        self.runtime_policy = policy;
+    pub fn set_runtime_policy(&mut self, policy: Option<&serde_json::Value>) {
+        self.runtime_policy = policy.cloned();
     }
 
     /// Run one item to completion. `args` bind to `item.params` by position.
     pub fn run_item(&mut self, item: &ItemCode, args: &[Value]) -> Result<Value, VmError> {
+        let mut state = self.start_item(item, args)?;
+        match self.run_slice(&mut state, usize::MAX)? {
+            SliceOutcome::Complete(value) => Ok(value),
+            SliceOutcome::Capability(request) => {
+                // This synchronous API refuses before a dispatcher sees the
+                // request; it is not an uncertain external outcome.
+                state.pending = None;
+                self.cancel_item(&mut state)?;
+                Err(VmError {
+                    code: "E_CAP_MISSING",
+                    msg: format!("{}.{} requires an asynchronous capability driver", request.family, request.op),
+                    line: request.line,
+                })
+            }
+            SliceOutcome::Yielded => {
+                // Synchronous callers cannot continue beyond this slice.
+                self.cancel_item(&mut state)?;
+                Err(VmError::new("E_KAZE_STATE", "synchronous item exceeded the instruction slice"))
+            }
+        }
+    }
+
+    /// Begin one item without running any instructions. At most one item may
+    /// be active in a VM, so its stack and locals cannot be overwritten while
+    /// a continuation is suspended.
+    pub(crate) fn start_item(
+        &mut self,
+        item: &ItemCode,
+        args: &[Value],
+    ) -> Result<ItemContinuation, VmError> {
+        if self.active_item.is_some() {
+            return Err(VmError::new("E_KAZE_STATE", "another item is already active"));
+        }
+        let token = NEXT_CONTINUATION_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| VmError::new("E_KAZE_STATE", "continuation identifiers exhausted"))?;
         self.stack.clear();
         self.locals = vec![Value::Unit; item.slots.max(item.params.len() as u8) as usize];
         for (i, a) in args.iter().enumerate().take(self.locals.len()) {
             self.locals[i] = *a;
         }
         self.verdict = None;
+        self.active_item = Some(token);
+        Ok(ItemContinuation { item: item.clone(), pc: 0, token, finished: false, pending: None })
+    }
+
+    /// Execute at most `budget` instructions, retaining the exact next program
+    /// counter on yield. A failure terminates the item; it must never be
+    /// resumed and replay a side effect whose outcome may be unknown.
+    pub(crate) fn run_slice(
+        &mut self,
+        state: &mut ItemContinuation,
+        budget: usize,
+    ) -> Result<SliceOutcome, VmError> {
+        self.validate_continuation(state)?;
+        if budget == 0 {
+            return Err(VmError::new("E_KAZE_STATE", "instruction slice must be nonzero"));
+        }
+        if state.pending.is_some() {
+            return Err(VmError::new("E_KAZE_STATE", "resume the pending capability before running another slice"));
+        }
+        let result = self.run_slice_inner(state, budget);
+        if !matches!(result, Ok(SliceOutcome::Yielded | SliceOutcome::Capability(_))) {
+            state.finished = true;
+            self.active_item = None;
+        }
+        result
+    }
+
+    /// Complete exactly one pending asynchronous capability. The request id
+    /// binds the response to this continuation and rejects duplicates/late
+    /// replies. Errors terminate the run so an uncertain effect cannot replay.
+    pub(crate) fn resume_capability(
+        &mut self,
+        state: &mut ItemContinuation,
+        request_id: u64,
+        result: Result<serde_json::Value, VmError>,
+    ) -> Result<(), VmError> {
+        self.validate_continuation(state)?;
+        let Some(pending) = state.pending.as_ref() else {
+            return Err(VmError::new("E_KAZE_STATE", "there is no pending capability to resume"));
+        };
+        if pending.id != request_id {
+            return Err(VmError::new("E_KAZE_STATE", "capability response is stale, duplicated, or belongs to another run"));
+        }
+        let pending_line = pending.line;
+        let pending_family = pending.family.clone();
+        let pending_op = pending.op.clone();
+        state.pending = None;
+        let value = match result {
+            Ok(json) => {
+                let bytes = match serde_json::to_vec(&json) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        state.finished = true;
+                        self.active_item = None;
+                        self.host.note_async_completion(&pending_family, &pending_op, false);
+                        return Err(VmError { code: "E_KAZE_HOST", msg: "capability result is not valid JSON".into(), line: pending_line });
+                    }
+                };
+                if bytes.len() > MAX_CAPABILITY_JSON_BYTES {
+                    state.finished = true;
+                    self.active_item = None;
+                    self.host.note_async_completion(&pending_family, &pending_op, false);
+                    return Err(VmError { code: "E_KAZE_MEMORY", msg: "capability result exceeded the 1 MiB limit".into(), line: pending_line });
+                }
+                match crate::sfs::json_to_value(&json, &mut self.arena, &mut self.heap) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        state.finished = true;
+                        self.active_item = None;
+                        self.host.note_async_completion(&pending_family, &pending_op, false);
+                        return Err(VmError { code: "E_KAZE_MEMORY", msg: message, line: pending_line });
+                    }
+                }
+            }
+            Err(mut error) => {
+                state.finished = true;
+                self.active_item = None;
+                if error.line == 0 {
+                    error.line = pending_line;
+                }
+                if error.code == "E_KAZE_OUTCOME_UNKNOWN" {
+                    self.host.note_async_unknown(&pending_family, &pending_op);
+                } else {
+                    self.host.note_async_completion(&pending_family, &pending_op, false);
+                }
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.push(value, pending_line) {
+            state.finished = true;
+            self.active_item = None;
+            self.host.note_async_completion(&pending_family, &pending_op, false);
+            return Err(error);
+        }
+        self.host.note_async_completion(&pending_family, &pending_op, true);
+        Ok(())
+    }
+
+    pub(crate) fn cancel_item(&mut self, state: &mut ItemContinuation) -> Result<(), VmError> {
+        self.validate_continuation(state)?;
+        if let Some(pending) = state.pending.take() {
+            self.host.note_async_unknown(&pending.family, &pending.op);
+        }
+        state.finished = true;
+        self.active_item = None;
+        Ok(())
+    }
+
+    pub(crate) fn has_pending_capability(&self, state: &ItemContinuation) -> bool {
+        state.pending.is_some()
+    }
+
+    fn validate_continuation(&self, state: &ItemContinuation) -> Result<(), VmError> {
+        if state.finished || self.active_item != Some(state.token) {
+            return Err(VmError::new("E_KAZE_STATE", "item continuation is no longer active in this VM"));
+        }
+        Ok(())
+    }
+
+    fn run_slice_inner(
+        &mut self,
+        state: &mut ItemContinuation,
+        budget: usize,
+    ) -> Result<SliceOutcome, VmError> {
+        let item = &state.item;
 
         let code = &item.code;
-        let mut pc = 0usize;
+        let mut pc = state.pc;
+        let mut steps = 0usize;
         while pc < code.len() {
+            if steps == budget {
+                state.pc = pc;
+                return Ok(SliceOutcome::Yielded);
+            }
             let w = code[pc];
             let current_line = item.line_map.get(pc).copied()
                 .filter(|line| *line > 0).unwrap_or(item.line);
@@ -138,6 +433,7 @@ impl<'a> Vm<'a> {
                 current_line
             };
             self.charge(step_line)?;
+            steps += 1;
             match op {
                 Op::Const => {
                     let imm = self.imm(code, pc, current_line)?;
@@ -260,17 +556,26 @@ impl<'a> Vm<'a> {
                 Op::CallCap => {
                     let imm = self.imm(code, pc, current_line)? as usize;
                     pc += 1;
-                    self.call_cap(imm, field_a(w) as usize, current_line)?;
+                    if let Some(request) = self.call_cap(imm, field_a(w) as usize, current_line)? {
+                        state.pc = pc;
+                        state.pending = Some(PendingCapability {
+                            id: request.id,
+                            line: request.line,
+                            family: request.family.clone(),
+                            op: request.op.clone(),
+                        });
+                        return Ok(SliceOutcome::Capability(request));
+                    }
                 }
                 Op::PolicyStop => {
                     let v = self.pop(current_line)?;
-                    return Ok(v);
+                    return Ok(SliceOutcome::Complete(v));
                 }
                 Op::Ret => {
                     let v = self.pop(current_line)?;
-                    return Ok(v);
+                    return Ok(SliceOutcome::Complete(v));
                 }
-                Op::RetUnit => return Ok(Value::Unit),
+                Op::RetUnit => return Ok(SliceOutcome::Complete(Value::Unit)),
                 Op::FuelTick => {
                     // The pre-charge above already paid for this tick; the
                     // immediate only names the loop for error reporting.
@@ -300,10 +605,10 @@ impl<'a> Vm<'a> {
                     };
                     return Err(VmError { code: "E_KAZE_TRAP", msg, line: current_line });
                 }
-                Op::Halt => return Ok(Value::Unit),
+                Op::Halt => return Ok(SliceOutcome::Complete(Value::Unit)),
             }
         }
-        Ok(Value::Unit)
+        Ok(SliceOutcome::Complete(Value::Unit))
     }
 
     /// Take the verdict the last `run_item` produced, if it was a `filter`.
@@ -313,6 +618,14 @@ impl<'a> Vm<'a> {
 
     pub fn fuel_left(&self) -> u64 {
         self.fuel_left
+    }
+
+    pub(crate) fn actions(&self) -> &[crate::sfs::caps::Action] {
+        self.host.actions()
+    }
+
+    pub(crate) fn logs(&self) -> &[(String, String)] {
+        self.host.logs()
     }
 
     // ── helpers ──────────────────────────────────────────────────────
@@ -581,7 +894,12 @@ impl<'a> Vm<'a> {
         }
     }
 
-    fn call_cap(&mut self, cap_idx: usize, argc: usize, line: u32) -> Result<(), VmError> {
+    fn call_cap(
+        &mut self,
+        cap_idx: usize,
+        argc: usize,
+        line: u32,
+    ) -> Result<Option<CapabilityRequest>, VmError> {
         let cap = self
             .module
             .caps
@@ -595,14 +913,14 @@ impl<'a> Vm<'a> {
 
         // The R7 gate runs for EVERY call, including the in-process families.
         crate::rt::hardware::authorise(
-            self.declared,
-            self.grants,
-            self.policy,
+            &self.declared,
+            &self.grants,
+            self.policy.as_ref(),
             &cap.family,
             &cap.op,
         )
         .map_err(|d| VmError { code: d.code, msg: format!("{} ({})", d.reason, d.rule), line })?;
-        if let Some(policy) = self.runtime_policy {
+        if let Some(policy) = self.runtime_policy.as_ref() {
             crate::rt::hardware::authorise_runtime_policy(policy, &cap.family, &cap.op)
                 .map_err(|d| VmError { code: d.code, msg: format!("{} ({})", d.reason, d.rule), line })?;
         }
@@ -615,7 +933,7 @@ impl<'a> Vm<'a> {
             let v = args.first().copied().unwrap_or(Value::Unit);
             self.verdict = Some(Verdict::Allow(render(&v, &self.arena, &self.heap)));
             self.push(v, line)?;
-            return Ok(());
+            return Ok(None);
         }
         if cap.family == "policy" && cap.op == "reject" {
             let reason = match args.first() {
@@ -624,7 +942,40 @@ impl<'a> Vm<'a> {
             };
             self.verdict = Some(Verdict::Reject(reason));
             self.push(Value::Unit, line)?;
-            return Ok(());
+            return Ok(None);
+        }
+
+        // Model and tool calls leave the VM as owned, bounded JSON requests.
+        // Authorization and argument checks above run before any dispatcher
+        // can observe the request. The synchronous host never fabricates a
+        // replacement result.
+        if matches!((cap.family.as_str(), cap.op.as_str()),
+            ("ai", "prompt" | "complete" | "classify") | ("tool", "call" | "run"))
+        {
+            let mut nodes = 0usize;
+            let serialized_args = args.iter()
+                .map(|value| value_to_json(*value, &self.arena, &self.heap, 0, &mut nodes, line))
+                .collect::<Result<Vec<_>, _>>()?;
+            let json = serde_json::Value::Array(serialized_args);
+            let bytes = serde_json::to_vec(&json)
+                .map_err(|_| VmError { code: "E_KAZE_HOST", msg: "capability arguments are not valid JSON".into(), line })?;
+            if bytes.len() > MAX_CAPABILITY_JSON_BYTES {
+                return Err(VmError { code: "E_KAZE_MEMORY", msg: "capability arguments exceeded the 1 MiB limit".into(), line });
+            }
+            self.host.check_async_dispatch().map_err(|message| {
+                let (code, msg) = split_host_code(message);
+                VmError { code, msg, line }
+            })?;
+            let id = NEXT_CAPABILITY_REQUEST_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .map_err(|_| VmError { code: "E_KAZE_STATE", msg: "capability request identifiers exhausted".into(), line })?;
+            return Ok(Some(CapabilityRequest {
+                id,
+                family: cap.family,
+                op: cap.op,
+                args: json,
+                line,
+            }));
         }
 
         let result = self
@@ -638,9 +989,54 @@ impl<'a> Vm<'a> {
                 let (code, msg) = split_host_code(msg);
                 VmError { code, msg, line }
             })?;
-        self.push(result, line)
+        self.push(result, line)?;
+        Ok(None)
     }
 
+}
+
+fn value_to_json(
+    value: Value,
+    arena: &Arena,
+    heap: &Heap,
+    depth: usize,
+    nodes: &mut usize,
+    line: u32,
+) -> Result<serde_json::Value, VmError> {
+    *nodes = nodes.saturating_add(1);
+    if depth > 32 || *nodes > 16_384 {
+        return Err(VmError { code: "E_KAZE_MEMORY", msg: "capability arguments are too deeply nested or complex".into(), line });
+    }
+    use serde_json::{Map, Number, Value as Json};
+    match value {
+        Value::Unit => Ok(Json::Null),
+        Value::Bool(value) => Ok(Json::Bool(value)),
+        Value::Num(value) => Number::from_f64(value).map(Json::Number)
+            .ok_or_else(|| VmError { code: "E_KAZE_TYPE", msg: "capability arguments must contain finite numbers".into(), line }),
+        Value::Str(value) => Ok(Json::String(arena.get(value).to_string())),
+        Value::Arr(index) => {
+            let values = heap.array(index)
+                .ok_or_else(|| VmError { code: "E_KAZE_BADCODE", msg: "capability argument contains an invalid list".into(), line })?;
+            values.iter().map(|value| value_to_json(*value, arena, heap, depth + 1, nodes, line))
+                .collect::<Result<Vec<_>, _>>().map(Json::Array)
+        }
+        Value::Map(index) => {
+            let values = heap.map(index)
+                .ok_or_else(|| VmError { code: "E_KAZE_BADCODE", msg: "capability argument contains an invalid record".into(), line })?;
+            let mut output = Map::new();
+            for (key, value) in values {
+                let Value::Str(key) = key else {
+                    return Err(VmError { code: "E_KAZE_TYPE", msg: "capability record keys must be text".into(), line });
+                };
+                let key = arena.get(*key).to_string();
+                if output.contains_key(&key) {
+                    return Err(VmError { code: "E_KAZE_TYPE", msg: "capability record has duplicate keys".into(), line });
+                }
+                output.insert(key, value_to_json(*value, arena, heap, depth + 1, nodes, line)?);
+            }
+            Ok(Json::Object(output))
+        }
+    }
 }
 
 /// Codes a capability host may raise. The list is closed on purpose: a host
@@ -692,4 +1088,221 @@ fn divide_by_zero(line: u32) -> VmError {
 
 fn render(v: &Value, arena: &Arena, heap: &Heap) -> String {
     crate::sfs::caps::render_value(*v, arena, heap)
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    use crate::sfs::caps::{Action, RuntimeHost, SimState};
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+
+    struct CountingHost(Arc<AtomicUsize>);
+
+    impl CapHost for CountingHost {
+        fn call(&mut self, family: &str, op: &str, _args: &[Value], _arena: &mut Arena, _heap: &mut Heap) -> Result<Value, String> {
+            if family == "log" && op == "info" {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Value::Unit)
+            } else {
+                Err(format!("E_CAP_MISSING: no test backend for {family}.{op}"))
+            }
+        }
+        fn actions(&self) -> &[Action] { &[] }
+        fn logs(&self) -> &[(String, String)] { &[] }
+    }
+
+    fn host() -> RuntimeHost {
+        RuntimeHost::new(SimState::default(), Vec::new(), Vec::new())
+    }
+
+    #[test]
+    fn slices_preserve_control_flow_and_do_not_replay_real_log_calls() {
+        let source = "needs: log\naction main():\n    let n = 0\n    while n < 3:\n        log \"tick\"\n        set n to n + 1\n    if n == 3:\n        return n\n    otherwise:\n        return 0\n";
+        let module = crate::sfs::prepare(source, "<continuation>").unwrap().module;
+        let item = module.item("main").unwrap();
+        let grants = vec!["log".to_string()];
+        let policy = serde_json::json!({"tools": {"allow": ["kaze.log.*"]}});
+
+        let mut synchronous_host = host();
+        let (expected_value, expected_instructions) = {
+            let mut vm = Vm::new(&module, &mut synchronous_host, &module.needs, &grants, Some(&policy), Limits::default());
+            (vm.run_item(item, &[]).unwrap(), vm.instructions)
+        };
+        let mut sliced_host = host();
+        let mut vm = Vm::new(&module, &mut sliced_host, &module.needs, &grants, Some(&policy), Limits::default());
+        let mut state = vm.start_item(item, &[]).unwrap();
+        let mut yields = 0;
+        let actual_value = loop {
+            match vm.run_slice(&mut state, 1).unwrap() {
+                SliceOutcome::Yielded => yields += 1,
+                SliceOutcome::Capability(request) => panic!("unexpected request: {request:?}"),
+                SliceOutcome::Complete(value) => break value,
+            }
+        };
+        assert!(yields > 3);
+        assert_eq!(actual_value, expected_value);
+        assert_eq!(actual_value, Value::Num(3.0));
+        assert_eq!(vm.instructions, expected_instructions);
+        assert_eq!(vm.run_slice(&mut state, 1).unwrap_err().code, "E_KAZE_STATE");
+        drop(vm);
+        assert_eq!(sliced_host.logs(), synchronous_host.logs());
+        assert_eq!(sliced_host.logs().len(), 3);
+        assert_eq!(sliced_host.actions().iter().map(|a| a.render()).collect::<Vec<_>>(),
+                   synchronous_host.actions().iter().map(|a| a.render()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn continuation_cannot_be_reused_or_moved_between_vms() {
+        let module = crate::sfs::prepare("action main():\n    return 7\n", "<continuation>").unwrap().module;
+        let item = module.item("main").unwrap();
+        let mut first_host = host();
+        let mut second_host = host();
+        let mut first = Vm::new(&module, &mut first_host, &module.needs, &[], None, Limits::default());
+        let mut second = Vm::new(&module, &mut second_host, &module.needs, &[], None, Limits::default());
+        let mut state = first.start_item(item, &[]).unwrap();
+        assert_eq!(second.run_slice(&mut state, 1).unwrap_err().code, "E_KAZE_STATE");
+        assert_eq!(first.start_item(item, &[]).err().unwrap().code, "E_KAZE_STATE");
+        assert_eq!(first.run_slice(&mut state, 0).unwrap_err().code, "E_KAZE_STATE");
+        assert_eq!(first.run_slice(&mut state, 1).unwrap(), SliceOutcome::Yielded);
+        first.cancel_item(&mut state).unwrap();
+        assert_eq!(first.run_slice(&mut state, 1).unwrap_err().code, "E_KAZE_STATE");
+        assert_eq!(first.run_item(item, &[]).unwrap(), Value::Num(7.0));
+    }
+
+    #[test]
+    fn denial_and_fuel_failure_are_terminal_across_slices() {
+        let module = crate::sfs::prepare("needs: log\naction main():\n    log \"blocked\"\n", "<continuation>").unwrap().module;
+        let mut denied_host = host();
+        let mut vm = Vm::new(&module, &mut denied_host, &module.needs, &[], None, Limits::default());
+        let mut state = vm.start_item(module.item("main").unwrap(), &[]).unwrap();
+        let error = loop {
+            match vm.run_slice(&mut state, 1) {
+                Ok(SliceOutcome::Yielded) => (),
+                Err(error) => break error,
+                Ok(SliceOutcome::Complete(_) | SliceOutcome::Capability(_)) => panic!("denied operation succeeded"),
+            }
+        };
+        assert_eq!(error.code, "E_CAP_MISSING");
+        assert_eq!(error.line, 3);
+        assert_eq!(vm.run_slice(&mut state, 1).unwrap_err().code, "E_KAZE_STATE");
+        drop(vm);
+        assert!(denied_host.actions().is_empty());
+        assert!(denied_host.logs().is_empty());
+
+        let loop_module = crate::sfs::prepare("action main():\n    while true:\n        let n = 1\n", "<continuation>").unwrap().module;
+        let mut loop_host = host();
+        let mut loop_vm = Vm::new(&loop_module, &mut loop_host, &loop_module.needs, &[], None, Limits { fuel: 8, ..Limits::default() });
+        let mut state = loop_vm.start_item(loop_module.item("main").unwrap(), &[]).unwrap();
+        let error = loop {
+            match loop_vm.run_slice(&mut state, 2) {
+                Ok(SliceOutcome::Yielded) => (),
+                Err(error) => break error,
+                Ok(SliceOutcome::Complete(_) | SliceOutcome::Capability(_)) => panic!("runaway loop completed"),
+            }
+        };
+        assert_eq!(error.code, "E_TIMEOUT");
+        assert_eq!(loop_vm.run_slice(&mut state, 1).unwrap_err().code, "E_KAZE_STATE");
+    }
+
+    #[test]
+    fn authorized_ai_call_yields_owned_request_without_fabricating_a_result() {
+        let source = "needs: log, ai\naction main():\n    log \"one side effect\"\n    return ai.prompt(\"fresh marker\")\n";
+        let module = crate::sfs::prepare(source, "<async-call>").unwrap().module;
+        let item = module.item("main").unwrap().clone();
+        let grants = vec!["log".to_string(), "ai".to_string()];
+        let policy = serde_json::json!({"tools": {"allow": ["kaze.*"]}});
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut vm = Vm::new_owned(
+            module.clone(),
+            Box::new(CountingHost(Arc::clone(&count))),
+            module.needs.clone(),
+            grants,
+            Some(policy.clone()),
+            Limits::default(),
+        );
+        vm.set_runtime_policy(Some(&policy));
+        let mut state = vm.start_item(&item, &[]).unwrap();
+        let request = loop {
+            match vm.run_slice(&mut state, 1).unwrap() {
+                SliceOutcome::Yielded => (),
+                SliceOutcome::Capability(request) => break request,
+                SliceOutcome::Complete(_) => panic!("AI request unexpectedly completed"),
+            }
+        };
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(request.family, "ai");
+        assert_eq!(request.op, "prompt");
+        assert_eq!(request.args, serde_json::json!(["fresh marker"]));
+        assert_eq!(request.line, 4);
+        assert_eq!(vm.run_slice(&mut state, 1).unwrap_err().code, "E_KAZE_STATE");
+        assert_eq!(vm.resume_capability(&mut state, request.id + 1, Ok(serde_json::json!("must not be accepted"))).unwrap_err().code, "E_KAZE_STATE");
+        assert_eq!(vm.run_slice(&mut state, 1).unwrap_err().code, "E_KAZE_STATE");
+        vm.cancel_item(&mut state).unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1, "earlier effect executed exactly once");
+    }
+
+    #[test]
+    fn denied_async_call_never_becomes_a_dispatch_request() {
+        let source = "needs: log, ai\naction main():\n    log \"one side effect\"\n    return ai.prompt(\"private prompt\")\n";
+        let module = crate::sfs::prepare(source, "<async-denial>").unwrap().module;
+        let item = module.item("main").unwrap().clone();
+        let grants = vec!["log".to_string(), "ai".to_string()];
+        let policy = serde_json::json!({"tools": {"deny": ["kaze.ai.*"]}});
+        let count = Arc::new(AtomicUsize::new(0));
+        let mut vm = Vm::new_owned(
+            module.clone(),
+            Box::new(CountingHost(Arc::clone(&count))),
+            module.needs.clone(), grants, Some(policy.clone()), Limits::default(),
+        );
+        vm.set_runtime_policy(Some(&serde_json::json!({"tools": {"allow": ["kaze.*"]}})));
+        let mut state = vm.start_item(&item, &[]).unwrap();
+        let error = loop {
+            match vm.run_slice(&mut state, 2) {
+                Ok(SliceOutcome::Yielded) => (),
+                Err(error) => break error,
+                Ok(SliceOutcome::Capability(_)) => panic!("denied request reached the dispatcher"),
+                Ok(SliceOutcome::Complete(_)) => panic!("denied request returned success"),
+            }
+        };
+        assert_eq!(error.code, "E_CAP_DENIED");
+        assert_eq!(error.line, 4);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(vm.run_slice(&mut state, 1).unwrap_err().code, "E_KAZE_STATE");
+    }
+
+    #[test]
+    fn uncertain_dispatched_effect_is_recorded_as_unknown_and_is_terminal() {
+        let source = "needs: tool\naction main():\n    return tool.call(\"write_once\")\n";
+        let module = crate::sfs::prepare(source, "<async-unknown>").unwrap().module;
+        let item = module.item("main").unwrap().clone();
+        let grants = vec!["tool".to_string()];
+        let policy = serde_json::json!({"tools": {"allow": ["kaze.*"]}});
+        let mut vm = Vm::new_owned(
+            module.clone(),
+            Box::new(host()),
+            module.needs.clone(),
+            grants,
+            Some(policy.clone()),
+            Limits::default(),
+        );
+        vm.set_runtime_policy(Some(&policy));
+        let mut state = vm.start_item(&item, &[]).unwrap();
+        let request = loop {
+            match vm.run_slice(&mut state, 8).unwrap() {
+                SliceOutcome::Yielded => (),
+                SliceOutcome::Capability(request) => break request,
+                SliceOutcome::Complete(_) => panic!("tool request unexpectedly completed"),
+            }
+        };
+        let error = vm.resume_capability(&mut state, request.id, Err(VmError {
+            code: "E_KAZE_OUTCOME_UNKNOWN",
+            msg: "no tool response was received".into(),
+            line: 0,
+        })).unwrap_err();
+        assert_eq!(error.code, "E_KAZE_OUTCOME_UNKNOWN");
+        assert_eq!(error.line, request.line);
+        assert_eq!(vm.actions().len(), 1);
+        assert_eq!(vm.actions()[0].result, "<unknown outcome>");
+        assert_eq!(vm.run_slice(&mut state, 1).unwrap_err().code, "E_KAZE_STATE");
+    }
 }

@@ -2355,6 +2355,733 @@
     return outStr;
   }
 
+  /* ── Mermaid Diagram TUI Parser & Renderer ─────────────────────────
+   * Renders Mermaid diagram blocks (```mermaid ... ```) into Unicode
+   * box-and-arrow ASCII art for the terminal.
+   * Supports: flowcharts (TD/TB, LR, BT, RL), sequence diagrams, state
+   * diagrams, class diagrams, pie charts, mindmaps, and git graphs.
+   * Falls back gracefully to standard code fence if parsing fails. */
+  function renderMermaidToAnsi(code, indent) {
+    try {
+      const ind = indent || '';
+      const cReset = '\x1b[0m';
+      const cBold = '\x1b[1m';
+      const cDim = '\x1b[2m';
+      const cSub = '\x1b[' + T('subtle') + 'm';
+      const cTool = '\x1b[' + T('tool') + 'm';
+      const cHead = '\x1b[' + T('heading') + 'm';
+      const cAcc = '\x1b[' + T('accent') + 'm';
+      const cAlert = '\x1b[' + T('alert') + 'm';
+
+      function vLen(s) {
+        return String(s || '').replace(/\x1b\[[0-9;]*m/g, '').length;
+      }
+      function pCenter(s, target) {
+        const d = target - vLen(s);
+        if (d <= 0) return s;
+        const l = Math.floor(d / 2);
+        return ' '.repeat(l) + s + ' '.repeat(d - l);
+      }
+      function pRight(s, target) {
+        const d = target - vLen(s);
+        return d <= 0 ? s : s + ' '.repeat(d);
+      }
+      function cleanQ(s) {
+        let t = String(s || '').trim();
+        if ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'"))) {
+          t = t.slice(1, -1);
+        }
+        return t.replace(/\\n/g, ' ');
+      }
+
+      // rBox: multi-line label support (<br/> and \n), all shapes
+      function rBox(label, shape, col) {
+        const rawLines = String(label || '')
+          .replace(/<br\s*\/?>/gi, '\n')
+          .replace(/\\n/g, '\n')
+          .split('\n')
+          .map(s => s.trim())
+          .filter(Boolean);
+        if (rawLines.length === 0) rawLines.push('');
+        const maxLen = Math.max(...rawLines.map(l => vLen(l)), 4);
+        const len = maxLen + 2;
+        const b = col || cSub;
+        const t = cBold;
+        const res = [];
+        switch (shape) {
+          case 'rounded':
+            res.push(b + '╭' + '─'.repeat(len) + '╮' + cReset);
+            for (const line of rawLines) res.push(b + '│' + cReset + t + pCenter(line, len) + cReset + b + '│' + cReset);
+            res.push(b + '╰' + '─'.repeat(len) + '╯' + cReset);
+            break;
+          case 'stadium':
+            res.push(b + ' ╭' + '─'.repeat(Math.max(len - 2, 2)) + '╮ ' + cReset);
+            for (const line of rawLines) res.push(b + '( ' + cReset + t + pCenter(line, Math.max(len - 4, 2)) + cReset + b + ' )' + cReset);
+            res.push(b + ' ╰' + '─'.repeat(Math.max(len - 2, 2)) + '╯ ' + cReset);
+            break;
+          case 'database':
+            res.push(b + '⌠' + '─'.repeat(len) + '⌡' + cReset);
+            for (const line of rawLines) res.push(b + '│' + cReset + t + pCenter(line, len) + cReset + b + '│' + cReset);
+            res.push(b + '⌡' + '─'.repeat(len) + '⌠' + cReset);
+            break;
+          case 'circle':
+            res.push(b + ' (( ' + cReset + t + rawLines[0] + cReset + b + ' )) ' + cReset);
+            break;
+          case 'diamond':
+            res.push(b + '  ◇ ' + '─'.repeat(Math.max(len - 4, 2)) + ' ◇  ' + cReset);
+            for (const line of rawLines) res.push(b + ' ‹ ' + cReset + t + pCenter(line, Math.max(len - 4, 2)) + cReset + b + ' › ' + cReset);
+            res.push(b + '  ◇ ' + '─'.repeat(Math.max(len - 4, 2)) + ' ◇  ' + cReset);
+            break;
+          case 'subroutine':
+            res.push(b + '╓─' + '─'.repeat(Math.max(len - 2, 2)) + '─╖' + cReset);
+            for (const line of rawLines) res.push(b + '║ ' + cReset + t + pCenter(line, Math.max(len - 2, 2)) + cReset + b + '║' + cReset);
+            res.push(b + '╙─' + '─'.repeat(Math.max(len - 2, 2)) + '─╜' + cReset);
+            break;
+          case 'flag':
+            res.push(b + '┌' + '─'.repeat(len) + '╲' + cReset);
+            for (const line of rawLines) res.push(b + '│' + cReset + t + pCenter(line, len) + cReset + b + '│' + cReset);
+            res.push(b + '└' + '─'.repeat(len) + '╱' + cReset);
+            break;
+          case 'rect':
+          default:
+            res.push(b + '┌' + '─'.repeat(len) + '┐' + cReset);
+            for (const line of rawLines) res.push(b + '│' + cReset + t + pCenter(line, len) + cReset + b + '│' + cReset);
+            res.push(b + '└' + '─'.repeat(len) + '┘' + cReset);
+            break;
+        }
+        return res;
+      }
+
+      // 1. Flowchart renderer — true LR columns + coordinate-based TD arrows
+      function renderFlow(lines, direction) {
+        const isLR = (direction || '').toUpperCase() === 'LR' || (direction || '').toUpperCase() === 'RL';
+        const nodes = {};
+        const edges = [];
+
+        function addN(id, label, shape) {
+          const cid = id.trim();
+          const hasExplicit = label != null && label !== cid;
+          if (!nodes[cid]) {
+            nodes[cid] = { id: cid, label: label != null ? cleanQ(label) : cid, shape: shape || 'rect', explicit: hasExplicit };
+          } else {
+            if (hasExplicit || !nodes[cid].explicit) {
+              if (label != null) nodes[cid].label = cleanQ(label);
+              if (hasExplicit) nodes[cid].explicit = true;
+            }
+            if (shape != null && shape !== 'rect') nodes[cid].shape = shape;
+          }
+          return nodes[cid];
+        }
+
+        function parseN(tok) {
+          if (!tok) return null;
+          const t = tok.trim();
+          if (t === '[*]') return addN('[*]', '\u25cf', 'circle');
+          let m;
+          if ((m = t.match(/^([A-Za-z0-9_.-]+)\[\[(.*?)\]\]$/))) return addN(m[1], m[2], 'subroutine');
+          if ((m = t.match(/^([A-Za-z0-9_.-]+)\[\((.*?)\)\]$/))) return addN(m[1], m[2], 'database');
+          if ((m = t.match(/^([A-Za-z0-9_.-]+)\(\[(.*?)\]\)$/))) return addN(m[1], m[2], 'stadium');
+          if ((m = t.match(/^([A-Za-z0-9_.-]+)\(\((.*?)\)\)$/))) return addN(m[1], m[2], 'circle');
+          if ((m = t.match(/^([A-Za-z0-9_.-]+)\{\{(.*?)\}\}$/))) return addN(m[1], m[2], 'diamond');
+          if ((m = t.match(/^([A-Za-z0-9_.-]+)\{(.*?)\}$/))) return addN(m[1], m[2], 'diamond');
+          if ((m = t.match(/^([A-Za-z0-9_.-]+)\((.*?)\)$/))) return addN(m[1], m[2], 'rounded');
+          if ((m = t.match(/^([A-Za-z0-9_.-]+)>(.*?)\]$/))) return addN(m[1], m[2], 'flag');
+          if ((m = t.match(/^([A-Za-z0-9_.-]+)\[(.*?)\]$/))) return addN(m[1], m[2], 'rect');
+          if ((m = t.match(/^([A-Za-z0-9_.-]+)$/))) return addN(m[1], m[1], 'rect');
+          return null;
+        }
+
+        const ARROW = /\s*(-->\|.*?\||-->|--\s*.*?\s*-->|==>\|.*?\||==>|==\s*.*?\s*==>|-\.->\|.*?\||-\.->|-\.\s*.*?\s*\.->|---|--\s*.*?\s*---|~~>)\s*/;
+
+        for (let l of lines) {
+          l = l.trim();
+          if (!l || l.startsWith('%%') || l.startsWith('subgraph') || l === 'end') continue;
+          const parts = l.split(ARROW);
+          if (parts.length >= 3) {
+            for (let i = 0; i < parts.length - 2; i += 2) {
+              const arrow = parts[i + 1];
+              let elab = '';
+              let atype = 'solid';
+              if (arrow.includes('-.->' )) atype = 'dotted';
+              else if (arrow.includes('==>')) atype = 'thick';
+              else if (arrow.includes('---')) atype = 'line';
+              const mp = arrow.match(/\|(.*?)\|/);
+              const mh = arrow.match(/--\s*(.*?)\s*-->/);
+              if (mp) elab = cleanQ(mp[1]);
+              else if (mh) elab = cleanQ(mh[1]);
+              const lefts = parts[i].split(/\s*&\s*/).map(parseN).filter(Boolean);
+              const rights = parts[i + 2].split(/\s*&\s*/).map(parseN).filter(Boolean);
+              for (const ln of lefts) {
+                for (const rn of rights) {
+                  edges.push({ from: ln.id, to: rn.id, label: elab, type: atype });
+                }
+              }
+            }
+          } else {
+            parseN(l);
+          }
+        }
+
+        const keys = Object.keys(nodes);
+        if (keys.length === 0) return null;
+
+        // Topological ranking via longest-path relaxation (guards against false cycle detection)
+        const inDeg = {};
+        const adj = {};
+        for (const k of keys) { inDeg[k] = 0; adj[k] = []; }
+        for (const e of edges) {
+          if (adj[e.from]) adj[e.from].push(e.to);
+          if (inDeg[e.to] != null) inDeg[e.to]++;
+        }
+        const rank = {};
+        for (const k of keys) rank[k] = (inDeg[k] === 0) ? 0 : 1;
+        for (let iter = 0; iter < keys.length + 2; iter++) {
+          let changed = false;
+          for (const e of edges) {
+            if (rank[e.from] != null) {
+              const newR = rank[e.from] + 1;
+              if (rank[e.to] == null || rank[e.to] < newR) {
+                if (newR <= keys.length) { rank[e.to] = newR; changed = true; }
+              }
+            }
+          }
+          if (!changed) break;
+        }
+        for (const k of keys) { if (rank[k] == null) rank[k] = 0; }
+
+        const levels = [];
+        for (const k of keys) {
+          const r = rank[k] || 0;
+          while (levels.length <= r) levels.push([]);
+          levels[r].push(nodes[k]);
+        }
+
+        const res = [];
+
+        if (isLR) {
+          // TRUE HORIZONTAL (LR) LAYOUT: levels are columns across the screen
+          const colWidths = levels.map(lvl => {
+            let maxW = 8;
+            for (const n of lvl) maxW = Math.max(maxW, vLen(rBox(n.label, n.shape, cSub)[0]));
+            return maxW;
+          });
+          const maxRowsInAnyCol = Math.max(...levels.map(lvl => lvl.length));
+          for (let rowIdx = 0; rowIdx < maxRowsInAnyCol; rowIdx++) {
+            const rowBoxes = levels.map(lvl => { const n = lvl[rowIdx]; return n ? rBox(n.label, n.shape, cSub) : null; });
+            const maxBoxH = Math.max(...rowBoxes.map(b => b ? b.length : 0), 3);
+            for (let lineIdx = 0; lineIdx < maxBoxH; lineIdx++) {
+              let lineStr = ind + '  ';
+              for (let colIdx = 0; colIdx < levels.length; colIdx++) {
+                const b = rowBoxes[colIdx];
+                const w = colWidths[colIdx];
+                if (b && lineIdx < b.length) {
+                  lineStr += b[lineIdx] + ' '.repeat(Math.max(w - vLen(b[lineIdx]), 0));
+                } else {
+                  lineStr += ' '.repeat(w);
+                }
+                if (colIdx < levels.length - 1) {
+                  if (!!b && !!rowBoxes[colIdx + 1] && lineIdx === Math.floor(maxBoxH / 2)) {
+                    lineStr += cTool + ' \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u25ba ' + cReset;
+                  } else {
+                    lineStr += '           ';
+                  }
+                }
+              }
+              res.push(lineStr);
+            }
+            if (rowIdx < maxRowsInAnyCol - 1) res.push('');
+          }
+          return res;
+        }
+
+        // TOP-DOWN (TD) LAYOUT: coordinate-based connector routing
+        for (let r = 0; r < levels.length; r++) {
+          const lnodes = levels[r];
+          const boxes = lnodes.map(n => rBox(n.label, n.shape, cSub));
+          const maxH = Math.max(...boxes.map(b => b.length));
+
+          // Calculate X positions and center X for each node in this level
+          let curX = 2;
+          const nodeLayout = [];
+          for (let i = 0; i < lnodes.length; i++) {
+            const bw = vLen(boxes[i][0]);
+            nodeLayout.push({ id: lnodes[i].id, left: curX, width: bw, cx: curX + Math.floor(bw / 2) });
+            curX += bw + 4;
+          }
+
+          // Render boxes
+          for (let lineIdx = 0; lineIdx < maxH; lineIdx++) {
+            let lineStr = '';
+            for (let i = 0; i < lnodes.length; i++) {
+              const b = boxes[i];
+              const nl = nodeLayout[i];
+              while (vLen(lineStr) < nl.left) lineStr += ' ';
+              if (lineIdx < b.length) lineStr += b[lineIdx];
+              else lineStr += ' '.repeat(nl.width);
+            }
+            res.push(ind + lineStr);
+          }
+
+          // Render connectors to next level using 2D box-drawing topology
+          if (r < levels.length - 1) {
+            const nextNodes = levels[r + 1];
+            let nCurX = 2;
+            const nextLayout = [];
+            for (let i = 0; i < nextNodes.length; i++) {
+              const nb = rBox(nextNodes[i].label, nextNodes[i].shape, cSub);
+              const bw = vLen(nb[0]);
+              nextLayout.push({ id: nextNodes[i].id, left: nCurX, width: bw, cx: nCurX + Math.floor(bw / 2) });
+              nCurX += bw + 4;
+            }
+
+            const maxTotalW = Math.max(curX, nCurX) + 8;
+            const arrowRow1 = Array(maxTotalW).fill(' ');
+            const arrowRow2 = Array(maxTotalW).fill(' ');
+            const arrowRow3 = Array(maxTotalW).fill(' ');
+
+            const connectingEdges = edges.filter(e => rank[e.from] === r && rank[e.to] === r + 1);
+
+            const hasTop = Array(maxTotalW).fill(false);
+            const hasBot = Array(maxTotalW).fill(false);
+            const hasLeft2 = Array(maxTotalW).fill(false);
+            const hasRight2 = Array(maxTotalW).fill(false);
+
+            for (const e of connectingEdges) {
+              const p = nodeLayout.find(x => x.id === e.from);
+              const c = nextLayout.find(x => x.id === e.to);
+              if (!p || !c) continue;
+              const sx = p.cx; const tx = c.cx;
+              arrowRow1[sx] = '\u2502';
+              arrowRow3[tx] = '\u25bc';
+              hasTop[sx] = true;
+              hasBot[tx] = true;
+              const minX = Math.min(sx, tx); const maxX = Math.max(sx, tx);
+              for (let x = minX; x < maxX; x++) { hasRight2[x] = true; hasLeft2[x + 1] = true; }
+            }
+
+            for (let x = 0; x < maxTotalW; x++) {
+              const T = hasTop[x], B = hasBot[x], L = hasLeft2[x], R = hasRight2[x];
+              if (!T && !B && !L && !R) continue;
+              if      (T && B && L && R)   arrowRow2[x] = '\u253c';
+              else if (T && B && L && !R)  arrowRow2[x] = '\u2524';
+              else if (T && B && !L && R)  arrowRow2[x] = '\u251c';
+              else if (T && !B && L && R)  arrowRow2[x] = '\u2534';
+              else if (!T && B && L && R)  arrowRow2[x] = '\u252c';
+              else if (T && B)             arrowRow2[x] = '\u2502';
+              else if (T && !B && !L && R) arrowRow2[x] = '\u2514';
+              else if (T && !B && L && !R) arrowRow2[x] = '\u2518';
+              else if (!T && B && !L && R) arrowRow2[x] = '\u250c';
+              else if (!T && B && L && !R) arrowRow2[x] = '\u2510';
+              else if (L || R)             arrowRow2[x] = '\u2500';
+            }
+
+            res.push(ind + cTool + arrowRow1.join('').replace(/\s+$/, '') + cReset);
+            res.push(ind + cTool + arrowRow2.join('').replace(/\s+$/, '') + cReset);
+            res.push(ind + cTool + arrowRow3.join('').replace(/\s+$/, '') + cReset);
+          }
+        }
+
+        // Back-edges that couldn't be topologically ordered (true cycles only)
+        const back = edges.filter(e => (rank[e.from] || 0) >= (rank[e.to] || 0) &&
+                                       e.from !== e.to &&
+                                       rank[e.from] !== rank[e.to]);
+        for (const be of back) {
+          const fn = nodes[be.from] ? nodes[be.from].label : be.from;
+          const tn = nodes[be.to]   ? nodes[be.to].label   : be.to;
+          const ll = be.label ? ' (' + be.label + ')' : '';
+          res.push(ind + cSub + '  \u21ba [cycle: ' + fn + ' \u2500\u2500\u25ba ' + tn + ll + ']' + cReset);
+        }
+
+        return res;
+      }
+
+      // 2. Sequence diagram renderer — buffer-based, no negative repeat, alt/else/end support
+      function renderSeq(lines) {
+        const parts = [];
+        const partMap = {};
+        const events = [];
+
+        function addP(id, label) {
+          const cid = id.trim();
+          if (partMap[cid]) {
+            if (label) partMap[cid].label = label.trim();
+            return partMap[cid];
+          }
+          const o = { id: cid, label: (label || cid).trim() };
+          partMap[cid] = o;
+          parts.push(o);
+          return o;
+        }
+
+        for (let l of lines) {
+          l = l.trim();
+          if (!l || l.startsWith('%%') || l === 'sequenceDiagram' || l === 'autonumber') continue;
+          let m;
+          if ((m = l.match(/^participant\s+([A-Za-z0-9_.-]+)(?:\s+as\s+(.*))?$/i))) { addP(m[1], m[2]); continue; }
+          if ((m = l.match(/^actor\s+([A-Za-z0-9_.-]+)(?:\s+as\s+(.*))?$/i)))      { addP(m[1], m[2]); continue; }
+          if ((m = l.match(/^Note\s+(over|left of|right of)\s+([A-Za-z0-9_., -]+):\s*(.*)$/i))) {
+            events.push({ type: 'note', text: m[3].trim(), targets: m[2].split(',').map(s => s.trim()) });
+            continue;
+          }
+          if ((m = l.match(/^(loop|alt|opt|par|critical)\s*(.*)$/i))) {
+            events.push({ type: 'b_start', kind: m[1], text: m[2].trim() }); continue;
+          }
+          if ((m = l.match(/^else\s*(.*)$/i))) {
+            events.push({ type: 'b_else', text: m[1].trim() }); continue;
+          }
+          if (l === 'end') { events.push({ type: 'b_end' }); continue; }
+          if ((m = l.match(/^([A-Za-z0-9_]+)\s*(-->>\|->>|-->|->>|->|-x|-\))\s*([A-Za-z0-9_]+):\s*(.*)$/))) {
+            addP(m[1]); addP(m[3]);
+            events.push({ type: 'msg', from: m[1], to: m[3], arrow: m[2], text: m[4].trim() });
+            continue;
+          }
+        }
+
+        if (parts.length === 0) return null;
+
+        const colW = parts.map(p => Math.max(vLen(p.label) + 2, 8));
+        const colDist = [];
+        for (let i = 0; i < parts.length - 1; i++) {
+          let reqDist = 12;
+          for (const ev of events) {
+            if (ev.type === 'msg') {
+              const fIdx = parts.findIndex(p => p.id === ev.from);
+              const tIdx = parts.findIndex(p => p.id === ev.to);
+              if ((fIdx === i && tIdx === i + 1) || (fIdx === i + 1 && tIdx === i)) {
+                reqDist = Math.max(reqDist, vLen(ev.text) + 4);
+              }
+            }
+          }
+          colDist.push(Math.min(reqDist, 32));
+        }
+
+        const colX = [];
+        let curX = 2;
+        for (let i = 0; i < parts.length; i++) {
+          const half = Math.floor(colW[i] / 2);
+          colX.push(curX + half);
+          curX += colW[i] + (colDist[i] || 10);
+        }
+        const totalW = curX + 4;
+
+        const res2 = [];
+
+        function drawBoxes(top) {
+          const rows = ['', '', ''];
+          for (let i = 0; i < parts.length; i++) {
+            const p = parts[i];
+            const w = colW[i];
+            const cx = colX[i];
+            const left = cx - Math.floor(w / 2);
+            const half = Math.floor(w / 2);
+            const padLen = w - 2;
+            const text = vLen(p.label) > padLen ? p.label.slice(0, padLen) : p.label;
+            const d = padLen - vLen(text);
+            const lpad = Math.floor(d / 2);
+            const padded = ' '.repeat(lpad) + text + ' '.repeat(d - lpad);
+            for (let r = 0; r < 3; r++) { while (rows[r].length < left) rows[r] += ' '; }
+            if (top) {
+              rows[0] += '\u250c' + '\u2500'.repeat(padLen) + '\u2510';
+              rows[1] += '\u2502' + padded + '\u2502';
+              rows[2] += '\u2514' + '\u2500'.repeat(half - 1) + '\u252c' + '\u2500'.repeat(w - 2 - half) + '\u2518';
+            } else {
+              rows[0] += '\u250c' + '\u2500'.repeat(half - 1) + '\u2534' + '\u2500'.repeat(w - 2 - half) + '\u2510';
+              rows[1] += '\u2502' + padded + '\u2502';
+              rows[2] += '\u2514' + '\u2500'.repeat(padLen) + '\u2518';
+            }
+          }
+          rows.forEach(r => res2.push(ind + '  ' + cSub + r + cReset));
+        }
+
+        function makeLifelineRow() {
+          const chars = Array(totalW).fill(' ');
+          for (const cx of colX) chars[cx] = '\u2502';
+          return chars;
+        }
+
+        drawBoxes(true);
+        res2.push(ind + '  ' + cSub + makeLifelineRow().join('') + cReset);
+
+        for (const ev of events) {
+          if (ev.type === 'b_start') {
+            const tag = '\u250c\u2500\u2500 [' + ev.kind.toUpperCase() + (ev.text ? ': ' + ev.text : '') + '] ';
+            const line = tag + '\u2500'.repeat(Math.max(totalW - vLen(tag) - 2, 4)) + '\u2510';
+            res2.push(ind + '  ' + cAcc + line + cReset);
+            res2.push(ind + '  ' + cSub + makeLifelineRow().join('') + cReset);
+            continue;
+          }
+          if (ev.type === 'b_else') {
+            const tag = '\u251c\u2500\u2500 [else' + (ev.text ? ': ' + ev.text : '') + '] ';
+            const line = tag + '\u254c'.repeat(Math.max(totalW - vLen(tag) - 2, 4)) + '\u2524';
+            res2.push(ind + '  ' + cAcc + line + cReset);
+            res2.push(ind + '  ' + cSub + makeLifelineRow().join('') + cReset);
+            continue;
+          }
+          if (ev.type === 'b_end') {
+            const line = '\u2514\u2500\u2500' + '\u2500'.repeat(Math.max(totalW - 6, 4)) + '\u2518';
+            res2.push(ind + '  ' + cAcc + line + cReset);
+            res2.push(ind + '  ' + cSub + makeLifelineRow().join('') + cReset);
+            continue;
+          }
+          if (ev.type === 'note') {
+            const tIdx = parts.findIndex(p => p.id === ev.targets[0]);
+            const sx = tIdx >= 0 ? colX[tIdx] : colX[0];
+            res2.push(ind + '  ' + ' '.repeat(sx) + cHead + '\u250c\u2500 Note: ' + ev.text + ' \u2500\u2510' + cReset);
+            res2.push(ind + '  ' + cSub + makeLifelineRow().join('') + cReset);
+            continue;
+          }
+          if (ev.type === 'msg') {
+            const fIdx = parts.findIndex(p => p.id === ev.from);
+            const tIdx = parts.findIndex(p => p.id === ev.to);
+            if (fIdx === -1 || tIdx === -1) continue;
+
+            const lx = colX[fIdx];
+            const rx = colX[tIdx];
+
+            if (fIdx === tIdx) {
+              res2.push(ind + '  ' + ' '.repeat(lx) + cTool + '\u2502\u256d\u2500\u2500 ' + cHead + ev.text + cReset);
+              res2.push(ind + '  ' + ' '.repeat(lx) + cTool + '\u2502\u2570\u2500\u25ba' + cReset);
+              res2.push(ind + '  ' + cSub + makeLifelineRow().join('') + cReset);
+              continue;
+            }
+
+            const startX = Math.min(lx, rx);
+            const endX   = Math.max(lx, rx);
+            const span   = endX - startX;
+            const isDash = ev.arrow.includes('--');
+            const fillChar = isDash ? '\u254c' : '\u2500';
+
+            const chars = makeLifelineRow();
+            const text = ' ' + ev.text + ' ';
+            const textFit = vLen(text) < span - 2 ? text : text.slice(0, span - 3);
+            const d = span - 1 - vLen(textFit);
+            const lpad2 = Math.floor(d / 2);
+            const inner = fillChar.repeat(Math.max(lpad2, 1)) + textFit + fillChar.repeat(Math.max(d - lpad2, 1));
+
+            if (fIdx < tIdx) {
+              const arrStr = inner + '\u25ba';
+              for (let j = 0; j < arrStr.length && (startX + 1 + j) <= endX; j++) chars[startX + 1 + j] = arrStr[j];
+            } else {
+              const arrStr = '\u25c4' + inner;
+              for (let j = 0; j < arrStr.length && (startX + j) < endX; j++) chars[startX + j] = arrStr[j];
+            }
+
+            res2.push(ind + '  ' + cTool + chars.join('') + cReset);
+            res2.push(ind + '  ' + cSub + makeLifelineRow().join('') + cReset);
+          }
+        }
+
+        drawBoxes(false);
+        return res2;
+      }
+
+      // 3. Pie chart renderer
+      function renderPie(lines) {
+        let title = 'Distribution';
+        const slices = [];
+        let total = 0;
+        for (let l of lines) {
+          l = l.trim();
+          if (!l || l.startsWith('%%') || l === 'pie') continue;
+          if (l.startsWith('title')) { title = l.replace(/^title\s*/, '').trim(); continue; }
+          const m = l.match(/^"?(.*?)"?\s*:\s*([0-9.]+)/);
+          if (m) {
+            const val = parseFloat(m[2]);
+            slices.push({ label: m[1].trim(), value: val });
+            total += val;
+          }
+        }
+        if (slices.length === 0 || total === 0) return null;
+        const res = [ind + '  ' + cHead + cBold + title + cReset, ''];
+        const maxL = Math.max(...slices.map(s => vLen(s.label)), 6);
+        const bW = 32;
+        for (let i = 0; i < slices.length; i++) {
+          const s = slices[i];
+          const pct = (s.value / total) * 100;
+          const fil = Math.round((s.value / total) * bW);
+          const col = (i % 2 === 0) ? cTool : cAcc;
+          const bar = col + '█'.repeat(fil) + cSub + '░'.repeat(bW - fil) + cReset;
+          res.push(ind + '  ' + cBold + pRight(s.label, maxL) + cReset + ' ' + bar + ' ' + cHead + pct.toFixed(1) + '%' + cReset + cDim + ' (' + s.value + ')' + cReset);
+        }
+        return res;
+      }
+
+      // 4. Class diagram renderer
+      function renderClass(lines) {
+        const classes = {};
+        const rels = [];
+        let cur = null;
+        for (let l of lines) {
+          l = l.trim();
+          if (!l || l.startsWith('%%') || l === 'classDiagram') continue;
+          let m;
+          if ((m = l.match(/^class\s+([A-Za-z0-9_]+)\s*\{?$/))) {
+            cur = { name: m[1], fields: [], methods: [] };
+            classes[m[1]] = cur;
+            continue;
+          }
+          if (l === '}') { cur = null; continue; }
+          if (cur) {
+            if (l.includes('(')) cur.methods.push(l); else cur.fields.push(l);
+            continue;
+          }
+          if ((m = l.match(/^([A-Za-z0-9_]+)\s*(<\|--|\*--|o--|-->)\s*([A-Za-z0-9_]+)(?:\s*:\s*(.*))?$/))) {
+            rels.push({ from: m[1], to: m[3], type: m[2], label: m[4] || '' });
+            if (!classes[m[1]]) classes[m[1]] = { name: m[1], fields: [], methods: [] };
+            if (!classes[m[3]]) classes[m[3]] = { name: m[3], fields: [], methods: [] };
+          }
+        }
+        const cNames = Object.keys(classes);
+        if (cNames.length === 0) return null;
+        const res = [];
+        for (const name of cNames) {
+          const cls = classes[name];
+          const maxW = Math.max(vLen(cls.name) + 4, ...cls.fields.map(f => vLen(f) + 4), ...cls.methods.map(m => vLen(m) + 4), 16);
+          res.push(ind + '  ' + cSub + '┌' + '─'.repeat(maxW) + '┐' + cReset);
+          res.push(ind + '  ' + cSub + '│' + cReset + cBold + pCenter(cls.name, maxW) + cSub + '│' + cReset);
+          if (cls.fields.length > 0) {
+            res.push(ind + '  ' + cSub + '├' + '─'.repeat(maxW) + '┤' + cReset);
+            for (const f of cls.fields) res.push(ind + '  ' + cSub + '│' + cReset + ' ' + pRight(f, maxW - 1) + cSub + '│' + cReset);
+          }
+          if (cls.methods.length > 0) {
+            res.push(ind + '  ' + cSub + '├' + '─'.repeat(maxW) + '┤' + cReset);
+            for (const m of cls.methods) res.push(ind + '  ' + cSub + '│' + cReset + ' ' + pRight(m, maxW - 1) + cSub + '│' + cReset);
+          }
+          res.push(ind + '  ' + cSub + '└' + '─'.repeat(maxW) + '┘' + cReset);
+          res.push('');
+        }
+        if (rels.length > 0) {
+          res.push(ind + '  ' + cHead + 'Relationships:' + cReset);
+          for (const r of rels) {
+            const sym = r.type === '<|--' ? '──► (extends)' : '──► (relates)';
+            res.push(ind + '  ' + cTool + '• ' + r.to + ' ' + sym + ' ' + r.from + (r.label ? ' [' + r.label + ']' : '') + cReset);
+          }
+        }
+        return res;
+      }
+
+      // 5. Mindmap renderer
+      function renderMind(lines) {
+        const items = [];
+        for (let l of lines) {
+          const raw = l; l = l.trim();
+          if (!l || l.startsWith('%%') || l === 'mindmap') continue;
+          const indL = raw.search(/\S/);
+          const txt = l.replace(/^[A-Za-z0-9_]+\s*\(\((.*?)\)\)/, '$1').replace(/^\s*[()+[\]{}]*/, '').replace(/[()+[\]{}]*$/, '').trim();
+          items.push({ indent: indL, text: txt });
+        }
+        if (items.length === 0) return null;
+        const res = [ind + '  ' + cHead + cBold + '⬡ ' + items[0].text + cReset];
+        for (let i = 1; i < items.length; i++) {
+          const it = items[i];
+          const d = Math.max(1, Math.floor(it.indent / 2));
+          res.push(ind + '  ' + cSub + '│ '.repeat(d - 1) + '├── ' + cReset + cBold + it.text + cReset);
+        }
+        return res;
+      }
+
+      // 6. Git Graph renderer
+      function renderGit(lines) {
+        const commits = [];
+        let cur = 'main';
+        for (let l of lines) {
+          l = l.trim();
+          if (!l || l.startsWith('%%') || l === 'gitGraph') continue;
+          let m;
+          if ((m = l.match(/^branch\s+([A-Za-z0-9_.-]+)/))) { cur = m[1]; continue; }
+          if ((m = l.match(/^checkout\s+([A-Za-z0-9_.-]+)/))) { cur = m[1]; continue; }
+          if ((m = l.match(/^merge\s+([A-Za-z0-9_.-]+)/))) { commits.push({ type: 'merge', branch: cur, source: m[1] }); continue; }
+          if (l.startsWith('commit')) {
+            const im = l.match(/id:\s*"?(.*?)"?$/);
+            commits.push({ type: 'commit', branch: cur, id: im ? im[1] : null });
+            continue;
+          }
+        }
+        if (commits.length === 0) return null;
+        const res = [];
+        for (let i = 0; i < commits.length; i++) {
+          const c = commits[i];
+          const isM = c.type === 'merge';
+          const node = isM ? cAcc + '⨂' + cReset : cTool + '●' + cReset;
+          const tag = cHead + '[' + c.branch + ']' + cReset;
+          const id = c.id ? ' ' + cDim + c.id + cReset : '';
+          const mStr = isM ? ' merged from ' + cAcc + c.source + cReset : '';
+          res.push(ind + '  ' + node + ' ' + tag + id + mStr);
+          if (i < commits.length - 1) res.push(ind + '  ' + cSub + '│' + cReset);
+        }
+        return res;
+      }
+
+      // 7. ER Diagram renderer
+      function renderER(lines) {
+        const rels = [];
+        for (let l of lines) {
+          l = l.trim();
+          if (!l || l.startsWith('%%') || l === 'erDiagram') continue;
+          let m;
+          if ((m = l.match(/^([A-Za-z0-9_.-]+)\s*([|o}{]+--[|o}{]+)\s*([A-Za-z0-9_.-]+)\s*:\s*(.*)$/))) {
+            rels.push({ e1: m[1], card: m[2], e2: m[3], label: cleanQ(m[4]) });
+          }
+        }
+        if (rels.length === 0) return null;
+        const res = [ind + '  ' + cHead + cBold + 'Entity Relationships:' + cReset, ''];
+        for (const r of rels) {
+          const cardStr = r.card.includes('}') || r.card.includes('{') ? '1 ────► N' : '1 ──── 1';
+          res.push(ind + '  ' + cBold + r.e1 + cReset + cTool + ' ' + cardStr + ' ' + cReset + cBold + r.e2 + cReset + cDim + ' [' + r.label + ']' + cReset);
+        }
+        return res;
+      }
+
+      const allLines = String(code || '')
+        .split('\n')
+        .map(l => l.replace(/\r$/, ''))
+        .filter(l => l.trim().length > 0 && !l.trim().startsWith('%%'));
+
+      if (allLines.length === 0) return null;
+      const first = allLines[0].trim();
+      let typeLabel = 'diagram';
+      let rendered = null;
+
+      if (/^(graph|flowchart)\b/i.test(first)) {
+        const dm = first.match(/^(?:graph|flowchart)\s+([A-Za-z]+)/i);
+        const dir = dm ? dm[1] : 'TD';
+        typeLabel = 'flowchart ' + dir.toUpperCase();
+        rendered = renderFlow(allLines.slice(1), dir);
+      } else if (/^sequenceDiagram\b/i.test(first)) {
+        typeLabel = 'sequenceDiagram';
+        rendered = renderSeq(allLines);
+      } else if (/^pie\b/i.test(first)) {
+        typeLabel = 'pie chart';
+        rendered = renderPie(allLines);
+      } else if (/^(stateDiagram|stateDiagram-v2)\b/i.test(first)) {
+        typeLabel = 'stateDiagram';
+        rendered = renderFlow(allLines.slice(1), 'TD');
+      } else if (/^classDiagram\b/i.test(first)) {
+        typeLabel = 'classDiagram';
+        rendered = renderClass(allLines);
+      } else if (/^mindmap\b/i.test(first)) {
+        typeLabel = 'mindmap';
+        rendered = renderMind(allLines);
+      } else if (/^gitGraph\b/i.test(first)) {
+        typeLabel = 'gitGraph';
+        rendered = renderGit(allLines);
+      } else if (/^erDiagram\b/i.test(first)) {
+        typeLabel = 'erDiagram';
+        rendered = renderER(allLines);
+      } else {
+        typeLabel = 'flowchart TD';
+        rendered = renderFlow(allLines, 'TD');
+      }
+
+      if (!rendered || rendered.length === 0) return null;
+      const hdr = ind + cSub + '─── ' + cReset + cTool + cBold + 'mermaid: ' + typeLabel + cReset + cSub + ' ' + '─'.repeat(30) + cReset;
+      const ftr = ind + cSub + '─'.repeat(52) + cReset;
+      return [hdr, ...rendered, ftr].join('\n');
+    } catch (e) {
+      return null;
+    }
+  }
+
   /* Markdown hierarchy for the final answer paint (TTY only). Model
    * answers arrive as undifferentiated white text — headings, emphasis
    * and code all read at the same level, so long answers are a wall.
@@ -2368,19 +3095,47 @@
     const sub = '\x1b[' + T('subtle') + 'm';
     const bul = '\x1b[' + T('tool') + 'm';
     let inFence = false;
+    let fenceLang = '';
+    let fenceIndent = '';
+    let fenceLines = [];
     for (const line of lines) {
       const fm = line.match(/^(\s*)```(.*)$/);
       if (fm) {
         inFence = !inFence;
         if (inFence) {
-          const lang = fm[2].trim();
-          outLines.push(fm[1] + (lang ? sub + '─── \x1b[0m' + bul + lang + '\x1b[0m' : sub + '────────\x1b[0m'));
+          fenceIndent = fm[1];
+          fenceLang = fm[2].trim().toLowerCase();
+          fenceLines = [];
+          if (fenceLang !== 'mermaid') {
+            const lang = fm[2].trim();
+            outLines.push(fm[1] + (lang ? sub + '─── \x1b[0m' + bul + lang + '\x1b[0m' : sub + '────────\x1b[0m'));
+          }
         } else {
-          outLines.push(fm[1] + sub + '────────\x1b[0m');
+          if (fenceLang === 'mermaid') {
+            const mRendered = renderMermaidToAnsi(fenceLines.join('\n'), fenceIndent);
+            if (mRendered != null) {
+              outLines.push(mRendered);
+            } else {
+              outLines.push(fenceIndent + sub + '─── \x1b[0m' + bul + 'mermaid\x1b[0m');
+              for (const fl of fenceLines) outLines.push(fl);
+              outLines.push(fenceIndent + sub + '────────\x1b[0m');
+            }
+          } else {
+            outLines.push(fm[1] + sub + '────────\x1b[0m');
+          }
+          fenceLang = '';
+          fenceLines = [];
         }
         continue;
       }
-      if (inFence) { outLines.push(line); continue; }
+      if (inFence) {
+        if (fenceLang === 'mermaid') {
+          fenceLines.push(line);
+        } else {
+          outLines.push(line);
+        }
+        continue;
+      }
       if (/^\s*(---|\*\*\*|___)\s*$/.test(line)) { outLines.push(sub + '────────────────────────────────\x1b[0m'); continue; }
       const qm = line.match(/^(\s*)>\s?(.*)$/);
       if (qm) { outLines.push(qm[1] + sub + '│ \x1b[0m' + fmtInline(qm[2])); continue; }
@@ -2726,7 +3481,18 @@
     let lastRowWasTool = false;
     const thinks = [];
     const stopAnim = () => { if (anim) { clearTimeout(anim); anim = null; } };
-    const tick2 = () => { outLast('\x1b[2m' + SPINNER[si2++ % SPINNER.length] + '\x1b[0m ' + acc); };
+    /* previewAcc: sanitize partial streaming content so unclosed ```mermaid
+     * fences don't add unpredictable line counts during token generation.
+     * Replaces any open (unclosed) mermaid/code fence with a stable 1-line
+     * placeholder, keeping the spinner row count constant. */
+    function previewAcc(s) {
+      const fenceRe = /```[a-z]*\n[\s\S]*?```/g;
+      const cleaned = s.replace(fenceRe, '');
+      const openFence = cleaned.match(/```[a-z]*\n[\s\S]*$/);
+      if (!openFence) return s;
+      return s.replace(/```[a-z]*\n[\s\S]*$/, '\x1b[2m\u2500\u2500\u2500 generating\u2026 \x1b[0m');
+    }
+    const tick2 = () => { outLast('\x1b[2m' + SPINNER[si2++ % SPINNER.length] + '\x1b[0m ' + previewAcc(acc)); };
     const startAnim = () => { if (TTY && !anim) anim = setTimeout(function loop() { tick2(); anim = setTimeout(loop, 120); }, 120); };
     let rlmSummary = null;
     let answer = '(no response)';

@@ -3850,6 +3850,14 @@ mod tests {
             DRIVER.contains("paintChecklist(p.todos)"),
             "driver: todo_write results must paint the list, not the one-row summary"
         );
+        assert!(
+            DRIVER.contains("function renderMermaidToAnsi"),
+            "driver: mermaid diagram renderer missing — mermaid diagrams render as raw code"
+        );
+        assert!(
+            DRIVER.contains("renderMermaidToAnsi(fenceLines.join('\\n')"),
+            "driver: mermaid fence wiring missing in formatMarkdown"
+        );
     }
 
     /// Compile gate for the embedded JS: cargo builds the DRIVER string

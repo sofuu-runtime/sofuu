@@ -1865,7 +1865,14 @@ impl Cma {
                 TIER_ENTITY => 1.5,
                 _ => 0.8,
             };
-            let norm = dist / (dist + 1.0);
+            // For unit-normalized vectors, dist is Euclidean: dist^2 = 2 - 2*cos(theta).
+            // Cosine similarity cos(theta) = 1.0 - (dist^2) / 2.0.
+            // Orthogonal vectors (dist ~= 1.414) produce sim <= 0.0, rejecting noise.
+            let sim = if dist <= 2.0 {
+                (1.0 - (dist * dist) / 2.0).max(0.0)
+            } else {
+                (1.0 / (1.0 + dist)).max(0.0)
+            };
             /* H-08: rank a pin as if it had never decayed. Lifecycle
              * (decay, retention, on-disk strength) is untouched — only the
              * ordering term is floored, so an aged pin cannot be buried by
@@ -1875,7 +1882,7 @@ impl Cma {
             } else {
                 rec.strength
             };
-            let mut score = (1.0 - norm) * rank_strength * tier_w;
+            let mut score = sim * rank_strength * tier_w;
             // Resonance: engagement history boost (max ~30%).
             if rec.total_recalls > 0 {
                 let ratio = ((rec.positive_recalls as f32 + 1.0).ln())
@@ -1896,21 +1903,26 @@ impl Cma {
          * tier weight, the recency boost — no resonance history). */
         for w in &self.working {
             let dist = sq_dist(w.vector.as_slice(), query).sqrt();
-            let norm = dist / (dist + 1.0);
-            let mut score = (1.0 - norm) * 1.0 * 0.5; /* TIER_WORKING weight */
+            let sim = if dist <= 2.0 {
+                (1.0 - (dist * dist) / 2.0).max(0.0)
+            } else {
+                (1.0 / (1.0 + dist)).max(0.0)
+            };
+            let mut score = sim * 1.0 * 0.5; /* TIER_WORKING weight */
             let age = now.saturating_sub(w.created_at) as f32;
             score *= 1.0 + RECENCY_MAX_BOOST * (-age / RECENCY_TAU_SECONDS).exp();
             scored.push((w.id, dist, score));
         }
         scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Gravity: co-recall partners of the top-1 get a boost. Working
-        // records have no corecall field — only persistent ids take part.
-        if scored.len() > 1 && !is_working_id(scored[0].0) {
+        // Gravity: co-recall partners of the top-1 get a boost only if the
+        // top-1 seed itself is a confident hit (score >= 0.40) and the partner
+        // is not orthogonal noise (*score >= 0.15).
+        if scored.len() > 1 && !is_working_id(scored[0].0) && scored[0].2 >= 0.40 {
             let top1 = scored[0].0;
             let partners: Vec<u32> = self.records[top1 as usize].corecall_ids.clone();
             for (id, _, score) in scored.iter_mut().skip(1) {
-                if partners.contains(id) {
+                if partners.contains(id) && *score >= 0.15 {
                     *score *= 1.0 + GRAVITY_G;
                 }
             }
@@ -1967,7 +1979,9 @@ impl Cma {
             }
             // Reinforce + track recall.
             let rec = &mut self.records[id as usize];
-            rec.strength = (rec.strength * 1.1).min(1.0);
+            if score >= 0.45 {
+                rec.strength = (rec.strength * 1.1).min(1.0);
+            }
             rec.last_recalled_at = now;
             if rec.total_recalls < 65535 {
                 rec.total_recalls += 1;

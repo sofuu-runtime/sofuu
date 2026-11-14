@@ -330,7 +330,11 @@
     const defs = [];
     const names = {};
     for (const t of mcpTools) {
-      if (names[t.name]) continue;
+      let toolName = t.name;
+      if (names[toolName]) {
+        toolName = t.server + '__' + t.name;
+        if (names[toolName]) continue;
+      }
       let desc = t.description || ('MCP tool from ' + t.server);
       let schema = t.schema || { type: 'object', properties: {} };
       if (isTight) {
@@ -339,12 +343,12 @@
         schema = compactParamSchema(schema);
       }
       defs.push({
-        name: t.name,
+        name: toolName,
         description: desc,
         parameters: schema,
         execute: (args) => callMcpTool(t.name, args),
       });
-      names[t.name] = 1;
+      names[toolName] = 1;
     }
     if (sofuu.plugins && sofuu.plugins.TOOLS) {
       for (const pk of Object.keys(sofuu.plugins.TOOLS)) {
@@ -476,21 +480,18 @@
       names.output_history = 1;
     }
     for (const t of mcpTools) {
-      if (names[t.name]) {
-        const wKey = t.server + ':' + t.name;
-        if (!warnedShadowed[wKey]) {
-          warnedShadowed[wKey] = 1;
-          out('\x1b[33m  ⚠ MCP tool ' + t.name + ' (' + t.server + ') shadowed by a built-in tool\x1b[0m');
-        }
-        continue;
+      let toolName = t.name;
+      if (names[toolName]) {
+        toolName = t.server + '__' + t.name;
+        if (names[toolName]) continue;
       }
       defs.push({
-        name: t.name,
+        name: toolName,
         description: t.description || ('MCP tool from ' + t.server),
         parameters: t.schema || { type: 'object', properties: {} },
         execute: (args) => callMcpTool(t.name, args),
       });
-      names[t.name] = 1;
+      names[toolName] = 1;
     }
     if (sofuu.plugins && sofuu.plugins.TOOLS) {
       for (const pk of Object.keys(sofuu.plugins.TOOLS)) {
@@ -940,6 +941,65 @@
       } catch (eS) { /* a semantic flush that fails only defers durability to the next open */ }
       out('\x1b[90m  ⏺ forgot #' + id + ' · pruned at the next turn boundary\x1b[0m\n');
     } catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); }
+  }
+
+  async function handleBrainRepair() {
+    out('\x1b[90m  Checking and repairing brain store integrity...\x1b[0m\n');
+    try {
+      const p = brainPath();
+      if (sofuu.brain && typeof sofuu.brain.repair === 'function') {
+        const rep = sofuu.brain.repair(p);
+        out('  \x1b[32m✓ ' + (rep && rep.message ? rep.message : 'Brain repaired successfully') + '\x1b[0m\n');
+      } else {
+        out('  \x1b[33m⚠ Brain repair available via `sofuu brain repair ' + p + '`\x1b[0m\n');
+      }
+    } catch (e) {
+      out('  \x1b[31m✗ Repair failed: ' + String(e.message || e) + '\x1b[0m\n');
+    }
+  }
+
+  async function handleBrainPrune() {
+    out('\x1b[90m  Pruning decayed memories from brain...\x1b[0m\n');
+    try {
+      const entry = sofuu.agent && typeof sofuu.agent.brainFor === 'function' ? sofuu.agent.brainFor(brainDef()) : null;
+      if (entry && entry.cma) {
+        if (typeof entry.cma.decayTick === 'function') entry.cma.decayTick();
+        if (typeof entry.cma.retain === 'function') {
+          const dropped = entry.cma.retain();
+          out('  \x1b[32m✓ Pruned ' + dropped + ' dead/decayed memories\x1b[0m\n');
+        } else {
+          out('  \x1b[32m✓ Decay tick completed\x1b[0m\n');
+        }
+        if (typeof entry.cma.flush === 'function') entry.cma.flush();
+      } else {
+        out('  \x1b[33m⚠ Brain handle not active (/brain on to enable)\x1b[0m\n');
+      }
+    } catch (e) {
+      out('  \x1b[31m✗ Prune failed: ' + String(e.message || e) + '\x1b[0m\n');
+    }
+  }
+
+  async function handleBrainClear() {
+    out('\x1b[90m  Clearing project-local brain memories...\x1b[0m\n');
+    try {
+      const entry = sofuu.agent && typeof sofuu.agent.brainFor === 'function' ? sofuu.agent.brainFor(brainDef()) : null;
+      if (entry && entry.cma) {
+        const listRes = JSON.parse(entry.cma.list({ limit: 1000 }));
+        let count = 0;
+        for (const rec of (listRes.records || [])) {
+          if (typeof entry.cma.forget === 'function') {
+            entry.cma.forget(rec.id);
+            count++;
+          }
+        }
+        if (typeof entry.cma.flush === 'function') entry.cma.flush();
+        out('  \x1b[32m✓ Cleared ' + count + ' memories from project brain\x1b[0m\n');
+      } else {
+        out('  \x1b[33m⚠ Brain handle not active (/brain on to enable)\x1b[0m\n');
+      }
+    } catch (e) {
+      out('  \x1b[31m✗ Clear failed: ' + String(e.message || e) + '\x1b[0m\n');
+    }
   }
 
   /* ── Timestamped output archive ──────────────────────────────────── */
@@ -4654,19 +4714,32 @@
     maybeRefreshPanel();
   }
   async function pickBrain() {
-    const notes = { on: 'memory recall + agent loop enabled', off: 'memory integration disabled' };
+    const notes = {
+      on: 'memory recall + agent loop enabled',
+      off: 'memory integration disabled',
+      info: 'show storage stats, capacity, and tiers',
+      repair: 'verify integrity and repair corrupted records',
+      prune: 'decay tick and retain (prune dead memories)',
+      clear: 'clear all memories in current project brain',
+    };
     const it = await selectMenu({
       title: 'Brain (memory)',
       hint: '↑↓/←→ move · enter apply · esc cancel',
       tabs: [],
-      items: ['on', 'off'].map(l => ({ id: l, label: l, tab: '', note: notes[l] })),
+      items: ['on', 'off', 'info', 'repair', 'prune', 'clear'].map(l => ({ id: l, label: l, tab: '', note: notes[l] })),
       currentId: cfg.brain ? 'on' : 'off',
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
-    __chat_slash('/brain ' + it.id);
-    try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
-    refreshStatus('');
-    maybeRefreshPanel();
+    if (it.id === 'info') handleBrainInfo();
+    else if (it.id === 'repair') await handleBrainRepair();
+    else if (it.id === 'prune') await handleBrainPrune();
+    else if (it.id === 'clear') await handleBrainClear();
+    else {
+      __chat_slash('/brain ' + it.id);
+      try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
+      refreshStatus('');
+      maybeRefreshPanel();
+    }
   }
   async function pickSync() {
     const notes = { on: 'session-mesh polling enabled', off: 'this session stops polling peers' };
@@ -4875,9 +4948,15 @@
           else out('\x1b[90m  Usage: /maxout <tokens|default>  (0-' + (cfg.max_output_cap || 0) + '; current: ' + (cfg.max_output || 'provider default') + ')\x1b[0m\n');
         } else if (r === 'pick_brain') {
           if (TTY) await pickBrain();
-          else out('\x1b[90m  Usage: /brain <on|off|info>  (current: ' + (cfg.brain ? 'on' : 'off') + ')\x1b[0m\n');
+          else out('\x1b[90m  Usage: /brain <on|off|info|repair|prune|clear>  (current: ' + (cfg.brain ? 'on' : 'off') + ')\x1b[0m\n');
         } else if (r === 'brain_info') {
           handleBrainInfo();
+        } else if (r === 'brain_repair') {
+          await handleBrainRepair();
+        } else if (r === 'brain_prune') {
+          await handleBrainPrune();
+        } else if (r === 'brain_clear') {
+          await handleBrainClear();
         } else if (r === 'pick_sync') {
           if (TTY) await pickSync();
           else out('\x1b[90m  Usage: /sync <on|off>  (current: ' + (cfg.sync ? 'on' : 'off') + ')\x1b[0m\n');

@@ -759,7 +759,7 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     ("/effort", "Set the thinking/reasoning effort", "off | low | medium | high | max  (unsupported levels fall back to the model's highest; budgets scale with the model)"),
     ("/compact", "Summarize the conversation into context", ""),
     ("/clear", "Reset this session (keep settings)", ""),
-    ("/brain", "Toggle the memory/brain integration", "on | off | info"),
+    ("/brain", "Toggle/manage memory brain integration", "on | off | info | repair | prune | clear"),
     ("/ml", "ML context-economy gates + online learning", "on | off | learn | adopt | discard | reset | wrong | wasted | info"),
     ("/rlm", "Route long-context turns through RLM", "on | off | auto"),
     ("/mode", "View/set the permission mode", "full | edit | plan  (bare = show · TAB cycles)"),
@@ -1136,6 +1136,12 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                 "pick_brain"
             } else if arg == "info" {
                 "brain_info"
+            } else if arg == "repair" {
+                "brain_repair"
+            } else if arg == "prune" {
+                "brain_prune"
+            } else if arg == "clear" {
+                "brain_clear"
             } else if arg == "off" {
                 cfg.brain = false;
                 cfg.save();
@@ -1147,7 +1153,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                 chat_out("  ✓ Brain enabled\n");
                 "ok"
             } else {
-                chat_out("  Usage: /brain [on|off|info]\n");
+                chat_out("  Usage: /brain [on|off|info|repair|prune|clear]\n");
                 "ok"
             }
         }
@@ -1570,7 +1576,7 @@ fn print_help() {
     c(&mut rows, "/effort", "reasoning-effort picker (off/low…max)");
     c(&mut rows, "/compact", "summarize the conversation into context");
     c(&mut rows, "/clear", "reset this session (keep settings)");
-    c(&mut rows, "/brain [on|off|info]", "toggle memory/brain integration · info = store panel");
+    c(&mut rows, "/brain [on|off|info|repair|prune|clear]", "manage memory brain integration · info/repair/prune/clear");
     c(&mut rows, "/ml [on|off|learn|adopt|discard|reset|wrong|wasted|info]", "ML context-economy gates + supervisor online learning");
     c(&mut rows, "/rlm [on|off|auto]", "route long-context turns through the RLM loop");
     c(&mut rows, "/mode [full|edit|plan]", "permission mode: plan=read-only, edit=no shell, full=all tools");
@@ -4129,6 +4135,9 @@ mod tests {
         // Bare config commands open their picker panel (DRIVER handles it).
         assert_eq!(handle_slash(&mut c, "/brain"), "pick_brain");
         assert_eq!(handle_slash(&mut c, "/brain info"), "brain_info");
+        assert_eq!(handle_slash(&mut c, "/brain repair"), "brain_repair");
+        assert_eq!(handle_slash(&mut c, "/brain prune"), "brain_prune");
+        assert_eq!(handle_slash(&mut c, "/brain clear"), "brain_clear");
         assert_eq!(handle_slash(&mut c, "/brain on"), "ok");
         assert!(c.brain);
         // /ml: bare prints status (no picker); on/off persist.

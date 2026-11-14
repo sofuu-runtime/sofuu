@@ -975,15 +975,10 @@
     }
     for (var i = 0; i < S.mcpTools.length; i++) {
       var mt = S.mcpTools[i];
-      if (names[mt.name]) {
-        if (!S.warnedShadowed) S.warnedShadowed = {};
-        var wk = mt.server + ':' + mt.name;
-        if (!S.warnedShadowed[wk]) {
-          S.warnedShadowed[wk] = 1;
-          emit({ kind: 'warn', payload: { message: 'MCP tool ' + mt.name +
-                 ' (' + mt.server + ') shadowed by a built-in tool' } });
-        }
-        continue;
+      var toolName = mt.name;
+      if (names[toolName]) {
+        toolName = mt.server + '__' + mt.name;
+        if (names[toolName]) continue;
       }
       var desc = mt.description || ('MCP tool from ' + mt.server);
       var schema = mt.schema || { type: 'object', properties: {} };
@@ -993,14 +988,14 @@
         schema = compactParamSchema(schema);
       }
       defs.push(gateTool({
-        name: mt.name,
+        name: toolName,
         description: desc,
         parameters: schema,
-        execute: (function (toolName) {
-          return function (args) { return callMcpTool(toolName, args); };
+        execute: (function (realToolName) {
+          return function (args) { return callMcpTool(realToolName, args); };
         })(mt.name),
       }));
-      names[mt.name] = 1;
+      names[toolName] = 1;
     }
     if (sofuu.plugins && sofuu.plugins.TOOLS) {
       var pKeys = Object.keys(sofuu.plugins.TOOLS);

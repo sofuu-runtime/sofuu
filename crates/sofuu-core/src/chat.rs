@@ -630,27 +630,6 @@ pub fn parse_token_count(s: &str) -> Option<i64> {
 /// model's real ceiling and the error surfaces.
 const MAX_OUTPUT_TOKENS: i64 = 384_000;
 
-/// Legacy per-provider fallback context windows — used ONLY when neither
-/// /ctx nor the model capability registry (rt/model_caps.rs) knows better.
-/// The registry is the primary source; this map is the last resort.
-fn default_ctx_window(provider: &str) -> i64 {
-    match provider {
-        "openai" | "anthropic" => 128_000,
-        /* Local engines serve a modest window by default; the registry still
-         * wins whenever it knows the real model. */
-        "local" | "ollama" | "llamacpp" => 32_768,
-        _ => 32_768,
-    }
-}
-
-/// Effective window: the configured value, or the provider default.
-pub fn effective_ctx_window(provider: &str, ctx_window: i64) -> i64 {
-    if ctx_window > 0 {
-        ctx_window
-    } else {
-        default_ctx_window(provider)
-    }
-}
 
 /// The evidence-ladder resolve for the SELECTED model (the same one every
 /// JS driver consumer uses via sofuu.ai.resolveCaps): learned-from-400s >
@@ -933,19 +912,19 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                     };
                     session::cmd_show(&p, &id);
                 }
-                None => chat_out(&format!("  [sync] session mesh is off (--sync on to enable)\n")),
+                None => chat_out("  [sync] session mesh is off (--sync on to enable)\n"),
             }
             "ok"
         }
         "/work" => {
             if arg.is_empty() {
-                chat_out(&format!("  Usage: /work <what you are doing>\n"));
+                chat_out("  Usage: /work <what you are doing>\n");
             } else if let Ok(mut guard) = SESS.lock() {
                 if let Some(sess) = guard.as_mut() {
                     sess.set_task(Some(arg.to_string()));
                     chat_out(&format!("  ✓ Task set (visible to all sessions on this project): {}\n", arg));
                 } else {
-                    chat_out(&format!("  [sync] session mesh is off (--sync on to enable)\n"));
+                    chat_out("  [sync] session mesh is off (--sync on to enable)\n");
                 }
             }
             "ok"
@@ -954,35 +933,35 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
             if let Ok(mut guard) = SESS.lock() {
                 if let Some(sess) = guard.as_mut() {
                     sess.set_task(None);
-                    chat_out(&format!("  ✓ Task cleared\n"));
+                    chat_out("  ✓ Task cleared\n");
                 } else {
-                    chat_out(&format!("  [sync] session mesh is off (--sync on to enable)\n"));
+                    chat_out("  [sync] session mesh is off (--sync on to enable)\n");
                 }
             }
             "ok"
         }
         "/note" => {
             if arg.is_empty() {
-                chat_out(&format!("  Usage: /note <message>\n"));
+                chat_out("  Usage: /note <message>\n");
             } else if let Ok(mut guard) = SESS.lock() {
                 if let Some(sess) = guard.as_mut() {
                     sess.add_note(arg);
-                    chat_out(&format!("  ✓ Note recorded\n"));
+                    chat_out("  ✓ Note recorded\n");
                 } else {
-                    chat_out(&format!("  [sync] session mesh is off (--sync on to enable)\n"));
+                    chat_out("  [sync] session mesh is off (--sync on to enable)\n");
                 }
             }
             "ok"
         }
         "/notify" => {
             if arg.is_empty() {
-                chat_out(&format!("  Usage: /notify <critical message for all sessions>\n"));
+                chat_out("  Usage: /notify <critical message for all sessions>\n");
             } else if let Ok(mut guard) = SESS.lock() {
                 if let Some(sess) = guard.as_mut() {
                     sess.broadcast_critical(arg);
                     chat_out(&format!("  ✓ Critical notice broadcast to all sessions on this project: {}\n", arg));
                 } else {
-                    chat_out(&format!("  [sync] session mesh is off (--sync on to enable)\n"));
+                    chat_out("  [sync] session mesh is off (--sync on to enable)\n");
                 }
             }
             "ok"
@@ -1107,9 +1086,9 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
             } else if arg == "off" {
                 cfg.effort.clear();
                 cfg.save();
-                chat_out(&format!("  ✓ Effort cleared (provider default)\n"));
+                chat_out("  ✓ Effort cleared (provider default)\n");
             } else if !valid_effort(arg) {
-                chat_out(&format!("  Effort must be one of: low, medium, high, max (or off)\n"));
+                chat_out("  Effort must be one of: low, medium, high, max (or off)\n");
             } else {
                 cfg.effort = arg.to_string();
                 cfg.save();
@@ -1273,7 +1252,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                     "ok"
                 }
                 _ => {
-                    chat_out(&format!("  Usage: /rlm [on|off|auto]\n"));
+                    chat_out("  Usage: /rlm [on|off|auto]\n");
                     "ok"
                 }
             }
@@ -1317,6 +1296,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
         "/tools" => "tools",
         "/plugins" => "plugins",
         "/agents" => "agents",
+        "/scouter" | "/health" => "scouter",
         "/ctx" => {
             // /ctx          → config panel (DRIVER handles "pick_ctx")
             // /ctx <n>      → set for THIS model (obeyed as typed)
@@ -1546,6 +1526,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
     }
 }
 
+#[inline(never)]
 fn print_help() {
     // Rows are collected before rendering so the command column can be sized
     // to the longest label. It used to be a fixed 20 cells, which silently
@@ -1562,73 +1543,71 @@ fn print_help() {
         Note(&'static str),
         Blank,
     }
-    let mut rows: Vec<Row> = Vec::new();
-    let h = |rows: &mut Vec<Row>, s: &'static str| rows.push(Row::Header(s));
-    let c = |rows: &mut Vec<Row>, cmd: &'static str, desc: &'static str| {
-        rows.push(Row::Cmd(cmd, desc))
-    };
-    rows.push(Row::Blank);
-    h(&mut rows, "  Sofuu Chat Commands");
-    c(&mut rows, "/help", "this help");
-    c(&mut rows, "/model", "interactive model picker (search, arrows, enter)");
-    c(&mut rows, "/model <name>", "switch model directly (persisted)");
-    c(&mut rows, "/provider", "your providers + add a new one");
-    c(&mut rows, "/effort", "reasoning-effort picker (off/low…max)");
-    c(&mut rows, "/compact", "summarize the conversation into context");
-    c(&mut rows, "/clear", "reset this session (keep settings)");
-    c(&mut rows, "/brain [on|off|info|repair|prune|clear]", "manage memory brain integration · info/repair/prune/clear");
-    c(&mut rows, "/ml [on|off|learn|adopt|discard|reset|wrong|wasted|info]", "ML context-economy gates + supervisor online learning");
-    c(&mut rows, "/rlm [on|off|auto]", "route long-context turns through the RLM loop");
-    c(&mut rows, "/mode [full|edit|plan]", "permission mode: plan=read-only, edit=no shell, full=all tools");
-    c(&mut rows, "/plan /edit /full", "shorthands for /mode plan|edit|full");
-    c(&mut rows, "/theme [name]", "switch the TUI color theme (13 dark-blend)");
-    c(&mut rows, "/ctx [<tokens>]", "view/set the context window (max 4M)");
-    c(&mut rows, "/maxout [<tokens>]", "view/set max output tokens (max 384k)");
-    c(&mut rows, "/tools", "list connected MCP servers + their tools");
-    c(&mut rows, "/plugins", "list installed plugins (~/.sofuu/plugins)");
-    c(&mut rows, "/agents", "list agent definitions (~/.sofuu/agents/*.js)");
-    c(&mut rows, "/version", "print the runtime version");
-    h(&mut rows, "  Brain & memory");
-    c(&mut rows, "/remember <fact>", "pin a fact directly to the brain");
-    c(&mut rows, "/why", "which memories shaped the last answer");
-    c(&mut rows, "/memory [tier|query]", "browse stored memories (paginated)");
-    c(&mut rows, "/forget <id>", "delete one memory (shows it first; --yes confirms)");
-    c(&mut rows, "/share [path]", "export a brain card (metadata + pointers)");
-    c(&mut rows, "/import <path>", "import + merge a brain card");
-    c(&mut rows, "/resume [id]", "browse + resume a past session");
-    c(&mut rows, "/serve", "brain-server quick info (sofuu serve --brain)");
-    h(&mut rows, "  Context & tools");
-    c(&mut rows, "@file[:start-end]", "attach file contents to a prompt");
-    c(&mut rows, "@name <task>", "run a loaded agent directly (@agent:name too)");
-    c(&mut rows, "/watch <path>", "watch a directory for changes in context");
-    c(&mut rows, "/cost", "token usage + spend breakdown + budget");
-    c(&mut rows, "/ghost [on|off]", "toggle ghost prompt completion");
-    c(&mut rows, "/hooks", "show ~/.sofuu/hooks.js user middleware info");
-    h(&mut rows, "  Session mesh");
-    c(&mut rows, "/sessions [id]", "browse sessions on this project (↑↓ + Enter resumes)");
-    c(&mut rows, "/context [id]", "full context of a session (default: this one)");
-    c(&mut rows, "/work <desc>", "announce what you are working on");
-    c(&mut rows, "/done", "clear your current task");
-    c(&mut rows, "/note <msg>", "record a personal note (seen by peers)");
-    c(&mut rows, "/notify <msg>", "CRITICAL notice, shown to every session now");
-    c(&mut rows, "/sync [on|off]", "toggle session-mesh polling (restart to join)");
-    c(&mut rows, "/exit /quit", "save config and exit");
-    rows.push(Row::Note("\n\x1b[2m  Sessions on the SAME project share context in real time (tasks,\x1b[0m"));
-    rows.push(Row::Note("\x1b[2m  notes, critical notices). Data persists as .qtsq files in\x1b[0m"));
-    rows.push(Row::Note("\x1b[2m  <project>/.sofuu/sessions/.\x1b[0m"));
-    h(&mut rows, "\n  Shortcuts");
-    c(&mut rows, "TAB", "complete after '/', cycle permission mode otherwise");
-    c(&mut rows, "↑ / ↓", "input history");
-    c(&mut rows, "PgUp / PgDn", "scroll the conversation");
-    c(&mut rows, "Shift+Enter", "newline inside the input (Alt+Enter too)");
-    c(&mut rows, "Esc", "stop the response (while streaming) / clear the input");
-    c(&mut rows, "Ctrl-K", "copy the mouse-selected text (drag over rows, then Ctrl-K)");
-    c(&mut rows, "Ctrl-C", "quit sofuu");
-    c(&mut rows, "Ctrl-D", "exit");
-    rows.push(Row::Blank);
+    const ROWS: &[Row] = &[
+        Row::Blank,
+        Row::Header("  Sofuu Chat Commands"),
+        Row::Cmd("/help", "this help"),
+        Row::Cmd("/model", "interactive model picker (search, arrows, enter)"),
+        Row::Cmd("/model <name>", "switch model directly (persisted)"),
+        Row::Cmd("/provider", "your providers + add a new one"),
+        Row::Cmd("/effort", "reasoning-effort picker (off/low…max)"),
+        Row::Cmd("/compact", "summarize the conversation into context"),
+        Row::Cmd("/clear", "reset this session (keep settings)"),
+        Row::Cmd("/brain [on|off|info|repair|prune|clear]", "manage memory brain integration · info/repair/prune/clear"),
+        Row::Cmd("/ml [on|off|learn|adopt|discard|reset|wrong|wasted|info]", "ML context-economy gates + supervisor online learning"),
+        Row::Cmd("/rlm [on|off|auto]", "route long-context turns through the RLM loop"),
+        Row::Cmd("/mode [full|edit|plan]", "permission mode: plan=read-only, edit=no shell, full=all tools"),
+        Row::Cmd("/plan /edit /full", "shorthands for /mode plan|edit|full"),
+        Row::Cmd("/theme [name]", "switch the TUI color theme (13 dark-blend)"),
+        Row::Cmd("/ctx [<tokens>]", "view/set the context window (max 4M)"),
+        Row::Cmd("/maxout [<tokens>]", "view/set max output tokens (max 384k)"),
+        Row::Cmd("/tools", "list connected MCP servers + their tools"),
+        Row::Cmd("/plugins", "list installed plugins (~/.sofuu/plugins)"),
+        Row::Cmd("/agents", "list agent definitions (~/.sofuu/agents/*.js)"),
+        Row::Cmd("/scouter", "real-time context & brain health diagnostics"),
+        Row::Cmd("/version", "print the runtime version"),
+        Row::Header("  Brain & memory"),
+        Row::Cmd("/remember <fact>", "pin a fact directly to the brain"),
+        Row::Cmd("/why", "which memories shaped the last answer"),
+        Row::Cmd("/memory [tier|query]", "browse stored memories (paginated)"),
+        Row::Cmd("/forget <id>", "delete one memory (shows it first; --yes confirms)"),
+        Row::Cmd("/share [path]", "export a brain card (metadata + pointers)"),
+        Row::Cmd("/import <path>", "import + merge a brain card"),
+        Row::Cmd("/resume [id]", "browse + resume a past session"),
+        Row::Cmd("/serve", "brain-server quick info (sofuu serve --brain)"),
+        Row::Header("  Context & tools"),
+        Row::Cmd("@file[:start-end]", "attach file contents to a prompt"),
+        Row::Cmd("@name <task>", "run a loaded agent directly (@agent:name too)"),
+        Row::Cmd("/watch <path>", "watch a directory for changes in context"),
+        Row::Cmd("/cost", "token usage + spend breakdown + budget"),
+        Row::Cmd("/ghost [on|off]", "toggle ghost prompt completion"),
+        Row::Cmd("/hooks", "show ~/.sofuu/hooks.js user middleware info"),
+        Row::Header("  Session mesh"),
+        Row::Cmd("/sessions [id]", "browse sessions on this project (↑↓ + Enter resumes)"),
+        Row::Cmd("/context [id]", "full context of a session (default: this one)"),
+        Row::Cmd("/work <desc>", "announce what you are working on"),
+        Row::Cmd("/done", "clear your current task"),
+        Row::Cmd("/note <msg>", "record a personal note (seen by peers)"),
+        Row::Cmd("/notify <msg>", "CRITICAL notice, shown to every session now"),
+        Row::Cmd("/sync [on|off]", "toggle session-mesh polling (restart to join)"),
+        Row::Cmd("/exit /quit", "save config and exit"),
+        Row::Note("\n\x1b[2m  Sessions on the SAME project share context in real time (tasks,\x1b[0m"),
+        Row::Note("\x1b[2m  notes, critical notices). Data persists as .qtsq files in\x1b[0m"),
+        Row::Note("\x1b[2m  <project>/.sofuu/sessions/.\x1b[0m"),
+        Row::Header("\n  Shortcuts"),
+        Row::Cmd("TAB", "complete after '/', cycle permission mode otherwise"),
+        Row::Cmd("↑ / ↓", "input history"),
+        Row::Cmd("PgUp / PgDn", "scroll the conversation"),
+        Row::Cmd("Shift+Enter", "newline inside the input (Alt+Enter too)"),
+        Row::Cmd("Esc", "stop the response (while streaming) / clear the input"),
+        Row::Cmd("Ctrl-K", "copy the mouse-selected text (drag over rows, then Ctrl-K)"),
+        Row::Cmd("Ctrl-C", "quit sofuu"),
+        Row::Cmd("Ctrl-D", "exit"),
+        Row::Blank,
+    ];
 
     // ── Render ──────────────────────────────────────────────────
-    let col = help_command_col(rows.iter().filter_map(|r| match r {
+    let col = help_command_col(ROWS.iter().filter_map(|r| match r {
         Row::Cmd(cmd, _) => Some(char_cells_str(cmd)),
         _ => None,
     }));
@@ -1653,7 +1632,7 @@ fn print_help() {
         ("\x1b[1;36m".to_string(), "\x1b[2m".to_string())
     };
 
-    for row in &rows {
+    for row in ROWS {
         match row {
             Row::Blank => chat_out(""),
             Row::Header(s) => chat_out(&format!("\n{hdr_sgr}{s}\x1b[0m")),
@@ -2002,20 +1981,17 @@ fn welcome_panel_at(cfg: &ChatConfig, session: &str, dir: &str, width: usize) ->
     };
     let model = if cfg.provider.is_empty() || cfg.model.is_empty() {
         "not configured · run /model to pick one".to_string()
-    } else if cfg.provider == "local" {
-        let display_name = if cfg.model.starts_with('/') && cfg.model.contains('/') {
-            std::path::Path::new(&cfg.model).file_name().and_then(|s| s.to_str()).unwrap_or(&cfg.model)
-        } else {
-            &cfg.model
-        };
-        format!("local: {}{}", display_name, effort)
     } else {
         let display_name = if cfg.model.starts_with('/') && cfg.model.contains('/') {
             std::path::Path::new(&cfg.model).file_name().and_then(|s| s.to_str()).unwrap_or(&cfg.model)
         } else {
             &cfg.model
         };
-        format!("{}/{}{}", cfg.provider, display_name, effort)
+        if cfg.provider == "local" {
+            format!("local: {}{}", display_name, effort)
+        } else {
+            format!("{}/{}{}", cfg.provider, display_name, effort)
+        }
     };
     let labels: [(String, String); 6] = [
         ("Directory:".into(), trunc_cells(dir, inner.saturating_sub(14))),
@@ -2141,12 +2117,7 @@ struct RecallHit {
     text: String,
     score: f64,
     role: String,
-    #[serde(default = "default_recall_tier")]
     tier: u8,
-}
-
-fn default_recall_tier() -> u8 {
-    1 /* episodic — the pre-B6 default for hits without a tier */
 }
 
 /// F6: per-session cost tracking.
@@ -2665,7 +2636,7 @@ unsafe extern "C" fn js_chat_get_recall(
 ) -> JSValue {
     let json = {
         let hits = LAST_RECALL.lock().unwrap();
-        serde_json::json!(*hits).to_string()
+        serde_json::to_string(&*hits).unwrap_or_else(|_| "[]".into())
     };
     js_new_string(ctx, &json)
 }

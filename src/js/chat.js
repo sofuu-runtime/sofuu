@@ -1963,6 +1963,12 @@
     }
     S.history.push({ role: 'assistant', content: answer });
     await trimHistory();
+    try {
+      if (typeof sofuu !== 'undefined' && sofuu.scouter) {
+        var lt = (turnTranscript && turnTranscript.length) ? String(turnTranscript[turnTranscript.length - 1].content || '') : null;
+        sofuu.scouter.contextHealth(S.history, lt, histAtReq);
+      }
+    } catch (eScouter) { /* advisory */ }
     /* Live ctx meter event: what the NEXT request will look like. With
      * retained transcripts (2026-09-03 e) that is calibrated-overhead +
      * the full history INCLUDING this turn's transcript — firstPromptTk

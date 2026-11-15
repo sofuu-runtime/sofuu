@@ -21,25 +21,28 @@ Every division operates under strict architectural boundaries to guarantee that 
 
 ## 2. Division Index & Matrix
 
-| Division | Name | Focus & Scope | Primary Locations | Maturity | Verification Command |
-|---|---|---|---|---|---|
-| **D01** | **Core Substrate & Event Loop** | QuickJS, libuv, process lifecycle, C-API, memory allocator | `crates/sofuu-ffi/`, `crates/sofuu-capi/`, `crates/sofuu-core/src/rt/` | Core | `cargo test -p sofuu-ffi -p sofuu-core --lib rt` |
-| **D02** | **Cognitive Vector Memory** | In-process QTSQ engine, SIMD cosine recall, CMA memory, deterministic embedder | `crates/sofuu-core/src/domains/memory/`, `crates/sofuu-core/src/embedding/` | Core | `cargo test -p sofuu-core --lib domains::memory` |
-| **D03** | **Autonomous AI Agents** | Turn-block context retention, sub-agent delegation, reflection, agent routines | `src/js/agent.js`, `crates/sofuu-core/src/chat.rs` | Core | `make bc-check` |
-| **D04** | **Tool Belt & Protocol Gates** | Sandboxed in-process tools, SSRF firewall, native MCP client & host | `crates/sofuu-core/src/mcp/`, `crates/sofuu-core/src/rt/policy.rs` | Core | `cargo test -p sofuu-core --lib mcp` |
-| **D05** | **Kaze Language & Compiler** | Declarative `.kaze` AST, linear arena VM, capability gates, supervisor daemon | `kaze/`, `crates/sofuu-core/src/domains/kaze/`, `crates/sofuu-core/src/compiler.rs`, `example-agents/` | Core | Policy-compliant Kaze checks (see D05) |
-| **D06** | **Hardware Inference Engine** | GGUF/SafeTensors loaders, Metal GPU shaders, NEON/AVX2 kernels, quantization | `crates/sofuu-core/src/domains/infer/`, `crates/sofuu-core/src/ml/` | Experimental Preview | `cargo test -p sofuu-core --lib domains::infer` |
-| **D07** | **Robotics, Drones & Edge** | MAVLink 2.0 protocol, GPIO pulse timers, physical safety gates, telemetry | `crates/sofuu-core/src/domains/robotics/`, `kaze/src/hardware.rs` | Core | `cargo test -p sofuu-core --lib domains::robotics` |
-| **D08** | **CLI, Interactive TUI & REPL** | `sofuu` CLI flags, full-screen `chat` TUI, interactive REPL, inspector | `src/js/chat_tui.js`, `crates/sofuu-core/src/main.rs` | Core | `./sofuu doctor` |
-| **D09** | **Mobile & Native Embeddings** | Android C-API/APK, Swift Package Manager (iOS/macOS), CocoaPods | `sofuu-android/`, `sofuu-ios/`, `crates/sofuu-capi/` | Core / Edge | `cargo test -p sofuu-capi` |
-| **D10** | **Desktop App Presentation** | Tauri GUI shell, isolated GTK/WebKit presentation layer | `sofuu-desktop/` | Experimental Preview | `cd sofuu-desktop && npm run build` |
-| **D11** | **Public Surface & Operations** | Documentation, landing page (`sofuu.xyz`), npm distribution, Cloudflare Pages | `sofuu-landing/`, `npm/`, `docs/`, `README.md` | Public Operations | `cd sofuu-landing && npm run build` |
+> Detailed specifications for every division reside in [`docs/sofuu-map/`](docs/sofuu-map/README.md).
+
+| Division | Name | Focus & Scope | Primary Locations | Maturity | Verification Command | Detailed Specification |
+|---|---|---|---|---|---|---|
+| **D01** | **Core Substrate & Event Loop** | QuickJS, libuv, process lifecycle, C-API, memory allocator | `crates/sofuu-ffi/`, `crates/sofuu-capi/`, `crates/sofuu-core/src/rt/` | Core | `cargo test -p sofuu-ffi -p sofuu-core --lib rt` | [D01-core-substrate.md](docs/sofuu-map/D01-core-substrate.md) |
+| **D02** | **Cognitive Vector Memory** | In-process QTSQ engine, SIMD cosine recall, CMA memory, deterministic embedder | `crates/sofuu-core/src/domains/memory/`, `crates/sofuu-core/src/embedding/` | Core | `cargo test -p sofuu-core --lib domains::memory` | [D02-cognitive-memory.md](docs/sofuu-map/D02-cognitive-memory.md) |
+| **D03** | **Autonomous AI Agents** | Turn-block context retention, sub-agent delegation, reflection, agent routines | `src/js/agent.js`, `crates/sofuu-core/src/chat.rs` | Core | `make bc-check` | [D03-autonomous-agents.md](docs/sofuu-map/D03-autonomous-agents.md) |
+| **D04** | **Tool Belt & Protocol Gates** | Sandboxed in-process tools, SSRF firewall, native MCP client & host | `crates/sofuu-core/src/mcp/`, `crates/sofuu-core/src/rt/policy.rs` | Core | `cargo test -p sofuu-core --lib mcp` | [D04-tool-belt-mcp.md](docs/sofuu-map/D04-tool-belt-mcp.md) |
+| **D05** | **Kaze Language & Compiler** | Declarative `.kaze` AST, linear arena VM, capability gates, supervisor daemon | `kaze/`, `crates/sofuu-core/src/domains/kaze/`, `crates/sofuu-core/src/compiler.rs`, `example-agents/` | Core | Policy-compliant Kaze checks (see D05) | [D05-kaze-compiler.md](docs/sofuu-map/D05-kaze-compiler.md) |
+| **D06** | **Hardware Inference Engine** | GGUF/SafeTensors loaders, Metal GPU shaders, NEON/AVX2 kernels, quantization | `crates/sofuu-core/src/domains/infer/`, `crates/sofuu-core/src/ml/` | Experimental Preview | `cargo test -p sofuu-core --lib domains::infer` | [D06-hardware-inference.md](docs/sofuu-map/D06-hardware-inference.md) |
+| **D07** | **Robotics, Drones & Edge** | MAVLink 2.0 protocol, GPIO pulse timers, physical safety gates, telemetry | `crates/sofuu-core/src/domains/robotics/`, `kaze/src/hardware.rs` | Core | `cargo test -p sofuu-core --lib domains::robotics` | [D07-robotics-edge.md](docs/sofuu-map/D07-robotics-edge.md) |
+| **D08** | **CLI, Interactive TUI & REPL** | `sofuu` CLI flags, full-screen `chat` TUI, interactive REPL, inspector | `src/js/chat_tui.js`, `crates/sofuu-core/src/main.rs` | Core | `./sofuu doctor` | [D08-cli-interactive-tui.md](docs/sofuu-map/D08-cli-interactive-tui.md) |
+| **D09** | **Mobile & Native Embeddings** | Android C-API/APK, Swift Package Manager (iOS/macOS), CocoaPods | `sofuu-android/`, `sofuu-ios/`, `crates/sofuu-capi/` | Core / Edge | `cargo test -p sofuu-capi` | [D09-mobile-native-embeddings.md](docs/sofuu-map/D09-mobile-native-embeddings.md) |
+| **D10** | **Desktop App Presentation** | Tauri GUI shell, isolated GTK/WebKit presentation layer | `sofuu-desktop/` | Experimental Preview | `cd sofuu-desktop && npm run build` | [D10-desktop-app.md](docs/sofuu-map/D10-desktop-app.md) |
+| **D11** | **Public Surface & Operations** | Documentation, landing page (`sofuu.xyz`), npm distribution, Cloudflare Pages | `sofuu-landing/`, `npm/`, `docs/`, `README.md` | Public Operations | `cd sofuu-landing && npm run build` | [D11-public-surface-operations.md](docs/sofuu-map/D11-public-surface-operations.md) |
 
 ---
 
 ## 3. Detailed Division Specifications
 
 ### Division 01: Core Substrate & Event Loop (D01)
+> Detailed Specification: [`docs/sofuu-map/D01-core-substrate.md`](docs/sofuu-map/D01-core-substrate.md)
 * **Mission**: Provide the deterministic, low-latency foundation for all JavaScript, TypeScript, and native execution.
 * **Owned Files**:
   * `crates/sofuu-ffi/` (QuickJS C bindings, libuv integration, build scripts)
@@ -55,10 +58,12 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [x] Optimize QuickJS microtask queue drain latency under saturated event loops.
   - [x] PLAN-UNIFIED-DIAGNOSTICS: versioned diagnostic contract, uncaught/rejection rendering, and shared event-string redaction (`rt/diag_contract.rs`).
   - [x] AUDIT-REMEDIATION-2026-11-08: Complete core substrate tasks — microtask queue drainage on 1M chained promises (CLI-054), native `node:crypto` hashing (SHA-1/MD5/SHA-256/SHA-512/HMAC via `rt/digest.rs`) (JR-053), and `sofuu.spawn()` handle contract with ENOENT rejection (JR-073, JR-077).
+  - [x] PLAN-SCOUTER: Tamper-proof mathematical context & cognitive brain health monitor substrate (`crates/sofuu-core/src/rt/scouter.rs`, `sofuu.scouter.*`).
 
 ---
 
 ### Division 02: Cognitive Vector Memory Subsystem (D02)
+> Detailed Specification: [`docs/sofuu-map/D02-cognitive-memory.md`](docs/sofuu-map/D02-cognitive-memory.md)
 * **Mission**: Deliver microsecond-level in-process vector storage and associative memory without running external database daemons.
 * **Owned Files**:
   * `crates/sofuu-core/src/domains/memory/` (QTSQ memory substrate, CMA allocator, memory index)
@@ -77,6 +82,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 ---
 
 ### Division 03: Autonomous AI Agents & Sub-Agents (D03)
+> Detailed Specification: [`docs/sofuu-map/D03-autonomous-agents.md`](docs/sofuu-map/D03-autonomous-agents.md)
 * **Mission**: Provide lightweight, multi-turn autonomous agent loops with turn-block context retention and hierarchical delegation.
 * **Owned Files**:
   * `src/js/agent.js` and snapshots `src/js/agent.bc`, `src/js/agent.bc.gz`
@@ -95,6 +101,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 ---
 
 ### Division 04: Native Tool Belt & Protocol Gates (D04)
+> Detailed Specification: [`docs/sofuu-map/D04-tool-belt-mcp.md`](docs/sofuu-map/D04-tool-belt-mcp.md)
 * **Mission**: Host in-process execution tools and native Model Context Protocol (MCP) clients and servers behind strict security firewalls.
 * **Owned Files**:
   * `crates/sofuu-core/src/mcp/` (Native MCP protocol implementation, JSON-RPC transport)
@@ -113,6 +120,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 ---
 
 ### Division 05: Kaze Language, VM & Standalone Compiler (D05)
+> Detailed Specification: [`docs/sofuu-map/D05-kaze-compiler.md`](docs/sofuu-map/D05-kaze-compiler.md)
 * **Mission**: Pure declarative agent routine language and linear arena VM for mission-critical, zero-GC edge intelligence.
 * **Owned Files**:
   * `kaze/` (Separate standalone Kaze 1.0 repository, CLI, compiler, VM, and documentation)
@@ -149,6 +157,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 ---
 
 ### Division 06: Hardware Inference Engine (D06 - Experimental Preview)
+> Detailed Specification: [`docs/sofuu-map/D06-hardware-inference.md`](docs/sofuu-map/D06-hardware-inference.md)
 * **Mission**: In-process neural network inference on CPU and Apple Silicon Metal shaders for local fallback and edge nodes.
 * **Owned Files**:
   * `crates/sofuu-core/src/domains/infer/` (GGUF parser, SafeTensors loader, tensor operators)
@@ -165,6 +174,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 ---
 
 ### Division 07: Robotics, Drones & Edge Subsystems (D07)
+> Detailed Specification: [`docs/sofuu-map/D07-robotics-edge.md`](docs/sofuu-map/D07-robotics-edge.md)
 * **Mission**: Hardware interfacing, GPIO telemetry, and MAVLink 2.0 flight protocol integration for autonomous physical systems.
 * **Owned Files**:
   * `crates/sofuu-core/src/domains/robotics/` (MAVLink protocol encoder/decoder, flight safety gates)
@@ -182,6 +192,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 ---
 
 ### Division 08: CLI, Interactive TUI & Developer Experience (D08)
+> Detailed Specification: [`docs/sofuu-map/D08-cli-interactive-tui.md`](docs/sofuu-map/D08-cli-interactive-tui.md)
 * **Mission**: Provide intuitive, zero-configuration developer interfaces from one-line scripts to interactive terminal chat.
 * **Owned Files**:
   * `src/js/chat_tui.js` and snapshots `src/js/chat.bc`, `src/js/chat.bc.gz`
@@ -201,6 +212,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 ---
 
 ### Division 09: Mobile & Native Embeddings (D09)
+> Detailed Specification: [`docs/sofuu-map/D09-mobile-native-embeddings.md`](docs/sofuu-map/D09-mobile-native-embeddings.md)
 * **Mission**: Distribute the embeddable Sofuu core runtime to mobile ecosystems (Android APK/AAR, iOS/macOS frameworks).
 * **Owned Files**:
   * `sofuu-android/` (Gradle project, JNI bindings, sample Android application)
@@ -218,6 +230,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 ---
 
 ### Division 10: Desktop App Presentation (D10 - Experimental Preview)
+> Detailed Specification: [`docs/sofuu-map/D10-desktop-app.md`](docs/sofuu-map/D10-desktop-app.md)
 * **Mission**: Visual presentation shell and local GUI dashboard built with Tauri.
 * **Owned Files**:
   * `sofuu-desktop/` (Tauri configuration, Vite frontend, GTK presentation layer)
@@ -232,6 +245,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 ---
 
 ### Division 11: Public Surface, Documentation & Operations (D11)
+> Detailed Specification: [`docs/sofuu-map/D11-public-surface-operations.md`](docs/sofuu-map/D11-public-surface-operations.md)
 * **Mission**: Maintain the public website, official documentation, npm package, and release delivery pipeline.
 * **Owned Files**:
   * `sofuu-landing/` (Next.js public site at `sofuu.xyz`, Cloudflare Pages deployment)

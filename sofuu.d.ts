@@ -1656,6 +1656,8 @@ export interface SofuuRuntime {
   diagnostics: SofuuDiagnostics;
   /** The deterministic in-process execution sandbox (rt/sandbox.rs). */
   sandbox: SofuuSandbox;
+  /** Real-time mathematical context & brain health scouter (PLAN-SCOUTER). */
+  scouter?: SofuuScouter;
   /**
    * The manifest's `build` block, registered at startup: exactly
    * `capabilities().build`, without building the whole manifest (which probes
@@ -1841,6 +1843,45 @@ export interface SofuuSandbox {
   eval<T = unknown>(code: string, options?: SandboxOptions): T | Promise<T>;
   /** Stateful realm for multi-step work. */
   create(options?: SandboxOptions): SandboxSession;
+}
+
+export interface ScouterThreat {
+  kind: string;
+  source: string;
+  score_impact: number;
+  detail: string;
+}
+
+export interface ContextHealthReport {
+  score: number;
+  grade: string;
+  max_entropy: number;
+  zipf_dev: number;
+  efficiency_ratio: number;
+  threats: ScouterThreat[];
+}
+
+export interface BrainHealthReport {
+  score: number;
+  grade: string;
+  cluster_variance: number;
+  contradiction_count: number;
+  gravity_traps: number;
+  threats: ScouterThreat[];
+}
+
+export interface ScouterStatus {
+  contextScore: number;
+  brainScore: number;
+  totalAlerts: number;
+  recentThreats: ScouterThreat[];
+}
+
+export interface SofuuScouter {
+  contextHealth(messages: Array<{ role: string; content: string }>, lastToolOutput?: string | null, totalTokens?: number): string;
+  brainHealth(items: Array<{ text: string; vector: number[]; hits?: number; age?: number }>): string;
+  status(): string;
+  sanitizeAnsi(text: string): string;
 }
 
 /* ================================================================== 

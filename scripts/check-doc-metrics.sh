@@ -29,8 +29,8 @@ skip() {
     case "$1" in
         BENCHMARKS.md|CHANGELOG.md) return 0 ;;
         docs/archive/*)             return 0 ;;
-        *AUDIT*|*SESSION*)          return 0 ;;
-        docs/*AUDIT*|docs/*SESSION*|docs/*PLAN*) return 0 ;;
+        *AUDIT*|*SESSION*|*PLAN*)   return 0 ;;
+        docs/*AUDIT*|docs/*SESSION*|docs/*PLAN*|docs/plans/*|docs/audits/*) return 0 ;;
     esac
     return 1
 }

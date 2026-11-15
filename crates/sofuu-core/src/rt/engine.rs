@@ -534,6 +534,11 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         crate::rt::wasm_plugin::mod_wasm_register(ctx);
     }
 
+    // PLAN-SCOUTER: Tamper-proof mathematical context & brain health monitor (sofuu.scouter.*)
+    unsafe {
+        crate::rt::scouter::mod_scouter_register(ctx);
+    }
+
     // Subsystem capsule declarative dispatch (PLAN-ZERO-RISK-MODULARIZATION §3.2)
     if let Err(err) = crate::domains::init_subsystems(ctx) {
         eprintln!("[sofuu:fatal] Failed to initialize subsystem capsules: {}", err);

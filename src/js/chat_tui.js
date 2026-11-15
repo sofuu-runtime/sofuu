@@ -281,6 +281,30 @@
     }
     out('');
   }
+  function showScouterDiagnostics() {
+    if (typeof sofuu === 'undefined' || !sofuu.scouter) {
+      out('\x1b[90m  Scouter unavailable\x1b[0m\n');
+      return;
+    }
+    let r = null, st = null;
+    try { r = JSON.parse(sofuu.scouter.contextHealth(history, null, usedCtx)); } catch (e) { /* advisory */ }
+    try { st = JSON.parse(sofuu.scouter.status()); } catch (e) { /* advisory */ }
+    out('\n\x1b[1m  Scouter Health & Diagnostics\x1b[0m \x1b[90m(Pure Math)\x1b[0m');
+    const cs = (r && typeof r.score === 'number') ? r.score : (st ? st.contextScore : 100);
+    const bs = st ? st.brainScore : 100;
+    const cg = (s) => '\x1b[' + (s >= 90 ? T('ok') : (s >= 70 ? T('warn') : T('error'))) + 'm';
+    out('  ' + cg(cs) + '●\x1b[0m \x1b[1mContext:\x1b[0m ' + cg(cs) + cs + '%\x1b[0m \x1b[90m[' + ((r && r.grade) ? r.grade : (cs >= 90 ? 'A' : (cs >= 70 ? 'B' : 'F'))) + ']\x1b[0m');
+    if (r) out('    \x1b[90mEntropy: ' + (r.max_entropy || 0).toFixed(2) + ' b/B · Zipf Dev: ' + (r.zipf_dev || 0).toFixed(2) + ' · Efficiency: ' + ((r.efficiency_ratio || 1) * 100).toFixed(1) + '%\x1b[0m');
+    out('  ' + cg(bs) + '●\x1b[0m \x1b[1mBrain  :\x1b[0m ' + cg(bs) + bs + '%\x1b[0m \x1b[90m[' + (bs >= 90 ? 'A' : (bs >= 70 ? 'B' : 'F')) + ']\x1b[0m');
+    const ths = (r && r.threats && r.threats.length) ? r.threats : ((st && st.recentThreats) ? st.recentThreats : []);
+    if (ths.length) {
+      out('\n  \x1b[1;33m⚠ Active Threats (' + ths.length + '):\x1b[0m');
+      for (const t of ths) out('    \x1b[31m▸\x1b[0m \x1b[1m' + t.kind + '\x1b[0m \x1b[90m[' + t.source + ' -' + t.score_impact + ']\x1b[0m: ' + t.detail);
+    } else {
+      out('\n  \x1b[32m✓ Context & Brain healthy — no active threats.\x1b[0m');
+    }
+    out('');
+  }
   async function handlePluginsCmd() {
     if (!sofuu.plugins) {
       out('\x1b[90m  plugin runtime unavailable\x1b[0m\n');
@@ -3936,6 +3960,15 @@
       }
       history.push({ role: 'assistant', content: answer });
       await trimHistory();
+      try {
+        if (typeof sofuu !== 'undefined' && sofuu.scouter) {
+          const lt = (turnTranscript && turnTranscript.length) ? String(turnTranscript[turnTranscript.length - 1].content || '') : null;
+          const rep = JSON.parse(sofuu.scouter.contextHealth(history, lt, usedCtx));
+          if (rep && rep.threats && rep.threats.length && rep.score < 75) {
+            out('\x1b[33m  ⚠ [SCOUTER] Potential threat detected (' + rep.score + '% [' + rep.grade + ']) — run /scouter\x1b[0m');
+          }
+        }
+      } catch (eScouterEval) { /* advisory */ }
     }
     /* Meter: re-estimate for the NEXT request. With transcripts retained
      * (2026-09-03 e) the settled value stays close to the live one — it
@@ -4281,6 +4314,14 @@
      * brain is off. The per-turn usage chip rides the SAME row (left of
      * RAM): "ctx 2.4k/128k · brain · in 30k · out 800 · $0.0121". */
     if (cfg.brain) { ctxMet = ctxMet + dim(' · brain'); }
+    try {
+      if (typeof sofuu !== 'undefined' && sofuu.scouter) {
+        const sc = JSON.parse(sofuu.scouter.status());
+        const ch = (v) => ' \x1b[' + (v >= 90 ? T('ok') : (v >= 70 ? T('warn') : T('error'))) + 'm[H:' + v + '%]\x1b[0m';
+        if (sc && typeof sc.contextScore === 'number') ctxMet += ch(sc.contextScore);
+        if (cfg.brain && sc && typeof sc.brainScore === 'number') ctxMet += ch(sc.brainScore);
+      }
+    } catch (eScouter) { /* advisory */ }
     if (chip) { ctxMet = ctxMet + dim(' · ' + chip); }
     let ramMet = '';
     try {
@@ -4985,6 +5026,7 @@
         else if (r === 'tools') { await connectMcpServers(); showTools(); }
         else if (r === 'plugins') { await handlePluginsCmd(); }
         else if (r === 'agents') { await handleAgentsCmd(); }
+        else if (r === 'scouter' || r === 'health') { showScouterDiagnostics(); }
         // F1–F11 feature dispatch
         else if (r === 'remember') { await handleRemember(t.replace(/^\/remember\s*/, '').trim()); }
         else if (r === 'why') { handleWhy(); }

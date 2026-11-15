@@ -287,6 +287,7 @@ pub trait CapHost {
 pub struct RuntimeHost {
     physical: Option<SimHost>,
     blocked_live: Vec<String>,
+    alert_sink: Option<String>,
     pub(crate) actions: Vec<Action>,
     pub(crate) logs: Vec<(String, String)>,
     log_bytes: usize,
@@ -299,12 +300,21 @@ const MAX_ACTION_RECORDS: usize = 4096;
 
 impl RuntimeHost {
     pub fn new(state: SimState, physical_sim: Vec<String>, blocked_live: Vec<String>) -> Self {
+        Self::with_alert(state, physical_sim, blocked_live, None)
+    }
+
+    pub fn with_alert(
+        state: SimState,
+        physical_sim: Vec<String>,
+        blocked_live: Vec<String>,
+        alert_sink: Option<String>,
+    ) -> Self {
         let physical = if physical_sim.is_empty() {
             None
         } else {
             Some(SimHost::with_simulated(state, physical_sim))
         };
-        Self { physical, blocked_live, actions: Vec::new(), logs: Vec::new(), log_bytes: 0, seq: 0 }
+        Self { physical, blocked_live, alert_sink, actions: Vec::new(), logs: Vec::new(), log_bytes: 0, seq: 0 }
     }
 
     pub(crate) fn note(&mut self, family: &str, op: &str, args: &[String], result: String) {
@@ -397,6 +407,16 @@ impl CapHost for RuntimeHost {
                     Ok(Value::Unit)
                 }
             }
+            ("alert", "send") => {
+                let Some(sink) = self.alert_sink.as_deref().filter(|s| !s.is_empty()) else {
+                    return Err("E_CAP_MISSING: embedded Kaze has no available backend for alert.send".to_string());
+                };
+                let msg = str_at(args, 0, arena);
+                if msg.is_empty() || msg.len() > 1024 {
+                    return Err("E_KAZE_RANGE: alert message must contain 1 to 1024 bytes".to_string());
+                }
+                deliver_alert_msg(sink, &msg)
+            }
             _ => Err(format!("E_CAP_MISSING: embedded Kaze has no available backend for {}.{}", family, op)),
         };
         let rendered = match &result {
@@ -409,6 +429,30 @@ impl CapHost for RuntimeHost {
         self.note(family, op, &shown, rendered);
         result
     }
+}
+
+fn deliver_alert_msg(sink: &str, msg: &str) -> Result<Value, String> {
+    use std::io::Write;
+    let line = format!("[ALERT] {}\n", msg);
+    let bytes = line.as_bytes();
+    let res = match sink {
+        "stdout" => std::io::stdout().write_all(bytes),
+        "stderr" => std::io::stderr().write_all(bytes),
+        s if s.starts_with("file:") => {
+            let path = &s[5..];
+            if path.is_empty() {
+                return Err("E_CONFIG: empty file path for alert sink".to_string());
+            }
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .and_then(|mut f| f.write_all(bytes))
+        }
+        unsupported => return Err(format!("E_CONFIG: unsupported alert sink '{}'", unsupported)),
+    };
+    res.map_err(|e| format!("E_IO: failed to deliver alert: {}", e))?;
+    Ok(Value::Unit)
 }
 
 /// Physical test simulation only. This host cannot answer AI, tool, memory,

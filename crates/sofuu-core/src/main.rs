@@ -303,7 +303,7 @@ fn wants_help(args: &[String]) -> bool {
         Some(first) if first.starts_with('-') => {
             args[2..].iter().any(|a| a == "-h" || a == "--help")
         }
-        Some(first) => {
+        Some(_) => {
             /* CLI-007..009/CLI-075 (AUDIT-2026-11-08): 35 subcommands ignored
              * a trailing --help, and 'plugin init --help' scaffolded a plugin
              * literally named --help.ts. A management subcommand answers
@@ -3814,11 +3814,9 @@ fn main() -> ExitCode {
             // `--score` may directly follow the model — the prompt is unused
             // when scoring: `sofuu infer <model> --score <file>`.
             let mut prompt = prompt.clone();
-            let mut i = i; // shadowed below; keep parse-loop position mutable
             if args.len() > 4 && args[3] == "--score" {
                 score_path = Some(args[4].clone());
                 prompt = String::new();
-                i = 5;
             }
             if chat {
                 let tmpl = sofuu_core::infer::gguf::GgufFile::open(model_path)

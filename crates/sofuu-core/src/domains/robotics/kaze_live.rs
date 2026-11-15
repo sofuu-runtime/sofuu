@@ -42,8 +42,8 @@ pub const WARMUP_MS: u64 = 30_000;
 /// link did not answer.
 pub const DEFAULT_ACK_TIMEOUT_MS: u64 = 3_000;
 /// A cached reading is not evidence of the vehicle's current state forever.
-/// This is a conservative local limit, not a claim of physical safety.
-const TELEMETRY_MAX_AGE: Duration = Duration::from_secs(3);
+/// Enforces the strict 1.5s heartbeat safety window across robotics.
+const TELEMETRY_MAX_AGE: Duration = Duration::from_millis(1500);
 
 /// What the autopilot last told us. Updated by the receiver thread; read by
 /// `drone.telemetry(...)`, never invented.

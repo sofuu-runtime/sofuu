@@ -5,6 +5,8 @@
 //! promise persistence, semantic search, or cross-run sharing. The VM has
 //! already enforced declarations, grants and policy before calling this host.
 
+use std::path::PathBuf;
+
 use serde_json::{Map, Number, Value as Json};
 
 use crate::memory::cma::Cma;
@@ -18,6 +20,20 @@ const MAX_BYTES: usize = 256 * 1024;
 const MAX_LABEL_BYTES: usize = 1024;
 const MAX_VALUE_DEPTH: usize = 16;
 const MAX_VALUE_NODES: usize = 4096;
+
+fn validate_label(value: Option<&Value>, arena: &Arena) -> Result<String, String> {
+    let Some(Value::Str(text)) = value else {
+        return Err("E_KAZE_MEMORY: memory label must be nonempty text".into());
+    };
+    let text = arena.get(*text);
+    if text.is_empty() || text.len() > MAX_LABEL_BYTES {
+        return Err(format!(
+            "E_KAZE_MEMORY: memory label must contain 1 to {} bytes",
+            MAX_LABEL_BYTES
+        ));
+    }
+    Ok(text.to_string())
+}
 
 pub(crate) struct EphemeralMemoryHost {
     base: RuntimeHost,
@@ -39,17 +55,7 @@ impl EphemeralMemoryHost {
     }
 
     fn label(value: Option<&Value>, arena: &Arena) -> Result<String, String> {
-        let Some(Value::Str(text)) = value else {
-            return Err("E_KAZE_MEMORY: memory label must be nonempty text".into());
-        };
-        let text = arena.get(*text);
-        if text.is_empty() || text.len() > MAX_LABEL_BYTES {
-            return Err(format!(
-                "E_KAZE_MEMORY: memory label must contain 1 to {} bytes",
-                MAX_LABEL_BYTES
-            ));
-        }
-        Ok(text.to_string())
+        validate_label(value, arena)
     }
 
     fn save(&mut self, args: &[Value], arena: &Arena, heap: &Heap) -> Result<Value, String> {
@@ -118,6 +124,136 @@ impl EphemeralMemoryHost {
 }
 
 impl CapHost for EphemeralMemoryHost {
+    fn call(
+        &mut self,
+        family: &str,
+        op: &str,
+        args: &[Value],
+        arena: &mut Arena,
+        heap: &mut Heap,
+    ) -> Result<Value, String> {
+        match (family, op) {
+            ("memory", "save") => {
+                self.base.check_trace_capacity()?;
+                self.save(args, arena, heap)
+            }
+            ("memory", "recall") => {
+                self.base.check_trace_capacity()?;
+                self.recall(args, arena, heap)
+            }
+            _ => self.base.call(family, op, args, arena, heap),
+        }
+    }
+
+    fn actions(&self) -> &[Action] {
+        self.base.actions()
+    }
+    fn logs(&self) -> &[(String, String)] {
+        self.base.logs()
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredRecord {
+    label: String,
+    value: Json,
+}
+
+pub(crate) struct DurableMemoryHost {
+    base: RuntimeHost,
+    path: PathBuf,
+}
+
+impl DurableMemoryHost {
+    pub(crate) fn new(base: RuntimeHost, path: PathBuf) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("E_KAZE_MEMORY: cannot create storage directory {}: {}", parent.display(), e))?;
+            }
+        }
+        Ok(Self { base, path })
+    }
+
+    fn read_records(&self) -> Result<Vec<StoredRecord>, String> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(b) if !b.is_empty() => b,
+            _ => return Ok(Vec::new()),
+        };
+        serde_json::from_slice(&bytes)
+            .map_err(|e| format!("E_KAZE_MEMORY: corrupt storage data in {}: {}", self.path.display(), e))
+    }
+
+    fn write_records(&mut self, records: &[StoredRecord]) -> Result<(), String> {
+        let serialized = serde_json::to_vec(records)
+            .map_err(|e| format!("E_KAZE_MEMORY: failed to serialize records: {}", e))?;
+        if serialized.len() > MAX_BYTES {
+            return Err("E_KAZE_MEMORY: per-run durable memory limit reached".into());
+        }
+        let tmp_path = format!("{}.tmp.{}", self.path.display(), std::process::id());
+        std::fs::write(&tmp_path, &serialized)
+            .map_err(|e| format!("E_KAZE_MEMORY: cannot write temporary storage file {}: {}", tmp_path, e))?;
+        std::fs::rename(&tmp_path, &self.path)
+            .map_err(|e| format!("E_KAZE_MEMORY: cannot commit storage file {}: {}", self.path.display(), e))?;
+        Ok(())
+    }
+
+    fn save(&mut self, args: &[Value], arena: &Arena, heap: &Heap) -> Result<Value, String> {
+        if args.len() != 2 {
+            return Err("E_KAZE_MEMORY: memory.save requires a label and a value".into());
+        }
+        let label = validate_label(args.first(), arena)?;
+        let mut nodes = 0;
+        let value = to_json(args[1], arena, heap, 0, &mut nodes)?;
+        let mut records = self.read_records()?;
+        if records.len() >= MAX_RECORDS {
+            return Err("E_KAZE_MEMORY: per-run durable memory limit reached".into());
+        }
+        records.push(StoredRecord { label, value });
+        self.write_records(&records)?;
+        self.base.note(
+            "memory",
+            "save",
+            &["<redacted>".into()],
+            "stored in durable file".into(),
+        );
+        Ok(Value::Unit)
+    }
+
+    fn recall(
+        &mut self,
+        args: &[Value],
+        arena: &mut Arena,
+        heap: &mut Heap,
+    ) -> Result<Value, String> {
+        if args.len() != 1 {
+            return Err("E_KAZE_MEMORY: memory.recall requires one label".into());
+        }
+        let label = validate_label(args.first(), arena)?;
+        let records = self.read_records()?;
+        let mut matches = Vec::new();
+        for record in records {
+            if record.label == label {
+                matches.push(
+                    crate::sfs::json_to_value(&record.value, arena, heap)
+                        .map_err(|e| format!("E_KAZE_MEMORY: {}", e))?,
+                );
+            }
+        }
+        let value = heap
+            .push_array(matches)
+            .map_err(|e| format!("E_KAZE_MEMORY: {}", e))?;
+        self.base.note(
+            "memory",
+            "recall",
+            &["<redacted>".into()],
+            "exact match in durable store".into(),
+        );
+        Ok(value)
+    }
+}
+
+impl CapHost for DurableMemoryHost {
     fn call(
         &mut self,
         family: &str,

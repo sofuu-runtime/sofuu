@@ -522,6 +522,47 @@ pub fn run_module(module: Module, name: &str, opts: &RunOptions) -> Result<RunRe
     run_prepared(Prepared { module, name: name.to_string(), from_bytecode: true }, opts)
 }
 
+fn build_cap_host(
+    opts: &RunOptions,
+    simulated_families: Vec<String>,
+    blocked_live: Vec<String>,
+) -> Result<Box<dyn CapHost>, KazeError> {
+    let alert_sink = opts
+        .backend
+        .iter()
+        .find(|(family, backend)| caps::family_of(family) == "alert" && !backend.is_empty())
+        .map(|(_, backend)| backend.clone());
+    let base_host = RuntimeHost::with_alert(
+        opts.sim.clone(),
+        simulated_families,
+        blocked_live,
+        alert_sink,
+    );
+    let memory_backend = opts
+        .backend
+        .iter()
+        .find(|(family, _)| caps::family_of(family) == "memory")
+        .map(|(_, backend)| backend.as_str());
+    match memory_backend {
+        Some("ephemeral") => Ok(Box::new(crate::rt::kaze_memory::EphemeralMemoryHost::new(base_host))),
+        Some("durable") => {
+            let default_path = std::path::PathBuf::from(".sofuu/kaze_memory.json");
+            Ok(Box::new(
+                crate::rt::kaze_memory::DurableMemoryHost::new(base_host, default_path)
+                    .map_err(|e| KazeError::new("E_CONFIG", e))?,
+            ))
+        }
+        Some(b) if b.starts_with("file:") || b.starts_with("path:") => {
+            let p = std::path::PathBuf::from(&b[5..]);
+            Ok(Box::new(
+                crate::rt::kaze_memory::DurableMemoryHost::new(base_host, p)
+                    .map_err(|e| KazeError::new("E_CONFIG", e))?,
+            ))
+        }
+        _ => Ok(Box::new(base_host)),
+    }
+}
+
 fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, KazeError> {
     let module = prepared.module;
     let declared = module.needs.clone();
@@ -551,16 +592,7 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
     if !opts.pins.is_empty() {
         blocked_live.push("device".to_string());
     }
-    let base_host = RuntimeHost::new(
-        opts.sim.clone(), simulated_families.clone(), blocked_live,
-    );
-    let use_ephemeral_memory = opts.backend.iter().any(|(family, backend)|
-        caps::family_of(family) == "memory" && backend == "ephemeral");
-    let mut host: Box<dyn CapHost> = if use_ephemeral_memory {
-        Box::new(crate::rt::kaze_memory::EphemeralMemoryHost::new(base_host))
-    } else {
-        Box::new(base_host)
-    };
+    let mut host = build_cap_host(opts, simulated_families.clone(), blocked_live)?;
     let limits = Limits { fuel: opts.fuel.max(1), heap_bytes: opts.heap_bytes, ..Limits::default() };
 
     let entry = resolve_entry(&module, opts)?;
@@ -802,14 +834,7 @@ fn create_async_run(
     if !opts.pins.is_empty() {
         blocked_live.push("device".to_string());
     }
-    let base_host = RuntimeHost::new(opts.sim.clone(), simulated_families.clone(), blocked_live);
-    let host: Box<dyn CapHost> = if opts.backend.iter().any(|(family, backend)|
-        caps::family_of(family) == "memory" && backend == "ephemeral")
-    {
-        Box::new(crate::rt::kaze_memory::EphemeralMemoryHost::new(base_host))
-    } else {
-        Box::new(base_host)
-    };
+    let host = build_cap_host(opts, simulated_families.clone(), blocked_live)?;
     let limits = Limits { fuel: opts.fuel.max(1), heap_bytes: opts.heap_bytes, ..Limits::default() };
     let mut vm = Vm::new_owned(
         module.clone(), host, declared, opts.grants.clone(), opts.policy.clone(), limits,

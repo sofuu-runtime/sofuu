@@ -96,7 +96,10 @@ pub fn validate_grant(family: &str, backend: &str) -> Result<(), Denial> {
         return Ok(());
     }
     let fam = crate::sfs::caps::family_of(family);
-    if fam == "memory" && name == "ephemeral" {
+    if fam == "memory" && (name == "ephemeral" || name == "durable" || name.starts_with("file:") || name.starts_with("path:")) {
+        return Ok(());
+    }
+    if fam == "alert" && (matches!(name, "stdout" | "stderr") || name.starts_with("file:")) {
         return Ok(());
     }
     if name == "sim" {
@@ -512,5 +515,10 @@ mod tests {
         assert_eq!(validate_grant("fan", "sim").unwrap_err().code, "E_CAP_INVALID");
         // A bare grant does not select a backend.
         assert!(validate_grant("drone", "").is_ok());
+        assert!(validate_grant("alert", "stdout").is_ok());
+        assert!(validate_grant("alert", "stderr").is_ok());
+        assert!(validate_grant("alert", "file:/tmp/alerts.log").is_ok());
+        assert!(validate_grant("memory", "durable").is_ok());
+        assert!(validate_grant("memory", "file:/tmp/mem.json").is_ok());
     }
 }

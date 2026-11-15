@@ -3525,7 +3525,7 @@
     for (var i = 0; i < entries.length; i++) {
       var e = String(entries[i]);
       if (e.charAt(0) === '.') continue;
-      if (e.slice(-3) !== '.js' && e.slice(-3) !== '.ts') continue;
+      if (e.slice(-3) !== '.js' && e.slice(-3) !== '.ts' && e.slice(-5) !== '.wasm') continue;
       if (e.slice(-5) === '.d.ts') continue;
       files.push(e);
     }
@@ -3534,6 +3534,31 @@
       var fname = files[f];
       var fpath = dir.replace(/\/+$/, '') + '/' + fname;
       var before = registrySnapshot();
+      if (fname.slice(-5) === '.wasm') {
+        try {
+          var wName = fname.slice(0, -5);
+          var mPath = fpath.replace(/\.wasm$/, '.manifest.json');
+          var wSchema = { type: 'object', properties: {} };
+          var wDesc = 'Zero-trust WASM plugin ' + wName;
+          var wFunc = 'run';
+          try {
+            if (await sofuu.fs.exists(mPath)) {
+              var mData = JSON.parse(String(await fsReadFile(mPath)));
+              if (mData.name) wName = mData.name;
+              if (mData.description) wDesc = mData.description;
+              if (mData.schema) wSchema = mData.schema;
+              if (mData.func) wFunc = mData.func;
+            }
+          } catch (eMf) { /* manifest optional */ }
+          P.defineWasmTool({ name: wName, description: wDesc, wasm: fpath, func: wFunc, schema: wSchema });
+          var addedW = registryDiff(before);
+          tagOrigin(addedW, fpath);
+          out.loaded.push({ file: fname, items: addedW });
+        } catch (eWasmErr) {
+          out.broken.push({ file: fname, error: String((eWasmErr && eWasmErr.message) || eWasmErr) });
+        }
+        continue;
+      }
       try {
         var src = String(await fsReadFile(fpath));
         var execSrc = pluginExecSource(src, /\.ts$/.test(fname));
@@ -3567,7 +3592,31 @@
     for (var i = 0; i < items.length; i++) {
       var it = items[i];
       if (typeof it === 'string') it = { source: it };
-      if (!it || !it.source || it.enabled === false) continue;
+      if (!it || it.enabled === false) continue;
+      if (it.mcp) {
+        var mcpName = String(it.mcp);
+        var shield = it.shield || {};
+        try {
+          var ingRes = await P.ingestMcp(mcpName, {
+            command: it.command,
+            args: it.args,
+            env: it.env,
+            url: it.url,
+            transport: it.transport,
+            timeoutMs: shield.timeoutMs || it.timeoutMs,
+            requiresApproval: shield.requiresApproval || it.requiresApproval,
+          });
+          if (ingRes && ingRes.ok) {
+            var mcpToolCount = (ingRes.tools && ingRes.tools.length) || 1;
+            total += mcpToolCount;
+            sources.push({ source: 'mcp:' + mcpName, loaded: mcpToolCount, broken: 0 });
+          }
+        } catch (eMcpIng) {
+          sources.push({ source: 'mcp:' + mcpName, error: String((eMcpIng && eMcpIng.message) || eMcpIng) });
+        }
+        continue;
+      }
+      if (!it.source) continue;
       var src2 = String(it.source);
       if (src2.charAt(0) !== '.' && src2.charAt(0) !== '/') continue;
       try {
@@ -3726,6 +3775,20 @@
   }
   P.cliValidate = async function (file) {
     try {
+      if (/\.wasm$/i.test(file)) {
+        if (!sofuu.wasm || typeof sofuu.wasm.validate !== 'function') {
+          console.error('Validation failed: WASM runtime is unavailable');
+          return cliExit(1);
+        }
+        var val = sofuu.wasm.validate(file);
+        if (!val || !val.valid) {
+          console.error('Validation failed: invalid WASM binary in ' + file);
+          return cliExit(1);
+        }
+        var expList = Array.isArray(val.exports) ? val.exports.join(', ') : 'none';
+        console.log('Plugin ' + file + ' is a valid WASM module (exports: ' + expList + ', pages: ' + val.pages + ')');
+        return;
+      }
       var src = String(await fsReadFile(file));
       var execSrc = pluginExecSource(src, /\.ts$/.test(file));
       var before = registrySnapshot();
@@ -4199,6 +4262,162 @@ export default defineTool({\n\
       console.error(String((e && e.message) || e));
       return cliExit(1);
     }
+  };
+
+  /* ══ Pillar 5: Zero-Trust WASM Tool Definition ═══════════════════════════ */
+  P.defineWasmTool = function defineWasmTool(opts) {
+    opts = opts || {};
+    var name = String(opts.name || '');
+    if (!name) throw makeError('E_SCHEMA', 'defineWasmTool requires a name');
+    var wasmRef = opts.wasm || opts.module || opts.file;
+    if (!wasmRef) throw makeError('E_SCHEMA', 'defineWasmTool requires a wasm file path or bytes');
+
+    if (sofuu.wasm && typeof sofuu.wasm.validate === 'function') {
+      var check = sofuu.wasm.validate(wasmRef);
+      if (!check || !check.valid) throw makeError('E_SCHEMA', 'invalid WASM module for ' + name);
+    }
+
+    var funcName = opts.func || opts.entry || 'run';
+    var fuel = typeof opts.fuel === 'number' ? opts.fuel : 500000;
+    var maxMem = typeof opts.maxMemoryMb === 'number' ? opts.maxMemoryMb : 32;
+
+    return P.defineTool({
+      name: name,
+      description: String(opts.description || ('Zero-trust WASM tool ' + name)),
+      schema: opts.schema || opts.parameters || { type: 'object', properties: {} },
+      timeoutMs: opts.timeoutMs || 15000,
+      requiresApproval: opts.requiresApproval,
+      category: 'wasm',
+      async run(args, ctx) {
+        if (!sofuu.wasm || typeof sofuu.wasm.run !== 'function') {
+          throw makeError('E_TOOL', 'WASM runtime is not available');
+        }
+        var callArgs = [];
+        if (Array.isArray(args)) callArgs = args;
+        else if (args && Array.isArray(args.args)) callArgs = args.args;
+        else if (args && typeof args === 'object') {
+          var vals = Object.values(args);
+          for (var vi = 0; vi < vals.length; vi++) {
+            if (typeof vals[vi] === 'number') callArgs.push(vals[vi]);
+          }
+        }
+        try {
+          var res = sofuu.wasm.run(wasmRef, funcName, callArgs, {
+            fuel: fuel,
+            maxMemoryMb: maxMem,
+          });
+          return res;
+        } catch (trapErr) {
+          var msg = String((trapErr && trapErr.message) || trapErr);
+          if (msg.indexOf('E_TIMEOUT') >= 0) throw makeError('E_TIMEOUT', msg);
+          if (msg.indexOf('E_OOM') >= 0) throw makeError('E_OOM', msg);
+          if (msg.indexOf('E_SCHEMA') >= 0) throw makeError('E_SCHEMA', msg);
+          throw makeError('E_TOOL', msg);
+        }
+      }
+    });
+  };
+
+  /* ══ Pillar 2: Universal Bi-Directional Bridge (Plugin -> MCP Server) ═══ */
+  P.exportAsMcp = function exportAsMcp(names, serverOpts) {
+    if (!sofuu.mcp || typeof sofuu.mcp.serve !== 'function') {
+      throw makeError('E_CAPABILITY', 'sofuu.mcp.serve is required to export plugins as MCP');
+    }
+    serverOpts = serverOpts || {};
+    var srv = sofuu.mcp.serve(serverOpts);
+    var toolKeys = Array.isArray(names) && names.length ? names : Object.keys(P.TOOLS);
+
+    for (var i = 0; i < toolKeys.length; i++) {
+      var tName = toolKeys[i];
+      var t = P.TOOLS[tName];
+      if (!t) continue;
+      var desc = t.description || ('Plugin tool ' + tName);
+      var schema = t.schema || t.parameters || { type: 'object', properties: {} };
+      (function (toolName, toolObj, toolDesc, toolSchema) {
+        srv.tool(toolName, { description: toolDesc, schema: toolSchema }, async function (args) {
+          if (sofuu.policy && typeof sofuu.policy.evaluate === 'function') {
+            var verdict = sofuu.policy.evaluate({
+              surface: 'mcp-export',
+              op: 'tool.run',
+              tool: toolName,
+              args: args
+            });
+            if (verdict && verdict.decision === 'deny') {
+              var err = new Error('E_DENIED: host policy denied exported plugin tool "' + toolName + '"');
+              err.code = 'E_DENIED';
+              throw err;
+            }
+          }
+          var inv = await P.invoke(toolName, args || {});
+          if (!inv || !inv.ok) {
+            var c = (inv && inv.error && inv.error.code) || 'E_TOOL';
+            var m = (inv && inv.error && inv.error.message) || 'plugin execution failed';
+            var throwErr = new Error(c + ': ' + m);
+            throwErr.code = c;
+            throw throwErr;
+          }
+          return inv.result;
+        });
+      })(tName, t, desc, schema);
+    }
+
+    if (P.STORES && serverOpts.exportStores !== false) {
+      for (var sName in P.STORES) {
+        if (!Object.prototype.hasOwnProperty.call(P.STORES, sName)) continue;
+        var store = P.STORES[sName];
+        (function (stName, stObj) {
+          srv.resource('sofuu://store/' + stName, { name: 'Storage ' + stName, mimeType: 'application/json' }, async function (uri) {
+            var allKeys = [];
+            if (typeof stObj.keys === 'function') {
+              try { allKeys = await stObj.keys(); } catch (eK) { /* optional keys listing */ }
+            }
+            return { uri: uri, text: JSON.stringify({ store: stName, keys: allKeys }) };
+          });
+        })(sName, store);
+      }
+    }
+
+    return srv;
+  };
+
+  P.cliServe = async function (args) {
+    args = Array.isArray(args) ? args : [];
+    await P.discoverAll();
+    var transport = 'stdio';
+    var port = 8765;
+    var path = '/mcp';
+    var names = [];
+    var authToken = '';
+
+    for (var i = 0; i < args.length; i++) {
+      var a = args[i];
+      if (a.indexOf('--transport=') === 0) transport = a.slice(12).toLowerCase();
+      else if (a === '--http') transport = 'http';
+      else if (a === '--stdio') transport = 'stdio';
+      else if (a.indexOf('--port=') === 0) port = parseInt(a.slice(7), 10) || port;
+      else if (a.indexOf('--path=') === 0) path = a.slice(7);
+      else if (a.indexOf('--auth-token=') === 0) authToken = a.slice(13);
+      else if (a.charAt(0) !== '-') names.push(a);
+    }
+
+    var serverOpts = {
+      name: 'sofuu-plugin-server',
+      transport: transport,
+      port: port,
+      path: path,
+    };
+    if (authToken) {
+      serverOpts.auth = { type: 'bearer', token: authToken };
+    }
+
+    var srv = P.exportAsMcp(names.length ? names : null, serverOpts);
+    var count = Object.keys(srv._tools || {}).length;
+    console.log('Serving ' + count + ' plugin tool(s) via MCP (' + transport + (transport === 'http' ? (':' + port + path) : '') + ')');
+
+    if (typeof srv.start === 'function') {
+      srv.start();
+    }
+    return 0;
   };
 
   /* ── Global primitive exports (the `import { ... } from 'sofuu'` path

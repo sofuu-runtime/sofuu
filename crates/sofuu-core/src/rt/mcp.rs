@@ -66,6 +66,17 @@ fn reserve_line_buf(buf: &mut Vec<u8>, read_len: usize, extra: usize) -> bool {
     buf.resize(cap.min(MCP_MAX_LINE), 0);
     true
 }
+
+/// PLAN-PLUGIN-MCP Track A.1: deterministic idle shrink threshold.
+/// When all pending lines have been consumed (read_len == 0) and the buffer
+/// was grown during a heavy payload burst (> 256 KiB), shrink it back to
+/// MCP_READ_BUF (64 KiB) so transient megabytes are released to the OS immediately.
+fn maybe_shrink_line_buf(buf: &mut Vec<u8>, read_len: usize) {
+    if read_len == 0 && buf.len() > 256 * 1024 {
+        buf.resize(MCP_READ_BUF, 0);
+        buf.shrink_to_fit();
+    }
+}
 const MAX_TOOLS: usize = 64;
 
 static ACTIVE_MCP_CHILDREN: Mutex<Vec<libc::pid_t>> = Mutex::new(Vec::new());
@@ -799,6 +810,7 @@ unsafe extern "C" fn mcp_on_read(stream: *mut UvStream, nread: isize, buf: *cons
         let remaining = c.read_len - head;
         c.read_buf.copy_within(head..c.read_len, 0);
         c.read_len = remaining;
+        maybe_shrink_line_buf(&mut c.read_buf, c.read_len);
 
         /* NOTE: no sofuu_flush_jobs here at all — we are inside a libuv
          * read callback; running JS re-enters the loop mid-dispatch and
@@ -2786,6 +2798,7 @@ unsafe extern "C" fn mcp_server_on_read(stream: *mut UvStream, nread: isize, buf
         let remaining = s.read_len - head;
         s.read_buf.copy_within(head..s.read_len, 0);
         s.read_len = remaining;
+        maybe_shrink_line_buf(&mut s.read_buf, s.read_len);
     }
 
     if !(*buf).base.is_null() {

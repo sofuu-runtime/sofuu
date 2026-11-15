@@ -3166,6 +3166,17 @@ unsafe extern "C" fn js_chat_gc(
     if !rt.is_null() {
         sofuu_ffi::qjs::JS_RunGC(rt);
     }
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+    #[cfg(target_os = "macos")]
+    unsafe {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: usize);
+        }
+        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+    }
     sofuu_ffi::qjs::sofuu_js_undefined()
 }
 

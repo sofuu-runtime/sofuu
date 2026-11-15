@@ -40,6 +40,7 @@ pub fn compile(program: &Program) -> Result<Module, CompileError> {
     };
     for item in &program.items {
         let mut cx = Cx {
+            needs: &program.needs,
             consts: &mut module.consts,
             caps: &mut module.caps,
             code: Vec::new(),
@@ -91,6 +92,7 @@ pub fn compile(program: &Program) -> Result<Module, CompileError> {
 }
 
 struct Cx<'a> {
+    needs: &'a [String],
     consts: &'a mut Vec<Const>,
     caps: &'a mut Vec<CapRef>,
     code: Vec<u32>,
@@ -277,7 +279,20 @@ impl<'a> Cx<'a> {
                 for a in args {
                     self.expr(a)?;
                 }
-                let family = caps::family_of(recv);
+                let is_mcp_or_plugin = self.needs.iter().any(|d| {
+                    if let Some(rest) = d.strip_prefix("mcp(") {
+                        rest.trim_end_matches(')').trim_matches('"') == recv
+                    } else if let Some(rest) = d.strip_prefix("plugin(") {
+                        rest.trim_end_matches(')').trim_matches('"') == recv
+                    } else {
+                        false
+                    }
+                });
+                let family = if is_mcp_or_plugin {
+                    recv.as_str()
+                } else {
+                    caps::family_of(recv)
+                };
                 let cap = self.push_cap(family, op, args.len() as u8)?;
                 self.emit_wide(Op::CallCap, args.len() as u8, cap);
             }

@@ -61,6 +61,7 @@ pub mod deadline; // sofuu.host.armDeadline/disarmDeadline: JS-callable interrup
 pub mod interrupt; // P1-14: the engine runtime's one interrupt slot + the regexp budget
 pub mod session_js; // PLAN-DESKTOP C: sync session-mesh primitives for shipped chat.js
 pub mod tui; // M10: io/tui.c — the chat alt-screen renderer (tui_* exports)
+pub mod wasm_plugin; // PLAN-PLUGIN-MCP Pillar 5: Zero-trust WASM plugin sandbox
 
 /// End the process the way a default SIGPIPE disposition would have: quietly,
 /// with status 141 and no output.

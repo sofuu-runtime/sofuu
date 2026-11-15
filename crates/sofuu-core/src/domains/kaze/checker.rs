@@ -263,6 +263,23 @@ fn infer(
             Ty::Any
         }
         Expr::Call { recv, op, args, line } => {
+            let is_mcp_or_plugin = declared.iter().any(|d| {
+                if let Some(rest) = d.strip_prefix("mcp(") {
+                    let inner = rest.trim_end_matches(')').trim_matches('"');
+                    inner == recv
+                } else if let Some(rest) = d.strip_prefix("plugin(") {
+                    let inner = rest.trim_end_matches(')').trim_matches('"');
+                    inner == recv
+                } else {
+                    false
+                }
+            });
+            if is_mcp_or_plugin {
+                for a in args {
+                    infer(a, scope, declared, errors);
+                }
+                return Ty::Any;
+            }
             let family = caps::family_of(recv);
             if !declared.iter().any(|d| *d == recv || caps::family_of(d) == family) {
                 errors.push(e(
@@ -431,6 +448,7 @@ mod tests {
             "needs: rover, lidar, log\n\nevery 100ms:\n    let front = lidar.front_distance()\n    if front < 0.5 meters:\n        log warning \"obstacle\"\n        stop rover\n        turn right by 90 degrees\n    otherwise:\n        drive forward at 1.2 m/s\n",
             "needs: sensor, fan, mister, alert\n\ncheck climate(t, h):\n    if sensor.temperature() > t + 2:\n        turn on fan\n        send alert \"cooling\"\n    otherwise:\n        turn off fan\n    if sensor.humidity() < h:\n        pulse mister for 5 seconds\n",
             "needs: memory, policy\n\nfilter user_prompt(prompt):\n    if length of prompt > 2000:\n        reject with \"too long\"\n    if policy detects secrets in prompt:\n        reject with \"secrets\"\n    remember prompt as \"last\"\n    allow prompt\n",
+            "needs: mcp(\"blender\"), plugin(\"github_repo\")\n\naction inspect_scene():\n    let info = blender.get_scene_info()\n    return info\n",
         ] {
             check_src(src).unwrap_or_else(|e| panic!("{}", e[0].msg));
         }

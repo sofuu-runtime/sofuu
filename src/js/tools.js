@@ -2045,6 +2045,24 @@
             }
             httpServer = sofuu.http.createServer(async function (req, res) {
               var headers = req.headers || {};
+              var expectedToken = '';
+              if (opts.auth && opts.auth.type === 'bearer') {
+                if (opts.auth.token) expectedToken = String(opts.auth.token);
+                else if (opts.auth.secretEnv) expectedToken = String(envOf()[opts.auth.secretEnv] || '');
+              }
+              if (expectedToken) {
+                var authHeader = String(headers['authorization'] || headers['Authorization'] || '');
+                var prefix = 'Bearer ';
+                if (!authHeader.startsWith(prefix) || authHeader.slice(prefix.length).trim() !== expectedToken) {
+                  res.writeHead(401, { 'Content-Type': 'application/json' });
+                  res.end(JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: null,
+                    error: { code: -32000, message: 'Unauthorized: invalid or missing bearer token' }
+                  }));
+                  return;
+                }
+              }
               var rawPath = String(req.url || '/');
               var qMark = rawPath.indexOf('?');
               if (qMark >= 0) rawPath = rawPath.slice(0, qMark);
@@ -2537,6 +2555,10 @@
       try { requireMcpPolicy('net.fetch', { host: host }); }
       catch (eNet) { return Promise.reject(eNet); }
       var baseHeaders = { 'content-type': 'application/json', 'accept': 'application/json, text/event-stream' };
+      if (cfg.auth && cfg.auth.type === 'bearer') {
+        var tok = cfg.auth.token || (cfg.auth.secretEnv && envOf()[cfg.auth.secretEnv]);
+        if (tok) baseHeaders['authorization'] = 'Bearer ' + String(tok);
+      }
       if (cfg.headers && typeof cfg.headers === 'object') {
         for (var hk in cfg.headers) {
           if (Object.prototype.hasOwnProperty.call(cfg.headers, hk)) baseHeaders[hk.toLowerCase()] = String(cfg.headers[hk]);
@@ -2962,6 +2984,7 @@
         if (src.env && typeof src.env === 'object') cfg.env = src.env;
         if (typeof src.cwd === 'string' && src.cwd) cfg.cwd = src.cwd;
         if (src.headers && typeof src.headers === 'object') cfg.headers = src.headers;
+        if (src.auth && typeof src.auth === 'object') cfg.auth = src.auth;
       }
       var transport = '';
       if (arg && typeof arg === 'object' && arg.transport) transport = String(arg.transport);
@@ -3711,6 +3734,153 @@
       try { h.kill(); n++; } catch (eK) { /* the process already exited; it is still removed from the list. */ }
     }
     return n;
+  };
+
+  /* ══ Pillar 1: Tool RAG — Semantic Tool Retrieval via CMA ══════════════ */
+  var _toolsCatalog = {};
+
+  function toolDescriptorText(tool) {
+    if (!tool) return '';
+    var name = String(tool.name || '');
+    var desc = String(tool.description || tool.summary || '');
+    var params = '';
+    var schema = tool.parameters || tool.schema;
+    if (schema && typeof schema === 'object' && schema.properties) {
+      params = Object.keys(schema.properties).join(' ');
+    }
+    return (name + ' ' + desc + ' ' + params).trim();
+  }
+
+  function computeToolVector(text) {
+    if (sofuu.ai && typeof sofuu.ai.embedLocal === 'function') {
+      try {
+        var v = sofuu.ai.embedLocal(text, 64);
+        if (v && v.length) return v;
+      } catch (eEmb) { /* fallback below */ }
+    }
+    var dim = 64;
+    var vec = new Float32Array(dim);
+    var str = text.toLowerCase();
+    for (var i = 0; i < str.length - 2; i++) {
+      var h = (str.charCodeAt(i) * 31 + str.charCodeAt(i + 1)) * 31 + str.charCodeAt(i + 2);
+      var idx = Math.abs(h % dim);
+      vec[idx] += 1.0;
+    }
+    var norm = 0;
+    for (var k = 0; k < dim; k++) norm += vec[k] * vec[k];
+    if (norm > 0) {
+      norm = Math.sqrt(norm);
+      for (var j = 0; j < dim; j++) vec[j] /= norm;
+    }
+    return vec;
+  }
+
+  function vectorCosine(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+    if (sofuu.ai && typeof sofuu.ai.similarity === 'function') {
+      try { return sofuu.ai.similarity(a, b); } catch (eSim) { /* fallback to manual dot product */ }
+    }
+    var dot = 0, nA = 0, nB = 0;
+    for (var i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      nA += a[i] * a[i];
+      nB += b[i] * b[i];
+    }
+    if (nA === 0 || nB === 0) return 0;
+    return dot / (Math.sqrt(nA) * Math.sqrt(nB));
+  }
+
+  sofuu.tools.indexCatalog = function (toolsList) {
+    if (!Array.isArray(toolsList)) return 0;
+    var indexed = 0;
+    for (var i = 0; i < toolsList.length; i++) {
+      var t = toolsList[i];
+      if (!t || !t.name) continue;
+      var txt = toolDescriptorText(t);
+      var vec = computeToolVector(txt);
+      _toolsCatalog[t.name] = { tool: t, vec: vec, text: txt };
+      indexed++;
+    }
+    return indexed;
+  };
+
+  sofuu.tools.semanticSelect = function (query, tools, opts) {
+    opts = opts || {};
+    var topK = typeof opts.topK === 'number' && opts.topK > 0 ? opts.topK : 8;
+    var minScore = typeof opts.minScore === 'number' ? opts.minScore : 0.15;
+    var alwaysInclude = Array.isArray(opts.alwaysInclude) ? opts.alwaysInclude : [];
+    var alwaysMap = {};
+    for (var a = 0; a < alwaysInclude.length; a++) alwaysMap[alwaysInclude[a]] = 1;
+
+    var candidateList = Array.isArray(tools) ? tools : [];
+    if (candidateList.length <= topK) {
+      return candidateList.slice();
+    }
+
+    var qText = String(query || '').trim();
+    if (!qText) {
+      return candidateList.slice(0, topK);
+    }
+    var qVec = computeToolVector(qText);
+
+    var scored = [];
+    var pinned = [];
+    var seenNames = {};
+
+    for (var i = 0; i < candidateList.length; i++) {
+      var tool = candidateList[i];
+      var name = String(tool.name || '');
+      if (seenNames[name]) continue;
+      seenNames[name] = 1;
+
+      if (alwaysMap[name] || tool.alwaysInclude === true || tool.pinned === true) {
+        pinned.push(tool);
+        continue;
+      }
+
+      var cached = _toolsCatalog[name];
+      var tVec = (cached && cached.vec) || computeToolVector(toolDescriptorText(tool));
+      var score = vectorCosine(qVec, tVec);
+      scored.push({ tool: tool, score: score });
+    }
+
+    scored.sort(function (x, y) { return y.score - x.score; });
+
+    var selected = pinned.slice();
+    for (var s = 0; s < scored.length && selected.length < topK; s++) {
+      if (scored[s].score >= minScore || selected.length < Math.min(topK, 4)) {
+        selected.push(scored[s].tool);
+      }
+    }
+
+    if (candidateList.length > selected.length) {
+      var hasDiscover = selected.some(function (t) { return t.name === 'tools_discover'; });
+      if (!hasDiscover) {
+        selected.push({
+          name: 'tools_discover',
+          description: 'Search available tools in the catalog by query or capability keyword to discover and load additional specialized tools mid-turn.',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: 'The tool capability or domain keyword to discover' }
+            },
+            required: ['query']
+          },
+          execute: async function (args) {
+            var subQuery = (args && args.query) || '';
+            var matches = sofuu.tools.semanticSelect(subQuery, candidateList, { topK: 5, minScore: 0.1 });
+            var report = [];
+            for (var m = 0; m < matches.length; m++) {
+              if (matches[m].name === 'tools_discover') continue;
+              report.push('- ' + matches[m].name + ': ' + (matches[m].description || 'no description'));
+            }
+            return report.length ? ('Discovered tools:\n' + report.join('\n')) : 'No additional matching tools found.';
+          }
+        });
+      }
+    }
+
+    return selected;
   };
 
   /* ── H-01: install the one policy wrapper on EVERY executor ──────────

@@ -474,7 +474,24 @@
     S.history = [{ role: 'system', content: 'Prior conversation summary: ' + summary }].concat(S.history.slice(oldCount));
     return true;
   }
+  function foldHistoricalToolResults(history) {
+    if (!Array.isArray(history)) return;
+    for (var i = 0; i < history.length; i++) {
+      var m = history[i];
+      if (m && m.role === 'tool' && typeof m.content === 'string' && m.content.length > 512) {
+        if (m.content.indexOf('[folded tool output') !== 0) {
+          var preview = m.content.slice(0, 120).replace(/\s+/g, ' ').trim();
+          var toolName = m.name || (m.tool_call_id ? ('call ' + m.tool_call_id) : 'tool');
+          var ref = m.tool_call_id || ('#res_' + i);
+          m._fullContent = m.content;
+          m.content = '[folded tool output for ' + toolName + ' (' + m.content.length + ' chars): ' + preview + '…; ref=' + ref + ']';
+        }
+      }
+    }
+  }
+
   async function trimHistory() {
+    foldHistoricalToolResults(S.history);
     /* Hard safety net: the absolute entry cap — shed whole turn blocks from
      * the front so retained tool transcripts are never orphaned. */
     if (S.history.length > MAX_HISTORY_ENTRIES) {
@@ -1021,6 +1038,9 @@
         }));
         names[pt.name] = 1;
       }
+    }
+    if (defs.length > 8 && sofuu.tools && typeof sofuu.tools.indexCatalog === 'function') {
+      try { sofuu.tools.indexCatalog(defs); } catch (eIdx) { /* non-fatal background index */ }
     }
     return defs;
   }

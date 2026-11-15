@@ -1639,14 +1639,21 @@ fn cmd_plugin(rt: &SofuuRuntime, args: &[String]) -> i32 {
     if args.len() < 3 {
         eprintln!("\x1b[1mUsage:\x1b[0m");
         eprintln!("  sofuu plugin list [--json]");
-        eprintln!("  sofuu plugin validate <file.js|file.ts>");
+        eprintln!("  sofuu plugin validate <file.js|file.ts|file.wasm>");
         eprintln!("  sofuu plugin run <tool_name> [args_json]");
         eprintln!("  sofuu plugin test <tool_name> [args_json]   (alias of run)");
+        eprintln!("  sofuu plugin serve [names...] [--transport=stdio|http] [--port=8765] [--path=/mcp]");
         eprintln!("  sofuu plugin init <name> [--category=tool|provider|store|vectorstore|service|openapi]");
         eprintln!("  sofuu plugin add <name> [--global] [--force]");
         return 1;
     }
     match args[2].as_str() {
+        "serve" => {
+            let subargs: Vec<String> = if args.len() >= 4 { args[3..].to_vec() } else { Vec::new() };
+            let sub_json = serde_json::to_string(&subargs).unwrap_or_else(|_| "[]".into());
+            let code = format!("sofuu.plugins.cliServe({sub_json})");
+            rt.eval_string(&code, "<plugin-serve>")
+        }
         "list" | "ls" => {
             let json = if args.iter().any(|a| a == "--json") { "true" } else { "false" };
             let code = format!("sofuu.plugins.cliList({json})");

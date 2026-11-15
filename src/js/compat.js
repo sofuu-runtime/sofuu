@@ -2200,11 +2200,11 @@ if (typeof globalThis.ReadableStream === "undefined") {
       if (Object.prototype.hasOwnProperty.call(opts, k)) nativeOpts[k] = opts[k];
     }
     nativeOpts.onStdout = function (chunk) {
-      if (typeof userOut === 'function') { try { userOut(chunk); } catch (e) {} }
+      if (typeof userOut === 'function') { try { userOut(chunk); } catch (e) { /* user callback exception ignored */ } }
       stdout.emit('data', chunk);
     };
     nativeOpts.onStderr = function (chunk) {
-      if (typeof userErr === 'function') { try { userErr(chunk); } catch (e) {} }
+      if (typeof userErr === 'function') { try { userErr(chunk); } catch (e) { /* user callback exception ignored */ } }
       stderr.emit('data', chunk);
     };
     nativeOpts.onExit = function (code, signal) {
@@ -2212,7 +2212,7 @@ if (typeof globalThis.ReadableStream === "undefined") {
         code: (code === undefined || code === null) ? null : Number(code),
         signal: (!signal) ? null : Number(signal),
       };
-      try { if (typeof userExit === 'function') userExit(res.code, res.signal); } catch (e) {}
+      try { if (typeof userExit === 'function') userExit(res.code, res.signal); } catch (e) { /* user exit callback exception ignored */ }
       stdout.emit('end');
       stderr.emit('end');
       resolveExit(res);
@@ -2401,8 +2401,8 @@ if (typeof globalThis.ReadableStream === "undefined") {
         return nsRef;
       };
     })(ns, verb);
-    for (var k in ns) { try { callable[k] = ns[k]; } catch (e) { } }
+    for (var k in ns) { try { callable[k] = ns[k]; } catch (e) { /* non-configurable property copy */ } }
     callable.__sofuuNamespace = name;
-    try { ml[name] = callable; } catch (e) { }
+    try { ml[name] = callable; } catch (e) { /* namespace assignment fallback */ }
   }
 })();

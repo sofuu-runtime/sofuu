@@ -146,7 +146,20 @@ pub fn authorise(
     // Declared resources resolve to families here exactly as the checker
     // resolved them: `needs: lidar` declares the `sensor` family, so the gate
     // and the front end can never disagree about whether a call is declared.
-    let declared_families = || declared.iter().any(|d| crate::sfs::caps::family_of(d) == family);
+    let declared_families = || declared.iter().any(|d| {
+        if d == family || crate::sfs::caps::family_of(d) == family {
+            return true;
+        }
+        if let Some(rest) = d.strip_prefix("mcp(") {
+            let inner = rest.trim_end_matches(')').trim_matches('"');
+            inner == family
+        } else if let Some(rest) = d.strip_prefix("plugin(") {
+            let inner = rest.trim_end_matches(')').trim_matches('"');
+            inner == family
+        } else {
+            false
+        }
+    });
     if !declared_families() {
         return Err(Denial::new(
             "E_CAP_UNDECLARED",

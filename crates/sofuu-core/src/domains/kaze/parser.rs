@@ -177,7 +177,27 @@ impl Parser {
             self.bump();
             self.expect_punct(':')?;
             loop {
-                let name = self.expect_ident()?;
+                let mut name = self.expect_ident()?;
+                if self.eat_punct('(') {
+                    let inner = match self.peek() {
+                        Tok::Str(s) => {
+                            let s = s.clone();
+                            self.bump();
+                            s
+                        }
+                        Tok::Ident(s) => {
+                            let s = s.clone();
+                            self.bump();
+                            s
+                        }
+                        _ => {
+                            let (l, c) = self.here();
+                            return err(l, c, "expected capability parameter name inside parentheses");
+                        }
+                    };
+                    self.expect_punct(')')?;
+                    name = format!("{name}(\"{inner}\")");
+                }
                 if self.needs.iter().any(|n| *n == name) {
                     let (l, c) = self.here();
                     return err(l, c, format!("'{}' is declared twice in needs:", name));
@@ -980,6 +1000,14 @@ mod tests {
         assert!(matches!(patrol.kind, ItemKind::Action));
         assert_eq!(patrol.params, vec!["points".to_string()]);
         assert!(matches!(p.items[1].kind, ItemKind::When(_)));
+    }
+
+    #[test]
+    fn parses_parameterized_mcp_and_plugin_needs() {
+        let src = "needs: mcp(\"blender\"), plugin(\"github_repo\")\n\naction inspect_scene():\n    return 42\n";
+        let p = ok(src);
+        assert_eq!(p.needs, vec!["mcp(\"blender\")".to_string(), "plugin(\"github_repo\")".to_string()]);
+        assert_eq!(p.items.len(), 1);
     }
 
     #[test]

@@ -681,6 +681,82 @@
   var PROGRESSIVE_KEEP_FULL = {
     remember: 1, delegate: 1, map_context: 1, todo_write: 1, tool_schema: 1,
   };
+
+  /* ══ Track P0-B: Multi-Layer Context Compression ═════════════════════════ */
+  function minifyToolSchema(spec) {
+    if (!spec || typeof spec !== 'object') return spec;
+    var out = {
+      name: spec.name,
+      description: clip(String(spec.description || ''), 160),
+    };
+    if (spec.parameters && typeof spec.parameters === 'object') {
+      var p = spec.parameters;
+      var props = {};
+      var origProps = p.properties || {};
+      for (var k in origProps) {
+        if (!Object.prototype.hasOwnProperty.call(origProps, k)) continue;
+        var prop = origProps[k];
+        if (!prop || typeof prop !== 'object') continue;
+        var cleanProp = {
+          type: prop.type || 'string',
+        };
+        if (prop.description) {
+          var d = String(prop.description).split(/[\r\n.]/)[0].trim();
+          cleanProp.description = d.length > 85 ? d.slice(0, 82) + '…' : d;
+        }
+        if (Array.isArray(prop.enum)) cleanProp.enum = prop.enum;
+        if (prop.items && typeof prop.items === 'object') {
+          cleanProp.items = { type: prop.items.type || 'string' };
+        }
+        props[k] = cleanProp;
+      }
+      out.parameters = {
+        type: 'object',
+        properties: props,
+      };
+      if (Array.isArray(p.required) && p.required.length) {
+        out.parameters.required = p.required;
+      }
+    }
+    return out;
+  }
+
+  function stripReasoningTraces(messages) {
+    if (!Array.isArray(messages)) return messages;
+    var out = [];
+    for (var i = 0; i < messages.length; i++) {
+      var m = messages[i];
+      if (m && m.role === 'assistant' && typeof m.content === 'string' && m.content.indexOf('<think>') !== -1) {
+        var stripped = m.content.replace(/<think>[\s\S]*?<\/think>\s*/gi, '').trim();
+        out.push(Object.assign({}, m, { content: stripped }));
+      } else {
+        out.push(m);
+      }
+    }
+    return out;
+  }
+
+  function foldHistoricalToolResults(messages) {
+    if (!Array.isArray(messages)) return messages;
+    var out = [];
+    for (var i = 0; i < messages.length; i++) {
+      var m = messages[i];
+      if (m && m.role === 'tool' && typeof m.content === 'string' && m.content.length > 512) {
+        if (m.content.indexOf('[folded tool output') !== 0) {
+          var preview = m.content.slice(0, 120).replace(/\s+/g, ' ').trim();
+          var toolName = m.name || (m.tool_call_id ? ('call ' + m.tool_call_id) : 'tool');
+          var ref = m.tool_call_id || ('#res_' + i);
+          out.push(Object.assign({}, m, {
+            _fullContent: m.content,
+            content: '[folded tool output for ' + toolName + ' (' + m.content.length + ' chars): ' + preview + '…; ref=' + ref + ']'
+          }));
+          continue;
+        }
+      }
+      out.push(m);
+    }
+    return out;
+  }
   /* Recall gating — similarity floor + block token budget (defaults;
    * per-def recallMin / recallBudget override). Calibrated for the bundled
    * TF-IDF embedder where unrelated text scores ~0.27 and paraphrases >0.35
@@ -1070,6 +1146,7 @@
        * config predates sofuu_rt_register_host_tool. */
       hostTools: [],
       toolTimeoutMs: (def.toolTimeoutMs | 0) || TOOL_TIMEOUT_MS,
+      toolSelection: (def.toolSelection && typeof def.toolSelection === 'object') ? def.toolSelection : null,
     };
     var b = def.budget && typeof def.budget === 'object' ? def.budget : {};
     d.budget.maxSteps = (b.maxSteps | 0) || BUDGET_DEFAULTS.maxSteps;
@@ -2429,7 +2506,8 @@
   /* ── The loop (A1) ─────────────────────────────────────────────── */
 
   function aiOpts(d, opts, messages, withTools, cacheAnchor) {
-    var o = { messages: messages };
+    var cleanMsgs = stripReasoningTraces(messages);
+    var o = { messages: cleanMsgs };
     /* P1.2 (2026-10-15): the rolling Anthropic cache breakpoint — the
      * count of messages already sent on the previous request; ai.rs marks
      * that message's content block with cache_control so every round
@@ -2454,7 +2532,11 @@
     var mo = (opts && opts.max_tokens) || d.maxTokensOut || 0;
     if (mo <= 0 && !(opts && opts.max_tokens)) mo = maxOutputFor(d);
     if (mo > 0) o.max_tokens = mo;
-    if (withTools) o.tools = withTools;
+    if (withTools && Array.isArray(withTools)) {
+      o.tools = withTools.map(minifyToolSchema);
+    } else if (withTools) {
+      o.tools = withTools;
+    }
     return o;
   }
 
@@ -4288,9 +4370,10 @@
        * could shed the task itself and keep working aimlessly. Non-
        * enumerable so the wire builders' JSON.stringify never sends it. */
       Object.defineProperty(taskMsg, '_sofuu_task', { value: true, enumerable: false });
+      var histClean = foldHistoricalToolResults(Array.isArray(opts.history) ? opts.history : []);
       var messages = [{ role: 'system', content: d.system + identityLine }]
         .concat(ctxParts.length ? [{ role: 'user', content: ctxParts.join('\n\n') }] : [])
-        .concat(Array.isArray(opts.history) ? opts.history : [])
+        .concat(histClean)
         .concat([taskMsg]);
 
       /* ── P4.2 estimate mode (2026-10-16): project the run's costs
@@ -4541,6 +4624,19 @@
        * shapes; only the wire does. */
       var inlineFull = {};
       for (var infI = 0; infI < d.inlineTools.length; infI++) inlineFull[d.inlineTools[infI].name] = 1;
+      var toolSelCfg = d.toolSelection || (opts && opts.toolSelection);
+      if (tools && tools.length > 8 && sofuu.tools && typeof sofuu.tools.semanticSelect === 'function') {
+        var selMode = (toolSelCfg && toolSelCfg.mode) || 'auto';
+        if (selMode === 'semantic' || (selMode === 'auto' && tools.length > 12)) {
+          var selTopK = (toolSelCfg && toolSelCfg.topK) || 8;
+          var selAlways = (toolSelCfg && toolSelCfg.alwaysInclude) || ['remember'];
+          tools = sofuu.tools.semanticSelect(task, tools, {
+            topK: selTopK,
+            alwaysInclude: selAlways,
+            minScore: (toolSelCfg && toolSelCfg.minScore) || 0.15,
+          });
+        }
+      }
       var toolsCostTk = 0;
       if (tools) toolsCostTk = estTok(JSON.stringify(tools));
       var progressive = false;

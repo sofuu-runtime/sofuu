@@ -486,6 +486,13 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
         unsafe {
             libc::malloc_trim(0);
         }
+        #[cfg(target_os = "macos")]
+        unsafe {
+            extern "C" {
+                fn malloc_zone_pressure_relief(zone: *mut libc::c_void, goal: usize);
+            }
+            malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
+        }
         qjs::sofuu_js_undefined()
     }
     unsafe { sofuu_ffi::bridge::register_global_fn(ctx, "__sofuu_gc", js_sofuu_gc) };
@@ -520,6 +527,11 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
     // Phase 6 (agent loop): AOT bytecode snapshots for ~/.sofuu/agents.
     unsafe {
         crate::rt::bytecode::mod_bytecode_register(ctx);
+    }
+
+    // PLAN-PLUGIN-MCP Pillar 5: Zero-trust WebAssembly sandbox (sofuu.wasm.*)
+    unsafe {
+        crate::rt::wasm_plugin::mod_wasm_register(ctx);
     }
 
     // Subsystem capsule declarative dispatch (PLAN-ZERO-RISK-MODULARIZATION §3.2)

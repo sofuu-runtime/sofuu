@@ -245,14 +245,15 @@ Documentation: [sofuu.xyz/mcp](https://sofuu.xyz/mcp)
 
 ### 2. Plugins & Extensibility
 
-Sofuu is extensible directly from TypeScript or JavaScript with **no build step**. Drop a file into `./plugins/` (or `~/.sofuu/plugins/`), or install via `sofuu plugin add`, and it is discovered, validated, and registered at startup.
+Sofuu is extensible directly from TypeScript, JavaScript, or WebAssembly with **no build step**. Drop a file into `./plugins/` (or `~/.sofuu/plugins/`), or install via `sofuu plugin add`, and it is discovered, validated, and registered at startup.
 
 #### Plugin Categories
-* **Tools (`defineTool`):** Actions callable by LLMs with Zod or JSON Schema input validation and fine-grained permissions.
+* **Tools (`defineTool`, `defineWasmTool`):** In-process JS/TS tools or zero-trust WASM sandboxed tools with isolated linear memory and fuel limits.
 * **Providers (`defineProvider`):** Custom or local model backends (e.g. `sofuu plugin add llamacpp`, Ollama, or custom HTTP endpoints).
-* **Storage & Vector Stores (`defineVectorStore` / `defineStorage`):** Connect remote databases (e.g. pgvector, Pinecone) as an asynchronous dual-write mirror behind local QTSQ memory.
+* **Storage & Vector Stores (`defineVectorStore` / `defineStorage`):** Connect remote databases (e.g. pgvector, Pinecone) as an asynchronous dual-write mirror behind local QTSQ memory. Exposed automatically as MCP resources.
 * **Services (`defineService`):** Background lifecycle hooks (`onStart`, `onTurnStart`, `onToolCall`, `onToolResult`, `onTurnEnd`, `onStop`).
 * **OpenAPI & MCP Ingest (`useOpenAPI`, `ingestMcp`):** Automatic zero-code bridging of external REST APIs and MCP servers.
+* **Bi-Directional Serving (`sofuu plugin serve`, `exportAsMcp`):** Export 5-shield plugins outward as standard MCP servers over stdio or Streamable HTTP.
 
 #### Defining a Sandboxed Tool
 ```typescript
@@ -287,9 +288,10 @@ The plugin tool wrapper rejects missing, invalid, or failed policy evaluation.
 ```bash
 sofuu plugin add llamacpp                   # Install official local LLM provider bridge
 sofuu plugin init weather --category=tool   # Scaffold new tool in ./plugins/weather.ts
-sofuu plugin validate plugins/weather.ts    # Parse, check types, and verify registration
+sofuu plugin validate plugins/weather.ts    # Parse, check types, and verify registration (or .wasm)
 sofuu plugin test weather '{"city":"Oslo"}' # Invoke tool once and print execution envelope
 sofuu plugin list                           # View all registered plugins and breaker states
+sofuu plugin serve weather --port=8765 --http # Export 5-shield plugin as Streamable HTTP MCP server
 ```
 
 Documentation: [sofuu.xyz/docs](https://sofuu.xyz/docs)
@@ -420,8 +422,9 @@ sofuu mcp build <server.ts> -o <out> # Compile MCP server to standalone native b
 sofuu plugin list                   # List registered plugins and circuit breaker states
 sofuu plugin add <llamacpp|ollama>  # Install provider plugin
 sofuu plugin init <name> --category=tool # Scaffold a new plugin
-sofuu plugin validate <file.ts>     # Validate schemas and registration
+sofuu plugin validate <file.ts|wasm> # Validate schemas and registration (JS/TS or WASM)
 sofuu plugin test <name> '<json>'   # Test run a tool with circuit state reporting
+sofuu plugin serve [name...]        # Export 5-shield plugins as MCP server (--transport=stdio|http)
 
 # Memory & Serving
 sofuu brain verify <path>      # Verify QTSQ cognitive memory container

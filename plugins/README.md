@@ -48,6 +48,7 @@ sofuu plugin list                           # discovered tools, providers, store
 sofuu plugin validate plugins/fetch_web.ts
 sofuu plugin run fetch_web '{"url":"https://example.com"}'
 sofuu plugin test fetch_web '{"url":"https://example.com"}'   # alias of run
+sofuu plugin serve fetch_web --port=8765 --http                # export outward as Streamable HTTP MCP server
 ```
 
 `plugin test` prefers the isolated driver entry point (`cliTest`) and falls back
@@ -55,10 +56,16 @@ to `cliRun` when the shipped bytecode predates it, so the alias works on older
 builds.
 
 Files dropped into `./plugins` (and `~/.sofuu/plugins`) are discovered
-automatically. A `sofuu.json` at the project root adds more sources:
+automatically, including `.ts`, `.js`, and sandboxed `.wasm` binaries. A `sofuu.json` at the project root adds more sources or declarative MCP servers:
 
 ```json
-{ "plugins": ["./plugins", { "source": "./vendor/my-plugin.ts", "enabled": true }] }
+{
+  "plugins": [
+    "./plugins",
+    { "source": "./vendor/my-plugin.ts", "enabled": true },
+    { "mcp": "blender", "command": "uvx mcp-for-blender", "shield": { "timeoutMs": 30000 } }
+  ]
+}
 ```
 
 ## The 5-Shield safety boundary

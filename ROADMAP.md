@@ -39,9 +39,15 @@
 - [x] **Cross-Session Recall**: Automatic memory persistence across runs with `/remember` and `/recall`.
 - [x] **Portable Brain Cards**: Shareable vector cards (`/share` and `/import`) with cryptographic checksums; exports are unencrypted.
 
-#### 🤖 Autonomous Agents & Sandboxed Toolpacks
+#### 🤖 Autonomous Agents, Plugins & Sandboxed Toolpacks
 - [x] **Autonomous Agent Loops**: Multi-step reasoning loops with prompt sovereignty and budget limits.
-- [x] **Model Context Protocol (MCP)**: Native client and server support with transport-specific limitations; stdio resources and prompts require synchronous handlers.
+- [x] **Model Context Protocol (MCP)**: Native client and server support with stdio, direct in-process, and Streamable HTTP/SSE transports. Includes Bearer token auth and SSE keepalives.
+- [x] **Converged Plugins & MCP Substrate**: Universal bi-directional bridge (`sofuu plugin serve` & `exportAsMcp`), declarative MCP ingestion in `sofuu.json`, and store resource bridging (`sofuu://store/...`).
+- [x] **Tool RAG via CMA**: Dynamic sub-ms top-$K$ semantic tool retrieval over in-memory `__tools_catalog` with `tools_discover` mid-turn fallback meta-tool.
+- [x] **Multi-Layer Context Economy**: Lossless schema minification (`minifyToolSchema`), post-consumption tool result folding (>512 chars), reasoning trace (`<think>`) stripping, and rolling compaction.
+- [x] **RAM Optimization & Buffer Shrink-Back**: Native MCP stdio line buffers shrink back to 64 KiB at idle boundaries; turn-boundary OS page purging (`malloc_zone_pressure_relief` on Darwin, `malloc_trim` on Linux).
+- [x] **Zero-Trust WASM Sandbox**: Embedded clean-room WebAssembly interpreter (`defineWasmTool`, `./plugins/*.wasm` discovery/validation) with linear memory caps and fuel limits, keeping standalone binary $\le 5.5\text{ MiB}$.
+- [x] **Pure Kaze Capability Bindings**: Parameterized `needs: mcp("name")` and `plugin("name")` with dynamic capability dispatch and R7 fail-closed checks, requiring zero `.js` sidecars.
 - [x] **Deterministic Sandboxed Tools**: `sofuu.tools.PACKS` (`coding`, `web`, `memory`, `system`) with single-instruction fuel metering.
 - [x] **Resilient File Editing**: `smart_edit` with whitespace tolerance and AST syntax dry-runs (`JS_DetectScriptOrModule`).
 - [x] **Sandbox v2 (R7 Policy)**: Strict filesystem jailing, domain network allowlisting, credential shielding (`.ssh`, `.aws`, `.env`), and instruction fuel metering.

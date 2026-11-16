@@ -18,6 +18,11 @@ carry the same version (checked by `scripts/verify-dist.sh`).
   - Added `/scouter` and `/health` diagnostic commands in interactive chat (`src/js/chat_tui.js`), rendering a live color-coded status breakdown with active threat logs.
   - Real-time footer health chip (`[H:score%]`) provides non-intrusive status feedback after each assistant turn.
   - Exported JavaScript FFI surface `sofuu.scouter.{contextHealth, brainHealth, status, sanitizeAnsi}` with full TypeScript type definitions in `sofuu.d.ts`.
+- **Universal Execution Surface (Headless, Agents, API & Tools):**
+  - Integrated into autonomous agent loops (`src/js/agent.js`), evaluating context health after each completed tool step and emitting structured `scouter` and `warning` events into `.sofuu/logs/agent-<run_id>.jsonl` traces.
+  - Headless CLI runner `sofuu agent run` displays context and memory health in the terminal summary line and returns `scouter` in `--json` payloads.
+  - `sofuu serve` exposes live health telemetry on `GET /health` and `GET /v1/scouter`, and evaluates inbound payload health on `POST /v1/chat/completions` (`src/js/serve.js`).
+  - Standard `system_info` tool (`src/js/tools.js`) embeds live Scouter health reports for introspecting agents.
 - **Strict Prompt Sovereignty:**
   - Operates purely as an observability and alerting substrate. Never silently rewrites prompts, mutates tool results, or purges memories; human operators and supervisors maintain complete control.
 

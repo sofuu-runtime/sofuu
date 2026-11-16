@@ -472,8 +472,14 @@
         obsEmit(runId, path, 'halt', step,
                 { ok: false, reason: String(stopped), steps: step, tokens: tk }, true);
       } else {
+        var scMeta = null;
+        try {
+          if (typeof sofuu !== 'undefined' && sofuu.scouter) {
+            scMeta = JSON.parse(sofuu.scouter.status());
+          }
+        } catch (eScSt) { /* advisory */ }
         obsEmit(runId, path, 'run_complete', step,
-                { ok: true, steps: step, answer_chars: answerChars | 0, tokens: tk }, true);
+                { ok: true, steps: step, answer_chars: answerChars | 0, tokens: tk, scouter: scMeta }, true);
       }
       return true;
     } catch (e) { return false; }
@@ -3497,10 +3503,17 @@
             : 'done',
         });
       }
+      var scouterStatus = null;
+      try {
+        if (typeof sofuu !== 'undefined' && sofuu.scouter) {
+          scouterStatus = JSON.parse(sofuu.scouter.status());
+        }
+      } catch (eScRes) { /* advisory */ }
       var res = {
         runId: runId, name: d.name, answer: answer || '',
         steps: stepsTotal, subRuns: subRuns,
         usage: own, trace: trace, stopped: stopped,
+        scouter: scouterStatus,
         /* Why a budget stopped us. A bare "step budget reached" is
          * unactionable: the reader cannot tell a model that genuinely
          * needed 200 rounds from one stuck re-reading the same file, and
@@ -6274,6 +6287,28 @@
           tokens: { prompt: own.promptTokens, completion: own.completionTokens },
           last_tool: String(obsLastTool || ''),
         }, true);
+        /* Scouter: Headless & Autonomous Agent Context Health Evaluation */
+        try {
+          if (typeof sofuu !== 'undefined' && sofuu.scouter) {
+            var scJson = sofuu.scouter.contextHealth(loopMsgs, obsLastTool, own.promptTokens);
+            var scReport = JSON.parse(scJson);
+            if (scReport && scReport.threats && scReport.threats.length) {
+              emit('scouter', {
+                score: scReport.score,
+                grade: scReport.grade,
+                threats: scReport.threats,
+                step: stepsTotal
+              });
+              if (scReport.score < 75) {
+                emit('warning', {
+                  code: 'SCOUTER_THREAT_DETECTED',
+                  message: 'Scouter context health dropped to ' + scReport.score + '% (' + scReport.grade + '): ' +
+                    scReport.threats.map(function (t) { return t.kind + ' [' + t.source + ']'; }).join(', ')
+                });
+              }
+            }
+          }
+        } catch (eScouterAgent) { /* advisory */ }
         /* Freshness gate boundary flush (§5/§16): stale verdicts queued
          * during this step's tool calls become ONE ephemeral user notice
          * before the next generation — advise only, data path untouched. */

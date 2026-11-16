@@ -1229,14 +1229,16 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String], on_error: Option<&str>) -> i32 
             let print = if json {
                 r#"console.log(JSON.stringify({
                   answer: r.answer, steps: r.steps, stopped: r.stopped,
-                  usage: r.usage, subRuns: (r.subRuns || []).length }, null, 2));"#
+                  usage: r.usage, subRuns: (r.subRuns || []).length,
+                  scouter: r.scouter }, null, 2));"#
             } else {
                 r#"console.log('');
                   console.log(r.answer);
                   console.log('\n · ' + r.steps + ' steps · ' + r.usage.llmCalls + ' llm calls · ' +
                               r.usage.toolCalls + ' tool calls · ' + r.usage.promptTokens + '→' +
                               r.usage.completionTokens + ' tk' +
-                              (r.stopped ? ' · stopped: ' + r.stopped : ''));"#
+                              (r.stopped ? ' · stopped: ' + r.stopped : '') +
+                              (r.scouter ? ' · health: ' + r.scouter.contextScore + '%/' + r.scouter.brainScore + '%' : ''));"#
             };
             let log_js = if log { "true" } else { "false" };
             let code = format!(

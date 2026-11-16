@@ -1665,12 +1665,19 @@
           memInfo = { rss_mb: Math.round(mu.rss / 1048576) };
         }
       } catch (eMem) { /* memory stats are best effort; the report omits the field. */ }
+      var scouterStatus = null;
+      try {
+        if (typeof sofuu !== 'undefined' && sofuu.scouter) {
+          scouterStatus = JSON.parse(sofuu.scouter.status());
+        }
+      } catch (eScouter) { /* advisory */ }
       var info = {
         runtime: 'sofuu',
         version: (sofuu.VERSION || '0.3.0-beta'),
         platform: plat,
         capabilities: caps,
         memory: memInfo,
+        scouter: scouterStatus,
       };
       return JSON.stringify(info, null, 2);
     },

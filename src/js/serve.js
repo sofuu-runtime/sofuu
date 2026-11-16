@@ -840,12 +840,29 @@
               return;
             }
           }
+          var scouterStatus = null;
+          try {
+            if (typeof sofuu !== 'undefined' && sofuu.scouter) {
+              scouterStatus = JSON.parse(sofuu.scouter.status());
+            }
+          } catch (eScouter) { /* advisory */ }
           send(res, 200, {
             ok: true,
             status: 'ok',
             uptime_ms: S.startedAtMs ? (Date.now() - S.startedAtMs) : 0,
             version: cfg.version,
+            scouter: scouterStatus,
           });
+          return;
+        }
+
+        /* Scouter Health Report endpoint */
+        if (method === 'GET' && (path === '/scouter' || path === '/v1/scouter')) {
+          var sc = (typeof sofuu !== 'undefined' && sofuu.scouter && typeof sofuu.scouter.status === 'function')
+            ? sofuu.scouter.status()
+            : '{"contextScore":100,"brainScore":100,"totalAlerts":0,"recentThreats":[]}';
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(sc);
           return;
         }
 

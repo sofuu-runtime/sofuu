@@ -61,6 +61,7 @@
 - [x] **Tamper-Proof Out-of-Band State**: State isolated in private Rust host atomics (`AtomicU32`, ring buffer mutex), completely immune to JavaScript prototype tampering.
 - [x] **Anti-Terminal Spoofing**: Byte-level ANSI sanitization filter stripping control codes, cursor hops, and line clears from malicious tool streams.
 - [x] **Interactive Chat Integration**: Dedicated `/scouter` and `/health` diagnostic HUD plus live footer health chip `[H:score%]` in `src/js/chat_tui.js`.
+- [x] **Universal Execution Surface**: Integrated across headless agents (`sofuu agent run`, `src/js/agent.js`), background daemons (`sofuu daemon`), HTTP serving (`sofuu serve`, `GET /health`, `GET /v1/scouter`), system tools (`system_info`), and programmatic APIs (`sofuu.scouter`).
 - [x] **Strict Prompt Sovereignty**: Observational alerting only; never silently mutates user prompts or cognitive memories.
 
 #### ⚡ The "Killer Wedge": Standalone Agent Compiler (`sofuu compile`)

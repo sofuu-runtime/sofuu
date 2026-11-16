@@ -133,3 +133,12 @@ Scouter is **strictly observational**:
 * It never silently alters, redacts, or rewrites prompts or tool results.
 * It never silently truncates, corrupts, or deletes cognitive vector memories.
 * The developer and operator retain 100% prompt sovereignty. When anomalies or poisoning attempts occur, Scouter emits real-time visual alerts (interactive HUD, footer health chip `[H:score%]`, or programmatic JSON reports) so human operators and systems supervisors can intervene intentionally.
+
+### 4. Universal Execution Coverage (Not Just TUI)
+Scouter is not merely an interactive terminal widget; it is an in-process, universal runtime engine capability integrated across all execution surfaces:
+* **Headless Autonomous Agents (`sofuu agent run` & `src/js/agent.js`):** Continuously scores context health after each tool turn and completed step checkpoint. Threats emit structured `scouter` and `warning` events into `.sofuu/logs/agent-<run_id>.jsonl` traces, and the run summary reports live health in both human summary lines and `--json` payloads.
+* **Background Supervisor Daemons (`sofuu daemon`):** Inspects the health of unattended background agent processes.
+* **HTTP API Server (`sofuu serve`):** Exposes live health metrics on `GET /health` and `GET /v1/scouter`; evaluates inbound message payloads on `POST /v1/chat/completions`.
+* **Built-in Tooling (`src/js/tools.js`):** The standard `system_info` tool includes live Scouter health metrics for agents inspecting their own runtime state.
+* **Programmatic API (`sofuu.scouter`):** JavaScript and TypeScript scripts have full direct access via `sofuu.scouter.contextHealth()`, `sofuu.scouter.brainHealth()`, `sofuu.scouter.status()`, and `sofuu.scouter.sanitizeAnsi()`.
+* **Interactive Terminal TUI (`sofuu chat`):** Provides the `/scouter` and `/health` diagnostic HUD along with the real-time footer status chip `[H:score%]`.

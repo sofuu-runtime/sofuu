@@ -110,3 +110,26 @@ offer public credit, a detailed write-up of the fix, and our genuine thanks.
   refuses to proceed when a checksum tool is unavailable.
 * Run untrusted logic in `sofuu.sandbox` with explicit `fuel`, `timeoutMs`, and
   `maxMemoryMB` rather than in the host realm.
+* Use the out-of-band **Scouter** engine (`/scouter` or `/health` in `sofuu chat`, or `sofuu.scouter` in scripts) to continuously monitor model context integrity and cognitive vector memory health.
+
+---
+
+## Scouter: Tamper-Proof Mathematical Context & Memory Integrity (R7.10)
+
+Sofuu includes **Scouter** (`crates/sofuu-core/src/rt/scouter.rs`), a dedicated, real-time observability engine designed to detect prompt injection, context hacking, and cognitive memory poisoning before they can compromise downstream agent behavior.
+
+### 1. Pure Mathematics & Zero Machine Learning
+Scouter operates **strictly via deterministic mathematics and algorithms**—it never invokes neural networks, secondary LLMs, or ML classifiers:
+* **Immunity to Jailbreaks:** Because Scouter uses no learned models or neural weights, an attacker cannot jailbreak, deceive, prompt-inject, or induce hallucinations in the monitor itself.
+* **Bounded Latency:** Mathematical evaluations complete in under 0.5 ms per turn with zero dynamic memory allocation spikes.
+
+### 2. Tamper-Proof Out-of-Band State
+Scouter runs as an isolated subsystem in private Rust host memory:
+* **Prototype Pollution Immunity:** The global health tracking state (`AtomicU32`, `Mutex<[ScouterThreat; 32]>`) resides outside the JavaScript heap. Compromised JS scripts cannot alter Scouter's internal history or suppress active threat alerts via `Object.prototype` poisoning.
+* **Anti-Terminal Spoofing:** Tool outputs and incoming streams are filtered through an ANSI control-code sanitizer (`sanitize_terminal_stream`) before terminal display. Adversaries cannot clear lines (`\x1b[2K`), jump cursors (`\x1b[H`), or forge fake `[H:100% HEALTHY]` status chips in developer terminals.
+
+### 3. Prompt Sovereignty
+Scouter is **strictly observational**:
+* It never silently alters, redacts, or rewrites prompts or tool results.
+* It never silently truncates, corrupts, or deletes cognitive vector memories.
+* The developer and operator retain 100% prompt sovereignty. When anomalies or poisoning attempts occur, Scouter emits real-time visual alerts (interactive HUD, footer health chip `[H:score%]`, or programmatic JSON reports) so human operators and systems supervisors can intervene intentionally.

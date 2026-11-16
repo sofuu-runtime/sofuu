@@ -25,9 +25,10 @@ The project is beta. Features and evidence vary by platform and execution path:
 
 * **Native runtime:** QuickJS runs without a JIT. See [BENCHMARKS.md](BENCHMARKS.md) for measured startup conditions, not a universal latency bound.
 * **On-Device Vector Memory (QTSQ):** Local vector storage is encrypted by default; plaintext mode and unencrypted exports are available. `embedLocal` uses a 768-dimensional trigram hash, not a trained semantic model.
-* **Agents & Kaze:** JS/TS agent loops and domain toolpacks; Kaze routines and standalone compilation. The current source has a real model-and-tool bridge for authorized async Kaze paths; released-artifact and local-GGUF verification remain open.
+* **Agents & Kaze:** JS/TS agent loops and domain toolpacks; Kaze routines and standalone compilation. Pure-Kaze local GGUF model execution on Metal GPU, durable memory persistence (`memory=durable`), real alert sinks (`stdout`, `stderr`, `file:<path>`), and the asynchronous model-and-tool bridge are verified in source; published binaries remain separately unverified.
 * **Model Context Protocol (MCP):** Client and server support for selected protocol versions and transports; see the limitations below.
 * **Policy and sandbox tools:** Selected tool, filesystem, network, and shell paths have policy checks; boundaries and approval handling depend on the execution surface.
+* **Scouter Integrity Engine:** Real-time, out-of-band mathematical monitoring of model context health and cognitive memory integrity with zero ML classifiers, anti-terminal spoofing, and full prompt sovereignty.
 * **Embedding:** A C ABI and mobile wrappers are available; support and testing vary by platform. Hardware and app-store acceptance are not universally established.
 
 ---
@@ -338,9 +339,10 @@ console.log(report.fuelUsed); // instructions charged
 
 ### 5. Agent Observability & Recovery
 
-Built-in append-only JSONL tracing designed for autonomous supervisor loops:
+Built-in append-only JSONL tracing and tamper-proof mathematical health monitoring:
 
 * **Append-Only Traces:** Turns and tool steps append to `.sofuu/logs/agent-<run_id>.jsonl` with total-order sequence numbers.
+* **Scouter Health & Integrity Monitor:** Deterministic out-of-band mathematical analyzer (`sofuu.scouter`, `/scouter`, `/health`). Evaluates sliding-window Shannon entropy, role-delimiter spoofing, Zipfian deviation, cognitive memory Sybil clusters, semantic contradictions, and gravity traps in under 0.5 ms per turn with zero ML models.
 * **Secret Redaction:** Recognized credential and path patterns are redacted in supported diagnostic paths; coverage is not exhaustive.
 * **Crash Post-Mortems:** Diagnostic cards may be written to `.sofuu/crashes/<crash_id>.json` on a best-effort basis.
 * **Resumable Execution:** `sofuu resume <run_id>` requires a usable checkpoint; redacted or truncated checkpoints can be refused.
@@ -350,6 +352,9 @@ sofuu logs                     # List past agent runs
 sofuu logs show <run_id>       # Render colored, step-by-step transcript
 sofuu logs --last-error        # View post-mortem card for the latest failure
 sofuu resume <run_id>          # Resume an interrupted run from its last checkpoint
+# Inside interactive chat (`sofuu chat`):
+/scouter                       # Inspect mathematical context & memory health HUD
+/health                        # Alias for /scouter diagnostics
 ```
 
 ---

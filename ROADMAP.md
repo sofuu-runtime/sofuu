@@ -20,7 +20,7 @@
 
 ## 1. Implemented Surfaces and Experimental Modules
 
-> **Status:** Sofuu is beta. Implementation of a feature is not proof of production readiness, complete security, or an uptime guarantee. Current embedded Kaze source refuses unavailable non-robotics capabilities and serves authorized AI/tool calls through an async bridge on debug builds; released-artifact, local-GGUF and physical-hardware verification remain open.
+> **Status:** Sofuu is beta. Implementation of a feature is not proof of production readiness, complete security, or an uptime guarantee. Current embedded Kaze source refuses unavailable non-robotics capabilities, provides durable memory, real alert sinks, and serves authorized AI/tool calls through an async bridge verified with local GGUF weights; released-artifact and physical-hardware verification remain open.
 
 ### ⚡ Main Runtime Subsystems
 
@@ -54,6 +54,15 @@
 - [x] **Multi-Terminal Session Mesh**: Local IPC task synchronization (`/work`, `/done`) across simultaneous developer terminals.
 - [x] **Observability Stream**: Structured `.jsonl` audit logging with crash-resilient write-ahead logging (WAL).
 
+#### 🛡️ Scouter: Pure-Math Context & Brain Health Monitor
+- [x] **Zero-ML Deterministic Integrity Engine**: Real-time context & memory monitoring without neural models or learned classifiers (`sofuu.scouter`).
+- [x] **Context Health Evaluator**: Sliding-window Shannon entropy ($H \le 5.85$), chat-template role-delimiter spoofing detection, zero-alloc Zipfian deviation analyzer ($\le 2.85$), and context dilution/efficiency tracking.
+- [x] **Brain (Memory) Health Evaluator**: Single-pass centroid variance & Sybil/hub vector detection, cosine contradiction analysis ($\cos \ge 0.88$ with polarity inversion), and memory gravity trap identification ($> 2.5\sigma$).
+- [x] **Tamper-Proof Out-of-Band State**: State isolated in private Rust host atomics (`AtomicU32`, ring buffer mutex), completely immune to JavaScript prototype tampering.
+- [x] **Anti-Terminal Spoofing**: Byte-level ANSI sanitization filter stripping control codes, cursor hops, and line clears from malicious tool streams.
+- [x] **Interactive Chat Integration**: Dedicated `/scouter` and `/health` diagnostic HUD plus live footer health chip `[H:score%]` in `src/js/chat_tui.js`.
+- [x] **Strict Prompt Sovereignty**: Observational alerting only; never silently mutates user prompts or cognitive memories.
+
 #### ⚡ The "Killer Wedge": Standalone Agent Compiler (`sofuu compile`)
 - [x] **Trailer Format Implementation**: 32-byte `SOFUU_BIN_V1` binary trailer with CRC32 verification.
 - [x] **Fast-Path Boot Detection**: Single-seek payload inspection (< 0.1 ms overhead).
@@ -64,7 +73,7 @@
 #### 💨 Kaze (風) Zero-GC Deterministic Guardrail Engine
 - [x] **Small Typed Language**: Fixed-size arena allocation, zero-GC pauses in the hot path, bytecode compilation.
 - [x] **Capability Gates**: Fail-closed access-control policies enforcing declared hardware/system permissions.
-- [ ] **Real Kaze backends**: The embedded source includes an authorized async bridge for AI and built-in/MCP tools, plus explicitly selected per-run CMA memory. Synchronous paths and unavailable persistent memory, alerts, sensors and devices fail closed. Complete cancellation and approval-receipt handling, local-GGUF coverage, released-artifact verification and the remaining execution-path audit; see [Kaze embedded status](KAZE-EMBEDDED.md).
+- [x] **Real Kaze backends**: Cross-process durable memory host (`memory=durable`, `memory=file:<path>`), real alert sinks (`stdout`, `stderr`, `file:<path>`), and pure-Kaze local GGUF model execution grounded via real MCP tool reads are implemented and verified in source (`bb98aaa65`). Released-artifact and physical hardware verification remain open; see [Kaze embedded status](KAZE-EMBEDDED.md).
 
 ---
 

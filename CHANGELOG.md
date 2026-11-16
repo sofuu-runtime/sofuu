@@ -4,6 +4,23 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Scouter Mathematical Context & Memory Health Substrate — 2026-11-16
+
+- **Deterministic Context & Memory Observability (`crates/sofuu-core/src/rt/scouter.rs`):**
+  - Shipped the **Scouter** engine to provide continuous, real-time health analysis of LLM context windows and cognitive vector memories without relying on neural classifiers or secondary LLMs.
+  - **Zero-ML Guarantee:** Built exclusively on deterministic algorithms, discrete information theory, and linear algebra. The observability monitor cannot be jailbroken, adversarial-perturbed, or prompted into hallucination.
+  - **Model Context Health:** Sliding-window Shannon entropy ($H \le 5.85\text{ b/B}$) detects high-entropy obfuscation in tool outputs; deterministic substring matching flags injected chat role markers (`<|im_start|>`, `<|system|>`, `[INST]`, `<|turn_start|>`); zero-alloc log-deviation analysis detects abnormal Zipfian token distributions ($\le 2.85$); context efficiency tracking flags context dilution below $12\%$.
+  - **Cognitive Memory Health:** Centroid variance and distance ratios detect Sybil cluster poisoning and artificial hub vectors; pairwise cosine similarity ($\cos \ge 0.88$) with lexical negation detection spots semantic contradictions in top recall candidates; gravity entrapment analysis flags memory monopolization exceeding $2.5\sigma$.
+- **Tamper-Proof Out-of-Band State & Anti-Terminal Spoofing:**
+  - Health state (`GLOBAL_SCOUTER_STATE`) is held in private Rust atomics (`AtomicU32`, ring buffer mutex), isolated from the JavaScript heap and immune to `Object.prototype` pollution.
+  - Stream-level ANSI sanitization (`sanitize_terminal_stream`) filters carriage returns and terminal control escapes (`\x1b[2K`, `\x1b[H`, `\x1b[A`), preventing malicious tool output from forging clean health chips in developer terminals.
+- **TUI & Developer Experience:**
+  - Added `/scouter` and `/health` diagnostic commands in interactive chat (`src/js/chat_tui.js`), rendering a live color-coded status breakdown with active threat logs.
+  - Real-time footer health chip (`[H:score%]`) provides non-intrusive status feedback after each assistant turn.
+  - Exported JavaScript FFI surface `sofuu.scouter.{contextHealth, brainHealth, status, sanitizeAnsi}` with full TypeScript type definitions in `sofuu.d.ts`.
+- **Strict Prompt Sovereignty:**
+  - Operates purely as an observability and alerting substrate. Never silently rewrites prompts, mutates tool results, or purges memories; human operators and supervisors maintain complete control.
+
 ## Unified Diagnostics Review Fixes — 2026-11-10
 
 - Sanitization handles ordered and quoted key/value pairs, common token

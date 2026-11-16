@@ -77,6 +77,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [x] Standardize offline deterministic 768-dimension embedding API.
   - [x] Implement memory compaction and retention decay curve algorithms.
   - [x] AUDIT-REMEDIATION-2026-11-08: Complete memory integrity tasks — path validation rejecting empty/directory paths (MEM-003, MEM-004), corrupt file preservation (MEM-013), post-close access `E_LOCKED` protection (MEM-024), and immediate 65KB record ceiling validation.
+  - [x] PLAN-REAL-EXECUTION R3: Cross-process durable memory persistence host (`memory=durable`, `memory=file:<path>`) with atomic commits and store isolation (`bb98aaa65`).
   - [ ] Add zero-copy memory-mapped QTSQ persistence validation for multi-process concurrency.
 
 ---
@@ -135,6 +136,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   * The standalone source now requires explicit grants and a valid policy, refuses unavailable non-robotics backends, and requires labelled opt-in for drone/rover simulation. The [standalone roadmap](https://github.com/sofuu-runtime/kaze/blob/main/docs/ROADMAP.md) tracks current progress and remaining verification. Targeted safety and migrated compatibility/language tests pass. Live drone actuation is disabled until the required 1.5-second heartbeat and per-field telemetry freshness veto is implemented; physical hardware and release compatibility remain unverified.
   * **Embedded Kaze fail-closed work, 2026-11-11:** Current source requires grants and an R7 policy with explicit `tools.allow` or `tools.deny` rules for calls. An explicitly selected per-run CMA memory backend is available; unavailable AI, tool, persistent Kaze memory, alert, sensor and device operations refuse instead of returning fabricated success. Drone/rover simulation requires an explicit test selection and is labelled. Live drone and GPIO paths are disabled pending verified policy and safety propagation. The local debug build passed Kaze unit and cross-surface checks; published artifacts remain unverified. See the tracked [embedded capability status](KAZE-EMBEDDED.md).
   * **Embedded Kaze async bridge, 2026-11-13 (source commit `544c680c8`):** `sofuu.kaze.runAsync` and its `sofuu.sfs` alias suspend at authorized AI/tool requests, apply active host policy before dispatch, bound serialized requests, validate `ai.classify` results against requested labels, and report missing-model/unknown-outcome failures with Kaze diagnostics. `sofuu script run` now serves a source or `.kazebc` file that declares `ai`/`tool` through the same bridge; every other script keeps the engine-free synchronous runner and fails closed for unavailable backends. Approval-required requests are denied without a verifiable approval receipt. Debug artifact `cd0a0abef7835aad1393a4d75e82362231d2768c1f18e92e1324b5d1749b0a21` passed 99 focused embedded Kaze tests, 246 broader Kaze/compiler/memory/robotics tests, the fail-closed, per-run-memory and JS-boundary scripts, and a real model-plus-MCP journey through `sofuu.kaze.runAsync`, a compiled agent, and `sofuu script run` (source and `.kazebc`) with a configured remote provider. Local-GGUF weights, cancellation behavior, published binaries and physical hardware remain unverified.
+  * **Embedded Kaze real execution remediation, 2026-11-16 (source commit `bb98aaa65`):** Real alert sinks (`alert=stdout`, `alert=stderr`, `alert=file:<path>`) stream raw bytes, enforce length bounds ($\le 1024$ B), and fail closed with `E_CAP_MISSING`. Cross-process durable memory persistence (`memory=durable`, `memory=file:<path>`) uses atomic tempfile commits. Pure-Kaze Local-GGUF execution verified across 3/3 runs on Metal GPU with pre-existing `SmolLM2-360M` weights and real MCP tool read grounding without downloads. Standalone binary size ceiling respected (standalone agent at 4.5 MiB).
   * `sofuu script compile` emits Kaze bytecode, while `sofuu compile` creates a standalone executable. The in-process APIs are exposed as `sofuu.kaze` and `sofuu.sfs`.
   * The embedded Kaze unit suite has been migrated for these changes. The ignored local `kaze_language` integration suite and repository-wide mandatory gates still include non-robotics stand-ins and require migration before they can be run under `RULES.md` §1.9. Run `make kaze-drift-check` to report differences from the prototype.
   * `kaze/`, both local Kaze documents under `docs/`, `crates/sofuu-core/tests/`, and `examples/kaze/` are gitignored local resources and may be absent in a clean checkout.
@@ -187,6 +189,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 * **Active Tasks**:
   - [x] Add explicit error logging for pulse timer pin de-assert failures (F-09).
   - [x] Formalize MAVLink hardware policy gates with fail-closed verdicts.
+  - [x] Align `TELEMETRY_MAX_AGE` to 1500 ms in `kaze_live.rs`, unifying with `mavlink_gate.rs` 1.5-second safety watchdog (`bb98aaa65`).
   - [ ] Implement simulation mock harness for SITL (Software In The Loop) automated regression tests.
 
 ---
@@ -207,6 +210,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [x] Verify CLI argument parsing matches 12-factor configuration hierarchy.
   - [ ] PLAN-UNIFIED-DIAGNOSTICS: concise/full error rendering and bounded reported JS frames are implemented in source; audit remaining TUI/REPL, ABI, protocol and release surfaces before claiming complete coverage.
   - [x] AUDIT-REMEDIATION-2026-11-08: Complete CLI polish — read-only `--help` with zero disk side-effects (CLI-008/009), strict ANSI scrubbing under `NO_COLOR=1` / `TERM=dumb` (CLI-023/024), `sofuu run -` / `eval <<EOF` stdin execution (CLI-055–057), and `sofuu bundle` stdout streaming (CP-069).
+  - [x] PLAN-SCOUTER-HEALTH-AND-INTEGRITY: Integrated real-time Scouter HUD context saturation and brain health monitor into terminal chat TUI (`94347eaba`).
   - [ ] Add interactive debugging hooks (`--inspect-brk`) for Kaze VM step execution.
 
 ---

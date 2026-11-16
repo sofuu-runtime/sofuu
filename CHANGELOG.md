@@ -21,6 +21,24 @@ carry the same version (checked by `scripts/verify-dist.sh`).
 - **Strict Prompt Sovereignty:**
   - Operates purely as an observability and alerting substrate. Never silently rewrites prompts, mutates tool results, or purges memories; human operators and supervisors maintain complete control.
 
+## Real Execution Remediation (Durable Memory, Alert Sinks, 1.5s Safety) — 2026-11-16
+
+- **Durable Kaze Memory Substrate (`crates/sofuu-core/src/rt/kaze_memory.rs`):**
+  - Implemented `DurableMemoryHost` supporting `memory=durable` (default `.sofuu/kaze_memory.json`) and `memory=file:<path>`.
+  - Atomic commit semantics using temporary file writes and renaming to ensure zero corrupt state across unexpected process terminations.
+  - Hard capacity limits: 256 records, 256 KiB maximum payload, and 1024-byte label length.
+  - Strict store isolation from ephemeral in-memory CMA stores; verified across source, bytecode (`.kazebc`), and standalone binary paths (`scripts/test-kaze-memory-durable.py`).
+- **Real Alert Sinks (`crates/sofuu-core/src/domains/kaze/caps.rs`):**
+  - Replaced simulated alert drops with real streaming sinks: `alert=stdout`, `alert=stderr`, and `alert=file:<path>`.
+  - Enforced 1024-byte message bounds, action trace redaction, and fail-closed `E_CAP_MISSING` errors when no alert backend is granted.
+  - Verified across source, bytecode, and standalone binary paths (`scripts/test-kaze-alert-real.py`).
+- **Pure-Kaze Local GGUF Grounding:**
+  - Verified pure Kaze agent routines calling `ai.prompt` grounded with real stdio MCP tool reads (`real_file_mcp_server.js`) on Apple Silicon Metal GPU using local `SmolLM2-360M-Instruct-Q8_0.gguf` weights without downloads (`scripts/test-kaze-local-gguf-real.py`).
+  - Passed 3/3 independent runs across both source (`sofuu.kaze.runAsync`) and compiled standalone binary (`sofuu compile`) paths.
+- **Robotics 1.5s Heartbeat Safety Unification:**
+  - Unified `TELEMETRY_MAX_AGE` to 1500 ms in `crates/sofuu-core/src/domains/robotics/kaze_live.rs`, matching `mavlink_gate.rs::TELEMETRY_MAX_AGE_MS = 1_500`.
+  - Enforced fail-closed rejection of unknown, missing, and protocol-sentinel telemetry readings.
+
 ## Unified Diagnostics Review Fixes — 2026-11-10
 
 - Sanitization handles ordered and quoted key/value pairs, common token

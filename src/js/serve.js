@@ -858,9 +858,19 @@
 
         /* Scouter Health Report endpoint */
         if (method === 'GET' && (path === '/scouter' || path === '/v1/scouter')) {
-          var sc = (typeof sofuu !== 'undefined' && sofuu.scouter && typeof sofuu.scouter.status === 'function')
-            ? sofuu.scouter.status()
-            : '{"contextScore":100,"brainScore":100,"totalAlerts":0,"recentThreats":[]}';
+          /* No Scouter substrate means NO health verdict. The previous
+           * fallback answered with a perfect synthetic report, which read
+           * as a measured healthy context on a build that had never
+           * measured anything. */
+          var sc = null;
+          if (typeof sofuu !== 'undefined' && sofuu.scouter && typeof sofuu.scouter.status === 'function') {
+            try { sc = sofuu.scouter.status(); } catch (eScouter) { sc = null; }
+          }
+          if (typeof sc !== 'string' || !sc.trim()) {
+            fail(res, 503, 'the Scouter substrate is unavailable in this build',
+              'server_error', 'scouter_unavailable');
+            return;
+          }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(sc);
           return;

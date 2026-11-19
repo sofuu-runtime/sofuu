@@ -269,7 +269,16 @@ pub unsafe extern "C" fn sofuu_init() -> *mut SofuuRuntime {
     }
     // SAFETY: engine_create returned a live engine; builtins registered
     // before the runtime escapes (C order: register after create).
-    unsafe { engine_register_builtins(eng) };
+    if let Err(err) = unsafe { engine_register_builtins(eng) } {
+        /* The documented C contract is NULL on failure, and a release build
+         * aborts the process on a panic (panic = "abort"). Tear the partial
+         * engine down and return NULL so the host fails closed on a broken
+         * runtime instead of being killed by it. */
+        eprintln!("[sofuu] E_CONFIG: runtime initialization failed: {err}");
+        // SAFETY: eng is a live engine owned by this frame.
+        unsafe { engine_destroy(eng) };
+        return ptr::null_mut();
+    }
     let rt = Box::new(SofuuRuntime { engine: eng as *mut c_void });
     Box::into_raw(rt) as *mut SofuuRuntime
 }
@@ -408,7 +417,11 @@ unsafe fn engine_create() -> *mut SofuuEngine {
 
 /// Register every built-in native module, then build the `Sofuu` global.
 /// The order is the C registration order — property order is JS-visible.
-unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
+///
+/// Returns the reason the runtime cannot be used (a subsystem capsule that
+/// refused to register). The caller fails closed on it: a runtime missing a
+/// capsule must not be handed out as if it were complete.
+unsafe fn engine_register_builtins(eng: *mut SofuuEngine) -> Result<(), &'static str> {
     // SAFETY: eng is live.
     let ctx = unsafe { (*eng).ctx };
     unsafe {
@@ -540,12 +553,10 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) {
     }
 
     // Subsystem capsule declarative dispatch (PLAN-ZERO-RISK-MODULARIZATION §3.2)
-    if let Err(err) = crate::domains::init_subsystems(ctx) {
-        eprintln!("[sofuu:fatal] Failed to initialize subsystem capsules: {}", err);
-        panic!("Subsystem initialization failure: {}", err);
-    }
+    crate::domains::init_subsystems(ctx)?;
 
     unsafe { build_sofuu_global(ctx) };
+    Ok(())
 }
 
 /// Ultra-lean registration for micro MCP servers and tools:
@@ -1062,15 +1073,14 @@ fn c_dirname(p: &str) -> String {
 
 /// engine_read_file — reads a whole file into a heap buffer with a
 /// trailing NUL (JS_Eval reads past input_len), like the C helper.
-fn engine_read_file(path: &str) -> Option<(Vec<u8>, usize)> {
-    match std::fs::read(path) {
-        Ok(mut buf) => {
-            let n = buf.len();
-            buf.push(0); // NUL sentinel — QuickJS reads past input_len
-            Some((buf, n))
-        }
-        Err(_) => None,
-    }
+/// The I/O error is returned rather than dropped: "cannot open" without the
+/// reason is not actionable (a missing file, a permission failure and a
+/// directory are three different problems).
+fn engine_read_file(path: &str) -> Result<(Vec<u8>, usize), std::io::Error> {
+    let mut buf = std::fs::read(path)?;
+    let n = buf.len();
+    buf.push(0); // NUL sentinel — QuickJS reads past input_len
+    Ok((buf, n))
 }
 
 /// resolve_module_path — the loader's resolution ladder (engine.c):
@@ -1286,25 +1296,31 @@ pub unsafe extern "C" fn sofuu_module_loader(
         return ptr::null_mut();
     }
 
-    let Some((source, mut len)) = engine_read_file(&path) else {
-        let mut msg = format!("Cannot find module '{}' (resolved: '{}')", name, path);
-        let from = Path::new(&base).parent().unwrap_or_else(|| Path::new("."));
-        if let Some(why) = crate::npm::explain_module_not_found(from, &name) {
-            msg = crate::rt::diagnostics::resolution_message(&name, &why);
-        }
-        if let Some(hint) = crate::rt::diagnostics::native_package_hint(norm_name) {
-            msg.push_str(&format!("\n  → Recommendation: {hint}."));
-        }
-        // SAFETY: ctx live; the message is a Rust &str.
-        unsafe {
-            crate::rt::diagnostics::throw_with_code(
-                ctx,
-                c"ReferenceError",
-                &msg,
-                crate::rt::diagnostics::E_RESOLVE,
+    let (source, mut len) = match engine_read_file(&path) {
+        Ok(v) => v,
+        Err(e) => {
+            let mut msg = format!(
+                "Cannot find module '{}' (resolved: '{}'): {}",
+                name, path, e
             );
+            let from = Path::new(&base).parent().unwrap_or_else(|| Path::new("."));
+            if let Some(why) = crate::npm::explain_module_not_found(from, &name) {
+                msg = crate::rt::diagnostics::resolution_message(&name, &why);
+            }
+            if let Some(hint) = crate::rt::diagnostics::native_package_hint(norm_name) {
+                msg.push_str(&format!("\n  → Recommendation: {hint}."));
+            }
+            // SAFETY: ctx live; the message is a Rust &str.
+            unsafe {
+                crate::rt::diagnostics::throw_with_code(
+                    ctx,
+                    c"ReferenceError",
+                    &msg,
+                    crate::rt::diagnostics::E_RESOLVE,
+                );
+            }
+            return ptr::null_mut();
         }
-        return ptr::null_mut();
     };
 
     let mut src_ptr: *const c_char = source.as_ptr() as *const c_char;
@@ -1490,9 +1506,15 @@ fn canonical_module_name(path: &str) -> String {
 unsafe fn engine_eval_file(eng: *mut SofuuEngine, path_c: *const c_char) -> c_int {
     // SAFETY: path_c is a NUL-terminated C string.
     let path = unsafe { CStr::from_ptr(path_c) }.to_string_lossy().into_owned();
-    let Some((source, len)) = engine_read_file(&path) else {
-        eprintln!("{}", paint("31", &format!("Error: Cannot open file '{}'", path)));
-        return 1;
+    let (source, len) = match engine_read_file(&path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                paint("31", &format!("Error: Cannot open file '{}': {}", path, e))
+            );
+            return 1;
+        }
     };
 
     // TypeScript: strip types before evaluating (.ts suffix check).
@@ -2192,6 +2214,51 @@ unsafe fn engine_eval_repl_inner(
         return c_bytes_dup(&out);
     }
 
+    /* A REPL line whose value is an ALREADY-REJECTED promise is a failed
+     * operation, not a value: JS_Eval does not raise for it, so the REPL
+     * rendered the promise as `{}` and the rejection only surfaced at
+     * teardown — a swallowed error on a surface that must report it
+     * (RULES 3.5.3). Report it once, here, the way Node does. */
+    if unsafe { qjs::is_object(result) }
+        && unsafe { qjs::JS_PromiseState(ctx, result) } == qjs::JSPromiseStateEnum::Rejected
+    {
+        let reason = unsafe { qjs::JS_PromiseResult(ctx, result) };
+        // Retract the rejection tracker's copy of the same reason so the
+        // failure is reported once, not twice.
+        unsafe { crate::rt::promise::sofuu_rt_suppress_rejections(ctx, reason) };
+        if !is_error.is_null() {
+            // SAFETY: is_error is a valid out-ptr.
+            unsafe { *is_error = 1 };
+        }
+        let estr = unsafe { qjs::JS_ToString(ctx, reason) };
+        let msg = unsafe { qjs::sofuu_js_to_cstring(ctx, estr) };
+        let msg_s = if msg.is_null() {
+            "Uncaught (in promise)".to_string()
+        } else {
+            let out = unsafe { CStr::from_ptr(msg) }.to_string_lossy().into_owned();
+            unsafe { qjs::sofuu_js_free_cstring(ctx, msg) };
+            out
+        };
+        let head = format!("Uncaught (in promise) {msg_s}");
+        let mut buf = paint("31", &head).into_owned();
+        let stack = unsafe { qjs::sofuu_js_get_property_str(ctx, reason, c"stack".as_ptr()) };
+        if !unsafe { qjs::is_undefined(stack) } {
+            let st = unsafe { qjs::sofuu_js_to_cstring(ctx, stack) };
+            if !st.is_null() {
+                let st_s = unsafe { CStr::from_ptr(st) }.to_string_lossy();
+                buf.push_str(&format!("\n{}", paint("90", &st_s)));
+                // SAFETY: st from to_cstring on this ctx.
+                unsafe { qjs::sofuu_js_free_cstring(ctx, st) };
+            }
+        }
+        unsafe { qjs::sofuu_js_free_value(ctx, stack) };
+        unsafe { qjs::sofuu_js_free_value(ctx, estr) };
+        unsafe { qjs::sofuu_js_free_value(ctx, reason) };
+        unsafe { qjs::sofuu_js_free_value(ctx, result) };
+        let out = buf.into_bytes();
+        return c_bytes_dup(&out);
+    }
+
     let display = unsafe { repl_inspect(ctx, result) };
     unsafe { qjs::sofuu_js_free_value(ctx, result) };
     let out = display.into_bytes();
@@ -2211,4 +2278,85 @@ fn c_bytes_dup(s: &[u8]) -> *mut c_char {
         *p.add(s.len()) = 0;
     }
     p as *mut c_char
+}
+
+// ── Tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bare engine: runtime + context, no native modules. The REPL path
+    /// needs nothing else, and registering every module would make a unit
+    /// test depend on all of them.
+    fn bare_engine() -> *mut SofuuEngine {
+        unsafe {
+            let rt = qjs::JS_NewRuntime();
+            assert!(!rt.is_null(), "no QuickJS runtime");
+            let ctx = qjs::JS_NewContext(rt);
+            assert!(!ctx.is_null(), "no QuickJS context");
+            Box::into_raw(Box::new(SofuuEngine { rt, ctx }))
+        }
+    }
+
+    unsafe fn free_bare_engine(eng: *mut SofuuEngine) {
+        unsafe {
+            qjs::JS_FreeContext((*eng).ctx);
+            qjs::JS_FreeRuntime((*eng).rt);
+            drop(Box::from_raw(eng));
+        }
+    }
+
+    /// Evaluate one REPL line; returns (is_error flag, rendered output).
+    fn repl_line(eng: *mut SofuuEngine, src: &str) -> (c_int, String) {
+        let c_src = CString::new(src).unwrap();
+        let mut is_error: c_int = 0;
+        // SAFETY: eng is a live bare engine; c_src is NUL-terminated.
+        let out = unsafe { engine_eval_repl_inner(eng, c_src.as_ptr(), &mut is_error) };
+        assert!(!out.is_null(), "the REPL produced no output for {src:?}");
+        // SAFETY: out is a malloc'd C string.
+        let s = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+        unsafe { libc::free(out as *mut c_void) };
+        (is_error, s)
+    }
+
+    /// A value still renders as a value.
+    #[test]
+    fn repl_renders_a_value() {
+        let eng = bare_engine();
+        let (is_error, out) = repl_line(eng, "1+1");
+        assert_eq!(is_error, 0, "a plain value is not an error: {out}");
+        assert!(out.contains('2'), "{out}");
+        unsafe { free_bare_engine(eng) };
+    }
+
+    /// A throw is an error: the flag is set and the message names the cause.
+    #[test]
+    fn repl_reports_a_thrown_error() {
+        let eng = bare_engine();
+        let (is_error, out) = repl_line(eng, "throw new Error('boom')");
+        assert_eq!(is_error, 1, "a throw must be flagged: {out}");
+        assert!(out.contains("boom"), "{out}");
+        unsafe { free_bare_engine(eng) };
+    }
+
+    /// A rejected promise is a failed operation, not a value. JS_Eval does
+    /// not raise for it, so without the rejection check the REPL rendered
+    /// `{}` and the failure only surfaced at teardown.
+    #[test]
+    fn repl_reports_a_rejected_promise() {
+        let eng = bare_engine();
+        let (is_error, out) = repl_line(eng, "Promise.reject(new Error('nope'))");
+        assert_eq!(is_error, 1, "a rejected promise must be flagged: {out}");
+        assert!(
+            out.contains("Uncaught (in promise)"),
+            "the rejection must be named as such: {out}"
+        );
+        assert!(out.contains("nope"), "the cause must survive: {out}");
+        assert!(
+            !out.trim().starts_with('{'),
+            "the promise must not be rendered as a value: {out}"
+        );
+        unsafe { free_bare_engine(eng) };
+    }
 }

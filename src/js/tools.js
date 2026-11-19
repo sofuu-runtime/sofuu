@@ -297,6 +297,19 @@
   function executeWithPolicy(toolName, params, ctx) {
     var name = String(toolName == null ? '' : toolName);
     var implementation = TOOL_IMPLEMENTATIONS[name];
+    /* A tool registered AFTER the wrappers were installed — a plugin tool
+     * published into sofuu.tools.TOOLS — has no entry in the private table.
+     * Its own execute() already carries the plugin driver's policy check and
+     * schema validation, so call that instead of reporting a registered tool
+     * as unknown. */
+    var lateRegistered = false;
+    if (typeof implementation !== 'function') {
+      var lateSpec = TOOLS[name];
+      if (lateSpec && typeof lateSpec.execute === 'function') {
+        implementation = lateSpec.execute;
+        lateRegistered = true;
+      }
+    }
     if (typeof implementation !== 'function') {
       var e = new Error('E_TOOL: unknown tool \'' + name + '\'');
       e.code = 'E_TOOL';
@@ -313,6 +326,25 @@
       approval.rule = d.rule || 'R7';
       approval.decision = 'ask';
       throw approval;
+    }
+    if (!lateRegistered) {
+      /* The tool's own declared schema IS its argument contract. Validating
+       * it here — with the same validator and the same shape the agent loop
+       * uses — keeps a missing or mistyped argument an error instead of a
+       * successful-looking result (grep with no pattern used to answer "no
+       * matches for /undefined/"), and keeps the listing, the agent and this
+       * executor from disagreeing about what a call may look like. */
+      var schema = TOOLS[name] && (TOOLS[name].parameters || TOOLS[name].schema);
+      if (schema && typeof schema === 'object') {
+        var bad = schemaWalk(params || {}, schema, '$');
+        if (bad) {
+          var argErr = makeError('E_SCHEMA', name + ': invalid arguments at ' + (bad.path || '$') +
+            ': ' + (bad.error || 'invalid'));
+          argErr.path = bad.path || '$';
+          argErr.tool = name;
+          throw argErr;
+        }
+      }
     }
     toolDispatchBegin();
     var out;
@@ -2015,6 +2047,14 @@
                 return { body: { jsonrpc: '2.0', id: id, error: { code: -32601, message: 'Tool not found: ' + tName } } };
               }
               var tArgs = (msg.params && msg.params.arguments) || {};
+              var tViolation = mcpArgsViolation(tEntry, tArgs);
+              if (tViolation) {
+                return { body: { jsonrpc: '2.0', id: id, error: {
+                  code: -32602,
+                  message: 'Invalid params: ' + tViolation.path + ' ' + tViolation.reason,
+                  data: { field: tViolation.path, reason: tViolation.reason }
+                } } };
+              }
               try {
                 var mws = serverObj._middlewares || [];
                 var mIdx = 0;
@@ -2177,6 +2217,31 @@
         return serverObj;
       };
       sofuu.mcp.__serveWrapped = true;
+    }
+
+    /* The schema a registered MCP tool was declared with.
+     * `server.tool(name, {description, schema}, handler)` stores that opts
+     * object, so the schema itself is opts.schema; a tool registered without
+     * one accepts any arguments, which is the stdio server's documented
+     * permissive behaviour. */
+    function mcpToolSchema(entry) {
+      if (!entry) return null;
+      var s = entry.schema;
+      if (!s || typeof s !== 'object') return null;
+      if (s.schema && typeof s.schema === 'object') return s.schema;
+      if (s.parameters && typeof s.parameters === 'object') return s.parameters;
+      return s;
+    }
+    /* The stdio server (rt/mcp.rs) validates the arguments against the
+     * registered schema BEFORE the handler runs, so the same registered
+     * tool must not behave differently over the HTTP or the in-process
+     * transport. */
+    function mcpArgsViolation(entry, args) {
+      var schema = mcpToolSchema(entry);
+      if (!schema) return null;
+      var bad = schemaWalk(args || {}, schema, '$');
+      if (!bad) return null;
+      return { path: bad.path || '$', reason: bad.error || 'invalid arguments' };
     }
 
     /* In-Memory Direct MCP Transport client constructor */
@@ -2399,6 +2464,13 @@
               var notFound = new Error("Tool not found: '" + toolName + "'");
               notFound.code = -32601;
               throw notFound;
+            }
+            var directViolation = mcpArgsViolation(t, p.arguments || {});
+            if (directViolation) {
+              var badArgs = new Error("Invalid params: " + directViolation.path + ' ' + directViolation.reason);
+              badArgs.code = -32602;
+              badArgs.data = { field: directViolation.path, reason: directViolation.reason };
+              throw badArgs;
             }
 
             var srvMws = (srv && srv._middlewares) || [];
@@ -3069,7 +3141,18 @@
             throw eHttp;
           });
         }
-        return Promise.resolve(realConnect(cfg));
+        return Promise.resolve(realConnect(cfg)).catch(function (eNative) {
+          /* The native connect refuses a server command the host policy
+           * denies (R7.6/shell.*, or the operator's SOFUU_NO_SHELL switch).
+           * Surface it with the same typed code the JS policy gate uses. */
+          if (eNative && eNative.code === -32006) {
+            var denied = makeError('E_POLICY_DENIED', String((eNative && eNative.message) || eNative));
+            denied.rule = (eNative.data && eNative.data.rule) || 'R7';
+            denied.decision = 'deny';
+            throw denied;
+          }
+          throw eNative;
+        });
       }
 
       function wrapResilient(rawClient) {

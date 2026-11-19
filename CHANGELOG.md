@@ -4,11 +4,46 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Real-Execution Remediation — 2026-11-16
+
+- **Fail-closed capability host (`crates/sofuu-core/src/domains/kaze/caps.rs`):**
+  the runtime host no longer has a path where `ai`, `tool`, `memory` or
+  `alert` reports success without a configured backend — a missing backend
+  fails with `E_CAP_MISSING` instead of a synthesised answer. The physical
+  test host answers only the `drone`/`rover` family it was explicitly
+  selected for; a bare or empty `--cap` no longer means simulation, and
+  `--sim` refuses AI, tool, memory and alert response overrides.
+- **Action provenance:** every action line carries `[<mode>: <backend>]`, and
+  the structured result carries the resolved `backends` array, so a
+  simulated action can never be read as a real one.
+- **No substitute provider remains** in the Rust or JS provider registries.
+  The RLM unit tests are pure state-machine tests over fixed reply inputs;
+  the real-model coverage lives in `crates/sofuu-core/src/rlm/real_model.rs`
+  (`#[ignore]`d, existing local GGUF only).
+- **Migration note (breaking behaviour).** Removing implicit simulation is
+  intentional: a bare/empty `--cap`, a `--sim` AI/tool override and a
+  simulated memory or alert are now typed errors. `--no-policy` installs an
+  explicit deny-all policy — it is not an authorisation bypass.
+- **Release-size change:** `src/js/kaze_async.js` now rides the same gzip
+  mechanism as every other shipped driver (18,884 B → 5,535 B in `.rodata`).
+- **Android AAR API break:** `SofuuBridge.similarity()` now returns
+  `Float?` instead of `Float`. It used to answer a hardcoded `0f` when the
+  runtime could not compute the value; it now answers `null`. No in-repo
+  caller exists; a host that must keep a non-null value should default
+  explicitly.
+- **Known open items at the time of writing** (recorded, not hidden): the
+  shipping binary measured 5,801,024 B against the 5,767,168 B ceiling
+  before the gzip change above was rebuilt; the `.bc` snapshots for
+  `tools.js`, `providers.js` and `plugins.js` were stale; 30 local JS test
+  cases still drive a scripted provider endpoint (reported BLOCKED, not
+  PASS); and the staged `dist/` artifacts predate the fail-closed fix. See
+  `contract/CAPABILITY-REGISTER.md`.
+
 ## Scouter Mathematical Context & Memory Health Substrate — 2026-11-16
 
 - **Deterministic Context & Memory Observability (`crates/sofuu-core/src/rt/scouter.rs`):**
   - Shipped the **Scouter** engine to provide continuous, real-time health analysis of LLM context windows and cognitive vector memories without relying on neural classifiers or secondary LLMs.
-  - **Zero-ML Guarantee:** Built exclusively on deterministic algorithms, discrete information theory, and linear algebra. The observability monitor cannot be jailbroken, adversarial-perturbed, or prompted into hallucination.
+  - **Zero-ML Guarantee:** Built exclusively on deterministic algorithms, discrete information theory, and linear algebra — no neural classifier and no second model to prompt. It analyses the context it is given; it does not verify what a model said, and it cannot be made to report on a context it never saw.
   - **Model Context Health:** Sliding-window Shannon entropy ($H \le 5.85\text{ b/B}$) detects high-entropy obfuscation in tool outputs; deterministic substring matching flags injected chat role markers (`<|im_start|>`, `<|system|>`, `[INST]`, `<|turn_start|>`); zero-alloc log-deviation analysis detects abnormal Zipfian token distributions ($\le 2.85$); context efficiency tracking flags context dilution below $12\%$.
   - **Cognitive Memory Health:** Centroid variance and distance ratios detect Sybil cluster poisoning and artificial hub vectors; pairwise cosine similarity ($\cos \ge 0.88$) with lexical negation detection spots semantic contradictions in top recall candidates; gravity entrapment analysis flags memory monopolization exceeding $2.5\sigma$.
 - **Tamper-Proof Out-of-Band State & Anti-Terminal Spoofing:**
@@ -16,15 +51,27 @@ carry the same version (checked by `scripts/verify-dist.sh`).
   - Stream-level ANSI sanitization (`sanitize_terminal_stream`) filters carriage returns and terminal control escapes (`\x1b[2K`, `\x1b[H`, `\x1b[A`), preventing malicious tool output from forging clean health chips in developer terminals.
 - **TUI & Developer Experience:**
   - Added `/scouter` and `/health` diagnostic commands in interactive chat (`src/js/chat_tui.js`), rendering a live color-coded status breakdown with active threat logs.
-  - Real-time footer health chip (`[H:score%]`) provides non-intrusive status feedback after each assistant turn.
+  - Real-time footer health chip (`[H:score%]`) provides non-intrusive status feedback after each assistant turn; a score the substrate never measured is shown as unavailable, not as a number.
   - Exported JavaScript FFI surface `sofuu.scouter.{contextHealth, brainHealth, status, sanitizeAnsi}` with full TypeScript type definitions in `sofuu.d.ts`.
 - **Universal Execution Surface (Headless, Agents, API & Tools):**
   - Integrated into autonomous agent loops (`src/js/agent.js`), evaluating context health after each completed tool step and emitting structured `scouter` and `warning` events into `.sofuu/logs/agent-<run_id>.jsonl` traces.
   - Headless CLI runner `sofuu agent run` displays context and memory health in the terminal summary line and returns `scouter` in `--json` payloads.
-  - `sofuu serve` exposes live health telemetry on `GET /health` and `GET /v1/scouter`, and evaluates inbound payload health on `POST /v1/chat/completions` (`src/js/serve.js`).
+  - `sofuu serve` exposes live health telemetry on `GET /health` and `GET /v1/scouter` (`src/js/serve.js`).
   - Standard `system_info` tool (`src/js/tools.js`) embeds live Scouter health reports for introspecting agents.
 - **Strict Prompt Sovereignty:**
   - Operates purely as an observability and alerting substrate. Never silently rewrites prompts, mutates tool results, or purges memories; human operators and supervisors maintain complete control.
+- **Measurement honesty, 2026-11-16:**
+  - A score the substrate never measured is reported as `null` with
+    `contextMeasured` / `brainMeasured` flags, not as a perfect `100`.
+  - `GET /scouter` and `GET /v1/scouter` answer `503 scouter_unavailable`
+    on a build without the substrate, and the TUI prints "unavailable"
+    instead of a health verdict it did not measure.
+  - No per-turn latency figure is published: the monitor has no benchmark
+    yet, so the earlier "under 0.5 ms per turn" wording was a claim without a
+    measurement and has been withdrawn from the README.
+  - The inbound-payload evaluation on `POST /v1/chat/completions` claimed by
+    the entry above is not in the current tree; `src/js/serve.js` evaluates
+    the Scouter on the `GET /health` and `GET /v1/scouter` routes only.
 
 ## Real Execution Remediation (Durable Memory, Alert Sinks, 1.5s Safety) — 2026-11-16
 
@@ -43,6 +90,27 @@ carry the same version (checked by `scripts/verify-dist.sh`).
 - **Robotics 1.5s Heartbeat Safety Unification:**
   - Unified `TELEMETRY_MAX_AGE` to 1500 ms in `crates/sofuu-core/src/domains/robotics/kaze_live.rs`, matching `mavlink_gate.rs::TELEMETRY_MAX_AGE_MS = 1_500`.
   - Enforced fail-closed rejection of unknown, missing, and protocol-sentinel telemetry readings.
+- **Fail-Closed Non-Robotics Capabilities:**
+  - The Kaze runtime host (`crates/sofuu-core/src/domains/kaze/caps.rs`) no
+    longer answers `ai`, `tool`, `memory` or `alert` without a configured
+    backend: a granted capability with no backend stops with
+    `E_CAP_MISSING` instead of a fabricated success.
+  - Simulation is reachable only through an explicit, labelled `drone=sim` /
+    `rover=sim` selection, and `--sim` sets the initial physical machine state
+    of that simulator — never an AI, tool, memory or alert result.
+
+## Public Example Agents — 2026-11-16
+
+- **Retired the `paper_trader` example.** It described simulated non-robotics
+  execution. It is replaced by `example-agents/local_brief/`, a read-only
+  example whose routine reads one operator-selected local file through an
+  authorized MCP tool and returns a real model's answer about it.
+- **`example-agents/quant_sentinel`, `example-agents/med_protocol` and
+  `example-agents/agri_sentinel` remain language examples.** No broker,
+  exchange, order router, patient record, EHR, greenhouse, sensor, irrigation
+  controller or actuator is connected to any of them. Their capability calls
+  fail closed with typed errors; each README now states the observed refusal
+  and the real dependencies instead of describing an outcome.
 
 ## Unified Diagnostics Review Fixes — 2026-11-10
 
@@ -114,6 +182,7 @@ Post-stabilization freeze enhancements across Model Context Protocol (MCP), stan
 **MCP Pillar 3 — In-Memory Direct Transport & Middleware Onion Pipeline (`51fa5a23f`).**
 - **In-Memory Direct Transport (`transport: "direct"`):** Connect in-process MCP servers directly to runtime clients (`sofuu.mcp.connect(server, { transport: 'direct' })`) with zero IPC overhead, eliminating process-spawn and JSON serialization bottlenecks (sub-millisecond invocation latency). Directly accepted by `sofuu.agent.define({ tools: [directClient] })`.
 - **Middleware Onion Pipeline (`client.use` / `server.use`):** Added composable async middleware interceptors (`(ctx, next) => { await next(); }`) executing in standard onion order across both client and server lifecycles, enabling cross-cutting concerns (tool call tracing, validation, authorization, retries).
+  - **Scope note (2026-11-16):** The onion pipeline lives in the JavaScript driver layer (`src/js/tools.js`) and runs on the in-process/direct and HTTP transports. A stdio MCP server is served by the native engine and does not run it.
 - **Standalone HTTP MCP Server:** Added HTTP server mode (`sofuu.mcp.serve({ transport: 'http', port })`) with graceful connection teardown (`server.close()`).
 - **MCP CLI Inspection:** Added `sofuu mcp inspect <name | command line | http(s)://url> [--call <tool> [--args <json>]]` to introspect server capabilities, list tools/resources, and invoke tools directly from the command line.
 
@@ -153,6 +222,11 @@ Post-stabilization freeze enhancements across Model Context Protocol (MCP), stan
 
 **Pass 3.1 — concurrency ceiling measured, not assumed.**
 - `scripts/bench/event_loop_latency.js` (`make event-loop-check`, wired into `make test`) drives the shipped `sofuu.serve` handler with a macrotask-yielding fake stream: 32 concurrent turns × 128 chunks measured **max loop lag 1 ms**, p95 1 ms, against the 16 ms hard-realtime ceiling. The 64×256 stress row is also 1 ms.
+- **Historical, superseded (2026-11-16).** That row measured a generated fake
+  stream, not inference. The benchmark now drives a real local model over
+  loopback and requires an already-present GGUF; without one the gate is
+  blocked. The 1 ms figure above is not comparable to a real-inference
+  measurement and must not be quoted as one. See `BENCHMARKS.md` §6.
 
 **Extreme cold-start characterization.**
 - `scripts/bench/extreme_cold_start.py` (`make cold-start-bench`) runs ~7,000 process launches: 1,000 spawn-floor runs, 500 engine boots, 300-run env variants, and concurrent bursts to 200 processes.
@@ -252,6 +326,11 @@ Shipped 4-stage automated gate verifying zero cross-domain coupling, QuickJS byt
 - 123 unit and integration tests passing across MAVLink, drone operations, GPIO, and Kaze live backends.
 - Fuzzing target `crates/fuzz/fuzz_targets/mavlink.rs` active.
 - Live ArduPilot SITL flight over Wi-Fi verified (`takeoff -> goto -> rtl`).
+  - **Corrected, 2026-11-16.** That flight was an ArduPilot SITL simulator
+    run — the labelled robotics/drone physical-test case — not a flight on a
+    physical vehicle. No receipt for it is retained in this tree, and no
+    physical drone or rover has been attached since: hardware execution stays
+    unverified and live dispatch stays disabled.
 
 
 ## Production Local Inference Plugin Bridge & Plugin Add CLI — 2026-11-01
@@ -324,6 +403,12 @@ a numeric pin), and records — the maps JSON arguments already produce — are 
 with `record.field`, which compiles to `GET_FIELD`. A missing field reads as
 `nothing`; a field read on something that is not a record is `E_KAZE_TYPE`.
 
+**Corrected, 2026-11-16.** The deterministic `0` fallback for a numeric pin
+described above no longer exists: an unknown or stale telemetry field is
+refused with `E_CAP_MISSING`, and the 1500 ms freshness window is shared by
+`kaze_live.rs` and `mavlink_gate.rs`. This entry is kept as the dated record
+of what shipped then.
+
 **Surfaces.** `sofuu script run|check|compile|repl` — the command never
 initialises QuickJS, so `check` answers with no model, config or network — and
 `sofuu.sfs.run/check/compile/version` from JS, which returns a report object
@@ -349,6 +434,14 @@ comparing every example against the byte-exact trace in
 patrol run, the `E_CAP_MISSING` refusal, the fuel `E_TIMEOUT` stop, the guardrail
 verdicts, the `triage` run that reads `record.kind` and `record.level`, and the
 JS round-trip quoted above were produced by `./sofuu`, not by inspection.
+
+**Corrected, 2026-11-16.** These are language examples over static fixture
+records: the greenhouse and triage scripts read fixed example data, not a
+sensor reading and not a patient record. No greenhouse, irrigation controller,
+triage queue or clinical system is connected to any of them, and the example
+set shipped publicly was retired and replaced on 2026-11-16 (see "Public
+Example Agents" above). This entry is kept as the dated record of what
+shipped then.
 
 **Size.** A differential build of the same tree with the Kaze modules disabled
 measures the engine at 115,520 B of binary. `make size-check` passes after the

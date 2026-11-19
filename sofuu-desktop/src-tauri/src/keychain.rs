@@ -7,7 +7,9 @@
 //
 // Backends: macOS Keychain (security_framework), Windows Credential Manager
 // + Linux Secret Service (keyring; see the per-target features in
-// Cargo.toml), everything else → in-process stub.
+// Cargo.toml). Every other platform has no credential store and REFUSES
+// key writes — an in-process map would report "saved" and lose the key at
+// exit.
 
 const SERVICE: &str = "com.sofuu.desktop";
 
@@ -67,23 +69,19 @@ mod imp {
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 mod imp {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-
-    static STUB: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
-
-    pub fn set_key(provider: &str, key: &str) -> Result<(), String> {
-        STUB.lock().unwrap().get_or_insert_with(HashMap::new).insert(provider.into(), key.into());
-        Ok(())
+    // No OS credential store on this platform. An in-process map would
+    // answer "saved" and then lose the key at exit — a stored credential
+    // the app cannot keep is not a stored credential. Fail closed.
+    pub fn set_key(_provider: &str, _key: &str) -> Result<(), String> {
+        Err("no OS credential store on this platform — provider keys cannot be stored".into())
     }
 
-    pub fn get_key(provider: &str) -> Option<String> {
-        STUB.lock().unwrap().as_ref()?.get(provider).cloned()
+    pub fn get_key(_provider: &str) -> Option<String> {
+        None
     }
 
-    pub fn delete_key(provider: &str) -> Result<(), String> {
-        STUB.lock().unwrap().as_mut()?.remove(provider);
-        Ok(())
+    pub fn delete_key(_provider: &str) -> Result<(), String> {
+        Err("no OS credential store on this platform — there is nothing to delete".into())
     }
 }
 

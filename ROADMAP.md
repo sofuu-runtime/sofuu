@@ -110,9 +110,12 @@ This is a partial remediation, not evidence that simulated non-robotics
 behavior has been removed throughout Sofuu. The current source:
 
 - Requires explicit Kaze grants and policy, and fails closed for unavailable
-  AI, tool, persistent memory, alert and physical-device backends. An
-  explicitly selected `memory=ephemeral` backend provides isolated per-run
-  CMA storage; it is not durable or shared with QTSQ. Kaze file access and
+  AI, tool and physical-device backends. Memory is selected explicitly:
+  `memory=ephemeral` provides isolated per-run CMA storage, and `memory=durable`
+  / `memory=file:<path>` provide a file-backed store that survives a process
+  restart; a store that cannot be opened is refused, never silently replaced.
+  Alerts need an explicit sink (`alert=stdout`, `alert=stderr`,
+  `alert=file:<path>`) and fail closed without one. Kaze file access and
   embedded calls also respect the host's filesystem and runtime policy. See
   [Kaze embedded status](KAZE-EMBEDDED.md) for the supported surface.
 - Applies CLI argument, environment and config-file precedence for Kaze, and
@@ -140,9 +143,8 @@ releases.
 The pure-Kaze model-plus-MCP journey now passes on a debug build through
 `sofuu.kaze.runAsync`, a compiled agent and `sofuu script run` for source and
 `.kazebc`. Remaining work includes approval receipts, cancellation coverage,
-durable Kaze memory and acknowledged alerts, physical-simulator safety,
-migration of remaining simulated test providers, local-GGUF coverage, broader
-surface and release-artifact audits, and the applicable release gates. `make test-rust`,
+physical-simulator safety, migration of remaining simulated test providers,
+broader surface and release-artifact audits, and the applicable release gates. `make test-rust`,
 the aggregate tests and preflight are blocked until their simulated providers
 are migrated. The main CI job therefore currently stops at `make test-rust`;
 model-dependent CI gates also require an existing compatible model on the

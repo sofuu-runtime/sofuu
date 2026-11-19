@@ -68,6 +68,15 @@ pub struct MissionSafety {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Preflight {
     pub ok: bool,
+    /// The endpoint the mission would be flown over.
+    pub device: String,
+    /// The vehicle profile the mission file declares.
+    ///
+    /// Whether the far end is an in-process model, a separate SITL
+    /// autopilot or a real vehicle is the operator's declaration. The runtime
+    /// sees one MAVLink endpoint in every case and cannot tell them apart,
+    /// so the declaration travels with the verdict instead of being guessed.
+    pub vehicle: String,
     pub steps: Vec<StepVerdict>,
 }
 
@@ -450,13 +459,16 @@ pub fn preflight(policy: &HardwarePolicy, device: &str, mission: &Mission) -> Pr
             reason: verdict.reason,
         });
     }
-    Preflight { ok, steps }
+    Preflight { ok, device: device.to_string(), vehicle: mission.vehicle.clone(), steps }
 }
 
 impl Preflight {
     pub fn to_json(&self) -> Value {
         json!({
             "ok": self.ok,
+            "device": self.device,
+            "vehicle": self.vehicle,
+            "link": "mavlink",
             "steps": self.steps.iter().map(|s| json!({
                 "index": s.index, "kind": s.kind, "allowed": s.allowed,
                 "code": s.code, "rule": s.rule, "reason": s.reason,
@@ -670,6 +682,24 @@ mod tests {
         assert!(!pf.steps[0].allowed);
         assert!(pf.steps[1].allowed, "rtl is fine");
         assert!(!pf.steps[2].allowed);
+    }
+
+    /// The structured verdict names the endpoint and the vehicle profile the
+    /// mission file declares. A SITL mission and a hardware mission are
+    /// different claims, and the runtime cannot tell them apart from the
+    /// endpoint alone — so the declaration travels with the verdict.
+    #[test]
+    fn the_preflight_verdict_carries_its_device_and_vehicle_profile() {
+        let m = parse_mission(&json!({
+            "vehicle": "rover-sim",
+            "steps": [{"type": "rtl"}]
+        }))
+        .unwrap();
+        let pf = preflight(&policy(), DEV, &m);
+        let json = pf.to_json();
+        assert_eq!(json["device"], DEV);
+        assert_eq!(json["vehicle"], "rover-sim");
+        assert_eq!(json["link"], "mavlink");
     }
 
     #[test]

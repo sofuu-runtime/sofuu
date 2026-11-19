@@ -60,18 +60,39 @@ impl Ty {
     }
 }
 
+/// The server an `mcp(...)` or `plugin(...)` declaration names.
+///
+/// A binding is not a capability family: it reaches exactly one server, so it
+/// never stands in for the family an unrelated receiver would resolve to.
+fn binding_server(declared: &str) -> Option<&str> {
+    let rest = declared
+        .strip_prefix("mcp(")
+        .or_else(|| declared.strip_prefix("plugin("))?;
+    let inner = rest.strip_suffix(')').unwrap_or(rest);
+    Some(inner.trim_matches('"'))
+}
+
+/// Whether a declaration is an `mcp(...)` or `plugin(...)` binding.
+fn is_binding(declared: &str) -> bool {
+    declared.starts_with("mcp(") || declared.starts_with("plugin(")
+}
+
 /// The declared rows, so `filter` bodies can be checked for a verdict.
 pub fn check(p: &Program) -> Result<(), Vec<CheckError>> {
     let mut errors: Vec<CheckError> = Vec::new();
     let declared: Vec<&str> = p.needs.iter().map(|s| s.as_str()).collect();
 
     for need in &p.needs {
-        let family = caps::family_of(need);
-        if need != family && !caps::FAMILIES.contains(&family) {
-            errors.push(e(
-                1,
-                format!("'{}' does not name a capability family or an instance", need),
-            ));
+        // A binding names one server: `mcp("blender")` reaches the server
+        // called blender and nothing else. An empty binding names no server at
+        // all, so it is refused instead of standing in for a declaration.
+        if let Some(server) = binding_server(need) {
+            if server.is_empty() {
+                errors.push(e(
+                    1,
+                    format!("'{}' names no server; write mcp(\"server\") with the server to reach", need),
+                ));
+            }
         }
     }
 
@@ -220,7 +241,7 @@ fn infer(
             }
         },
         Expr::Ambient { field, family } => {
-            if !declared.iter().any(|d| caps::family_of(d) == *family) {
+            if !declared.iter().any(|d| !is_binding(d) && caps::family_of(d) == *family) {
                 errors.push(e(
                     0,
                     format!("'{}' is read from '{}', which this script does not declare", field, family),
@@ -228,11 +249,11 @@ fn infer(
             }
             Ty::Any
         }
-        Expr::Field { base, line, .. } => {
+        Expr::Field { base, field, line } => {
             if !scope.iter().rev().any(|(n, _)| n == base) {
                 errors.push(e(
                     *line,
-                    format!("'.{}' reads a field of '{}', which is not a value here", "", base),
+                    format!("'.{}' reads a field of '{}', which is not a value here", field, base),
                 ));
             }
             Ty::Any
@@ -263,17 +284,7 @@ fn infer(
             Ty::Any
         }
         Expr::Call { recv, op, args, line } => {
-            let is_mcp_or_plugin = declared.iter().any(|d| {
-                if let Some(rest) = d.strip_prefix("mcp(") {
-                    let inner = rest.trim_end_matches(')').trim_matches('"');
-                    inner == recv
-                } else if let Some(rest) = d.strip_prefix("plugin(") {
-                    let inner = rest.trim_end_matches(')').trim_matches('"');
-                    inner == recv
-                } else {
-                    false
-                }
-            });
+            let is_mcp_or_plugin = declared.iter().any(|d| binding_server(d) == Some(recv.as_str()));
             if is_mcp_or_plugin {
                 for a in args {
                     infer(a, scope, declared, errors);
@@ -281,7 +292,11 @@ fn infer(
                 return Ty::Any;
             }
             let family = caps::family_of(recv);
-            if !declared.iter().any(|d| *d == recv || caps::family_of(d) == family) {
+            // A binding declares one server, never a family, so it cannot
+            // stand in for the receiver this call names.
+            if !declared.iter().any(|d| {
+                *d == recv || (!is_binding(d) && caps::family_of(d) == family)
+            }) {
                 errors.push(e(
                     *line,
                     format!(
@@ -337,8 +352,9 @@ fn known_ops(family: &str) -> String {
     for op in [
         "arm", "takeoff", "land", "rtl", "hold", "goto", "stop", "telemetry", "forward", "backward",
         "turn_left", "turn_right", "temperature", "humidity", "distance", "front_distance", "read",
-        "set_relay", "set_duty", "pulse", "read_gpio", "save", "recall", "detects", "allow", "reject", "info",
-        "warn", "error", "debug", "send", "prompt", "complete", "classify", "call", "run",
+        "set_relay", "set_duty", "pulse", "read_gpio", "save", "recall", "detects", "detect", "allow",
+        "reject", "info", "warn", "error", "debug", "send", "prompt", "complete", "classify", "call",
+        "run",
     ] {
         if caps::known_op(family, op) {
             names.push(op);
@@ -506,5 +522,35 @@ mod tests {
         let msg = first_error("needs: drone\naction a():\n    lidar.front_distance()\n");
         assert!(msg.contains("not declared"), "{}", msg);
         assert!(msg.contains("needs: sensor"), "{}", msg);
+    }
+
+    #[test]
+    fn a_binding_that_names_no_server_is_refused() {
+        let msg = first_error("needs: mcp(\"\")\naction a():\n    return 1\n");
+        assert!(msg.contains("names no server"), "{}", msg);
+    }
+
+    /// A binding reaches one server. It is not a family, so it cannot stand in
+    /// for the receiver an unrelated call names.
+    #[test]
+    fn a_binding_does_not_declare_a_family_for_an_unrelated_receiver() {
+        let errors = check_src("needs: mcp(\"\")\naction a():\n    fan.set_duty(50)\n").unwrap_err();
+        let messages: Vec<&str> = errors.iter().map(|e| e.msg.as_str()).collect();
+        assert!(messages.iter().any(|m| m.contains("not declared")), "{:?}", messages);
+        assert!(messages.iter().any(|m| m.contains("names no server")), "{:?}", messages);
+    }
+
+    #[test]
+    fn a_field_diagnostic_names_the_field_that_could_not_be_read() {
+        let msg = first_error("action a():\n    let x = missing.field\n");
+        assert!(msg.contains(".field"), "{}", msg);
+        assert!(msg.contains("missing"), "{}", msg);
+    }
+
+    #[test]
+    fn an_unknown_operation_lists_every_operation_the_registry_has() {
+        let msg = first_error("needs: policy\naction a():\n    policy.frobnicate(\"x\")\n");
+        assert!(msg.contains("not something a script can ask for"), "{}", msg);
+        assert!(msg.contains("detect"), "{}", msg);
     }
 }

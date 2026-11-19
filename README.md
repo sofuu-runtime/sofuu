@@ -28,7 +28,7 @@ The project is beta. Features and evidence vary by platform and execution path:
 * **Agents & Kaze:** JS/TS agent loops and domain toolpacks; Kaze routines and standalone compilation. Pure-Kaze local GGUF model execution on Metal GPU, durable memory persistence (`memory=durable`), real alert sinks (`stdout`, `stderr`, `file:<path>`), and the asynchronous model-and-tool bridge are verified in source; published binaries remain separately unverified.
 * **Model Context Protocol (MCP):** Client and server support for selected protocol versions and transports; see the limitations below.
 * **Policy and sandbox tools:** Selected tool, filesystem, network, and shell paths have policy checks; boundaries and approval handling depend on the execution surface.
-* **Scouter Integrity Engine:** Real-time, out-of-band mathematical monitoring of model context health and cognitive memory integrity with zero ML classifiers, anti-terminal spoofing, and full prompt sovereignty across interactive TUI, headless agent runs, supervisor daemons, and HTTP servers.
+* **Scouter Integrity Engine:** Deterministic, out-of-band analysis of model context health and cognitive memory integrity — no ML classifier, no second model, and no prompt rewriting. It measures the context it is given; it does not verify what the model said. Active in the interactive TUI, in headless agent runs (`sofuu agent run`), in autonomous agent loops, in the HTTP server (`GET /health`, `GET /v1/scouter`) and in the `system_info` tool. A surface with no Scouter substrate reports `scouter_unavailable` rather than a health verdict, and a score that was never measured is reported as `null`.
 * **Embedding:** A C ABI and mobile wrappers are available; support and testing vary by platform. Hardware and app-store acceptance are not universally established.
 
 ---
@@ -45,7 +45,7 @@ curl -fsSL https://sofuu.xyz/install | sh
 npm install -g sofuu
 ```
 
-Official pre-compiled single binaries are available for macOS (Apple Silicon) and Linux (`x86_64` and `arm64` / Raspberry Pi 5).
+Official pre-compiled single binaries are available for macOS (Apple Silicon) and Linux (`x86_64` and `arm64` / Raspberry Pi 5). The published Linux archives are still over the project's 5.5 MiB release cap and need a re-cut — see [Platform evidence](#platform-evidence-2026-11-10) below.
 
 ---
 
@@ -54,7 +54,7 @@ Official pre-compiled single binaries are available for macOS (Apple Silicon) an
 The following JavaScript example creates local vector memory, calls a native tool, and defines an agent. It does not invoke a model:
 
 ```javascript
-// quickstart.js - memory · native tools · agents · zero daemons
+// memory · native tools · agents · zero daemons
 const brain = sofuu.memory.open("./brain.qtsq", 768);
 brain.remember(sofuu.ai.embedLocal("runtime"), "AI runtime. Under 10 MB.");
 
@@ -75,7 +75,7 @@ console.log(hit.text, "•", sys.platform || process.platform, "• agent:", age
 // -> AI runtime. Under 10 MB. · darwin · agent: assistant
 ```
 
-*This example does not invoke an agent or model. Local memory does not require a database server.*
+*This example does not invoke an agent or model. Local memory does not require a database server. The repository's `quickstart.js` runs these same three steps and prints a labelled line for each; the output above is the shortened snippet.*
 
 Run it immediately with zero setup, or compile it into a standalone native executable:
 
@@ -108,15 +108,17 @@ $ sofuu eval 'const b = sofuu.memory.open("./brain.qtsq", 768); b.remember(sofuu
 
 ### 4. Kaze: a domain-specific scripting language
 
-Kaze provides a parser, checker, VM, capability declarations and standalone compilation for bounded agent and device routines. It is not a general-purpose language. A script or compiled agent that declares AI or tool needs runs through an asynchronous bridge that routes AI calls through Sofuu's AI API and tool calls through its built-in tools or MCP client under the applicable policies. **A real Kaze model-and-authorized-tool journey has been exercised on a debug build with a configured remote model and a real MCP server, through `sofuu.kaze.runAsync`, a compiled agent, and `sofuu script run` for source and bytecode.** A script that declares neither capability keeps the engine-free synchronous runner and refuses unavailable AI and tool backends. Current source also includes an explicitly selected, per-run in-memory CMA backend; persistent Kaze memory and alert, sensor and device operations remain unavailable. Physical simulation is explicitly selected for drone or rover testing. Released binaries, local-GGUF weights and live hardware still need separate verification. Do not use the examples for real-world actions or treat their output as evidence of verified live integrations.
+Kaze provides a parser, checker, VM, capability declarations and standalone compilation for bounded agent and device routines. It is not a general-purpose language. A script or compiled agent that declares AI or tool needs runs through an asynchronous bridge that routes AI calls through Sofuu's AI API and tool calls through its built-in tools or MCP client under the applicable policies. **A real Kaze model-and-authorized-tool journey has been exercised on a debug build, through `sofuu.kaze.runAsync`, a compiled agent, and `sofuu script run` for source and bytecode — with a configured remote provider and, separately, with pre-existing local GGUF weights and a real local MCP server.** A script that declares neither capability keeps the engine-free synchronous runner and refuses unavailable AI and tool backends. Memory backends are `memory=ephemeral` (a per-run in-memory CMA store), `memory=durable` and `memory=file:<path>` (persisted across process restarts); alert sinks are `alert=stdout`, `alert=stderr` and `alert=file:<path>`. Sensor, device and physical-hardware operations remain unavailable. Physical simulation is explicitly selected for drone or rover testing. Released binaries, other providers and live hardware still need separate verification. Do not use the examples for real-world actions or treat their output as evidence of verified live integrations.
 
 See [embedded Kaze capability status](KAZE-EMBEDDED.md) for policy, backend and verification details.
 
 The [Kaze examples](example-agents/README.md) can be inspected and checked without executing their capabilities:
 
 ```bash
-sofuu script check example-agents/quant_sentinel/agent.kaze
+sofuu script check example-agents/local_brief/agent.kaze
 ```
+
+One of them, [Local Brief](example-agents/local_brief/README.md), is a real read-only workflow: a pure Kaze routine reads one operator-selected local file through an authorized MCP tool and returns a real model's answer about it. The other three are language examples whose capability calls fail closed because no backend is configured for them. None of them places an order, treats a patient, actuates equipment or sends a clinical alert; the trading, clinical and greenhouse themes are illustrative only.
 
 Compilation packages supported routines as one executable; system libraries and any real backends needed by the workload remain separate.
 
@@ -136,12 +138,12 @@ Sofuu groups the main runtime surfaces and experimental modules below. Core mean
 
 | Subsystem | Status | Description |
 | :--- | :---: | :--- |
-| **Autonomous Agent Engine** | **Core** | `sofuu.agent`, cooperative scheduling (`scheduler.yield`), step budgets, resilient editing (`smart_edit`), and real-time trace streaming. |
+| **Autonomous Agent Engine** | **Core** | `sofuu.agent`, cooperative scheduling (`scheduler.yield`), step budgets, resilient `edit_file` edits (whitespace-tolerant match, syntax dry-run), and real-time trace streaming. |
 | **Domain Toolpacks** | **Core** | Modular toolpacks (`coding`, `web`, `memory`, `system`), single-instruction fuel sandbox, numbered unified diffs. |
 | **Standalone Compiler** | **Core** | `sofuu compile`: native executables with a 32-byte `SOFUU_BIN_V1` trailer; signing and dependencies vary by platform. |
 | **Vector Memory (QTSQ)** | **Core** | On-device `.qtsq` vector containers, cached KDF v2, plaintext zero-KDF mode, hardware SIMD search. |
 | **Model Context Protocol (MCP)** | **Core** | Native client & server supporting stdio, HTTP, SSE, and direct in-process transports; dynamic tool discovery. |
-| **Kaze Agent Language** | **Core** | Domain-specific scripting language and VM with authorized async model/tool dispatch; released-artifact and local-GGUF verification remain open. |
+| **Kaze Agent Language** | **Core** | Domain-specific scripting language and VM with authorized async model/tool dispatch. The local-GGUF path is verified in source (3/3 runs, source and compiled); the released artifact, other providers and live hardware stay unverified. |
 | **Security Sandbox** | **Core** | Deterministic path traversal blocking, private CIDR SSRF filtering, credential shielding (`.env`, `id_rsa`). |
 | **Local Inference Engine** | **Preview** | Built-in custom GGUF/SafeTensors engine. (For deployed local inference, use `sofuu-plugin-llamacpp` or remote providers). |
 | **Robotics & MAVLink** | **Preview** | `sofuu drone`, MAVLink v2 codec, and GPIO line timers through hardware safety gates. |
@@ -199,7 +201,8 @@ server.resource("system://platform", { mimeType: "application/json" }, () => {
   return JSON.stringify({ platform: process.platform });
 });
 
-// Composable onion middleware
+// Composable onion middleware (applies to the direct and HTTP transports;
+// a stdio server is served natively and does not run this pipeline)
 server.use(async (ctx, next) => {
   console.error(`[MCP] Invoking ${ctx.toolName}`);
   await next();
@@ -301,7 +304,7 @@ Documentation: [sofuu.xyz/docs](https://sofuu.xyz/docs)
 
 ### 3. Cloud LLM Streaming (Any Provider)
 
-Stream from OpenAI, Anthropic, DeepSeek, OpenRouter, or any OpenAI-compatible server with zero SDKs to install:
+Stream from OpenAI, Anthropic, or any OpenAI-compatible server (DeepSeek, OpenRouter, vLLM, LM Studio) with zero SDKs to install. OpenAI and Anthropic are built in; any other OpenAI-compatible host is reached as a custom provider with an explicit `base_url`:
 
 ```javascript
 // server.js
@@ -342,7 +345,7 @@ console.log(report.fuelUsed); // instructions charged
 Built-in append-only JSONL tracing and tamper-proof mathematical health monitoring:
 
 * **Append-Only Traces:** Turns and tool steps append to `.sofuu/logs/agent-<run_id>.jsonl` with total-order sequence numbers.
-* **Scouter Health & Integrity Monitor:** Deterministic out-of-band mathematical analyzer (`sofuu.scouter`, `/scouter`, `/health`). Evaluates sliding-window Shannon entropy, role-delimiter spoofing, Zipfian deviation, cognitive memory Sybil clusters, semantic contradictions, and gravity traps in under 0.5 ms per turn with zero ML models. Active across headless agent runs (`sofuu agent run`), autonomous agent loops, background daemons, HTTP server endpoints (`GET /health`, `GET /v1/scouter`), and the interactive TUI.
+* **Scouter Health & Integrity Monitor:** Deterministic out-of-band mathematical analyzer (`sofuu.scouter`, `/scouter`, `/health`) with no ML model in the loop. It evaluates sliding-window Shannon entropy, role-delimiter spoofing, Zipfian deviation, cognitive memory Sybil clusters, semantic contradictions, and gravity traps. Active in headless agent runs (`sofuu agent run`), autonomous agent loops, the HTTP server (`GET /health`, `GET /v1/scouter`) and the interactive TUI. It carries no published latency guarantee: there is no per-turn benchmark for it.
 * **Secret Redaction:** Recognized credential and path patterns are redacted in supported diagnostic paths; coverage is not exhaustive.
 * **Crash Post-Mortems:** Diagnostic cards may be written to `.sofuu/crashes/<crash_id>.json` on a best-effort basis.
 * **Resumable Execution:** `sofuu resume <run_id>` requires a usable checkpoint; redacted or truncated checkpoints can be refused.
@@ -444,7 +447,7 @@ sofuu version                  # Display semver, commit revision, and engine inf
 
 ## Embedded Integration (`libsofuu`)
 
-Sofuu ships an embeddable C ABI library (`libsofuu`) with first-class Swift and Kotlin bindings for iOS, Android, and desktop apps:
+Sofuu ships an embeddable C ABI library (`libsofuu`) with Swift and Kotlin binding sources for iOS, Android and desktop hosts. The Swift package and CocoaPods coordinates in this tree were not installable at the 2026-10-31 site audit, and no device or app-store acceptance has been demonstrated:
 
 ```swift
 // Swift (iOS / macOS)

@@ -1,6 +1,10 @@
 # Med Protocol — illustrative Kaze language example.
-# AI, tool, memory, and alert capabilities can currently use synthetic results;
-# this is not a verified integration or a real-world deployment.
+#
+# This is not medical software. No patient record, EHR, triage queue or
+# clinical alert channel is connected to it, and "ehr_record_vitals" is an MCP
+# tool name that no shipped configuration provides, so the calls fail closed.
+# An alert here reaches a local sink (stdout, stderr or a local file), never a
+# clinician. Do not use it for triage, patient care or emergency response.
 
 needs: ai, tool, policy, memory, log, alert
 

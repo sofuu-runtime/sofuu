@@ -2,7 +2,8 @@
 //
 // Every function maps 1:1 to a #[tauri::command] in src-tauri/commands.rs.
 // Outside a Tauri webview (plain `npm run dev` in a browser) the calls fail
-// cleanly so the UI can still be developed against mock data.
+// cleanly — the UI reports the failure; it never substitutes sample data
+// for a backend result.
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -47,7 +48,21 @@ export function resolveApproval(id: string, allow: boolean, always = false): Pro
 
 // ── Sessions ──────────────────────────────────────────────────────
 
-export function listSessions(): Promise<SessionInfo[]> {
+/** The workspace's sessions.
+ *
+ *  A failed listing is NOT an empty workspace: the backend answers with
+ *  the error and the UI shows it. `error` is set when the engine could not
+ *  answer (the list then comes from the on-disk registry mirror) or when
+ *  the list could not be read at all. */
+export interface SessionList {
+  sessions: SessionInfo[];
+  error?: string;
+  /** Where the list came from: the engine's registry, or the registry
+   *  file mirror (the engine was unreachable). */
+  source?: string;
+}
+
+export function listSessions(): Promise<SessionList> {
   // Normalize defensively: the engine reply may arrive as {sessions:[…]}
   // or a bare array — a malformed shape must never reach a .map() and
   // blank the app (the TopBar crash class).
@@ -56,9 +71,14 @@ export function listSessions(): Promise<SessionInfo[]> {
       const arr = Array.isArray(raw)
         ? raw
         : (raw as { sessions?: unknown })?.sessions;
-      return Array.isArray(arr) ? (arr as SessionInfo[]) : [];
+      const meta = (raw ?? {}) as { engineError?: string; source?: string };
+      return {
+        sessions: Array.isArray(arr) ? (arr as SessionInfo[]) : [],
+        error: meta.engineError,
+        source: meta.source,
+      };
     })
-    .catch(() => [] as SessionInfo[]);
+    .catch((e) => ({ sessions: [] as SessionInfo[], error: String(e) }));
 }
 
 export function sessionTurns(id: string): Promise<Array<{ prompt: string; answer: string }>> {
@@ -110,7 +130,17 @@ export function compactSession(): Promise<{ ok?: boolean; error?: string }> {
 
 // ── Parity surface (CLI slash parity) ─────────────────────────────
 
-export function listTools(): Promise<{ ok?: boolean; builtin?: string[]; mcp?: unknown; error?: string }> {
+/** The built-in tool inventory plus the MCP surface.
+ *  `mcp` is null when the runtime does not report its connected MCP
+ *  servers — that is an unknown, not an empty list, and `mcpNote` says
+ *  so. */
+export function listTools(): Promise<{
+  ok?: boolean;
+  builtin?: string[];
+  mcp?: unknown;
+  mcpNote?: string;
+  error?: string;
+}> {
   return invoke("list_tools");
 }
 
@@ -118,7 +148,7 @@ export function listAgents(): Promise<{ ok?: boolean; agents?: unknown; error?: 
   return invoke("list_agents");
 }
 
-export function brainRemember(fact: string): Promise<{ ok?: boolean; error?: string }> {
+export function brainRemember(fact: string): Promise<{ ok?: boolean; id?: number; error?: string }> {
   return invoke("brain_remember", { fact });
 }
 
@@ -179,20 +209,27 @@ export function keychainDelete(provider: string): Promise<{ ok: boolean }> {
 
 /** Delete a provider end-to-end: config entry, Keychain key, in-memory
  *  engine key, cached model list. The active provider is refused
- *  (switch first). Returns the redacted config for the caller to adopt. */
-export function removeProvider(provider: string): Promise<SofuuConfig> {
+ *  (switch first). Returns the redacted config plus the Keychain delete
+ *  outcome — a credential store that refused the delete is reported, not
+ *  hidden behind a clean "removed". */
+export function removeProvider(
+  provider: string
+): Promise<{ config: SofuuConfig; keychainError?: string }> {
   return invoke("remove_provider", { provider });
 }
 
 /** Live engine state (chat.state()): session id, tokens, spend,
  *  permission profile — used by Settings → General to show what the
- *  engine is actually doing right now. Alias of chatState() with a typed
- *  shape (both invoke the same `chat_state` command; kept separate so
- *  existing call sites don't churn). */
-export function engineState(): Promise<EngineState | null> {
+ *  engine is actually doing right now. The error is kept apart from the
+ *  state: "the engine could not answer" must not render as a live card
+ *  full of zeros. */
+export function engineState(): Promise<{ state: EngineState | null; error: string | null }> {
   return chatState()
-    .then((raw) => (raw && typeof raw === "object" ? (raw as EngineState) : null))
-    .catch(() => null);
+    .then((raw) => ({
+      state: raw && typeof raw === "object" ? (raw as EngineState) : null,
+      error: null,
+    }))
+    .catch((e) => ({ state: null, error: String(e) }));
 }
 
 // ── Usage (Settings → Usage) ──────────────────────────────────────
@@ -244,11 +281,18 @@ export interface UsageReport {
 }
 
 /** Aggregated per-turn usage across every session in the workspace —
- *  computed inside the engine from the encrypted session store. */
-export function usageReport(): Promise<UsageReport | null> {
+ *  computed inside the engine from the encrypted session store. A failed
+ *  read is reported as an error, not as an empty report. */
+export function usageReport(): Promise<{ report: UsageReport | null; error: string | null }> {
   return invoke("usage_report")
-    .then((raw) => (raw && typeof raw === "object" && (raw as UsageReport).ok ? (raw as UsageReport) : null))
-    .catch(() => null);
+    .then((raw) => ({
+      report:
+        raw && typeof raw === "object" && (raw as UsageReport).ok
+          ? (raw as UsageReport)
+          : null,
+      error: null,
+    }))
+    .catch((e) => ({ report: null, error: String(e) }));
 }
 
 // ── Subscriptions ─────────────────────────────────────────────────

@@ -1176,6 +1176,53 @@ unsafe extern "C" fn js_policy_explain(
     qjs::sofuu_js_new_string(ctx, cs.as_ptr())
 }
 
+/// Resolve one secret name against the effective policy.
+///
+/// `Ok(Some(v))` — the value. `Ok(None)` — the source answered and the name
+/// is not set. `Err(denied)` — the SOURCE could not be consulted at all: an
+/// unsupported source, a missing/unreadable/malformed secrets file. Those
+/// are different failures and a caller must be able to tell them apart: the
+/// old path answered "not set" for all of them, so an operator chasing a
+/// missing key was pointed at the wrong cause.
+fn resolve_secret(policy: &serde_json::Value, name: &str) -> Result<Option<String>, PolicyDenied> {
+    let source = str_at(policy, &["secrets", "source"]).unwrap_or("env");
+    match source {
+        "env" => Ok(std::env::var(name).ok()),
+        "file" => {
+            let path = str_at(policy, &["secrets", "file"]).unwrap_or("");
+            if path.is_empty() {
+                return Err(PolicyDenied::new(
+                    "E_CONFIG",
+                    "R7.5/secrets.file",
+                    "secrets.source is 'file' but secrets.file is not set".to_string(),
+                ));
+            }
+            let raw = std::fs::read_to_string(path).map_err(|e| {
+                PolicyDenied::new(
+                    "E_IO",
+                    "R7.5/secrets.file",
+                    format!("cannot read secrets.file '{path}': {e}"),
+                )
+            })?;
+            let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+                PolicyDenied::new(
+                    "E_CONFIG",
+                    "R7.5/secrets.file",
+                    format!("secrets.file '{path}' is not valid JSON: {e}"),
+                )
+            })?;
+            Ok(v.get(name).and_then(|x| x.as_str()).map(|s| s.to_string()))
+        }
+        other => Err(PolicyDenied::new(
+            "E_CAP_MISSING",
+            "R7.5/secrets.source",
+            format!(
+                "secrets.source '{other}' is not available in this runtime (supported: env, file)"
+            ),
+        )),
+    }
+}
+
 /// `policy.secret(name)` — resolve a secret at CALL time (R7.5).
 ///
 /// Sources (`policy.secrets.source`):
@@ -1206,35 +1253,18 @@ unsafe extern "C" fn js_policy_secret(
     }
     let policy = policy_json(ctx);
     let source = str_at(&policy, &["secrets", "source"]).unwrap_or("env");
-    let value: Option<String> = match source {
-        "env" => std::env::var(&name).ok(),
-        "file" => {
-            let path = str_at(&policy, &["secrets", "file"]).unwrap_or("");
-            if path.is_empty() {
-                None
-            } else {
-                std::fs::read_to_string(path)
-                    .ok()
-                    .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-                    .and_then(|v| {
-                        v.get(&name)
-                            .and_then(|x| x.as_str())
-                            .map(|s| s.to_string())
-                    })
-            }
-        }
-        _ => None,
-    };
-    match value {
-        Some(v) => {
+    match resolve_secret(&policy, &name) {
+        Ok(Some(v)) => {
             let cs = CString::new(v).unwrap_or_default();
             qjs::sofuu_js_new_string(ctx, cs.as_ptr())
         }
-        None => {
+        /* The secret really is absent — the documented "not set" refusal. */
+        Ok(None) => {
             let msg = format!("policy.secret: '{name}' is not set (secrets.source={source})");
             let cm = json_str(&msg);
             qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), cm.as_ptr())
         }
+        Err(denied) => throw_denied(ctx, &denied),
     }
 }
 
@@ -2495,6 +2525,66 @@ mod tests {
     fn lexical_clean_folds_dot_segments() {
         assert_eq!(lexical_clean(Path::new("/a/b/../c/./d")), PathBuf::from("/a/c/d"));
         assert_eq!(lexical_clean(Path::new("a/./b")), PathBuf::from("a/b"));
+    }
+
+    /* ── secrets: a missing value and an unusable source differ ────── */
+
+    #[test]
+    fn secret_source_failures_are_distinct_from_a_missing_secret() {
+        /* An absent value is the documented "not set" answer. */
+        let env = serde_json::json!({"secrets":{"source":"env"}});
+        assert!(
+            resolve_secret(&env, "SOFUU_DEFINITELY_NOT_SET_9C1F")
+                .expect("the env source always answers")
+                .is_none()
+        );
+
+        /* A source this runtime cannot serve is an unavailable BACKEND, not
+         * a missing value — the schema accepts "keychain"/"host", the
+         * runtime implements neither, so the caller must be told which. */
+        let keychain = serde_json::json!({"secrets":{"source":"keychain"}});
+        let e = resolve_secret(&keychain, "TOKEN").expect_err("keychain is not implemented");
+        assert_eq!(e.code, "E_CAP_MISSING");
+        assert_eq!(e.rule, "R7.5/secrets.source");
+
+        /* A file source with no file is a configuration error. */
+        let nofile = serde_json::json!({"secrets":{"source":"file"}});
+        let e = resolve_secret(&nofile, "TOKEN").expect_err("secrets.file is required");
+        assert_eq!(e.code, "E_CONFIG");
+
+        /* A file that cannot be read is an I/O failure, not "not set". */
+        let missing = serde_json::json!({
+            "secrets":{"source":"file","file":"/nonexistent/sofuu/policy-secrets.json"}
+        });
+        let e = resolve_secret(&missing, "TOKEN").expect_err("the file must be read");
+        assert_eq!(e.code, "E_IO");
+
+        let dir = std::env::temp_dir();
+        let bad = dir.join(format!("sofuu-policy-secret-{}.json", std::process::id()));
+        std::fs::write(&bad, b"not json").expect("write");
+        let badp = serde_json::json!({
+            "secrets":{"source":"file","file": bad.to_string_lossy()}
+        });
+        let e = resolve_secret(&badp, "TOKEN").expect_err("the file must parse");
+        assert_eq!(e.code, "E_CONFIG");
+        let _ = std::fs::remove_file(&bad);
+
+        /* A readable file answers the value; a name it does not carry is
+         * still "not set". */
+        let good = dir.join(format!("sofuu-policy-secret-{}-good.json", std::process::id()));
+        std::fs::write(&good, br#"{"TOKEN":"v"}"#).expect("write");
+        let goodp = serde_json::json!({
+            "secrets":{"source":"file","file": good.to_string_lossy()}
+        });
+        assert_eq!(
+            resolve_secret(&goodp, "TOKEN").expect("the file parses"),
+            Some("v".to_string())
+        );
+        assert!(
+            resolve_secret(&goodp, "OTHER").expect("the file parses").is_none(),
+            "a name the file does not carry is not set, not an error"
+        );
+        let _ = std::fs::remove_file(&good);
     }
 }
 

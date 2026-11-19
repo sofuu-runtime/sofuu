@@ -27,6 +27,16 @@ thread_local! {
     static REPORT: RefCell<Vec<serde_json::Value>> = const { RefCell::new(Vec::new()) };
     static CURRENT_SECTION: RefCell<String> = const { RefCell::new(String::new()) };
     static JSON_MODE: Cell<bool> = const { Cell::new(false) };
+    static COUNTS: RefCell<Counts> = const { RefCell::new(Counts { unavailable: 0, unverified: 0 }) };
+}
+
+/// Capabilities this check could not confirm. Neither counter is a broken
+/// build: one is a capability that is not configured here, the other is a
+/// capability this check deliberately did not exercise.
+#[derive(Clone, Copy, Default)]
+struct Counts {
+    unavailable: usize,
+    unverified: usize,
 }
 
 fn emit(level: &str, msg: &str) {
@@ -35,6 +45,11 @@ fn emit(level: &str, msg: &str) {
             "ok" => "\x1b[32m  ✓\x1b[0m",
             "warn" => "\x1b[33m  ⚠\x1b[0m",
             "bad" => "\x1b[31m  ✗\x1b[0m",
+            /* A capability that is not configured here, and a capability this
+             * check did not exercise. Neither is a success and neither is a
+             * failure, so neither wears the green check. */
+            "unavailable" => "\x1b[90m  ○\x1b[0m",
+            "unverified" => "\x1b[90m  ?\x1b[0m",
             _ => "\x1b[90m  ·\x1b[0m",
         };
         println!("{mark} {msg}");
@@ -59,6 +74,20 @@ fn warn(msg: &str) {
 
 fn bad(msg: &str) {
     emit("bad", msg);
+}
+
+/// A capability that is not available in this install: not configured, not
+/// built in, or not reachable here. It is not a broken build.
+fn unavailable(msg: &str) {
+    COUNTS.with(|c| c.borrow_mut().unavailable += 1);
+    emit("unavailable", msg);
+}
+
+/// A capability this check did not exercise. The install is not judged by it
+/// and it is never reported as working.
+fn unverified(msg: &str) {
+    COUNTS.with(|c| c.borrow_mut().unverified += 1);
+    emit("unverified", msg);
 }
 
 fn info(msg: &str) {
@@ -96,6 +125,57 @@ fn strip_ansi(s: &str) -> String {
 /// Byte size of a file, or None when it does not exist.
 fn file_len(p: &Path) -> Option<u64> {
     std::fs::metadata(p).ok().map(|m| m.len())
+}
+
+/// Whether a configured model name points at a file on disk. A provider may
+/// also name a model the runtime resolves somewhere else, so this only holds
+/// for a name that looks like a path.
+fn looks_like_a_file(model: &str) -> bool {
+    model.contains('/')
+        || model.contains('\\')
+        || model.ends_with(".gguf")
+        || model.ends_with(".safetensors")
+}
+
+/// The endpoint a model request would actually use.
+///
+/// An empty `base_url` is NOT "no endpoint": every provider carries a default
+/// URL (`crates/sofuu-core/src/rt/ai.rs::provider_api_url`), so the default
+/// is named here instead of leaving a blank that reads like a missing
+/// configuration.
+fn endpoint_text(cfg: &ChatConfig) -> String {
+    if cfg.base_url.trim().is_empty() {
+        "(the provider's default endpoint)".to_string()
+    } else {
+        cfg.base_url.clone()
+    }
+}
+
+/// The backend names this build's grant validator accepts for a family.
+///
+/// The names are probed from the runtime's own validator — the same function
+/// `sofuu script run --cap family=backend` is judged by — so the table
+/// doctor prints cannot drift from the code that enforces it.
+fn accepted_backends(family: &str) -> Vec<&'static str> {
+    /// One representative of every backend spelling the runtime knows. The
+    /// spellings are what a `--cap family=backend` grant carries.
+    const CANDIDATES: &[&str] = &[
+        "sim",
+        "real",
+        "mavlink",
+        "udp:127.0.0.1:14550",
+        "uart:/dev/ttyAMA0@921600",
+        "ephemeral",
+        "durable",
+        "stdout",
+        "stderr",
+        "file:<path>",
+    ];
+    CANDIDATES
+        .iter()
+        .copied()
+        .filter(|b| sofuu_core::rt::hardware::validate_grant(family, b).is_ok())
+        .collect()
 }
 
 fn human(n: u64) -> String {
@@ -734,7 +814,31 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
         None => warn(&format!("{} not found — provider keys must be set before chatting", cfg_path.display())),
     }
     if cfg.api_key.is_empty() {
-        warn("no API key set for the active provider (chat still runs, providers will 401)");
+        /* The providers that carry no key at all: the local engine and a
+         * llama-server (`rt/ai.rs::provider_env_key` returns None for both).
+         * Every other provider is unauthenticated without one, and a request
+         * would be refused rather than sent. */
+        let keyless = matches!(
+            cfg.provider.as_str(),
+            "local" | "ollama" | "llamacpp" | "llama.cpp" | "llama-server"
+        );
+        if keyless {
+            info(&format!(
+                "no API key set — the '{}' provider does not use one",
+                cfg.provider
+            ));
+        } else {
+            let who = if !cfg.active.is_empty() {
+                cfg.active.as_str()
+            } else if !cfg.provider.is_empty() {
+                cfg.provider.as_str()
+            } else {
+                "active provider"
+            };
+            unavailable(&format!(
+                "provider credentials: no API key for '{who}' — a model request is not authenticated and will be refused"
+            ));
+        }
     } else {
         let masked = if cfg.api_key.len() > 8 {
             format!("{}…{}", &cfg.api_key[..4], &cfg.api_key[cfg.api_key.len() - 2..])
@@ -746,7 +850,20 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
 
     // ── 5. Runtime itself ───────────────────────────────────────────
     section("runtime");
-    ok(&format!("engine initialized (QJS + libuv + {} embed spaces)", 4));
+    /* A probe, not a claim. This line used to report a number of "embed
+     * spaces" that no probe produced; the engine is now asked something and
+     * its answer is checked. */
+    let engine_probe = rt.eval_repl("(function () { return 40 + 2; })()").unwrap_or_default();
+    let engine_probe = strip_ansi(&engine_probe).trim().trim_matches('\'').trim().to_string();
+    if engine_probe == "42" {
+        ok("engine initialized: the JavaScript engine evaluated 40 + 2");
+    } else {
+        bad(&format!(
+            "engine probe FAILED: the JavaScript engine answered '{}' for 40 + 2",
+            engine_probe
+        ));
+        failures += 1;
+    }
 
     // ── 6. Protocols, sandbox, policy (D2) ─────────────────────────
     section("protocols / sandbox");
@@ -756,6 +873,74 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
         "sofuu.policy.set(globalThis.__sofuu_doctor_policy || '{}'); delete globalThis.__sofuu_doctor_policy;",
         "<doctor>",
     );
+
+    // ── 6b. The policy itself ──────────────────────────────────────
+    // Whether a policy document exists, whether it is non-empty, and
+    // whether the runtime would actually install it. The runtime installs
+    // NOTHING from a layer it cannot parse (`sofuu.policy.load()` reports
+    // the error and leaves the previous posture in force), so an invalid
+    // file means the default ALLOW posture — not the policy the operator
+    // believes they wrote.
+    section("policy");
+    let user_policy = std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".sofuu").join("policy.json"));
+    let project_policy = std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join(".sofuu").join("policy.json"));
+    for (label, path) in [("user", &user_policy), ("project", &project_policy)] {
+        match path {
+            Some(p) => match file_len(p) {
+                Some(n) => info(&format!("{label} policy: {} ({})", p.display(), human(n))),
+                None => info(&format!("{label} policy: absent ({})", p.display())),
+            },
+            None => info(&format!(
+                "{label} policy: not resolvable on this machine (no HOME / no working directory)"
+            )),
+        }
+    }
+    match sofuu_core::rt::policy::layered_policy_from_paths(user_policy, project_policy) {
+        Ok(merged) => {
+            let sections = merged.as_object().map(|m| m.len()).unwrap_or(0);
+            if sections == 0 {
+                warn(
+                    "policy: no document is in force — the default posture applies (tools are ALLOWED unless a policy denies them); write .sofuu/policy.json or pass --policy to confine tools/fs/http",
+                );
+                unavailable("policy document: absent or empty — the default ALLOW posture is in force");
+            } else {
+                ok(&format!(
+                    "policy document: {sections} top-level section(s) in the layer(s) above"
+                ));
+                /* Kaze authorizes a capability only through tools.allow or
+                 * tools.deny, and an empty allowlist authorizes nothing. */
+                let tools = merged.get("tools");
+                let has_rules = tools
+                    .and_then(|t| t.as_object())
+                    .is_some_and(|t| t.contains_key("allow") || t.contains_key("deny"));
+                if has_rules {
+                    let allow_empty = tools
+                        .and_then(|t| t.get("allow"))
+                        .and_then(|a| a.as_array())
+                        .is_some_and(Vec::is_empty);
+                    if allow_empty {
+                        info("policy: tools.allow is present but EMPTY — it authorizes no capability, including every Kaze family");
+                    } else {
+                        info("policy: tools.allow/tools.deny are present — they are what authorizes a Kaze capability");
+                    }
+                } else {
+                    warn(
+                        "policy: no tools.allow and no tools.deny — every Kaze capability is refused with E_CAP_DENIED until the policy names them",
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            warn(&format!(
+                "policy layer rejected: {e} — the runtime installs NOTHING from an invalid layer, so the default ALLOW posture is in force (fix the file or remove it)"
+            ));
+            unavailable("policy document: the layer on disk is invalid and is NOT in force");
+        }
+    }
     /* GL-09 (AUDIT-2026-11-08): the default posture is ALLOW — a tool runs
      * unless a policy denies it — and a fully green doctor run read as "this
      * box is hardened". Say the posture out loud so nobody assumes it. */
@@ -772,11 +957,9 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
         .trim_matches(|c| c == '\'' || c == '"')
         .to_string();
     if posture == "default" {
-        warn(
-            "default policy posture: tools are ALLOWED unless a policy denies them — this run is not hardened (write a policy file or pass --policy to confine tools/fs/http)",
-        );
+        info("installed posture: default — tools are ALLOWED unless a policy denies them (the probes above ran in their own realm)");
     } else if !posture.is_empty() {
-        info(&format!("policy posture: {posture}"));
+        info(&format!("installed posture: {posture}"));
     }
 
     // ── 7. Capability manifest (R1, T1.4) ──────────────────────────
@@ -812,7 +995,7 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
         ));
     }
     if real_missing.is_empty() {
-        ok("all declared build features present");
+        ok("all declared build features present (the build's declaration — the sections above show what was actually exercised)");
     } else {
         for m in real_missing {
             bad(&format!(
@@ -848,14 +1031,134 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
         gpu_available
     ));
 
+    // ── 8. Capability status ────────────────────────────────────────
+    // What this check observed, and what it could not. A capability that was
+    // not exercised is never reported as working (RULES §1.9) and never as
+    // broken either: it is unverified, and it stays visible.
+    section("capability status");
+    if cfg.model.is_empty() {
+        unavailable("model inference: no model is configured — set one with /model or --model");
+    } else {
+        unverified(&format!(
+            "model inference: configured ({} · {} @ {}) — this check sends no model request",
+            cfg.provider,
+            cfg.model,
+            endpoint_text(&cfg)
+        ));
+    }
+    if !cfg.model.is_empty() && looks_like_a_file(&cfg.model) {
+        match file_len(Path::new(&cfg.model)) {
+            Some(n) => unverified(&format!(
+                "model weights: {} present ({}), not loaded — this check does not run inference",
+                cfg.model,
+                human(n)
+            )),
+            None => unavailable(&format!(
+                "model weights: {} not found — the configured model cannot be loaded",
+                cfg.model
+            )),
+        }
+    } else if cfg.provider == "local" && !cfg.model.is_empty() {
+        unverified(&format!(
+            "model weights: '{}' is a model NAME, not a path — this check cannot tell whether the weights are present",
+            cfg.model
+        ));
+    }
+    unavailable("physical backends: live vehicle and GPIO dispatch is disabled in this build — a granted live backend is refused before any hardware is opened");
+    unverified("physical test simulator: drone=sim / rover=sim selects the labelled simulator; this check selected none and ran no simulated command");
+
+    // ── 9. Kaze capability backends ─────────────────────────────────
+    // Which grant resolves to which backend. The backend NAMES are probed
+    // from the runtime's own grant validator — the function that judges
+    // `--cap family=backend` — so this table cannot drift from the code
+    // that enforces it.
+    section("kaze backends");
+    for family in sofuu_core::sfs::caps::FAMILIES {
+        let accepted = accepted_backends(family);
+        if !accepted.is_empty() {
+            let shown: Vec<String> = accepted
+                .iter()
+                .map(|b| {
+                    if *b == "sim" {
+                        "sim (explicit physical test)".to_string()
+                    } else {
+                        b.to_string()
+                    }
+                })
+                .collect();
+            info(&format!("{family} → {}", shown.join(" · ")));
+            continue;
+        }
+        match *family {
+            "ai" => {
+                if cfg.model.is_empty() {
+                    unavailable("ai → the configured model backend: no model is configured — every ai.* call is refused with E_CAP_MISSING");
+                } else {
+                    info(&format!(
+                        "ai → the configured model backend ({} · {} @ {}) — configured, not exercised by this check",
+                        cfg.provider,
+                        cfg.model,
+                        endpoint_text(&cfg)
+                    ));
+                }
+            }
+            "tool" => info("tool → the configured MCP servers and the built-in tool registry (see protocols / sandbox above); a tool that is neither registered nor served by an MCP server is refused with E_CAP_MISSING"),
+            "policy" => info("policy → the in-process pattern detector; policy.allow / policy.reject are the VM's own control flow and no backend serves them"),
+            "log" => info("log → the in-process per-run log buffer; nothing is dispatched"),
+            _ => unavailable(&format!(
+                "{family} → no backend in this build: a grant names no implementation and every {family}.* call is refused with E_CAP_MISSING"
+            )),
+        }
+    }
+    info("a bare grant (--cap family with no =backend) resolves to NO implementation for every family — the call is refused with E_CAP_MISSING, never simulated");
+    info("simulation is available only for an explicit drone=sim / rover=sim test selection; a bare grant, a missing backend or a failure never selects it");
+
+    // ── 10. Scouter health state ────────────────────────────────────
+    // The Scouter scores exist only once something was measured. An
+    // unmeasured score is ABSENT — not 0 and not 100 — so doctor prints
+    // "not measured" instead of a number nobody computed.
+    section("scouter");
+    let sc = sofuu_core::rt::scouter::global_scouter_state();
+    let ctx_measured = sc.context_measured.load(std::sync::atomic::Ordering::Relaxed);
+    let brain_measured = sc.brain_measured.load(std::sync::atomic::Ordering::Relaxed);
+    if ctx_measured {
+        info(&format!(
+            "context health: {}% (measured in this process)",
+            sc.context_score.load(std::sync::atomic::Ordering::Relaxed)
+        ));
+    } else {
+        unverified("context health: not measured in this process — there is no score yet (it is computed from a real conversation, not by this check)");
+    }
+    if brain_measured {
+        info(&format!(
+            "brain health: {}% (measured in this process)",
+            sc.brain_score.load(std::sync::atomic::Ordering::Relaxed)
+        ));
+    } else {
+        unverified("brain health: not measured in this process — there is no score yet");
+    }
+    let scouter_report = serde_json::json!({
+        "contextScore": if ctx_measured { Some(sc.context_score.load(std::sync::atomic::Ordering::Relaxed)) } else { None },
+        "brainScore": if brain_measured { Some(sc.brain_score.load(std::sync::atomic::Ordering::Relaxed)) } else { None },
+        "contextMeasured": ctx_measured,
+        "brainMeasured": brain_measured,
+        "totalAlerts": sc.total_alerts.load(std::sync::atomic::Ordering::Relaxed),
+    });
+
     // ── verdict ─────────────────────────────────────────────────────
     section("verdict");
+    let counts = COUNTS.with(|c| *c.borrow());
+    let untested = counts.unavailable + counts.unverified;
     if failures == 0 && skipped > 0 {
         ok(&format!(
-            "healthy — caps resolution and the protocol floors are operational; {skipped} check(s) could not run because the resource was in use"
+            "install healthy — caps resolution and the protocol floors are operational; {skipped} check(s) could not run because the resource was in use; {untested} capabilit(ies) are unavailable or were not exercised"
+        ));
+    } else if failures == 0 && untested > 0 {
+        ok(&format!(
+            "install healthy — brain persistence, caps resolution and the protocol floors are operational; {untested} capabilit(ies) are unavailable or were not exercised (listed above)"
         ));
     } else if failures == 0 {
-        ok("healthy — brain persistence, caps resolution and the protocol floors are operational");
+        ok("install healthy — brain persistence, caps resolution and the protocol floors are operational");
     } else {
         bad(&format!("{failures} problem(s) found — see the ⚠/✗ lines above"));
     }
@@ -864,9 +1167,17 @@ pub fn run(rt: &sofuu_ffi::SofuuRuntime, args: &[String]) -> i32 {
             "version": crate::VERSION,
             "cwd": std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| "?".into()),
             "ok": failures == 0,
+            /* The install's health, not a claim about every capability: the
+             * counts below say which capabilities were absent and which were
+             * deliberately left unexercised. */
+            "status": if failures == 0 { "healthy" } else { "degraded" },
             "failures": failures,
+            "unavailable": counts.unavailable,
+            "unverified": counts.unverified,
             "jail": jail_ok,
             "capabilities": caps,
+            /* An unmeasured Scouter score is null, never 0 and never 100. */
+            "scouter": scouter_report,
             "entries": REPORT.with(|r| r.borrow().clone()),
         });
         println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".into()));
@@ -984,12 +1295,20 @@ fn protocol_probes(rt: &sofuu_ffi::SofuuRuntime, failures: &mut usize) -> bool {
         *failures += 1;
     }
 
+    /* A parsed config is not a reachable server. The distinction is the point:
+     * the config is read, the servers are not contacted. */
     if v.get("mcpOk").and_then(|b| b.as_bool()) == Some(true) {
-        ok(&format!(
-            "MCP config parsed: {} ({} server(s))",
-            v.get("mcpPath").and_then(|s| s.as_str()).unwrap_or("(no path)"),
-            v.get("mcpServers").and_then(|n| n.as_i64()).unwrap_or(0)
-        ));
+        let path = v.get("mcpPath").and_then(|s| s.as_str()).unwrap_or("(no path)");
+        let servers = v.get("mcpServers").and_then(|n| n.as_i64()).unwrap_or(0);
+        if servers > 0 {
+            ok(&format!("MCP config parsed: {}", path));
+            unverified(&format!(
+                "MCP servers: {} declared — this check did not connect to them or call a tool",
+                servers
+            ));
+        } else {
+            unavailable("MCP: no server is configured — MCP tools are unavailable");
+        }
     } else {
         bad(&format!(
             "MCP config FAILED: {}",
@@ -1000,12 +1319,14 @@ fn protocol_probes(rt: &sofuu_ffi::SofuuRuntime, failures: &mut usize) -> bool {
 
     if v.get("toolsList").and_then(|b| b.as_bool()) == Some(true) {
         ok("tool inventory reachable (sofuu.tools.list)");
+        unverified("tool backends: the inventory was listed, not run — no tool was executed by this check");
     } else {
         bad("tool inventory MISSING (sofuu.tools.list is not a function)");
         *failures += 1;
     }
     if v.get("serveRoutes").and_then(|b| b.as_bool()) == Some(true) {
         ok("serve routes registered (sofuu.serve.start/createHandler)");
+        unverified("HTTP routes: the handlers are registered, not exercised — this check sent no request");
     } else {
         bad("serve routes MISSING (sofuu.serve.start/createHandler not registered)");
         *failures += 1;
@@ -1043,5 +1364,73 @@ mod tests {
             "memory.open: the brain is corrupt (bad magic)"
         ));
         assert!(!is_busy_refusal("", "unexpected token in brain header"));
+    }
+
+    /// A capability that is not configured here, and a capability this check
+    /// did not exercise, are reported under their own levels. Neither wears
+    /// the green check: doctor must not print a success for an operation it
+    /// never ran.
+    #[test]
+    fn an_unavailable_capability_is_not_reported_as_a_success() {
+        use super::{unavailable, unverified, COUNTS, JSON_MODE, REPORT};
+        JSON_MODE.with(|j| j.set(true));
+        REPORT.with(|r| r.borrow_mut().clear());
+        unavailable("model inference: no model is configured");
+        let entries = REPORT.with(|r| r.borrow().clone());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["level"], serde_json::json!("unavailable"));
+        let counts = COUNTS.with(|c| *c.borrow());
+        assert_eq!(counts.unavailable, 1);
+        assert_eq!(counts.unverified, 0);
+    }
+
+    #[test]
+    fn an_unexercised_capability_is_counted_separately() {
+        use super::{unavailable, unverified, COUNTS, JSON_MODE, REPORT};
+        JSON_MODE.with(|j| j.set(true));
+        REPORT.with(|r| r.borrow_mut().clear());
+        unverified("model inference: not exercised");
+        let entries = REPORT.with(|r| r.borrow().clone());
+        assert_eq!(entries[0]["level"], serde_json::json!("unverified"));
+        let counts = COUNTS.with(|c| *c.borrow());
+        assert_eq!(counts.unavailable, 0);
+        assert_eq!(counts.unverified, 1);
+    }
+
+    /// The backend table doctor prints is probed from the runtime's own
+    /// grant validator, so it always names the backends that are really
+    /// accepted — and never names one that is not.
+    #[test]
+    fn the_backend_table_names_only_real_backends() {
+        use super::accepted_backends;
+
+        let drone = accepted_backends("drone");
+        assert!(drone.contains(&"sim"), "{drone:?}");
+        assert!(drone.contains(&"real"), "{drone:?}");
+        assert!(drone.contains(&"mavlink"), "{drone:?}");
+        assert!(drone.contains(&"udp:127.0.0.1:14550"), "{drone:?}");
+
+        // Simulation is a drone/rover testing facility and nothing else.
+        assert_eq!(accepted_backends("rover"), vec!["sim"]);
+        assert!(accepted_backends("sensor").is_empty());
+        assert!(accepted_backends("device").is_empty());
+
+        assert_eq!(
+            accepted_backends("memory"),
+            vec!["ephemeral", "durable", "file:<path>"]
+        );
+        assert_eq!(
+            accepted_backends("alert"),
+            vec!["stdout", "stderr", "file:<path>"]
+        );
+
+        // The in-process families take no backend name at all.
+        for family in ["ai", "tool", "policy", "log"] {
+            assert!(
+                accepted_backends(family).is_empty(),
+                "{family} named a backend: {:?}",
+                accepted_backends(family)
+            );
+        }
     }
 }

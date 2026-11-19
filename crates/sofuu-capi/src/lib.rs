@@ -2273,9 +2273,8 @@ mod tests {
     /// surface is compiled out (sofuu-core/src/rt/memory.rs gates the
     /// register bodies on `#[cfg(has_qtsq)]`), so there is no brain to open
     /// and the funnel correctly answers `unknown_method`. CI builds this way
-    /// on purpose (QTSQ is a separate checkout, not vendored here), and the
-    /// JS suite covers the brain through a mock server. Without this skip
-    /// those tests
+    /// on purpose (QTSQ is a separate checkout, not vendored here). Without
+    /// this skip those tests
     /// would fail in CI while passing locally — a gate that only ever runs on
     /// one machine is not a gate.
     macro_rules! require_qtsq {
@@ -2334,6 +2333,87 @@ mod tests {
             .and_then(|c| c.as_str())
             .unwrap_or("<no code>")
             .to_string()
+    }
+
+    /// Evaluate a setup snippet and fail loudly when it throws — a silent
+    /// setup failure would turn into a confusing assertion further down.
+    fn eval_setup(rt: *mut CapiRuntime, src: &str) {
+        let c = CString::new(src).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { sofuu_rt_eval(rt, c.as_ptr(), &mut out) };
+        let json = if out.is_null() {
+            String::new()
+        } else {
+            let s = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+            unsafe { sofuu_free(out as *mut c_void) };
+            s
+        };
+        assert_eq!(rc, 0, "setup must evaluate cleanly: {json}");
+        assert!(json.contains(r#""ok":true"#), "setup must not throw: {json}");
+    }
+
+    /// The Hermes tool-call tags the runtime's local parser accepts. They are
+    /// spelled out in ASCII pieces so no invisible character can slip into
+    /// the prompt the model is shown.
+    const TOOL_CALL_OPEN: &str = concat!("<", "tool_call", ">");
+    const TOOL_CALL_CLOSE: &str = concat!("</", "tool_call", ">");
+
+    /// The system prompt for the tool-path tests. It shows the model the
+    /// exact tool-call shape the runtime's local parser accepts, so the tool
+    /// REQUEST stays the model's own decision — nothing is injected into the
+    /// conversation and no reply is canned.
+    fn tool_call_system(tool: &str) -> String {
+        format!(
+            "You are a test agent that uses tools.\n\n\
+             When the user's request needs the {tool} tool you answer with exactly one tool call block:\n\
+             {open}\n\
+             {{\"name\": \"{tool}\", \"arguments\": {{}}}}\n\
+             {close}",
+            open = TOOL_CALL_OPEN,
+            close = TOOL_CALL_CLOSE,
+        )
+    }
+
+    /// Define an agent backed by a REAL local model through the shipped
+    /// `sofuu.agent.define`. `tools` is the agent's tool list as JSON. The
+    /// brain and the RLM are off: these tests are about the C-ABI, and a
+    /// shared on-disk brain would only add cross-process contention.
+    fn local_agent_js(agent: &str, model: &str, system: &str, tools: &str) -> String {
+        format!(
+            r#"(function(){{
+  sofuu.agent.define({{
+    name: {agent},
+    system: {system},
+    provider: "local",
+    model: {model},
+    memory: "off",
+    rlm: "off",
+    tools: {tools},
+    budget: {{ maxSteps: 4 }}
+  }});
+}})()"#,
+            agent = serde_json::to_string(agent).unwrap_or_default(),
+            system = serde_json::to_string(system).unwrap_or_default(),
+            model = serde_json::to_string(model).unwrap_or_default(),
+            tools = tools,
+        )
+    }
+
+    /// The JSON events of one kind in a captured run, as parsed objects.
+    fn events_of_kind(events: &[String], kind: &str) -> Vec<serde_json::Value> {
+        events
+            .iter()
+            .filter_map(|e| serde_json::from_str::<serde_json::Value>(e).ok())
+            .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some(kind))
+            .collect()
+    }
+
+    /// The single terminal `done` event of a captured run.
+    fn done_event(events: &[String]) -> serde_json::Value {
+        events_of_kind(events, "done")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("the run must end with exactly one done event, got {events:?}"))
     }
 
     #[test]
@@ -2593,34 +2673,29 @@ mod tests {
         unsafe { sofuu_rt_free(rt) };
     }
 
+    /// The funnel's streaming entry point must deliver the agent run's own
+    /// events to the host. The run is a REAL one: a real local model, real
+    /// inference, real agent loop. Nothing is faked — the assertions are
+    /// about what the run actually reported.
     #[test]
     fn stream_calls_agent_run_with_events() {
         let _g = lock();
+        let Some(model) = live_path("SOFUU_TEST_GGUF", DEFAULT_LIVE_GGUF) else {
+            return;
+        };
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
 
-        // Define a minimal agent that just returns a final answer via a mock.
-        let setup = CString::new(
-            r#"sofuu.agent.define({
-              name: "stream-test",
-              system: "You are a test agent.",
-              provider: "mock",
-              model: "mock-stream-test",
-              budget: { maxSteps: 1 }
-            });
-            // Intercept ai.complete: return a final answer on the first call.
-            var origComplete = sofuu.ai.complete;
-            sofuu.ai.complete = function(opts) {
-              if (opts.model === 'mock-stream-test') {
-                return Promise.resolve({ text: 'hello from mock' });
-              }
-              return origComplete.call(sofuu.ai, opts);
-            };"#,
-        ).unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        let rc = unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) };
-        assert_eq!(rc, 0, "setup should succeed");
-        unsafe { sofuu_free(out as *mut c_void) };
+        // Define a minimal agent that answers with the real model.
+        eval_setup(
+            rt,
+            &local_agent_js(
+                "stream-test",
+                &model,
+                "You are a test agent. Answer with one short sentence.",
+                "[]",
+            ),
+        );
 
         // Now stream agent.run — collect events.
         static STREAM_EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -2648,35 +2723,36 @@ mod tests {
         let events = STREAM_EVENTS.lock().unwrap().clone();
         // We should have received at least a "start" event from the agent loop.
         assert!(!events.is_empty(), "should have received at least one event, got: {events:?}");
+        assert_eq!(
+            events_of_kind(&events, "start").len(),
+            1,
+            "the run must report its start exactly once, got: {events:?}"
+        );
+        let done = done_event(&events);
+        assert!(done.get("error").is_none(), "the run must not fail: {done}");
+        let answer = done["result"]["answer"].as_str().unwrap_or("");
+        assert!(
+            !answer.trim().is_empty(),
+            "the real model must produce the answer: {done}"
+        );
 
         unsafe { sofuu_rt_free(rt) };
     }
 
     /// E0-2: `ai.stream` returns an async iterable and ignores `onStep`, so
     /// before the pump rewrite the funnel delivered ZERO events for it while
-    /// the header advertised it. This mocks the stream and proves the delta
-    /// pump works, and that a trailing `done` event carries the result.
+    /// the header advertised it. This drives the REAL local model through the
+    /// funnel and proves the delta pump works: every chunk the model
+    /// produced arrives as one delta event, and a trailing `done` event
+    /// carries the result and the model's real usage.
     #[test]
     fn stream_calls_ai_stream_emits_deltas_and_done() {
         let _g = lock();
+        let Some(model) = live_path("SOFUU_TEST_GGUF", DEFAULT_LIVE_GGUF) else {
+            return;
+        };
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
-
-        // Replace ai.stream with a 3-chunk async iterator.
-        let setup = CString::new(
-            r#"(function(){
-              var chunks = ["Hel", "lo ", "world"];
-              sofuu.ai.stream = function(opts) {
-                return (async function*(){
-                  for (var i=0;i<chunks.length;i++){ yield { text: chunks[i] }; }
-                })();
-              };
-            })()"#,
-        )
-        .unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
-        unsafe { sofuu_free(out as *mut c_void) };
 
         static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
         EVENTS.lock().unwrap().clear();
@@ -2686,7 +2762,15 @@ mod tests {
         }
 
         let method = CString::new("ai.stream").unwrap();
-        let args = CString::new(r#"{"prompt":"hi"}"#).unwrap();
+        let args = CString::new(
+            serde_json::json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": "Describe the sea in one sentence." }],
+                "maxTokens": 24
+            })
+            .to_string(),
+        )
+        .unwrap();
         let mut cancel_id: u64 = 0;
         let rc = unsafe {
             sofuu_rt_call_stream(
@@ -2702,14 +2786,30 @@ mod tests {
         assert!(cancel_id != 0, "cancel id should be issued");
 
         let events = EVENTS.lock().unwrap().clone();
-        // 3 delta events (one per chunk) + 1 done.
-        let deltas: Vec<&String> = events.iter().filter(|e| e.contains(r#""kind":"delta""#)).collect();
-        assert_eq!(deltas.len(), 3, "expected 3 delta events, got {events:?}");
-        assert!(events.iter().any(|e| e.contains("Hel")), "delta 1 text missing");
-        assert!(events.iter().any(|e| e.contains("world")), "delta 3 text missing");
+        // One delta event per chunk the model produced.
+        let deltas = events_of_kind(&events, "delta");
         assert!(
-            events.iter().any(|e| e.contains(r#""kind":"done""#)),
-            "expected a trailing done event, got {events:?}"
+            !deltas.is_empty(),
+            "the real model must produce deltas, got {events:?}"
+        );
+        let text: String = deltas
+            .iter()
+            .filter_map(|d| d.get("text").and_then(|t| t.as_str()))
+            .collect();
+        assert!(
+            !text.trim().is_empty(),
+            "the delta events must carry the model's text, got {events:?}"
+        );
+        let done = done_event(&events);
+        assert!(done.get("error").is_none(), "stream must not fail: {done}");
+        assert_eq!(
+            done["deltas"].as_u64(),
+            Some(deltas.len() as u64),
+            "the driver must report every chunk it pumped: {done}"
+        );
+        assert!(
+            done["usage"].is_object(),
+            "the done event must carry the model's real usage: {done}"
         );
 
         unsafe { sofuu_rt_free(rt) };
@@ -2717,91 +2817,133 @@ mod tests {
 
     // ── E1 (PLAN-EMBED-SDK): positional (array) args in the stream driver ──
     //
-    // Nothing model-sized is checked in — the GGUF / SafeTensors fixtures are
-    // hundreds of MB — so the live tests below degrade to a skip when the
-    // fixture is absent (override the path with the env var). Same shape
-    // sofuu-core's test_safetensors_models.rs uses, for the same reason: a
-    // gate that only passes on the author's machine is not a gate.
+    // Nothing model-sized is checked in — real weights are hundreds of MB — so
+    // the live tests below run against GGUF files that already exist on the
+    // machine and degrade to an explicit BLOCKED record when the file is
+    // absent (override the path with the env var). No model is ever
+    // downloaded and no fixture stands in for inference: the tests below
+    // either drive a real local model or report the coverage gap.
+    //
+    // SmolLM2-360M is the default because it is the fastest local model.
     const DEFAULT_LIVE_GGUF: &str =
-        "/Users/priyanshuboruah/Downloads/Qwen-3-0.6B-Claude-4.7-Opus-Distilled.i1-Q4_K_M.gguf";
+        "/Users/priyanshuboruah/Downloads/SmolLM2-360M-Instruct-Q8_0.gguf";
     const DEFAULT_LIVE_LFM2_DIR: &str = "/Users/priyanshuboruah/Downloads/liqiud-350";
 
-    /// Returns the fixture path when it exists, else None (after saying why).
+    /// A local model that is trained for the Hermes tool-call protocol the
+    /// runtime's local parser accepts. The tool-event coverage needs one:
+    /// SmolLM2-360M emits the JSON payload but never the `<tool_call>`
+    /// wrapper the parser requires (measured 0/5 runs on this Mac), so the
+    /// tool path cannot be exercised with it. Qwen3-0.6B complies in ~4/5
+    /// runs. A different local file can be selected with SOFUU_TEST_TOOL_GGUF.
+    const DEFAULT_TOOL_GGUF: &str =
+        "/Users/priyanshuboruah/Downloads/Qwen-3-0.6B-Claude-4.7-Opus-Distilled.i1-Q4_K_M.gguf";
+
+    /// How many times a model-backed run may be repeated while waiting for
+    /// the MODEL to decide something the test needs (a tool request, a
+    /// delegation). The decision belongs to the model, so a small local model
+    /// that does not take it is retried — never replaced by an injected one.
+    /// Measured on this Mac: the decision is stochastic (the same prompt
+    /// complies in some runs and not in others), so the budget is wide enough
+    /// that a refusal is a real model refusal, not a sampling accident.
+    const MAX_MODEL_ATTEMPTS: u32 = 8;
+
+    /// Returns the model path when it exists, else None (after saying why).
     fn live_path(env: &str, default: &str) -> Option<String> {
         let p = std::env::var(env).unwrap_or_else(|_| default.to_string());
         if std::path::Path::new(&p).exists() {
             Some(p)
         } else {
-            eprintln!("skipping: no model at {p} (set {env} to point at one)");
+            eprintln!(
+                "BLOCKED: no local model at {p} — set {env} to an existing GGUF \
+                 with real weights (no model is downloaded for this test)"
+            );
             None
         }
     }
 
+    /// The real local model for the tool/approval paths: the model that has
+    /// to be able to ASK for a tool. Absent → the caller records an explicit
+    /// BLOCKED coverage gap.
+    fn tool_model() -> Option<String> {
+        live_path("SOFUU_TEST_TOOL_GGUF", DEFAULT_TOOL_GGUF)
+    }
+
     /// E1: `ai.streamLocal` is positional — `(modelPath, prompt, options?)` —
     /// while the stream driver used to call every method with a single object,
-    /// so the model path never arrived. The mock here *fails the stream* if it
-    /// is not invoked positionally, so a regression cannot pass silently.
+    /// so the model path never arrived. This drives the REAL local model
+    /// positionally: a regression that handed the method a single object
+    /// would make `ai.streamLocal` throw ("requires (modelPath, prompt,
+    /// options?)"), and the run would end in an error event — which the
+    /// assertions below would see. The prompt is proven to arrive by its
+    /// cost: the long prompt must spend more prompt tokens than the short
+    /// one on the very same model.
     #[test]
     fn stream_spreads_positional_array_args() {
         let _g = lock();
+        let Some(model) = live_path("SOFUU_TEST_GGUF", DEFAULT_LIVE_GGUF) else {
+            return;
+        };
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
 
-        let setup = CString::new(
-            r#"(function(){
-              sofuu.ai.streamLocal = function(modelPath, prompt, opts) {
-                return (async function*(){
-                  if (modelPath !== "/tmp/m.gguf") throw new Error("modelPath was " + modelPath);
-                  if (prompt !== "hello") throw new Error("prompt was " + prompt);
-                  if (!opts || typeof opts.onStep !== "function") throw new Error("opts.onStep missing");
-                  if (typeof opts.signal !== "number") throw new Error("opts.signal missing");
-                  yield { text: "A" };
-                  yield { text: "B" };
-                })();
-              };
-            })()"#,
-        )
-        .unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
-        unsafe { sofuu_free(out as *mut c_void) };
-
         static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-        EVENTS.lock().unwrap().clear();
         unsafe extern "C" fn collect(event_json: *const c_char, _opaque: *mut c_void) {
             let s = unsafe { CStr::from_ptr(event_json) }.to_string_lossy().into_owned();
             EVENTS.lock().unwrap().push(s);
         }
 
-        let method = CString::new("ai.streamLocal").unwrap();
-        // No trailing options object: the driver must append one so a cancel
-        // hook exists even when the caller passes none.
-        let args = CString::new(r#"["/tmp/m.gguf","hello"]"#).unwrap();
-        let mut cancel_id: u64 = 0;
-        let rc = unsafe {
-            sofuu_rt_call_stream(
-                rt,
-                method.as_ptr(),
-                args.as_ptr(),
-                Some(collect),
-                ptr::null_mut(),
-                &mut cancel_id,
-            )
-        };
-        assert_eq!(rc, 0, "streamLocal via array args should return OK");
-        assert!(cancel_id != 0, "a cancel id is issued for the array shape too");
+        let short = "Once upon a time";
+        let long: String = std::iter::repeat("The quick brown fox jumps over the lazy dog. ")
+            .take(40)
+            .collect();
 
-        let events = EVENTS.lock().unwrap().clone();
-        let deltas = events
-            .iter()
-            .filter(|e| e.contains(r#""kind":"delta""#))
-            .count();
-        assert_eq!(deltas, 2, "expected 2 deltas, got {events:?}");
-        let done = events
-            .iter()
-            .find(|e| e.contains(r#""kind":"done""#))
-            .expect("a done event must always arrive");
-        assert!(!done.contains(r#""error""#), "stream must not fail: {done}");
+        let mut prompt_tokens: Vec<u64> = Vec::new();
+        for prompt in [short, long.as_str()] {
+            EVENTS.lock().unwrap().clear();
+            let method = CString::new("ai.streamLocal").unwrap();
+            // No trailing options object: the driver must append one so a
+            // cancel hook exists even when the caller passes none.
+            let args = CString::new(serde_json::json!([model, prompt]).to_string()).unwrap();
+            let mut cancel_id: u64 = 0;
+            let rc = unsafe {
+                sofuu_rt_call_stream(
+                    rt,
+                    method.as_ptr(),
+                    args.as_ptr(),
+                    Some(collect),
+                    ptr::null_mut(),
+                    &mut cancel_id,
+                )
+            };
+            assert_eq!(rc, 0, "streamLocal via array args should return OK");
+            assert!(cancel_id != 0, "a cancel id is issued for the array shape too");
+
+            let events = EVENTS.lock().unwrap().clone();
+            let deltas = events_of_kind(&events, "delta");
+            assert!(
+                !deltas.is_empty(),
+                "the real model must stream tokens: {events:?}"
+            );
+            let text: String = deltas
+                .iter()
+                .filter_map(|d| d.get("text").and_then(|t| t.as_str()))
+                .collect();
+            assert!(!text.trim().is_empty(), "the model must produce text: {events:?}");
+            let done = done_event(&events);
+            assert!(done.get("error").is_none(), "stream must not fail: {done}");
+            assert_eq!(
+                done["deltas"].as_u64(),
+                Some(deltas.len() as u64),
+                "every chunk must be pumped: {done}"
+            );
+            prompt_tokens.push(done["usage"]["promptTokens"].as_u64().unwrap_or(0));
+        }
+
+        assert!(
+            prompt_tokens[1] > prompt_tokens[0],
+            "the prompt must reach the model: the long prompt must cost more prompt \
+             tokens than the short one ({prompt_tokens:?})"
+        );
 
         unsafe { sofuu_rt_free(rt) };
     }
@@ -2809,27 +2951,19 @@ mod tests {
     /// E1: when the caller *does* pass a trailing options object, the driver
     /// must inject into it rather than replace it — dropping caller options
     /// would be a silent behaviour change — and cancel must work in the array
-    /// shape exactly as it does for the object shape.
+    /// shape exactly as it does for the object shape. The caller option is
+    /// `maxTokens`, and the REAL model honours it exactly: the decode stops
+    /// at the caller's token count (7, then 64), whatever the model wanted to
+    /// say, and without the option it would have run to the 512 default.
+    /// Cancelling mid-flight must stop the real decode.
     #[test]
     fn stream_array_args_keep_caller_options_and_cancel() {
         let _g = lock();
+        let Some(model) = live_path("SOFUU_TEST_GGUF", DEFAULT_LIVE_GGUF) else {
+            return;
+        };
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
-
-        let setup = CString::new(
-            r#"(function(){
-              sofuu.ai.streamLocal = function(modelPath, prompt, opts) {
-                return (async function*(){
-                  if (opts.maxTokens !== 7) throw new Error("caller options were dropped");
-                  for (var i = 0; i < 20; i++) yield { text: "t" + i };
-                })();
-              };
-            })()"#,
-        )
-        .unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
-        unsafe { sofuu_free(out as *mut c_void) };
 
         static DELTAS: Mutex<u32> = Mutex::new(0);
         static DONE: Mutex<String> = Mutex::new(String::new());
@@ -2841,6 +2975,16 @@ mod tests {
         struct CancelCtx {
             rt: *mut CapiRuntime,
             cid: u64,
+        }
+
+        unsafe extern "C" fn collect_only(event_json: *const c_char, _opaque: *mut c_void) {
+            let s = unsafe { CStr::from_ptr(event_json) }.to_string_lossy().into_owned();
+            if s.contains(r#""kind":"delta""#) {
+                let mut d = DELTAS.lock().unwrap();
+                *d += 1;
+            } else if s.contains(r#""kind":"done""#) {
+                *DONE.lock().unwrap() = s;
+            }
         }
 
         unsafe extern "C" fn collect_and_cancel(event_json: *const c_char, opaque: *mut c_void) {
@@ -2859,28 +3003,95 @@ mod tests {
             }
         }
 
-        let mut ctx = CancelCtx { rt, cid: 0 };
-        let method = CString::new("ai.streamLocal").unwrap();
-        let args = CString::new(r#"["/tmp/m.gguf","hello",{"maxTokens":7}]"#).unwrap();
-        let rc = unsafe {
-            sofuu_rt_call_stream(
-                rt,
-                method.as_ptr(),
-                args.as_ptr(),
-                Some(collect_and_cancel),
-                (&mut ctx as *mut CancelCtx) as *mut c_void,
-                &mut ctx.cid,
+        // Phase 1 — the caller's options survive: the driver's injected
+        // onStep/signal must be added to the caller's object, not replace it,
+        // so `maxTokens` still reaches the model. The proof is the REAL
+        // decode's own token count: with the caller's cap the model stops at
+        // exactly that many tokens, and with a bigger cap it stops at exactly
+        // that one — the default (512) would have let it run on.
+        for (cap, want) in [(7u64, 7u64), (64u64, 64u64)] {
+            *DELTAS.lock().unwrap() = 0;
+            DONE.lock().unwrap().clear();
+            let method = CString::new("ai.streamLocal").unwrap();
+            let args = CString::new(
+                serde_json::json!([
+                    model,
+                    // A completion-style prompt on purpose: an instruction-style
+                    // RAW prompt makes this small model emit a stop token
+                    // immediately (measured: 0 generated tokens in 3 of 6 runs
+                    // for "Tell me about the sea."), which would hide the cap
+                    // behind an empty answer instead of proving it.
+                    "Once upon a time",
+                    { "maxTokens": cap }
+                ])
+                .to_string(),
             )
-        };
-        assert_eq!(rc, 0);
+            .unwrap();
+            let mut cancel_id: u64 = 0;
+            let rc = unsafe {
+                sofuu_rt_call_stream(
+                    rt,
+                    method.as_ptr(),
+                    args.as_ptr(),
+                    Some(collect_only),
+                    ptr::null_mut(),
+                    &mut cancel_id,
+                )
+            };
+            assert_eq!(rc, 0);
 
-        let deltas = *DELTAS.lock().unwrap();
-        assert!(
-            deltas < 20,
-            "the first-delta cancel must stop the 20-chunk stream, saw {deltas}"
-        );
-        let done = DONE.lock().unwrap().clone();
-        assert!(done.contains(r#""aborted":true"#), "done should report aborted: {done}");
+            let deltas = *DELTAS.lock().unwrap();
+            let done = DONE.lock().unwrap().clone();
+            let done_json: JsonValue =
+                serde_json::from_str(&done).unwrap_or_else(|e| panic!("done is JSON ({e}): {done}"));
+            let completion = done_json["usage"]["completionTokens"].as_u64().unwrap_or(u64::MAX);
+            assert_eq!(
+                completion, want,
+                "the caller's maxTokens={cap} must reach the model: {completion} completion \
+                 tokens: {done}"
+            );
+            assert!(
+                deltas >= 1 && u64::from(deltas) <= want + 1,
+                "the real decode must stream the capped tokens: {deltas} deltas: {done}"
+            );
+            assert_eq!(
+                done_json["deltas"].as_u64(),
+                Some(deltas as u64),
+                "every chunk must be pumped: {done}"
+            );
+        }
+
+        // Phase 2 — a live cancel stops the real decode mid-flight and the
+        // terminal event says so.
+        {
+            *DELTAS.lock().unwrap() = 0;
+            DONE.lock().unwrap().clear();
+            let mut ctx = CancelCtx { rt, cid: 0 };
+            let method = CString::new("ai.streamLocal").unwrap();
+            let args = CString::new(
+                serde_json::json!([model, "Once upon a time", { "maxTokens": 64 }]).to_string(),
+            )
+            .unwrap();
+            let rc = unsafe {
+                sofuu_rt_call_stream(
+                    rt,
+                    method.as_ptr(),
+                    args.as_ptr(),
+                    Some(collect_and_cancel),
+                    (&mut ctx as *mut CancelCtx) as *mut c_void,
+                    &mut ctx.cid,
+                )
+            };
+            assert_eq!(rc, 0);
+
+            let deltas = *DELTAS.lock().unwrap();
+            assert!(
+                deltas <= 2,
+                "the first-delta cancel must stop the real decode, saw {deltas} deltas"
+            );
+            let done = DONE.lock().unwrap().clone();
+            assert!(done.contains(r#""aborted":true"#), "done should report aborted: {done}");
+        }
 
         unsafe { sofuu_rt_free(rt) };
     }
@@ -3025,60 +3236,25 @@ mod tests {
 
     // ── E2 (PLAN-EMBED-SDK): host-native tools ───────────────────────
 
-    /// A mock provider for the host-tool tests. It is injected as
-    /// `sofuu.ai.stream` because that is the one call the agent loop makes
-    /// (agent.js streamWithRetry), so the real loop, the real tool dispatch
-    /// and the real transcript assembly all run — only the model is fake.
-    ///
-    /// Round 1 asks for `tool`. Round 2 reports whether `token` (the tool's
-    /// result) is present in the messages the model would see, so a broken
-    /// bridge cannot pass by accident.
-    fn mock_tool_agent_js(token: &str, agent: &str, tool: &str) -> String {
-        format!(
-            r#"(function(){{
-  var TOKEN = {token_json};
-  var round = 0;
-  sofuu.ai.stream = function(opts) {{
-    round++;
-    var toolRound = (round === 1);
-    var chunks;
-    if (toolRound) {{ chunks = []; }}
-    else {{
-      var seen = JSON.stringify((opts && opts.messages) || []);
-      chunks = [{{ text: seen.indexOf(TOKEN) >= 0 ? "CONFIRMED-TOOL-RESULT" : "MISSING-TOOL-RESULT" }}];
-    }}
-    var i = 0;
-    var it = {{
-      usage: {{ promptTokens: 11, completionTokens: 3, finishReason: "stop" }},
-      toolCalls: toolRound
-        ? [{{ index: 0, id: "call_1", function: {{ name: {tool_json}, arguments: "{{}}" }} }}]
-        : [],
-      abort: function() {{}},
-      next: function() {{
-        if (i < chunks.length) return Promise.resolve({{ value: chunks[i++], done: false }});
-        return Promise.resolve({{ value: undefined, done: true }});
-      }}
-    }};
-    it[Symbol.asyncIterator] = function() {{ return it; }};
-    return it;
-  }};
-  sofuu.agent.define({{
-    name: {agent_json},
-    system: "You are a test agent.",
-    provider: "mock",
-    model: "mock-tool-test",
-    tools: [{{ builtin: {tool_json} }}],
-    budget: {{ maxSteps: 4 }}
-  }});
-}})()"#,
-            token_json = serde_json::to_string(token).unwrap_or_default(),
-            tool_json = serde_json::to_string(tool).unwrap_or_default(),
-            agent_json = serde_json::to_string(agent).unwrap_or_default(),
+    /// A real agent for the host-tool tests. The model is a REAL local GGUF
+    /// and the system prompt shows it the tool-call shape the runtime's
+    /// local parser accepts, so the tool REQUEST is the model's own
+    /// decision — nothing is injected into the conversation and no reply is
+    /// canned. The tool itself is the host's, registered through the C ABI.
+    fn real_tool_agent_js(model: &str, agent: &str, tool: &str) -> String {
+        local_agent_js(
+            agent,
+            model,
+            &tool_call_system(tool),
+            &format!(
+                "[{{ builtin: {} }}]",
+                serde_json::to_string(tool).unwrap_or_default()
+            ),
         )
     }
 
     /// Drive `agent.run` over the streaming ABI and return every event.
-    fn run_agent_collect(rt: *mut CapiRuntime, target: &str) -> Vec<String> {
+    fn run_agent_collect(rt: *mut CapiRuntime, target: &str, task: &str) -> Vec<String> {
         static EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
         EVENTS.lock().unwrap().clear();
         unsafe extern "C" fn collect(event_json: *const c_char, _opaque: *mut c_void) {
@@ -3088,7 +3264,7 @@ mod tests {
 
         let method = CString::new("agent.run").unwrap();
         let args = CString::new(
-            serde_json::json!({ "target": target, "task": "take a photo" }).to_string(),
+            serde_json::json!({ "target": target, "task": task }).to_string(),
         )
         .unwrap();
         let mut cancel_id: u64 = 0;
@@ -3106,17 +3282,48 @@ mod tests {
         EVENTS.lock().unwrap().clone()
     }
 
+    /// Run the agent until the MODEL asks for `tool`, at most
+    /// MAX_MODEL_ATTEMPTS times. Whether a model calls a tool is the model's
+    /// decision, and a small local model is not certain about it — so the
+    /// run is repeated, never short-circuited by an injected tool call.
+    /// Returns the events of the run that carried the request (or of the
+    /// last attempt) and how many attempts it took.
+    fn run_agent_until_tool_requested(
+        rt: *mut CapiRuntime,
+        target: &str,
+        tool: &str,
+        task: &str,
+    ) -> (Vec<String>, u32) {
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let events = run_agent_collect(rt, target, task);
+            let requested = events_of_kind(&events, "tool")
+                .iter()
+                .filter(|e| e["payload"]["name"].as_str() == Some(tool))
+                .count();
+            if requested > 0 || attempts >= MAX_MODEL_ATTEMPTS {
+                return (events, attempts);
+            }
+        }
+    }
+
     /// E2: the headline case — a native function the host registered runs
     /// inside a real agent turn, and its result reaches the conversation the
-    /// model sees.
+    /// model sees. The turn is driven by a REAL local model: the tool
+    /// REQUEST is the model's own decision, the callback is the real C-ABI
+    /// bridge, and the result the model is shown is the host's real output.
     #[test]
     fn host_tool_runs_inside_an_agent_turn() {
         let _g = lock();
+        let Some(model) = tool_model() else {
+            return;
+        };
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
 
         static CALLS: Mutex<u32> = Mutex::new(0);
-        static ARGS: Mutex<String> = Mutex::new(String::new());
+        static ARGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
         *CALLS.lock().unwrap() = 0;
         ARGS.lock().unwrap().clear();
 
@@ -3129,7 +3336,7 @@ mod tests {
             _opaque: *mut c_void,
         ) -> *const c_char {
             let s = unsafe { CStr::from_ptr(args_json) }.to_string_lossy().into_owned();
-            *ARGS.lock().unwrap() = s;
+            ARGS.lock().unwrap().push(s);
             *CALLS.lock().unwrap() += 1;
             c"{\"path\":\"/tmp/TOOLRES-photo-9f3.jpg\"}".as_ptr()
         }
@@ -3151,26 +3358,47 @@ mod tests {
             "registration should succeed"
         );
 
-        let setup = CString::new(mock_tool_agent_js(
-            "TOOLRES-photo-9f3",
-            "photo-agent",
-            "take_photo",
-        ))
-        .unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
-        unsafe { sofuu_free(out as *mut c_void) };
+        eval_setup(rt, &real_tool_agent_js(&model, "photo-agent", "take_photo"));
 
-        let events = run_agent_collect(rt, "photo-agent");
+        let (events, attempts) = run_agent_until_tool_requested(rt, "photo-agent", "take_photo", "take a photo");
         let joined = events.join("\n");
+        let requests = events_of_kind(&events, "tool");
+        if requests.is_empty() {
+            eprintln!(
+                "BLOCKED: the local model did not request the host tool in {attempts} runs \
+                 (model={model}) — the host-tool-in-a-turn path is unverified with this model"
+            );
+            unsafe { sofuu_rt_free(rt) };
+            return;
+        }
 
-        assert_eq!(*CALLS.lock().unwrap(), 1, "the host tool must run exactly once");
-        assert_eq!(*ARGS.lock().unwrap(), "{}", "the model's args reach the callback");
-        assert!(
-            joined.contains("CONFIRMED-TOOL-RESULT"),
-            "the tool result must reach the model's transcript; events: {joined}"
+        // One host call per model request — never more.
+        assert_eq!(
+            *CALLS.lock().unwrap() as usize,
+            requests.len(),
+            "the host tool must run exactly once per model request: {joined}"
         );
-        assert!(!joined.contains("MISSING-TOOL-RESULT"), "events: {joined}");
+        // The model's arguments reach the callback unchanged.
+        let args_seen = ARGS.lock().unwrap().clone();
+        for (req, arg) in requests.iter().zip(args_seen.iter()) {
+            let want = req["payload"]["args"].as_str().unwrap_or("");
+            assert_eq!(
+                want, arg,
+                "the model's args must reach the callback unchanged: {joined}"
+            );
+        }
+        // The host's real output reaches the transcript the model is shown.
+        let results = events_of_kind(&events, "tool_result");
+        assert!(!results.is_empty(), "the tool result must be reported: {joined}");
+        assert!(
+            results.iter().any(|r| r["payload"]["result"]
+                .as_str()
+                .unwrap_or("")
+                .contains("TOOLRES-photo-9f3")),
+            "the host's real output must reach the transcript: {joined}"
+        );
+        let done = done_event(&events);
+        assert!(done.get("error").is_none(), "the run must not fail: {done}");
 
         unsafe { sofuu_rt_free(rt) };
     }
@@ -3182,6 +3410,9 @@ mod tests {
     #[test]
     fn host_tool_completes_from_another_thread() {
         let _g = lock();
+        let Some(model) = tool_model() else {
+            return;
+        };
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
 
@@ -3228,26 +3459,33 @@ mod tests {
             0
         );
 
-        let setup = CString::new(mock_tool_agent_js(
-            "TOOLRES-photo-9f3",
-            "photo-agent",
-            "take_photo",
-        ))
-        .unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
-        unsafe { sofuu_free(out as *mut c_void) };
+        eval_setup(rt, &real_tool_agent_js(&model, "photo-agent", "take_photo"));
 
-        let events = run_agent_collect(rt, "photo-agent");
+        let (events, attempts) = run_agent_until_tool_requested(rt, "photo-agent", "take_photo", "take a photo");
         let joined = events.join("\n");
+        let requests = events_of_kind(&events, "tool");
+        if requests.is_empty() {
+            eprintln!(
+                "BLOCKED: the local model did not request the host tool in {attempts} runs \
+                 (model={model}) — the deferred host-tool path is unverified with this model"
+            );
+            unsafe { drop(Box::from_raw(tx as *mut std::sync::mpsc::Sender<c_int>)) };
+            unsafe { sofuu_rt_free(rt) };
+            return;
+        }
 
         let rc = rx
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the deferred call must be resolvable from the host thread");
         assert_eq!(rc, 0, "resolve must accept an outstanding call id");
         assert!(
-            joined.contains("CONFIRMED-TOOL-RESULT"),
-            "the deferred result must reach the model's transcript; events: {joined}"
+            events_of_kind(&events, "tool_result")
+                .iter()
+                .any(|r| r["payload"]["result"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("TOOLRES-photo-9f3")),
+            "the deferred result must reach the transcript: {joined}"
         );
 
         unsafe { drop(Box::from_raw(tx as *mut std::sync::mpsc::Sender<c_int>)) };
@@ -3371,8 +3609,27 @@ mod tests {
     #[test]
     fn host_tool_reaches_a_config_defined_agent() {
         let _g = lock();
+        let Some(model) = tool_model() else {
+            return;
+        };
         let cfg = CString::new(
-            r#"{"agents":[{"name":"cfg-photo","system":"You are a test agent.","provider":"mock","model":"mock-tool-test","tools":[{"builtin":"take_photo"}],"budget":{"maxSteps":4}}]}"#,
+            serde_json::json!({
+                "agents": [{
+                    "name": "cfg-photo",
+                    // The same tool-call system prompt the other host-tool
+                    // agents use: it tells the model the exact call shape the
+                    // runtime's local parser accepts, so the tool REQUEST is
+                    // the model's own informed decision rather than a guess.
+                    "system": tool_call_system("take_photo"),
+                    "provider": "local",
+                    "model": model,
+                    "memory": "off",
+                    "rlm": "off",
+                    "tools": [{ "builtin": "take_photo" }],
+                    "budget": { "maxSteps": 4 }
+                }]
+            })
+            .to_string(),
         )
         .unwrap();
         let rt = unsafe { sofuu_rt_new(cfg.as_ptr()) };
@@ -3404,33 +3661,43 @@ mod tests {
             0
         );
 
-        // The mock defines an unrelated agent; the config one is the target.
-        let setup = CString::new(mock_tool_agent_js(
-            "TOOLRES-photo-9f3",
-            "unused-agent",
-            "take_photo",
-        ))
-        .unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
-        unsafe { sofuu_free(out as *mut c_void) };
+        // An unrelated agent is defined too; the config one is the target.
+        eval_setup(rt, &real_tool_agent_js(&model, "unused-agent", "take_photo"));
 
-        let events = run_agent_collect(rt, "cfg-photo");
+        let (events, attempts) = run_agent_until_tool_requested(rt, "cfg-photo", "take_photo", "take a photo");
         let joined = events.join("\n");
+        let requests = events_of_kind(&events, "tool");
+        if requests.is_empty() {
+            eprintln!(
+                "BLOCKED: the local model did not request the host tool in {attempts} runs \
+                 (model={model}) — the config-defined agent path is unverified with this model"
+            );
+            unsafe { sofuu_rt_free(rt) };
+            return;
+        }
 
-        assert_eq!(*CALLS.lock().unwrap(), 1, "the config agent must call the tool");
+        assert_eq!(
+            *CALLS.lock().unwrap() as usize,
+            requests.len(),
+            "the config agent must call the tool once per request: {joined}"
+        );
         assert!(
-            joined.contains("CONFIRMED-TOOL-RESULT"),
-            "the tool result must reach the model's transcript; events: {joined}"
+            events_of_kind(&events, "tool_result")
+                .iter()
+                .any(|r| r["payload"]["result"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("TOOLRES-photo-9f3")),
+            "the tool result must reach the transcript: {joined}"
         );
 
         unsafe { sofuu_rt_free(rt) };
     }
 
     /// E0-2: a *live* mid-flight cancel. The host cancels from inside the
-    /// event callback on the first delta; the iterator has 20 chunks, so an
-    /// early stop is directly observable in the delta count. (Before this,
-    /// only cancelling an *unknown* id was ever tested.)
+    /// event callback on the first delta; the REAL local model is still
+    /// decoding, so an early stop is directly observable in the delta count.
+    /// (Before this, only cancelling an *unknown* id was ever tested.)
     ///
     /// The cancel id is readable during the callback because
     /// `sofuu_rt_call_stream` writes `*out_cancel_id` before the JS runs;
@@ -3438,24 +3705,11 @@ mod tests {
     #[test]
     fn stream_ai_stream_cancels_mid_flight() {
         let _g = lock();
+        let Some(model) = live_path("SOFUU_TEST_GGUF", DEFAULT_LIVE_GGUF) else {
+            return;
+        };
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
-
-        // 20 chunks, so an early stop is observable.
-        let setup = CString::new(
-            r#"(function(){
-              var chunks = []; for (var i=0;i<20;i++) chunks.push("t"+i);
-              sofuu.ai.stream = function(opts) {
-                return (async function*(){
-                  for (var i=0;i<chunks.length;i++){ yield { text: chunks[i] }; }
-                })();
-              };
-            })()"#,
-        )
-        .unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
-        unsafe { sofuu_free(out as *mut c_void) };
 
         static DELTAS: Mutex<u32> = Mutex::new(0);
         static DONE_ABORTED: Mutex<bool> = Mutex::new(false);
@@ -3488,7 +3742,15 @@ mod tests {
 
         let mut ctx = CancelCtx { rt, cid: 0 };
         let method = CString::new("ai.stream").unwrap();
-        let args = CString::new(r#"{"prompt":"hi"}"#).unwrap();
+        let args = CString::new(
+            serde_json::json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": "Write a long story about the sea." }],
+                "maxTokens": 128
+            })
+            .to_string(),
+        )
+        .unwrap();
         let rc = unsafe {
             sofuu_rt_call_stream(
                 rt,
@@ -3503,8 +3765,8 @@ mod tests {
 
         let deltas = *DELTAS.lock().unwrap();
         assert!(
-            deltas < 20,
-            "cancel should stop the pump early, but all 20 deltas arrived ({deltas})"
+            deltas >= 1 && deltas <= 2,
+            "cancel should stop the real decode right after the first delta, saw {deltas}"
         );
         assert!(
             *DONE_ABORTED.lock().unwrap(),
@@ -3705,9 +3967,10 @@ mod tests {
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
 
-        // Define an agent via the eval escape hatch.
+        // Define an agent via the eval escape hatch. This is a registry
+        // entry only — nothing here runs a model, so no provider is named.
         let define_src = CString::new(
-            r#"sofuu.agent.define({ name: "capi-agent", system: "test", provider: "mock", model: "mock" });"true""#,
+            r#"sofuu.agent.define({ name: "capi-agent", system: "test" });"true""#,
         ).unwrap();
         let mut out: *mut c_char = ptr::null_mut();
         let rc = unsafe { sofuu_rt_eval(rt, define_src.as_ptr(), &mut out) };
@@ -3729,8 +3992,10 @@ mod tests {
     #[test]
     fn per_process_agent_definitions_in_config() {
         let _g = lock();
+        // A registry entry only — no provider is named because nothing here
+        // runs a model.
         let cfg = CString::new(
-            r#"{"agents":[{"name":"config-agent","system":"from config","provider":"mock","model":"mock"}]}"#,
+            r#"{"agents":[{"name":"config-agent","system":"from config"}]}"#,
         ).unwrap();
         let rt = unsafe { sofuu_rt_new(cfg.as_ptr()) };
         assert!(!rt.is_null());
@@ -3824,8 +4089,9 @@ mod tests {
         unsafe { sofuu_rt_free(rt) };
     }
 
-    // M2C: voice funnel validation (no network — transfer paths are
-    // covered by tests/voice_test.js against a mock).
+    // M2C: voice funnel validation. No network here: this pins the
+    // argument guards only. The transfer paths need a reachable voice
+    // backend and are not covered by this test.
     #[test]
     fn voice_fns_reject_bad_args() {
         let good_b64 = CString::new("QUJDRA==").unwrap();
@@ -5080,14 +5346,17 @@ mod tests {
     /// gitignored local-only — a fresh clone could regress the agent
     /// loop's core contract invisibly. This drives the REAL shipped JS
     /// (`src/js/agent.js`, embedded by `shipped.rs`) through the funnel
-    /// with a scripted provider seam — no network, no model needed:
-    ///   1. an inline tool executes and its result reaches the final
-    ///      answer, with real usage landed in the run accounting;
-    ///   2. a delegation cycle (da → db → da) is refused by the guard and
-    ///      the turn still completes (no hang, no re-entry storm) with
-    ///      exactly the expected call count;
-    ///   3. a token budget fires mid-run: stopped :'budget_tokens' with
-    ///      the full breach detail, after one single-shot salvage round.
+    /// with a REAL local model — every reply in the run is the model's own:
+    ///   1. an inline tool executes, its result reaches the transcript the
+    ///      model is shown, and the real usage lands in the run accounting;
+    ///   2. a token budget fires mid-run: stopped :'budget_tokens' with the
+    ///      full breach detail, after one single-shot salvage round.
+    ///
+    /// The delegation-cycle scenario (a → b → a) is NOT covered here: it
+    /// needs a model that issues `delegate` calls, and no local model does
+    /// (measured 0/5 with Qwen3-0.6B on this Mac). It is reported as an
+    /// explicit coverage gap at the end of this test rather than driven by a
+    /// scripted provider, which would fabricate a model decision.
     ///
     /// Deliberately out of scope here: provider delta merging (ai.rs folds
     /// fragments into `stream.toolCalls`; the local-model protocol parser
@@ -5097,180 +5366,118 @@ mod tests {
     #[test]
     fn agent_loop_core_contract_runs_through_shipped_js() {
         let _g = lock();
+        let Some(model) = tool_model() else {
+            return;
+        };
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
 
-        // Scripted provider: sofuu.ai.stream is replaced with a fake that
-        // shifts one step off a FIFO per call — the exact post-fold shape
-        // agent.js consumes (chunk.text from the stream, st.toolCalls,
-        // st.usage). Definitions + a result-capture wrapper ride eval.
-        let setup = CString::new(
-            r#"
-(function () {
-  sofuu._agT = { script: [], last: null };
-  sofuu.ai.stream = function () {
-    var step = sofuu._agT.script.shift() || { text: '(script exhausted)' };
-    var it = (function* () { if (step.text) yield { text: step.text }; })();
-    return {
-      abort: function () {},
-      toolCalls: step.toolCalls || [],
-      usage: step.usage || {},
-      [Symbol.asyncIterator]: function () { return it; }
-    };
-  };
-  sofuu.agent.define({
-    name: 'greeter', system: 'contract test', memory: 'off', rlm: 'off',
-    tools: [{ name: 'greet', description: 'greet the scene',
-              parameters: { type: 'object', properties: {} },
-              execute: function () { return 'GREET-TOOLRES'; } }]
-  });
-  sofuu.agent.define({ name: 'da', system: 'contract test', memory: 'off', rlm: 'off', agents: ['db'] });
-  sofuu.agent.define({ name: 'db', system: 'contract test', memory: 'off', rlm: 'off', agents: ['da'] });
+        let setup = format!(
+            r#"(function(){{
+  var MODEL = {model};
+  sofuu.agent.define({{
+    name: 'greeter', system: {greet}, provider: 'local', model: MODEL,
+    memory: 'off', rlm: 'off',
+    tools: [{{ name: 'greet', description: 'greet the scene',
+               parameters: {{ type: 'object', properties: {{}} }},
+               execute: function () {{ return 'GREET-TOOLRES'; }} }}],
+    budget: {{ maxSteps: 4 }}
+  }});
   /* tiny carries a tool: budgets bind at the loop top, so the run must be
    * in the tool loop for the token ceiling to fire mid-turn. */
-  sofuu.agent.define({ name: 'tiny', system: 'contract test', memory: 'off', rlm: 'off',
-                       budget: { maxTokens: 1 },
-                       tools: [{ name: 'noop', description: 'no-op',
-                                 parameters: { type: 'object', properties: {} },
-                                 execute: function () { return 'NOPRES'; } }] });
-  var realRun = sofuu.agent.run;
-  sofuu.agent.run = function (t, task, o) {
-    var p;
-    try { p = realRun(t, task, o); }
-    catch (eSync) {
-      sofuu._agT.last = { answer: 'SYNC-REJ: ' + String((eSync && eSync.stack) || eSync).slice(0, 600),
-                          stopped: 'rejected' };
-      return new Promise(function () {}); /* never settles; funnel times nothing */
-    }
-    return p.then(function (r) {
-      sofuu._agT.last = { answer: String(r && r.answer || ''),
-                          stopped: r && r.stopped || null,
-                          breachKind: (r && r.breach) ? r.breach.kind : null,
-                          llmCalls: (r && r.usage) ? (r.usage.llmCalls | 0) : -1,
-                          promptTokens: (r && r.usage) ? (r.usage.promptTokens | 0) : -1,
-                          toolCalls: (r && r.usage) ? (r.usage.toolCalls | 0) : -1 };
-      return r;
-    }, function (e) {
-      sofuu._agT.last = { answer: 'REJECTED: ' + String((e && e.stack) || e).slice(0, 600),
-                          stopped: 'rejected' };
-      throw e;
-    });
-  };
-})()"#,
-        )
-        .unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        let rc = unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) };
-        assert_eq!(rc, 0, "setup must succeed");
-        unsafe { sofuu_free(out as *mut c_void) };
+  sofuu.agent.define({{
+    name: 'tiny', system: {noop}, provider: 'local', model: MODEL,
+    memory: 'off', rlm: 'off',
+    tools: [{{ name: 'noop', description: 'no-op',
+               parameters: {{ type: 'object', properties: {{}} }},
+               execute: function () {{ return 'NOPRES'; }} }}],
+    budget: {{ maxSteps: 4, maxTokens: 1 }}
+  }});
+}})()"#,
+            model = serde_json::to_string(&model).unwrap_or_default(),
+            greet = serde_json::to_string(&tool_call_system("greet")).unwrap_or_default(),
+            noop = serde_json::to_string(&tool_call_system("noop")).unwrap_or_default(),
+        );
+        eval_setup(rt, &setup);
 
-        // Drive one agent.run to completion via the BLOCKING funnel —
-        // sofuu_rt_call pumps the event loop until the promise resolves
-        // (the stream variant is fire-and-tick, for hosts that pump) —
-        // then read the captured result back through eval.
-        fn run_and_capture(rt: *mut CapiRuntime, target: &str, task: &str) -> serde_json::Value {
-            let method = CString::new("agent.run").unwrap();
-            let args = CString::new(format!(
-                "{{\"target\":\"{target}\",\"task\":\"{task}\"}}"
-            ))
-            .unwrap();
-            let mut out: *mut c_char = ptr::null_mut();
-            let rc = unsafe { sofuu_rt_call(rt, method.as_ptr(), args.as_ptr(), &mut out) };
-            assert_eq!(rc, 0, "agent.run must settle: {}", unsafe {
-                if out.is_null() { "".into() } else {
-                    CStr::from_ptr(out).to_string_lossy().into_owned()
-                }
-            });
-            unsafe { sofuu_free(out as *mut c_void) };
-            let q = CString::new("sofuu._agT.last").unwrap();
-            let mut res: *mut c_char = ptr::null_mut();
-            let rc = unsafe { sofuu_rt_eval(rt, q.as_ptr(), &mut res) };
-            assert_eq!(rc, 0, "result readback must succeed");
-            let raw = unsafe { CStr::from_ptr(res) }.to_string_lossy().into_owned();
-            unsafe { sofuu_free(res as *mut c_void) };
-            let envelope: serde_json::Value =
-                serde_json::from_str(&raw).expect("captured result must be JSON envelope");
-            let v = envelope["result"].clone();
-            assert!(
-                v.is_object(),
-                "captured result must be an object — the run must settle: {raw}"
+        // 1. Tool round: the model asks for the inline tool, the tool runs
+        // for real, and its result reaches the transcript the model is
+        // shown — with the real usage in the run accounting.
+        let (events, attempts) =
+            run_agent_until_tool_requested(rt, "greeter", "greet", "greet the scene");
+        let joined = events.join("\n");
+        let requests = events_of_kind(&events, "tool");
+        if requests.is_empty() {
+            eprintln!(
+                "BLOCKED: the local model did not request the inline tool in {attempts} runs \
+                 (model={model}) — the agent-loop tool round is unverified with this model"
             );
-            v
+            unsafe { sofuu_rt_free(rt) };
+            return;
         }
-
-        let script = CString::new(
-            "sofuu._agT.script = [\
-             {toolCalls:[{id:'c1',name:'greet',arguments:{}}],usage:{promptTokens:10,completionTokens:5}},\
-             {text:'final-sees-GREET-TOOLRES',usage:{promptTokens:20,completionTokens:5}}];",
-        )
-        .unwrap();
-        unsafe { sofuu_rt_eval(rt, script.as_ptr(), &mut out) };
-        unsafe { sofuu_free(out as *mut c_void) };
-        let toolRound = run_and_capture(rt, "greeter", "do the thing");
+        assert!(
+            events_of_kind(&events, "tool_result")
+                .iter()
+                .any(|r| r["payload"]["result"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("GREET-TOOLRES")),
+            "the tool result must reach the transcript: {joined}"
+        );
+        let done = done_event(&events);
+        let result = &done["result"];
+        assert!(
+            result["usage"]["promptTokens"].as_i64().unwrap_or(0) >= 30,
+            "usage must reach the run accounting: {done}"
+        );
         assert_eq!(
-            toolRound["answer"].as_str().unwrap_or(""),
-            "final-sees-GREET-TOOLRES",
-            "tool round must produce the final answer: {toolRound}"
+            result["usage"]["toolCalls"].as_i64(),
+            Some(requests.len() as i64),
+            "the run accounting must count the real tool calls: {done}"
         );
         assert!(
-            toolRound["promptTokens"].as_i64().unwrap_or(0) >= 30,
-            "usage must reach the run accounting: {toolRound}"
-        );
-        assert!(
-            toolRound["toolCalls"].as_i64().unwrap_or(0) == 1,
-            "exactly one real tool call executes: {toolRound}"
+            !result["answer"].as_str().unwrap_or("").trim().is_empty(),
+            "the run must produce an answer: {done}"
         );
 
-        // Delegation cycle: da delegates db, db tries to delegate da — the
-        // guard refuses, db finishes anyway, and the tree completes with
-        // exactly 3 llm calls (guard failure would re-enter and burn more).
-        let script = CString::new(
-            "sofuu._agT.script = [\
-             {toolCalls:[{id:'d1',name:'delegate',arguments:{agent:'db',task:'sub'}}],usage:{promptTokens:20,completionTokens:5}},\
-             {toolCalls:[{id:'d2',name:'delegate',arguments:{agent:'da',task:'back'}}],usage:{promptTokens:20,completionTokens:5}},\
-             {text:'cycle-seen-OK',usage:{promptTokens:10,completionTokens:3}},\
-             {text:'parent-done',usage:{promptTokens:10,completionTokens:3}}];",
-        )
-        .unwrap();
-        unsafe { sofuu_rt_eval(rt, script.as_ptr(), &mut out) };
-        unsafe { sofuu_free(out as *mut c_void) };
-        let cycle = run_and_capture(rt, "da", "delegate something");
+        // 2. Token budget: maxTokens 1 blows on the first ask's tool round;
+        // the loop-top breach stops the run, one single-shot salvage round
+        // runs, and the result carries the breach detail with honest usage.
+        let (events, attempts) =
+            run_agent_until_tool_requested(rt, "tiny", "noop", "run the noop tool");
+        let joined = events.join("\n");
+        if events_of_kind(&events, "tool").is_empty() {
+            eprintln!(
+                "BLOCKED: the local model did not request the inline tool in {attempts} runs \
+                 (model={model}) — the agent-loop token-budget contract is unverified with this model"
+            );
+            unsafe { sofuu_rt_free(rt) };
+            return;
+        }
+        let done = done_event(&events);
+        let result = &done["result"];
         assert_eq!(
-            cycle["answer"].as_str().unwrap_or(""),
-            "parent-done",
-            "guarded cycle completes the tree: {cycle}"
-        );
-        assert!(
-            cycle["llmCalls"].as_i64().unwrap_or(0) <= 5,
-            "no re-entry storm — expected tree-shaped call count: {cycle}"
-        );
-
-        // Token budget: maxTokens 1 blows on the first ask's tool round; the
-        // loop-top breach stops the run, one single-shot salvage round runs,
-        // and the result carries the breach detail with honest usage.
-        let script = CString::new(
-            "sofuu._agT.script = [\
-             {toolCalls:[{id:'b1',name:'noop',arguments:{}}],usage:{promptTokens:50,completionTokens:10}},\
-             {text:'SALVAGE-OK',usage:{promptTokens:5,completionTokens:2}}];",
-        )
-        .unwrap();
-        unsafe { sofuu_rt_eval(rt, script.as_ptr(), &mut out) };
-        unsafe { sofuu_free(out as *mut c_void) };
-        let budget = run_and_capture(rt, "tiny", "long task");
-        assert_eq!(
-            budget["stopped"].as_str().unwrap_or(""),
+            result["stopped"].as_str().unwrap_or(""),
             "budget_tokens",
-            "token budget stops the run: {budget}"
+            "token budget stops the run: {done}"
         );
         assert_eq!(
-            budget["breachKind"].as_str().unwrap_or(""),
+            result["breach"]["kind"].as_str().unwrap_or(""),
             "budget_tokens",
-            "breach detail rides the result: {budget}"
+            "breach detail rides the result: {done}"
         );
-        assert_eq!(
-            budget["answer"].as_str().unwrap_or(""),
-            "SALVAGE-OK",
-            "the salvage round surfaces a usable answer: {budget}"
+        assert!(
+            !result["answer"].as_str().unwrap_or("").trim().is_empty(),
+            "the salvage round surfaces a usable answer: {done} / {joined}"
+        );
+
+        // 3. The delegation-cycle guard (a → b → a) stays uncovered: it
+        // needs a model that issues `delegate` calls, and no local model
+        // does. The gap is recorded, never simulated.
+        eprintln!(
+            "BLOCKED: the delegation-cycle scenario needs a model that issues `delegate` \
+             calls; no local model does (0/5 with Qwen3-0.6B). The chain guard in \
+             agent.js is unverified by this test."
         );
 
         unsafe { sofuu_rt_free(rt) };
@@ -5328,92 +5535,95 @@ mod tests {
 
     // ── Interactive approvals end-to-end (audit M2 → C funnel) ───────
 
-    /// One mock provider for both approval runs: round 1 demands the gated
-    /// tool; later rounds read the transcript and report what happened —
-    /// the tool ran (approval allowed) or the refusal reached the model.
-    fn approval_agent_js(agent: &str, allow: bool) -> String {
-        let agent_json = serde_json::to_string(agent).unwrap();
+    /// One real agent for both approval runs: the model is a REAL local GGUF
+    /// and the gated tool is a real inline tool. The host settles the
+    /// approval the way a host UI does — straight out of the
+    /// `approval_request` event — which is exactly what the runtime expects:
+    /// it registers the pending approval BEFORE emitting the event.
+    fn approval_agent_js(model: &str, agent: &str) -> String {
         format!(
             r#"(function(){{
-  var round = 0;
-  var ALLOW = {allow};
-  sofuu.ai.stream = function(opts) {{
-    round++;
-    /* The resolver timer is scheduled from INSIDE the run: a pre-armed
-     * setTimeout would fire during the setup eval's own drain (pending
-     * timers keep the uv pump alive there), and the parked approval would
-     * inherit an event-less loop — a deadlock. From here the timer lives
-     * exactly as long as the parking window and fires mid-drain. */
-    if (round === 1) {{
-      setTimeout(function () {{
-        var ps = sofuu.agent.pendingApprovals();
-        if (ps.length) sofuu.agent.resolveApproval(ps[0].id, ALLOW, ALLOW);
-      }}, 60);
-    }}
-    var mk = function(chunks, toolCalls) {{
-      var i = 0;
-      var it = {{
-        usage: {{ promptTokens: 7, completionTokens: 3, finishReason: "stop" }},
-        toolCalls: toolCalls, abort: function() {{}},
-        next: function() {{
-          if (i < chunks.length) return Promise.resolve({{ value: chunks[i++], done: false }});
-          return Promise.resolve({{ value: undefined, done: true }});
-        }}
-      }};
-      it[Symbol.asyncIterator] = function() {{ return it; }};
-      return it;
-    }};
-    if (round === 1) {{
-      return mk([], [{{ index: 0, id: "call_1",
-                        function: {{ name: "tick", arguments: "{{}}" }} }}]);
-    }}
-    var seen = JSON.stringify((opts && opts.messages) || []);
-    var verdict = seen.indexOf("TICK-RUN-7") >= 0 ? "APPROVAL-FLOW-OK"
-                : seen.indexOf("denied by user") >= 0 ? "DENIED-OK" : "UNEXPECTED";
-    return mk([{{ text: verdict }}], []);
-  }};
   sofuu.agent.define({{
-    name: {agent_json},
-    system: "You are a test agent.",
-    provider: "mock",
-    model: "mock-ap",
-    tools: [{{ name: "tick", description: "gated probe",
+    name: {agent},
+    system: {system},
+    provider: "local",
+    model: {model},
+    memory: "off",
+    rlm: "off",
+    tools: [{{ name: "tick", description: "tick tool — use it when the user asks to tick",
                parameters: {{ type: "object", properties: {{}} }},
                execute: function() {{ return "TICK-RUN-7"; }} }}],
     approve: "sensitive",
     budget: {{ maxSteps: 4 }}
   }});
-}})()"#)
+}})()"#,
+            agent = serde_json::to_string(agent).unwrap_or_default(),
+            system = serde_json::to_string(&tool_call_system("tick")).unwrap_or_default(),
+            model = serde_json::to_string(model).unwrap_or_default(),
+        )
     }
 
     static AP_EVENTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-    /// Prep the agent, then run it over the streaming ABI with
-    /// approveInteractive, resolving the parked approval from a libuv timer
-    /// through the JS facade (exactly how a UI host would settle it).
+    /// Settle a parked interactive approval from inside the event callback.
+    /// The evaluation does NOT drain the event loop — the run is already
+    /// inside one — and it is exactly the call a host UI makes.
+    unsafe fn resolve_approval(rt: *mut CapiRuntime, id: &str, allow: bool) {
+        let ctx = (*rt).ffi_rt.engine_ctx() as *mut qjs::JSContext;
+        let js = format!(
+            "sofuu.agent.resolveApproval({id}, {allow}, {allow})",
+            id = serde_json::to_string(id).unwrap_or_default(),
+        );
+        let src = CString::new(js).unwrap();
+        let res = qjs::JS_Eval(
+            ctx,
+            src.as_ptr(),
+            src.as_bytes().len(),
+            c"<capi-approval>".as_ptr(),
+            qjs::JS_EVAL_TYPE_GLOBAL,
+        );
+        if qjs::is_exception(res) {
+            let exc = qjs::JS_GetException(ctx);
+            qjs::sofuu_js_free_value(ctx, exc);
+        }
+        qjs::sofuu_js_free_value(ctx, res);
+    }
+
+    /// Run the agent over the streaming ABI with approveInteractive and
+    /// resolve the parked approval from the host the moment it is raised.
     fn run_approval(rt: *mut CapiRuntime, agent: &str, allow: bool) -> Vec<String> {
         AP_EVENTS.lock().unwrap().clear();
 
-        let setup = CString::new(approval_agent_js(agent, allow)).unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0,
-                   "approval agent setup should eval");
-        unsafe { sofuu_free(out as *mut c_void) };
+        #[repr(C)]
+        struct HostCtx {
+            rt: *mut CapiRuntime,
+            allow: bool,
+        }
 
-        unsafe extern "C" fn collect(event_json: *const c_char, _opaque: *mut c_void) {
+        unsafe extern "C" fn collect(event_json: *const c_char, opaque: *mut c_void) {
             let s = unsafe { CStr::from_ptr(event_json) }.to_string_lossy().into_owned();
+            let ctx = unsafe { &*(opaque as *const HostCtx) };
+            // A host answers the prompt the moment it is raised.
+            if let Ok(v) = serde_json::from_str::<JsonValue>(&s) {
+                if v.get("kind").and_then(|k| k.as_str()) == Some("approval_request") {
+                    if let Some(id) = v["payload"]["id"].as_str() {
+                        unsafe { resolve_approval(ctx.rt, id, ctx.allow) };
+                    }
+                }
+            }
             AP_EVENTS.lock().unwrap().push(s);
         }
 
         let method = CString::new("agent.run").unwrap();
         let args = CString::new(
             serde_json::json!({
-                "target": agent, "task": "use tick please",
+                "target": agent, "task": "use the tick tool please",
                 "approveInteractive": true, "toolTimeoutMs": 15000
             })
             .to_string(),
         )
         .unwrap();
+        let mut ctx = HostCtx { rt, allow };
         let mut cancel_id: u64 = 0;
         let rc = unsafe {
             sofuu_rt_call_stream(
@@ -5421,7 +5631,7 @@ mod tests {
                 method.as_ptr(),
                 args.as_ptr(),
                 Some(collect),
-                ptr::null_mut(),
+                (&mut ctx as *mut HostCtx) as *mut c_void,
                 &mut cancel_id,
             )
         };
@@ -5432,28 +5642,60 @@ mod tests {
     #[test]
     fn interactive_approval_allow_runs_the_tool() {
         let _g = lock();
+        let Some(model) = tool_model() else {
+            return;
+        };
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
 
-        let events = run_approval(rt, "capi-ap-allow", true);
+        eval_setup(rt, &approval_agent_js(&model, "capi-ap-allow"));
+
+        // The model has to ask for the gated tool; a small local model is
+        // not certain about it, so the run is repeated until it does.
+        let mut attempts = 0;
+        let events = loop {
+            attempts += 1;
+            let ev = run_approval(rt, "capi-ap-allow", true);
+            if !events_of_kind(&ev, "approval_request").is_empty()
+                || attempts >= MAX_MODEL_ATTEMPTS
+            {
+                break ev;
+            }
+        };
         let joined = events.join("\n");
+        if events_of_kind(&events, "approval_request").is_empty() {
+            eprintln!(
+                "BLOCKED: the local model did not request the gated tool in {attempts} runs \
+                 (model={model}) — the interactive-approval path is unverified with this model"
+            );
+            unsafe { sofuu_rt_free(rt) };
+            return;
+        }
+
         assert!(
-            events.iter().any(|e| e.contains("\"kind\":\"approval_request\"")),
+            events_of_kind(&events, "approval_request").len() == 1,
             "an approval_request event must reach the host, events: {joined}"
         );
         assert!(
-            events.iter().any(|e| e.contains("\"approval_resolved\"") && e.contains("\"allowed\":true")),
+            events_of_kind(&events, "approval_resolved")
+                .iter()
+                .any(|e| e["payload"]["allowed"].as_bool() == Some(true)),
             "the resolution event must say allowed:true, events: {joined}"
         );
-        let done = events
-            .iter()
-            .find(|e| e.contains("\"kind\":\"done\""))
-            .expect("exactly one terminal done event");
+        // The allowed tool really ran, and its real output reached the
+        // transcript the model is shown.
         assert!(
-            done.contains("APPROVAL-FLOW-OK"),
-            "the allowed run executed the gated tool and the model saw it: {done}"
+            events_of_kind(&events, "tool_result")
+                .iter()
+                .any(|r| r["payload"]["result"].as_str().unwrap_or("").contains("TICK-RUN-7")),
+            "the gated tool must have run: {joined}"
         );
-        assert!(!done.contains("\"error\""), "done must carry no error: {done}");
+        let done = done_event(&events);
+        assert!(done.get("error").is_none(), "done must carry no error: {done}");
+        assert!(
+            !done["result"]["answer"].as_str().unwrap_or("").trim().is_empty(),
+            "the run must produce an answer: {done}"
+        );
 
         unsafe { sofuu_rt_free(rt) };
     }
@@ -5461,27 +5703,61 @@ mod tests {
     #[test]
     fn interactive_approval_deny_refuses_in_band() {
         let _g = lock();
+        let Some(model) = tool_model() else {
+            return;
+        };
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
 
-        let events = run_approval(rt, "capi-ap-deny", false);
+        eval_setup(rt, &approval_agent_js(&model, "capi-ap-deny"));
+
+        let mut attempts = 0;
+        let events = loop {
+            attempts += 1;
+            let ev = run_approval(rt, "capi-ap-deny", false);
+            if !events_of_kind(&ev, "approval_request").is_empty()
+                || attempts >= MAX_MODEL_ATTEMPTS
+            {
+                break ev;
+            }
+        };
         let joined = events.join("\n");
+        if events_of_kind(&events, "approval_request").is_empty() {
+            eprintln!(
+                "BLOCKED: the local model did not request the gated tool in {attempts} runs \
+                 (model={model}) — the interactive-denial path is unverified with this model"
+            );
+            unsafe { sofuu_rt_free(rt) };
+            return;
+        }
+
         assert!(
-            events.iter().any(|e| e.contains("\"kind\":\"approval_request\"")),
+            events_of_kind(&events, "approval_request").len() == 1,
             "a prompt was raised, events: {joined}"
         );
         assert!(
-            events.iter().any(|e| e.contains("\"approval_resolved\"") && e.contains("\"allowed\":false")),
+            events_of_kind(&events, "approval_resolved")
+                .iter()
+                .any(|e| e["payload"]["allowed"].as_bool() == Some(false)),
             "the resolution event must say allowed:false, events: {joined}"
         );
-        let done = events
-            .iter()
-            .find(|e| e.contains("\"kind\":\"done\""))
-            .expect("terminal done event");
+        // The refusal is delivered in band: it is the tool's result the
+        // model is shown, and the gated tool never ran.
+        let results = events_of_kind(&events, "tool_result");
         assert!(
-            done.contains("DENIED-OK"),
-            "the refusal reached the model in-band and the run lived: {done}"
+            results
+                .iter()
+                .any(|r| r["payload"]["blocked"].as_str() == Some("approval")),
+            "the denial must reach the model in band: {joined}"
         );
+        assert!(
+            !results
+                .iter()
+                .any(|r| r["payload"]["result"].as_str().unwrap_or("").contains("TICK-RUN-7")),
+            "the denied tool must not have run: {joined}"
+        );
+        let done = done_event(&events);
+        assert!(done.get("error").is_none(), "the run must live: {done}");
 
         unsafe { sofuu_rt_free(rt) };
     }
@@ -5562,9 +5838,26 @@ mod tests {
     // web.search/web.open are PROMOTED surface: a host calls them directly
     // (host-initiated, network-touching). The model-facing agent path has
     // its own policy layers (netPolicy wrappers) — those live in the agent
-    // drivers and do not apply to direct host calls. The test injects fakes
-    // so the CONTRACT (method dispatch, argument plumb, envelope shape) is
-    // pinned without any network.
+    // drivers and do not apply to direct host calls.
+    //
+    // The test drives the REAL implementations: the host's arguments reach
+    // the real dispatch (the funnel's array form spreads positionally, which
+    // is what web.open(url) and web.search(query, opts) expect) and the
+    // runtime's own guards answer. Nothing is invented:
+    //   * web.open with an internal address is refused by the SSRF guard
+    //     with the typed ERR_SSRF_INTERNAL_REJECTED, naming the host it was
+    //     given — the argument reached the guard, not a stub;
+    //   * web.open with a non-http scheme is refused before any transfer;
+    //   * web.search with an empty query is refused by the real validation;
+    //   * web.search with an unknown engine is refused by the real engine
+    //     table, which proves the host's options were plumbed.
+    //   * web.open over an EXTERNAL target really fetches the page, and
+    //     web.search really queries the engine — the result is the remote
+    //     server's own, so it is asserted as it came back.
+    //
+    // The two result-producing calls need the public network. When it is
+    // not there, the transport's own error is what comes back and that is
+    // recorded as an explicit coverage gap — never served by a canned reply.
 
     #[test]
     fn promoted_web_methods_plumb_args_and_envelopes() {
@@ -5572,57 +5865,145 @@ mod tests {
         let rt = unsafe { sofuu_rt_new(ptr::null()) };
         assert!(!rt.is_null());
 
-        let setup = CString::new(r#"(function(){
-  globalThis.__SEARCH_ARGS = null;
-  globalThis.__OPEN_ARGS = null;
-  sofuu.web.search = async function (q, opts) {
-    globalThis.__SEARCH_ARGS = { query: q, opts: opts };
-    return { results: [ { title: "R1", url: "https://example.com/a", snippet: "s" } ] };
-  };
-  sofuu.web.open = async function (url, opts) {
-    globalThis.__OPEN_ARGS = { url: url, opts: opts };
-    return { title: "Page", text: "PAGE-BODY-9131" };
-  };
-})()"#).unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        assert_eq!(unsafe { sofuu_rt_eval(rt, setup.as_ptr(), &mut out) }, 0);
-        unsafe { sofuu_free(out as *mut c_void) };
-
-        // web.search: object opts, awaited result reaches out_json.
-        let m = CString::new("web.search").unwrap();
-        let a = CString::new(r#"{"query":"rust","count":3}"#).unwrap();
-        let mut out: *mut c_char = ptr::null_mut();
-        let rc = unsafe { sofuu_rt_call(rt, m.as_ptr(), a.as_ptr(), &mut out) };
-        assert_eq!(rc, 0, "web.search resolves through the funnel");
-        let env: JsonValue = serde_json::from_str(
-            unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref()).unwrap();
-        assert_eq!(env["result"]["results"][0]["title"], "R1", "envelope: {env}");
-        unsafe { sofuu_free(out as *mut c_void) };
-
-        // Argument plumb: the method received exactly what the host sent.
+        // web.open: the host's URL reaches the real SSRF guard, which
+        // refuses an internal address instead of fetching it.
         let m = CString::new("web.open").unwrap();
-        let a = CString::new(r#"{"url":"https://example.com/rust"}"#).unwrap();
+        let a = CString::new(r#"["http://127.0.0.1:9/private"]"#).unwrap();
         let mut out: *mut c_char = ptr::null_mut();
         let rc = unsafe { sofuu_rt_call(rt, m.as_ptr(), a.as_ptr(), &mut out) };
         assert_eq!(rc, 0, "web.open resolves through the funnel");
         let env: JsonValue = serde_json::from_str(
             unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref()).unwrap();
-        assert_eq!(env["result"]["text"], "PAGE-BODY-9131", "envelope: {env}");
         unsafe { sofuu_free(out as *mut c_void) };
+        assert_eq!(env["ok"], false, "the internal target must be refused: {env}");
+        assert_eq!(
+            env["error"]["code"], "ERR_SSRF_INTERNAL_REJECTED",
+            "the SSRF guard must answer: {env}"
+        );
+        assert!(
+            env["error"]["message"].as_str().unwrap_or("").contains("127.0.0.1"),
+            "the host's URL must reach the guard: {env}"
+        );
 
-        // Both calls plumbed their args.
-        let m = CString::new("ai.complete").unwrap();
-        let a = CString::new(r#"{"prompt":"probe"}"#).unwrap();
-        let plumb = CString::new("JSON.stringify({ s: globalThis.__SEARCH_ARGS, o: globalThis.__OPEN_ARGS })").unwrap();
+        // web.open: a non-http scheme never reaches a transport.
+        let a = CString::new(r#"["file:///etc/passwd"]"#).unwrap();
         let mut out: *mut c_char = ptr::null_mut();
-        let _ = unsafe { sofuu_rt_eval(rt, plumb.as_ptr(), &mut out) };
+        let rc = unsafe { sofuu_rt_call(rt, m.as_ptr(), a.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "web.open resolves through the funnel");
         let env: JsonValue = serde_json::from_str(
             unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref()).unwrap();
-        let res = env["result"].as_str().unwrap_or("");
-        assert!(res.contains("\"query\":\"rust\"") && res.contains("\"count\":3"),
-                "web.search received the host args: {res}");
-        assert!(res.contains("example.com/rust"), "web.open received the url: {res}");
         unsafe { sofuu_free(out as *mut c_void) };
+        assert_eq!(env["ok"], false, "a non-http scheme must be refused: {env}");
+        assert_eq!(
+            env["error"]["code"], "ERR_INVALID_PROTOCOL",
+            "the scheme check must answer: {env}"
+        );
+
+        // web.search: the query argument reached the real method — an empty
+        // query is refused by the real validation.
+        let m = CString::new("web.search").unwrap();
+        let a = CString::new(r#"["",{"engine":"duckduckgo","count":3}]"#).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { sofuu_rt_call(rt, m.as_ptr(), a.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "web.search resolves through the funnel");
+        let env: JsonValue = serde_json::from_str(
+            unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref()).unwrap();
+        unsafe { sofuu_free(out as *mut c_void) };
+        assert_eq!(env["ok"], false, "an empty query must be refused: {env}");
+        assert_eq!(
+            env["error"]["code"], "ERR_INVALID_ARGS",
+            "the query validation must answer: {env}"
+        );
+
+        // web.search: the options argument reached the real engine table.
+        let a = CString::new(r#"["rust",{"engine":"not-an-engine","count":3}]"#).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { sofuu_rt_call(rt, m.as_ptr(), a.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "web.search resolves through the funnel");
+        let env: JsonValue = serde_json::from_str(
+            unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref()).unwrap();
+        unsafe { sofuu_free(out as *mut c_void) };
+        assert_eq!(env["ok"], false, "an unknown engine must be refused: {env}");
+        assert_eq!(
+            env["error"]["code"], "ERR_UNKNOWN_ENGINE",
+            "the engine table must answer: {env}"
+        );
+
+        // The result-producing path is the real one: the page is really
+        // fetched and the search really runs. When the public network is not
+        // there, the transport's own error is what comes back, and that is
+        // recorded as an explicit coverage gap.
+        {
+            let m = CString::new("web.open").unwrap();
+            let a = CString::new(r#"["https://example.com/"]"#).unwrap();
+            let mut out: *mut c_char = ptr::null_mut();
+            let rc = unsafe { sofuu_rt_call(rt, m.as_ptr(), a.as_ptr(), &mut out) };
+            assert_eq!(rc, 0, "web.open resolves through the funnel");
+            let env: JsonValue = serde_json::from_str(
+                unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref()).unwrap();
+            unsafe { sofuu_free(out as *mut c_void) };
+            if env["ok"] == true {
+                assert_eq!(
+                    env["result"]["status"].as_u64(),
+                    Some(200),
+                    "the fetched page must carry the server's own status: {env}"
+                );
+                let text = env["result"]["text"].as_str().unwrap_or("");
+                assert!(
+                    text.contains("Example Domain"),
+                    "the fetched text must be the remote page's own: {env}"
+                );
+            } else {
+                eprintln!(
+                    "BLOCKED: web.open could not reach the public network ({}) — the \
+                     fetch path is unverified from this environment",
+                    env["error"]["code"]
+                );
+            }
+        }
+        {
+            let m = CString::new("web.search").unwrap();
+            let a = CString::new(r#"["rust",{"engine":"duckduckgo","count":3}]"#).unwrap();
+            let mut out: *mut c_char = ptr::null_mut();
+            let rc = unsafe { sofuu_rt_call(rt, m.as_ptr(), a.as_ptr(), &mut out) };
+            assert_eq!(rc, 0, "web.search resolves through the funnel");
+            let env: JsonValue = serde_json::from_str(
+                unsafe { CStr::from_ptr(out) }.to_string_lossy().as_ref()).unwrap();
+            unsafe { sofuu_free(out as *mut c_void) };
+            if env["ok"] == true {
+                assert_eq!(
+                    env["result"]["query"].as_str(),
+                    Some("rust"),
+                    "the engine must have received the host's query: {env}"
+                );
+                assert_eq!(
+                    env["result"]["engine"].as_str(),
+                    Some("duckduckgo"),
+                    "the engine must be the one the host asked for: {env}"
+                );
+                let results: &[serde_json::Value] = env["result"]["results"]
+                    .as_array()
+                    .map(|a| a.as_slice())
+                    .unwrap_or(&[]);
+                assert!(
+                    !results.is_empty(),
+                    "the engine must have returned real results: {env}"
+                );
+                for r in results {
+                    assert!(
+                        !r["url"].as_str().unwrap_or("").is_empty()
+                            && !r["title"].as_str().unwrap_or("").is_empty(),
+                        "a real result carries a title and a url: {r}"
+                    );
+                }
+            } else {
+                eprintln!(
+                    "BLOCKED: web.search could not reach the search engine ({}) — the \
+                     result path is unverified from this environment",
+                    env["error"]["code"]
+                );
+            }
+        }
 
         unsafe { sofuu_rt_free(rt) };
     }

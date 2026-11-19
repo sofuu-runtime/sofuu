@@ -16,15 +16,87 @@
 //   sofuu script compile <file> [--out f.kazebc] [--disasm]
 //   sofuu script repl
 //
-// Exit codes follow the run: 0 when the script ran, 1 when it did not, and the
-// parse/check/compile stages use 1 as well — a script that cannot be checked is
-// not a different kind of failure.
+// Exit codes follow the run: 0 when the script ran, 1 when it did not, 2 when
+// the command line was wrong, and the parse/check/compile stages use 1 as well
+// — a script that cannot be checked is not a different kind of failure. The
+// report's `status` field names the outcome exactly (success, denied,
+// unavailable, unknown, usage, error), so a caller can tell a refusal from a
+// missing backend from an effect whose result was lost without parsing text.
 
 use std::io::{BufRead, Write};
 
 use crate::sfs::caps::SimState;
 use crate::sfs::vm::Verdict;
 use crate::sfs::{self, isa, RunOptions, RunReport};
+
+/// What a run ended with, named for machine callers.
+///
+/// The categories mirror the taxonomy the asynchronous bridge already applies
+/// to backend failures (`domains::kaze::async_backend_error_code`), so the CLI
+/// and the bridge describe the same refusal the same way. RULES §1.9 asks for
+/// an unknown completion to stay distinguishable from a refusal and from an
+/// absent backend; that distinction lives here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Success,
+    /// A policy or capability gate refused the operation.
+    Denied,
+    /// A required backend, model, tool or store is not configured.
+    Unavailable,
+    /// The request may have been dispatched; its result was never received.
+    Unknown,
+    /// The command line was wrong.
+    Usage,
+    /// Any other failure. An unlisted code is never guessed at.
+    Error,
+}
+
+impl Outcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Success => "success",
+            Outcome::Denied => "denied",
+            Outcome::Unavailable => "unavailable",
+            Outcome::Unknown => "unknown",
+            Outcome::Usage => "usage",
+            Outcome::Error => "error",
+        }
+    }
+
+    /// The exit code this outcome maps to. Distinct codes let a front end
+    /// tell a refusal from an absent backend from an unknown completion
+    /// without reading the report; the report's `status` field carries the
+    /// same category for a caller that only reads the report.
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Outcome::Success => 0,
+            Outcome::Usage => 2,
+            Outcome::Denied => 3,
+            Outcome::Unavailable => 4,
+            Outcome::Unknown => 5,
+            Outcome::Error => 1,
+        }
+    }
+
+    /// Classify a typed error code.
+    pub fn of_code(code: &str) -> Outcome {
+        match code {
+            "E_CAP_DENIED" | "E_POLICY_DENIED" | "E_POLICY_APPROVAL_REQUIRED"
+            | "E_CAP_APPROVAL_REQUIRED" | "E_CAP_UNDECLARED" | "E_PERMISSION_DENIED"
+            | "E_PATH_OUTSIDE" | "E_SAFETY_VIOLATION" => Outcome::Denied,
+            "E_CAP_MISSING" | "E_CAPABILITY" | "E_CONFIG" | "E_KAZE_RUNTIME"
+            | "E_KAZE_HOST" | "E_TOOL" | "E_MCP_CONFIG" | "E_MCP_SECRET_UNAVAILABLE"
+            | "E_MCP_SERVER_NOT_FOUND" | "E_MCP_TOOL_NOT_FOUND" | "E_MCP_AMBIGUOUS"
+            | "E_MCP_METHOD_NOT_SUPPORTED" | "E_MCP_FETCH_UNAVAILABLE"
+            | "E_MCP_HTTP_SERVER_UNAVAILABLE" => Outcome::Unavailable,
+            /* A deadline that elapses after a dispatch leaves the effect in
+             * an unknown state: the request may have completed. */
+            "E_KAZE_OUTCOME_UNKNOWN" | "E_MCP_OUTCOME_UNKNOWN" | "E_TIMEOUT" => Outcome::Unknown,
+            "E_USAGE" => Outcome::Usage,
+            _ => Outcome::Error,
+        }
+    }
+}
 
 /// A CLI failure from either execution path.
 ///
@@ -59,6 +131,7 @@ impl CliFailure {
             CliFailure::Kaze(err) => kaze_error_json(err, ""),
             CliFailure::Bridge { code, message, diagnostic } => serde_json::json!({
                 "ok": false,
+                "status": Outcome::of_code(code).as_str(),
                 "code": code,
                 "error": crate::rt::diag_contract::redact_event_text(
                     &crate::rt::diag_contract::truncate_chars(message, 64 * 1024),
@@ -68,19 +141,30 @@ impl CliFailure {
         }
     }
 
+    /// The outcome category this failure belongs to.
+    fn outcome(&self) -> Outcome {
+        match self {
+            CliFailure::Kaze(err) => Outcome::of_code(&err.code),
+            CliFailure::Bridge { code, .. } => Outcome::of_code(code),
+        }
+    }
+
     fn print(&self) {
         match self {
             CliFailure::Kaze(err) => print_kaze_error(err, ""),
-            CliFailure::Bridge { code, message, diagnostic } => match diagnostic {
-                Some(view) => eprint!(
-                    "{}",
-                    crate::rt::diag_contract::Diagnostic::from_json(view).render_human(
-                        crate::rt::diag_contract::full_detail_requested(),
-                        crate::rt::engine::stderr_wants_color(),
-                    )
-                ),
-                None => eprintln!("\x1b[31m{}\x1b[0m: {}", code, message),
-            },
+            CliFailure::Bridge { code, message, diagnostic } => {
+                match diagnostic {
+                    Some(view) => eprint!(
+                        "{}",
+                        crate::rt::diag_contract::Diagnostic::from_json(view).render_human(
+                            crate::rt::diag_contract::full_detail_requested(),
+                            crate::rt::engine::stderr_wants_color(),
+                        )
+                    ),
+                    None => eprintln!("\x1b[31m{}\x1b[0m: {}", code, message),
+                }
+                eprintln!("outcome: {}", self.outcome().as_str());
+            }
         }
     }
 }
@@ -106,9 +190,14 @@ pub fn print_help() {
          \x20 repl                 Interactive session: define routines, then .run\n\
          \x20 version              Print the Kaze language version\n\n\
          run options:\n\
-         \x20 --cap <family>[=<device>]  Grant a family; drone=sim/rover=sim are tests\n\
-         \x20                       memory=ephemeral selects per-run CMA storage\n\
-         \x20 --policy <file>        Operator R7 policy with tools.allow or tools.deny\n\
+         \x20 --cap <family>[=<backend>]  Grant a family and the backend it uses.\n\
+         \x20                       A bare grant selects NO backend and never a\n\
+         \x20                       simulator. drone=sim / rover=sim are labelled\n\
+         \x20                       physical test simulators; memory=… and\n\
+         \x20                       alert=… name their own real backend.\n\
+         \x20 --policy <file>        Operator R7 policy. tools.allow or\n\
+         \x20                       tools.deny must be present or every\n\
+         \x20                       capability call is denied.\n\
          \x20 --pin <name>=<line>  Configure a device pin (live devices disabled)\n\
          \x20 --entry <name>         Routine to run (default: main, or the only one)\n\
          \x20 --arg <name>=<json>    Bind a parameter (repeatable)\n\
@@ -117,9 +206,20 @@ pub fn print_help() {
          \x20 --heap-kb <n>          Budget for lists and records in KiB (default 4096)\n\
          \x20 --ticks <n>            Supervisor ticks after the entry (default 0)\n\
          \x20 --tick-ms <n>          Virtual tick period (default 100)\n\
-         \x20 --sim <k=v,k=v>        Initial machine state (battery=15,armed=true)\n\
-         \x20 --no-policy            Skip loading; capability calls are denied\n\
-         \x20 --json                 Machine-readable report\n",
+         \x20 --sim <k=v,k=v>        Initial physical machine state for a\n\
+         \x20                       drone=sim / rover=sim test (battery=15,armed=true).\n\
+         \x20                       It cannot supply AI, tool, memory or alert\n\
+         \x20                       results: those come from their real backend.\n\
+         \x20 --no-policy            Deny every capability call: no effect\n\
+         \x20                       reaches a backend.\n\
+         \x20 --json                 Machine-readable report\n\n\
+         Unavailable in this build: live vehicle and GPIO dispatch (a granted\n\
+         live backend is refused), and every non-robotics capability without a\n\
+         configured real backend.\n\n\
+         exit status:\n\
+         \x20 0 the script ran   1 it did not   2 the command line was wrong\n\
+         \x20 The report's \"status\" field names the outcome: success, denied,\n\
+         \x20 unavailable, unknown, usage or error.\n",
         sfs::VERSION
     );
 }
@@ -133,18 +233,28 @@ fn print_subcommand_help(sub: &str) {
             "Usage: sofuu script run <file.kaze> [options]\n\n\
              Check, compile and run one script in the shared VM.\n\n\
              Options:\n\
-             \x20 --cap <family>[=<device>]  Grant a family; drone=sim/rover=sim are tests\n\
-             \x20                            memory=ephemeral selects per-run CMA\n\
+             \x20 --cap <family>[=<backend>]  Grant a family and the backend it uses.\n\
+             \x20                            A bare grant selects NO backend and\n\
+             \x20                            never a simulator; drone=sim / rover=sim\n\
+             \x20                            are labelled physical test simulators.\n\
              \x20 --entry <name>             Routine to run (default: main)\n\
              \x20 --arg <name>=<json>        Bind a parameter (repeatable)\n\
              \x20 --config <file>            Load routine arguments from JSON\n\
              \x20 --fuel <n>                 Instruction budget (default 200000)\n\
              \x20 --heap-kb <n>              List/record budget in KiB (default 4096)\n\
              \x20 --ticks <n> --tick-ms <n>  Supervisor ticks after the entry\n\
-             \x20 --sim <k=v,k=v>            Initial machine state\n\
-             \x20 --policy <file>            Operator policy layer\n\
-             \x20 --no-policy                Skip loading; capability calls are denied\n\
-             \x20 --json                     Machine-readable report\n"
+             \x20 --sim <k=v,k=v>            Initial physical machine state for a\n\
+             \x20                            drone=sim / rover=sim test; it cannot\n\
+             \x20                            supply AI, tool, memory or alert results\n\
+             \x20 --policy <file>            Operator policy layer; tools.allow or\n\
+             \x20                            tools.deny must be present\n\
+             \x20 --no-policy                Deny every capability call: no effect\n\
+             \x20                            reaches a backend\n\
+             \x20 --json                     Machine-readable report\n\n\
+             Unavailable in this build: live vehicle and GPIO dispatch.\n\
+             Exit status: 0 ran, 1 did not, 2 the command line was wrong. The\n\
+             report's \"status\" field names the outcome: success, denied,\n\
+             unavailable, unknown, usage or error.\n"
         ),
         "check" => println!(
             "Usage: sofuu script check <file.kaze> [options]\n\n\
@@ -327,26 +437,46 @@ enum OptErr {
     Usage(String),
     /// A policy layer exists but does not apply: exit 1, E_CAP_DENIED.
     Policy(String),
+    /// A grant names a backend this runtime does not have: exit 1,
+    /// E_CAP_INVALID.
+    Grant(String),
 }
 
 impl OptErr {
-    fn exit_code(&self) -> i32 {
+    /// The outcome this failure belongs to. A policy that does not apply is a
+    /// refusal; a grant that names an unknown backend is a mistake in the
+    /// command line, not a refusal by a gate.
+    fn outcome(&self) -> Outcome {
         match self {
-            OptErr::Usage(_) => 2,
-            OptErr::Policy(_) => 1,
+            OptErr::Usage(_) => Outcome::Usage,
+            OptErr::Policy(_) => Outcome::Denied,
+            OptErr::Grant(_) => Outcome::Error,
         }
+    }
+    fn exit_code(&self) -> i32 {
+        self.outcome().exit_code()
     }
     fn code(&self) -> &'static str {
         match self {
             OptErr::Usage(_) => "E_USAGE",
             OptErr::Policy(_) => "E_CAP_DENIED",
+            OptErr::Grant(_) => "E_CAP_INVALID",
         }
     }
     fn message(&self) -> &str {
         match self {
-            OptErr::Usage(msg) | OptErr::Policy(msg) => msg,
+            OptErr::Usage(msg) | OptErr::Policy(msg) | OptErr::Grant(msg) => msg,
         }
     }
+}
+
+/// The deny-all policy `--no-policy` selects.
+///
+/// It is a policy, not the absence of one: every capability call is refused
+/// by a rule the runtime evaluates, so the refusal never depends on a missing
+/// document being read as a refusal somewhere else.
+fn deny_all_policy() -> serde_json::Value {
+    serde_json::json!({ "tools": { "deny": ["kaze.*"] } })
 }
 
 fn policy_layer(f: &Flags) -> Result<Option<serde_json::Value>, OptErr> {
@@ -356,7 +486,7 @@ fn policy_layer(f: &Flags) -> Result<Option<serde_json::Value>, OptErr> {
                 "--policy and --no-policy are mutually exclusive".to_string(),
             ));
         }
-        return Ok(None);
+        return Ok(Some(deny_all_policy()));
     }
     /* KZ-051/KZ-052: an operator policy file is parsed here and a document
      * that cannot be understood is FATAL (exit 1, E_CAP_DENIED). Skipping it
@@ -380,15 +510,67 @@ fn policy_layer(f: &Flags) -> Result<Option<serde_json::Value>, OptErr> {
         .map_err(OptErr::Policy)
 }
 
-fn options_from(f: &Flags) -> Result<RunOptions, OptErr> {
+/// The capability families `--sim` must never answer for.
+///
+/// The robotics/drone simulator exception covers physical behaviour only. A
+/// simulated AI, tool, memory or alert result is not a machine state, and
+/// RULES §1.9 does not permit one inside a simulator test either. The keys
+/// the simulator DOES model are the simulator's own contract
+/// (`SimState::apply_overrides`), so there is one list of them and not two
+/// that can drift apart.
+const NON_PHYSICAL_SIM_KEYS: &[&str] = &["ai", "tool", "memory", "alert", "policy", "log"];
+
+/// The initial physical machine state a simulator test starts from.
+///
+/// `--sim` is a physical-test control, not a response injection point: it
+/// needs an explicitly selected `drone=sim` / `rover=sim` backend, and it can
+/// only set the state of the machine that backend simulates.
+fn sim_state(f: &Flags) -> Result<SimState, OptErr> {
     let mut sim = SimState::default();
-    if !f.sim.is_empty() {
-        if !f.backend.iter().any(|(family, backend)| backend == "sim"
-            && matches!(sfs::caps::family_of(family), "drone" | "rover")) {
-            return Err(OptErr::Usage("--sim requires an explicit drone=sim or rover=sim testing backend".into()));
-        }
-        sim.apply_overrides(&f.sim).map_err(OptErr::Usage)?;
+    if f.sim.trim().is_empty() {
+        return Ok(sim);
     }
+    for pair in f.sim.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let key = pair.split_once('=').map(|(k, _)| k.trim()).unwrap_or(pair);
+        if NON_PHYSICAL_SIM_KEYS.contains(&key) {
+            return Err(OptErr::Usage(format!(
+                "--sim cannot set '{}': a simulated {} result is not permitted; --sim only sets the initial physical machine state of a drone=sim / rover=sim test",
+                key, key
+            )));
+        }
+    }
+    /* A simulator is a physical test backend and must have been selected
+     * explicitly. A bare or empty grant never selects one. */
+    if !f.backend.iter().any(|(family, backend)| backend == "sim"
+        && matches!(sfs::caps::family_of(family), "drone" | "rover")) {
+        return Err(OptErr::Usage(
+            "--sim requires an explicit drone=sim or rover=sim testing backend".into(),
+        ));
+    }
+    /* The simulator owns the list of keys it models: an unknown key is
+     * refused by the simulator itself, with the key list it actually
+     * implements. */
+    sim.apply_overrides(&f.sim).map_err(|e| {
+        let detail = e.strip_prefix("E_CAP_INVALID: ").unwrap_or(&e);
+        OptErr::Usage(detail.to_string())
+    })?;
+    Ok(sim)
+}
+
+fn options_from(f: &Flags) -> Result<RunOptions, OptErr> {
+    /* RB-08: a grant that names a backend this runtime does not have is a
+     * mistake in the command line. It is caught here, before the script runs,
+     * instead of at the first capability call. */
+    for (family, backend) in &f.backend {
+        if let Err(d) = crate::rt::hardware::validate_grant(family, backend) {
+            return Err(OptErr::Grant(format!("--cap {}: {}", family, d.reason)));
+        }
+    }
+    let sim = sim_state(f)?;
     /* KZ-035 (AUDIT-2026-11-08): the guided E_KAZE_PARAM message offers
      * "or positional argument", so the runner honours it: after the script
      * path, each positional binds to the next routine parameter (by index, the
@@ -428,10 +610,14 @@ fn options_from(f: &Flags) -> Result<RunOptions, OptErr> {
 }
 
 /// `sofuu script …`; returns the process exit code.
+///
+/// The code names the outcome category (`Outcome::exit_code`), so a caller
+/// that propagates it can tell a refusal from an absent backend from an
+/// unknown completion without reading the report.
 pub fn run(argv: &[String]) -> i32 {
     let Some(command) = argv.first().map(String::as_str) else {
         print_help();
-        return 2;
+        return Outcome::Usage.exit_code();
     };
     let rest = &argv[1..];
     match command {
@@ -450,7 +636,7 @@ pub fn run(argv: &[String]) -> i32 {
         other => {
             eprintln!("\x1b[31mError:\x1b[0m unknown script command '{}'", other);
             print_help();
-            2
+            Outcome::Usage.exit_code()
         }
     }
 }
@@ -465,6 +651,7 @@ fn print_kaze_error(err: &sfs::KazeError, _path: &str) {
         "{}",
         diag.render_human(full, crate::rt::engine::stderr_wants_color())
     );
+    eprintln!("outcome: {}", Outcome::of_code(&err.code).as_str());
 }
 
 /// Inspect flag positions without treating an option's value as `--json`.
@@ -490,13 +677,15 @@ fn report_cli_failure(code: &str, message: &str, json: bool) {
 }
 
 /// The machine-readable half of the same failure. `code` and `error` keep
-/// their published meaning; `diagnostic` is the additive versioned view.
+/// their published meaning; `status` names the outcome category and
+/// `diagnostic` is the additive versioned view.
 fn kaze_error_json(err: &sfs::KazeError, _path: &str) -> serde_json::Value {
     let error = crate::rt::diag_contract::redact_event_text(
         &crate::rt::diag_contract::truncate_chars(&err.message, 64 * 1024),
     );
     serde_json::json!({
         "ok": false,
+        "status": Outcome::of_code(&err.code).as_str(),
         "code": &err.code,
         "error": error,
         "diagnostic": err.diagnostic(None).to_json(),
@@ -508,7 +697,7 @@ fn cmd_run(argv: &[String]) -> i32 {
         Ok(f) => f,
         Err(e) => {
             report_cli_failure("E_USAGE", &e, requested_json(argv));
-            return 2;
+            return Outcome::Usage.exit_code();
         }
     };
     if flags.want_help {
@@ -517,7 +706,7 @@ fn cmd_run(argv: &[String]) -> i32 {
     }
     let Some(path) = flags.positional.first() else {
         report_cli_failure("E_USAGE", "'sofuu script run' needs a .kaze file", flags.json);
-        return 2;
+        return Outcome::Usage.exit_code();
     };
     let opts = match options_from(&flags) {
         Ok(o) => o,
@@ -571,7 +760,7 @@ fn cmd_run(argv: &[String]) -> i32 {
             } else {
                 print_report(&report);
             }
-            0
+            Outcome::Success.exit_code()
         }
         Err(err) => {
             if flags.json {
@@ -582,7 +771,7 @@ fn cmd_run(argv: &[String]) -> i32 {
             } else {
                 err.print();
             }
-            1
+            err.outcome().exit_code()
         }
     }
 }
@@ -687,8 +876,9 @@ fn bridge_options(
     if !flags.sim.is_empty() {
         out.insert("sim".into(), bridge_sim(&flags.sim));
     }
-    // `None` is a deliberate `--no-policy`: the bridge then denies every
-    // capability call, which is the same refusal the synchronous path gives.
+    // The policy always travels: `--no-policy` carries the deny-all
+    // document, so the bridge refuses every capability call exactly as the
+    // synchronous path does.
     if let Some(policy) = &opts.policy {
         out.insert("policy".into(), policy.clone());
     }
@@ -824,7 +1014,7 @@ fn cmd_check(argv: &[String]) -> i32 {
         Ok(f) => f,
         Err(e) => {
             report_cli_failure("E_USAGE", &e, requested_json(argv));
-            return 2;
+            return Outcome::Usage.exit_code();
         }
     };
     if flags.want_help {
@@ -833,7 +1023,7 @@ fn cmd_check(argv: &[String]) -> i32 {
     }
     let Some(path) = flags.positional.first() else {
         report_cli_failure("E_USAGE", "'sofuu script check' needs a .kaze file", flags.json);
-        return 2;
+        return Outcome::Usage.exit_code();
     };
     match sfs::prepare_file(path) {
         Ok(prepared) => {
@@ -864,7 +1054,7 @@ fn cmd_check(argv: &[String]) -> i32 {
             } else {
                 print_kaze_error(&err, path);
             }
-            1
+            Outcome::of_code(&err.code).exit_code()
         }
     }
 }
@@ -874,7 +1064,7 @@ fn cmd_compile(argv: &[String]) -> i32 {
         Ok(f) => f,
         Err(e) => {
             report_cli_failure("E_USAGE", &e, requested_json(argv));
-            return 2;
+            return Outcome::Usage.exit_code();
         }
     };
     if flags.want_help {
@@ -883,7 +1073,7 @@ fn cmd_compile(argv: &[String]) -> i32 {
     }
     let Some(path) = flags.positional.first() else {
         report_cli_failure("E_USAGE", "'sofuu script compile' needs a .kaze file", flags.json);
-        return 2;
+        return Outcome::Usage.exit_code();
     };
     let prepared = match sfs::prepare_file(path) {
         Ok(p) => p,
@@ -893,7 +1083,7 @@ fn cmd_compile(argv: &[String]) -> i32 {
             } else {
                 print_kaze_error(&err, path);
             }
-            return 1;
+            return Outcome::of_code(&err.code).exit_code();
         }
     };
     let bytes = isa::serialize(&prepared.module);
@@ -963,6 +1153,7 @@ fn report_json(report: &RunReport) -> String {
     };
     let json = serde_json::json!({
         "ok": true,
+        "status": Outcome::Success.as_str(),
         "entry": report.entry,
         "result": report.value,
         "actions": report.actions,
@@ -988,7 +1179,7 @@ fn cmd_repl(argv: &[String]) -> i32 {
         Ok(f) => f,
         Err(e) => {
             report_cli_failure("E_USAGE", &e, false);
-            return 2;
+            return Outcome::Usage.exit_code();
         }
     };
     let mut needs: Vec<String> = flags.caps.clone();
@@ -1072,7 +1263,11 @@ fn handle_repl_command(
             println!(
                 ".list                 show the source added so far\n\
                  .needs <a, b>         declare capabilities for this session\n\
-                 .cap <family>[=sim]   grant a family; drone/rover sim is testing only\n\
+                 .cap <family>[=<backend>]\n\
+                 \x20                    grant a family; a bare grant selects no\n\
+                 \x20                    backend and never a simulator. drone=sim and\n\
+                 \x20                    rover=sim are labelled physical test\n\
+                 \x20                    simulators only\n\
                  .run <name> [json]    run a routine with optional arguments\n\
                  .clear                forget everything defined so far\n\
                  .exit                 leave"
@@ -1156,7 +1351,10 @@ fn handle_repl_command(
             opts.grants = grants.clone();
             match sfs::run_source(&src, "<repl>", &opts) {
                 Ok(report) => print_report(&report),
-                Err(err) => eprintln!("\x1b[31m{}\x1b[0m: {}", err.code, err.message),
+                Err(err) => {
+                    eprintln!("\x1b[31m{}\x1b[0m: {}", err.code, err.message);
+                    eprintln!("outcome: {}", Outcome::of_code(&err.code).as_str());
+                }
             }
         }
         other => println!("unknown command '{}'; .help lists them", other),
@@ -1211,10 +1409,43 @@ mod tests {
         assert_eq!(built["fuel"], serde_json::json!(opts.fuel));
         assert_eq!(built["heapBytes"], serde_json::json!(opts.heap_bytes));
 
-        // `--no-policy` is a deliberate refusal: the bridge must not be handed
-        // a policy document it never received.
+        // `--no-policy` is a deliberate refusal: the bridge must not be
+        // handed a policy document it never received. The command line
+        // never carries one — the deny-all document is the runner's own.
         opts.policy = None;
         assert!(bridge_options("agent.kaze", &opts, &flags()).get("policy").is_none());
+    }
+
+    /// `--no-policy` is a deny-all policy, not the absence of one: the run
+    /// must be refused by a rule the runtime evaluates, and the refusal must
+    /// not depend on a missing document being read as a refusal elsewhere.
+    #[test]
+    fn no_policy_is_a_deny_all_policy_and_nothing_reaches_a_backend() {
+        let f = flags_of(&["--no-policy", "--cap", "drone=sim"]);
+        let opts = match options_from(&f) {
+            Ok(opts) => opts,
+            Err(e) => panic!("options: {}", e.message()),
+        };
+        assert_eq!(
+            opts.policy,
+            Some(serde_json::json!({"tools": {"deny": ["kaze.*"]}})),
+            "--no-policy must produce a deny-all policy"
+        );
+        /* The same document reaches the asynchronous bridge, so both paths
+         * refuse identically. */
+        let built = bridge_options("agent.kaze", &opts, &f);
+        assert_eq!(
+            built["policy"],
+            serde_json::json!({"tools": {"deny": ["kaze.*"]}})
+        );
+
+        let err = sfs::run_source(
+            "needs: drone\naction main():\n    arm drone\n",
+            "<no-policy>",
+            &opts,
+        )
+        .expect_err("a deny-all policy refuses every capability call");
+        assert_eq!(err.code, "E_CAP_DENIED");
     }
 
     #[test]
@@ -1276,5 +1507,124 @@ mod tests {
         assert_eq!(empty.entry, "");
         assert_eq!(empty.value, "");
         assert!(empty.verdict.is_none());
+    }
+
+    fn flags_of(args: &[&str]) -> Flags {
+        let owned: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        parse_flags(&owned).expect("flag list")
+    }
+
+    /// A bare `--cap drone` grants the family and selects no backend. It must
+    /// never mean simulation: the call is refused at the capability gate
+    /// instead of being answered by the physical simulator.
+    #[test]
+    fn a_bare_grant_never_selects_a_simulator() {
+        let f = flags_of(&["--no-policy", "--cap", "drone"]);
+        let mut opts = match options_from(&f) {
+            Ok(opts) => opts,
+            Err(e) => panic!("options: {}", e.message()),
+        };
+        assert!(opts.backend.iter().all(|(_, backend)| backend != "sim"));
+        opts.policy = Some(serde_json::json!({"tools": {"allow": ["kaze.*"]}}));
+        let err = sfs::run_source(
+            "needs: drone\naction main():\n    arm drone\n",
+            "<bare-grant>",
+            &opts,
+        )
+        .expect_err("a bare grant has no backend to answer the call");
+        assert_eq!(err.code, "E_CAP_MISSING");
+        assert!(err.message.contains("no backend selected"), "{}", err.message);
+    }
+
+    /// The simulator is selected explicitly, and `--sim` only sets the state
+    /// of the machine it simulates.
+    #[test]
+    fn a_simulator_needs_an_explicit_test_grant() {
+        let f = flags_of(&["--no-policy", "--sim", "battery=15"]);
+        let err = options_from(&f).expect_err("--sim without a test backend");
+        assert_eq!(err.code(), "E_USAGE");
+        assert!(err.message().contains("drone=sim"), "{}", err.message());
+
+        let f = flags_of(&["--no-policy", "--cap", "drone=sim", "--sim", "battery=15"]);
+        let opts = match options_from(&f) {
+            Ok(opts) => opts,
+            Err(e) => panic!("options: {}", e.message()),
+        };
+        assert_eq!(opts.sim.battery, 15.0);
+    }
+
+    /// A simulator test may not carry a response for a non-physical
+    /// capability: the exception covers physical behaviour only.
+    #[test]
+    fn a_simulator_cannot_answer_for_ai_or_tools() {
+        for key in ["ai=hello", "tool=ok", "memory=42", "alert=sent"] {
+            let f = flags_of(&["--no-policy", "--cap", "drone=sim", "--sim", key]);
+            let err = options_from(&f).expect_err("--sim must not inject a response");
+            assert_eq!(err.code(), "E_USAGE", "{}", key);
+            assert!(
+                err.message().contains("result is not permitted"),
+                "{}: {}",
+                key,
+                err.message()
+            );
+        }
+    }
+
+    /// A key the simulator does not model is refused by the simulator
+    /// itself: the modelled state is one list, in one place.
+    #[test]
+    fn a_simulator_refuses_a_key_it_does_not_model() {
+        let f = flags_of(&["--no-policy", "--cap", "drone=sim", "--sim", "temperature=20"]);
+        let err = options_from(&f).expect_err("an unmodelled key is refused");
+        assert_eq!(err.code(), "E_USAGE");
+        assert!(
+            err.message().contains("unknown key 'temperature'"),
+            "{}",
+            err.message()
+        );
+    }
+
+    /// A grant that names a backend this runtime does not have is refused
+    /// before the script runs.
+    #[test]
+    fn a_grant_that_names_an_unknown_backend_is_refused() {
+        let f = flags_of(&["--no-policy", "--cap", "drone=bogus"]);
+        let err = options_from(&f).expect_err("unknown backend");
+        assert_eq!(err.code(), "E_CAP_INVALID");
+        assert!(err.message().contains("bogus"), "{}", err.message());
+    }
+
+    /// The outcome categories stay distinguishable: a refusal, an absent
+    /// backend and an effect whose result was lost are three different
+    /// things.
+    #[test]
+    fn an_outcome_names_the_failure_category() {
+        assert_eq!(Outcome::of_code("E_CAP_DENIED"), Outcome::Denied);
+        assert_eq!(Outcome::of_code("E_CAP_APPROVAL_REQUIRED"), Outcome::Denied);
+        assert_eq!(Outcome::of_code("E_CAP_MISSING"), Outcome::Unavailable);
+        assert_eq!(Outcome::of_code("E_CONFIG"), Outcome::Unavailable);
+        assert_eq!(Outcome::of_code("E_KAZE_OUTCOME_UNKNOWN"), Outcome::Unknown);
+        assert_eq!(Outcome::of_code("E_MCP_OUTCOME_UNKNOWN"), Outcome::Unknown);
+        assert_eq!(Outcome::of_code("E_USAGE"), Outcome::Usage);
+        assert_eq!(Outcome::of_code("E_KAZE_PARSE"), Outcome::Error);
+        // Distinct exit codes: a front end can tell them apart without
+        // reading the report.
+        assert_eq!(Outcome::Success.exit_code(), 0);
+        assert_ne!(Outcome::Denied.exit_code(), Outcome::Unavailable.exit_code());
+        assert_ne!(Outcome::Unknown.exit_code(), Outcome::Error.exit_code());
+        assert_ne!(Outcome::Usage.exit_code(), Outcome::Denied.exit_code());
+    }
+
+    /// The machine-readable report names the outcome as well as the code.
+    #[test]
+    fn the_report_names_the_outcome() {
+        let denied = sfs::KazeError::new("E_CAP_DENIED", "no policy is configured for drone.arm");
+        let json = kaze_error_json(&denied, "");
+        assert_eq!(json["ok"], serde_json::json!(false));
+        assert_eq!(json["status"], serde_json::json!("denied"));
+        assert_eq!(json["code"], serde_json::json!("E_CAP_DENIED"));
+
+        let missing = sfs::KazeError::new("E_CAP_MISSING", "no backend selected for drone.arm");
+        assert_eq!(kaze_error_json(&missing, "")["status"], serde_json::json!("unavailable"));
     }
 }

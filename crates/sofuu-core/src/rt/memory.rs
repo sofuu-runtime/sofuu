@@ -663,13 +663,20 @@ mod impl_qtsq {
                 .as_mut()
                 .map(|j| j.record(&tmp, path))
                 .unwrap_or(false);
-            if crate::rt::wal::publish(&tmp, path) {
-                if recorded {
-                    if let Some(j) = journal {
-                        j.commit();
-                    }
+            let published = crate::rt::wal::publish(&tmp, path);
+            /* The journal we own must not outlive this attempt: the rename
+             * either landed (the intent is spent) or the staged bytes are
+             * discarded (the intent is void). A journal left behind would
+             * make the next writer in this directory wait for it to age
+             * out, and `recover` would replay an intent nobody holds. */
+            if let Some(j) = journal {
+                if published && recorded {
+                    j.commit();
+                } else {
+                    j.abandon();
                 }
-            } else {
+            }
+            if !published {
                 // P3 (AUDIT-2026-09-07): the old code left the tmp behind on
                 // a failed rename — the exact leak the atomic-write scheme
                 // exists to avoid.
@@ -3138,6 +3145,10 @@ mod impl_qtsq {
     pub(crate) const E_LOCKED: &str = "E_LOCKED";
     pub(crate) const E_CORRUPT: &str = "E_CORRUPT";
     pub(crate) const E_ENOSPC: &str = "E_ENOSPC";
+    /// The store itself could not be opened: the directory is not there and
+    /// cannot be made, or it cannot be listed, or its index cannot be read.
+    /// A store that cannot be reached is not an empty store.
+    pub(crate) const E_STORE: &str = "E_STORE";
 
     /// A CString that never silently empties: an interior NUL is escaped
     /// (the C API cannot carry one, and an empty message would be a lie).
@@ -5612,15 +5623,20 @@ mod impl_qtsq {
         exotic: ptr::null_mut(),
     };
 
-    fn ensure_dir(path: &str) {
+    fn ensure_dir(path: &str) -> Result<(), String> {
         if std::fs::metadata(path).is_err() {
             /* C2: create_dir (single level) silently failed for a nested
              * store path whose parent did not exist yet — every page save
              * then failed with no directory to write into, and the old
              * kv_flush reported success anyway. create_dir_all matches what
-             * the brain path already does. */
-            let _ = std::fs::create_dir_all(path);
+             * the brain path already does. A directory that cannot be
+             * created is reported: an open that could never write must not
+             * look like an empty store. */
+            std::fs::create_dir_all(path).map_err(|e| {
+                format!("[sofuu/kv] cannot create the store directory {path}: {e}")
+            })?;
         }
+        Ok(())
     }
 
     fn now_u32() -> u32 {
@@ -5782,14 +5798,24 @@ mod impl_qtsq {
 
     /// kv_store_open — load the index if it exists (JS-parsed, exactly like
     /// the C), else start with an empty summary index.
+    ///
+    /// A store that cannot be opened is an ERROR carrying the reason, never
+    /// an empty store: a caller that cannot reach its store must not be told
+    /// that the store holds nothing.
     unsafe fn kv_store_open(
         ctx: *mut JSContext,
         path: &str,
         n_layers: usize,
         n_heads: usize,
         head_dim: usize,
-    ) -> Option<Box<Kvs>> {
-        ensure_dir(path);
+    ) -> Result<Box<Kvs>, String> {
+        /* A store directory that cannot be created is a refusal, not an
+         * empty store: every later write would fail, and answering "no
+         * pages" would hide that. */
+        if let Err(e) = ensure_dir(path) {
+            eprintln!("{e}");
+            return Err(e);
+        }
         // P3 (AUDIT-2026-09-07): crashed kv writers left `page_NNNN.qtsq.tmp`
         // siblings behind forever — sweep them once per open (age-guarded).
         sweep_stale_tmp_dir(path);
@@ -5820,7 +5846,19 @@ mod impl_qtsq {
 
         let idx_path = format!("{}/index.json", path);
         let mut index_parsed = false;
-        if let Ok(data) = std::fs::read(&idx_path) {
+        /* An index that EXISTS but cannot be read is a store failure, not a
+         * store without pages: answering "no pages" for an unreadable
+         * index would orphan every page that is on disk. */
+        let index_bytes = match std::fs::read(&idx_path) {
+            Ok(data) => Some(data),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                let reason = format!("cannot read the store index {idx_path}: {e}");
+                eprintln!("[sofuu/kv] {reason}");
+                return Err(reason);
+            }
+        };
+        if let Some(data) = index_bytes {
             if !data.is_empty() {
                 let mut json_buf = data.to_vec();
                 json_buf.push(0);
@@ -5897,24 +5935,30 @@ mod impl_qtsq {
          * every page file the index does not know about; they rank neutral
          * (zeroed k_summary) until the next flush records them. */
         let mut adopted = 0usize;
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else { continue };
-                let Some(rest) = name.strip_prefix("page_") else { continue };
-                let Some(id_str) = rest.strip_suffix(".qtsq") else { continue };
-                let Ok(page_id) = id_str.parse::<u32>() else { continue };
-                if page_id == 0 || kv.pages.iter().any(|p| p.page_id == page_id) {
-                    continue;
-                }
-                kv.pages.push(PageSummary {
-                    page_id,
-                    strength: 0.0,
-                    created_at: 0,
-                    k_summary: [0.0; KV_SUMMARY_DIM],
-                });
-                adopted += 1;
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(e) => {
+                let reason = format!("cannot list the store directory {path}: {e}");
+                eprintln!("[sofuu/kv] {reason}");
+                return Err(reason);
             }
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(rest) = name.strip_prefix("page_") else { continue };
+            let Some(id_str) = rest.strip_suffix(".qtsq") else { continue };
+            let Ok(page_id) = id_str.parse::<u32>() else { continue };
+            if page_id == 0 || kv.pages.iter().any(|p| p.page_id == page_id) {
+                continue;
+            }
+            kv.pages.push(PageSummary {
+                page_id,
+                strength: 0.0,
+                created_at: 0,
+                k_summary: [0.0; KV_SUMMARY_DIM],
+            });
+            adopted += 1;
         }
         if adopted > 0 {
             kv.pages.sort_by_key(|p| p.page_id);
@@ -5923,7 +5967,7 @@ mod impl_qtsq {
                 if index_parsed { "" } else { " (index was unreadable)" }
             );
         }
-        Some(kv)
+        Ok(kv)
     }
 
     /// kv_page_save — compress and append a page; updates index K-summary.
@@ -6148,13 +6192,19 @@ mod impl_qtsq {
             .map(|j| j.record(&tmp_path, &idx_path))
             .unwrap_or(false);
         let published = wrote && crate::rt::wal::publish(&tmp_path, &idx_path);
-        if published {
-            if recorded {
-                if let Some(j) = journal {
-                    j.commit();
-                }
+        /* The journal we own must not outlive this attempt. A journal that
+         * stays behind describes a commit that is no longer pending: the
+         * rename either landed (so the intent is spent) or the staged bytes
+         * are discarded (so the intent is void). Either way the next writer
+         * in this directory would have to wait for it to age out. */
+        if let Some(j) = journal {
+            if published && recorded {
+                j.commit();
+            } else {
+                j.abandon();
             }
-        } else {
+        }
+        if !published {
             let _ = std::fs::remove_file(&tmp_path);
         }
 
@@ -6199,16 +6249,26 @@ mod impl_qtsq {
         qjs::sofuu_js_to_uint32(ctx, &mut h_d, v_hd);
         qjs::sofuu_js_free_value(ctx, v_hd);
 
-        let kv = cstr_opt(path).and_then(|p| {
-            kv_store_open(ctx, &p, n_l as usize, n_h as usize, h_d as usize)
-        });
+        let kv = match cstr_opt(path).map(|p| kv_store_open(ctx, &p, n_l as usize, n_h as usize, h_d as usize)) {
+            Some(Ok(kv)) => Ok(kv),
+            Some(Err(reason)) => Err(reason),
+            /* A path that is not text names no store: a caller that cannot
+             * name its store has not opened an empty one. */
+            None => Err("the store path is not text".to_string()),
+        };
 
         if !path.is_null() {
             qjs::sofuu_js_free_cstring(ctx, path);
         }
 
-        let Some(kv) = kv else {
-            return qjs::JS_ThrowInternalError(ctx, c"Failed to initialize KV".as_ptr());
+        let kv = match kv {
+            Ok(kv) => kv,
+            Err(reason) => {
+                /* A store that cannot be opened is a typed refusal carrying
+                 * the reason, not a bare InternalError that tells the caller
+                 * nothing about which store failed or why. */
+                return throw_coded(ctx, E_STORE, &format!("memory.kv.open: {reason}"));
+            }
         };
         let kv = Box::into_raw(kv);
 

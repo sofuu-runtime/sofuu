@@ -11,6 +11,7 @@ pub mod gpio;
 pub mod drone_ops;
 pub mod hardware;
 pub mod kaze_live;
+pub mod safety;
 
 use sofuu_ffi::qjs::JSContext;
 use crate::domains::Subsystem;

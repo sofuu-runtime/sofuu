@@ -148,6 +148,10 @@ const MCP_ERR_TRANSPORT_UNAVAILABLE: i32 = -32003;
 const MCP_ERR_PROTOCOL: i32 = -32004;
 /// A single JSON-RPC line crossed MCP_MAX_LINE (MC-019).
 const MCP_ERR_PAYLOAD_TOO_LARGE: i32 = -32005;
+/// The host policy refused the server command (R7.6/shell.*, or the
+/// operator's SOFUU_NO_SHELL switch). The command was never spawned, so
+/// this is a refusal, not an uncertain completion.
+const MCP_ERR_POLICY_DENIED: i32 = -32006;
 
 /// g_next_id (C static).
 static NEXT_ID: AtomicI32 = AtomicI32::new(1);
@@ -815,10 +819,38 @@ unsafe extern "C" fn mcp_on_read(stream: *mut UvStream, nread: isize, buf: *cons
         /* NOTE: no sofuu_flush_jobs here at all — we are inside a libuv
          * read callback; running JS re-enters the loop mid-dispatch and
          * races the write side. The loop pumps jobs after uv_run. */
-    } else if nread < 0 && nread != uv::UV_EOF as isize {
-        /* Connection broken */
-        if !(*client).connect_promise.is_null() {
-            let ctx = (*client).ctx;
+    } else if nread < 0 {
+        /* The pipe is gone: no response can arrive for the calls that are
+         * still pending, so they must be REJECTED instead of left hanging.
+         * A caller that waits on a dead pipe forever is the one outcome an
+         * error must never become. The rejection carries the transport-loss
+         * code, so the JS layer reads it as an uncertain completion and
+         * never replays a possibly-executed call. */
+        let ctx = (*client).ctx;
+        let mut rejected = 0usize;
+        for i in 0..(*client).pending_count {
+            if (*client).pending[i].promise.is_null() {
+                continue;
+            }
+            let err = mcp_error_value(
+                ctx,
+                MCP_ERR_TRANSPORT_LOST,
+                "MCP server disconnected: stdout closed before the response arrived",
+                None,
+            );
+            sofuu_promise_reject((*client).pending[i].promise, err); /* consumes err */
+            rejected += 1;
+        }
+        (*client).pending_count = 0;
+        mcp_maybe_disarm_timeout(client);
+        if rejected > 0 {
+            sofuu_flush_jobs(ctx);
+        }
+        if nread != uv::UV_EOF as isize && !(*client).connect_promise.is_null() {
+            /* A read ERROR (not a clean EOF) also means the initialize
+             * handshake can never complete. A clean EOF is left to the exit
+             * callback, which reports the child's exit code and stderr — a
+             * better diagnosis than "disconnected". */
             let err = mcp_error_value(ctx, MCP_ERR_TRANSPORT_LOST, "MCP server disconnected", None);
             sofuu_promise_reject((*client).connect_promise, err); /* consumes err */
             sofuu_flush_jobs(ctx);
@@ -1206,6 +1238,25 @@ thread_local! {
 
 // ── shell-lite tokenizer (quotes + backslash escapes, max 63 args) ──
 
+/// The command-line spellings the process policy is asked about: the joined
+/// argv, plus — for `sh -c <payload>` — the payload itself. The gate itself
+/// also tries argv[0] reduced to its basename, so a `shell.allow` pattern
+/// means the same thing here as it does for sofuu.spawn.
+fn mcp_policy_command_lines(args: &[String]) -> Vec<String> {
+    let mut out = vec![args.join(" ")];
+    if args.len() >= 3 {
+        let base = args[0].rsplit('/').next().unwrap_or(args[0].as_str());
+        let flag = args[1].as_str();
+        if matches!(base, "sh" | "bash" | "zsh" | "dash" | "ksh" | "busybox")
+            && flag.starts_with('-')
+            && flag.contains('c')
+        {
+            out.push(args[2].clone());
+        }
+    }
+    out
+}
+
 fn tokenize_command(cmd: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let bytes = cmd.as_bytes();
@@ -1370,6 +1421,25 @@ unsafe extern "C" fn js_mcp_connect(
     args_arr.extend(extra_args);
     if args_arr.is_empty() {
         return qjs::JS_ThrowTypeError(ctx, c"mcp.connect: empty command".as_ptr());
+    }
+
+    /* An MCP server is a process THIS runtime starts, so the process policy
+     * binds it exactly as it binds sofuu.spawn: the operator's kill switch
+     * (SOFUU_NO_SHELL) and `shell.enabled` / `shell.allow` apply to the
+     * server command. Without this an MCP server was the way around them.
+     * The gate runs before the child exists, so a refused server reaches no
+     * backend at all. */
+    let cmdlines = mcp_policy_command_lines(&args_arr);
+    if let Err(denied) = crate::rt::policy::gate_process_spawn(ctx, &cmdlines) {
+        let msg = format!("mcp.connect: {}", denied.text_rule());
+        let data = serde_json::json!({
+            "code": denied.code,
+            "rule": denied.rule,
+            "command": cmdlines.first().cloned().unwrap_or_default(),
+        });
+        let data_text = serde_json::to_string(&data).unwrap_or_else(|_| "null".into());
+        let err = mcp_error_value(ctx, MCP_ERR_POLICY_DENIED, &msg, Some(&data_text));
+        return mcp_rejected_promise(ctx, err);
     }
 
     /* MCP servers are third-party code — the child env must be the
@@ -2061,29 +2131,15 @@ unsafe extern "C" fn mcp_tool_then_cb(
     qjs::JS_ToInt32(ctx, &mut req_id, *data);
     let srv = mcp_tool_data_server(data);
 
-    let json_val = qjs::JS_JSONStringify(ctx, *argv, qjs::sofuu_js_undefined(), qjs::sofuu_js_undefined());
-    let rs = if qjs::is_exception(json_val) {
-        None
-    } else {
-        let s = qjs::sofuu_js_to_cstring(ctx, json_val);
-        if s.is_null() {
-            None
-        } else {
-            let out = Some(CStr::from_ptr(s).to_string_lossy().into_owned());
-            qjs::sofuu_js_free_cstring(ctx, s);
-            out
-        }
-    };
-
-    /* M3: async successes get the same body builder as sync ones. */
+    /* M3: async successes get the same body builder as sync ones — and the
+     * builder owns the serialization: it reports a value that cannot be
+     * serialized as a tool failure and takes the exception JSON.stringify
+     * raised, so a failed serialization never reaches the next JS call. */
     let body = mcp_success_body(ctx, *argv);
 
     let resp = jsonrpc_response_cstr(req_id, &body);
     mcp_tool_write_response(srv, resp.as_bytes());
 
-    if !qjs::is_exception(json_val) {
-        qjs::sofuu_js_free_value(ctx, json_val);
-    }
     qjs::sofuu_js_undefined()
 }
 
@@ -2111,21 +2167,46 @@ unsafe extern "C" fn mcp_tool_reject_cb(
     qjs::sofuu_js_undefined()
 }
 
-/// JSON.stringify a JS value as text (None on an exception).
-unsafe fn mcp_json_text(ctx: *mut JSContext, val: JSValue) -> Option<String> {
+/// The outcome of serializing a handler's return value.
+///
+/// `Empty` is a genuinely empty result — the value has no JSON form
+/// (`undefined`, a function) — and stays a successful empty response.
+/// `Unserializable` is a FAILURE (a cycle, a throwing `toJSON`, a BigInt):
+/// it must never be reported as a successful empty result, or the model
+/// reads "the tool produced no output" where it produced nothing at all.
+enum McpPayload {
+    Text(String),
+    Empty,
+    Unserializable(String),
+}
+
+/// Serialize a handler's return value, telling "no JSON form" apart from
+/// "could not be serialized". The exception JSON.stringify may have raised is
+/// taken here, so it never leaks into the next JS call.
+unsafe fn mcp_payload(ctx: *mut JSContext, val: JSValue) -> McpPayload {
     let json = qjs::JS_JSONStringify(ctx, val, qjs::sofuu_js_undefined(), qjs::sofuu_js_undefined());
     if qjs::is_exception(json) {
-        return None;
+        let msg = mcp_take_exception_message(ctx);
+        return McpPayload::Unserializable(if msg.is_empty() {
+            "the value could not be serialized".to_string()
+        } else {
+            msg
+        });
+    }
+    if qjs::is_undefined(json) {
+        qjs::sofuu_js_free_value(ctx, json);
+        return McpPayload::Empty;
     }
     let s = qjs::sofuu_js_to_cstring(ctx, json);
     let out = if s.is_null() {
-        None
+        String::new()
     } else {
-        Some(CStr::from_ptr(s).to_string_lossy().into_owned())
+        let text = CStr::from_ptr(s).to_string_lossy().into_owned();
+        qjs::sofuu_js_free_cstring(ctx, s);
+        text
     };
-    qjs::sofuu_js_free_cstring(ctx, s);
     qjs::sofuu_js_free_value(ctx, json);
-    out
+    McpPayload::Text(out)
 }
 
 /// MCP tools/call result for a successful handler value.
@@ -2137,22 +2218,33 @@ unsafe fn mcp_json_text(ctx: *mut JSContext, val: JSValue) -> Option<String> {
 ///     `structuredContent` = the object itself (per spec);
 ///   * string result → text = that string (not its quoted form);
 ///   * anything else → text = its JSON text (`"42"`, `"null"`, `"[1,2]"`).
+///
+/// A result that cannot be serialized at all is an in-band tool FAILURE, not
+/// an empty success: the old path answered `"text":""` and the model read a
+/// serialization error as "the tool returned nothing".
 unsafe fn mcp_success_body(ctx: *mut JSContext, val: JSValue) -> String {
-    let js = mcp_json_text(ctx, val).unwrap_or_else(|| "\"\"".into());
-    let parsed: serde_json::Value =
-        serde_json::from_str(&js).unwrap_or(serde_json::Value::Null);
-    let text = match &parsed {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    };
-    let text_json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into());
-    if parsed.is_object() {
-        let structured = serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".into());
-        return format!(
-            "{{\"content\":[{{\"type\":\"text\",\"text\":{text_json}}}],\"structuredContent\":{structured}}}"
-        );
+    match mcp_payload(ctx, val) {
+        McpPayload::Unserializable(reason) => mcp_iserror_text(&format!(
+            "tool result could not be serialized: {reason}"
+        )),
+        McpPayload::Empty => "{\"content\":[{\"type\":\"text\",\"text\":\"\"}]}".to_string(),
+        McpPayload::Text(js) => {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&js).unwrap_or(serde_json::Value::Null);
+            let text = match &parsed {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let text_json = serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into());
+            if parsed.is_object() {
+                let structured = serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".into());
+                return format!(
+                    "{{\"content\":[{{\"type\":\"text\",\"text\":{text_json}}}],\"structuredContent\":{structured}}}"
+                );
+            }
+            format!("{{\"content\":[{{\"type\":\"text\",\"text\":{text_json}}}]}}")
+        }
     }
-    format!("{{\"content\":[{{\"type\":\"text\",\"text\":{text_json}}}]}}")
 }
 
 /// M3: a TOOL failure is in-band (`isError:true` with content), never a
@@ -2387,11 +2479,31 @@ unsafe fn mcp_server_handle_message(srv: *mut McpServer, input: &str) -> Option<
                         let resp = jsonrpc_response_cstr(req_id, &body);
                         out.push_str(&resp.to_string_lossy());
                     } else {
-                        let body = mcp_json_text(ctx, ret)
-                            .map(|j| format!("{{\"contents\":{j}}}"))
-                            .unwrap_or_else(|| "{\"contents\":[]}".into());
-                        let resp = jsonrpc_response_cstr(req_id, &body);
-                        out.push_str(&resp.to_string_lossy());
+                        /* A handler result that cannot be serialized is a
+                         * failure, not an empty resource: the old path
+                         * answered `{"contents":[]}` and the client read a
+                         * serialization error as "the resource is empty". */
+                        match mcp_payload(ctx, ret) {
+                            McpPayload::Unserializable(reason) => {
+                                let err = jsonrpc_error_cstr(
+                                    req_id,
+                                    -32603,
+                                    &format!(
+                                        "Resource handler result could not be serialized: {reason}"
+                                    ),
+                                );
+                                out.push_str(&err.to_string_lossy());
+                            }
+                            McpPayload::Empty => {
+                                let resp = jsonrpc_response_cstr(req_id, "{\"contents\":[]}");
+                                out.push_str(&resp.to_string_lossy());
+                            }
+                            McpPayload::Text(j) => {
+                                let body = format!("{{\"contents\":{j}}}");
+                                let resp = jsonrpc_response_cstr(req_id, &body);
+                                out.push_str(&resp.to_string_lossy());
+                            }
+                        }
                     }
                     qjs::sofuu_js_free_value(ctx, then_fn);
                 }
@@ -2475,7 +2587,7 @@ unsafe fn mcp_server_handle_message(srv: *mut McpServer, input: &str) -> Option<
                         );
                         out.push_str(&err.to_string_lossy());
                     } else {
-                        let text = if qjs::sofuu_js_is_string(ret) != 0 {
+                        let text: Option<String> = if qjs::sofuu_js_is_string(ret) != 0 {
                             let sp = qjs::sofuu_js_to_cstring(ctx, ret);
                             let v = if sp.is_null() {
                                 String::new()
@@ -2484,17 +2596,35 @@ unsafe fn mcp_server_handle_message(srv: *mut McpServer, input: &str) -> Option<
                                 qjs::sofuu_js_free_cstring(ctx, sp);
                                 out
                             };
-                            v
+                            Some(v)
                         } else {
-                            mcp_json_text(ctx, ret).unwrap_or_else(|| "".into())
+                            match mcp_payload(ctx, ret) {
+                                /* A prompt that cannot be serialized is an
+                                 * error, not an empty prompt. */
+                                McpPayload::Unserializable(reason) => {
+                                    let err = jsonrpc_error_cstr(
+                                        req_id,
+                                        -32603,
+                                        &format!(
+                                            "Prompt handler result could not be serialized: {reason}"
+                                        ),
+                                    );
+                                    out.push_str(&err.to_string_lossy());
+                                    None
+                                }
+                                McpPayload::Empty => Some(String::new()),
+                                McpPayload::Text(j) => Some(j),
+                            }
                         };
-                        let body = format!(
-                            "{{\"description\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]}}",
-                            json_escape(&desc),
-                            serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into())
-                        );
-                        let resp = jsonrpc_response_cstr(req_id, &body);
-                        out.push_str(&resp.to_string_lossy());
+                        if let Some(text) = text {
+                            let body = format!(
+                                "{{\"description\":\"{}\",\"messages\":[{{\"role\":\"user\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]}}",
+                                json_escape(&desc),
+                                serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into())
+                            );
+                            let resp = jsonrpc_response_cstr(req_id, &body);
+                            out.push_str(&resp.to_string_lossy());
+                        }
                     }
                     qjs::sofuu_js_free_value(ctx, then_fn);
                 }
@@ -3436,6 +3566,90 @@ mod tests {
         }
     }
 
+    /// An MCP server is a process this runtime starts, so the process policy
+    /// binds it: a `shell.allow` that does not cover the server command
+    /// refuses the connect BEFORE the child exists. The refusal is a typed
+    /// rejection (the policy code), never a started server.
+    #[test]
+    fn mcp_connect_refuses_a_server_command_the_process_policy_denies() {
+        let _loop_guard = crate::rt::test_loop_lock();
+        let rt = unsafe { qjs::JS_NewRuntime() };
+        let ctx = unsafe { qjs::JS_NewContext(rt) };
+        unsafe { crate::rt::event_loop::sofuu_loop_init() };
+        // SAFETY: registers sofuu.mcp on the global.
+        unsafe { mod_mcp_register(ctx) };
+
+        unsafe {
+            // The same global the policy driver installs.
+            let global = qjs::sofuu_js_get_global_object(ctx);
+            let text = std::ffi::CString::new("{\"shell\":{\"allow\":[\"git *\"]}}").unwrap();
+            let val = qjs::sofuu_js_new_string(ctx, text.as_ptr());
+            qjs::sofuu_js_set_property_str(ctx, global, c"__sofuu_policy_json".as_ptr(), val);
+            qjs::sofuu_js_free_value(ctx, global);
+
+            let r = eval_or_panic(
+                ctx,
+                c"<mcp-policy>",
+                c"globalThis.msg = '';
+                  sofuu.mcp.connect('/usr/bin/true')
+                    .then(function () { globalThis.msg = 'RESOLVED'; },
+                          function (e) { globalThis.msg = 'REFUSED:' + String(e && e.code) + ':' + String(e && e.message); });",
+            );
+            qjs::sofuu_js_free_value(ctx, r);
+            crate::rt::event_loop::sofuu_loop_run_bounded(
+                ctx,
+                Some(std::time::Duration::from_secs(60)),
+            );
+
+            let global = qjs::sofuu_js_get_global_object(ctx);
+            let v = qjs::sofuu_js_get_property_str(ctx, global, c"msg".as_ptr());
+            qjs::sofuu_js_free_value(ctx, global);
+            let p = qjs::sofuu_js_to_cstring(ctx, v);
+            qjs::sofuu_js_free_value(ctx, v);
+            let msg = if p.is_null() {
+                String::new()
+            } else {
+                let out = CStr::from_ptr(p).to_string_lossy().into_owned();
+                qjs::sofuu_js_free_cstring(ctx, p);
+                out
+            };
+
+            crate::rt::event_loop::sofuu_loop_close();
+            qjs::JS_FreeContext(ctx);
+            qjs::JS_FreeRuntime(rt);
+
+            assert!(
+                msg.starts_with(&format!("REFUSED:{MCP_ERR_POLICY_DENIED}:")),
+                "the connect must be refused by the process policy, got: {msg:?}"
+            );
+            assert!(
+                msg.contains("R7.6/shell.allow"),
+                "the refusal must name the rule that fired, got: {msg:?}"
+            );
+        }
+    }
+
+    /// The command-line spellings the process policy is asked about: the
+    /// joined argv, plus the payload of a `sh -c <payload>` command.
+    #[test]
+    fn mcp_policy_command_lines_offer_the_shell_payload() {
+        let plain = mcp_policy_command_lines(&[
+            "/usr/bin/node".to_string(),
+            "server.js".to_string(),
+        ]);
+        assert_eq!(plain, vec!["/usr/bin/node server.js".to_string()]);
+
+        let sh = mcp_policy_command_lines(&[
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "node server.js".to_string(),
+        ]);
+        assert_eq!(
+            sh,
+            vec!["/bin/sh -c node server.js".to_string(), "node server.js".to_string()]
+        );
+    }
+
     /// Eval a script, panicking with the exception text on failure (the bare
     /// test runtime has no std helpers, so js_std_dump_error is silent).
     /// Returns the result value — caller frees.
@@ -3646,6 +3860,88 @@ mod tests {
         unsafe { p1_server_teardown(rt, ctx, stdout_pipe, resp_rd) };
     }
 
+    /// A handler result that cannot be serialized (a cycle) is a FAILURE,
+    /// not a successful empty result. The old path answered `"text":""` for
+    /// tools and `{"contents":[]}` for resources, so the client read a
+    /// serialization error as "the tool produced nothing" — the fabricated
+    /// success RULES §1.9 forbids.
+    #[test]
+    fn mcp_unserializable_handler_result_is_reported_as_a_failure() {
+        let _loop_guard = crate::rt::test_loop_lock();
+        // SAFETY: standalone harness per the P0-2 pattern.
+        let (rt, ctx, srv, stdout_pipe, resp_rd, _base) = unsafe {
+            p1_server_harness(c"globalThis.srv = sofuu.mcp.serve();
+                srv.tool('cycle', {}, function () { var o = {}; o.self = o; return o; });
+                srv.resource('file:///cycle', {}, function () { var o = {}; o.self = o; return o; });
+                srv.prompt('cycle', {}, function () { var o = {}; o.self = o; return o; });")
+        };
+
+        let call = c"{\"jsonrpc\":\"2.0\",\"id\":21,\"method\":\"tools/call\",\"params\":{\"name\":\"cycle\",\"arguments\":{}}}";
+        unsafe { mcp_server_handle_request(srv, call.to_bytes()) };
+        unsafe { uv::uv_run(crate::rt::event_loop::sofuu_loop_get(), uv::UV_RUN_ONCE) };
+        let line = unsafe { read_response_line(resp_rd) };
+        assert!(
+            line.contains("\"isError\":true"),
+            "an unserializable tool result must be a tool failure, got: {line}"
+        );
+        assert!(
+            line.contains("could not be serialized"),
+            "the failure must name the cause, got: {line}"
+        );
+
+        let read = c"{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"resources/read\",\"params\":{\"uri\":\"file:///cycle\"}}";
+        unsafe { mcp_server_handle_request(srv, read.to_bytes()) };
+        unsafe { uv::uv_run(crate::rt::event_loop::sofuu_loop_get(), uv::UV_RUN_ONCE) };
+        let line = unsafe { read_response_line(resp_rd) };
+        assert!(
+            line.contains("\"code\":-32603"),
+            "an unserializable resource result must be an error, got: {line}"
+        );
+        assert!(
+            !line.contains("\"contents\":[]"),
+            "an unserializable resource must not be reported as empty, got: {line}"
+        );
+
+        let get = c"{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"prompts/get\",\"params\":{\"name\":\"cycle\"}}";
+        unsafe { mcp_server_handle_request(srv, get.to_bytes()) };
+        unsafe { uv::uv_run(crate::rt::event_loop::sofuu_loop_get(), uv::UV_RUN_ONCE) };
+        let line = unsafe { read_response_line(resp_rd) };
+        assert!(
+            line.contains("\"code\":-32603"),
+            "an unserializable prompt result must be an error, got: {line}"
+        );
+
+        unsafe { p1_server_teardown(rt, ctx, stdout_pipe, resp_rd) };
+    }
+
+    /// The other half of the contract: a GENUINELY empty result (a handler
+    /// that returns undefined) stays a successful empty response. The fix
+    /// above must not turn an honest empty answer into a failure.
+    #[test]
+    fn mcp_empty_handler_result_is_still_a_successful_response() {
+        let _loop_guard = crate::rt::test_loop_lock();
+        // SAFETY: standalone harness per the P0-2 pattern.
+        let (rt, ctx, srv, stdout_pipe, resp_rd, _base) = unsafe {
+            p1_server_harness(c"globalThis.srv = sofuu.mcp.serve(); srv.tool('nothing', {}, function () { return undefined; });")
+        };
+
+        let call = c"{\"jsonrpc\":\"2.0\",\"id\":31,\"method\":\"tools/call\",\"params\":{\"name\":\"nothing\",\"arguments\":{}}}";
+        unsafe { mcp_server_handle_request(srv, call.to_bytes()) };
+        unsafe { uv::uv_run(crate::rt::event_loop::sofuu_loop_get(), uv::UV_RUN_ONCE) };
+        let line = unsafe { read_response_line(resp_rd) };
+        assert!(line.contains("\"id\":31"), "got: {line}");
+        assert!(
+            !line.contains("\"isError\":true"),
+            "an empty result is not a failure, got: {line}"
+        );
+        assert!(
+            line.contains("\"text\":\"\""),
+            "an empty result stays an empty text, got: {line}"
+        );
+
+        unsafe { p1_server_teardown(rt, ctx, stdout_pipe, resp_rd) };
+    }
+
     /// P1-9 regression (AUDIT-2026-09-07): a synchronous uv_write failure
     /// (EPIPE/EBADF after child death) must settle the pending `call()`
     /// promise and reclaim the MAX_PENDING slot — before the fix the rc was
@@ -3758,6 +4054,117 @@ mod tests {
         // detach the opaque, drop the Box manually (finalizer is a no-op).
         unsafe {
             uv::uv_close(stdin_pipe as *mut UvHandle, Some(free_pipe_cb));
+            uv::uv_run(crate::rt::event_loop::sofuu_loop_get(), uv::UV_RUN_ONCE);
+            crate::rt::event_loop::sofuu_loop_close();
+            qjs::JS_SetOpaque((*client_ptr).self_val, ptr::null_mut());
+            qjs::sofuu_js_free_value(ctx, (*client_ptr).self_val);
+            drop(Box::from_raw(client_ptr));
+            qjs::JS_FreeContext(ctx);
+            qjs::JS_FreeRuntime(rt);
+        }
+    }
+
+    /// A pending call whose server closes stdout must be REJECTED, not left
+    /// hanging: the response can never arrive, and a promise that never
+    /// settles is the one outcome a transport failure must never become.
+    #[test]
+    fn mcp_stdout_close_rejects_pending_calls() {
+        let _loop_guard = crate::rt::test_loop_lock();
+        // SAFETY: standalone harness per the P0-2 pattern.
+        let rt = unsafe { qjs::JS_NewRuntime() };
+        let ctx = unsafe { qjs::JS_NewContext(rt) };
+        unsafe { crate::rt::event_loop::sofuu_loop_init() };
+        // SAFETY: registers sofuu.mcp + both class IDs on the runtime.
+        unsafe { mod_mcp_register(ctx) };
+
+        let stdin_pipe = unsafe { libc::malloc(uv::sofuu_uv_pipe_size()) } as *mut UvPipe;
+        let stdout_pipe = unsafe { libc::malloc(uv::sofuu_uv_pipe_size()) } as *mut UvPipe;
+        unsafe {
+            uv::uv_pipe_init(crate::rt::event_loop::sofuu_loop_get(), stdin_pipe, 0);
+            uv::uv_pipe_init(crate::rt::event_loop::sofuu_loop_get(), stdout_pipe, 0);
+        }
+        let client = unsafe {
+            Box::new(McpClient {
+                process: ptr::null_mut(),
+                stdin_pipe,
+                stdout_pipe,
+                stderr_pipe: ptr::null_mut(),
+                ctx,
+                self_val: qjs::sofuu_js_undefined(),
+                read_buf: vec![0u8; MCP_READ_BUF],
+                read_len: 0,
+                stderr_buf: [0u8; MCP_STDERR_CAP],
+                stderr_len: 0,
+                pending: [PendingCall { id: 0, promise: ptr::null_mut(), ctx: ptr::null_mut(), deadline: None, timeout_ms: 0 }; MAX_PENDING],
+                pending_count: 0,
+                timeout_timer: ptr::null_mut(),
+                timer_armed: 0,
+                initialized: 0,
+                initialize_id: 0,
+                protocol_version: [0u8; 32],
+                protocol_version_len: 0,
+                connect_promise: ptr::null_mut(),
+                done: 0,
+                closing: 0,
+            })
+        };
+        let client_ptr = Box::into_raw(client);
+        unsafe {
+            (*client_ptr).self_val =
+                qjs::JS_NewObjectClass(ctx, MCP_CLIENT_CLASS_ID.load(Ordering::Relaxed) as c_int);
+            qjs::JS_SetOpaque((*client_ptr).self_val, client_ptr as *mut c_void);
+            /* The stdout pipe's ->data carries the client, as at connect. */
+            *(stdout_pipe as *mut *mut McpClient) = client_ptr;
+        }
+
+        /* One pending call with a real promise. */
+        let mut promise_out: *mut PromiseHandle = ptr::null_mut();
+        let promise = unsafe { sofuu_promise_new(ctx, &mut promise_out) };
+        unsafe {
+            (*client_ptr).pending[0].id = 42;
+            (*client_ptr).pending[0].promise = promise_out;
+            (*client_ptr).pending[0].ctx = ctx;
+            (*client_ptr).pending_count = 1;
+            let global = qjs::sofuu_js_get_global_object(ctx);
+            qjs::sofuu_js_set_property_str(ctx, global, c"p".as_ptr(), promise);
+            qjs::sofuu_js_free_value(ctx, global);
+            let r = eval_or_panic(
+                ctx,
+                c"<mcp-eof-catch>",
+                c"globalThis.pmsg = null; globalThis.p.catch(function (e) { globalThis.pmsg = String((e && e.code) + '|' + (e && e.message)); });",
+            );
+            qjs::sofuu_js_free_value(ctx, r);
+        }
+
+        /* The server closes stdout: no response can arrive any more. */
+        let mut buf = uv::UvBuf { base: ptr::null_mut(), len: 0 };
+        unsafe { mcp_on_read(stdout_pipe as *mut UvStream, uv::UV_EOF as isize, &mut buf) };
+        unsafe { sofuu_flush_jobs(ctx) };
+
+        assert_eq!(
+            unsafe { (*client_ptr).pending_count },
+            0,
+            "a closed stdout must reclaim the pending slot, not leave the call pending forever"
+        );
+        unsafe {
+            let r = eval_or_panic(ctx, c"<mcp-eof-read>", c"String(globalThis.pmsg)");
+            assert!(
+                qjs::sofuu_js_is_string(r) != 0,
+                "the pending call must have been rejected"
+            );
+            let s = qjs::sofuu_js_to_cstring(ctx, r);
+            let msg = CStr::from_ptr(s).to_string_lossy().into_owned();
+            qjs::sofuu_js_free_cstring(ctx, s);
+            qjs::sofuu_js_free_value(ctx, r);
+            assert!(
+                msg.contains("-32000"),
+                "the rejection must carry the transport-loss code, got: {msg}"
+            );
+        }
+
+        unsafe {
+            uv::uv_close(stdin_pipe as *mut UvHandle, Some(free_pipe_cb));
+            uv::uv_close(stdout_pipe as *mut UvHandle, Some(free_pipe_cb));
             uv::uv_run(crate::rt::event_loop::sofuu_loop_get(), uv::UV_RUN_ONCE);
             crate::rt::event_loop::sofuu_loop_close();
             qjs::JS_SetOpaque((*client_ptr).self_val, ptr::null_mut());

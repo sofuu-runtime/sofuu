@@ -11,6 +11,13 @@ pub mod js_api;
 pub mod router;
 pub mod sandbox;
 
+/// Real-model coverage for the episode loop (RULES §1.9): the tests in
+/// `episode`/`js_api` are pure state-machine checks over fixed inputs, while
+/// this module drives the same loop with replies from the shipped inference
+/// engine. Test-only, so the release binary is unchanged.
+#[cfg(test)]
+mod real_model;
+
 use serde::{Deserialize, Serialize};
 
 /// One RLM query: a long context plus a question, never windowed whole.

@@ -4035,7 +4035,7 @@
 export default defineProvider({\n\
   name: 'llamacpp',\n\
   kind: 'llamacpp',\n\
-  baseUrl: (typeof process !== 'undefined' && process.env && process.env.LLAMACPP_HOST) || 'http://127.0.0.1:8080',\n\
+  baseUrl: (typeof process !== 'undefined' && process.env && (process.env.LLAMA_CPP_HOST || process.env.LLAMACPP_HOST)) || 'http://127.0.0.1:8080',\n\
   model: 'default',\n\
   description: 'Production llama.cpp inference bridge (/v1/chat/completions)',\n\
   async complete(req, ctx) {\n\

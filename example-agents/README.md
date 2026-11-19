@@ -1,18 +1,34 @@
 # Kaze example routines
 
-> **Status:** Kaze language examples only. Current embedded source refuses unavailable AI, tool, memory and alert calls; older published binaries may behave differently. A real model-and-authorized-tool workflow is not established. Do not execute these examples as evidence of a real action.
+> **Status:** one example (Local Brief) is a real, read-only model-and-tool
+> workflow; the other three are language examples whose capability calls fail
+> closed because no backend is configured for them. No example here places an
+> order, treats a patient, actuates equipment or sends a clinical alert.
 
-These four pure Kaze source files illustrate routine syntax and capability declarations. They are not deployable integrations or evidence of reliable autonomous behavior. The names and domain scenarios are illustrative.
+- [Local Brief](local_brief/README.md): the real one. A pure Kaze routine
+  reads one operator-selected local file through an authorized MCP tool and
+  returns a real model's answer about it. Read-only.
+- [Quant Sentinel](quant_sentinel/README.md): trade-risk language example. No
+  broker, exchange or order router is connected.
+- [Med Protocol](med_protocol/README.md): clinical-themed language example.
+  Not medical software.
+- [Agri Sentinel](agri_sentinel/README.md): greenhouse-themed language example.
+  No sensor, controller or actuator is connected.
 
-- [Quant Sentinel](quant_sentinel/README.md): trade-risk example.
-- [Med Protocol](med_protocol/README.md): illustrative clinical-themed syntax, not medical software.
-- [Agri Sentinel](agri_sentinel/README.md): greenhouse-themed example, not a tested controller.
-- [Paper Trader](paper_trader/README.md): trading-themed example; no functioning exchange is established.
-
-Inspect the sources or check syntax without executing capability calls:
+## Inspect without executing capability calls
 
 ```bash
-sofuu script check example-agents/quant_sentinel/agent.kaze
+sofuu script check example-agents/local_brief/agent.kaze
 ```
 
-`sofuu compile` can package a supported Kaze routine into one executable; OS libraries and the selected workflow's resources remain dependencies. A compiled executable does not establish real AI, tool, memory, alert, or hardware integration.
+## Execute
+
+`sofuu compile` packages a supported Kaze routine into one executable; the
+model, the MCP service, the operator policy and the OS libraries stay
+separate dependencies of the workload. A compiled executable does not by
+itself establish real AI, tool, memory, alert or hardware integration — it
+only establishes that the routine was packaged.
+
+See [Local Brief](local_brief/README.md) for a run that was actually observed
+against real local model weights and a real MCP service, and for the exact
+dependencies it needs.

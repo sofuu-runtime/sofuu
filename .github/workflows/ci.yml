@@ -84,8 +84,10 @@ jobs:
         run: SOFUU_BIN=./sofuu make kaze-js-boundary-check
 
       - name: Rust unit tests
-        # Block the aggregate while it includes scripted model execution.
-        # Individual audited pure tests can still run during migration.
+        # The compliant core suite runs for real here. The RLM tests that
+        # drive the episode loop with a canned model response are named and
+        # left unexecuted (RULES 1.9), so this step still exits 2 and prints
+        # the exact list of blocked scenarios instead of a bare BLOCKED line.
         run: make test-rust
 
       - name: Phase exit gates (QTSQ_UPGRADE_PLAN.md)
@@ -278,6 +280,7 @@ jobs:
           # P3 (R5.3): the C ABI is now a checked surface — the libsofuu step
           # above already built dist/, so the cabi parity cases run too.
           CONTRACT_NOQTSQ_BIN=target/release/sofuu \
+            SOFUU_BIN=target/release/sofuu \
             CONTRACT_LIBSOFUU=dist/libsofuu.dylib \
             ALLOW_BLOCKED=1 \
             bash scripts/contract/run_contract_tests.sh
@@ -374,6 +377,34 @@ jobs:
           name: sofuu-${{ matrix.label }}
           path: sofuu
           retention-days: 7
+
+      # ── The mandatory gates, last, and always ─────────────────────────
+      # `if: always()` so their verdict is still printed when an earlier gate
+      # has already failed the job: a red gate must not hide the state of the
+      # other gates.
+      #
+      # RULES 3.4 makes the preflight mandatory for every change. These are
+      # the halves that need no model, no device and no service, so every
+      # runner can answer them: the domain capsules must not import one
+      # another, the shipped bytecode must match its source, the Kaze product
+      # surface must not fall behind the prototype, and the release binary
+      # must stay within the 5,767,168-byte ceiling.
+      - name: Preflight gates (division isolation, bytecode, Kaze drift, size cap)
+        if: always()
+        run: bash scripts/preflight.sh isolation bytecode drift size
+
+      # Every real-resource gate runs against a real backend: a real MCP
+      # server reading a real file, a real QTSQ store, the real Kaze CMA and
+      # durable stores, the real alert sinks and real local-GGUF inference.
+      # A missing real-weight GGUF, an unlinked QTSQ checkout or a denied
+      # permission is reported BLOCKED (exit 2) and fails the job — the
+      # coverage is not claimed, and no weight is ever downloaded (AGENTS.md).
+      # SOFUU_BIN points the gates at the release artifact this job built.
+      - name: Real-resource gates (real MCP, memory, Kaze memory, alerts, local-GGUF inference)
+        if: always()
+        env:
+          SOFUU_BIN: ./sofuu
+        run: bash scripts/preflight.sh real
 
   # Android app — OPT-IN, deliberately skipped by default.
   #

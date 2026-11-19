@@ -132,9 +132,13 @@ Call `sofuu.close()` when the screen (and its worker) goes away: it frees
 the runtime and releases the registrations, which otherwise pin your
 `HostTool` lambdas — and through them, the Activity.
 
-This whole surface is exercised on the host JVM with no device attached:
+This ABI/engine surface is exercised on the host JVM with no device attached:
 `make sdk-jvm-check` compiles this module's `jni_bridge.c` for the host OS
-and runs its assertions through the real wrapper and runtime.
+and runs its assertions through the real wrapper and runtime (real local
+inference against an existing GGUF, real host-tool file reads, mid-flight
+cancel, the UTF-8 boundary). That is HOST-JVM coverage, not Android device
+coverage: the camera and the other device capabilities above need a physical
+device and are recorded as unverified until one is attached.
 
 ## Building and publishing the AAR
 

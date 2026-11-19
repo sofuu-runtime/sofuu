@@ -1,0 +1,14 @@
+[
+  {
+    "name": "local-brief-read",
+    "command": "sofuu",
+    "args": [
+      "run",
+      "example-agents/local_brief/mcp/read_document_server.js",
+      "PATH_TO_THE_DOCUMENT_YOU_WANT_READ"
+    ],
+    "tools": {
+      "allow": ["read_document"]
+    }
+  }
+]

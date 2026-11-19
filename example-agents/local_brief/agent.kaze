@@ -1,0 +1,14 @@
+# Local Brief — read-only example agent.
+#
+# The routine reads one operator-selected local file through an authorized MCP
+# tool and returns a real model's answer about that file. It writes nothing,
+# places no order, touches no patient record and drives no actuator. When the
+# MCP service, the policy or the model is unavailable the run fails closed
+# instead of producing an answer.
+
+needs: ai, tool, log
+
+action main(instruction):
+    log.info("local brief: reading the operator-selected file through the authorized MCP tool")
+    let document = tool.call("read_document")
+    return ai.prompt(instruction + "\n\nDocument:\n" + document)

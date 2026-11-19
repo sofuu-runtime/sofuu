@@ -14,6 +14,12 @@ interface Props {
   /** Read-only transcript being viewed, if any (◷ history). */
   previewLabel: string | null;
   sessions: SessionInfo[];
+  /** Why the session list could not be read — an empty strip must not
+   *  read as "this workspace has no chats". */
+  error?: string | null;
+  /** Where the list came from when the engine did not answer: the
+   *  on-disk registry mirror. */
+  source?: string | null;
   onNewChat: () => void;
   onSelectSession: (id: string) => void;
   onDeleteSession: (id: string) => void;
@@ -153,7 +159,15 @@ export function TopBar(props: Props) {
           </button>
           <Popover open={historyOpen} onClose={() => setHistoryOpen(false)} align="right">
             <div className="popover-title">Chat history</div>
-            {props.sessions.length === 0 && <div className="popover-empty">No chats yet</div>}
+            {props.sessions.length === 0 && (
+              <div className="popover-empty">
+                {props.error
+                  ? props.source
+                    ? "No chats in the registry mirror"
+                    : "Chats unavailable"
+                  : "No chats yet"}
+              </div>
+            )}
             {props.sessions.map((s) => (
               <PopoverItem
                 key={s.id}

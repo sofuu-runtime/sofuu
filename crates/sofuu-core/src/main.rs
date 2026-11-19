@@ -217,7 +217,7 @@ fn print_help() {
     println!("  sofuu plugin add <name>  Install plugin by name/package (--global, --force)");
     println!("  sofuu plugin validate <f> Validate plugin syntax, export interface, and microZod schema");
     println!("  sofuu plugin run <tool>  Execute a plugin tool under 5-shield safety boundaries");
-    println!("  sofuu plugin test <tool> Test a plugin tool in isolation with mock parameters");
+    println!("  sofuu plugin test <tool> Alias of `plugin run`: execute the tool with the arguments you supply");
     println!("  sofuu plugin init <name> Scaffold a new plugin project (--category=tool|service|...)");
     println!();
     println!("\x1b[1mSecurity, Policies & Conformance:\x1b[0m");
@@ -1238,7 +1238,13 @@ fn cmd_agent(rt: &SofuuRuntime, args: &[String], on_error: Option<&str>) -> i32 
                               r.usage.toolCalls + ' tool calls · ' + r.usage.promptTokens + '→' +
                               r.usage.completionTokens + ' tk' +
                               (r.stopped ? ' · stopped: ' + r.stopped : '') +
-                              (r.scouter ? ' · health: ' + r.scouter.contextScore + '%/' + r.scouter.brainScore + '%' : ''));"#
+                              (r.scouter && r.scouter.contextMeasured === true &&
+                               typeof r.scouter.contextScore === 'number'
+                                ? ' · health: ' + r.scouter.contextScore + '%/' +
+                                  (r.scouter.brainMeasured === true &&
+                                   typeof r.scouter.brainScore === 'number'
+                                    ? r.scouter.brainScore + '%' : 'not measured')
+                                : ''));"#
             };
             let log_js = if log { "true" } else { "false" };
             let code = format!(
@@ -2910,7 +2916,8 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
         eprintln!("\x1b[2m  token: (from --token / SOFUU_SERVE_TOKEN)\x1b[0m");
     }
     eprintln!("\x1b[2m  endpoints:\x1b[0m");
-    eprintln!("\x1b[2m    GET  /health               (liveness, no auth)\x1b[0m");
+    eprintln!("\x1b[2m    GET  /healthz, /livez      (liveness, no auth)\x1b[0m");
+    eprintln!("\x1b[2m    GET  /health               (needs the bearer token unless --public-health)\x1b[0m");
     eprintln!("\x1b[2m    GET  /v1/models\x1b[0m");
     eprintln!("\x1b[2m    POST /v1/chat/completions  (OpenAI SSE stream & json)\x1b[0m");
     eprintln!("\x1b[2m    POST /v1/completions       (text completions)\x1b[0m");

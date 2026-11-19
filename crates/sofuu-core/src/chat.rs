@@ -502,7 +502,6 @@ impl ChatConfig {
                 flat_provider = e.name.clone(); flat_model = e.model.clone(); flat_base = e.endpoint.clone(); flat_key = e.api_key.clone(); flat_profile = e.profile.clone();
             }
             let dir = Self::config_dir();
-            let _ = std::fs::create_dir_all(&dir);
             let json = serde_json::json!({
                 /* P3 (R4.1): the config is a persisted artifact, so it carries
                  * the §5 schema_version; the reader treats absence as v0 and
@@ -549,37 +548,69 @@ impl ChatConfig {
                 "archive_recovery_budget_chars": self.archive_recovery_budget_chars,
             })
             .to_string();
-            let tmp = dir.join("config.json.tmp");
-            /* P2-10: the config carries the API key — create the tmp with
-             * 0600 from the FIRST write instead of write-then-chmod (which
-             * left a world-readable window on every save). Non-unix has no
-             * mode API; the write is the best available there. */
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                use std::io::Write;
-                let _ = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&tmp)
-                    .and_then(|mut f| f.write_all(json.as_bytes()));
+            /* A config that did not land is NOT a saved config: the
+             * provider/model/key the user just set is not in effect for the
+             * next session. Report the failure instead of letting the write
+             * disappear (RULES 3.5.3 — no ignored I/O on a critical path). */
+            if let Err(e) = save_config_atomic(&dir, &json, self.spend_total_usd) {
+                eprintln!(
+                    "\x1b[31m[sofuu] E_CONFIG: could not save {}: {}\x1b[0m",
+                    Self::config_path().display(),
+                    e
+                );
             }
-            #[cfg(not(unix))]
-            {
-                let _ = std::fs::write(&tmp, &json);
-            }
-            let _ = std::fs::rename(&tmp, Self::config_path());
-            /* P3: record the flushed spend mark so the per-turn cost hook
-             * (js_chat_report_usage) can throttle full-config rewrites to
-             * once per accrued cent. */
-            SPEND_SAVED_BITS.store(
-                self.spend_total_usd.to_bits(),
-                std::sync::atomic::Ordering::Relaxed,
-            );
         }
     }
+}
+
+/// Write the config JSON to `<dir>/config.json` and, on success, advance the
+/// persisted-spend mark to the total that is now on disk.
+///
+/// The mark only moves when the file actually landed. It is what throttles
+/// the per-turn cost hook's full-config rewrite (RULES: no ignored I/O on a
+/// critical path) — a mark that advanced past a FAILED write made the
+/// persisted lifetime spend drift below the real total, with nothing saying
+/// the write had been lost.
+fn save_config_atomic(
+    dir: &std::path::Path,
+    json: &str,
+    spend_total_usd: f64,
+) -> Result<(), String> {
+    write_config_atomic(dir, json)?;
+    SPEND_SAVED_BITS.store(spend_total_usd.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Write `json` to `<dir>/config.json`: a 0600 temp file beside the target,
+/// then a rename. The rename is what makes the swap atomic, so a reader never
+/// sees a half-written config. Returns the I/O error when the write or the
+/// rename failed — the caller must not report a failed write as a save.
+fn write_config_atomic(dir: &std::path::Path, json: &str) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let tmp = dir.join("config.json.tmp");
+    let target = dir.join("config.json");
+    /* P2-10: the config carries the API key — create the tmp with 0600 from
+     * the FIRST write instead of write-then-chmod (which left a
+     * world-readable window on every save). Non-unix has no mode API; the
+     * write is the best available there. */
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| e.to_string())?;
+        f.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| e.to_string())
 }
 
 // ── Slash commands ──────────────────────────────────────────────
@@ -801,6 +832,17 @@ fn mode_hint(mode: &str) -> &'static str {
     }
 }
 
+/// What `/brain on` says about persistence. Mirrors the welcome panel's
+/// Memory row: a build without the QTSQ codec no-ops every brain write, so
+/// "enabled" must not imply that what it stores survives a restart.
+fn brain_enable_note() -> &'static str {
+    if sofuu_ffi::qtsq_linked() {
+        "  ✓ Brain enabled (persists across sessions)\n"
+    } else {
+        "  ✓ Brain enabled, but NOT persisting (QTSQ codec not linked in this build — run `sofuu doctor`)\n"
+    }
+}
+
 /// Set + persist the permission profile. The JS driver re-applies it to
 /// the agent runtime (sofuu.agent.setPermissions) after every command.
 fn set_mode(cfg: &mut ChatConfig, mode: &str) -> &'static str {
@@ -991,6 +1033,20 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
             let is_gguf = picked.ends_with(".gguf")
                 || sofuu_core::infer::clean_model_path(&picked).extension().map_or(false, |e| e == "gguf");
             if is_gguf && (cfg.provider.is_empty() || cfg.provider == "local") {
+                /* A local model IS a file on disk: the local provider loads
+                 * the GGUF the path names. Announcing one that is not there
+                 * is a success banner for an unavailable operation — the
+                 * welcome panel would then show a working local model and
+                 * the next turn would fail at load time. Refuse the change
+                 * and say which file is missing. */
+                let path = sofuu_core::infer::clean_model_path(&picked);
+                if !path.is_file() {
+                    chat_out(&format!(
+                        "  ✗ Local model file not found: {}\n  Model unchanged — /model <path> needs an existing GGUF file.\n",
+                        path.display()
+                    ));
+                    return "ok";
+                }
                 cfg.provider = "local".to_string();
                 cfg.base_url.clear();
                 cfg.api_key.clear();
@@ -1129,7 +1185,7 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
             } else if arg == "on" {
                 cfg.brain = true;
                 cfg.save();
-                chat_out("  ✓ Brain enabled\n");
+                chat_out(brain_enable_note());
                 "ok"
             } else {
                 chat_out("  Usage: /brain [on|off|info|repair|prune|clear]\n");
@@ -4242,16 +4298,50 @@ mod tests {
         assert_eq!(*prices, [2.50, 10.00]);
     }
 
+    /// The effective context window, and the clamps around it.
+    ///
+    /// This used to read `effective_ctx_window(provider, n)` — a
+    /// provider-keyed table that no longer exists. Capabilities are
+    /// resolved from the MODEL's evidence (registry > discovered > learned)
+    /// and `resolved_ctx_window` is the chat-side entry point, so the
+    /// assertions below pin the same intent against the current ladder:
+    /// nothing configured resolves to the model's own window, an EXPLICIT
+    /// value is obeyed as typed, an INHERITED global shrinks to the model's
+    /// real bound, and a model with no evidence falls back to the
+    /// conservative default. (In a test build the discovered/learned
+    /// stores are empty, so the registry rung is the only one in play and
+    /// the numbers below are deterministic.)
     #[test]
     fn ctx_window_effective_and_clamped() {
-        // 0 = provider default.
-        assert_eq!(effective_ctx_window("openai", 0), 128_000);
-        assert_eq!(effective_ctx_window("anthropic", 0), 128_000);
-        assert_eq!(effective_ctx_window("local", 0), 32_768);
-        assert_eq!(effective_ctx_window("custom-xyz", 0), 32_768);
-        // An explicit window wins over the default — up to the 1M cap.
-        assert_eq!(effective_ctx_window("openai", 1_000_000), 1_000_000);
-        assert_eq!(effective_ctx_window("local", 1_000_000), 1_000_000);
+        let cfg_for = |model: &str, window: i64, explicit: bool| ChatConfig {
+            model: model.into(),
+            ctx_window: window,
+            ctx_window_explicit: explicit,
+            ..Default::default()
+        };
+        // 0 = the model's own window (the registry rung).
+        assert_eq!(resolved_ctx_window(&cfg_for("gpt-4o", 0, false)), 128_000);
+        assert_eq!(
+            resolved_ctx_window(&cfg_for("claude-sonnet-4", 0, false)),
+            200_000
+        );
+        assert_eq!(resolved_ctx_window(&cfg_for("llama3.1", 0, false)), 131_072);
+        // A model with no evidence at all reads as the conservative default.
+        assert_eq!(
+            resolved_ctx_window(&cfg_for("custom-xyz", 0, false)),
+            sofuu_core::ml::alloc::policy::UNKNOWN_WINDOW
+        );
+        // An EXPLICIT window (the user typed /ctx) is obeyed as given.
+        assert_eq!(
+            resolved_ctx_window(&cfg_for("gpt-4o", 1_000_000, true)),
+            1_000_000
+        );
+        assert_eq!(
+            resolved_ctx_window(&cfg_for("llama3.1", 1_000_000, true)),
+            1_000_000
+        );
+        // An INHERITED global shrinks to the model's real bound.
+        assert_eq!(resolved_ctx_window(&cfg_for("llama3", 1_000_000, false)), 8_192);
         // load() clamps corrupt/over-the-cap persisted values. The cap is
         // MAX_CTX_WINDOW (4 MiB) — it was raised from 1,000,000 because the
         // /ctx picker's own "1M" preset (1048576) was being REJECTED by the
@@ -4301,6 +4391,27 @@ mod tests {
         let rows = welcome_panel_at(&cfg, "s-ab12", "/tmp/work", 120);
         let line = rows.iter().find(|r| r.contains("Memory:")).unwrap();
         assert!(line.contains("off"), "{line}");
+    }
+
+    /// `/brain on` must not claim a persistence the binary cannot deliver
+    /// either: the confirmation and the welcome panel's Memory row have to
+    /// agree, or the panel reads as a lie about the same feature.
+    #[test]
+    fn brain_enable_note_agrees_with_the_memory_row() {
+        let note = brain_enable_note();
+        let cfg = ChatConfig { brain: true, ..Default::default() };
+        let rows = welcome_panel_at(&cfg, "s-ab12", "/tmp/work", 120);
+        let line = rows
+            .iter()
+            .find(|r| r.contains("Memory:"))
+            .unwrap_or_else(|| panic!("no Memory row in {:?}", rows));
+        if sofuu_ffi::qtsq_linked() {
+            assert!(note.contains("persists across sessions"), "{note}");
+            assert!(line.contains("persists across sessions"), "{line}");
+        } else {
+            assert!(note.contains("NOT persisting"), "{note}");
+            assert!(line.contains("NOT persisting"), "{line}");
+        }
     }
 
     #[test]
@@ -4465,6 +4576,108 @@ mod tests {
             }
         }
     }
+
+    /// A config write that fails must be reported AND must not advance the
+    /// persisted-spend mark: the mark is what throttles the per-turn cost
+    /// hook's rewrite, so a mark that moved past a failed write made the
+    /// persisted lifetime spend drift below the real total with nothing
+    /// saying the write had been lost.
+    #[test]
+    fn a_failed_config_write_is_reported_and_keeps_the_spend_mark() {
+        let tmp = std::env::temp_dir().join(format!(
+            "sofuu-cfg-write-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // A regular file where the config directory should be: every write
+        // under it fails with a real filesystem error (ENOTDIR).
+        let blocker = tmp.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let before = SPEND_SAVED_BITS.load(std::sync::atomic::Ordering::Relaxed);
+        let err = save_config_atomic(&blocker.join("sub"), "{}", 1.25)
+            .expect_err("a write under a non-directory must fail");
+        assert!(!err.is_empty(), "the failure must carry a reason");
+        assert_eq!(
+            SPEND_SAVED_BITS.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "a failed write must not advance the persisted-spend mark"
+        );
+
+        // The same call against a real directory lands and moves the mark.
+        save_config_atomic(&tmp, "{\"ok\":true}", 1.25)
+            .expect("a real directory must accept the config");
+        assert!(tmp.join("config.json").exists(), "the config file must exist");
+        assert_eq!(
+            SPEND_SAVED_BITS.load(std::sync::atomic::Ordering::Relaxed),
+            1.25f64.to_bits(),
+            "a successful write moves the mark to what is on disk"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The config carries the API key: the file must not be world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn config_file_is_written_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!(
+            "sofuu-cfg-mode-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        write_config_atomic(&tmp, "{}").expect("write");
+        let mode = std::fs::metadata(tmp.join("config.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the config must be owner-only (got {mode:o})");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// `/model <path.gguf>` on the local provider names a FILE the local
+    /// engine loads. Announcing a model whose file is not there is a success
+    /// banner for an unavailable operation: the welcome panel would show a
+    /// working local model and the next turn would fail at load time. The
+    /// change is refused and the reason is printed.
+    #[test]
+    fn model_command_refuses_a_missing_local_gguf() {
+        let mut c = ChatConfig::defaults();
+        let missing = std::env::temp_dir().join("sofuu-no-such-model-42.gguf");
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(
+            handle_slash(&mut c, &format!("/model {}", missing.display())),
+            "ok"
+        );
+        assert!(c.model.is_empty(), "a missing model file must not be set");
+        assert!(
+            c.provider.is_empty(),
+            "a missing model file must not switch the provider"
+        );
+
+        // An existing file is accepted (and the provider becomes "local").
+        let tmp = std::env::temp_dir().join(format!(
+            "sofuu-model-pick-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let gguf = tmp.join("model.gguf");
+        std::fs::write(&gguf, b"placeholder bytes - the pick only checks presence").unwrap();
+        assert_eq!(
+            handle_slash(&mut c, &format!("/model {}", gguf.display())),
+            "ok"
+        );
+        assert_eq!(c.model, gguf.to_string_lossy());
+        assert_eq!(c.provider, "local");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
 }
 
     /// Wide glyphs are 2 cells, so the panel's measure (cell_w) and its

@@ -74,17 +74,23 @@ fn mesh_root(project: &Path) -> PathBuf {
     project.to_path_buf()
 }
 
-/// List the project's sessions, newest activity first. Missing/corrupt
-/// registry → empty list (a broken file must never break the sidebar).
-pub fn list_sessions(project: &Path) -> Vec<SessionInfo> {
+/// List the project's sessions, newest activity first.
+///
+/// A MISSING registry file means the project has no chats yet — an empty
+/// list, not an error. A registry that exists but cannot be read or parsed
+/// IS an error: reporting "no sessions" there would hide a broken store
+/// behind an empty sidebar.
+pub fn list_sessions(project: &Path) -> Result<Vec<SessionInfo>, String> {
     let path = sessions_dir(&mesh_root(project)).join("registry.json");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("registry unreadable ({}): {e}", path.display())),
     };
     let Ok(reg) = serde_json::from_str::<Registry>(&text) else {
-        return Vec::new();
+        return Err(format!("registry malformed ({})", path.display()));
     };
     let mut sessions = reg.sessions;
     sessions.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
-    sessions
+    Ok(sessions)
 }

@@ -67,7 +67,10 @@ pub const E_HARDWARE_DISABLED: &str = "E_HARDWARE_DISABLED";
 pub const E_APPROVAL_REQUIRED: &str = "E_APPROVAL_REQUIRED";
 
 /// Telemetry older than this vetoes coordinate-dependent commands (§4.3).
-pub const TELEMETRY_MAX_AGE_MS: u64 = 1_500;
+///
+/// One window for the whole division: the Kaze capability path reads the same
+/// number from `robotics/safety.rs`, so the two cannot drift apart.
+pub const TELEMETRY_MAX_AGE_MS: u64 = super::safety::TELEMETRY_MAX_AGE_MS;
 /// HDOP floor for accepting a position as usable.
 pub const GPS_MAX_HDOP: f32 = 2.0;
 /* Conservative bounds used when the policy omits them. A missing bound must
@@ -717,6 +720,28 @@ pub fn gate_send(
     /* Payload bounds — reject, never clamp. */
     if let Err(v) = check_bounds(policy, state, frame, now_ms) {
         return v;
+    }
+
+    /* Link loss: a frame that moves a vehicle needs a vehicle that is still
+     * answering. When the link was alive and has gone quiet, the vehicle's
+     * state is unknown — it may have landed, gone out of range or lost its
+     * own link — so an actuator frame is refused rather than fired into the
+     * dark. The heartbeat is not actuator-bearing and keeps flowing, which is
+     * exactly what a dead-man switch is for. */
+    if spec.class == Class::Actuator {
+        if let Some(last) = state.last_telemetry_ms {
+            let quiet_for = now_ms.saturating_sub(last);
+            if quiet_for > TELEMETRY_MAX_AGE_MS {
+                return Verdict::deny(
+                    E_SAFETY_VIOLATION,
+                    "R-HW/failClosed/linkLost",
+                    format!(
+                        "no telemetry for {quiet_for} ms; the link is not known to be alive, so {} was not sent",
+                        spec.name
+                    ),
+                );
+            }
+        }
     }
 
     /* Rate limits: the strictest matching period wins. */
@@ -1412,6 +1437,28 @@ mod tests {
         elsewhere.set_u32_at(8, 40_000_000);
         st.observe(&elsewhere, 30);
         assert_eq!(st.home, Some((52.1234, 4.1234)), "home is set once");
+    }
+
+    /* ── link loss ───────────────────────────────────────────────── */
+
+    #[test]
+    fn a_link_that_went_quiet_vetoes_an_actuator_frame() {
+        let p = open_policy();
+        let mut st = state_at_home(0);
+        // The link was alive and has gone silent: the vehicle's state is
+        // unknown, so nothing that moves it may leave.
+        let v = gate_send(&p, &mut st, &SendRequest { device: DEV, frame: &takeoff(10.0) }, 2_000, false);
+        assert!(!v.allowed);
+        assert_eq!(v.rule, "R-HW/failClosed/linkLost");
+        assert!(v.reason.contains("not known to be alive"), "{}", v.reason);
+    }
+
+    #[test]
+    fn a_link_that_went_quiet_still_carries_the_dead_man_heartbeat() {
+        let p = open_policy();
+        let mut st = state_at_home(0);
+        let hb = gate_send(&p, &mut st, &SendRequest { device: DEV, frame: &msg_heartbeat(0, 255, 191) }, 5_000, false);
+        assert!(hb.allowed, "{hb:?}");
     }
 
     /* ── rate limits ──────────────────────────────────────────────── */

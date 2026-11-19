@@ -161,6 +161,8 @@ export default function App() {
           activeId={currentId}
           previewLabel={preview ? preview.label : null}
           sessions={state.sessions}
+          error={state.sessionsError}
+          source={state.sessionsSource}
           onNewChat={store.newChat}
           onSelectSession={switchSession}
           onDeleteSession={store.deleteSession}
@@ -170,6 +172,16 @@ export default function App() {
 
         <div className="content">
           {state.bootError && <div className="banner error">{state.bootError}</div>}
+          {state.permissionsError && (
+            <div className="banner waiting">Permission profile not applied: {state.permissionsError}</div>
+          )}
+          {state.sessionsError && (
+            <div className="banner error">
+              {state.sessionsSource
+                ? `Chats served from the on-disk registry — the engine did not answer: ${state.sessionsError}`
+                : `Chats unavailable: ${state.sessionsError}`}
+            </div>
+          )}
 
           {preview ? (
             <ChatPane messages={[]} chatFontSize={state.chatFontSize} phase={null} preview={preview} />

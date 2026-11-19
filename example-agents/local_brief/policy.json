@@ -1,0 +1,5 @@
+{
+  "tools": {
+    "allow": ["kaze.log.*", "kaze.ai.*", "kaze.tool.*", "read_document"]
+  }
+}

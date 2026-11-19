@@ -1,6 +1,5 @@
 {
   "entry": "evaluate_trade",
-  "interval": "2s",
   "fuel": 200000,
   "args": {
     "ticker": "NVDA",

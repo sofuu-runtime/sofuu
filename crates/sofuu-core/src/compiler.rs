@@ -1479,6 +1479,14 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     let kaze_needs_json = serde_json::to_string(&kaze_needs).unwrap_or_else(|_| "[]".to_string());
     let kaze_source_json = serde_json::to_string(&kaze_src).unwrap_or_else(|_| "\"\"".to_string());
     let kaze_name_json = serde_json::to_string(file_stem).unwrap_or_else(|_| "\"agent\"".to_string());
+    /* The name a diagnostic should carry: the entry's own file name. The
+     * artifact is portable, so the path it was compiled from is not. */
+    let kaze_source_name = entry_path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "agent".to_string());
+    let kaze_source_name_json =
+        serde_json::to_string(&kaze_source_name).unwrap_or_else(|_| "\"agent\"".to_string());
 
     let bootstrap = format!(r##"
 (function() {{
@@ -1491,23 +1499,227 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     }}
     var kazeSource = {kaze_source_json};
     var kazeName = {kaze_name_json};
-    /* Declared families that need a real asynchronous backend. A routine that
-     * names ai or tool must never run through the synchronous host, which has
-     * no model or MCP connection and would refuse the call. */
+    var kazeSourceName = {kaze_source_name_json};
     var kazeNeeds = {kaze_needs_json};
-    var asyncFamilies = {{ ai: true, tool: true }};
-    var needsAsync = false;
-    for (var nf = 0; nf < kazeNeeds.length; nf++) {{
-        if (asyncFamilies[kazeNeeds[nf]]) {{ needsAsync = true; break; }}
-    }}
-    // Declarations in the agent source are not host grants.
-    var defaultGrants = [];
-    var policyPath = null;
-    var policyJson = null;
-    var pins = {{}};
-    var sim = null;
     var defaultEntry = {default_entry_json};
     var routineSignatures = {routine_signatures_json};
+
+    /* A declared family that leaves the Kaze VM as an owned request needs the
+     * asynchronous coordinator. The synchronous host has no model and no MCP
+     * connection, so it would refuse the call instead of performing it. */
+    function asyncFamily(declared) {{
+        if (declared === 'ai' || declared === 'tool') return true;
+        var open = declared.indexOf('(');
+        var close = declared.lastIndexOf(')');
+        if (open === -1 || close < open) return false;
+        var inner = declared.slice(open + 1, close).replace(/^["']/, '').replace(/["']$/, '');
+        return inner === 'ai' || inner === 'tool';
+    }}
+    var needsAsync = false;
+    for (var nf = 0; nf < kazeNeeds.length; nf++) {{
+        if (asyncFamily(kazeNeeds[nf])) {{ needsAsync = true; break; }}
+    }}
+
+    /* ---- resolved options ------------------------------------------------
+     * One option set, written by three tiers: the command line, the
+     * environment and the configuration file. The command line is final, the
+     * environment beats the file, and the file fills what nobody else set.
+     * Nothing here names a provider, a model, an endpoint or a business
+     * default: the operator's own selection travels through unchanged. */
+    var optCaps = Object.create(null);
+    var optGrants = [];
+    var optCapSource = Object.create(null);
+    var optPolicyDoc = null;
+    var optPolicyText = null;
+    var optPins = Object.create(null);
+    var optSim = null;
+    var optEntry = defaultEntry;
+    var optFuel = 200000;
+    var optTimeoutMs = null;
+    var optHeapBytes = null;
+    var optTicks = null;
+    var optTickMs = null;
+    var optAi = null;
+    var optMcp = null;
+    var optSource = Object.create(null);
+    var cliArgs = Object.create(null);
+    var args = Object.create(null);
+    var positionals = [];
+
+    /* The configuration file owns these names; they are never routine
+     * arguments. */
+    var configKeys = ['args', 'entry', 'fuel', 'interval', 'every', 'daemon', 'caps',
+        'grants', 'policy', 'policyJson', 'policyPath', 'pins', 'sim', 'timeoutMs',
+        'heapBytes', 'ticks', 'tickMs', 'ai', 'mcp', 'config'];
+    /* The environment spells the same options in its own upper-case names. */
+    var envKeys = ['args', 'entry', 'fuel', 'interval', 'every', 'daemon', 'caps',
+        'grants', 'policy', 'policy_json', 'policy_path', 'pins', 'sim',
+        'timeout_ms', 'heap_bytes', 'ticks', 'tick_ms', 'ai', 'mcp', 'config'];
+
+    function fail(code, message) {{
+        var line = code + ': ' + message;
+        if (typeof process !== 'undefined' && process.stderr && process.stderr.write) {{
+            process.stderr.write(line + '\n');
+        }} else {{
+            console.error(line);
+        }}
+        if (typeof process !== 'undefined' && process.exit) process.exit(1);
+    }}
+
+    /* A numeric option. The runtime enforces its own range; this refuses a
+     * value that is not a number, so a typo is an error and not a setting
+     * that silently keeps its default. */
+    function wholeNumber(value, name, minimum) {{
+        if (typeof value === 'number' && isFinite(value) && Math.floor(value) === value && value >= minimum) return value;
+        if (typeof value === 'string' && /^[0-9]+$/.test(value.trim())) {{
+            var parsed = parseInt(value.trim(), 10);
+            if (parsed >= minimum) return parsed;
+        }}
+        fail('E_KAZE_ARGS', name + ' must be a whole number of at least ' + minimum);
+        return null;
+    }}
+
+    /* Claim an option for a tier. The command line is final, the environment
+     * beats the configuration file, and the file fills the rest. */
+    function claim(name, tier) {{
+        var current = optSource[name];
+        if (current === 'cli') return false;
+        if (current === 'env' && tier === 'config') return false;
+        optSource[name] = tier;
+        return true;
+    }}
+
+    function grantCap(family, backend, tier) {{
+        var current = optCapSource[family];
+        if (current === 'cli') return true;
+        if (current === 'env' && tier === 'config') return true;
+        optCapSource[family] = tier;
+        optCaps[family] = backend ? backend : true;
+        if (optGrants.indexOf(family) === -1) optGrants.push(family);
+        return true;
+    }}
+
+    /* "family" or "family=backend" — the one spelling every tier uses. */
+    function parseCapSpec(spec, tier) {{
+        var text = String(spec).trim();
+        if (!text) {{ fail('E_CAP_INVALID', 'a capability grant needs a family'); return false; }}
+        var eq = text.indexOf('=');
+        var family = (eq === -1 ? text : text.slice(0, eq)).trim();
+        var backend = (eq === -1 ? '' : text.slice(eq + 1)).trim();
+        if (!family) {{ fail('E_CAP_INVALID', 'a capability grant needs a family'); return false; }}
+        if (eq !== -1 && !backend) {{ fail('E_CAP_INVALID', "'" + family + "' needs a backend name"); return false; }}
+        return grantCap(family, backend, tier);
+    }}
+
+    function parsePinSpec(spec, name) {{
+        var text = String(spec).trim();
+        var eq = text.indexOf('=');
+        if (eq <= 0) {{ fail('E_KAZE_ARGS', name + ' expects name=<0..65535>'); return null; }}
+        var pinName = text.slice(0, eq).trim();
+        var pinRaw = text.slice(eq + 1).trim();
+        if (!pinName || !/^[0-9]+$/.test(pinRaw) || parseInt(pinRaw, 10) > 65535) {{
+            fail('E_KAZE_ARGS', name + ' expects name=<0..65535>');
+            return null;
+        }}
+        return [pinName, parseInt(pinRaw, 10)];
+    }}
+
+    function parseSimPairs(spec, name) {{
+        var out = {{}};
+        var pairs = String(spec).split(',');
+        for (var si = 0; si < pairs.length; si++) {{
+            var pair = pairs[si].trim();
+            if (!pair) continue;
+            var eq = pair.indexOf('=');
+            if (eq <= 0) {{ fail('E_CAP_INVALID', name + ' expects key=value'); return null; }}
+            out[pair.slice(0, eq).trim()] = pair.slice(eq + 1).trim();
+        }}
+        return out;
+    }}
+
+    /* The deny-all policy `--no-policy` selects. It is a policy, not the
+     * absence of one: every capability call is refused by a rule the
+     * runtime evaluates, so the refusal never depends on a missing document
+     * happening to be read as a refusal. */
+    function denyAllPolicy() {{
+        return {{ tools: {{ deny: ['kaze.*'] }} }};
+    }}
+
+    /* The capability families `--sim` must never answer for. The
+     * robotics/drone exception covers physical behaviour only: a simulated
+     * AI, tool, memory or alert result is not a machine state, and a
+     * simulator that could answer for one would be a general-purpose
+     * substitute. */
+    var nonPhysicalSimKeys = ['ai', 'tool', 'memory', 'alert', 'policy', 'log'];
+
+    function physicalSimOnly(pairs, name) {{
+        for (var simKey in pairs) {{
+            if (nonPhysicalSimKeys.indexOf(simKey) === -1) continue;
+            fail('E_CAP_INVALID', name + " cannot set '" + simKey + "': a simulated " + simKey +
+                ' result is not permitted; --sim only sets the initial physical machine state of a drone=sim / rover=sim test');
+            return false;
+        }}
+        return true;
+    }}
+
+    /* A structured option spelled as text (the environment and the command
+     * line carry JSON). Anything that is not a JSON object is a
+     * configuration error, not a value to be ignored. */
+    function jsonObjectOption(text, name) {{
+        var value = null;
+        try {{
+            value = JSON.parse(text);
+        }} catch (parseErr) {{
+            fail('E_CONFIG', name + ' must be a JSON object');
+            return null;
+        }}
+        if (!value || typeof value !== 'object' || Array.isArray(value)) {{
+            fail('E_CONFIG', name + ' must be a JSON object');
+            return null;
+        }}
+        return value;
+    }}
+
+    function parseInterval(s, name) {{
+        var label = name || '--every';
+        var text = ('' + s).trim().toLowerCase();
+        if (!text) {{ fail('E_KAZE_ARGS', label + ' needs a duration'); return null; }}
+        var units = [['ms', 1, 10], ['s', 1000, 100], ['m', 60000, 1000], ['h', 3600000, 1000], ['d', 86400000, 1000]];
+        for (var ui = 0; ui < units.length; ui++) {{
+            var suffix = units[ui][0];
+            if (!text.endsWith(suffix)) continue;
+            var amount = durationAmount(text.slice(0, text.length - suffix.length));
+            if (amount === null) {{ fail('E_KAZE_ARGS', label + ' expects a positive number of ' + suffix); return null; }}
+            return Math.max(units[ui][2], Math.round(amount * units[ui][1]));
+        }}
+        var plain = durationAmount(text);
+        if (plain === null) {{ fail('E_KAZE_ARGS', label + ' expects a duration such as 500ms, 2s, 10m, 1h or 1d'); return null; }}
+        return plain >= 100 ? Math.round(plain) : Math.round(plain * 1000);
+    }}
+
+    /* A plain, finite, positive number. Anything else is not a duration, and
+     * a duration that cannot be read must not silently become the default:
+     * a supervisor that runs every 5s because the operator wrote "5x" is not
+     * the supervisor the operator asked for. */
+    function durationAmount(text) {{
+        if (!/^[0-9]+(\.[0-9]+)?$/.test(text)) return null;
+        var amount = Number(text);
+        if (!isFinite(amount) || amount <= 0) return null;
+        return amount;
+    }}
+
+    /* A policy file is read as text and handed to the runtime, which parses it
+     * strictly: a duplicate key is an error there, not a rule that silently
+     * disappears here. */
+    function readPolicyFile(path) {{
+        try {{
+            if (!sofuu.fs || !sofuu.fs.readFileSync) throw new Error('policy file access is unavailable');
+            return '' + sofuu.fs.readFileSync(path, 'utf8');
+        }} catch (policyErr) {{
+            fail('E_CAP_DENIED', 'cannot read policy ' + path + ': ' + (policyErr && policyErr.message ? policyErr.message : policyErr));
+            return null;
+        }}
+    }}
 
     var argv = (typeof process !== 'undefined' && process.argv) ? process.argv.slice(2) : [];
     if (argv.indexOf('--help') !== -1 || argv.indexOf('-h') !== -1) {{
@@ -1521,16 +1733,28 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             "  --every <interval>     Supervisor cycle interval (e.g. 500ms, 2s, 10s, 1m, 1h; default: 5s)\n" +
             "  --interval <interval>  Alias for --every\n" +
             "  --fuel <n>             Instruction budget limit (default: 200000)\n" +
-            "  --cap <name>           Grant capability backend (e.g. drone=sim)\n" +
+            "  --cap <family>[=<backend>]  Grant a capability family and the backend behind it\n" +
             "  --policy <file>        Load the explicit capability policy\n" +
+            "  --no-policy            Run under a deny-all policy (every capability call is refused)\n" +
             "  --pin <name>=<line>    Configure a device pin\n" +
-            "  --sim <key=value,...>   Physical test state; requires an explicit simulator\n" +
+            "  --sim <key=value,...>  Physical test state; requires an explicit simulator\n" +
+            "  --ai <json>            Backend configuration for the ai family\n" +
+            "  --mcp <json>           Backend configuration for MCP servers\n" +
+            "  --timeout <ms>         Overall run deadline in milliseconds\n" +
+            "  --heap-kb <n>          Heap budget in kilobytes\n" +
+            "  --ticks <n>            Supervisor ticks after the entry finishes\n" +
+            "  --tick-ms <ms>         Supervisor tick interval in milliseconds\n" +
             "  -i, --interactive      Launch interactive Agent TUI shell\n" +
             "  -h, --help             Show this help message\n\n" +
             "Configuration Precedence (Production 12-Factor):\n" +
             "  1. CLI Arguments (--arg / positionals)\n" +
             "  2. Environment Variables (AGENT_<PARAM> / SOFUU_<PARAM>)\n" +
-            "  3. Configuration File (--config <path> / ./agent.config.json)\n");
+            "  3. Configuration File (--config <path> / ./agent.config.json)\n\n" +
+            "Configuration File Keys:\n" +
+            "  entry, fuel, every, daemon, caps, grants, policy, policyJson, policyPath,\n" +
+            "  pins, sim, timeoutMs, heapBytes, ticks, tickMs, ai, mcp, args\n\n" +
+            "Environment: the same names in upper case (AGENT_ENTRY, AGENT_FUEL,\n" +
+            "  AGENT_CAPS, AGENT_POLICY, AGENT_AI, ...); ai and mcp carry a JSON object.\n");
         return;
     }}
 
@@ -1539,39 +1763,16 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     var explicitDaemon = isDaemon;
     var intervalMs = 5000;
     var intervalRaw = '5s';
-    var explicitInterval = false;
-    var entryRoutine = defaultEntry;
-    var explicitEntry = false;
-    var fuel = 200000;
-    var explicitFuel = false;
     var explicitConfigFile = null;
-    var cliArgs = {{}};
-    var args = {{}};
-    var positionals = [];
+    var policyPath = null;
+    var policyRefused = false;
 
-    function parseInterval(s) {{
-        if (!s) return 5000;
-        s = ('' + s).trim().toLowerCase();
-        if (s.endsWith('ms')) {{
-            return Math.max(10, parseInt(s.slice(0, -2), 10) || 5000);
-        }}
-        if (s.endsWith('s')) {{
-            return Math.max(100, Math.round((parseFloat(s.slice(0, -1)) || 5) * 1000));
-        }}
-        if (s.endsWith('m')) {{
-            return Math.max(1000, Math.round((parseFloat(s.slice(0, -1)) || 1) * 60 * 1000));
-        }}
-        if (s.endsWith('h')) {{
-            return Math.max(1000, Math.round((parseFloat(s.slice(0, -1)) || 1) * 3600 * 1000));
-        }}
-        if (s.endsWith('d')) {{
-            return Math.max(1000, Math.round((parseFloat(s.slice(0, -1)) || 1) * 86400 * 1000));
-        }}
-        var num = parseFloat(s);
-        if (!isNaN(num) && num > 0) {{
-            return num >= 100 ? Math.round(num) : Math.round(num * 1000);
-        }}
-        return 5000;
+    /* The value of `--name value` or `--name=value`. */
+    function flagValue(flag, name, code) {{
+        if (flag.indexOf('=') !== -1) return flag.slice(flag.indexOf('=') + 1);
+        if (i + 1 < argv.length) return argv[++i];
+        fail(code || 'E_KAZE_ARGS', name + ' needs a value');
+        return null;
     }}
 
     for (var i = 0; i < argv.length; i++) {{
@@ -1580,120 +1781,226 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         if (a === '--daemon' || a === '-d') {{
             isDaemon = true;
             explicitDaemon = true;
+            optSource.daemon = 'cli';
             continue;
         }}
-        if ((a === '--every' || a === '--interval') && i + 1 < argv.length) {{
-            intervalRaw = argv[++i];
-            intervalMs = parseInterval(intervalRaw);
+        if (a === '--every' || a === '--interval') {{
+            intervalRaw = flagValue(a, a);
+            if (intervalRaw === null) return;
+            intervalMs = parseInterval(intervalRaw, a);
+            if (intervalMs === null) return;
             isDaemon = true;
-            explicitInterval = true;
             explicitDaemon = true;
+            optSource.interval = 'cli';
         }} else if (a.startsWith('--every=') || a.startsWith('--interval=')) {{
             intervalRaw = a.slice(a.indexOf('=') + 1);
-            intervalMs = parseInterval(intervalRaw);
+            intervalMs = parseInterval(intervalRaw, a);
+            if (intervalMs === null) return;
             isDaemon = true;
-            explicitInterval = true;
             explicitDaemon = true;
-        }} else if ((a === '--config' || a === '-c') && i + 1 < argv.length) {{
-            explicitConfigFile = argv[++i];
+            optSource.interval = 'cli';
+        }} else if (a === '--config' || a === '-c') {{
+            explicitConfigFile = flagValue(a, '--config');
+            if (explicitConfigFile === null) return;
         }} else if (a.startsWith('--config=')) {{
             explicitConfigFile = a.slice(9);
         }} else if (a.startsWith('-c=')) {{
             explicitConfigFile = a.slice(3);
-        }} else if (a === '--entry' && i + 1 < argv.length) {{
-            entryRoutine = argv[++i];
-            explicitEntry = true;
+        }} else if (a === '--entry') {{
+            optEntry = flagValue(a, '--entry');
+            if (optEntry === null) return;
+            optSource.entry = 'cli';
         }} else if (a.startsWith('--entry=')) {{
-            entryRoutine = a.slice(8);
-            explicitEntry = true;
-        }} else if (a === '--cap' || a.startsWith('--cap=')) {{
-            var capVal = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
-            if (!capVal) {{ console.error('E_CAP_INVALID: --cap needs a family'); if (process.exit) process.exit(1); return; }}
-            defaultGrants.push(capVal.trim());
-        }} else if (a === '--policy' || a.startsWith('--policy=')) {{
-            policyPath = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
-            if (!policyPath) {{ console.error('E_CAP_DENIED: --policy needs a path'); if (process.exit) process.exit(1); return; }}
-        }} else if (a === '--pin' || a.startsWith('--pin=')) {{
-            var pinVal = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
-            var pinEq = pinVal ? pinVal.indexOf('=') : -1;
-            var pinName = pinEq > 0 ? pinVal.slice(0, pinEq).trim() : '';
-            var pinNumber = pinEq > 0 ? pinVal.slice(pinEq + 1).trim() : '';
-            if (!pinName || !/^\d+$/.test(pinNumber) || Number(pinNumber) > 65535) {{
-                console.error('E_KAZE_ARGS: --pin expects name=<0..65535>'); if (process.exit) process.exit(1); return;
-            }}
-            pins[pinName] = Number(pinNumber);
-        }} else if (a === '--sim' || a.startsWith('--sim=')) {{
-            var simVal = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
-            if (!simVal) {{ console.error('E_CAP_INVALID: --sim needs key=value'); if (process.exit) process.exit(1); return; }}
-            sim = sim || {{}};
-            var pairs = simVal.split(',');
-            for (var si = 0; si < pairs.length; si++) {{
-                var simEq = pairs[si].indexOf('=');
-                if (simEq <= 0) {{ console.error('E_CAP_INVALID: --sim expects key=value'); if (process.exit) process.exit(1); return; }}
-                sim[pairs[si].slice(0, simEq).trim()] = pairs[si].slice(simEq + 1).trim();
-            }}
-        }} else if (a.startsWith('--arg')) {{
-            var pair = a.indexOf('=') !== -1 ? a.slice(a.indexOf('=') + 1) : argv[++i];
-            if (pair) {{
-                var eq = pair.indexOf('=');
-                if (eq > 0) {{
-                    var k = pair.slice(0, eq).trim();
-                    var v = pair.slice(eq + 1).trim();
-                    try {{ cliArgs[k] = JSON.parse(v); }} catch (_) {{ cliArgs[k] = v; }}
-                }}
-            }}
-        }} else if (a.startsWith('--fuel=') || (a === '--fuel' && i + 1 < argv.length)) {{
-            fuel = parseInt(a.indexOf('=') !== -1 ? a.slice(7) : argv[++i], 10) || 200000;
-            explicitFuel = true;
+            optEntry = a.slice(8);
+            optSource.entry = 'cli';
+        }} else if (a === '--cap') {{
+            var capVal = flagValue(a, '--cap', 'E_CAP_INVALID');
+            if (capVal === null) return;
+            if (!parseCapSpec(capVal, 'cli')) return;
+        }} else if (a.startsWith('--cap=')) {{
+            if (!parseCapSpec(a.slice(a.indexOf('=') + 1), 'cli')) return;
+        }} else if (a === '--policy') {{
+            policyPath = flagValue(a, '--policy', 'E_CAP_DENIED');
+            if (policyPath === null) return;
+        }} else if (a.startsWith('--policy=')) {{
+            policyPath = a.slice(a.indexOf('=') + 1);
+        }} else if (a === '--no-policy') {{
+            policyRefused = true;
+            optSource.policy = 'cli';
+            /* A deny-all policy, not an absent one: the run must be refused
+             * by a rule, and the refusal must not depend on a missing
+             * document being read as a refusal somewhere else. */
+            optPolicyDoc = denyAllPolicy();
+        }} else if (a === '--pin') {{
+            var pinVal = flagValue(a, '--pin');
+            if (pinVal === null) return;
+            var cliPin = parsePinSpec(pinVal, '--pin');
+            if (cliPin === null) return;
+            optPins[cliPin[0]] = cliPin[1];
+            optSource.pins = 'cli';
+        }} else if (a.startsWith('--pin=')) {{
+            var cliPin2 = parsePinSpec(a.slice(a.indexOf('=') + 1), '--pin');
+            if (cliPin2 === null) return;
+            optPins[cliPin2[0]] = cliPin2[1];
+            optSource.pins = 'cli';
+        }} else if (a === '--sim') {{
+            var simVal = flagValue(a, '--sim', 'E_CAP_INVALID');
+            if (simVal === null) return;
+            var cliSim = parseSimPairs(simVal, '--sim');
+            if (cliSim === null) return;
+            if (!physicalSimOnly(cliSim, '--sim')) return;
+            optSim = cliSim;
+            optSource.sim = 'cli';
+        }} else if (a.startsWith('--sim=')) {{
+            var cliSim2 = parseSimPairs(a.slice(a.indexOf('=') + 1), '--sim');
+            if (cliSim2 === null) return;
+            if (!physicalSimOnly(cliSim2, '--sim')) return;
+            optSim = cliSim2;
+            optSource.sim = 'cli';
+        }} else if (a === '--ai') {{
+            var aiVal = flagValue(a, '--ai', 'E_CONFIG');
+            if (aiVal === null) return;
+            var cliAi = jsonObjectOption(aiVal, '--ai');
+            if (cliAi === null) return;
+            optAi = cliAi;
+            optSource.ai = 'cli';
+        }} else if (a.startsWith('--ai=')) {{
+            var cliAi2 = jsonObjectOption(a.slice(a.indexOf('=') + 1), '--ai');
+            if (cliAi2 === null) return;
+            optAi = cliAi2;
+            optSource.ai = 'cli';
+        }} else if (a === '--mcp') {{
+            var mcpVal = flagValue(a, '--mcp', 'E_CONFIG');
+            if (mcpVal === null) return;
+            var cliMcp = jsonObjectOption(mcpVal, '--mcp');
+            if (cliMcp === null) return;
+            optMcp = cliMcp;
+            optSource.mcp = 'cli';
+        }} else if (a.startsWith('--mcp=')) {{
+            var cliMcp2 = jsonObjectOption(a.slice(a.indexOf('=') + 1), '--mcp');
+            if (cliMcp2 === null) return;
+            optMcp = cliMcp2;
+            optSource.mcp = 'cli';
+        }} else if (a === '--fuel') {{
+            var fuelRaw = flagValue(a, '--fuel');
+            if (fuelRaw === null) return;
+            var cliFuel = wholeNumber(fuelRaw, '--fuel', 0);
+            if (cliFuel === null) return;
+            optFuel = cliFuel;
+            optSource.fuel = 'cli';
+        }} else if (a.startsWith('--fuel=')) {{
+            var cliFuel2 = wholeNumber(a.slice(7), '--fuel', 0);
+            if (cliFuel2 === null) return;
+            optFuel = cliFuel2;
+            optSource.fuel = 'cli';
+        }} else if (a === '--timeout') {{
+            var timeoutRaw = flagValue(a, '--timeout');
+            if (timeoutRaw === null) return;
+            var cliTimeout = wholeNumber(timeoutRaw, '--timeout', 1);
+            if (cliTimeout === null) return;
+            optTimeoutMs = cliTimeout;
+            optSource.timeout = 'cli';
+        }} else if (a.startsWith('--timeout=')) {{
+            var cliTimeout2 = wholeNumber(a.slice(10), '--timeout', 1);
+            if (cliTimeout2 === null) return;
+            optTimeoutMs = cliTimeout2;
+            optSource.timeout = 'cli';
+        }} else if (a === '--heap-kb') {{
+            var heapRaw = flagValue(a, '--heap-kb');
+            if (heapRaw === null) return;
+            var cliHeap = wholeNumber(heapRaw, '--heap-kb', 0);
+            if (cliHeap === null) return;
+            optHeapBytes = cliHeap * 1024;
+            optSource.heap = 'cli';
+        }} else if (a.startsWith('--heap-kb=')) {{
+            var cliHeap2 = wholeNumber(a.slice(10), '--heap-kb', 0);
+            if (cliHeap2 === null) return;
+            optHeapBytes = cliHeap2 * 1024;
+            optSource.heap = 'cli';
+        }} else if (a === '--ticks') {{
+            var ticksRaw = flagValue(a, '--ticks');
+            if (ticksRaw === null) return;
+            var cliTicks = wholeNumber(ticksRaw, '--ticks', 0);
+            if (cliTicks === null) return;
+            optTicks = cliTicks;
+            optSource.ticks = 'cli';
+        }} else if (a.startsWith('--ticks=')) {{
+            var cliTicks2 = wholeNumber(a.slice(8), '--ticks', 0);
+            if (cliTicks2 === null) return;
+            optTicks = cliTicks2;
+            optSource.ticks = 'cli';
+        }} else if (a === '--tick-ms') {{
+            var tickRaw = flagValue(a, '--tick-ms');
+            if (tickRaw === null) return;
+            var cliTick = wholeNumber(tickRaw, '--tick-ms', 1);
+            if (cliTick === null) return;
+            optTickMs = cliTick;
+            optSource.tick = 'cli';
+        }} else if (a.startsWith('--tick-ms=')) {{
+            var cliTick2 = wholeNumber(a.slice(10), '--tick-ms', 1);
+            if (cliTick2 === null) return;
+            optTickMs = cliTick2;
+            optSource.tick = 'cli';
+        }} else if (a === '--arg') {{
+            var argPair = flagValue(a, '--arg');
+            if (argPair === null) return;
+            var argEq = argPair.indexOf('=');
+            if (argEq <= 0) {{ fail('E_KAZE_ARGS', '--arg expects name=value'); return; }}
+            var argKey = argPair.slice(0, argEq).trim();
+            var argRaw = argPair.slice(argEq + 1).trim();
+            if (!argKey) {{ fail('E_KAZE_ARGS', '--arg expects name=value'); return; }}
+            try {{ cliArgs[argKey] = JSON.parse(argRaw); }} catch (_) {{ cliArgs[argKey] = argRaw; }}
+        }} else if (a.startsWith('--arg=')) {{
+            var argPair2 = a.slice(6);
+            var argEq2 = argPair2.indexOf('=');
+            if (argEq2 <= 0) {{ fail('E_KAZE_ARGS', '--arg expects name=value'); return; }}
+            var argKey2 = argPair2.slice(0, argEq2).trim();
+            var argRaw2 = argPair2.slice(argEq2 + 1).trim();
+            if (!argKey2) {{ fail('E_KAZE_ARGS', '--arg expects name=value'); return; }}
+            try {{ cliArgs[argKey2] = JSON.parse(argRaw2); }} catch (_) {{ cliArgs[argKey2] = argRaw2; }}
         }} else if (!a.startsWith('-')) {{
             positionals.push(a);
         }}
     }}
 
+    if (policyPath && policyRefused) {{
+        fail('E_CAP_DENIED', '--policy and --no-policy are mutually exclusive');
+        return;
+    }}
     if (policyPath) {{
-        try {{
-            if (!sofuu.fs || !sofuu.fs.readFileSync) throw new Error('policy file access is unavailable');
-            policyJson = '' + sofuu.fs.readFileSync(policyPath, 'utf8');
-        }} catch (policyErr) {{
-            console.error('E_CAP_DENIED: cannot read policy: ' + (policyErr && policyErr.message ? policyErr.message : policyErr));
-            if (typeof process !== 'undefined' && process.exit) process.exit(1);
-            return;
-        }}
-    }}
-    /* No --policy flag: use the same layered ~/.sofuu/policy.json +
-     * ./.sofuu/policy.json document that `sofuu script run` applies, so a
-     * compiled agent and its source behave alike. A file that exists but cannot
-     * be read is fatal rather than silently skipped (KZ-051/KZ-052). */
-    if (policyJson === null && sofuu.policy && typeof sofuu.policy.load === 'function') {{
-        try {{
-            var loadedPolicy = JSON.parse(sofuu.policy.load());
-            if (loadedPolicy && loadedPolicy.ok === false) {{
-                console.error('E_CAP_DENIED: ' + loadedPolicy.error);
-                if (typeof process !== 'undefined' && process.exit) process.exit(1);
-                return;
-            }}
-            if (loadedPolicy && loadedPolicy.ok === true && loadedPolicy.policy) {{
-                policyJson = JSON.stringify(loadedPolicy.policy);
-            }}
-        }} catch (loadErr) {{
-            /* An unreadable policy document stays "no policy": every Kaze
-             * capability then fails closed with H-3 instead of running. */
-            policyJson = null;
-        }}
+        optPolicyText = readPolicyFile(policyPath);
+        if (optPolicyText === null) return;
+        optSource.policy = 'cli';
     }}
 
-    function runOptions() {{
-        var opts = {{ fuel: fuel, grants: defaultGrants }};
-        if (entryRoutine) opts.entry = entryRoutine;
-        if (policyJson !== null) opts.policyJson = policyJson;
-        if (Object.keys(pins).length) opts.pins = pins;
-        if (sim !== null) opts.sim = sim;
-        return opts;
+    /* ---- configuration file ---------------------------------------------
+     * The file is the lowest tier: it fills the options the command line and
+     * the environment left alone, and it is the only place a routine's own
+     * arguments are configured. */
+    var env = (typeof process !== 'undefined' && process.env) ? process.env : null;
+    var envNorm = Object.create(null);
+    if (env) {{
+        for (var envKey in env) {{
+            var normKey = null;
+            var normTier = null;
+            if (envKey.startsWith('AGENT_')) {{ normKey = envKey.slice(6).toLowerCase(); normTier = 'agent'; }}
+            else if (envKey.startsWith('SOFUU_')) {{ normKey = envKey.slice(6).toLowerCase(); normTier = 'sofuu'; }}
+            if (!normKey) continue;
+            if (!envNorm[normKey]) envNorm[normKey] = Object.create(null);
+            envNorm[normKey][normTier] = env[envKey];
+        }}
+    }}
+    function envValue(name) {{
+        var entry = envNorm[name];
+        if (!entry) return null;
+        if (entry.agent !== undefined && entry.agent !== '') return entry.agent;
+        if (entry.sofuu !== undefined && entry.sofuu !== '') return entry.sofuu;
+        return null;
     }}
 
-    // --- Production Configuration Pipeline (Tiered Precedence) ---
-    // Tier 1: Config File (Base Configuration)
     var configFileToLoad = explicitConfigFile;
+    var envConfig = envValue('config');
+    if (!configFileToLoad && envConfig) configFileToLoad = envConfig;
     if (!configFileToLoad && typeof sofuu !== 'undefined' && sofuu.fs && sofuu.fs.existsSync) {{
         var autoCandidates = [
             './agent.config.json',
@@ -1708,73 +2015,321 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         }}
     }}
 
-    if (configFileToLoad) {{
-        try {{
-            if (typeof sofuu !== 'undefined' && sofuu.fs && sofuu.fs.readFileSync) {{
-                var rawCfg = sofuu.fs.readFileSync(configFileToLoad, 'utf8');
-                var cfg = JSON.parse(rawCfg);
-                if (cfg && typeof cfg === 'object') {{
-                    if (cfg.entry && !explicitEntry) entryRoutine = cfg.entry;
-                    if (cfg.fuel && !explicitFuel) fuel = parseInt(cfg.fuel, 10) || fuel;
-                    if ((cfg.every || cfg.interval) && !explicitInterval) {{
-                        intervalRaw = '' + (cfg.every || cfg.interval);
-                        intervalMs = parseInterval(intervalRaw);
-                        if (!explicitDaemon) isDaemon = true;
-                    }}
-                    if (cfg.daemon !== undefined && !explicitDaemon) isDaemon = !!cfg.daemon;
-                    if (Array.isArray(cfg.grants)) {{
-                        for (var g = 0; g < cfg.grants.length; g++) {{
-                            if (defaultGrants.indexOf(cfg.grants[g]) === -1) defaultGrants.push(cfg.grants[g]);
-                        }}
-                    }}
-                    var cfgArgs = cfg.args && typeof cfg.args === 'object' ? cfg.args : cfg;
-                    for (var k in cfgArgs) {{
-                        if (k !== 'args' && k !== 'entry' && k !== 'fuel' && k !== 'interval' && k !== 'every' && k !== 'daemon' && k !== 'grants') {{
-                            if (args[k] === undefined) {{
-                                args[k] = cfgArgs[k];
-                            }}
-                        }}
-                    }}
+    function applyConfig(cfg, path) {{
+        if (cfg.entry !== undefined) {{
+            if (typeof cfg.entry !== 'string' || !cfg.entry) {{ fail('E_KAZE_ARGS', "configuration 'entry' must be text"); return false; }}
+            if (claim('entry', 'config')) optEntry = cfg.entry;
+        }}
+        if (cfg.fuel !== undefined) {{
+            var cfgFuel = wholeNumber(cfg.fuel, "configuration 'fuel'", 0);
+            if (cfgFuel === null) return false;
+            if (claim('fuel', 'config')) optFuel = cfgFuel;
+        }}
+        if (cfg.every !== undefined || cfg.interval !== undefined) {{
+            if (claim('interval', 'config')) {{
+                intervalRaw = '' + (cfg.every !== undefined ? cfg.every : cfg.interval);
+                intervalMs = parseInterval(intervalRaw, "configuration 'every'");
+                if (intervalMs === null) return false;
+                if (!explicitDaemon) isDaemon = true;
+            }}
+        }}
+        if (cfg.daemon !== undefined) {{
+            if (typeof cfg.daemon !== 'boolean') {{ fail('E_KAZE_ARGS', "configuration 'daemon' must be true or false"); return false; }}
+            if (claim('daemon', 'config') && !explicitDaemon) isDaemon = cfg.daemon;
+        }}
+        if (cfg.caps !== undefined) {{
+            if (!cfg.caps || typeof cfg.caps !== 'object' || Array.isArray(cfg.caps)) {{ fail('E_CAP_INVALID', "configuration 'caps' must be an object"); return false; }}
+            for (var capName in cfg.caps) {{
+                var capBackend = cfg.caps[capName];
+                if (capBackend === true || capBackend === null) {{
+                    grantCap(capName, '', 'config');
+                }} else if (typeof capBackend === 'string') {{
+                    if (!parseCapSpec(capName + '=' + capBackend, 'config')) return false;
+                }} else {{
+                    fail('E_CAP_INVALID', "configuration 'caps." + capName + "' must be a backend name or true");
+                    return false;
                 }}
             }}
+        }}
+        if (cfg.grants !== undefined) {{
+            if (!Array.isArray(cfg.grants)) {{ fail('E_CAP_INVALID', "configuration 'grants' must be an array"); return false; }}
+            for (var gi = 0; gi < cfg.grants.length; gi++) {{
+                if (typeof cfg.grants[gi] !== 'string') {{ fail('E_CAP_INVALID', "configuration 'grants' entries must be text"); return false; }}
+                if (!parseCapSpec(cfg.grants[gi], 'config')) return false;
+            }}
+        }}
+        if (cfg.policy !== undefined || cfg.policyJson !== undefined || cfg.policyPath !== undefined) {{
+            var policyForms = (cfg.policy !== undefined ? 1 : 0) + (cfg.policyJson !== undefined ? 1 : 0) +
+                (cfg.policyPath !== undefined ? 1 : 0);
+            if (policyForms > 1) {{
+                fail('E_CAP_DENIED', "configuration 'policy', 'policyJson' and 'policyPath' are mutually exclusive");
+                return false;
+            }}
+        }}
+        if (cfg.policy !== undefined) {{
+            if (!cfg.policy || typeof cfg.policy !== 'object' || Array.isArray(cfg.policy)) {{ fail('E_CAP_DENIED', "configuration 'policy' must be a JSON object"); return false; }}
+            if (claim('policy', 'config')) optPolicyDoc = cfg.policy;
+        }}
+        if (cfg.policyJson !== undefined) {{
+            if (typeof cfg.policyJson !== 'string') {{ fail('E_CAP_DENIED', "configuration 'policyJson' must be text"); return false; }}
+            if (claim('policy', 'config')) optPolicyText = cfg.policyJson;
+        }}
+        if (cfg.policyPath !== undefined) {{
+            if (typeof cfg.policyPath !== 'string' || !cfg.policyPath) {{ fail('E_CAP_DENIED', "configuration 'policyPath' must be a path"); return false; }}
+            var cfgPolicyText = readPolicyFile(cfg.policyPath);
+            if (cfgPolicyText === null) return false;
+            if (claim('policy', 'config')) optPolicyText = cfgPolicyText;
+        }}
+        if (cfg.pins !== undefined) {{
+            if (!cfg.pins || typeof cfg.pins !== 'object' || Array.isArray(cfg.pins)) {{ fail('E_KAZE_ARGS', "configuration 'pins' must be an object"); return false; }}
+            var cfgPins = [];
+            for (var pinName in cfg.pins) {{
+                var cfgPin = parsePinSpec(pinName + '=' + cfg.pins[pinName], "configuration pin '" + pinName + "'");
+                if (cfgPin === null) return false;
+                cfgPins.push(cfgPin);
+            }}
+            if (claim('pins', 'config')) {{
+                for (var cpi = 0; cpi < cfgPins.length; cpi++) optPins[cfgPins[cpi][0]] = cfgPins[cpi][1];
+            }}
+        }}
+        if (cfg.sim !== undefined) {{
+            if (!cfg.sim || typeof cfg.sim !== 'object' || Array.isArray(cfg.sim)) {{ fail('E_KAZE_ARGS', "configuration 'sim' must be an object"); return false; }}
+            if (!physicalSimOnly(cfg.sim, "configuration 'sim'")) return false;
+            if (claim('sim', 'config')) optSim = cfg.sim;
+        }}
+        if (cfg.timeoutMs !== undefined) {{
+            var cfgTimeout = wholeNumber(cfg.timeoutMs, "configuration 'timeoutMs'", 1);
+            if (cfgTimeout === null) return false;
+            if (claim('timeout', 'config')) optTimeoutMs = cfgTimeout;
+        }}
+        if (cfg.heapBytes !== undefined) {{
+            var cfgHeap = wholeNumber(cfg.heapBytes, "configuration 'heapBytes'", 0);
+            if (cfgHeap === null) return false;
+            if (claim('heap', 'config')) optHeapBytes = cfgHeap;
+        }}
+        if (cfg.ticks !== undefined) {{
+            var cfgTicks = wholeNumber(cfg.ticks, "configuration 'ticks'", 0);
+            if (cfgTicks === null) return false;
+            if (claim('ticks', 'config')) optTicks = cfgTicks;
+        }}
+        if (cfg.tickMs !== undefined) {{
+            var cfgTick = wholeNumber(cfg.tickMs, "configuration 'tickMs'", 1);
+            if (cfgTick === null) return false;
+            if (claim('tick', 'config')) optTickMs = cfgTick;
+        }}
+        if (cfg.ai !== undefined) {{
+            if (!cfg.ai || typeof cfg.ai !== 'object' || Array.isArray(cfg.ai)) {{ fail('E_CONFIG', "configuration 'ai' must be an object"); return false; }}
+            if (claim('ai', 'config')) optAi = cfg.ai;
+        }}
+        if (cfg.mcp !== undefined) {{
+            if (!cfg.mcp || typeof cfg.mcp !== 'object' || Array.isArray(cfg.mcp)) {{ fail('E_CONFIG', "configuration 'mcp' must be an object"); return false; }}
+            if (claim('mcp', 'config')) optMcp = cfg.mcp;
+        }}
+        /* Routine arguments: the file's own keys, minus the option names. */
+        var cfgArgs = cfg;
+        if (cfg.args !== undefined) {{
+            if (!cfg.args || typeof cfg.args !== 'object' || Array.isArray(cfg.args)) {{ fail('E_KAZE_ARGS', "configuration 'args' must be an object"); return false; }}
+            cfgArgs = cfg.args;
+        }}
+        for (var key in cfgArgs) {{
+            if (configKeys.indexOf(key) === -1 && args[key] === undefined) {{
+                args[key] = cfgArgs[key];
+            }}
+        }}
+        return true;
+    }}
+
+    if (configFileToLoad) {{
+        var rawCfg = null;
+        try {{
+            if (!sofuu.fs || !sofuu.fs.readFileSync) throw new Error('file access is unavailable');
+            rawCfg = sofuu.fs.readFileSync(configFileToLoad, 'utf8');
         }} catch (cfgErr) {{
-            console.error("\x1b[31m[Config Error]\x1b[0m Failed to parse configuration file '" + configFileToLoad + "': " + (cfgErr && cfgErr.message ? cfgErr.message : cfgErr));
-            if (typeof process !== 'undefined' && process.exit) process.exit(1);
+            fail('E_CONFIG', "cannot read configuration '" + configFileToLoad + "': " + (cfgErr && cfgErr.message ? cfgErr.message : cfgErr));
             return;
         }}
+        var cfg = null;
+        try {{
+            cfg = JSON.parse(rawCfg);
+        }} catch (parseErr) {{
+            fail('E_CONFIG', "cannot parse configuration '" + configFileToLoad + "': " + (parseErr && parseErr.message ? parseErr.message : parseErr));
+            return;
+        }}
+        if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) {{
+            fail('E_CONFIG', "configuration '" + configFileToLoad + "' must be a JSON object");
+            return;
+        }}
+        if (!applyConfig(cfg, configFileToLoad)) return;
     }}
 
-    // Tier 2: Environment Variables (Container / Cloud Injection)
-    if (typeof process !== 'undefined' && process.env) {{
-        var env = process.env;
-        if (env.AGENT_ENTRY && !explicitEntry) entryRoutine = env.AGENT_ENTRY;
-        if (env.AGENT_FUEL && !explicitFuel) fuel = parseInt(env.AGENT_FUEL, 10) || fuel;
-        if (env.AGENT_INTERVAL && !explicitInterval) {{
-            intervalRaw = env.AGENT_INTERVAL;
-            intervalMs = parseInterval(intervalRaw);
-            if (!explicitDaemon) isDaemon = true;
+    /* ---- environment ----------------------------------------------------
+     * The environment beats the configuration file and loses to the command
+     * line. A routine's own arguments arrive here too, under their parameter
+     * names, exactly as the source path resolves them. */
+    if (env) {{
+        var envEntry = envValue('entry');
+        if (envEntry !== null) {{
+            if (typeof envEntry !== 'string' || !envEntry) {{ fail('E_KAZE_ARGS', 'AGENT_ENTRY must be text'); return; }}
+            if (claim('entry', 'env')) optEntry = envEntry;
         }}
-        if ((env.AGENT_DAEMON === 'true' || env.AGENT_DAEMON === '1') && !explicitDaemon) isDaemon = true;
-
-        for (var envKey in env) {{
-            var normKey = null;
-            if (envKey.startsWith('AGENT_')) {{
-                normKey = envKey.slice(6).toLowerCase();
-            }} else if (envKey.startsWith('SOFUU_')) {{
-                normKey = envKey.slice(6).toLowerCase();
+        var envFuel = envValue('fuel');
+        if (envFuel !== null) {{
+            var envFuelValue = wholeNumber(envFuel, 'AGENT_FUEL', 0);
+            if (envFuelValue === null) return;
+            if (claim('fuel', 'env')) optFuel = envFuelValue;
+        }}
+        var envInterval = envValue('interval');
+        if (envInterval === null) envInterval = envValue('every');
+        if (envInterval !== null) {{
+            if (claim('interval', 'env')) {{
+                intervalRaw = '' + envInterval;
+                intervalMs = parseInterval(intervalRaw, 'AGENT_EVERY');
+                if (intervalMs === null) return;
+                if (!explicitDaemon) isDaemon = true;
             }}
-            if (normKey && normKey !== 'entry' && normKey !== 'fuel' && normKey !== 'interval' && normKey !== 'every' && normKey !== 'daemon') {{
-                if (cliArgs[normKey] === undefined) {{
-                    var rawEnv = env[envKey];
-                    try {{ args[normKey] = JSON.parse(rawEnv); }} catch (_) {{ args[normKey] = rawEnv; }}
-                }}
+        }}
+        var envDaemon = envValue('daemon');
+        if (envDaemon !== null) {{
+            if (envDaemon !== 'true' && envDaemon !== '1' && envDaemon !== 'false' && envDaemon !== '0') {{
+                fail('E_KAZE_ARGS', 'AGENT_DAEMON must be true or false');
+                return;
             }}
+            if (claim('daemon', 'env') && !explicitDaemon) isDaemon = (envDaemon === 'true' || envDaemon === '1');
+        }}
+        var envCaps = envValue('caps');
+        if (envCaps === null) envCaps = envValue('grants');
+        if (envCaps !== null) {{
+            var envCapList = String(envCaps).split(',');
+            for (var ec = 0; ec < envCapList.length; ec++) {{
+                var envCapSpec = envCapList[ec].trim();
+                if (!envCapSpec) continue;
+                if (!parseCapSpec(envCapSpec, 'env')) return;
+            }}
+        }}
+        var envPolicy = envValue('policy');
+        if (envPolicy !== null) {{
+            var envPolicyText = readPolicyFile(String(envPolicy));
+            if (envPolicyText === null) return;
+            if (claim('policy', 'env')) optPolicyText = envPolicyText;
+        }}
+        var envPins = envValue('pins');
+        if (envPins !== null) {{
+            var envPinList = String(envPins).split(',');
+            var parsedEnvPins = [];
+            for (var ep = 0; ep < envPinList.length; ep++) {{
+                var envPinSpec = envPinList[ep].trim();
+                if (!envPinSpec) continue;
+                var envPin = parsePinSpec(envPinSpec, 'AGENT_PINS');
+                if (envPin === null) return;
+                parsedEnvPins.push(envPin);
+            }}
+            if (claim('pins', 'env')) {{
+                for (var epi = 0; epi < parsedEnvPins.length; epi++) optPins[parsedEnvPins[epi][0]] = parsedEnvPins[epi][1];
+            }}
+        }}
+        var envSim = envValue('sim');
+        if (envSim !== null) {{
+            var envSimPairs = parseSimPairs(envSim, 'AGENT_SIM');
+            if (envSimPairs === null) return;
+            if (!physicalSimOnly(envSimPairs, 'AGENT_SIM')) return;
+            if (claim('sim', 'env')) optSim = envSimPairs;
+        }}
+        /* The backend configuration travels the same way as every other
+         * option: the environment beats the configuration file, and the
+         * command line beats both. The value is JSON because the option is
+         * a structured block. */
+        var envAi = envValue('ai');
+        if (envAi !== null) {{
+            var envAiOptions = jsonObjectOption(envAi, 'AGENT_AI');
+            if (envAiOptions === null) return;
+            if (claim('ai', 'env')) optAi = envAiOptions;
+        }}
+        var envMcp = envValue('mcp');
+        if (envMcp !== null) {{
+            var envMcpOptions = jsonObjectOption(envMcp, 'AGENT_MCP');
+            if (envMcpOptions === null) return;
+            if (claim('mcp', 'env')) optMcp = envMcpOptions;
+        }}
+        var envTimeout = envValue('timeout_ms');
+        if (envTimeout !== null) {{
+            var envTimeoutValue = wholeNumber(envTimeout, 'AGENT_TIMEOUT_MS', 1);
+            if (envTimeoutValue === null) return;
+            if (claim('timeout', 'env')) optTimeoutMs = envTimeoutValue;
+        }}
+        var envHeap = envValue('heap_bytes');
+        if (envHeap !== null) {{
+            var envHeapValue = wholeNumber(envHeap, 'AGENT_HEAP_BYTES', 0);
+            if (envHeapValue === null) return;
+            if (claim('heap', 'env')) optHeapBytes = envHeapValue;
+        }}
+        var envTicks = envValue('ticks');
+        if (envTicks !== null) {{
+            var envTicksValue = wholeNumber(envTicks, 'AGENT_TICKS', 0);
+            if (envTicksValue === null) return;
+            if (claim('ticks', 'env')) optTicks = envTicksValue;
+        }}
+        var envTick = envValue('tick_ms');
+        if (envTick !== null) {{
+            var envTickValue = wholeNumber(envTick, 'AGENT_TICK_MS', 1);
+            if (envTickValue === null) return;
+            if (claim('tick', 'env')) optTickMs = envTickValue;
+        }}
+        for (var normName in envNorm) {{
+            if (envKeys.indexOf(normName) !== -1) continue;
+            if (cliArgs[normName] !== undefined) continue;
+            var rawEnv = envNorm[normName].agent !== undefined ? envNorm[normName].agent : envNorm[normName].sofuu;
+            if (rawEnv === undefined) continue;
+            try {{ args[normName] = JSON.parse(rawEnv); }} catch (_) {{ args[normName] = rawEnv; }}
         }}
     }}
 
-    // Tier 3: CLI Arguments (Highest Precedence)
+    /* The command line has the last word on a routine's own arguments. */
     for (var cliKey in cliArgs) {{
         args[cliKey] = cliArgs[cliKey];
+    }}
+
+    /* No policy anywhere: apply the same layered document the runtime and
+     * `sofuu script run` apply, so a compiled agent and its source decide
+     * alike. A document that exists but cannot be read is fatal. */
+    if (optSource.policy === undefined) {{
+        if (sofuu.policy && typeof sofuu.policy.load === 'function') {{
+            try {{
+                var loadedPolicy = JSON.parse(sofuu.policy.load());
+                if (loadedPolicy && loadedPolicy.ok === false) {{
+                    fail('E_CAP_DENIED', loadedPolicy.error);
+                    return;
+                }}
+                if (loadedPolicy && loadedPolicy.ok === true && loadedPolicy.policy) {{
+                    optPolicyDoc = loadedPolicy.policy;
+                }}
+            }} catch (loadErr) {{
+                /* An unreadable policy document stays "no policy": every Kaze
+                 * capability then fails closed instead of running. */
+                optPolicyDoc = null;
+            }}
+        }}
+    }}
+
+    /* ---- run options ----------------------------------------------------
+     * The same shape the source and bytecode paths hand to the Kaze host:
+     * the granted families, the backend behind each of them, the policy and
+     * the validated limits. */
+    function runOptions() {{
+        var opts = {{ ambientArgs: false, sourceName: kazeSourceName, fuel: optFuel, grants: optGrants.slice() }};
+        if (optEntry) opts.entry = optEntry;
+        if (Object.keys(optCaps).length) opts.caps = optCaps;
+        if (optPolicyText !== null) opts.policyJson = optPolicyText;
+        else if (optPolicyDoc !== null) opts.policy = optPolicyDoc;
+        if (Object.keys(optPins).length) opts.pins = optPins;
+        if (optSim !== null) opts.sim = optSim;
+        if (optTimeoutMs !== null) opts.timeoutMs = optTimeoutMs;
+        if (optHeapBytes !== null) opts.heapBytes = optHeapBytes;
+        if (optTicks !== null) opts.ticks = optTicks;
+        if (optTickMs !== null) opts.tickMs = optTickMs;
+        if (optAi !== null) opts.ai = optAi;
+        if (optMcp !== null) opts.mcp = optMcp;
+        if (configFileToLoad) opts.configPath = configFileToLoad;
+        return opts;
     }}
 
     function badge(type, text) {{
@@ -1811,7 +2366,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
          * (and query="cli-pos 500 BTC" when no env was set). A named --arg
          * for the same parameter still wins: it is the more specific
          * spelling of the same tier. */
-        var expected = routineSignatures[entryRoutine] || [];
+        var expected = routineSignatures[optEntry] || [];
         for (var p = 0; p < positionals.length; p++) {{
             var pKey = '' + p;
             var rawPos = positionals[p];
@@ -1837,7 +2392,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
     }}
 
     function validateParameters(targetArgs) {{
-        var expected = routineSignatures[entryRoutine];
+        var expected = routineSignatures[optEntry];
         if (!expected || expected.length === 0) return true;
 
         var missing = [];
@@ -1848,7 +2403,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             }}
         }}
         if (missing.length > 0) {{
-            console.error("\x1b[31m[Agent Config Error]\x1b[0m Routine '" + entryRoutine + "' requires parameter(s):");
+            console.error("\x1b[31m[Agent Config Error]\x1b[0m Routine '" + optEntry + "' requires parameter(s):");
             for (var m = 0; m < missing.length; m++) {{
                 console.error("  • \x1b[1m" + missing[m] + "\x1b[0m");
             }}
@@ -1904,7 +2459,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         var timerId = null;
 
         badge('DAEMON', "Starting 24/7 supervisor loop for " + kazeName);
-        badge('DAEMON', "Interval: " + intervalRaw + " (" + intervalMs + "ms) · Fuel: " + fuel + " · PID: " + (typeof process !== 'undefined' ? process.pid : 'unknown'));
+        badge('DAEMON', "Interval: " + intervalRaw + " (" + intervalMs + "ms) · Fuel: " + optFuel + " · PID: " + (typeof process !== 'undefined' ? process.pid : 'unknown'));
         badge('DAEMON', "Autonomous recovery active · Press Ctrl+C to stop gracefully.");
 
         function formatDuration(ms) {{
@@ -1912,8 +2467,8 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
             var m = Math.floor(s / 60);
             var h = Math.floor(m / 60);
             var d = Math.floor(h / 24);
-            if (d > 0) return d + "d " + (h % 24) + "h " + (m % 60) + "m";
-            if (h > 0) return h + "h " + (m % 60) + "m " + (s % 60) + "s";
+            if (d > 0) return d + "d " + (h % 24) + "h " + (m % 60) + "m " + (s % 60) + "s";
+            if (h > 0) return h + "h " + (m % 24) + "m " + (s % 60) + "s";
             if (m > 0) return m + "m " + (s % 60) + "s";
             return s + "s";
         }}
@@ -2112,6 +2667,7 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         }}
     }})();
 }})();
+
 "##);
 
     Ok(bootstrap)
@@ -2127,6 +2683,200 @@ mod tests {
 
     fn fake_base(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// What a generated bootstrap did when it ran.
+    #[derive(Debug, Default)]
+    struct BootstrapRun {
+        /// The options object the bootstrap handed to the Kaze host.
+        options: Option<serde_json::Value>,
+        /// The routine arguments the bootstrap handed to the Kaze host.
+        arguments: Option<serde_json::Value>,
+        /// Which host entry point the bootstrap chose.
+        mode: Option<String>,
+        /// The exit code the bootstrap asked for, if it asked for one.
+        exit: Option<i64>,
+        /// What the bootstrap wrote to stderr.
+        errors: Vec<String>,
+        /// What the bootstrap wrote to stdout.
+        output: Vec<String>,
+    }
+
+    /// Read a global string out of the engine.
+    fn read_global_string(rt: &sofuu_ffi::SofuuRuntime, name: &str) -> Option<String> {
+        let ctx = rt.engine_ctx() as *mut sofuu_ffi::qjs::JSContext;
+        if ctx.is_null() {
+            return None;
+        }
+        let key = std::ffi::CString::new(name).ok()?;
+        unsafe {
+            let global = sofuu_ffi::qjs::sofuu_js_get_global_object(ctx);
+            let value = sofuu_ffi::qjs::sofuu_js_get_property_str(ctx, global, key.as_ptr());
+            let text = if sofuu_ffi::qjs::is_undefined(value) || sofuu_ffi::qjs::is_null(value) {
+                None
+            } else {
+                let raw = sofuu_ffi::qjs::sofuu_js_to_cstring(ctx, value);
+                if raw.is_null() {
+                    None
+                } else {
+                    let owned = std::ffi::CStr::from_ptr(raw).to_string_lossy().into_owned();
+                    sofuu_ffi::qjs::sofuu_js_free_cstring(ctx, raw);
+                    Some(owned)
+                }
+            };
+            sofuu_ffi::qjs::sofuu_js_free_value(ctx, value);
+            sofuu_ffi::qjs::sofuu_js_free_value(ctx, global);
+            text
+        }
+    }
+
+    /// Run a generated bootstrap inside the real engine.
+    ///
+    /// With `record` the Kaze host entry points are replaced by a recorder, so
+    /// the test sees the option plumbing the generated code produced and
+    /// nothing else. No model, tool, store or backend is contacted, so this is
+    /// evidence about an agent's configuration and not about inference.
+    /// Without it the real host runs, which is how the fail-closed check sees
+    /// a genuinely unavailable backend refuse the call.
+    fn bootstrap_run(agent: &str, argv: &[&str], env: &[(&str, &str)], record: bool) -> BootstrapRun {
+        let _guard = crate::rt::test_loop_lock();
+        let bootstrap =
+            generate_kaze_agent_bootstrap(Path::new("/tmp/sofuu-bootstrap.agent.kaze"), agent.as_bytes())
+                .expect("the agent compiles");
+
+        /* argv[0] and argv[1] are the program and the script slot, exactly as
+         * the compiled-artifact path builds them. */
+        let mut args: Vec<String> = vec!["sofuu-agent".to_string(), "sofuu-agent".to_string()];
+        args.extend(argv.iter().map(|a| a.to_string()));
+        let owned: Vec<std::ffi::CString> = args
+            .iter()
+            .map(|a| std::ffi::CString::new(a.as_str()).unwrap_or_default())
+            .collect();
+        let mut ptrs: Vec<*mut std::ffi::c_char> =
+            owned.iter().map(|c| c.as_ptr() as *mut std::ffi::c_char).collect();
+        // SAFETY: the CStrings outlive the call; the callee copies them.
+        unsafe {
+            crate::modules::process::mod_process_set_args(
+                owned.len() as std::ffi::c_int,
+                ptrs.as_mut_ptr(),
+            );
+        }
+
+        let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
+
+        let env_json = serde_json::to_string(
+            &env.iter()
+                .map(|(k, v)| ((*k).to_string(), serde_json::Value::String((*v).to_string())))
+                .collect::<serde_json::Map<String, serde_json::Value>>(),
+        )
+        .unwrap_or_else(|_| "{}".to_string());
+        let recorder = if record {
+            "    sofuu.kaze.run = function (source, runArgs, opts) { return capture('run', runArgs, opts); };\n\
+             \x20   sofuu.kaze.runAsync = function (source, runArgs, opts) { return capture('runAsync', runArgs, opts); };\n"
+        } else {
+            ""
+        };
+        let prelude = format!(
+            r#"
+(function () {{
+    var state = {{ capture: null, exit: null, errors: [], output: [] }};
+    globalThis.__sofuuBootstrap = state;
+    var env = {env_json};
+    for (var key in env) process.env[key] = env[key];
+    /* A compiled agent must not inherit an ambient model: the fail-closed
+     * check needs the backend to be genuinely unavailable. */
+    delete process.env.SOFUU_AI_PROVIDER;
+    delete process.env.SOFUU_AI_MODEL;
+    delete process.env.SOFUU_AI_BASE_URL;
+    function report() {{
+        return {{ ok: true, entry: 'main', value: 'ok', result: 'ok', actions: [], logs: [],
+                  fuel_used: 0, instructions: 0, ticks: 0, verdict: null, simulated_families: [] }};
+    }}
+    function capture(mode, runArgs, opts) {{
+        state.capture = JSON.stringify({{ mode: mode, args: runArgs, opts: opts }});
+        return Promise.resolve(report());
+    }}
+{recorder}    process.stderr.write = function (text) {{ state.errors.push(String(text)); return true; }};
+    console.log = function (text) {{ state.output.push(String(text)); }};
+    console.error = function (text) {{ state.errors.push(String(text)); }};
+    process.exit = function (code) {{ state.exit = code === undefined ? 0 : code; throw new Error('sofuu-bootstrap-exit'); }};
+}})();
+"#
+        );
+        assert_eq!(rt.eval_string(&prelude, "<bootstrap-prelude>"), 0, "the prelude installs");
+        let _ = rt.eval_string(&bootstrap, "<bootstrap>");
+        let _ = rt.eval_string(
+            "globalThis.__sofuuBootstrapJson = JSON.stringify(globalThis.__sofuuBootstrap);",
+            "<bootstrap-capture>",
+        );
+
+        let raw = read_global_string(&rt, "__sofuuBootstrapJson").unwrap_or_default();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+        let capture = value
+            .get("capture")
+            .and_then(|c| c.as_str())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+        BootstrapRun {
+            options: capture.as_ref().and_then(|c| c.get("opts")).cloned(),
+            arguments: capture.as_ref().and_then(|c| c.get("args")).cloned(),
+            mode: capture
+                .as_ref()
+                .and_then(|c| c.get("mode"))
+                .and_then(|m| m.as_str())
+                .map(str::to_string),
+            exit: value.get("exit").and_then(|v| v.as_i64()),
+            errors: value
+                .get("errors")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            output: value
+                .get("output")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The options a compiled agent hands to the Kaze host.
+    fn bootstrap_options(agent: &str, argv: &[&str], env: &[(&str, &str)]) -> serde_json::Value {
+        let run = bootstrap_run(agent, argv, env, true);
+        run.options
+            .unwrap_or_else(|| panic!("the agent reached the Kaze host: {:?}", run.errors))
+    }
+
+    /// The routine arguments the bootstrap handed to the Kaze host. These are
+    /// the second argument of `sofuu.kaze.run`, not part of its options.
+    fn bootstrap_arguments(agent: &str, argv: &[&str], env: &[(&str, &str)]) -> serde_json::Value {
+        let run = bootstrap_run(agent, argv, env, true);
+        run.arguments
+            .unwrap_or_else(|| panic!("the agent reached the Kaze host: {:?}", run.errors))
+    }
+
+    /// A temporary directory holding one file per name.
+    fn temp_files(files: &[(&str, &str)]) -> (PathBuf, Vec<String>) {
+        let dir = std::env::temp_dir().join(format!("sofuu-bootstrap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        let paths = files
+            .iter()
+            .map(|(name, body)| {
+                let path = dir.join(name);
+                std::fs::write(&path, body).expect("the fixture file");
+                path.to_string_lossy().into_owned()
+            })
+            .collect();
+        (dir, paths)
     }
 
     #[test]
@@ -2151,6 +2901,301 @@ mod tests {
         .expect("a pure agent compiles");
         assert!(pure.contains("var kazeNeeds = [\"log\"]"), "declared physical needs are recorded");
         assert!(pure.contains("Promise.resolve(sofuu.kaze.run(kazeSource, runArgs, opts))"), "pure agents keep the synchronous entry point");
+    }
+
+    #[test]
+    fn a_compiled_agent_reaches_the_async_bridge_for_ai_and_tool() {
+        let ai = bootstrap_run(
+            "needs: ai\naction main():\n    return ai.prompt(\"hello\")\n",
+            &[],
+            &[],
+            true,
+        );
+        assert_eq!(ai.mode.as_deref(), Some("runAsync"), "an ai agent uses the asynchronous bridge");
+
+        let tool = bootstrap_run(
+            "needs: tool\naction main():\n    return tool.call(\"read\")\n",
+            &[],
+            &[],
+            true,
+        );
+        assert_eq!(tool.mode.as_deref(), Some("runAsync"), "a tool agent uses the asynchronous bridge");
+
+        let bound = bootstrap_run(
+            "needs: mcp(\"tool\")\naction main():\n    return tool.call(\"read\")\n",
+            &[],
+            &[],
+            true,
+        );
+        assert_eq!(bound.mode.as_deref(), Some("runAsync"), "a bound tool agent uses the asynchronous bridge");
+
+        let pure = bootstrap_run(
+            "needs: log\naction main():\n    return 1\n",
+            &[],
+            &[],
+            true,
+        );
+        assert_eq!(pure.mode.as_deref(), Some("run"), "a pure agent keeps the synchronous entry point");
+    }
+
+    #[test]
+    fn a_compiled_agent_carries_the_backend_policy_and_configuration() {
+        let (_dir, paths) = temp_files(&[("policy.json", "{\"tools\":{\"allow\":[\"kaze.*\"]}}")]);
+        let options = bootstrap_options(
+            "needs: drone\naction main():\n    return drone.telemetry(\"battery\")\n",
+            &[
+                "--cap",
+                "drone=sim",
+                "--policy",
+                &paths[0],
+                "--pin",
+                "fan=17",
+                "--fuel",
+                "1234",
+                "--entry",
+                "main",
+                "--sim",
+                "battery=42",
+            ],
+            &[],
+        );
+        /* The backend behind a grant is the operator's choice and must reach
+         * the host, not just the family's name. */
+        assert_eq!(options["caps"]["drone"], "sim", "the backend survives");
+        assert_eq!(options["grants"][0], "drone", "the granted family is recorded");
+        assert!(options.get("policyJson").is_some(), "the policy travels with the agent");
+        assert_eq!(options["pins"]["fan"], 17, "the pin travels with the agent");
+        assert_eq!(options["fuel"], 1234, "the budget travels with the agent");
+        assert_eq!(options["entry"], "main", "the entry travels with the agent");
+        assert_eq!(options["sim"]["battery"], "42", "the physical test state travels with the agent");
+        assert_eq!(options["ambientArgs"], false, "the agent resolves its own configuration");
+        assert_eq!(options["sourceName"], "sofuu-bootstrap.agent.kaze", "diagnostics name the agent");
+    }
+
+    #[test]
+    fn a_compiled_agent_keeps_the_configuration_hierarchy() {
+        let (_dir, paths) = temp_files(&[(
+            "agent.config.json",
+            "{\"fuel\": 111, \"caps\": {\"drone\": \"sim\"}, \"args\": {\"topic\": \"from-file\"}}",
+        )]);
+        let agent = "needs: log\naction main(topic):\n    return topic\n";
+
+        let from_file = bootstrap_options(agent, &["--config", &paths[0]], &[]);
+        assert_eq!(from_file["fuel"], 111, "the file fills what nobody else set");
+        assert_eq!(from_file["caps"]["drone"], "sim", "the file carries a backend");
+        assert_eq!(
+            bootstrap_arguments(agent, &["--config", &paths[0]], &[])["topic"],
+            "from-file",
+            "the file carries a routine argument"
+        );
+
+        let from_env = bootstrap_options(
+            agent,
+            &["--config", &paths[0]],
+            &[("AGENT_FUEL", "222"), ("AGENT_TOPIC", "from-env")],
+        );
+        assert_eq!(from_env["fuel"], 222, "the environment beats the file");
+        assert_eq!(
+            bootstrap_arguments(
+                agent,
+                &["--config", &paths[0]],
+                &[("AGENT_FUEL", "222"), ("AGENT_TOPIC", "from-env")]
+            )["topic"],
+            "from-env",
+            "the environment beats the file"
+        );
+
+        let from_cli = bootstrap_options(
+            agent,
+            &["--config", &paths[0], "--fuel", "333", "--arg", "topic=from-cli"],
+            &[("AGENT_FUEL", "222"), ("AGENT_TOPIC", "from-env")],
+        );
+        assert_eq!(from_cli["fuel"], 333, "the command line beats the environment");
+        assert_eq!(
+            bootstrap_arguments(
+                agent,
+                &["--config", &paths[0], "--fuel", "333", "--arg", "topic=from-cli"],
+                &[("AGENT_FUEL", "222"), ("AGENT_TOPIC", "from-env")]
+            )["topic"],
+            "from-cli",
+            "the command line beats the environment"
+        );
+    }
+
+    #[test]
+    fn a_malformed_option_fails_closed_instead_of_being_ignored() {
+        let bad_fuel = bootstrap_run(
+            "needs: log\naction main():\n    return 1\n",
+            &["--fuel", "abc"],
+            &[],
+            true,
+        );
+        assert_eq!(bad_fuel.exit, Some(1), "the agent refuses to run");
+        assert!(bad_fuel.options.is_none(), "no run happens");
+        assert!(
+            bad_fuel.errors.iter().any(|e| e.contains("E_KAZE_ARGS")),
+            "{:?}",
+            bad_fuel.errors
+        );
+
+        let bad_cap = bootstrap_run(
+            "needs: log\naction main():\n    return 1\n",
+            &["--cap", "drone="],
+            &[],
+            true,
+        );
+        assert_eq!(bad_cap.exit, Some(1), "the agent refuses to run");
+        assert!(
+            bad_cap.errors.iter().any(|e| e.contains("E_CAP_INVALID")),
+            "{:?}",
+            bad_cap.errors
+        );
+
+        let bad_env = bootstrap_run(
+            "needs: log\naction main():\n    return 1\n",
+            &[],
+            &[("AGENT_FUEL", "abc")],
+            true,
+        );
+        assert_eq!(bad_env.exit, Some(1), "the agent refuses to run");
+        assert!(
+            bad_env.errors.iter().any(|e| e.contains("E_KAZE_ARGS")),
+            "{:?}",
+            bad_env.errors
+        );
+    }
+
+    /// `--no-policy` is a deny-all policy, not the absence of one: the run
+    /// must be refused by a rule the runtime evaluates, and the refusal must
+    /// not depend on a missing document being read as a refusal elsewhere.
+    #[test]
+    fn a_no_policy_bootstrap_carries_a_deny_all_policy() {
+        let options = bootstrap_options(
+            "needs: log\naction main():\n    return 1\n",
+            &["--no-policy"],
+            &[],
+        );
+        assert_eq!(
+            options["policy"],
+            serde_json::json!({"tools": {"deny": ["kaze.*"]}}),
+            "--no-policy must produce a deny-all policy"
+        );
+        assert!(
+            options.get("policyJson").is_none(),
+            "the deny-all policy is a document, not a policy text: {options}"
+        );
+    }
+
+    /// A duration that cannot be read is a mistake in the command line, not
+    /// a setting that silently keeps its default: a supervisor that runs
+    /// every 5s because the operator wrote "abc" is not the supervisor the
+    /// operator asked for.
+    #[test]
+    fn a_malformed_interval_fails_closed_instead_of_defaulting() {
+        for interval in ["abc", "0", "10x", "-5"] {
+            let run = bootstrap_run(
+                "needs: log\naction main():\n    return 1\n",
+                &["--every", interval],
+                &[],
+                true,
+            );
+            assert_eq!(run.exit, Some(1), "--every {interval} must refuse");
+            assert!(run.options.is_none(), "--every {interval} must not run");
+            assert!(
+                run.errors.iter().any(|e| e.contains("E_KAZE_ARGS")),
+                "--every {interval}: {:?}",
+                run.errors
+            );
+        }
+    }
+
+    /// The robotics/drone exception covers physical behaviour only: a
+    /// compiled agent must not be able to hand the runtime a canned AI or
+    /// tool answer through `--sim`.
+    #[test]
+    fn a_sim_bootstrap_refuses_a_non_physical_response() {
+        for key in ["ai=hello", "tool=ok", "memory=42", "alert=sent"] {
+            let run = bootstrap_run(
+                "needs: drone\naction main():\n    return drone.telemetry(\"battery\")\n",
+                &["--sim", key],
+                &[],
+                true,
+            );
+            assert_eq!(run.exit, Some(1), "--sim {key} must refuse");
+            assert!(run.options.is_none(), "--sim {key} must not run");
+            assert!(
+                run.errors
+                    .iter()
+                    .any(|e| e.contains("E_CAP_INVALID") && e.contains("not permitted")),
+                "--sim {key}: {:?}",
+                run.errors
+            );
+        }
+    }
+
+    /// The backend configuration travels the documented hierarchy: the
+    /// command line beats the environment, the environment beats the
+    /// configuration file.
+    #[test]
+    fn a_compiled_agent_carries_the_backend_configuration_through_the_hierarchy() {
+        let (_dir, paths) = temp_files(&[(
+            "agent.config.json",
+            "{\"ai\": {\"model\": \"from-file\"}}",
+        )]);
+        let agent = "needs: ai\naction main():\n    return ai.prompt(\"hello\")\n";
+
+        let from_file = bootstrap_options(agent, &["--config", &paths[0]], &[]);
+        assert_eq!(from_file["ai"]["model"], "from-file");
+
+        let from_env = bootstrap_options(
+            agent,
+            &["--config", &paths[0]],
+            &[("AGENT_AI", "{\"model\": \"from-env\"}")],
+        );
+        assert_eq!(from_env["ai"]["model"], "from-env");
+
+        let from_cli = bootstrap_options(
+            agent,
+            &["--config", &paths[0], "--ai", "{\"model\": \"from-cli\"}"],
+            &[("AGENT_AI", "{\"model\": \"from-env\"}")],
+        );
+        assert_eq!(from_cli["ai"]["model"], "from-cli");
+
+        /* A backend configuration that is not a JSON object is a
+         * configuration error, not a value to ignore. */
+        let bad = bootstrap_run(agent, &["--ai", "not-json"], &[], true);
+        assert_eq!(bad.exit, Some(1));
+        assert!(bad.options.is_none());
+        assert!(
+            bad.errors.iter().any(|e| e.contains("E_CONFIG")),
+            "{:?}",
+            bad.errors
+        );
+    }
+
+    #[test]
+    fn a_compiled_agent_with_an_unavailable_backend_fails_closed() {
+        /* No model is configured and none may be inherited, so the real
+         * backend is genuinely unavailable: the agent has to refuse, not
+         * answer. */
+        let (_dir, paths) = temp_files(&[("policy.json", "{\"tools\":{\"allow\":[\"kaze.*\"]}}")]);
+        let run = bootstrap_run(
+            "needs: ai\naction main():\n    return ai.prompt(\"hello\")\n",
+            &["--cap", "ai", "--policy", &paths[0]],
+            &[],
+            false,
+        );
+        assert_eq!(run.exit, Some(1), "the agent fails instead of answering");
+        assert!(
+            run.errors.iter().any(|e| e.contains("E_CAP_MISSING")),
+            "{:?}",
+            run.errors
+        );
+        assert!(
+            !run.output.iter().any(|line| line.contains("[RESULT]")),
+            "no answer was produced: {:?}",
+            run.output
+        );
     }
 
     #[test]

@@ -213,8 +213,13 @@ function fmtTk(n: number | undefined): string {
 function GeneralPane(props: Props) {
   const { config, projectDir, permissions, onPermissionsChange, onConfigChanged, onProjectDirChanged } = props;
   const [engine, setEngine] = useState<EngineState | null>(null);
+  const [engineError, setEngineError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const pullEngine = useCallback(() => {
-    backend.engineState().then(setEngine);
+    backend.engineState().then(({ state, error }) => {
+      setEngine(state);
+      setEngineError(error);
+    });
   }, []);
   useEffect(pullEngine, [pullEngine]);
 
@@ -224,7 +229,9 @@ function GeneralPane(props: Props) {
         onConfigChanged(await backend.updateConfig(p));
         pullEngine();
       } catch (e) {
-        console.error(e);
+        // A config write that failed must be visible: the switch would
+        // otherwise look applied while the file still holds the old value.
+        setNotice(`Change not saved: ${String(e)}`);
       }
     },
     [onConfigChanged, pullEngine]
@@ -247,6 +254,7 @@ function GeneralPane(props: Props) {
 
   return (
     <>
+      {notice && <div className="settings-notice">{notice}</div>}
       <SectionTitle>Engine</SectionTitle>
       {engine ? (
         <div className="engine-card">
@@ -265,17 +273,25 @@ function GeneralPane(props: Props) {
                 {engine.sessionId ? engine.sessionId.slice(0, 10) + "…" : "None yet"}
               </span>
             </div>
+            {/* A number the engine did not report is UNKNOWN — "0 turns"
+                reads as a measured zero. */}
             <div className="engine-cell">
               <span className="engine-key">History</span>
-              <span className="engine-val">{engine.historyTurns ?? 0} turns</span>
+              <span className="engine-val">
+                {engine.historyTurns != null ? `${engine.historyTurns} turns` : "not reported"}
+              </span>
             </div>
             <div className="engine-cell">
               <span className="engine-key">Context</span>
-              <span className="engine-val">{fmtTk(engine.contextTokens)} tk</span>
+              <span className="engine-val">
+                {engine.contextTokens != null ? `${fmtTk(engine.contextTokens)} tk` : "not reported"}
+              </span>
             </div>
             <div className="engine-cell">
               <span className="engine-key">Session spend</span>
-              <span className="engine-val">${(engine.sessionSpendUsd ?? 0).toFixed(4)}</span>
+              <span className="engine-val">
+                {engine.sessionSpendUsd != null ? `$${engine.sessionSpendUsd.toFixed(4)}` : "not reported"}
+              </span>
             </div>
           </div>
           {(engine.streaming || (engine.pendingApprovals ?? 0) > 0) && (
@@ -289,7 +305,9 @@ function GeneralPane(props: Props) {
         </div>
       ) : (
         <div className="settings-desc" style={{ padding: "4px 0 10px" }}>
-          Engine not connected (dev mode outside Tauri shows no live state).
+          {engineError
+            ? `Engine unavailable — ${engineError}`
+            : "Engine not connected (dev mode outside Tauri shows no live state)."}
         </div>
       )}
 
@@ -316,7 +334,7 @@ function GeneralPane(props: Props) {
       <Row label="Memory (brain)" desc="Recall saved project memories into each turn and let the model store new ones (.sofuu/brain/).">
         <Toggle on={!!config?.brain} onChange={(v) => patch({ brain: v })} />
       </Row>
-      <Row label="Recall similarity floor" desc="Minimum match score for a memory to be recalled. 0 = built-in 0.30 (unrelated text scores ≈0.27, paraphrases >0.35 on the bundled embedder).">
+      <Row label="Recall similarity floor" desc="Minimum match score for a memory to be recalled. 0 = the engine's built-in 0.50 floor (the bundled TF-IDF embedder scores unrelated text ≈0.27 and paraphrases >0.35 on the composite scale).">
         <NumberField
           value={config?.recall_min ?? 0}
           step="0.01"
@@ -324,7 +342,7 @@ function GeneralPane(props: Props) {
           onCommit={(n) => patch({ recall_min: n })}
         />
       </Row>
-      <Row label="Recall token budget" desc="Max tokens of memories injected per turn. 0 = auto: ≈2% of the context window (1k–16k).">
+      <Row label="Recall token budget" desc="Max tokens of memories injected per turn. 0 = auto: ≈2% of the context window, clamped to 1k–16k (256 for local providers).">
         <NumberField
           value={config?.recall_budget ?? 0}
           width={110}
@@ -437,12 +455,15 @@ function AppearancePane(props: Props) {
 // ── Models ────────────────────────────────────────────────────────
 
 function ModelsPane({ config, onConfigChanged, projectDir }: Props) {
+  const [notice, setNotice] = useState<string | null>(null);
   const patch = useCallback(
     async (p: Record<string, unknown>) => {
       try {
         onConfigChanged(await backend.updateConfig(p));
       } catch (e) {
-        console.error(e);
+        // A failed write leaves the file unchanged — say so instead of
+        // letting the field look like it took.
+        setNotice(`Change not saved: ${String(e)}`);
       }
     },
     [onConfigChanged]
@@ -450,6 +471,7 @@ function ModelsPane({ config, onConfigChanged, projectDir }: Props) {
 
   return (
     <>
+      {notice && <div className="settings-notice">{notice}</div>}
       <Row label="Active provider" desc="Set on the Providers tab. New turns go to it.">
         <span className="field" style={{ minWidth: 200 }}>{config?.provider || "none"}</span>
       </Row>
@@ -476,7 +498,7 @@ function ModelsPane({ config, onConfigChanged, projectDir }: Props) {
           ))}
         </select>
       </Row>
-      <Row label="Context window" desc="Tokens. 0 = the engine resolves it live: boot report → learned model limits → discovered caps → 131k default. A manual override is clamped to the model's real limit.">
+      <Row label="Context window" desc="Tokens. 0 = the engine resolves it live: boot report → learned model limits → discovered caps → a conservative default (32,768) when nothing is known. A manual override is clamped to the model's real limit.">
         <NumberField
           value={config?.ctx_window ?? 0}
           width={130}
@@ -510,9 +532,11 @@ function ModelsPane({ config, onConfigChanged, projectDir }: Props) {
 // ── Providers ─────────────────────────────────────────────────────
 
 /** Keychain status is separate from config's has_api_key (which only
- *  reflects CLI-written keys in config.json) — query it per provider. */
+ *  reflects CLI-written keys in config.json) — query it per provider.
+ *  A FAILED lookup is "unknown", not "no key": the credential store may
+ *  hold a key the shell could not read. */
 function useKeychainStatus(names: string[]) {
-  const [status, setStatus] = useState<Record<string, boolean>>({});
+  const [status, setStatus] = useState<Record<string, boolean | null>>({});
   const namesKey = names.join("|");
   useEffect(() => {
     let alive = true;
@@ -522,7 +546,9 @@ function useKeychainStatus(names: string[]) {
         .then((r) => {
           if (alive) setStatus((s) => ({ ...s, [n]: !!r.has_key }));
         })
-        .catch(() => {});
+        .catch(() => {
+          if (alive) setStatus((s) => ({ ...s, [n]: null }));
+        });
     }
     return () => {
       alive = false;
@@ -543,8 +569,11 @@ function ProvidersPane({ config, onConfigChanged }: Props) {
     async (p: Record<string, unknown>) => {
       try {
         onConfigChanged(await backend.updateConfig(p));
+        setNotice(null);
       } catch (e) {
-        console.error(e);
+        // The config file did not change — say so instead of leaving the
+        // field looking like it took.
+        setNotice(`Change not saved: ${String(e)}`);
       }
     },
     [onConfigChanged]
@@ -585,7 +614,20 @@ function ProvidersPane({ config, onConfigChanged }: Props) {
   const deleteProvider = async (name: string) => {
     if (!window.confirm(`Remove provider "${name}" and its stored Keychain credentials?`)) return;
     try {
-      onConfigChanged(await backend.removeProvider(name));
+      // The backend answers with the redacted config AND the Keychain
+      // delete outcome: a credential store that refused the delete must
+      // not be hidden behind a clean "removed".
+      const res = await backend.removeProvider(name);
+      onConfigChanged(res.config);
+      if (res.keychainError) {
+        // The key may still be on disk — the state is unknown, not "gone".
+        setKeyStatus((s) => ({ ...s, [name]: null }));
+        setNotice(
+          `Provider ${name} removed from the config, but its Keychain entry was not deleted: ${res.keychainError}`
+        );
+        return;
+      }
+      setKeyStatus((s) => ({ ...s, [name]: false }));
       setNotice(`Provider ${name} removed.`);
     } catch (e) {
       setNotice(String(e));
@@ -631,7 +673,8 @@ function ProvidersPane({ config, onConfigChanged }: Props) {
         </div>
       )}
       {providers.map((p) => {
-        const keySaved = keyStatus[p.name] ?? false;
+        const keyKnown = keyStatus[p.name];
+        const keySaved = keyKnown === true;
         const hasKey = keySaved || !!p.has_api_key;
         const isActive = p.name === active;
         return (
@@ -641,7 +684,11 @@ function ProvidersPane({ config, onConfigChanged }: Props) {
               {isActive && <span className="provider-active">active</span>}
               <span className="provider-meta">
                 {p.profile}
-                {hasKey ? " · key set" : " · no key"}
+                {keyKnown === null
+                  ? " · key status unavailable"
+                  : hasKey
+                    ? " · key set"
+                    : " · no key"}
               </span>
               <div className="provider-actions">
                 {!isActive && (
@@ -873,15 +920,26 @@ function UsageChart({ days }: { days: backend.UsageDayRow[] }) {
 
 function UsagePane({ projectDir }: Props) {
   const [report, setReport] = useState<backend.UsageReport | null>(null);
-  const [unavailable, setUnavailable] = useState(false);
+  const [unavailable, setUnavailable] = useState<string | null>(null);
   const pull = useCallback(() => {
     backend
       .usageReport()
-      .then((r) => {
-        if (r) setReport(r);
-        else setUnavailable(true);
+      .then(({ report, error }) => {
+        // The engine's answer and the reason it gave are kept apart: an
+        // empty report from a reachable engine is NOT the same as "the
+        // engine could not answer".
+        if (report) {
+          setReport(report);
+          setUnavailable(null);
+          return;
+        }
+        setReport(null);
+        setUnavailable(error ?? "the engine did not report usage");
       })
-      .catch(() => setUnavailable(true));
+      .catch((e) => {
+        setReport(null);
+        setUnavailable(String(e));
+      });
   }, []);
   useEffect(() => {
     pull();
@@ -895,7 +953,8 @@ function UsagePane({ projectDir }: Props) {
   if (unavailable) {
     return (
       <div className="settings-desc" style={{ padding: "8px 0" }}>
-        Engine not connected — usage is computed by the engine from the workspace session store.
+        Usage unavailable — {unavailable}. Usage is computed by the engine from the
+        workspace session store.
       </div>
     );
   }

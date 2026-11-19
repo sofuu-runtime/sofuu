@@ -1938,31 +1938,38 @@
         cost: costUsd,
       }));
     }
-    /* Persist the turn to this session's .qtsq + heartbeat the registry. */
-    sessionLog('answer', answer);
-    registryUpsert(S.project, S.info);
-    /* History stores the manifest only (not full file text). */
-    var histText = manifest ? text + ' [' + manifest + ']' : text;
-    /* Meter calibration inputs, captured BEFORE this turn lands in history:
-     * overhead = firstPromptTk − histAtReq − turnTk (system + tool schemas +
-     * ephemeral), so the post-turn ctx event = overhead + historyTokens()
-     * — with retained transcripts (2026-09-03 e) the next request INCLUDES
-     * the turn's transcript, and firstPromptTk alone would under-count it. */
-    var histAtReq = historyTokens();
-    var turnTk = estTok(histText);
-    /* Turn-block retention (2026-09-03 e): the turn's tool transcript
-     * (assistant tool_calls + tool results) persists into history between
-     * the prompt and the answer — the model keeps its tool context across
-     * turns and compaction sheds it, not a per-turn release. */
-    S.history.push({ role: 'user', content: histText });
-    var turnTranscript = (res && Array.isArray(res.transcript)) ? res.transcript : null;
-    if (turnTranscript && turnTranscript.length) {
-      for (var ti2 = 0; ti2 < turnTranscript.length; ti2++) {
-        S.history.push(turnTranscript[ti2]);
+    /* Persist the turn to this session's .qtsq + heartbeat the registry.
+     * A failed-salvage placeholder is NEVER persisted nor pushed into history (P2-14):
+     * a resumed session would replay "(no response)" as if it were the answer. */
+    var noResponse = answer === '(no response)' && res && res.stopped;
+    if (!noResponse) {
+      sessionLog('answer', answer);
+      registryUpsert(S.project, S.info);
+      /* History stores the manifest only (not full file text). */
+      var histText = manifest ? text + ' [' + manifest + ']' : text;
+      /* Meter calibration inputs, captured BEFORE this turn lands in history:
+       * overhead = firstPromptTk − histAtReq − turnTk (system + tool schemas +
+       * ephemeral), so the post-turn ctx event = overhead + historyTokens()
+       * — with retained transcripts (2026-09-03 e) the next request INCLUDES
+       * the turn's transcript, and firstPromptTk alone would under-count it. */
+      var histAtReq = historyTokens();
+      var turnTk = estTok(histText);
+      /* Turn-block retention (2026-09-03 e): the turn's tool transcript
+       * (assistant tool_calls + tool results) persists into history between
+       * the prompt and the answer — the model keeps its tool context across
+       * turns and compaction sheds it, not a per-turn release. */
+      S.history.push({ role: 'user', content: histText });
+      var turnTranscript = (res && Array.isArray(res.transcript)) ? res.transcript : null;
+      if (turnTranscript && turnTranscript.length) {
+        for (var ti2 = 0; ti2 < turnTranscript.length; ti2++) {
+          S.history.push(turnTranscript[ti2]);
+        }
       }
+      S.history.push({ role: 'assistant', content: answer });
+      await trimHistory();
+    } else {
+      registryUpsert(S.project, S.info);
     }
-    S.history.push({ role: 'assistant', content: answer });
-    await trimHistory();
     try {
       if (typeof sofuu !== 'undefined' && sofuu.scouter) {
         var lt = (turnTranscript && turnTranscript.length) ? String(turnTranscript[turnTranscript.length - 1].content || '') : null;

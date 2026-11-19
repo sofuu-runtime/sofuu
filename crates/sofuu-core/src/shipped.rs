@@ -128,6 +128,29 @@ pub const OBSERVABILITY_JS: &str = include_str!("../../../src/js/observability.j
 pub const OBSERVABILITY_JS: &str = "";
 pub const OBSERVABILITY_BC: &[u8] = include_bytes!("../../../src/js/observability.bc.gz");
 
+/// The Kaze asynchronous driver — single source of truth is src/js/kaze_async.js.
+///
+/// It rides the same gzip mechanism as the other single-path drivers: staged
+/// by build.rs and embedded here as the compressed payload, so its 18,884 B of
+/// source stop costing .rodata. The inflate happens once, at the point where
+/// the driver is evaluated into the Kaze namespace.
+pub const KAZE_ASYNC_JS_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kaze_async.js.gz"));
+
+/// The Kaze async driver source, inflated once for the life of the process.
+///
+/// A torn payload must surface as a driver eval error, not as an empty source
+/// that reads like "this build has no driver" — so the fallback throws.
+pub fn kaze_async_js() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| {
+        inflate_gz(KAZE_ASYNC_JS_GZ, "src/js/kaze_async.js").unwrap_or_else(|| {
+            String::from(
+                "throw new Error(\"sofuu.kaze unavailable: embedded kaze_async.js failed to inflate\");\n",
+            )
+        })
+    })
+}
+
 /// Inflate one gzipped embedded asset (AUDIT-2026-10-31 P1-8).
 ///
 /// The shipped JS that only one code path needs is embedded gzipped, so its
@@ -371,6 +394,7 @@ mod tests {
             ("compat.js", include_str!("../../../src/js/compat.js")),
             ("rlm.js", include_str!("../../../src/js/rlm.js")),
             ("chat_tui.js", include_str!("../../../src/js/chat_tui.js")),
+            ("kaze_async.js", include_str!("../../../src/js/kaze_async.js")),
         ] {
             let path = std::path::Path::new(env!("OUT_DIR")).join(format!("{asset}.gz"));
             let gz = std::fs::read(&path)

@@ -1,0 +1,7 @@
+{
+  "entry": "main",
+  "fuel": 200000,
+  "args": {
+    "instruction": "Summarize the document in one sentence."
+  }
+}

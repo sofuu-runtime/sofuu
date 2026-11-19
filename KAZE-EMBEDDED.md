@@ -72,14 +72,27 @@ required capability and embedded-boundary gates.
 - A real model-plus-MCP journey has been exercised on a debug build through all
   three entry points; see the local verification section. A script or
   `.kazebc` file that declares neither `ai` nor `tool` keeps the engine-free
-  synchronous runner. Alert, sensor, device, and persistent memory operations
-  remain unavailable unless explicitly documented above.
+  synchronous runner. Alert and persistent memory operations are available
+  through the backends described below; sensor, device and physical-hardware
+  operations remain unavailable.
 - Drone and rover simulation is available only when explicitly selected for
   testing, for example `--cap drone=sim`. Reports label simulated families.
   A bare `--cap drone` does not select a simulator.
 - Embedded live drone and GPIO dispatch is disabled until policy propagation
   and physical safety checks are verified. No physical-hardware result is
   claimed.
+
+### Alert sinks
+
+`alert.send` needs an explicit sink grant: `alert=stdout`, `alert=stderr` or
+`alert=file:<path>`. The sink receives the message as one `[ALERT] <message>`
+line and flushes it. A message must contain 1 to 1024 bytes; a larger or
+empty message is refused with `E_KAZE_RANGE`. Without a sink grant the call
+fails closed with `E_CAP_MISSING`, so an alert is never reported as delivered
+when nothing received it. These are local sinks: they are not a pager, an
+email, an SMS or a clinical escalation channel, and the acknowledgement is
+that the bytes were written, not that a person read them. The action trace
+redacts the message text.
 
 ### Per-run Kaze memory
 
@@ -102,11 +115,30 @@ Each invocation creates its own in-memory CMA. Calls within that invocation
 and its supervisor ticks share the store; independent invocations do not.
 There is no disk reopen, cross-process sharing or storage encryption claim.
 
+### Durable Kaze memory
+
+`--cap memory=durable` selects a file-backed store at
+`.sofuu/kaze_memory.json`; `--cap memory=file:<path>` (or `path:<path>`)
+selects an explicit path. The store is opened before the routine runs and
+records are committed atomically through a temporary file and a rename, so an
+interrupted process leaves the previous commit intact. The same 256-record,
+256 KiB and 1,024-byte limits apply, and a store that cannot be opened is
+refused with `E_CONFIG` rather than silently falling back to memory.
+
+Durability is a separate claim from availability and is verified by reopening
+the store in a new process: `scripts/test-kaze-memory-durable.py` writes in
+one process, exits, and recalls the same label in a second process, and also
+checks store isolation from the ephemeral CMA, policy denial, the `.kazebc`
+path and the compiled standalone binary. A durable claim is not made for the
+ephemeral backend, and the two stores do not share data.
+
 Existing published binaries have not been verified against these changes and
 may behave differently. The async bridge is implemented and has passed a real
-model-plus-MCP journey on a debug build with a configured remote provider; local
-GGUF weights and released artifacts remain unverified. This work does not
-establish a shared Kaze 1.0 core or bytecode compatibility with standalone Kaze.
+model-plus-MCP journey on a debug build with a configured remote provider and,
+separately, with pre-existing local GGUF weights and a real local MCP server;
+released artifacts and other providers remain unverified. This work does not
+establish a shared Kaze 1.0 core or bytecode compatibility with standalone
+Kaze.
 
 ## Local verification and remaining work
 
@@ -128,17 +160,43 @@ cargo test --offline -p sofuu-core --lib domains::kaze
 cargo test --offline -p sofuu-core --lib domains::robotics::hardware::tests
 python3 scripts/test-kaze-fail-closed.py target/debug/sofuu
 python3 scripts/test-kaze-memory-real.py target/debug/sofuu
+python3 scripts/test-kaze-memory-durable.py target/debug/sofuu
+python3 scripts/test-kaze-alert-real.py target/debug/sofuu
 python3 scripts/test-kaze-js-boundaries.py target/debug/sofuu
+# Requires pre-existing local GGUF weights; downloads nothing:
+python3 scripts/test-kaze-local-gguf-real.py
 # Opt-in, requires SOFUU_TEST_* provider configuration:
 python3 scripts/test-kaze-real-ai.py
 python3 scripts/test-kaze-cli-real-ai.py
 ```
 
+On 2026-11-16 the macOS debug build with SHA-256
+`b9669d547619329c35295cef7a230d83feb4a60c17e1be6e2008b720d3a83153`
+(working tree at revision `853d01325` with uncommitted changes; the binary was
+rebuilt during the session and the final re-run used
+`51ca0b0d3db7462d6c5e17e6fed902b7e155935acae68ba332a2d57697189c5b`)
+exercised the real local-GGUF path on this machine with
+the pre-existing `~/Downloads/SmolLM2-360M-Instruct-Q8_0.gguf` weights
+(386,404,960 bytes) on the Metal GPU: the `sofuu.kaze.runAsync` source path
+returned a model answer grounded in a real MCP file read, and the compiled
+standalone path ran the same real tool and model. In that same run the
+standalone path's answer did not contain the expected marker, so that
+standalone run counts as a model-quality failure and not as a successful
+grounding. The same build was also observed serving a real alert to
+`alert=stdout` and `alert=file:<path>` and storing and recalling a record in
+`memory=durable` and `memory=file:<path>`.
+
+`example-agents/local_brief/` is the public, read-only example of this path: a
+pure Kaze routine reads one operator-selected local file through an
+authorized MCP tool and returns a real model's answer about it. Its README
+records the observed runs and the refusals it produces when the model, the MCP
+service or the policy is absent.
+
 The same boundary, fail-closed and ephemeral-memory checks also passed on a
 temporary release candidate before the async bridge was added; that candidate
 does not contain the bridge. The real-provider journey above is a local
 debug-build result with one configured provider; it does not establish
-published-artifact, local-GGUF, supervisor, interactive, or cancellation
+published-artifact, other-provider, supervisor, interactive, or cancellation
 coverage. The ignored local Kaze integration suite and repository-wide
 mandatory gates still contain non-robotics stand-ins that need migration.
 Follow the remaining Kaze tasks in [sofuu-map.md](sofuu-map.md).

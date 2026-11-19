@@ -608,12 +608,38 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
     }
 }
 
+/// Register the `__rlm_*` globals on a QuickJS context.
+///
+/// The shipped engine seam (`sofuu_rust_register_engine_js`) registers the
+/// same set plus the JS drivers; this is the bare-primitive half, used by the
+/// real-model coverage in `real_model.rs` to drive an episode through the
+/// wire without the shipped driver.
+#[cfg(test)]
+pub(crate) fn register_primitives(ctx: *mut JSContext) {
+    // SAFETY: ctx is the caller's live context; all fns are 'static.
+    unsafe {
+        register_global_fn(ctx, "__rlm_new", js_rlm_new as JSCFunction);
+        register_global_fn(ctx, "__rlm_start", js_rlm_start as JSCFunction);
+        register_global_fn(ctx, "__rlm_step", js_rlm_step as JSCFunction);
+        register_global_fn(ctx, "__rlm_feed_llm", js_rlm_feed_llm as JSCFunction);
+        register_global_fn(ctx, "__rlm_feed_tools", js_rlm_feed_tools as JSCFunction);
+        register_global_fn(ctx, "__rlm_free", js_rlm_free as JSCFunction);
+    }
+}
+
 /* ── Tests ───────────────────────────────────────────────────────── */
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use sofuu_ffi::qjs;
+
+    /// The tests in this module are PURE wire-protocol checks (RULES §1.9
+    /// static-data rule): the episode replies are fixed INPUTS to the
+    /// deterministic action machine, not a simulated model. Nothing here
+    /// executes a model and nothing here claims one ran — the coverage that
+    /// needs a real backend lives in `real_model.rs`, which drives the same
+    /// wire with replies from the shipped inference engine.
 
     #[test]
     fn request_json_maps_camelcase_opts() {
@@ -653,7 +679,9 @@ mod tests {
     /// __rlm_* globals on a bare JS_NewContext, then drive an episode from
     /// JS and assert the action JSON round-trips. (QjsSandbox's ctx field is
     /// private, so the test builds its own context via the qjs bindings —
-    /// the __rlm_* functions only need a valid ctx, not a sandbox.)
+    /// the __rlm_* functions only need a valid ctx, not a sandbox.) The
+    /// reply fed to the episode is a fixed input to the action machine; the
+    /// real-model path is covered in `real_model.rs`.
     #[test]
     fn js_roundtrip_through_quickjs() {
         // SAFETY: single-threaded test; ctx/rt torn down at the end.
@@ -740,7 +768,9 @@ mod tests {
 
     /// A4 full form through a REAL QuickJS context: tools in the request
     /// JSON → documented in the system prompt → snippet tool() call →
-    /// resolve_tools action → feed → done with tool_calls accounted.
+    /// resolve_tools action → feed → done with tool_calls accounted. The
+    /// tool result fed back is a fixed input to the action machine — the
+    /// host executor lives in the JS driver, not here.
     #[test]
     fn js_tools_roundtrip_through_quickjs() {
         // SAFETY: single-threaded test; ctx/rt torn down at the end.
@@ -892,7 +922,7 @@ mod tests {
         assert!(!opts_dbg.contains("sk-DECOY-123"), "opts carry the key: {opts_dbg}");
         assert!(!opts_dbg.contains("decoy.example"), "opts carry base_url: {opts_dbg}");
 
-        // Drive a full episode (scripted fake) and serialize the result.
+        // Drive a full episode over a fixed reply and serialize the result.
         let mut ep = Episode::new(req, 0).expect("episode");
         let result = ep.run(&mut |_msgs| "```js\nfinal(\"eu-west\")\n```".to_string());
         let ser = serde_json::to_string(&result).expect("serialize");

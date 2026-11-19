@@ -855,7 +855,11 @@ pub fn frame_from_json(core: &LinkCore, v: &Value) -> Result<Frame, String> {
         86 => {
             let lat = num("lat").ok_or("SET_POSITION_TARGET_GLOBAL_INT needs `lat`")?;
             let lon = num("lon").ok_or("SET_POSITION_TARGET_GLOBAL_INT needs `lon`")?;
-            let alt = num("alt").unwrap_or(0.0);
+            /* The altitude is stated, not assumed. A missing field used to
+             * become 0 m, which is a command to descend to the ground rather
+             * than the target the caller had in mind — an actuation built from
+             * a missing number. */
+            let alt = num("alt").ok_or("SET_POSITION_TARGET_GLOBAL_INT needs `alt`")?;
             let vel = [num("vx").unwrap_or(0.0) as f32, num("vy").unwrap_or(0.0) as f32, num("vz").unwrap_or(0.0) as f32];
             let yaw_rate = num("yawRate").unwrap_or(0.0) as f32;
             /* Default mask depends on what the caller actually supplied.

@@ -362,6 +362,11 @@ fn main() {
          * ride the same gzip mechanism as the other single-path drivers. */
         "mavlink.js",
         "drone.js",
+        /* The Kaze async driver was the last raw source on this path: 18,884 B
+         * of .rodata for a driver only the Kaze namespace needs. It rides the
+         * same mechanism — staged gzipped here, inflated once where it is
+         * evaluated (shipped::kaze_async_js). */
+        "kaze_async.js",
     ] {
         use std::io::Write as _;
         let path = manifest.join("../../src/js").join(asset);

@@ -11,7 +11,7 @@
 //! - Out-of-band Rust memory isolation - immune to JS prototype pollution or prompt injection
 
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use sofuu_ffi::qjs::{self, JSContext, JSValue, JSValueConst};
 
@@ -208,6 +208,10 @@ fn score_to_grade(score: u32) -> &'static str {
 pub struct ContextHealthReport {
     pub score: u32,
     pub grade: &'static str,
+    /// Whether this report measured anything. A conversation with no
+    /// messages (and no token count) has nothing to evaluate: reporting a
+    /// perfect score for it is a health verdict nobody measured.
+    pub measured: bool,
     pub max_entropy: f64,
     pub zipf_dev: f64,
     pub efficiency_ratio: f64,
@@ -217,9 +221,21 @@ pub struct ContextHealthReport {
 impl ContextHealthReport {
     #[inline(never)]
     pub fn to_json(&self) -> String {
+        /* An unmeasured report carries no score and no grade: a reader must
+         * not mistake "nothing was evaluated" for "everything is healthy". */
+        let (score, grade) = if self.measured {
+            (self.score.to_string(), format!("\"{}\"", self.grade))
+        } else {
+            ("null".to_string(), "null".to_string())
+        };
         let mut out = format!(
-            r#"{{"score":{},"grade":"{}","max_entropy":{:.4},"zipf_dev":{:.4},"efficiency_ratio":{:.4},"threats":"#,
-            self.score, self.grade, self.max_entropy, self.zipf_dev, self.efficiency_ratio
+            r#"{{"score":{},"grade":{},"measured":{},"max_entropy":{:.4},"zipf_dev":{:.4},"efficiency_ratio":{:.4},"threats":"#,
+            score,
+            grade,
+            self.measured,
+            self.max_entropy,
+            self.zipf_dev,
+            self.efficiency_ratio
         );
         write_threats_json(&mut out, &self.threats);
         out.push('}');
@@ -312,6 +328,9 @@ pub fn evaluate_context_health(
     ContextHealthReport {
         score,
         grade,
+        /* Nothing to evaluate: an empty conversation with no token count
+         * has no context to measure. */
+        measured: !messages.is_empty() || total_tokens > 0,
         max_entropy,
         zipf_dev: max_zipf,
         efficiency_ratio: eff_ratio,
@@ -325,6 +344,10 @@ pub fn evaluate_context_health(
 pub struct BrainHealthReport {
     pub score: u32,
     pub grade: &'static str,
+    /// Whether this report measured anything. An empty memory store (no
+    /// entries, or entries with no vector) has no brain health to report:
+    /// a perfect score for it is a verdict nobody measured.
+    pub measured: bool,
     pub cluster_variance: f64,
     pub contradiction_count: usize,
     pub gravity_traps: usize,
@@ -334,9 +357,19 @@ pub struct BrainHealthReport {
 impl BrainHealthReport {
     #[inline(never)]
     pub fn to_json(&self) -> String {
+        let (score, grade) = if self.measured {
+            (self.score.to_string(), format!("\"{}\"", self.grade))
+        } else {
+            ("null".to_string(), "null".to_string())
+        };
         let mut out = format!(
-            r#"{{"score":{},"grade":"{}","cluster_variance":{:.6},"contradiction_count":{},"gravity_traps":{},"threats":"#,
-            self.score, self.grade, self.cluster_variance, self.contradiction_count, self.gravity_traps
+            r#"{{"score":{},"grade":{},"measured":{},"cluster_variance":{:.6},"contradiction_count":{},"gravity_traps":{},"threats":"#,
+            score,
+            grade,
+            self.measured,
+            self.cluster_variance,
+            self.contradiction_count,
+            self.gravity_traps
         );
         write_threats_json(&mut out, &self.threats);
         out.push('}');
@@ -387,10 +420,14 @@ pub fn evaluate_brain_health(
     let mut gravity_traps = 0usize;
     let n = vectors.len();
 
+    /* No entries, or entries without a vector: there is no brain to
+     * evaluate. The score stays at its nominal 100 but the report is
+     * marked UNMEASURED — it is not a perfect health verdict. */
     if n == 0 {
         return BrainHealthReport {
             score: 100,
             grade: "A",
+            measured: false,
             cluster_variance: 1.0,
             contradiction_count: 0,
             gravity_traps: 0,
@@ -403,6 +440,7 @@ pub fn evaluate_brain_health(
         return BrainHealthReport {
             score: 100,
             grade: "A",
+            measured: false,
             cluster_variance: 1.0,
             contradiction_count: 0,
             gravity_traps: 0,
@@ -497,6 +535,7 @@ pub fn evaluate_brain_health(
     BrainHealthReport {
         score,
         grade,
+        measured: true,
         cluster_variance,
         contradiction_count,
         gravity_traps,
@@ -518,14 +557,21 @@ const EMPTY_THREAT: ScouterThreat = ScouterThreat {
 pub struct ScouterState {
     pub context_score: AtomicU32,
     pub brain_score: AtomicU32,
+    /// Whether `context_score` / `brain_score` came from a real evaluation.
+    /// Before the first evaluation there is no reading at all: a perfect
+    /// default would be a fabricated "healthy" verdict, not a measurement.
+    pub context_measured: AtomicBool,
+    pub brain_measured: AtomicBool,
     pub total_alerts: AtomicUsize,
     pub threat_cursor: AtomicUsize,
     pub recent_threats: Mutex<[ScouterThreat; MAX_RECENT_THREATS]>,
 }
 
 static GLOBAL_SCOUTER_STATE: ScouterState = ScouterState {
-    context_score: AtomicU32::new(100),
-    brain_score: AtomicU32::new(100),
+    context_score: AtomicU32::new(0),
+    brain_score: AtomicU32::new(0),
+    context_measured: AtomicBool::new(false),
+    brain_measured: AtomicBool::new(false),
     total_alerts: AtomicUsize::new(0),
     threat_cursor: AtomicUsize::new(0),
     recent_threats: Mutex::new([EMPTY_THREAT; MAX_RECENT_THREATS]),
@@ -536,13 +582,22 @@ pub fn global_scouter_state() -> &'static ScouterState {
     &GLOBAL_SCOUTER_STATE
 }
 
+/// Record the outcome of one evaluation in the global state.
+///
+/// `score` is None when the evaluation measured nothing: the previous
+/// reading (and its "measured" flag) is then left alone — an unmeasured
+/// pass must not publish a score, and must not clear one either.
 #[inline(never)]
-fn record_scouter_threats(threats: &[ScouterThreat], score: u32, is_context: bool) {
+fn record_scouter_threats(threats: &[ScouterThreat], score: Option<u32>, is_context: bool) {
     let state = global_scouter_state();
-    if is_context {
-        state.context_score.store(score, Ordering::Relaxed);
-    } else {
-        state.brain_score.store(score, Ordering::Relaxed);
+    if let Some(score) = score {
+        if is_context {
+            state.context_score.store(score, Ordering::Relaxed);
+            state.context_measured.store(true, Ordering::Relaxed);
+        } else {
+            state.brain_score.store(score, Ordering::Relaxed);
+            state.brain_measured.store(true, Ordering::Relaxed);
+        }
     }
     if let Ok(mut lock) = state.recent_threats.lock() {
         for t in threats {
@@ -640,7 +695,11 @@ unsafe extern "C" fn js_scouter_context_health(
         500, // estimated system token default
         100, // estimated user token default
     );
-    record_scouter_threats(&report.threats, report.score, true);
+    record_scouter_threats(
+        &report.threats,
+        report.measured.then_some(report.score),
+        true,
+    );
     js_new_string_from_str(ctx, &report.to_json())
 }
 
@@ -706,7 +765,11 @@ unsafe extern "C" fn js_scouter_brain_health(
 
     let texts_ref: Vec<&str> = texts_owned.iter().map(|s| s.as_str()).collect();
     let report = evaluate_brain_health(&vectors, &texts_ref, &hits, &ages);
-    record_scouter_threats(&report.threats, report.score, false);
+    record_scouter_threats(
+        &report.threats,
+        report.measured.then_some(report.score),
+        false,
+    );
     js_new_string_from_str(ctx, &report.to_json())
 }
 
@@ -718,14 +781,22 @@ unsafe extern "C" fn js_scouter_status(
     _argv: *const JSValueConst,
 ) -> JSValue {
     let state = global_scouter_state();
+    let ctx_measured = state.context_measured.load(Ordering::Relaxed);
+    let brain_measured = state.brain_measured.load(Ordering::Relaxed);
     let ctx_score = state.context_score.load(Ordering::Relaxed);
     let brain_score = state.brain_score.load(Ordering::Relaxed);
     let total_alerts = state.total_alerts.load(Ordering::Relaxed);
     let cursor = state.threat_cursor.load(Ordering::Relaxed);
 
+    /* A score nobody measured is `null`, not a number. The previous
+     * default (100) read as a perfect health verdict on a process that had
+     * evaluated nothing at all. */
+    let ctx_json = if ctx_measured { ctx_score.to_string() } else { "null".to_string() };
+    let brain_json = if brain_measured { brain_score.to_string() } else { "null".to_string() };
+
     let mut out = format!(
-        r#"{{"contextScore":{},"brainScore":{},"totalAlerts":{},"recentThreats":["#,
-        ctx_score, brain_score, total_alerts
+        r#"{{"contextScore":{},"brainScore":{},"contextMeasured":{},"brainMeasured":{},"totalAlerts":{},"recentThreats":["#,
+        ctx_json, brain_json, ctx_measured, brain_measured, total_alerts
     );
     let count = cursor.min(MAX_RECENT_THREATS);
     if let Ok(lock) = state.recent_threats.lock() {
@@ -857,5 +928,36 @@ mod tests {
         let texts = ["0", "1", "2", "3", "4", "5"];
         let report = evaluate_brain_health(&vectors, &texts, &[1; 6], &[0; 6]);
         assert!(report.threats.iter().any(|t| t.kind == "hub_vector_sybil"));
+    }
+
+    /// An evaluation with nothing to evaluate must NOT publish a score.
+    /// The nominal 100/A of an empty store is not a health verdict — it
+    /// is a verdict nobody measured.
+    #[test]
+    fn an_unmeasured_evaluation_reports_no_score() {
+        let brain = evaluate_brain_health(&[], &[], &[], &[]);
+        assert!(!brain.measured, "an empty brain is not measured");
+        let json = brain.to_json();
+        assert!(
+            json.contains("\"score\":null"),
+            "an unmeasured brain has no score: {json}"
+        );
+        assert!(json.contains("\"measured\":false"), "{json}");
+
+        let context = evaluate_context_health(&[], None, 0, 500, 100);
+        assert!(!context.measured, "an empty context is not measured");
+        let json = context.to_json();
+        assert!(
+            json.contains("\"score\":null"),
+            "an unmeasured context has no score: {json}"
+        );
+
+        /* A real evaluation still reports its score. */
+        let measured = evaluate_context_health(&[("user", "hello there")], None, 100, 50, 50);
+        assert!(measured.measured, "a context with a turn is measured");
+        assert!(
+            measured.to_json().contains("\"score\":"),
+            "a measured context reports its score"
+        );
     }
 }

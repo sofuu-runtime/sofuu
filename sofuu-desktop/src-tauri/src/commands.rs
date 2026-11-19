@@ -22,6 +22,23 @@ fn project_dir() -> String {
         .unwrap_or_else(|| sofuu_core::embed_config::home_dir().unwrap_or_else(|| ".".into()))
 }
 
+/// Parse an engine reply into a command result.
+///
+/// The chat surface answers either its own shape ({ok, …}) or a failure
+/// envelope ({error: '…'}). The failure envelope must NOT reach the
+/// WebView as a successful reply: the UI reads `ok`/shape, and an
+/// `{error: …}` object that looks like a result is how an unavailable
+/// engine ends up rendered as an empty transcript or a zeroed counter.
+fn engine_reply(reply: &str) -> Result<Value, String> {
+    let v: Value = serde_json::from_str(reply).map_err(|e| e.to_string())?;
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        if !err.is_empty() {
+            return Err(err.to_string());
+        }
+    }
+    Ok(v)
+}
+
 /// Frontend crash/error forwarding: the webview's console is invisible in
 /// release builds — window.onerror (installed by an initialization script)
 /// routes here so JS failures reach stderr. Never blocks the UI.
@@ -68,23 +85,47 @@ pub async fn list_sessions(engine: State<'_, EngineHandle>) -> Result<Value, Str
     // The registry is qtsq-encrypted now (project store, no plaintext) —
     // the ENGINE reads it (sofuu.chat.sessions). The Rust plaintext-json
     // mirror stays as a fallback for pre-layout projects (and the old
-    // TUI-written registry) so the sidebar never empties spuriously.
+    // TUI-written registry). When the engine cannot answer AND the mirror
+    // cannot be read, this FAILS: an empty list must never stand in for
+    // "the engine could not answer" — the sidebar renders an empty list as
+    // "no chats here".
     let script = "(__desktop_reply(JSON.stringify( \
-         (sofuu.chat && sofuu.chat.sessions) ? sofuu.chat.sessions() : {sessions: []} \
+         (sofuu.chat && typeof sofuu.chat.sessions === 'function') ? sofuu.chat.sessions() : {error:'session registry unavailable in this runtime'} \
        )))";
     // CONTRACT: the frontend expects a BARE ARRAY of SessionInfo (the old
     // plaintext-mirror shape). The engine reply is {sessions:[…]} — strip
     // the envelope, never leak it (a leaked object makes TopBar's
     // sessions.map crash → React unmounts → blank window).
-    if let Ok(reply) = engine.query(script.to_string(), QUERY_TIMEOUT) {
-        if let Ok(v) = serde_json::from_str::<Value>(&reply) {
-            if let Some(arr) = v.get("sessions").and_then(|s| s.as_array()) {
-                return Ok(json!(arr));
-            }
-        }
-    }
-    let sessions = sessions::list_sessions(std::path::Path::new(&project_dir()));
-    serde_json::to_value(sessions).map_err(|e| e.to_string())
+    let engine_error = match engine.query(script.to_string(), QUERY_TIMEOUT) {
+        Ok(reply) => match serde_json::from_str::<Value>(&reply) {
+            Ok(v) => match v.get("sessions").and_then(|s| s.as_array()) {
+                Some(arr) => return Ok(json!(arr)),
+                // The engine's own failure reason beats a generic wording.
+                None => Some(
+                    v.get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("engine reply carried no session list")
+                        .to_string(),
+                ),
+            },
+            Err(e) => Some(format!("engine reply was not JSON: {e}")),
+        },
+        Err(e) => Some(e),
+    };
+    // The engine did not answer — the plaintext mirror is the last REAL
+    // source (a read of the registry file on disk). A registry that cannot
+    // be read is an error, not an empty list.
+    let mirror = sessions::list_sessions(std::path::Path::new(&project_dir())).map_err(|e| {
+        format!(
+            "session list unavailable — engine: {}; registry: {e}",
+            engine_error.unwrap_or_else(|| "unavailable".into())
+        )
+    })?;
+    Ok(json!({
+        "sessions": mirror,
+        "source": "registry-file",
+        "engineError": engine_error,
+    }))
 }
 
 /// Turn history for a session — served by chat.js through the engine (the
@@ -98,7 +139,7 @@ pub async fn session_turns(engine: State<'_, EngineHandle>, id: String) -> Resul
          ))"
     );
     let reply = engine.query(script, QUERY_TIMEOUT)?;
-    serde_json::from_str(&reply).map_err(|e| e.to_string())
+    engine_reply(&reply)
 }
 
 #[tauri::command]
@@ -106,7 +147,7 @@ pub async fn new_session(engine: State<'_, EngineHandle>) -> Result<Value, Strin
     let script =
         "__desktop_reply(JSON.stringify((sofuu.chat && sofuu.chat.newSession) ? sofuu.chat.newSession() : {error:'chat engine unavailable'}))";
     let reply = engine.query(script.to_string(), QUERY_TIMEOUT)?;
-    serde_json::from_str(&reply).map_err(|e| e.to_string())
+    engine_reply(&reply)
 }
 
 /// Switch the engine's active session to `id` (loads its transcript into
@@ -122,7 +163,7 @@ pub async fn resume_session(engine: State<'_, EngineHandle>, id: String) -> Resu
          ))"
     );
     let reply = engine.query(script.to_string(), QUERY_TIMEOUT)?;
-    serde_json::from_str(&reply).map_err(|e| e.to_string())
+    engine_reply(&reply)
 }
 
 /// Set the permission profile: 'full' | 'edit' | 'plan' | 'prompt'.
@@ -135,7 +176,7 @@ pub async fn set_permissions(engine: State<'_, EngineHandle>, profile: String) -
          ))"
     );
     let reply = engine.query(script.to_string(), QUERY_TIMEOUT)?;
-    serde_json::from_str(&reply).map_err(|e| e.to_string())
+    engine_reply(&reply)
 }
 
 #[tauri::command]
@@ -143,7 +184,7 @@ pub async fn chat_state(engine: State<'_, EngineHandle>) -> Result<Value, String
     let script =
         "__desktop_reply(JSON.stringify((sofuu.chat && sofuu.chat.state) ? sofuu.chat.state() : {error:'chat engine unavailable'}))";
     let reply = engine.query(script.to_string(), QUERY_TIMEOUT)?;
-    serde_json::from_str(&reply).map_err(|e| e.to_string())
+    engine_reply(&reply)
 }
 
 /// Usage report for Settings › Usage — served by chat.js through the
@@ -155,13 +196,17 @@ pub async fn usage_report(engine: State<'_, EngineHandle>) -> Result<Value, Stri
     let script =
         "__desktop_reply(JSON.stringify((sofuu.chat && sofuu.chat.usage) ? sofuu.chat.usage() : {error:'chat engine unavailable'}))";
     let reply = engine.query(script.to_string(), QUERY_TIMEOUT)?;
-    serde_json::from_str(&reply).map_err(|e| e.to_string())
+    engine_reply(&reply)
 }
 
 #[tauri::command]
 pub async fn compact(engine: State<'_, EngineHandle>) -> Result<Value, String> {
+    // The engine answers {ok, savedTokens} or {ok:false, error}. A reply
+    // that carries NEITHER is not a successful compaction — it means the
+    // engine did not report an outcome, so report it as unavailable
+    // instead of claiming the history was folded.
     let script =
-        "(function(){ if (sofuu.chat && sofuu.chat.compact) { Promise.resolve(sofuu.chat.compact()).then(function(r){ __desktop_reply(JSON.stringify(r||{ok:true})); }, function(e){ __desktop_reply(JSON.stringify({error:String(e&&e.message||e)})); }); } else { __desktop_reply(JSON.stringify({error:'chat engine unavailable'})); } })()";
+        "(function(){ if (sofuu.chat && sofuu.chat.compact) { Promise.resolve(sofuu.chat.compact()).then(function(r){ __desktop_reply(JSON.stringify(r && r.ok ? r : {ok:false, error: (r && r.error) ? r.error : 'compact did not report a result'})); }, function(e){ __desktop_reply(JSON.stringify({ok:false, error:String(e&&e.message||e)})); }); } else { __desktop_reply(JSON.stringify({ok:false, error:'chat engine unavailable'})); } })()";
     let reply = engine.query(script.to_string(), Duration::from_secs(120))?;
     serde_json::from_str(&reply).map_err(|e| e.to_string())
 }
@@ -173,12 +218,24 @@ pub async fn compact(engine: State<'_, EngineHandle>) -> Result<Value, String> {
 
 #[tauri::command]
 pub async fn list_tools(engine: State<'_, EngineHandle>) -> Result<Value, String> {
+    // sofuu.tools.list() is the engine's own inventory (same policy
+    // decision builder the executor uses). The bare TOOLS key list is the
+    // fallback for a runtime without it. No tools API at all → the command
+    // FAILS: an empty list would read as "this build has no tools".
     let script = "__desktop_reply(JSON.stringify((function(){ try { \
-        var defs = []; \
-        if (sofuu.tools && sofuu.tools.TOOLS) { for (var k in sofuu.tools.TOOLS) defs.push(k); } \
-        var mcp = []; \
-        try { if (sofuu.chat && sofuu.chat.state) { var st = sofuu.chat.state(); if (st && st.mcpTools) mcp = st.mcpTools; } } catch(e){} \
-        return {ok:true, builtin:defs, mcp:mcp}; \
+        var builtin = []; \
+        if (sofuu.tools && typeof sofuu.tools.list === 'function') { \
+          var all = sofuu.tools.list({ enabledOnly: false }); \
+          for (var i = 0; i < all.length; i++) { \
+            var t = all[i]; \
+            builtin.push(t.name + (t.policy && t.policy.requiresApproval ? ' (asks)' : '')); \
+          } \
+        } else if (sofuu.tools && sofuu.tools.TOOLS) { \
+          for (var k in sofuu.tools.TOOLS) builtin.push(k); \
+        } else { \
+          return {ok:false, error:'tools API unavailable in this runtime'}; \
+        } \
+        return {ok:true, builtin:builtin, mcp:null, mcpNote:'the engine does not report its connected MCP servers'}; \
       } catch(e){ return {ok:false, error:String(e&&e.message||e)}; } })()))";
     let reply = engine.query(script.to_string(), QUERY_TIMEOUT)?;
     serde_json::from_str(&reply).map_err(|e| e.to_string())
@@ -186,9 +243,13 @@ pub async fn list_tools(engine: State<'_, EngineHandle>) -> Result<Value, String
 
 #[tauri::command]
 pub async fn list_agents(engine: State<'_, EngineHandle>) -> Result<Value, String> {
+    // No agent registry in this runtime → the command FAILS; an empty
+    // list would read as "this build has no agents".
     let script = "__desktop_reply(JSON.stringify((function(){ try { \
-        var list = (sofuu.agent && sofuu.agent.list) ? sofuu.agent.list() : []; \
-        return {ok:true, agents:list}; \
+        if (!sofuu.agent || typeof sofuu.agent.list !== 'function') { \
+          return {ok:false, error:'agent registry unavailable in this runtime'}; \
+        } \
+        return {ok:true, agents:sofuu.agent.list()}; \
       } catch(e){ return {ok:false, error:String(e&&e.message||e)}; } })()))";
     let reply = engine.query(script.to_string(), QUERY_TIMEOUT)?;
     serde_json::from_str(&reply).map_err(|e| e.to_string())
@@ -197,11 +258,29 @@ pub async fn list_agents(engine: State<'_, EngineHandle>) -> Result<Value, Strin
 #[tauri::command]
 pub async fn brain_remember(engine: State<'_, EngineHandle>, fact: String) -> Result<Value, String> {
     let fact_js = serde_json::to_string(&fact).unwrap_or_else(|_| "\"\"".into());
+    // The desktop keeps no brain handle: the runtime's memory API refuses
+    // a write without an OPEN store ("memory: no open brain"), so a direct
+    // sofuu.memory.remember() could never land a fact. The runtime's own
+    // writer (sofuu.agent.rememberGist) opens the workspace brain with the
+    // right vector space, embeds the text, stores it and flushes — the
+    // fact really lands in <project>/.sofuu/brain/. Its answer is the
+    // evidence: {ok, id} only when the store took it.
+    let brain_js = serde_json::to_string(&format!("{}/.sofuu/brain/brain.qtsq", project_dir()))
+        .unwrap_or_else(|_| "\"\"".into());
     let script = format!(
-        "__desktop_reply(JSON.stringify((function(){{ try {{ \
-          if (sofuu.memory && sofuu.memory.remember) {{ sofuu.memory.remember({fact_js}); return {{ok:true}}; }} \
-          return {{ok:false, error:'brain unavailable (enable /brain)'}}; \
-        }} catch(e){{ return {{ok:false, error:String(e&&e.message||e)}}; }} }})()))"
+        "(function(){{ try {{ \
+          if (!sofuu.agent || typeof sofuu.agent.rememberGist !== 'function') {{ \
+            __desktop_reply(JSON.stringify({{ok:false, error:'memory API unavailable in this runtime'}})); return; \
+          }} \
+          sofuu.agent.rememberGist({{name:'desktop', memory:'shared', brainPath:{brain_js}}}, {fact_js}) \
+            .then(function(r){{ \
+              __desktop_reply(JSON.stringify(r && r.ok \
+                ? {{ok:true, id:r.id}} \
+                : {{ok:false, error:(r && (r.reason || r.error)) || 'the memory store refused the write'}})); \
+            }}, function(e){{ \
+              __desktop_reply(JSON.stringify({{ok:false, error:String(e&&e.message||e)}})); \
+            }}); \
+        }} catch(e){{ __desktop_reply(JSON.stringify({{ok:false, error:String(e&&e.message||e)}})); }} }})()"
     );
     let reply = engine.query(script, QUERY_TIMEOUT)?;
     serde_json::from_str(&reply).map_err(|e| e.to_string())
@@ -209,9 +288,20 @@ pub async fn brain_remember(engine: State<'_, EngineHandle>, fact: String) -> Re
 
 #[tauri::command]
 pub async fn brain_why(engine: State<'_, EngineHandle>) -> Result<Value, String> {
+    // The engine's chat state carries no per-answer recall hits (no
+    // lastRecall / lastRecallHits field exists in the runtime), so there is
+    // nothing real to show here. Reporting "no memories shaped the last
+    // answer" would be an invented negative — say the surface is
+    // unavailable instead.
     let script = "__desktop_reply(JSON.stringify((function(){ try { \
-        var st = (sofuu.chat && sofuu.chat.state) ? sofuu.chat.state() : {}; \
-        return {ok:true, lastRecall:(st && st.lastRecall) || null, recall:(st && st.lastRecallHits) || null}; \
+        if (!sofuu.chat || typeof sofuu.chat.state !== 'function') { \
+          return {ok:false, error:'chat engine unavailable'}; \
+        } \
+        var st = sofuu.chat.state() || {}; \
+        if (st.lastRecall == null && st.lastRecallHits == null) { \
+          return {ok:false, error:'this runtime does not report which memories shaped an answer'}; \
+        } \
+        return {ok:true, lastRecall:st.lastRecall || null, recall:st.lastRecallHits || null}; \
       } catch(e){ return {ok:false, error:String(e&&e.message||e)}; } })()))";
     let reply = engine.query(script.to_string(), QUERY_TIMEOUT)?;
     serde_json::from_str(&reply).map_err(|e| e.to_string())
@@ -219,8 +309,18 @@ pub async fn brain_why(engine: State<'_, EngineHandle>) -> Result<Value, String>
 
 #[tauri::command]
 pub async fn ml_info(engine: State<'_, EngineHandle>) -> Result<Value, String> {
+    // No ML surface in this runtime → the command FAILS; {ok:true, info:null}
+    // would read as "the ML gates are on and report nothing".
+    // sofuu.ml.info() answers a JSON STRING — parse it so the UI gets an
+    // object, not a double-encoded blob.
     let script = "__desktop_reply(JSON.stringify((function(){ try { \
-        var info = (sofuu.ml && sofuu.ml.info) ? sofuu.ml.info() : null; \
+        if (!sofuu.ml || typeof sofuu.ml.info !== 'function') { \
+          return {ok:false, error:'ML surface unavailable in this runtime'}; \
+        } \
+        var raw = sofuu.ml.info(); \
+        var info = raw; \
+        if (typeof raw === 'string') { try { info = JSON.parse(raw); } catch (eP) { info = raw; } } \
+        if (info == null) { return {ok:false, error:'the ML surface reported no state'}; } \
         return {ok:true, info:info}; \
       } catch(e){ return {ok:false, error:String(e&&e.message||e)}; } })()))";
     let reply = engine.query(script.to_string(), QUERY_TIMEOUT)?;
@@ -229,9 +329,13 @@ pub async fn ml_info(engine: State<'_, EngineHandle>) -> Result<Value, String> {
 
 #[tauri::command]
 pub async fn context_dump(engine: State<'_, EngineHandle>) -> Result<Value, String> {
+    // Without chat.state() there is no engine context to dump — an empty
+    // object would read as "the engine has an empty context".
     let script = "__desktop_reply(JSON.stringify((function(){ try { \
-        var st = (sofuu.chat && sofuu.chat.state) ? sofuu.chat.state() : {}; \
-        return {ok:true, state:st}; \
+        if (!sofuu.chat || typeof sofuu.chat.state !== 'function') { \
+          return {ok:false, error:'chat engine unavailable'}; \
+        } \
+        return {ok:true, state:sofuu.chat.state()}; \
       } catch(e){ return {ok:false, error:String(e&&e.message||e)}; } })()))";
     let reply = engine.query(script.to_string(), QUERY_TIMEOUT)?;
     serde_json::from_str(&reply).map_err(|e| e.to_string())
@@ -587,7 +691,14 @@ pub async fn delete_session(engine: State<'_, EngineHandle>, id: String) -> Resu
     let reply = engine.query(script, QUERY_TIMEOUT)?;
     let parsed: Value = serde_json::from_str(&reply).unwrap_or(json!({ "ok": false }));
     if parsed.get("ok") != Some(&json!(true)) {
-        return Ok(parsed);
+        // The engine refused (or did not answer). Report the refusal with
+        // an explicit ok:false — a reply WITHOUT `ok` would read as a
+        // successful delete in the UI, which then drops the pill.
+        let err = parsed
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("the engine refused the delete");
+        return Ok(json!({ "ok": false, "error": err }));
     }
     // Remove the files: project-store folder + legacy flat layout.
     let base = sessions::sessions_dir(&sessions::mesh_root_for(std::path::Path::new(&project_dir())));
@@ -608,7 +719,13 @@ pub async fn clear_all_sessions(engine: State<'_, EngineHandle>) -> Result<Value
     let reply = engine.query(script.to_string(), QUERY_TIMEOUT)?;
     let parsed: Value = serde_json::from_str(&reply).unwrap_or(json!({ "ok": false }));
     if parsed.get("ok") != Some(&json!(true)) {
-        return Ok(parsed);
+        // As in delete_session: an explicit ok:false, never a reply the
+        // UI would read as "the chats are gone".
+        let err = parsed
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("the engine refused the clear");
+        return Ok(json!({ "ok": false, "error": err }));
     }
     let base = sessions::sessions_dir(&sessions::mesh_root_for(std::path::Path::new(&project_dir())));
     if let Some(ids) = parsed.get("ids").and_then(|v| v.as_array()) {
@@ -639,7 +756,18 @@ pub async fn set_project_dir(engine: State<'_, EngineHandle>, path: String) -> R
         "__desktop_reply(JSON.stringify((sofuu.chat && sofuu.chat.setProject) ? sofuu.chat.setProject({path_js}) : {{ok:false,error:'chat engine unavailable'}}))"
     );
     let reply = engine.query(script, QUERY_TIMEOUT)?;
-    serde_json::from_str(&reply).map_err(|e| e.to_string())
+    let parsed: Value = serde_json::from_str(&reply).map_err(|e| e.to_string())?;
+    if parsed.get("ok") != Some(&json!(true)) {
+        // The engine did not take the folder: report it. The frontend
+        // reverts to the previous workspace on an error, which is the
+        // honest outcome for a switch that did not happen.
+        let err = parsed
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("the engine refused the workspace switch");
+        return Err(err.to_string());
+    }
+    Ok(parsed)
 }
 
 /// Native folder picker (NSOpenPanel via the dialog plugin). Returns the
@@ -712,13 +840,17 @@ pub fn keychain_delete(provider: String) -> Result<Value, String> {
 
 /// Delete a provider: drop the config entry (the active one is refused —
 /// switch first), its Keychain key, and any cached model list for it.
+///
+/// The Keychain delete can fail on its own (no secret-service daemon, a
+/// locked store). That failure is REPORTED, not swallowed: the UI must not
+/// claim the credentials are gone when they are still on disk.
 #[tauri::command]
 pub fn remove_provider(provider: String) -> Result<Value, String> {
     let cfg = config::remove_provider(&provider)?;
-    let _ = keychain::delete_key(&provider);
+    let keychain_error = keychain::delete_key(&provider).err();
     sofuu_core::embed_config::clear_api_key(&provider);
     model_cache().lock().unwrap().remove(&provider);
-    Ok(cfg)
+    Ok(json!({ "config": cfg, "keychainError": keychain_error }))
 }
 
 #[cfg(test)]

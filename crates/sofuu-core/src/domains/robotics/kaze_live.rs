@@ -27,8 +27,9 @@ use serde_json::{json, Value as J};
 use super::mavlink;
 use super::mavlink_gate::{self as gate, HardwarePolicy};
 use super::mavlink_link::{self as link, Event, Io, LinkCore};
+use super::safety::{self, VehicleState};
 use crate::sfs::arena::Arena;
-use crate::sfs::caps::{render_value, CapHost, RuntimeHost, SimState};
+use crate::sfs::caps::{render_value, ActionMode, CapHost, RuntimeHost, SimState};
 use crate::sfs::value::{Heap, Value};
 
 /// How often the receiver thread pumps the transport (20 Hz, inside the plan's
@@ -42,8 +43,9 @@ pub const WARMUP_MS: u64 = 30_000;
 /// link did not answer.
 pub const DEFAULT_ACK_TIMEOUT_MS: u64 = 3_000;
 /// A cached reading is not evidence of the vehicle's current state forever.
-/// Enforces the strict 1.5s heartbeat safety window across robotics.
-const TELEMETRY_MAX_AGE: Duration = Duration::from_millis(1500);
+/// Enforces the strict 1.5s heartbeat safety window across robotics. One
+/// number for the whole division: `mavlink_gate` reads the same one.
+const TELEMETRY_MAX_AGE: Duration = safety::TELEMETRY_MAX_AGE;
 
 /// What the autopilot last told us. Updated by the receiver thread; read by
 /// `drone.telemetry(...)`, never invented.
@@ -63,6 +65,12 @@ pub struct DroneTelemetry {
     /// True once a HEARTBEAT has arrived: before that, every reading is a
     /// guess, and a script that acts on a guess is a bug.
     pub heard: bool,
+    /// The first position the vehicle reported. It is the geofence centre and
+    /// it never moves, so a target can be measured against it.
+    pub home: Option<(f64, f64)>,
+    /// When the autopilot confirmed an arming command. The confirmation is a
+    /// fact about the vehicle's state until a newer heartbeat says otherwise.
+    armed_confirmed_at: Option<Instant>,
     observed: std::collections::HashMap<&'static str, Instant>,
 }
 
@@ -97,6 +105,44 @@ impl DroneTelemetry {
         } else {
             Err(format!("E_KAZE_LINK: drone {} is missing or stale", field))
         }
+    }
+
+    /// How long since the autopilot's last heartbeat, if one has arrived.
+    pub fn heartbeat_age(&self) -> Option<Duration> {
+        self.observed.get("heartbeat").map(|at| at.elapsed())
+    }
+
+    /// The arming state, when it is known.
+    ///
+    /// A heartbeat is the vehicle's own report and the newest word we have.
+    /// An arming command the autopilot accepted is also a fact, and it stays
+    /// the answer until a *later* heartbeat says the vehicle is disarmed.
+    /// `None` means the arming state was never reported at all.
+    pub fn armed_state(&self) -> Option<bool> {
+        let heartbeat_at = self.observed.get("armed").copied();
+        let confirmed_at = self.armed_confirmed_at;
+        let newest = match (heartbeat_at, confirmed_at) {
+            (Some(h), Some(c)) => Some(h.max(c)),
+            (Some(h), None) => Some(h),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
+        };
+        let newest = newest?;
+        if newest.elapsed() > TELEMETRY_MAX_AGE {
+            return None;
+        }
+        match (heartbeat_at, confirmed_at) {
+            (Some(h), Some(c)) if h > c => Some(self.armed),
+            (Some(_), Some(_)) => Some(true),
+            (Some(_), None) => Some(self.armed),
+            (None, Some(_)) => Some(true),
+            (None, None) => None,
+        }
+    }
+
+    /// Record that the autopilot accepted an arming command.
+    pub fn confirm_armed(&mut self) {
+        self.armed_confirmed_at = Some(Instant::now());
     }
 
     fn fresh_mode(&self) -> Result<&str, String> {
@@ -134,6 +180,16 @@ impl DroneTelemetry {
                 "GLOBAL_POSITION_INT" => {
                     record_reading(&mut self.observed, "lat", &mut self.lat, data["lat"].as_f64().filter(|v| (-90.0..=90.0).contains(v)), now);
                     record_reading(&mut self.observed, "lon", &mut self.lon, data["lon"].as_f64().filter(|v| (-180.0..=180.0).contains(v)), now);
+                    // The first position is the home a target is measured
+                    // against. A zero pair is ArduPilot's no-fix placeholder,
+                    // not a place the vehicle was.
+                    if self.home.is_none()
+                        && self.observed.get("lat") == Some(&now)
+                        && self.observed.get("lon") == Some(&now)
+                        && !(self.lat == 0.0 && self.lon == 0.0)
+                    {
+                        self.home = Some((self.lat, self.lon));
+                    }
                     record_reading(&mut self.observed, "altitude_msl", &mut self.alt_m, data["alt_m"].as_f64(), now);
                     record_reading(&mut self.observed, "altitude", &mut self.rel_alt_m, data["relative_alt_m"].as_f64(), now);
                     // MAVLink's 65535 sentinel is decoded as 655.35 degrees.
@@ -184,6 +240,8 @@ pub struct DroneLink {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
     ack_timeout_ms: u64,
+    /// The fence radius this link's hardware policy carries.
+    geofence_radius_m: f64,
     pub device: String,
 }
 
@@ -241,6 +299,7 @@ impl DroneLink {
         poll_ms: u64,
         ack_timeout_ms: u64,
     ) -> Result<DroneLink, String> {
+        let geofence_radius_m = core.policy.bounds.geofence_radius_m as f64;
 
         // The first heartbeat goes out before the thread starts, so a script's
         // very first command already talks to a vehicle that has heard us.
@@ -260,7 +319,7 @@ impl DroneLink {
                 .spawn(move || run_link(core, io, rx, tele, notes, stop, poll_ms, ack_timeout_ms))
                 .map_err(|e| format!("E_KAZE_LINK: cannot start the receiver thread: {}", e))?
         };
-        Ok(DroneLink { tx, tele, notes, stop, handle: Some(handle), ack_timeout_ms, device })
+        Ok(DroneLink { tx, tele, notes, stop, handle: Some(handle), ack_timeout_ms, geofence_radius_m, device })
     }
 
     /// Gate and send a frame the vehicle does not acknowledge (a position
@@ -323,6 +382,27 @@ impl DroneLink {
 
     pub fn is_alive(&self) -> bool {
         self.handle.as_ref().map(|h| !h.is_finished()).unwrap_or(false)
+    }
+
+    /// Record that the autopilot accepted an arming command.
+    pub fn confirm_armed(&self) {
+        if let Ok(mut tele) = self.tele.lock() {
+            tele.confirm_armed();
+        }
+    }
+
+    /// The safety facts this link knows right now: the arming state, the home
+    /// a target is measured against, how fresh the last telemetry is, and
+    /// whether the link can still carry a command.
+    pub fn vehicle_state(&self) -> VehicleState {
+        let tele = self.telemetry();
+        VehicleState {
+            armed: tele.armed_state(),
+            home: tele.home,
+            geofence_radius_m: Some(self.geofence_radius_m),
+            telemetry_age: tele.heartbeat_age(),
+            link_alive: self.is_alive(),
+        }
     }
 }
 
@@ -529,6 +609,8 @@ impl LiveHost {
             let root = std::env::var_os("KAZE_GPIO_ROOT").map(std::path::PathBuf::from);
             Some(crate::rt::gpio::GpioBus::new(pins, root.as_deref()))
         };
+        // No simulator behind a live host: a family with no live backend is
+        // unavailable, never simulated.
         Ok(LiveHost { sim: RuntimeHost::new(sim, Vec::new(), Vec::new()), live, gpio })
     }
 
@@ -573,6 +655,7 @@ impl CapHost for LiveHost {
         if family == "drone" && self.live.is_some() {
             self.sim.check_trace_capacity()?;
             let shown: Vec<String> = args.iter().map(|v| render_value(*v, arena, heap)).collect();
+            let backend = self.device().unwrap_or("mavlink").to_string();
             let mut link = self.live.take().expect("checked above");
             let result = live_drone(&mut link, op, args, arena);
             self.live = Some(link);
@@ -580,13 +663,25 @@ impl CapHost for LiveHost {
                 Ok(v) => render_value(*v, arena, heap),
                 Err(e) => format!("error: {}", e),
             };
-            self.sim.note("drone", op, &shown, rendered);
+            self.sim.note_with_backend(
+                "drone",
+                op,
+                &shown,
+                rendered,
+                ActionMode::Real,
+                &format!("mavlink:{}", backend),
+            );
             self.drain_notes();
             return result;
         }
         if family == "device" && self.gpio.is_some() {
             self.sim.check_trace_capacity()?;
             let shown: Vec<String> = args.iter().map(|v| render_value(*v, arena, heap)).collect();
+            let backend = self
+                .gpio
+                .as_ref()
+                .map(|bus| format!("gpio:{}", bus.backend_name()))
+                .unwrap_or_default();
             let mut bus = self.gpio.take().expect("checked above");
             let result = live_device(&mut bus, op, args, arena, heap);
             self.gpio = Some(bus);
@@ -594,7 +689,7 @@ impl CapHost for LiveHost {
                 Ok(v) => render_value(*v, arena, heap),
                 Err(e) => format!("error: {}", e),
             };
-            self.sim.note("device", op, &shown, rendered);
+            self.sim.note_with_backend("device", op, &shown, rendered, ActionMode::Real, &backend);
             return result;
         }
         self.sim.call(family, op, args, arena, heap)
@@ -706,17 +801,29 @@ fn live_device(
     match op {
         "set_relay" => {
             let name = name_of(args);
+            // A missing state is not "off": switching a relay because an
+            // argument was missing is an actuation nobody asked for.
             let on = match args.get(1) {
                 Some(Value::Bool(b)) => *b,
-                Some(v) => v.as_num().map(|n| n != 0.0).unwrap_or(false),
-                None => false,
+                Some(v) => v
+                    .as_num()
+                    .map(|n| n != 0.0)
+                    .ok_or_else(|| format!("E_KAZE_RANGE: device.set_relay needs an on/off state for '{}'", name))?,
+                None => {
+                    return Err(format!(
+                        "E_KAZE_RANGE: device.set_relay needs an on/off state for '{}'",
+                        name
+                    ))
+                }
             };
             bus.set(&name, on)?;
             Ok(Value::Unit)
         }
         "pulse" => {
             let name = name_of(args);
-            let seconds = args.get(1).and_then(|v| v.as_num()).unwrap_or(1.0);
+            let seconds = args.get(1).and_then(|v| v.as_num()).filter(|n| n.is_finite()).ok_or_else(|| {
+                format!("E_KAZE_RANGE: device.pulse needs a duration in seconds for '{}'", name)
+            })?;
             bus.pulse(&name, seconds)?;
             Ok(Value::Unit)
         }
@@ -726,10 +833,11 @@ fn live_device(
         }
         // The GPIO bus is on/off only: there is no pwmchip backend in this build,
         // so a duty cycle cannot be written. Refusing is the honest answer — a
-        // script that believes it set 40% would be acting on a lie.
+        // script that believes it set 40% would be acting on a lie, and the
+        // line was not driven at all.
         "set_duty" => Err(format!(
             "E_KAZE_LINK: the GPIO bus has no PWM channel for '{}' in this build; \
-             set_duty is simulated, not actuated",
+             nothing was actuated",
             name_of(args)
         )),
         other => Err(format!("E_KAZE_LINK: the live device bus has no '{}'", other)),
@@ -763,16 +871,38 @@ fn ensure_guided(link: &mut DroneLink) -> Result<(), String> {
     Err("E_KAZE_LINK: the vehicle accepted GUIDED but is not reporting it".to_string())
 }
 
+/// The shared physical rules, applied before anything reaches the vehicle.
+///
+/// The error carries the same `CODE: reason (rule)` shape every other host
+/// error uses, so the caller sees the code the diagnostics contract names.
+fn safety_gate(
+    link: &DroneLink,
+    family: &str,
+    op: &str,
+    target: Option<(f64, f64)>,
+) -> Result<(), String> {
+    safety::gate_physical_command(family, op, &link.vehicle_state(), target)
+        .map_err(|d| format!("{}: {} ({})", d.code, d.reason, d.rule))
+}
+
 /// The v0.2 command map: one Kaze verb, one MAV_CMD, through the gate.
 fn live_drone(link: &mut DroneLink, op: &str, args: &[Value], arena: &mut Arena) -> Result<Value, String> {
     let num = |i: usize| args.get(i).and_then(|v| v.as_num()).filter(|n| n.is_finite())
         .ok_or_else(|| "E_KAZE_RANGE: drone command requires finite numeric arguments".to_string());
     match op {
-        "arm" => link
-            .command(mavlink::cmd::COMPONENT_ARM_DISARM, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            .map(|_| Value::Unit),
+        "arm" => {
+            safety_gate(link, "drone", op, None)?;
+            link.command(mavlink::cmd::COMPONENT_ARM_DISARM, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                .map(|_| {
+                    // The autopilot's acceptance is a fact about the vehicle's
+                    // state until a newer heartbeat says otherwise.
+                    link.confirm_armed();
+                    Value::Unit
+                })
+        }
         "takeoff" => {
             let alt = num(0)?;
+            safety_gate(link, "drone", op, None)?;
             ensure_guided(link)?;
             link.command(mavlink::cmd::NAV_TAKEOFF, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, alt as f32])
                 .map(|_| Value::Unit)
@@ -785,6 +915,7 @@ fn live_drone(link: &mut DroneLink, op: &str, args: &[Value], arena: &mut Arena)
                 return Err("E_CAP_MISSING: live drone.goto requires explicit latitude, longitude and altitude".into());
             }
             let (lat, lon, alt) = (num(0)?, num(1)?, num(2)?);
+            safety_gate(link, "drone", op, Some((lat, lon)))?;
             ensure_guided(link)?;
             // ArduCopter answers UNSUPPORTED to NAV_WAYPOINT as a command (it
             // is a mission item, not a command), so guided flight is a position
@@ -792,13 +923,20 @@ fn live_drone(link: &mut DroneLink, op: &str, args: &[Value], arena: &mut Arena)
             let frame = link.position_frame(lat, lon, alt as f32);
             link.send_target(frame).map(|_| Value::Unit)
         }
-        "rtl" => link
-            .command(mavlink::cmd::NAV_RETURN_TO_LAUNCH, [0.0; 7])
-            .map(|_| Value::Unit),
-        "land" => link.command(mavlink::cmd::NAV_LAND, [0.0; 7]).map(|_| Value::Unit),
-        "hold" | "stop" => link
-            .command(mavlink::cmd::NAV_LOITER_UNLIM, [0.0; 7])
-            .map(|_| Value::Unit),
+        "rtl" => {
+            safety_gate(link, "drone", op, None)?;
+            link.command(mavlink::cmd::NAV_RETURN_TO_LAUNCH, [0.0; 7])
+                .map(|_| Value::Unit)
+        }
+        "land" => {
+            safety_gate(link, "drone", op, None)?;
+            link.command(mavlink::cmd::NAV_LAND, [0.0; 7]).map(|_| Value::Unit)
+        }
+        "hold" | "stop" => {
+            safety_gate(link, "drone", op, None)?;
+            link.command(mavlink::cmd::NAV_LOITER_UNLIM, [0.0; 7])
+                .map(|_| Value::Unit)
+        }
         "telemetry" => {
             let field = args.first().map(|v| render_value(*v, arena, &Heap::empty())).unwrap_or_default();
             let field = field.trim_matches('"').to_string();
@@ -998,7 +1136,7 @@ mod tests {
     }
 
     #[test]
-    fn a_live_host_routes_the_drone_family_and_keeps_the_simulator_for_the_rest() {
+    fn a_live_host_routes_the_drone_family_and_leaves_the_rest_to_the_runtime_host() {
         let (fc, _written, _incoming) = AutoFc::new(0);
         let link = DroneLink::with_io(core(), Box::new(fc), DEV.to_string(), 1, 500).expect("link");
         let mut host = LiveHost::with_link(SimState::default(), link);
@@ -1010,6 +1148,50 @@ mod tests {
             .expect("log stays in-process");
         assert!(host.is_live());
         assert_eq!(host.actions().len(), 2, "both calls are in one trace");
+    }
+
+    /// The live path applies the shared physical rules: a takeoff needs a
+    /// known arming state, and a refused command never reaches the wire.
+    #[test]
+    fn a_takeoff_without_a_known_arming_state_is_refused() {
+        let (fc, written, _incoming) = AutoFc::new(0);
+        let mut link = DroneLink::with_io(core(), Box::new(fc), DEV.to_string(), 1, 500).expect("link");
+        let mut arena = Arena::new(256 * 1024);
+        let err = live_drone(&mut link, "takeoff", &[Value::Num(15.0)], &mut arena)
+            .expect_err("an unarmed takeoff must be refused");
+        assert!(err.starts_with("E_CAP_DENIED:"), "{err}");
+        assert!(err.contains("arming state"), "{err}");
+        let bytes = written.lock().unwrap().clone();
+        assert!(
+            commands_on_the_wire(&bytes).is_empty(),
+            "the refused takeoff must not reach the wire: {:?}",
+            commands_on_the_wire(&bytes)
+        );
+    }
+
+    /// An armed vehicle with fresh telemetry may take off: the gate refuses
+    /// what it cannot know, not what it knows.
+    #[test]
+    fn an_armed_vehicle_with_fresh_telemetry_may_take_off() {
+        let (fc, written, incoming) = AutoFc::new(0);
+        let mut heartbeat = mavlink::Frame::new(0, 0, 1, 1).expect("HEARTBEAT is known");
+        heartbeat.set_u8_at(4, 18);
+        heartbeat.set_u8_at(6, 128); // base_mode: the safety bit — armed
+        heartbeat.set_u32_at(0, 4); // custom_mode: GUIDED
+        incoming
+            .lock()
+            .unwrap()
+            .extend(mavlink::encode(&heartbeat).expect("a heartbeat encodes"));
+        let mut link = DroneLink::with_io(core(), Box::new(fc), DEV.to_string(), 1, 500).expect("link");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while link.telemetry().armed_state().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut arena = Arena::new(256 * 1024);
+        live_drone(&mut link, "takeoff", &[Value::Num(15.0)], &mut arena)
+            .expect("an armed vehicle with fresh telemetry may take off");
+        assert!(commands_on_the_wire(&written.lock().unwrap().clone())
+            .contains(&mavlink::cmd::NAV_TAKEOFF));
     }
 }
 

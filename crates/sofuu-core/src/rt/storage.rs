@@ -105,6 +105,10 @@ pub struct StorageManager {
     pub tables: HashMap<String, SofuTable>,
     pub schemas: HashMap<String, SofuSchema>,
     pub dirty: bool,
+    /// The reason the last flush failed, kept so a close that could not
+    /// persist the pending rows can report the failure instead of claiming
+    /// the close succeeded.
+    pub last_flush_error: Option<String>,
 }
 
 impl StorageManager {
@@ -115,7 +119,8 @@ impl StorageManager {
             base_path.to_path_buf()
         };
 
-        fs::create_dir_all(&base_dir).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&base_dir)
+            .map_err(|e| format!("E_STORAGE: cannot create the store directory {}: {e}", base_dir.display()))?;
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -140,14 +145,25 @@ impl StorageManager {
             }
         };
 
+        /* The manifest is the store's index. A manifest that EXISTS but
+         * cannot be read or parsed is a damaged store, not a fresh one:
+         * replacing it with a default would silently drop the recorded
+         * segment list and make the store look empty. */
         let manifest_path = base_dir.join("manifest.json");
-        let mut manifest = if manifest_path.exists() {
-            fs::read_to_string(&manifest_path)
-                .ok()
-                .and_then(|data| serde_json::from_str::<StorageManifest>(&data).ok())
-                .unwrap_or_default()
-        } else {
-            StorageManifest::default()
+        let mut manifest = match fs::read_to_string(&manifest_path) {
+            Ok(data) => serde_json::from_str::<StorageManifest>(&data).map_err(|e| {
+                format!(
+                    "E_STORAGE: corrupt store manifest {}: {e}",
+                    manifest_path.display()
+                )
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => StorageManifest::default(),
+            Err(e) => {
+                return Err(format!(
+                    "E_STORAGE: cannot read the store manifest {}: {e}",
+                    manifest_path.display()
+                ))
+            }
         };
 
         manifest.active_segment = active_seg.clone();
@@ -162,6 +178,7 @@ impl StorageManager {
             tables: HashMap::new(),
             schemas: HashMap::new(),
             dirty: false,
+            last_flush_error: None,
         };
 
         // Initialize standard schemas
@@ -170,26 +187,47 @@ impl StorageManager {
         // Scan base_dir for all table segments of the active week:
         // storage_{year}_w{week:02}_<table_name>.qtsq
         let prefix = format!("storage_{year}_w{week:02}_");
-        if let Ok(entries) = fs::read_dir(&mgr.base_dir) {
-            for entry in entries.flatten() {
-                let fname = entry.file_name().to_string_lossy().into_owned();
-                if fname.starts_with(&prefix) && fname.ends_with(".qtsq") {
-                    let table_name = fname[prefix.len()..fname.len() - 5].to_string();
-                    let seg_file = entry.path();
-                    if let Ok(tbl) = SofuTable::read_qtsq(&seg_file, &table_name, mgr.password.as_deref()) {
-                        mgr.schemas.insert(table_name.clone(), tbl.schema().clone());
-                        mgr.tables.insert(table_name, tbl);
-                    }
-                }
+        let read_dir = fs::read_dir(&mgr.base_dir).map_err(|e| {
+            format!(
+                "E_STORAGE: cannot list the store directory {}: {e}",
+                mgr.base_dir.display()
+            )
+        })?;
+        let mut segments: Vec<(String, PathBuf)> = Vec::new();
+        for entry in read_dir {
+            let entry = entry.map_err(|e| {
+                format!(
+                    "E_STORAGE: cannot list the store directory {}: {e}",
+                    mgr.base_dir.display()
+                )
+            })?;
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if fname.starts_with(&prefix) && fname.ends_with(".qtsq") {
+                let table_name = fname[prefix.len()..fname.len() - 5].to_string();
+                segments.push((table_name, entry.path()));
             }
+        }
+        /* A segment that cannot be opened is a damaged store, not an absent
+         * table: skipping it would let the store answer "no rows" for a
+         * table whose rows are on disk and unreadable. */
+        for (table_name, seg_file) in segments {
+            let tbl = SofuTable::read_qtsq(&seg_file, &table_name, mgr.password.as_deref())
+                .map_err(|e| {
+                    format!(
+                        "E_STORAGE: cannot open the store segment {}: {e}",
+                        seg_file.display()
+                    )
+                })?;
+            mgr.schemas.insert(table_name.clone(), tbl.schema().clone());
+            mgr.tables.insert(table_name, tbl);
         }
 
         // Initialize any default schemas that were not on disk
         for (name, schema) in &mgr.schemas {
             if !mgr.tables.contains_key(name) {
-                if let Ok(tbl) = SofuTable::create(schema) {
-                    mgr.tables.insert(name.clone(), tbl);
-                }
+                let tbl = SofuTable::create(schema)
+                    .map_err(|e| format!("E_STORAGE: cannot create the table '{name}': {e}"))?;
+                mgr.tables.insert(name.clone(), tbl);
             }
         }
 
@@ -309,7 +347,7 @@ impl StorageManager {
         }
 
         let schema = self.schemas.get(table_name)
-            .ok_or_else(|| format!("Unknown table '{table_name}'"))?;
+            .ok_or_else(|| format!("E_STORAGE: unknown table '{table_name}'"))?;
         let col_names = schema.col_names();
 
         let mut row_vals = Vec::with_capacity(col_names.len());
@@ -356,9 +394,10 @@ impl StorageManager {
         }
 
         let tbl = self.tables.get_mut(table_name)
-            .ok_or_else(|| format!("Table '{table_name}' not initialized"))?;
+            .ok_or_else(|| format!("E_STORAGE: table '{table_name}' is not initialized"))?;
 
-        tbl.insert(&row_vals)?;
+        tbl.insert(&row_vals)
+            .map_err(|e| format!("E_STORAGE: cannot insert into '{table_name}': {e}"))?;
         self.dirty = true;
 
         let row_id = tbl.row_count() as i64;
@@ -371,38 +410,28 @@ impl StorageManager {
         query: &SofuQuery,
     ) -> Result<Vec<serde_json::Value>, String> {
         let tbl = self.tables.get(table_name)
-            .ok_or_else(|| format!("Table '{table_name}' not found"))?;
+            .ok_or_else(|| format!("E_STORAGE: table '{table_name}' not found"))?;
 
         let schema = self.schemas.get(table_name)
-            .ok_or_else(|| format!("Schema for '{table_name}' not found"))?;
+            .ok_or_else(|| format!("E_STORAGE: schema for '{table_name}' not found"))?;
         let col_names = schema.col_names();
 
-        let res_table = tbl.query(query)?;
+        let res_table = tbl
+            .query(query)
+            .map_err(|e| format!("E_STORAGE: cannot query '{table_name}': {e}"))?;
         let count = res_table.row_count();
         let mut results = Vec::with_capacity(count);
 
         for r in 0..count {
-            let row = res_table.get_row(r)?;
+            let row = res_table
+                .get_row(r)
+                .map_err(|e| format!("E_STORAGE: cannot read a row of '{table_name}': {e}"))?;
             let mut map = serde_json::Map::new();
 
             for (ci, val) in row.into_iter().enumerate() {
                 if ci < col_names.len() {
                     let key = &col_names[ci];
-                    let jv = match val {
-                        SofuValue::Null => serde_json::Value::Null,
-                        SofuValue::Int64(i) => serde_json::json!(i),
-                        SofuValue::Int32(i) => serde_json::json!(i),
-                        SofuValue::Float64(f) => serde_json::json!(f),
-                        SofuValue::Float32(f) => serde_json::json!(f),
-                        SofuValue::Bool(b) => serde_json::json!(b),
-                        SofuValue::Timestamp(t) => serde_json::json!(t),
-                        SofuValue::String(s) => serde_json::json!(s),
-                        SofuValue::Bytes(b) => serde_json::json!(b),
-                        SofuValue::Json(j) => {
-                            serde_json::from_str(&j).unwrap_or(serde_json::Value::String(j))
-                        }
-                    };
-                    map.insert(key.clone(), jv);
+                    map.insert(key.clone(), row_value_to_json(val, key)?);
                 }
             }
             results.push(serde_json::Value::Object(map));
@@ -411,59 +440,68 @@ impl StorageManager {
         // If results are fewer than query.limit (or no limit) and historical segments exist on disk:
         if query.limit == 0 || results.len() < query.limit as usize {
             let active_seg_file = weekly_table_segment_name(self.active_year, self.active_week, table_name);
-            if let Ok(entries) = fs::read_dir(&self.base_dir) {
-                let suffix = format!("_{table_name}.qtsq");
-                let mut historical_files = Vec::new();
-                for entry in entries.flatten() {
-                    let fname = entry.file_name().to_string_lossy().into_owned();
-                    if fname.starts_with("storage_") && fname.ends_with(&suffix) && fname != active_seg_file {
-                        historical_files.push(entry.path());
-                    }
+            let read_dir = fs::read_dir(&self.base_dir).map_err(|e| {
+                format!(
+                    "E_STORAGE: cannot list the store directory {}: {e}",
+                    self.base_dir.display()
+                )
+            })?;
+            let suffix = format!("_{table_name}.qtsq");
+            let mut historical_files = Vec::new();
+            for entry in read_dir {
+                let entry = entry.map_err(|e| {
+                    format!(
+                        "E_STORAGE: cannot list the store directory {}: {e}",
+                        self.base_dir.display()
+                    )
+                })?;
+                let fname = entry.file_name().to_string_lossy().into_owned();
+                if fname.starts_with("storage_") && fname.ends_with(&suffix) && fname != active_seg_file {
+                    historical_files.push(entry.path());
                 }
-                historical_files.sort();
-                if query.order_desc {
-                    historical_files.reverse();
-                }
+            }
+            historical_files.sort();
+            if query.order_desc {
+                historical_files.reverse();
+            }
 
-                for hfile in historical_files {
+            for hfile in historical_files {
+                if query.limit > 0 && results.len() >= query.limit as usize {
+                    break;
+                }
+                let mut rem_query = query.clone();
+                if query.limit > 0 {
+                    rem_query.limit = (query.limit as usize - results.len()) as u32;
+                }
+                /* A historical segment that cannot be read is a store
+                 * failure. Skipping it would answer the query with the rows
+                 * that happen to be readable and present that as the whole
+                 * result. */
+                let h_tbl = SofuTable::query_qtsq(&hfile, table_name, self.password.as_deref(), &rem_query)
+                    .map_err(|e| {
+                        format!(
+                            "E_STORAGE: cannot read the store segment {}: {e}",
+                            hfile.display()
+                        )
+                    })?;
+                let h_count = h_tbl.row_count();
+                for r in 0..h_count {
+                    let row = h_tbl.get_row(r).map_err(|e| {
+                        format!(
+                            "E_STORAGE: cannot read a row of the store segment {}: {e}",
+                            hfile.display()
+                        )
+                    })?;
+                    let mut map = serde_json::Map::new();
+                    for (ci, val) in row.into_iter().enumerate() {
+                        if ci < col_names.len() {
+                            let key = &col_names[ci];
+                            map.insert(key.clone(), row_value_to_json(val, key)?);
+                        }
+                    }
+                    results.push(serde_json::Value::Object(map));
                     if query.limit > 0 && results.len() >= query.limit as usize {
                         break;
-                    }
-                    let mut rem_query = query.clone();
-                    if query.limit > 0 {
-                        rem_query.limit = (query.limit as usize - results.len()) as u32;
-                    }
-                    if let Ok(h_tbl) = SofuTable::query_qtsq(&hfile, table_name, self.password.as_deref(), &rem_query) {
-                        let h_count = h_tbl.row_count();
-                        for r in 0..h_count {
-                            if let Ok(row) = h_tbl.get_row(r) {
-                                let mut map = serde_json::Map::new();
-                                for (ci, val) in row.into_iter().enumerate() {
-                                    if ci < col_names.len() {
-                                        let key = &col_names[ci];
-                                        let jv = match val {
-                                            SofuValue::Null => serde_json::Value::Null,
-                                            SofuValue::Int64(i) => serde_json::json!(i),
-                                            SofuValue::Int32(i) => serde_json::json!(i),
-                                            SofuValue::Float64(f) => serde_json::json!(f),
-                                            SofuValue::Float32(f) => serde_json::json!(f),
-                                            SofuValue::Bool(b) => serde_json::json!(b),
-                                            SofuValue::Timestamp(t) => serde_json::json!(t),
-                                            SofuValue::String(s) => serde_json::json!(s),
-                                            SofuValue::Bytes(b) => serde_json::json!(b),
-                                            SofuValue::Json(j) => {
-                                                serde_json::from_str(&j).unwrap_or(serde_json::Value::String(j))
-                                            }
-                                        };
-                                        map.insert(key.clone(), jv);
-                                    }
-                                }
-                                results.push(serde_json::Value::Object(map));
-                                if query.limit > 0 && results.len() >= query.limit as usize {
-                                    break;
-                                }
-                            }
-                        }
                     }
                 }
             }
@@ -472,21 +510,53 @@ impl StorageManager {
         Ok(results)
     }
 
-    pub fn count(&self, table_name: &str) -> usize {
-        self.tables.get(table_name).map(|t| t.row_count()).unwrap_or(0)
+    /// The number of rows the ACTIVE segment holds for `table_name`, or
+    /// `None` when the table is not registered. A registered table with no
+    /// rows is `Some(0)`; an unknown table is never reported as zero.
+    pub fn count(&self, table_name: &str) -> Option<usize> {
+        self.tables.get(table_name).map(|t| t.row_count())
     }
 
     pub fn flush(&mut self) -> Result<(), String> {
         if !self.dirty {
             return Ok(());
         }
+        match self.write_pending() {
+            Ok(()) => {
+                self.dirty = false;
+                self.last_flush_error = None;
+                Ok(())
+            }
+            Err(e) => {
+                self.last_flush_error = Some(e.clone());
+                Err(e)
+            }
+        }
+    }
 
+    /// Write every pending table to its segment and commit the manifest.
+    /// The rows stay pending when this fails, so a later attempt can still
+    /// commit them.
+    fn write_pending(&self) -> Result<(), String> {
+        /* Each segment is staged beside its target and published with the
+         * runtime's durable atomic publish (fsync the staged bytes, rename
+         * over the target, fsync the directory). A reader therefore sees
+         * either the previous segment or the new one — never a half-written
+         * container. */
         for (name, tbl) in &self.tables {
             if tbl.row_count() > 0 {
                 let seg_name = weekly_table_segment_name(self.active_year, self.active_week, name);
                 let seg_file = self.base_dir.join(&seg_name);
-                tbl.write_qtsq(&seg_file, self.password.as_deref())
-                    .map_err(|e| format!("Failed to flush table '{name}': {e}"))?;
+                let seg_tmp = self.base_dir.join(format!(".{seg_name}.tmp"));
+                tbl.write_qtsq(&seg_tmp, self.password.as_deref())
+                    .map_err(|e| format!("E_STORAGE: failed to flush table '{name}': {e}"))?;
+                if !crate::rt::wal::publish_paths(&seg_tmp, &seg_file) {
+                    let _ = fs::remove_file(&seg_tmp);
+                    return Err(format!(
+                        "E_STORAGE: cannot commit the store segment {}",
+                        seg_file.display()
+                    ));
+                }
             }
         }
 
@@ -494,18 +564,47 @@ impl StorageManager {
         let manifest_path = self.base_dir.join("manifest.json");
         let manifest_tmp = self.base_dir.join(".manifest.tmp");
 
-        let manifest_bytes = serde_json::to_vec_pretty(&self.manifest).map_err(|e| e.to_string())?;
-        fs::write(&manifest_tmp, &manifest_bytes).map_err(|e| e.to_string())?;
-        fs::rename(&manifest_tmp, &manifest_path).map_err(|e| e.to_string())?;
-
-        self.dirty = false;
+        let manifest_bytes = serde_json::to_vec_pretty(&self.manifest)
+            .map_err(|e| format!("E_STORAGE: cannot serialize the store manifest: {e}"))?;
+        fs::write(&manifest_tmp, &manifest_bytes)
+            .map_err(|e| format!("E_STORAGE: cannot write the store manifest {}: {e}", manifest_tmp.display()))?;
+        if !crate::rt::wal::publish_paths(&manifest_tmp, &manifest_path) {
+            let _ = fs::remove_file(&manifest_tmp);
+            return Err(format!(
+                "E_STORAGE: cannot commit the store manifest {}",
+                manifest_path.display()
+            ));
+        }
         Ok(())
     }
 }
 
+/// One stored column value as JSON. A column whose bytes are not the JSON
+/// they claim to be is a corrupt store, not a value that may be reshaped
+/// into something else.
+fn row_value_to_json(val: SofuValue, key: &str) -> Result<serde_json::Value, String> {
+    Ok(match val {
+        SofuValue::Null => serde_json::Value::Null,
+        SofuValue::Int64(i) => serde_json::json!(i),
+        SofuValue::Int32(i) => serde_json::json!(i),
+        SofuValue::Float64(f) => serde_json::json!(f),
+        SofuValue::Float32(f) => serde_json::json!(f),
+        SofuValue::Bool(b) => serde_json::json!(b),
+        SofuValue::Timestamp(t) => serde_json::json!(t),
+        SofuValue::String(s) => serde_json::json!(s),
+        SofuValue::Bytes(b) => serde_json::json!(b),
+        SofuValue::Json(j) => serde_json::from_str(&j)
+            .map_err(|e| format!("E_STORAGE: corrupt JSON column '{key}': {e}"))?,
+    })
+}
+
 impl Drop for StorageManager {
     fn drop(&mut self) {
-        let _ = self.flush();
+        /* A final flush that fails must not vanish: the rows would be lost
+         * and the caller has already gone. */
+        if let Err(e) = self.flush() {
+            eprintln!("[sofuu/storage] the final flush failed: {e}");
+        }
     }
 }
 
@@ -545,9 +644,11 @@ unsafe extern "C" fn js_storage_open(
     match StorageManager::open(path, password.as_deref()) {
         Ok(mgr) => {
             let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
-            if let Ok(mut reg) = get_registry().lock() {
-                reg.insert(handle, mgr);
-            }
+            let mut reg = match get_registry().lock() {
+                Ok(r) => r,
+                Err(_) => return qjs::JS_ThrowTypeError(ctx, c"storage registry is unavailable".as_ptr()),
+            };
+            reg.insert(handle, mgr);
             qjs::sofuu_js_new_int64(ctx, handle as i64)
         }
         Err(e) => {
@@ -630,7 +731,59 @@ unsafe extern "C" fn js_storage_query(
         None => return qjs::JS_ThrowTypeError(ctx, c"Invalid query json".as_ptr()),
     };
 
-    let q_obj: serde_json::Value = serde_json::from_str(&query_json).unwrap_or(serde_json::Value::Null);
+    let q = match parse_query(&query_json) {
+        Ok(q) => q,
+        Err(e) => {
+            let err_c = CString::new(e).unwrap();
+            return qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), err_c.as_ptr());
+        }
+    };
+
+    let reg = match get_registry().lock() {
+        Ok(r) => r,
+        Err(_) => return qjs::JS_ThrowTypeError(ctx, c"Lock poison".as_ptr()),
+    };
+
+    let mgr = match reg.get(&(handle as u64)) {
+        Some(m) => m,
+        None => return qjs::JS_ThrowTypeError(ctx, c"Invalid storage handle".as_ptr()),
+    };
+
+    match mgr.query(&table_name, &q) {
+        Ok(rows) => {
+            /* A row set that cannot be serialized is a FAILED read, not an
+             * empty one: answering `[]` would present the serialization
+             * failure as "the table holds no matching rows". */
+            let json_str = match serde_json::to_string(&rows) {
+                Ok(s) => s,
+                Err(e) => {
+                    let err_c = CString::new(format!("E_STORAGE: cannot serialize the query result: {e}"))
+                        .unwrap();
+                    return qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), err_c.as_ptr());
+                }
+            };
+            let c_json = CString::new(json_str).unwrap();
+            qjs::JS_ParseJSON(ctx, c_json.as_ptr(), c_json.as_bytes().len(), c"<query>".as_ptr())
+        }
+        Err(e) => {
+            let err_c = CString::new(format!("Query failed: {e}")).unwrap();
+            qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), err_c.as_ptr())
+        }
+    }
+}
+
+/// The query the JS surface sends, decoded.
+///
+/// A query that is not a JSON OBJECT is refused. It used to decode to a null
+/// query, which carries no filter at all: a typo in the query string
+/// silently widened the read to the whole table, and the caller received
+/// every row as though it had asked for them.
+fn parse_query(query_json: &str) -> Result<SofuQuery, String> {
+    let q_obj: serde_json::Value = serde_json::from_str(query_json)
+        .map_err(|e| format!("E_STORAGE: the query is not valid JSON: {e}"))?;
+    if !q_obj.is_object() {
+        return Err("E_STORAGE: the query must be a JSON object".to_string());
+    }
 
     let mut q = SofuQuery::new();
     if let Some(min_id) = q_obj.get("minId").or_else(|| q_obj.get("min_id")).and_then(|v| v.as_i64()) {
@@ -671,28 +824,7 @@ unsafe extern "C" fn js_storage_query(
     ) {
         q = q.filter_str(col, val);
     }
-
-    let reg = match get_registry().lock() {
-        Ok(r) => r,
-        Err(_) => return qjs::JS_ThrowTypeError(ctx, c"Lock poison".as_ptr()),
-    };
-
-    let mgr = match reg.get(&(handle as u64)) {
-        Some(m) => m,
-        None => return qjs::JS_ThrowTypeError(ctx, c"Invalid storage handle".as_ptr()),
-    };
-
-    match mgr.query(&table_name, &q) {
-        Ok(rows) => {
-            let json_str = serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into());
-            let c_json = CString::new(json_str).unwrap();
-            qjs::JS_ParseJSON(ctx, c_json.as_ptr(), c_json.as_bytes().len(), c"<query>".as_ptr())
-        }
-        Err(e) => {
-            let err_c = CString::new(format!("Query failed: {e}")).unwrap();
-            qjs::JS_ThrowTypeError(ctx, c"%s".as_ptr(), err_c.as_ptr())
-        }
-    }
+    Ok(q)
 }
 
 unsafe extern "C" fn js_storage_count(
@@ -702,7 +834,7 @@ unsafe extern "C" fn js_storage_count(
     argv: *const JSValueConst,
 ) -> JSValue {
     if argc < 2 {
-        return qjs::sofuu_js_new_int32(ctx, 0);
+        return qjs::JS_ThrowTypeError(ctx, c"storage.count requires (handle, table)".as_ptr());
     }
 
     let mut handle: i64 = 0;
@@ -710,16 +842,25 @@ unsafe extern "C" fn js_storage_count(
 
     let table_name = match js_to_string(ctx, *argv.add(1)) {
         Some(s) => s,
-        None => return qjs::sofuu_js_new_int32(ctx, 0),
+        None => return qjs::JS_ThrowTypeError(ctx, c"Invalid table name".as_ptr()),
     };
 
     let reg = match get_registry().lock() {
         Ok(r) => r,
-        Err(_) => return qjs::sofuu_js_new_int32(ctx, 0),
+        Err(_) => return qjs::JS_ThrowTypeError(ctx, c"Lock poison".as_ptr()),
     };
 
-    let count = reg.get(&(handle as u64)).map(|m| m.count(&table_name)).unwrap_or(0);
-    qjs::sofuu_js_new_int64(ctx, count as i64)
+    /* An unknown handle or an unknown table is a FAILURE. Reporting zero
+     * rows for a store that cannot be reached would present a storage
+     * failure as an empty table. */
+    let mgr = match reg.get(&(handle as u64)) {
+        Some(m) => m,
+        None => return qjs::JS_ThrowTypeError(ctx, c"Invalid storage handle".as_ptr()),
+    };
+    match mgr.count(&table_name) {
+        Some(count) => qjs::sofuu_js_new_int64(ctx, count as i64),
+        None => qjs::JS_ThrowTypeError(ctx, c"Unknown table".as_ptr()),
+    }
 }
 
 unsafe extern "C" fn js_storage_flush(
@@ -741,8 +882,16 @@ unsafe extern "C" fn js_storage_flush(
     };
 
     if let Some(mgr) = reg.get_mut(&(handle as u64)) {
-        let res = mgr.flush().is_ok();
-        js_new_bool(ctx, res)
+        match mgr.flush() {
+            Ok(()) => js_new_bool(ctx, true),
+            Err(e) => {
+                /* The caller's only signal is the boolean, so the reason is
+                 * written to the log as well: a flush that failed must not
+                 * vanish. */
+                eprintln!("[sofuu/storage] flush failed: {e}");
+                js_new_bool(ctx, false)
+            }
+        }
     } else {
         js_new_bool(ctx, false)
     }
@@ -763,8 +912,18 @@ unsafe extern "C" fn js_storage_close(
 
     if let Ok(mut reg) = get_registry().lock() {
         if let Some(mut mgr) = reg.remove(&(handle as u64)) {
-            let _ = mgr.flush();
-            return js_new_bool(ctx, true);
+            /* A close that could not persist the pending rows is NOT a
+             * successful close: those rows would be lost, so the close
+             * reports the failure instead of claiming success. The boolean
+             * is the caller's only signal, so the reason goes to the log
+             * as well — a close that failed must not vanish. */
+            return match mgr.flush() {
+                Ok(()) => js_new_bool(ctx, true),
+                Err(e) => {
+                    eprintln!("[sofuu/storage] the close could not persist the pending rows: {e}");
+                    js_new_bool(ctx, false)
+                }
+            };
         }
     }
     js_new_bool(ctx, false)
@@ -814,6 +973,16 @@ pub unsafe fn mod_storage_register(ctx: *mut JSContext) {
 mod tests {
     use super::*;
 
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        p.push(format!("sofuu-storage-{tag}-{}-{n}", std::process::id()));
+        p
+    }
+
     #[test]
     fn test_epoch_to_year_week() {
         // 2026-10-21 (Wednesday of Week 43)
@@ -846,7 +1015,7 @@ mod tests {
 
         let id = mgr.insert("messages", &msg).unwrap();
         assert_eq!(id, 1);
-        assert_eq!(mgr.count("messages"), 1);
+        assert_eq!(mgr.count("messages"), Some(1));
 
         // 2. Query messages
         let q = SofuQuery::new().filter_str("session_id", "session_alpha");
@@ -860,7 +1029,7 @@ mod tests {
             "val": { "mode": "dark", "accent": "violet" }
         });
         mgr.insert("_kv_store", &kv_doc).unwrap();
-        assert_eq!(mgr.count("_kv_store"), 1);
+        assert_eq!(mgr.count("_kv_store"), Some(1));
 
         let kv_query = SofuQuery::new().filter_str("key", "user_theme");
         let kv_res = mgr.query("_kv_store", &kv_query).unwrap();
@@ -873,12 +1042,156 @@ mod tests {
 
         // Re-open and verify persistence
         let mgr2 = StorageManager::open(&temp_dir, Some("test-vault-password")).unwrap();
-        assert_eq!(mgr2.count("messages"), 1);
+        assert_eq!(mgr2.count("messages"), Some(1));
         let q2 = SofuQuery::new().filter_str("session_id", "session_alpha");
         let results2 = mgr2.query("messages", &q2).unwrap();
         assert_eq!(results2.len(), 1);
         assert_eq!(results2[0]["content"], "Hello QTSQ Structured Storage!");
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// An unknown table is not an empty table: `count` must not answer zero
+    /// for a table the store does not have.
+    #[test]
+    fn an_unknown_table_is_not_reported_as_zero_rows() {
+        let dir = tmp_dir("unknown-table");
+        let mgr = StorageManager::open(&dir, Some("test-vault-password")).unwrap();
+        assert_eq!(mgr.count("messages"), Some(0));
+        assert_eq!(mgr.count("no_such_table"), None);
+        assert!(mgr.query("no_such_table", &SofuQuery::new()).is_err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A manifest that exists but cannot be parsed is a damaged store. It
+    /// must not be replaced with a default manifest, which would present the
+    /// store as a fresh, empty one.
+    #[test]
+    fn a_corrupt_manifest_fails_the_open_instead_of_starting_an_empty_store() {
+        let dir = tmp_dir("corrupt-manifest");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("manifest.json"), b"{not json").unwrap();
+        let error = match StorageManager::open(&dir, Some("test-vault-password")) {
+            Ok(_) => panic!("a corrupt manifest must not open as a fresh store"),
+            Err(e) => e,
+        };
+        assert!(error.starts_with("E_STORAGE:"), "{error}");
+        assert!(error.contains("corrupt store manifest"), "{error}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A segment that exists but cannot be opened is a damaged store, not an
+    /// absent table: skipping it would make the store answer "no rows" for
+    /// rows that are on disk.
+    #[test]
+    fn an_unreadable_segment_fails_the_open_instead_of_hiding_its_table() {
+        let dir = tmp_dir("unreadable-segment");
+        fs::create_dir_all(&dir).unwrap();
+        let (year, week) = epoch_to_year_week(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        );
+        let seg = dir.join(weekly_table_segment_name(year, week, "messages"));
+        fs::write(&seg, b"not a qtsq container").unwrap();
+        let error = match StorageManager::open(&dir, Some("test-vault-password")) {
+            Ok(_) => panic!("an unreadable segment must not open as an empty store"),
+            Err(e) => e,
+        };
+        assert!(error.starts_with("E_STORAGE:"), "{error}");
+        assert!(error.contains("cannot open the store segment"), "{error}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A flush that cannot reach the disk is an error, and the manager stays
+    /// dirty so a later attempt can still commit it.
+    #[test]
+    fn a_flush_that_cannot_reach_the_disk_is_reported() {
+        let dir = tmp_dir("unflushable");
+        fs::create_dir_all(&dir).unwrap();
+        let mut mgr = StorageManager::open(&dir, Some("test-vault-password")).unwrap();
+        mgr.insert(
+            "messages",
+            &serde_json::json!({
+                "session_id": "s",
+                "role": "user",
+                "content": "c"
+            }),
+        )
+        .unwrap();
+        assert!(mgr.dirty);
+        // Replace the store directory with a file so the segment commit
+        // cannot create its staged file.
+        fs::remove_dir_all(&dir).unwrap();
+        fs::write(&dir, b"not a directory").unwrap();
+        let error = mgr.flush().unwrap_err();
+        assert!(error.starts_with("E_STORAGE:"), "{error}");
+        assert!(mgr.dirty, "a failed flush must leave the store pending");
+        let _ = fs::remove_file(&dir);
+    }
+
+    /// The durable claim, checked across a process boundary: one process
+    /// writes and exits, the next opens the same store and reads the rows
+    /// that were actually written.
+    #[test]
+    fn a_flushed_row_survives_the_process_that_wrote_it() {
+        // The child process: write one row, flush, exit.
+        if let Ok(child_dir) = std::env::var("SOFUU_SLICE9_STORAGE_CHILD") {
+            let mut mgr = StorageManager::open(Path::new(&child_dir), Some("test-vault-password")).unwrap();
+            mgr.insert(
+                "messages",
+                &serde_json::json!({
+                    "session_id": "cross-process",
+                    "role": "user",
+                    "content": "cross-process-content"
+                }),
+            )
+            .unwrap();
+            mgr.flush().unwrap();
+            return;
+        }
+
+        let dir = tmp_dir("cross-process");
+        let exe = std::env::current_exe().expect("the test binary path must be known");
+        let status = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "rt::storage::tests::a_flushed_row_survives_the_process_that_wrote_it",
+                "--nocapture",
+            ])
+            .env("SOFUU_SLICE9_STORAGE_CHILD", &dir)
+            .status()
+            .expect("the child process must start");
+        assert!(status.success(), "the writing process must exit cleanly");
+
+        let mgr = StorageManager::open(&dir, Some("test-vault-password")).unwrap();
+        let q = SofuQuery::new().filter_str("session_id", "cross-process");
+        let rows = mgr.query("messages", &q).unwrap();
+        assert_eq!(rows.len(), 1, "the reopened store must return the written row");
+        assert_eq!(rows[0]["content"], "cross-process-content");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A malformed query is REFUSED. It used to decode to a null query,
+    /// which carries no filter at all: a typo in the query string widened
+    /// the read to the whole table, and the caller received every row as
+    /// though it had asked for them.
+    #[test]
+    fn a_malformed_query_is_refused_instead_of_widening_the_read() {
+        for bad in ["{not json", "[]", "null", "\"text\"", "42", "true"] {
+            match parse_query(bad) {
+                Ok(_) => panic!("a malformed query must be refused: {bad}"),
+                Err(e) => assert!(e.starts_with("E_STORAGE:"), "{bad}: {e}"),
+            }
+        }
+        assert!(
+            parse_query("{}").is_ok(),
+            "an empty query object is a valid query"
+        );
+        assert!(
+            parse_query(r#"{"filterCol":"session_id","filterVal":"s","limit":5}"#).is_ok(),
+            "a well-formed query must still decode"
+        );
     }
 }

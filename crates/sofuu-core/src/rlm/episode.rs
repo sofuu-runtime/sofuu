@@ -56,9 +56,10 @@ pub enum EpisodeAction {
 ///
 /// P1.3 (PLAN-MEMORY-TOKENS): this is a PROTOCOL CONTRACT, not persona —
 /// every semantic rule and API name must survive, but the prose is merged
-/// (~150 tokens vs ~250) to keep the RLM transcript prefix lean. The mock
-/// battery (rlm_mock_test) asserts the state machine, not this text; the
-/// unit test below asserts every API name + rule keyword stays present.
+/// (~150 tokens vs ~250) to keep the RLM transcript prefix lean. The unit
+/// test below asserts every API name + rule keyword stays present; the
+/// real-model coverage in `real_model.rs` drives the loop with a real
+/// backend.
 const SYSTEM_PROMPT: &str = "\
 Sofuu RLM loop: the context lives as data in a sandboxed JS env — it is NOT in this prompt.
 
@@ -360,9 +361,11 @@ impl Episode {
     }
 
     /// convenience driver: `ask` runs the model on the given messages.
-    /// Sub-prompts are fulfilled as plain completions (no snippet framing);
-    /// tool suspensions feed a visible not-available marker (the JS driver
-    /// is the consumer that actually executes agent tools).
+    /// Sub-prompts are fulfilled as plain completions (no snippet framing).
+    /// A tool suspension has no executor on this driver: the episode stops
+    /// with an explicit `tool_unavailable` outcome rather than feeding a
+    /// placeholder back as if a tool had run (RULES §1.9 — the JS driver is
+    /// the consumer that actually executes agent tools).
     pub fn run(&mut self, ask: &mut dyn FnMut(Vec<Message>) -> String) -> RlmResult {
         let mut action = self.start();
         loop {
@@ -379,11 +382,13 @@ impl Episode {
                     self.feed_llm_answers(answers)
                 }
                 EpisodeAction::ResolveTool { calls, .. } => {
-                    let results = calls
-                        .iter()
-                        .map(|_| "[rlm: tool not available on this driver]".to_string())
-                        .collect();
-                    self.feed_tool_results(results)
+                    return self.done_result(
+                        format!(
+                            "stopped: {} host tool call(s) cannot be fulfilled on this driver",
+                            calls.len()
+                        ),
+                        Some("tool_unavailable".into()),
+                    );
                 }
                 EpisodeAction::Done(r) => return r,
             };
@@ -536,6 +541,11 @@ impl Episode {
     /// events; overflow lands in dropped_events. The answer is capped at
     /// 64KB with a `note` event saying so.
     fn done(&mut self, answer: String, stopped: Option<String>) -> EpisodeAction {
+        EpisodeAction::Done(self.done_result(answer, stopped))
+    }
+
+    /// The same finished episode, as a result rather than an action.
+    fn done_result(&mut self, answer: String, stopped: Option<String>) -> RlmResult {
         let answer = if answer.chars().count() > MAX_ANSWER_CHARS {
             self.push_event("note", format!("final answer truncated to {MAX_ANSWER_CHARS} chars"));
             truncate_chars(&answer, MAX_ANSWER_CHARS)
@@ -554,7 +564,7 @@ impl Episode {
             dropped = dropped.saturating_add((trace.len() - MAX_TRACE_EVENTS) as u32);
             trace.truncate(MAX_TRACE_EVENTS);
         }
-        EpisodeAction::Done(RlmResult {
+        RlmResult {
             answer,
             calls: self.calls,
             tool_calls: self.tool_calls,
@@ -564,7 +574,7 @@ impl Episode {
             trace,
             dropped_events: dropped,
             stopped,
-        })
+        }
     }
 }
 
@@ -602,6 +612,13 @@ fn truncate_chars(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every test in this module is a PURE state-machine check (RULES §1.9
+    /// static-data rule): the model replies are fixed INPUTS to a
+    /// deterministic transition function, not a simulated model. Nothing here
+    /// executes a model and nothing here claims a model ran — the coverage
+    /// that needs a real backend lives in `real_model.rs`, which drives the
+    /// same loop with replies from the shipped inference engine.
 
     fn request(context: &str) -> RlmRequest {
         RlmRequest {
@@ -701,11 +718,13 @@ mod tests {
         assert!(!blank.messages[1].content.contains("episode protocol"));
     }
 
-    /// Full flow with a scripted fake model: round 1 inspects count/chunk,
-    /// round 2 calls llm() on a slice (suspends; the fake fulfills the
-    /// sub-prompt), round 3 finishes with final().
+    /// Full episode flow over a fixed reply script: round 1 inspects
+    /// count/chunk, round 2 calls llm() on a slice (the episode suspends and
+    /// the caller supplies the sub-prompt answer), round 3 finishes with
+    /// final(). The replies are fixed inputs to the state machine — no model
+    /// runs here (see the module note above).
     #[test]
-    fn full_episode_with_scripted_model() {
+    fn full_episode_flow_over_a_fixed_reply_script() {
         let mut corpus = String::new();
         for i in 0..40 {
             corpus.push_str(&format!("paragraph {i} of filler text about nothing much\n\n"));
@@ -749,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn no_snippet_retries_then_gives_up_with_text() {
+    fn no_snippet_retries_end_the_episode_with_the_reply_text() {
         let mut ep = Episode::new(request("short context"), 0).expect("episode");
         let mut n = 0u32;
         let result = ep.run(&mut |_msgs| {
@@ -772,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn snippet_errors_go_back_to_the_model() {
+    fn snippet_errors_are_framed_into_the_transcript() {
         let mut ep = Episode::new(request("short context"), 0).expect("episode");
         let mut saw_error = false;
         let result = ep.run(&mut |msgs: Vec<Message>| {
@@ -784,7 +803,7 @@ mod tests {
                 "```js\nnoSuchFn()\n```".to_string()
             }
         });
-        assert!(saw_error, "the JS error text must reach the model");
+        assert!(saw_error, "the JS error text must reach the transcript the model sees");
         assert_eq!(result.answer, "recovered");
     }
 
@@ -793,7 +812,7 @@ mod tests {
     /// The transcript wrappers must say so explicitly (mirroring the agent
     /// layer's tool-output marker), while keeping the exact
     /// "[snippet result]"/"[snippet error]" tokens that downstream
-    /// consumers match on (the JS mock driver, the chat agent transcript).
+    /// consumers match on (the shipped JS driver, the chat agent transcript).
     #[test]
     fn snippet_transcript_markers_carry_the_untrusted_note() {
         let mut ep = Episode::new(request("short context"), 0).expect("episode");
@@ -958,6 +977,28 @@ mod tests {
             }
             _ => panic!("expected budget stop"),
         }
+    }
+
+    /// A tool suspension on the `run()` driver has no executor: the episode
+    /// must stop with an explicit outcome instead of resuming with a
+    /// placeholder string that would read like a tool result (RULES §1.9).
+    #[test]
+    fn tool_suspension_without_an_executor_stops_the_episode() {
+        let mut req = request("short context");
+        req.opts.tools = vec![ToolSpec {
+            name: "echo".into(),
+            description: "echoes".into(),
+            parameters: serde_json::json!({"type":"object"}),
+        }];
+        let mut ep = Episode::new(req, 0).expect("episode");
+        let result = ep.run(&mut |_msgs| "```js\ntool(\"echo\", {})\n```".to_string());
+        assert_eq!(result.stopped.as_deref(), Some("tool_unavailable"));
+        assert!(
+            result.answer.contains("cannot be fulfilled"),
+            "answer: {}",
+            result.answer
+        );
+        assert_eq!(result.tool_calls, 1, "the attempted call is still accounted");
     }
 
     // ── G: security guardrails ──────────────────────────────────

@@ -5,7 +5,19 @@
   'use strict';
   var sofuu = global.sofuu;
   var kaze = sofuu && sofuu.kaze;
-  if (!kaze || typeof kaze._asyncStart !== 'function') return;
+  if (!kaze) return;
+  if (typeof kaze._asyncStart !== 'function') {
+    /* The native bridge is absent, so ai/tool capabilities cannot run. The
+     * JS API still has to answer with a typed refusal: leaving runAsync
+     * undefined turns every call site into an untyped TypeError instead of
+     * a diagnostic the caller can act on. */
+    kaze.runAsync = function () {
+      var missing = new Error('this Sofuu runtime has no asynchronous Kaze bridge for ai/tool capabilities');
+      missing.code = 'E_KAZE_RUNTIME';
+      return Promise.reject(missing);
+    };
+    return;
+  }
 
   function errorFrom(step) {
     var source = step && step.error && typeof step.error === 'object' ? step.error : (step || {});

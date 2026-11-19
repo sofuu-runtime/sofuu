@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -31,12 +31,16 @@ pub const SYSFS_ROOT: &str = "/sys/class/gpio";
 pub struct GpioBus {
     root: PathBuf,
     /// `device name -> BCM line number`, from `--pin`. Empty means "no live
-    /// device family": the simulator answers instead.
+    /// device family": the device operations have no backend at all, and a
+    /// simulator never answers them.
     pins: HashMap<String, u16>,
     /// Lines this process exported, so `drop` can release them.
     exported: Vec<u16>,
     /// Set once the chardev ABI had to be used.
     chardev: bool,
+    /// The last failure of a background pulse. A pulse that could not lower
+    /// the line may have left it high, so the next operation reports it.
+    pulse_error: Arc<Mutex<Option<String>>>,
 }
 
 impl GpioBus {
@@ -47,6 +51,7 @@ impl GpioBus {
             pins: pins.iter().cloned().collect(),
             exported: Vec::new(),
             chardev: false,
+            pulse_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -61,6 +66,7 @@ impl GpioBus {
 
     /// Drive a named line high or low.
     pub fn set(&mut self, name: &str, on: bool) -> Result<(), String> {
+        self.pulse_failure()?;
         let pin = self
             .pin_of(name)
             .ok_or_else(|| format!("E_KAZE_LINK: no GPIO pin is configured for '{}' (--pin {}=<n>)", name, name))?;
@@ -69,6 +75,7 @@ impl GpioBus {
 
     /// Read a named line.
     pub fn read(&mut self, name: &str) -> Result<bool, String> {
+        self.pulse_failure()?;
         let pin = self
             .pin_of(name)
             .ok_or_else(|| format!("E_KAZE_LINK: no GPIO pin is configured for '{}'", name))?;
@@ -81,20 +88,48 @@ impl GpioBus {
     /// Raise the line, then lower it after `seconds` from a background thread so
     /// the script (and the flight loop) never blocks on the timer.
     pub fn pulse(&mut self, name: &str, seconds: f64) -> Result<(), String> {
+        self.pulse_failure()?;
         let pin = self
             .pin_of(name)
             .ok_or_else(|| format!("E_KAZE_LINK: no GPIO pin is configured for '{}'", name))?;
         self.write_line(pin, true)?;
         let root = self.root.clone();
         let ms = (seconds.max(0.0) * 1000.0).round() as u64;
+        let failure = Arc::clone(&self.pulse_error);
+        let device = name.to_string();
         thread::Builder::new()
             .name(format!("kaze-gpio-pulse-{}", pin))
             .spawn(move || {
                 thread::sleep(Duration::from_millis(ms));
-                let _ = write_value_str(&root.join(format!("gpio{}", pin)).join("value"), "0");
+                let path = root.join(format!("gpio{}", pin)).join("value");
+                if let Err(e) = write_value_str(&path, "0") {
+                    // The line may still be high. Say so instead of losing the
+                    // failure: a stuck relay is a physical fault, not a detail.
+                    let message = format!(
+                        "E_KAZE_LINK: the pulse of '{}' could not lower the line: {}; it may still be high",
+                        device, e
+                    );
+                    if let Ok(mut slot) = failure.lock() {
+                        *slot = Some(message);
+                    }
+                }
             })
             .map_err(|e| format!("E_KAZE_LINK: cannot start the pulse timer: {}", e))?;
         Ok(())
+    }
+
+    /// The failure of the last pulse, if the line could not be lowered. The
+    /// next operation reports it rather than continuing as if the line were
+    /// back where it belongs.
+    fn pulse_failure(&self) -> Result<(), String> {
+        let mut slot = self
+            .pulse_error
+            .lock()
+            .map_err(|_| "E_KAZE_LINK: the GPIO bus state is poisoned".to_string())?;
+        match slot.take() {
+            Some(message) => Err(message),
+            None => Ok(()),
+        }
     }
 
     /// What the operator can see with `sofuu script run --json`.
@@ -104,7 +139,12 @@ impl GpioBus {
             .iter()
             .map(|(name, pin)| json!({ "name": name, "line": pin }))
             .collect();
-        json!({ "backend": if self.chardev { "chardev" } else { "sysfs" }, "pins": pins })
+        json!({ "backend": self.backend_name(), "pins": pins })
+    }
+
+    /// Which GPIO backend this bus drives, for provenance in a trace.
+    pub fn backend_name(&self) -> &'static str {
+        if self.chardev { "chardev" } else { "sysfs" }
     }
 
     /* ── internals ─────────────────────────────────────────────────────── */
@@ -209,6 +249,22 @@ mod tests {
         assert_eq!(fs::read_to_string(root.join("gpio17").join("value")).unwrap(), "1");
         thread::sleep(Duration::from_millis(200));
         assert_eq!(fs::read_to_string(root.join("gpio17").join("value")).unwrap(), "0");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A pulse that cannot lower the line may have left it high. The failure
+    /// is reported instead of being lost, so the next operation knows.
+    #[test]
+    fn a_pulse_that_cannot_lower_the_line_is_reported() {
+        let root = fake_root("stuck");
+        let mut bus = GpioBus::new(&[("fan".to_string(), 17u16)], Some(&root));
+        bus.pulse("fan", 0.05).expect("pulse arms");
+        // Take the line away while the pulse timer is still running: the
+        // lowering write cannot succeed.
+        fs::remove_dir_all(root.join("gpio17")).expect("remove the line");
+        thread::sleep(Duration::from_millis(200));
+        let err = bus.read("fan").expect_err("the stuck line must be reported");
+        assert!(err.contains("could not lower the line"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
 }

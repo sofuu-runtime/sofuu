@@ -208,7 +208,22 @@
   async function applyFacts(facts, brainInstance) {
     if (!facts || !facts.length) return { added: 0, updated: 0, skipped: 0 };
     var b = resolveBrain(brainInstance);
-    if (!b) return { added: 0, updated: 0, skipped: 0 };
+    /* Facts were extracted, so there is something to store: a missing store
+     * is a failure, not a run that happened to add nothing. */
+    if (!b) {
+      throw makeError('E_CAP_MISSING',
+        'extractor: no memory store is available, so the extracted facts were not written');
+    }
+    /* One write path for both shapes. The counters below describe writes
+     * that HAPPENED, so the call is awaited and a store that cannot write
+     * is an error rather than a silent drop counted as a success. */
+    var write = (typeof b.learn === 'function') ? b.learn
+      : (typeof b.remember === 'function' ? b.remember : null);
+    if (!write) {
+      throw makeError('E_CAP_MISSING',
+        'extractor: this memory store cannot write (no learn() or remember()), ' +
+        'so the extracted facts were not written');
+    }
 
     var added = 0;
     var updated = 0;
@@ -226,9 +241,9 @@
         var existing = [];
         try {
           if (typeof b.search === 'function') {
-            existing = b.search(searchQuery, 3);
+            existing = await b.search(searchQuery, 3);
           } else if (typeof b.recall === 'function') {
-            existing = b.recall(searchQuery, 3);
+            existing = await b.recall(searchQuery, 3);
           }
         } catch (eSearch) { /* the pre-write search is an optimisation; a backend that cannot search just skips the hit list. */ }
 
@@ -240,7 +255,7 @@
             if (hit && (hit.distance < 0.45 || hit.score > 0.55)) {
               try {
                 if (typeof b.forget === 'function' && hit.id !== undefined) {
-                  b.forget(hit.id);
+                  await b.forget(hit.id);
                 }
               } catch (eForget) { /* forgetting the superseded fact is best effort: a backend that refuses keeps both, which is the old behaviour. */ }
             }
@@ -248,20 +263,16 @@
         }
 
         // 3. Learn new fact
-        if (typeof b.learn === 'function') {
-          b.learn(factText, role, source);
-        } else if (typeof b.remember === 'function') {
-          b.remember(factText, role, source);
-        }
+        await write.call(b, factText, role, source);
         updated++;
       } else {
         // ADD action: Deduplicate check
         var dupHits = [];
         try {
           if (typeof b.search === 'function') {
-            dupHits = b.search(factText, 1);
+            dupHits = await b.search(factText, 1);
           } else if (typeof b.recall === 'function') {
-            dupHits = b.recall(factText, 1);
+            dupHits = await b.recall(factText, 1);
           }
         } catch (eDup) { /* duplicate detection is advisory; a failed search reports no duplicate rather than blocking the write. */ }
 
@@ -271,17 +282,13 @@
           continue;
         }
 
-        if (typeof b.learn === 'function') {
-          b.learn(factText, role, source);
-        } else if (typeof b.remember === 'function') {
-          b.remember(factText, role, source);
-        }
+        await write.call(b, factText, role, source);
         added++;
       }
     }
 
     try {
-      if (typeof b.flush === 'function') b.flush();
+      if (typeof b.flush === 'function') await b.flush();
     } catch (eFlush) { /* flush is durability, not correctness: the fact is already in the backend buffer. */ }
 
     return { added: added, updated: updated, skipped: skipped };

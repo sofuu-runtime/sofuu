@@ -210,6 +210,12 @@ pub fn sha256_file(path: &str) -> Option<String> {
 
 /// fsync a file so its bytes are on stable storage.
 pub fn fsync_file(path: &str) -> bool {
+    fsync_path(Path::new(path))
+}
+
+/// fsync a file given as a path, so a store whose path is not UTF-8 can be
+/// committed with the same discipline.
+pub fn fsync_path(path: &Path) -> bool {
     std::fs::File::open(path)
         .and_then(|f| f.sync_all())
         .is_ok()
@@ -222,20 +228,53 @@ pub fn fsync_dir(dir: &str) {
     }
 }
 
+/// fsync a directory given as a path.
+pub fn fsync_dir_path(dir: &Path) {
+    if let Ok(f) = std::fs::File::open(dir) {
+        let _ = f.sync_all();
+    }
+}
+
 /// Durable atomic publish: fsync the staged file, rename it over the target,
 /// then fsync the directory. Returns false (leaving the target untouched)
 /// when the staged file cannot be made durable or the rename fails.
 pub fn publish(tmp: &str, target: &str) -> bool {
-    if !fsync_file(tmp) {
+    publish_paths(Path::new(tmp), Path::new(target))
+}
+
+/// The path-based spelling of `publish`. A store whose path is not UTF-8
+/// cannot go through the `&str` form without changing the file it names.
+///
+/// What "committed" means here: the staged bytes are on stable storage and
+/// the rename has landed, so a reader sees the whole new file and never a
+/// torn one. The directory entry's own durability rests on the directory
+/// fsync, which is best-effort — a filesystem that refuses it does not
+/// un-write the file, it only leaves the rename itself unrecorded across a
+/// power loss.
+pub fn publish_paths(tmp: &Path, target: &Path) -> bool {
+    if !fsync_path(tmp) {
         return false;
     }
     if std::fs::rename(tmp, target).is_err() {
         return false;
     }
-    if let Some(parent) = Path::new(target).parent() {
-        fsync_dir(&parent.to_string_lossy());
+    if let Some(parent) = target.parent() {
+        fsync_dir_path(target_dir(parent));
     }
     true
+}
+
+/// The directory a rename into `parent` changed.
+///
+/// `Path::parent` of a bare relative name is `Some("")`, and an empty path
+/// cannot be opened: the directory the rename changed would go unrecorded.
+/// The current directory is what the rename changed.
+fn target_dir(parent: &Path) -> &Path {
+    if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    }
 }
 
 /// Move a damaged file out of the way instead of deleting it (R-25,
@@ -316,7 +355,13 @@ impl Journal {
                 path,
                 entries: Vec::new(),
             };
-            j.flush()?;
+            if j.flush().is_none() {
+                /* The claim file was created but could not be written. Leaving
+                 * it behind would block every later writer until it ages out,
+                 * for a journal nobody owns. */
+                let _ = std::fs::remove_file(&j.path);
+                return None;
+            }
             return Some(j);
         }
         if !journal_is_stale(&path) {
@@ -334,7 +379,10 @@ impl Journal {
                 path,
                 entries: Vec::new(),
             };
-            j.flush()?;
+            if j.flush().is_none() {
+                let _ = std::fs::remove_file(&j.path);
+                return None;
+            }
             return Some(j);
         }
         None
@@ -360,6 +408,18 @@ impl Journal {
         }
         fsync_dir(&self.dir);
         true
+    }
+
+    /// Clear the journal when the commit it described was ABANDONED: the
+    /// staged bytes are gone and the recorded rename will never happen.
+    ///
+    /// The file goes away exactly as it does in [`Self::commit`]; only the
+    /// meaning differs. A journal left behind in either case describes a
+    /// commit that is no longer pending, and the next writer in this
+    /// directory would have to wait for it to age out before it could
+    /// publish.
+    pub fn abandon(self) -> bool {
+        self.commit()
     }
 
     fn flush(&mut self) -> Option<()> {
@@ -581,6 +641,17 @@ mod tests {
             &target.to_string_lossy()
         ));
         assert!(!target.exists());
+    }
+
+    /// A target with no directory component names the current directory.
+    /// `Path::parent` returns an empty path there, and an empty path cannot
+    /// be opened — so the directory the rename changed would never be
+    /// fsynced and the rename would go unrecorded across a power loss.
+    #[test]
+    fn a_bare_relative_target_resolves_to_the_current_directory() {
+        assert_eq!(Path::new("store.json").parent(), Some(Path::new("")));
+        assert_eq!(target_dir(Path::new("")), Path::new("."));
+        assert_eq!(target_dir(Path::new("/tmp/store.json")), Path::new("/tmp"));
     }
 
     #[test]

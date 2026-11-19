@@ -354,12 +354,30 @@ class SofuuBridge(configJson: String? = null) {
     }
 
     /// Compute cosine similarity between two vectors.
-    fun similarity(a: FloatArray, b: FloatArray): Float {
+    ///
+    /// Returns null when the runtime could not compute it — the runtime is
+    /// closed, the engine raised, or the answer was not a number. A failed
+    /// computation is NOT a measured similarity of zero: a helper that
+    /// always answers 0 looks like a measurement and is not one.
+    fun similarity(a: FloatArray, b: FloatArray): Float? {
         val aJS = a.joinToString(",")
         val bJS = b.joinToString(",")
         val js = "sofuu.ai.similarity(new Float32Array([$aJS]), new Float32Array([$bJS]))"
-        val result = eval(js) ?: return 0f
-        return result.trim().toFloatOrNull() ?: 0f
+        // The eval escape hatch answers with the ABI envelope
+        // ({"ok":true,"result":…} / {"ok":false,"error":…}), so the number
+        // has to be unwrapped — the raw envelope never parses as a float.
+        val envelope = eval(js) ?: return null
+        return try {
+            val obj = org.json.JSONObject(envelope)
+            if (!obj.optBoolean("ok", false)) return null
+            val value = obj.opt("result") ?: return null
+            when (value) {
+                is String -> value.trim().toFloatOrNull()
+                else -> value.toString().trim().toFloatOrNull()
+            }
+        } catch (_: org.json.JSONException) {
+            null
+        }
     }
 
     // ── JNI native declarations ──────────────────────────────────────

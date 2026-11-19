@@ -2779,12 +2779,17 @@
     try {
       if (sofuu.tools && typeof sofuu.tools.validateArgs === 'function') {
         var r = sofuu.tools.validateArgs(schema, obj);
-        if (r.ok) return { ok: true, why: '' };
-        return { ok: false, why: (r.path ? r.path + ' ' : '') + (r.error || 'invalid') };
+        if (r.ok) return { ok: true, why: '', checked: true };
+        return { ok: false, why: (r.path ? r.path + ' ' : '') + (r.error || 'invalid'), checked: true };
       }
-      return { ok: true, why: '' };
+      /* No validator: the answer was NOT validated. Reporting it as
+       * validated would claim a check that never ran, and the retry loop
+       * would ask the model to fix an answer nobody can judge. */
+      return { ok: false, why: 'schema validator unavailable', checked: false };
     } catch (e) {
-      return { ok: false, why: 'validator error' };
+      /* The validator threw: no verdict was produced, so no verdict is
+       * claimed, and a model retry cannot produce one either. */
+      return { ok: false, why: 'validator error', checked: false };
     }
   }
   /* Answer → first JSON value: direct parse, then a fenced ```json block,
@@ -6432,7 +6437,7 @@
           ? { ok: false, why: 'not parseable as JSON' }
           : validateSchemaLight(pj, respSchema);
         var tries = 0;
-        while (!pv.ok && !state.cancelled && tries < 2) {
+        while (!pv.ok && pv.checked !== false && !state.cancelled && tries < 2) {
           tries++;
           emit('schema', { attempt: tries, why: clip(pv.why || '', 160) });
           try {
@@ -6465,7 +6470,7 @@
           }
         }
         var ok = !!(pv.ok && pj !== undefined);
-        emit('schema', { attempt: tries, ok: ok });
+        emit('schema', { attempt: tries, ok: ok, checked: pv.checked !== false, why: clip(pv.why || '', 160) });
         return { ok: ok, data: ok ? pj : undefined, answer: a };
       }
 

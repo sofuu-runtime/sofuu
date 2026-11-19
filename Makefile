@@ -5,7 +5,7 @@
 #
 # `make`           → Rust-first build (cargo; build.rs compiles the C
 #                    engine layer: QuickJS + SIMD + http-parser)
-# `make test`      → JS parity suite
+# `make test`      → real-resource gates + the blocked-suite report
 # `make size-check`→ fail if binary exceeds SIZE_LIMIT (default 5.5 MiB = 5,767,168 B)
 # `make c-only`    → REMOVED in M10 (the pure-C binary died; see
 #                    PLAN-RUST-MIGRATION.md) — prints an error
@@ -36,7 +36,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: real-mcp-check real-memory-check real-kaze-memory-check kaze-js-boundary-check js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check cold-start-bench all clean install test protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
+.PHONY: real-mcp-check real-memory-check real-kaze-memory-check real-kaze-memory-durable-check real-kaze-alert-check real-kaze-fail-closed-check real-kaze-gguf-check real-gates kaze-js-boundary-check js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check cold-start-bench all clean install test preflight protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
 	kaze-drift-check kaze-drift-strict clippy-ratchet \
 	observability-stress asan fuzz-simd policy-dx modern-npm sbom sign-dist \
         deps scoreboard scoreboard-check cuda-check \
@@ -48,6 +48,10 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
         ios-engine ios-engine-deps ios-project ios-typecheck ios-app ios-sim
 
 SIZE_LIMIT ?= 5767168   # 5.5 MB hard cap (bytes)
+
+# The artifact the real-resource gates exercise: an explicit SOFUU_BIN wins,
+# then the debug build, then the stripped release copy at the repository root.
+SOFUU_GATE_BIN = $(if $(SOFUU_BIN),$(SOFUU_BIN),$(if $(wildcard target/debug/sofuu),target/debug/sofuu,$(TARGET)))
 
 all: $(TARGET)
 
@@ -364,29 +368,57 @@ clean:
 # and for a single area:
 #   SOFUU_ALLOW_LOOPBACK=1 cargo test --release -p sofuu-core --lib rt::policy
 test-rust:
-	@echo "BLOCKED: the full Rust suite includes scripted model execution; migrate or separate those tests before running it."
-	@exit 2
+	@bash scripts/preflight.sh rust
 
 # These targeted checks use real temporary resources. Set SOFUU_BIN to the
 # candidate under test; missing prerequisites are reported as blocked.
 real-mcp-check:
-	@python3 scripts/test-real-mcp-file.py
+	@SOFUU_BIN="$(SOFUU_GATE_BIN)" python3 scripts/test-real-mcp-file.py
 
 real-memory-check:
-	@python3 scripts/test-real-memory.py
+	@SOFUU_BIN="$(SOFUU_GATE_BIN)" python3 scripts/test-real-memory.py
 
 real-kaze-memory-check:
-	@python3 scripts/test-kaze-memory-real.py "$(if $(SOFUU_BIN),$(SOFUU_BIN),target/debug/sofuu)"
+	@python3 scripts/test-kaze-memory-real.py "$(SOFUU_GATE_BIN)"
+
+real-kaze-memory-durable-check:
+	@python3 scripts/test-kaze-memory-durable.py "$(SOFUU_GATE_BIN)"
+
+real-kaze-alert-check:
+	@python3 scripts/test-kaze-alert-real.py "$(SOFUU_GATE_BIN)"
+
+real-kaze-fail-closed-check:
+	@python3 scripts/test-kaze-fail-closed.py "$(SOFUU_GATE_BIN)"
+
+real-kaze-gguf-check:
+	@SOFUU_BIN="$(SOFUU_GATE_BIN)" python3 scripts/test-kaze-local-gguf-real.py
+
+# Every real-resource gate in one run: a real MCP server, a real QTSQ store,
+# the real Kaze CMA and durable stores, the real alert sinks, real local-GGUF
+# inference and the event-loop benchmark. PASS / FAIL / BLOCKED per check; the
+# exit code is 1 on a failure and 2 while a prerequisite is missing. A blocked
+# check is a coverage gap, never a pass, and nothing is ever substituted.
+real-gates:
+	@bash scripts/preflight.sh real
 
 kaze-js-boundary-check:
-	@python3 scripts/test-kaze-js-boundaries.py "$(if $(SOFUU_BIN),$(SOFUU_BIN),target/debug/sofuu)"
+	@python3 scripts/test-kaze-js-boundaries.py "$(SOFUU_GATE_BIN)"
 
-test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check
+# The test suite runs the real-resource gates first, so a green run means real
+# coverage, and then reports the suites that are still blocked. It exits 2
+# while any of them is blocked: the JS corpus below still asserts against
+# canned-response providers, so the aggregate is not green and is not run.
+test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check env-knobs-check swiftpm-consistency-check
 	@echo ""
 	@echo "\033[1m=== Sofuu Test Suite ===\033[0m"
 	@echo ""
-	@echo "BLOCKED: the local JS suite contains non-robotics simulated providers; see ROADMAP.md for the unverified coverage."
-	@exit 2
+	@bash scripts/preflight.sh real serve js
+
+# The mandatory pre-commit gate (RULES §3.4): domain isolation, bytecode
+# sync, Kaze drift, the binary size cap, the core unit tests and the
+# real-resource gates.
+preflight:
+	@bash scripts/preflight.sh
 
 # The Kaze surface gate (PLAN-AUDIT-REMEDIATION §4 Task 2.1).
 # Two Kaze engines live in this tree and drifted silently once already, so this
@@ -450,8 +482,7 @@ protocol-test: $(TARGET)
 # H1–H3's historical runner substitutes model streams. It is blocked until
 # its assertions are migrated to a real model or appropriate pure tests.
 serve-test: $(TARGET)
-	@echo "BLOCKED: serve acceptance uses simulated model streams; migrate its assertions before running it."
-	@exit 2
+	@SOFUU_BIN=$(TARGET) bash scripts/preflight.sh serve
 
 # ─── Cross-compilation (cargo + zig; local convenience) ────────────
 # Uses Zig as a zero-dependency cross-compiler (no Docker needed).

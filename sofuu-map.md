@@ -13,9 +13,11 @@ Every division operates under strict architectural boundaries to guarantee that 
 2. **Core Compiler Generalization**: The compiler (`crates/sofuu-core/src/compiler.rs`) must remain 100% domain-agnostic. Never hardcode domain parameters (`entry_price`, `heart_rate`, `leverage`) or external APIs. All configuration enters via 12-factor hierarchy (CLI flags > ENV > Config file > Routine signature).
 3. **No Auxiliary Wrappers**: Standalone agent binaries are 100% pure Kaze (`agent.kaze`). Zero auxiliary `.js` sidecars or `.sh` script wrappers.
 4. **Local Models Only**: Test and benchmark harnesses must run exclusively against local GGUFs already on disk. Never initiate remote model downloads.
-5. **Fail-Closed Security**: Every capability check (network, filesystem, hardware, memory) must fail closed (`E_CAP_DENIED` / reject) on missing, malformed, or empty policies.
-6. **Beta Positioning**: Sofuu is in active beta (`v0.3.0-beta`). Features must be described accurately as Core or Experimental Preview.
-7. **Zero Decorative Emojis**: Documentation, CLI banners, log outputs, and web interfaces must remain strictly professional without decorative emojis.
+5. **Fail-Closed Security**: Every capability check (network, filesystem, hardware, memory) must fail closed (`E_CAP_DENIED` / reject) on missing, malformed, or empty policies. A granted capability that has no configured backend must fail closed too (`E_CAP_MISSING`); it may never report success.
+6. **No Fabricated Results** (`RULES.md` §1.9): No simulated, mocked, stubbed, canned or fabricated AI, tool, MCP, memory, alert or network result may be produced in shipped code, tests, demos or benchmarks. The single exception is an explicitly selected and labelled robotics/drone *physical* simulator. Static fixtures — input strings, byte sequences, known outputs, synthetic tensors, GGUF headers — may test parsing, serialization and deterministic computation, but may never impersonate a running provider or a completed external action. `blocked` and `unverified` are recorded outcomes; a fabricated pass is not.
+7. **Division Separation**: Kaze, robotics and AI stay apart. The Kaze runtime host answers only what a configured backend implements; the robotics host answers only the physical families it was explicitly selected for; and AI, tool, memory and alert traffic never falls back to a simulator or to a canned answer. A physical simulator is selected explicitly (`drone=sim` / `rover=sim`), is labelled in every result it produces, and never answers for another capability family.
+8. **Beta Positioning**: Sofuu is in active beta (`v0.3.0-beta`). Features must be described accurately as Core or Experimental Preview.
+9. **Zero Decorative Emojis**: Documentation, CLI banners, log outputs, and web interfaces must remain strictly professional without decorative emojis.
 
 ---
 
@@ -31,11 +33,11 @@ Every division operates under strict architectural boundaries to guarantee that 
 | **D04** | **Tool Belt & Protocol Gates** | Sandboxed in-process tools, SSRF firewall, native MCP client & host | `crates/sofuu-core/src/mcp/`, `crates/sofuu-core/src/rt/policy.rs` | Core | `cargo test -p sofuu-core --lib mcp` | [D04-tool-belt-mcp.md](docs/sofuu-map/D04-tool-belt-mcp.md) |
 | **D05** | **Kaze Language & Compiler** | Declarative `.kaze` AST, linear arena VM, capability gates, supervisor daemon | `kaze/`, `crates/sofuu-core/src/domains/kaze/`, `crates/sofuu-core/src/compiler.rs`, `example-agents/` | Core | Policy-compliant Kaze checks (see D05) | [D05-kaze-compiler.md](docs/sofuu-map/D05-kaze-compiler.md) |
 | **D06** | **Hardware Inference Engine** | GGUF/SafeTensors loaders, Metal GPU shaders, NEON/AVX2 kernels, quantization | `crates/sofuu-core/src/domains/infer/`, `crates/sofuu-core/src/ml/` | Experimental Preview | `cargo test -p sofuu-core --lib domains::infer` | [D06-hardware-inference.md](docs/sofuu-map/D06-hardware-inference.md) |
-| **D07** | **Robotics, Drones & Edge** | MAVLink 2.0 protocol, GPIO pulse timers, physical safety gates, telemetry | `crates/sofuu-core/src/domains/robotics/`, `kaze/src/hardware.rs` | Core | `cargo test -p sofuu-core --lib domains::robotics` | [D07-robotics-edge.md](docs/sofuu-map/D07-robotics-edge.md) |
+| **D07** | **Robotics, Drones & Edge** | MAVLink 2.0 protocol, GPIO pulse timers, physical safety gates, telemetry | `crates/sofuu-core/src/domains/robotics/`, `kaze/src/hardware.rs` | Preview (live actuation unverified) | `cargo test -p sofuu-core --lib domains::robotics` | [D07-robotics-edge.md](docs/sofuu-map/D07-robotics-edge.md) |
 | **D08** | **CLI, Interactive TUI & REPL** | `sofuu` CLI flags, full-screen `chat` TUI, interactive REPL, inspector | `src/js/chat_tui.js`, `crates/sofuu-core/src/main.rs` | Core | `./sofuu doctor` | [D08-cli-interactive-tui.md](docs/sofuu-map/D08-cli-interactive-tui.md) |
 | **D09** | **Mobile & Native Embeddings** | Android C-API/APK, Swift Package Manager (iOS/macOS), CocoaPods | `sofuu-android/`, `sofuu-ios/`, `crates/sofuu-capi/` | Core / Edge | `cargo test -p sofuu-capi` | [D09-mobile-native-embeddings.md](docs/sofuu-map/D09-mobile-native-embeddings.md) |
 | **D10** | **Desktop App Presentation** | Tauri GUI shell, isolated GTK/WebKit presentation layer | `sofuu-desktop/` | Experimental Preview | `cd sofuu-desktop && npm run build` | [D10-desktop-app.md](docs/sofuu-map/D10-desktop-app.md) |
-| **D11** | **Public Surface & Operations** | Documentation, landing page (`sofuu.xyz`), npm distribution, Cloudflare Pages | `sofuu-landing/`, `npm/`, `docs/`, `README.md` | Public Operations | `cd sofuu-landing && npm run build` | [D11-public-surface-operations.md](docs/sofuu-map/D11-public-surface-operations.md) |
+| **D11** | **Public Surface & Operations** | Documentation, landing page (`sofuu.xyz`), npm distribution, Cloudflare Pages | `sofuu-landing/`, `npm/`, `docs/`, `README.md`, `CHANGELOG.md`, `sofuu-map.md` | Public Operations | `cd sofuu-landing && npm run build` | [D11-public-surface-operations.md](docs/sofuu-map/D11-public-surface-operations.md) |
 
 ---
 
@@ -97,6 +99,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [x] Purge outdated branding comments in favor of "turn-block context retention" (F-08).
   - [x] Recompile and lock QuickJS bytecode snapshots (11/11 match verified).
   - [x] AUDIT-REMEDIATION-2026-11-08: Complete agent loop hardening — turn-block context retention with consolidated parallel tool call emission (AG-025b), `maxDepth=0` preservation (AG-044/049), provider latency accounting against `maxWallMs` (AG-043), and sensitive credential / home directory path redaction in run logs (AG-101/102).
+  - [x] Remove the canned agent-loop fallback: the provider registry carries no substitute provider, and a capability that is refused is a typed error rather than a fixed answer.
   - [ ] Expand sub-agent result synthesis protocol for parallel delegation trees.
 
 ---
@@ -116,6 +119,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [x] Fix SSRF private subnet check ordering when loopback testing mode is active (F-14).
   - [x] Eliminate unchecked binary payload decodes in tool communication (F-05).
   - [x] AUDIT-REMEDIATION-2026-11-08: Complete tool belt and protocol gates — SSRF loopback alignment across URL filters and socket gates with strict private/metadata blocking (JR-090, JR-092), MCP disconnect idempotency and process-group signal isolation (MC-017), and dynamic MCP stdio line buffer up to 32MB (MC-019).
+  - [x] Gate dispatch before the backend is reached: a denied tool receives no request at all, and a lost response after a possibly effectful call is reported as an unknown outcome instead of being retried (`scripts/test-real-mcp-file.py`).
   - [ ] Add streaming MCP tool response pipes for large file operations.
 
 ---
@@ -128,12 +132,12 @@ Every division operates under strict architectural boundaries to guarantee that 
   * `crates/sofuu-core/src/domains/kaze/` (Shipped parser, checker, bytecode compiler, arena VM, capability gates, and runtime bridge; aliased as `crate::sfs`)
   * `crates/sofuu-core/src/script_cmd.rs` (`sofuu script` CLI, including `.kazebc` compilation and execution)
   * `crates/sofuu-core/src/compiler.rs` (Runtime standalone binary compiler)
-  * `example-agents/` (`quant_sentinel/`, `med_protocol/`, `agri_sentinel/`, `paper_trader/`)
+  * `example-agents/` (`local_brief/`, `quant_sentinel/`, `med_protocol/`, `agri_sentinel/`)
 * **Implementation and Verification**:
   * Standalone Kaze reports language version `1.0` and uses bytecode format `4`; its dated, per-item tagged [implementation inventory](https://github.com/sofuu-runtime/kaze/blob/main/docs/KAZE-1.0-REFERENCE.md) is in the separate Kaze repository. The separate engine embedded in Sofuu reports language version `0.1`. Its current source writes format `2` with statement-line metadata and can read legacy format `1`; the dated format-1 local inventory is [`docs/KAZE-CURRENT-SURFACE.md`](docs/KAZE-CURRENT-SURFACE.md). The engines have different features and incompatible artifacts. `docs/KAZE-SPEC.md` is a historical embedded-engine specification with known stale claims. Published binaries need separate verification.
   * **Planned version alignment:** Adopt one Kaze 1.0 language contract across standalone and Sofuu, preferably with a shared language core and separate host integrations. This is not implemented; preserve current version reporting until contract, fail-closed behavior, compatibility, and release checks pass. Runtime and bytecode format versions remain separate. The local plan at `kaze/docs/VERSION-ALIGNMENT.md` is gitignored in this checkout.
   * The landing site's [`/docs/kaze`](https://sofuu.xyz/docs/kaze) page renders a tagged snapshot of the standalone 1.0 inventory at Kaze commit `5f2475a`, with examples and links from `/kaze` and `/docs`. The local site source also records the planned version alignment; that note is not in the deployed snapshot. Update `sofuu-landing/src/app/docs/kaze/reference.md` and its examples when the standalone inventory changes. Production Cloudflare Pages deployment `83536b13` was verified on 2026-11-11; published Kaze binaries remain separately unverified.
-  * The standalone source now requires explicit grants and a valid policy, refuses unavailable non-robotics backends, and requires labelled opt-in for drone/rover simulation. The [standalone roadmap](https://github.com/sofuu-runtime/kaze/blob/main/docs/ROADMAP.md) tracks current progress and remaining verification. Targeted safety and migrated compatibility/language tests pass. Live drone actuation is disabled until the required 1.5-second heartbeat and per-field telemetry freshness veto is implemented; physical hardware and release compatibility remain unverified.
+  * The standalone source now requires explicit grants and a valid policy, refuses unavailable non-robotics backends, and requires labelled opt-in for drone/rover simulation. The [standalone roadmap](https://github.com/sofuu-runtime/kaze/blob/main/docs/ROADMAP.md) tracks current progress and remaining verification. Targeted safety and migrated compatibility/language tests pass. The 1.5-second heartbeat and per-field telemetry freshness veto are implemented (unified at 1500 ms across `kaze_live.rs` and `mavlink_gate.rs`); live drone actuation stays disabled because physical hardware and release compatibility remain unverified — no device has been attached.
   * **Embedded Kaze fail-closed work, 2026-11-11:** Current source requires grants and an R7 policy with explicit `tools.allow` or `tools.deny` rules for calls. An explicitly selected per-run CMA memory backend is available; unavailable AI, tool, persistent Kaze memory, alert, sensor and device operations refuse instead of returning fabricated success. Drone/rover simulation requires an explicit test selection and is labelled. Live drone and GPIO paths are disabled pending verified policy and safety propagation. The local debug build passed Kaze unit and cross-surface checks; published artifacts remain unverified. See the tracked [embedded capability status](KAZE-EMBEDDED.md).
   * **Embedded Kaze async bridge, 2026-11-13 (source commit `544c680c8`):** `sofuu.kaze.runAsync` and its `sofuu.sfs` alias suspend at authorized AI/tool requests, apply active host policy before dispatch, bound serialized requests, validate `ai.classify` results against requested labels, and report missing-model/unknown-outcome failures with Kaze diagnostics. `sofuu script run` now serves a source or `.kazebc` file that declares `ai`/`tool` through the same bridge; every other script keeps the engine-free synchronous runner and fails closed for unavailable backends. Approval-required requests are denied without a verifiable approval receipt. Debug artifact `cd0a0abef7835aad1393a4d75e82362231d2768c1f18e92e1324b5d1749b0a21` passed 99 focused embedded Kaze tests, 246 broader Kaze/compiler/memory/robotics tests, the fail-closed, per-run-memory and JS-boundary scripts, and a real model-plus-MCP journey through `sofuu.kaze.runAsync`, a compiled agent, and `sofuu script run` (source and `.kazebc`) with a configured remote provider. Local-GGUF weights, cancellation behavior, published binaries and physical hardware remain unverified.
   * **Embedded Kaze real execution remediation, 2026-11-16 (source commit `bb98aaa65`):** Real alert sinks (`alert=stdout`, `alert=stderr`, `alert=file:<path>`) stream raw bytes, enforce length bounds ($\le 1024$ B), and fail closed with `E_CAP_MISSING`. Cross-process durable memory persistence (`memory=durable`, `memory=file:<path>`) uses atomic tempfile commits. Pure-Kaze Local-GGUF execution verified across 3/3 runs on Metal GPU with pre-existing `SmolLM2-360M` weights and real MCP tool read grounding without downloads. Standalone binary size ceiling respected (standalone agent at 4.5 MiB).
@@ -145,14 +149,15 @@ Every division operates under strict architectural boundaries to guarantee that 
   * Standalone compiled binaries must support production 12-factor configuration resolution.
   * Agents must run on pure Kaze with zero auxiliary `.js` or `.sh` wrapper scripts.
   * Missing parameters must trigger structured diagnostic guidance, not runtime crashes.
+  * A capability with no configured backend must fail closed (`E_CAP_MISSING`): the Kaze runtime host may never answer `ai`, `tool`, `memory` or `alert` itself, and a simulator is reachable only through an explicit, labelled `drone=sim` / `rover=sim` selection.
 * **Active Tasks**:
   - [ ] Align standalone and Sofuu on the shared Kaze 1.0 contract; define the contract, shared-core integration, compatibility and migration decisions, and cross-surface conformance before changing the embedded version string. See `kaze/docs/VERSION-ALIGNMENT.md`.
   - [ ] Complete standalone Kaze capability-safety verification and release compatibility decision; targeted policy, grant, backend, link-loss, and argument-gate checks are in `kaze/tests/capability_safety.rs`. Close the live-drone heartbeat and telemetry freshness gap before physical use, and migrate non-robotics stand-ins before running full release suites.
   - [x] K0 inventory in progress: local Kaze source and binary behavior documented; published artifact, real backend/policy paths, and applicable model coverage remain to be verified.
   - [x] Address missing/empty policy handling in the standalone prototype (F-04).
-  - [ ] K1: embedded source, bytecode, JS aliases, REPL and compiled one-shot paths refuse unavailable synchronous non-robotics calls and require explicit grants and applicable policy; `sofuu.kaze.runAsync`, a compiled agent that declares `needs: ai`/`needs: tool`, and `sofuu script run` for source or `.kazebc` dispatch authorized AI/tool requests through bounded continuations. A real model-plus-MCP journey has passed on a debug build with a configured remote provider. Continue auditing supervisor/interactive execution, cancellation, local-GGUF coverage and released binaries; migrate integration/gate tests and finish the host split before claiming the milestone complete. Local debug coverage: `scripts/test-kaze-fail-closed.py`, `scripts/test-kaze-memory-real.py`, `scripts/test-kaze-js-boundaries.py`, `scripts/test-kaze-real-ai.py`, and `scripts/test-kaze-cli-real-ai.py`.
+  - [ ] K1: embedded source, bytecode, JS aliases, REPL and compiled one-shot paths refuse unavailable synchronous non-robotics calls and require explicit grants and applicable policy; `sofuu.kaze.runAsync`, a compiled agent that declares `needs: ai`/`needs: tool`, and `sofuu script run` for source or `.kazebc` dispatch authorized AI/tool requests through bounded continuations. A real model-plus-MCP journey has passed on a debug build with a configured remote provider, and the local-GGUF variant has passed 3/3 runs on both the source and the compiled path. The host split is landed (`crates/sofuu-core/src/domains/kaze/caps.rs`): a granted capability with no backend stops with `E_CAP_MISSING`. Still open: auditing supervisor/interactive execution and cancellation, migrating the integration and gate tests, and verifying the released binaries before claiming the milestone complete. Local debug coverage: `scripts/test-kaze-fail-closed.py`, `scripts/test-kaze-memory-real.py`, `scripts/test-kaze-js-boundaries.py`, `scripts/test-kaze-real-ai.py`, and `scripts/test-kaze-cli-real-ai.py`.
   - [x] AUDIT-REMEDIATION-2026-11-08: Complete Kaze VM and Compiler remediation — recursion depth ceiling $\le 256$ (KZ-095/099), modulo-by-zero trap `error[E_KAZE_DIV0]` (KZ-035), 12-factor configuration resolution for routine parameters (KZ-079/082/084), standalone compiler unresolved import failure scrubbing (CP-075/068), and standalone top-level await (CP-007/008).
-  - [x] Build and verify 4 showcase agents in `example-agents/` with automated build harness.
+  - [x] Build and verify 4 showcase agents in `example-agents/` with automated build harness. The `paper_trader` example was retired on 2026-11-16 and replaced by `example-agents/local_brief/`, a read-only routine that reads one operator-selected local file through an authorized MCP tool and returns a real model's answer about it. The remaining three (`quant_sentinel`, `med_protocol`, `agri_sentinel`) are language examples whose capability calls fail closed; no broker, exchange, patient record, greenhouse or actuator is connected to any of them.
   - [ ] PLAN-UNIFIED-DIAGNOSTICS: Kaze parser/checker and statement-level VM locations, version-2 bytecode mapping with version-1 reader, and run/check JSON diagnostics are in source. A local release-profile standalone arithmetic failure uses the shared renderer. Expression spans, Kaze call frames, source excerpts and broader standalone/release evidence remain open.
   - [ ] Implement incremental AST caching for sub-millisecond Kaze routine compilation.
 
@@ -178,6 +183,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 ### Division 07: Robotics, Drones & Edge Subsystems (D07)
 > Detailed Specification: [`docs/sofuu-map/D07-robotics-edge.md`](docs/sofuu-map/D07-robotics-edge.md)
 * **Mission**: Hardware interfacing, GPIO telemetry, and MAVLink 2.0 flight protocol integration for autonomous physical systems.
+* **Maturity**: The MAVLink codec, the safety gates and the telemetry freshness path are covered by the domain test suite. Live actuation — a real drone, rover or GPIO line — is unverified and disabled: no physical device has been attached to this machine.
 * **Owned Files**:
   * `crates/sofuu-core/src/domains/robotics/` (MAVLink protocol encoder/decoder, flight safety gates)
   * `kaze/src/hardware.rs` & `kaze/src/gpio.rs` (Hardware policy enforcement and pulse timer pins)
@@ -186,11 +192,14 @@ Every division operates under strict architectural boundaries to guarantee that 
   * Hardware actuations (motor throttle, servo PWM, relay switches) must fail closed on heartbeat timeout.
   * GPIO de-assert failures must log structured errors to prevent stuck actuators (F-09).
   * Geofence policy breaches must trigger immediate automatic return-to-launch (RTL) rejection.
+  * An unknown, missing or stale telemetry field is refused (`E_CAP_MISSING`); it is never reported as a default reading.
+  * A simulator answers only the physical families it was explicitly selected for. Inside a simulator run, every AI, tool, memory and alert operation still uses its own real configured backend or fails closed, and the result says it was a simulator run.
 * **Active Tasks**:
   - [x] Add explicit error logging for pulse timer pin de-assert failures (F-09).
   - [x] Formalize MAVLink hardware policy gates with fail-closed verdicts.
   - [x] Align `TELEMETRY_MAX_AGE` to 1500 ms in `kaze_live.rs`, unifying with `mavlink_gate.rs` 1.5-second safety watchdog (`bb98aaa65`).
-  - [ ] Implement simulation mock harness for SITL (Software In The Loop) automated regression tests.
+  - [ ] Implement an explicit, labelled physical-test harness for SITL (Software In The Loop) regression runs; it may not stand in for hardware validation.
+  - [ ] Attach physical hardware and run the release-profile hardware checks; until then the hardware rows of the capability register stay `unverified` and live dispatch stays disabled.
 
 ---
 
@@ -229,6 +238,8 @@ Every division operates under strict architectural boundaries to guarantee that 
 * **Active Tasks**:
   - [x] Package Android standalone universal APK and arm64-v8a APK.
   - [x] Maintain Swift Package Manager (`Package.swift`) distribution artifacts.
+  - [x] Host-JVM SDK check through the AAR's JNI shim (`scripts/mobile/sdk_jvm_check.sh`): streaming, cancellation, the UTF-8 boundary and the host-tool bridge run against a real temporary file. Host-JVM coverage is not device coverage.
+  - [ ] Run the SDK check on an attached Android device and cover the camera path; no device has been attached, so device and camera coverage stays `unverified`.
   - [ ] Add automated Gradle build verification to continuous integration pipeline.
 
 ---
@@ -256,12 +267,18 @@ Every division operates under strict architectural boundaries to guarantee that 
   * `npm/` (Official `sofuu` CLI distribution package on the npm registry)
   * `docs/` (Architecture blueprints, audit reports, remediation plans)
   * `README.md` (Repository documentation and quickstart guides)
+  * `CHANGELOG.md` (Dated release record; historical entries stay dated and labelled)
+  * `sofuu-map.md` (Division boundaries and verification ownership)
 * **Architectural Boundaries**:
   * Hero section must frankly communicate active beta status (`v0.3.0-beta`) with support email `hello@sofuu.xyz`.
   * Transparently communicate active beta status (`v0.3.0-beta`) without claiming finished status.
   * Zero competitor brand mentions or disparaging comparisons (F-12).
   * Cloudflare Pages deployments must pass static generation builds without uncommitted diffs.
+  * A public claim is published only with a receipt: the artifact, the command, the backend and the actual result. An unexercised claim is published as unavailable or unverified, never as a working feature.
+  * No public surface may present a simulated, mocked or fabricated result as a successful one. The robotics/drone physical simulator is the only exception and must be labelled wherever it appears.
 * **Active Tasks**:
+  - [x] Correct the public claims in `README.md`, `CHANGELOG.md` and `sofuu-map.md` against `contract/CAPABILITY-REGISTER.md` (2026-11-16): the Scouter latency and "background daemon" coverage claims, the invented `smart_edit` tool name, the MCP middleware scope and the inbound-payload health evaluation were withdrawn or corrected in place; the retired `paper_trader` example and the three language examples are described as they actually behave.
+  - [ ] Audit the landing site (`sofuu-landing/`) and the npm package against the same register; they are separate public surfaces and were not covered by that pass.
   - [x] Deploy the tagged Kaze 1.0 reference page and links from the Kaze and documentation pages to Cloudflare Pages (`83536b13`); verify `/docs/kaze`, `/kaze`, `/docs`, and the existing `/map`. The clean deployment source is landing commit `20d24d3` on the local `codex/kaze-reference-deploy` branch; it has not been pushed.
   - [x] Add non-generic beta status notice and support email to landing page hero section.
   - [x] Update README with `quickstart.js` visual snippet and pure Kaze example agents demo.

@@ -102,6 +102,19 @@
     return v ? v : dflt;
   }
 
+  /* A service can be configured under more than one name — the built-in
+   * adapter and the sibling plugin file must point at the same server. The
+   * first name that is set wins; the rest are aliases. */
+  function envFirst(names, dflt) {
+    if (typeof names === 'string') names = [names];
+    if (!names || !names.length) return dflt;
+    for (var i = 0; i < names.length; i++) {
+      var v = envGet(names[i]);
+      if (v) return v;
+    }
+    return dflt;
+  }
+
   function nowMs() {
     return (typeof Date !== 'undefined' && Date.now) ? Date.now() : 0;
   }
@@ -220,7 +233,7 @@
        * LLAMA_CPP_HOST change made after load would be ignored. */
       if (given && given !== own) return given;
     }
-    var fromEnv = adapter.envVar ? envGet(adapter.envVar) : null;
+    var fromEnv = envFirst(adapter.envVars || adapter.envVar, null);
     if (fromEnv) return normaliseBase(fromEnv);
     return own;
   }
@@ -844,7 +857,8 @@
       name: def.name,
       kind: def.kind,
       envVar: def.envVar,
-      baseUrl: normaliseBase(envOr(def.envVar, def.baseUrl)),
+      envVars: def.envVars || null,
+      baseUrl: normaliseBase(envFirst(def.envVars || def.envVar, def.baseUrl)),
       model: def.modelEnv ? envOr(def.modelEnv, def.model || '') : (def.model || ''),
       description: def.description,
       streaming: 'buffered',
@@ -882,7 +896,8 @@
        * OpenAI wire. Identity lives in name + delegate. */
       kind: 'openai',
       envVar: def.envVar,
-      baseUrl: normaliseBase(envOr(def.envVar, def.baseUrl)),
+      envVars: def.envVars || null,
+      baseUrl: normaliseBase(envFirst(def.envVars || def.envVar, def.baseUrl)),
       model: def.modelEnv ? envOr(def.modelEnv, '') : '',
       description: def.description,
       streaming: 'buffered',
@@ -1062,6 +1077,9 @@
     name: 'llamacpp',
     kind: 'llamacpp',
     envVar: 'LLAMA_CPP_HOST',
+    /* LLAMACPP_HOST is the spelling the sibling plugin file
+     * (plugins/llamacpp_provider.ts) uses; both must resolve to one server. */
+    envVars: ['LLAMA_CPP_HOST', 'LLAMACPP_HOST'],
     baseUrl: 'http://127.0.0.1:8080',
     chatPath: '/v1/chat/completions',
     modelEnv: 'LLAMA_CPP_MODEL',

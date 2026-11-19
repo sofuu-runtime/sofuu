@@ -55,6 +55,9 @@ struct AsyncRun {
     tick_ms: u64,
     context_key: usize,
     simulated_families: Vec<String>,
+    /// The backends this run resolved, so a report can name the adapter that
+    /// served each family.
+    backends: Vec<BackendSelection>,
     deadline: std::time::Instant,
 }
 
@@ -191,6 +194,42 @@ mod fail_closed_tests {
         let mut arena = arena::Arena::new(4);
         let mut heap = value::Heap::new(1024);
         assert!(json_to_value(&json!(["ok", "long"]), &mut arena, &mut heap).is_err());
+    }
+
+    /// R4.1: a mixed run — the physical family on the explicitly selected
+    /// simulator, another family on its own real backend — says which is
+    /// which in the trace, and a family with no backend fails instead of
+    /// being answered by the simulator.
+    #[test]
+    fn a_mixed_run_names_the_mode_and_the_backend_of_every_action() {
+        let src = "needs: drone, log\naction main():\n    log \"starting\"\n    arm drone\n";
+        let mut opts = allowed("drone");
+        opts.grants.push("log".into());
+        opts.backend.push(("drone".into(), "sim".into()));
+        let report = run_source(src, "<mixed>", &opts).unwrap();
+        assert_eq!(report.simulated_families, vec!["drone"]);
+        assert!(
+            report.actions.iter().any(|a| a.ends_with("[simulated: sim]")),
+            "{:?}",
+            report.actions
+        );
+        assert!(
+            report.actions.iter().any(|a| a.ends_with("[real: local-log]")),
+            "{:?}",
+            report.actions
+        );
+        // The plain CLI text carries the same provenance as the trace.
+        assert!(report.render_plain().contains("[simulated: sim]"), "{}", report.render_plain());
+
+        // The selected simulator answers the drone family and nothing else:
+        // an alert with no sink is refused, not simulated.
+        let alerting = "needs: drone, alert\naction main():\n    arm drone\n    send alert \"hello\"\n";
+        let mut opts = allowed("drone");
+        opts.grants.push("alert".into());
+        opts.backend.push(("drone".into(), "sim".into()));
+        let err = run_source(alerting, "<mixed>", &opts).unwrap_err();
+        assert_eq!(err.code, "E_CAP_MISSING", "{}", err.message);
+        assert!(err.message.contains("alert.send"), "{}", err.message);
     }
 }
 
@@ -450,6 +489,103 @@ impl Default for RunOptions {
     }
 }
 
+/// The backend a run resolved for one capability family.
+///
+/// This is configuration, not evidence: it says which adapter the dispatcher
+/// was given, never that an operation through it succeeded. A family with an
+/// empty backend was granted without a device, which is a grant that no
+/// adapter can serve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendSelection {
+    /// The capability family the backend serves, resolved from the name the
+    /// host granted (`lidar` is the `sensor` family).
+    pub family: String,
+    /// The backend name the host granted, or an empty string when the family
+    /// was granted without one.
+    pub backend: String,
+    /// True when the backend is an explicitly selected physical test
+    /// simulator rather than a real implementation.
+    pub simulated: bool,
+}
+
+/// Resolve every granted backend into the adapter that will serve it.
+///
+/// One resolver serves the synchronous runner and the asynchronous bridge, so a
+/// granted backend cannot mean one thing on the source path and another on the
+/// bytecode path. Each backend is judged here, at grant time, before a single
+/// instruction runs: an unknown backend is `E_CAP_INVALID` rather than a run
+/// that later finds nothing to answer it.
+pub fn resolve_backends(
+    opts: &RunOptions,
+    source_name: &str,
+) -> Result<Vec<BackendSelection>, KazeError> {
+    let mut selection: Vec<BackendSelection> = Vec::new();
+    for (family, backend) in &opts.backend {
+        if let Err(d) = crate::rt::hardware::validate_grant(family, backend) {
+            return Err(KazeError::new(
+                d.code,
+                format!("{}: {} ({})", source_name, d.reason, d.rule),
+            ));
+        }
+        let resolved = caps::family_of(family).to_string();
+        let simulated = backend == "sim";
+        match selection.iter_mut().find(|s| s.family == resolved) {
+            Some(existing) => {
+                // A second, different backend for the same family would leave
+                // the first one silently discarded. Say so instead.
+                if !existing.backend.is_empty() && !backend.is_empty() && existing.backend != *backend
+                {
+                    return Err(KazeError::new(
+                        "E_CAP_INVALID",
+                        format!(
+                            "{}: '{}' was granted two different backends ('{}' and '{}')",
+                            source_name, resolved, existing.backend, backend
+                        ),
+                    ));
+                }
+                if existing.backend.is_empty() && !backend.is_empty() {
+                    existing.backend = backend.clone();
+                    existing.simulated = simulated;
+                }
+            }
+            None => selection.push(BackendSelection {
+                family: resolved,
+                backend: backend.clone(),
+                simulated,
+            }),
+        }
+    }
+    Ok(selection)
+}
+
+/// The families whose backend is an explicitly selected physical test
+/// simulator. Only these may be answered by a simulator.
+pub fn simulated_families(selection: &[BackendSelection]) -> Vec<String> {
+    selection
+        .iter()
+        .filter(|s| s.simulated)
+        .map(|s| s.family.clone())
+        .collect()
+}
+
+/// The families whose live backend exists but is not yet reachable. They are
+/// refused at the operation instead of being answered by a simulator.
+pub fn blocked_live_families(selection: &[BackendSelection], pins: bool) -> Vec<String> {
+    let mut blocked: Vec<String> = selection
+        .iter()
+        .filter(|s| {
+            !s.backend.is_empty()
+                && !s.simulated
+                && matches!(s.family.as_str(), "drone" | "rover" | "sensor" | "device")
+        })
+        .map(|s| s.family.clone())
+        .collect();
+    if pins && !blocked.iter().any(|f| f == "device") {
+        blocked.push("device".to_string());
+    }
+    blocked
+}
+
 /// What one run did. Everything here is evidence: the trace, the numbers and
 /// the verdict are all derived, not narrated.
 #[derive(Debug, Clone)]
@@ -524,25 +660,29 @@ pub fn run_module(module: Module, name: &str, opts: &RunOptions) -> Result<RunRe
 
 fn build_cap_host(
     opts: &RunOptions,
-    simulated_families: Vec<String>,
-    blocked_live: Vec<String>,
+    selection: &[BackendSelection],
+    declared: &[String],
 ) -> Result<Box<dyn CapHost>, KazeError> {
-    let alert_sink = opts
-        .backend
+    let alert_sink = selection
         .iter()
-        .find(|(family, backend)| caps::family_of(family) == "alert" && !backend.is_empty())
-        .map(|(_, backend)| backend.clone());
+        .find(|s| s.family == "alert" && !s.backend.is_empty())
+        .map(|s| s.backend.clone());
     let base_host = RuntimeHost::with_alert(
         opts.sim.clone(),
-        simulated_families,
-        blocked_live,
+        simulated_families(selection),
+        blocked_live_families(selection, !opts.pins.is_empty()),
         alert_sink,
     );
-    let memory_backend = opts
-        .backend
+    // The store is only opened for a script that declares the memory family.
+    // A routine that never calls memory must not fail because a store it does
+    // not touch cannot be opened, and a family with no store keeps failing
+    // closed at the operation.
+    let declares_memory = declared.iter().any(|d| caps::family_of(d) == "memory");
+    let memory_backend = selection
         .iter()
-        .find(|(family, _)| caps::family_of(family) == "memory")
-        .map(|(_, backend)| backend.as_str());
+        .find(|s| s.family == "memory")
+        .map(|s| s.backend.as_str())
+        .filter(|_| declares_memory);
     match memory_backend {
         Some("ephemeral") => Ok(Box::new(crate::rt::kaze_memory::EphemeralMemoryHost::new(base_host))),
         Some("durable") => {
@@ -553,9 +693,15 @@ fn build_cap_host(
             ))
         }
         Some(b) if b.starts_with("file:") || b.starts_with("path:") => {
-            let p = std::path::PathBuf::from(&b[5..]);
+            let path = b[5..].trim();
+            if path.is_empty() {
+                return Err(KazeError::new(
+                    "E_CONFIG",
+                    "a durable Kaze memory store needs a file path after 'file:' or 'path:'",
+                ));
+            }
             Ok(Box::new(
-                crate::rt::kaze_memory::DurableMemoryHost::new(base_host, p)
+                crate::rt::kaze_memory::DurableMemoryHost::new(base_host, std::path::PathBuf::from(path))
                     .map_err(|e| KazeError::new("E_CONFIG", e))?,
             ))
         }
@@ -569,30 +715,8 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
     // RB-08 (AUDIT-2026-11-08): every `--cap` backend is judged at GRANT time,
     // before the script runs, so `--cap sensor=bogus` fails as E_CAP_INVALID
     // instead of being accepted and then answered by the simulator.
-    for (family, backend) in &opts.backend {
-        if let Err(d) = crate::rt::hardware::validate_grant(family, backend) {
-            return Err(KazeError::new(
-                d.code,
-                format!("{}: {} ({})", prepared.name, d.reason, d.rule),
-            ));
-        }
-    }
-    let simulated_families: Vec<String> = opts.backend.iter()
-        .filter(|(_, backend)| backend == "sim")
-        .map(|(family, _)| caps::family_of(family).to_string())
-        .collect();
-    // The old live host opened hardware before the VM's policy gate and built
-    // its own hardware policy. Keep those paths unavailable until the caller's
-    // policy and physical safety checks are propagated and verified.
-    let mut blocked_live: Vec<String> = opts.backend.iter()
-        .filter(|(family, backend)| matches!(caps::family_of(family), "drone" | "rover" | "sensor" | "device")
-            && !backend.is_empty() && backend != "sim")
-        .map(|(family, _)| caps::family_of(family).to_string())
-        .collect();
-    if !opts.pins.is_empty() {
-        blocked_live.push("device".to_string());
-    }
-    let mut host = build_cap_host(opts, simulated_families.clone(), blocked_live)?;
+    let selection = resolve_backends(opts, &prepared.name)?;
+    let mut host = build_cap_host(opts, &selection, &declared)?;
     let limits = Limits { fuel: opts.fuel.max(1), heap_bytes: opts.heap_bytes, ..Limits::default() };
 
     let entry = resolve_entry(&module, opts)?;
@@ -611,7 +735,7 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
         instructions: 0,
         ticks: 0,
         verdict: None,
-        simulated_families,
+        simulated_families: simulated_families(&selection),
     };
 
     {
@@ -692,7 +816,7 @@ fn run_prepared(prepared: Prepared, opts: &RunOptions) -> Result<RunReport, Kaze
 enum AsyncStep {
     Yielded { remaining_ms: u64 },
     Capability(CapabilityRequest, u64),
-    Complete(RunReport),
+    Complete(RunReport, Vec<BackendSelection>),
     Failed(KazeError),
 }
 
@@ -739,7 +863,7 @@ fn async_advance(run: &mut AsyncRun) -> AsyncStep {
                 ticks: run.completed_ticks,
                 verdict: run.vm.take_verdict(),
                 simulated_families: run.simulated_families.clone(),
-            })
+            }, run.backends.clone())
         }
         Err(error) => AsyncStep::Failed(async_error(&run.source_name, error)),
     }
@@ -816,25 +940,9 @@ fn create_async_run(
         return Err(KazeError::new("E_KAZE_BUSY", "the per-thread asynchronous Kaze run limit has been reached"));
     }
 
-    for (family, backend) in &opts.backend {
-        if let Err(d) = crate::rt::hardware::validate_grant(family, backend) {
-            return Err(KazeError::new(d.code, format!("{}: {} ({})", prepared.name, d.reason, d.rule)));
-        }
-    }
     let declared = module.needs.clone();
-    let simulated_families: Vec<String> = opts.backend.iter()
-        .filter(|(_, backend)| backend == "sim")
-        .map(|(family, _)| caps::family_of(family).to_string())
-        .collect();
-    let mut blocked_live: Vec<String> = opts.backend.iter()
-        .filter(|(family, backend)| matches!(caps::family_of(family), "drone" | "rover" | "sensor" | "device")
-            && !backend.is_empty() && backend != "sim")
-        .map(|(family, _)| caps::family_of(family).to_string())
-        .collect();
-    if !opts.pins.is_empty() {
-        blocked_live.push("device".to_string());
-    }
-    let host = build_cap_host(opts, simulated_families.clone(), blocked_live)?;
+    let selection = resolve_backends(opts, &prepared.name)?;
+    let host = build_cap_host(opts, &selection, &declared)?;
     let limits = Limits { fuel: opts.fuel.max(1), heap_bytes: opts.heap_bytes, ..Limits::default() };
     let mut vm = Vm::new_owned(
         module.clone(), host, declared, opts.grants.clone(), opts.policy.clone(), limits,
@@ -870,7 +978,8 @@ fn create_async_run(
         requested_ticks: opts.ticks,
         tick_ms: opts.tick_ms,
         context_key: ctx as usize,
-        simulated_families,
+        simulated_families: simulated_families(&selection),
+        backends: selection,
         deadline: std::time::Instant::now() + std::time::Duration::from_millis(opts.timeout_ms),
     }))
 }
@@ -1158,7 +1267,7 @@ unsafe fn js_async_prepared_of(
     prepare(&source, &name)
 }
 
-fn report_to_js(ctx: *mut JSContext, report: &RunReport) -> JSValue {
+fn report_to_js(ctx: *mut JSContext, report: &RunReport, backends: &[BackendSelection]) -> JSValue {
     unsafe {
         let obj = qjs::sofuu_js_new_object(ctx);
         set_bool(ctx, obj, c"ok", true);
@@ -1173,6 +1282,17 @@ fn report_to_js(ctx: *mut JSContext, report: &RunReport) -> JSValue {
             qjs::JS_SetPropertyUint32(ctx, simulated, i as u32, v);
         }
         qjs::sofuu_js_set_property_str(ctx, obj, c"simulated_families".as_ptr(), simulated);
+        // The backend each family resolved to. A run that used a physical test
+        // simulator says so here as well as in `simulated_families`.
+        let backend_list = qjs::JS_NewArray(ctx);
+        for (i, backend) in backends.iter().enumerate() {
+            let entry = qjs::sofuu_js_new_object(ctx);
+            set_str(ctx, entry, c"family", &backend.family);
+            set_str(ctx, entry, c"backend", &backend.backend);
+            set_bool(ctx, entry, c"simulated", backend.simulated);
+            qjs::JS_SetPropertyUint32(ctx, backend_list, i as u32, entry);
+        }
+        qjs::sofuu_js_set_property_str(ctx, obj, c"backends".as_ptr(), backend_list);
         let actions = qjs::JS_NewArray(ctx);
         for (i, a) in report.actions.iter().enumerate() {
             let v = qjs::sofuu_js_new_string(ctx, CString::new(a.as_str()).unwrap_or_default().as_ptr());
@@ -1278,8 +1398,8 @@ unsafe fn async_step_value(ctx: *mut JSContext, run_id: Option<u64>, step: Async
             qjs::sofuu_js_set_property_str(ctx, obj, c"args".as_ptr(), args);
             obj
         }
-        AsyncStep::Complete(report) => {
-            let obj = report_to_js(ctx, &report);
+        AsyncStep::Complete(report, backends) => {
+            let obj = report_to_js(ctx, &report, &backends);
             set_str(ctx, obj, c"state", "complete");
             if let Some(id) = run_id { set_str(ctx, obj, c"runId", &id.to_string()); }
             obj
@@ -1369,9 +1489,27 @@ fn opts_from_json(j: Option<serde_json::Value>) -> Result<RunOptions, KazeError>
         if !opts.grants.iter().any(|g| g == family) {
             opts.grants.push(family.to_string());
         }
-        if !backend.is_empty() || !opts.backend.iter().any(|(f, _)| f == family) {
-            opts.backend.retain(|(f, _)| f != family);
-            opts.backend.push((family.to_string(), backend.to_string()));
+        // A family may be granted once without a device and once with one. Two
+        // different devices for the same family would leave the first one
+        // silently discarded, so say which ones disagree.
+        let resolved = caps::family_of(family);
+        match opts.backend.iter().position(|(f, _)| caps::family_of(f) == resolved) {
+            Some(index) => {
+                let current = opts.backend[index].1.clone();
+                if !current.is_empty() && !backend.is_empty() && current != backend {
+                    return Err(KazeError::new(
+                        "E_CAP_INVALID",
+                        format!(
+                            "'{}' was granted two different backends ('{}' and '{}')",
+                            resolved, current, backend
+                        ),
+                    ));
+                }
+                if current.is_empty() && !backend.is_empty() {
+                    opts.backend[index].1 = backend.to_string();
+                }
+            }
+            None => opts.backend.push((family.to_string(), backend.to_string())),
         }
         Ok(())
     };
@@ -1427,17 +1565,30 @@ fn opts_from_json(j: Option<serde_json::Value>) -> Result<RunOptions, KazeError>
         }
         let mut spec = String::new();
         for (k, v) in sim {
+            // The override syntax separates entries with commas, so a value
+            // that contains one cannot be expressed and is refused rather
+            // than silently split into two overrides.
+            let value = match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            if k.contains(',') || k.contains('=') || value.contains(',') {
+                return Err(KazeError::new(
+                    "E_CAP_INVALID",
+                    format!("sim override '{}' cannot contain a comma or an equals sign", k),
+                ));
+            }
             if !spec.is_empty() {
                 spec.push(',');
             }
             spec.push_str(k);
             spec.push('=');
-            spec.push_str(&match v {
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            });
+            spec.push_str(&value);
         }
-        opts.sim.apply_overrides(&spec).map_err(|e| KazeError::new("E_CAP_INVALID", e))?;
+        opts.sim.apply_overrides(&spec).map_err(|e| {
+            let detail = e.strip_prefix("E_CAP_INVALID: ").unwrap_or(&e);
+            KazeError::new("E_CAP_INVALID", detail)
+        })?;
     }
     Ok(opts)
 }
@@ -1475,9 +1626,19 @@ unsafe extern "C" fn js_sfs_run(
         opts.args = args;
         opts.runtime_policy = Some(crate::rt::policy::policy_json(ctx));
 
-        let result = js_source_of(ctx, *argv, &text).and_then(|(src, name)| run_source(&src, &name, &opts));
+        let (src, name) = match js_source_of(ctx, *argv, &text) {
+            Ok(value) => value,
+            Err(err) => return error_to_js(ctx, &err),
+        };
+        // The same resolution the runner uses, so the report names the backend
+        // that was actually selected for each family.
+        let backends = match resolve_backends(&opts, &name) {
+            Ok(selection) => selection,
+            Err(err) => return error_to_js(ctx, &err),
+        };
+        let result = run_source(&src, &name, &opts);
         match result {
-            Ok(report) => report_to_js(ctx, &report),
+            Ok(report) => report_to_js(ctx, &report, &backends),
             Err(err) => error_to_js(ctx, &err),
         }
     }
@@ -1751,8 +1912,11 @@ pub unsafe fn mod_sfs_register(ctx: *mut JSContext) {
         qjs::sofuu_js_free_value(ctx, sofuu_obj);
         qjs::sofuu_js_free_value(ctx, global);
 
-        let driver = CString::new(include_str!("../../../../../src/js/kaze_async.js"))
-            .unwrap_or_default();
+        // The driver is embedded gzipped and inflated once, on this path only
+        // (shipped::kaze_async_js) — the same mechanism every other
+        // single-path shipped driver rides.
+        let source = crate::shipped::kaze_async_js();
+        let driver = CString::new(source).unwrap_or_default();
         let evaluated = qjs::JS_Eval(
             ctx,
             driver.as_ptr(),
@@ -2171,13 +2335,13 @@ mod tests {
         assert_eq!(
             report.actions,
             vec![
-                "log.info(<redacted>) -> nothing",
-                "drone.arm -> nothing",
-                "drone.takeoff(15) -> nothing",
-                "drone.goto(1, 15) -> nothing",
-                "drone.goto(2, 15) -> nothing",
-                "drone.goto(3, 15) -> nothing",
-                "drone.rtl -> nothing",
+                "log.info(<redacted>) -> nothing [real: local-log]",
+                "drone.arm -> nothing [simulated: sim]",
+                "drone.takeoff(15) -> nothing [simulated: sim]",
+                "drone.goto(1, 15) -> nothing [simulated: sim]",
+                "drone.goto(2, 15) -> nothing [simulated: sim]",
+                "drone.goto(3, 15) -> nothing [simulated: sim]",
+                "drone.rtl -> nothing [simulated: sim]",
             ]
         );
         assert_eq!(report.logs.len(), 1);
@@ -2293,7 +2457,7 @@ mod tests {
         let opts = RunOptions { grants: grants(&["drone"]), backend: vec![("drone".into(), "sim".into())], policy: test_policy(), ..Default::default() };
         let report = run(src, &opts);
         assert!(
-            report.actions.iter().any(|a| a == "drone.goto(1, 2, 3) -> nothing"),
+            report.actions.iter().any(|a| a == "drone.goto(1, 2, 3) -> nothing [simulated: sim]"),
             "{:?}",
             report.actions
         );
@@ -2370,5 +2534,182 @@ mod tests {
         let err = run_source(src, "<test_agent>", &opts).unwrap_err();
         assert_eq!(err.code, "E_CAP_MISSING");
         assert!(err.message.contains("ai.prompt"));
+    }
+
+    /// The simulator is a drone/rover testing facility, not a general
+    /// backend. It answers the family it was selected for and nothing else.
+    #[test]
+    fn a_selected_test_simulator_never_answers_another_family() {
+        let opts = RunOptions {
+            grants: grants(&["drone", "rover", "sensor"]),
+            backend: vec![("drone".into(), "sim".into())],
+            policy: test_policy(),
+            ..Default::default()
+        };
+        let selection = resolve_backends(&opts, "<t>").unwrap();
+        assert_eq!(selection.len(), 1);
+        assert_eq!(selection[0].family, "drone");
+        assert_eq!(selection[0].backend, "sim");
+        assert!(selection[0].simulated);
+        assert_eq!(simulated_families(&selection), vec!["drone"]);
+
+        let sensor = "needs: sensor\naction main():\n    return sensor.temperature()\n";
+        assert_eq!(run_source(sensor, "<t>", &opts).unwrap_err().code, "E_CAP_MISSING");
+        let rover = "needs: rover\naction main():\n    stop rover\n";
+        assert_eq!(run_source(rover, "<t>", &opts).unwrap_err().code, "E_CAP_MISSING");
+    }
+
+    /// A grant names one backend. Two different ones would leave the first
+    /// silently discarded, so the conflict is reported instead.
+    #[test]
+    fn two_backends_for_one_family_are_refused_instead_of_one_winning() {
+        let opts = RunOptions {
+            backend: vec![("drone".into(), "sim".into()), ("drone".into(), "real".into())],
+            ..Default::default()
+        };
+        let err = resolve_backends(&opts, "<t>").unwrap_err();
+        assert_eq!(err.code, "E_CAP_INVALID");
+        assert!(err.message.contains("two different backends"), "{}", err.message);
+    }
+
+    /// The option layer keeps the backend the caller selected, and says so
+    /// when two of them disagree.
+    #[test]
+    fn json_options_keep_the_selected_backend_and_refuse_a_conflict() {
+        let opts = opts_from_json(Some(serde_json::json!({
+            "caps": {"drone": "sim"}, "grants": ["drone"]
+        })))
+        .unwrap();
+        assert_eq!(opts.backend, vec![("drone".to_string(), "sim".to_string())]);
+        assert!(opts.grants.iter().any(|g| g == "drone"));
+
+        let err = opts_from_json(Some(serde_json::json!({
+            "caps": {"drone": "sim"}, "grants": ["drone=real"]
+        })))
+        .unwrap_err();
+        assert_eq!(err.code, "E_CAP_INVALID");
+        assert!(err.message.contains("two different backends"), "{}", err.message);
+    }
+
+    /// An override the `key=value` syntax cannot express is refused, not
+    /// split into two different overrides.
+    #[test]
+    fn a_sim_override_that_cannot_be_expressed_is_refused() {
+        let err = opts_from_json(Some(serde_json::json!({
+            "caps": {"drone": "sim"}, "sim": {"battery": "1,2"}
+        })))
+        .unwrap_err();
+        assert_eq!(err.code, "E_CAP_INVALID");
+        assert!(err.message.contains("comma"), "{}", err.message);
+    }
+
+    /// A granted but unconfigured capability fails closed on the path a
+    /// caller actually uses: the option layer, the source and the bytecode.
+    #[test]
+    fn a_granted_but_unconfigured_capability_fails_closed_through_the_option_layer() {
+        let opts = opts_from_json(Some(serde_json::json!({
+            "grants": ["ai", "tool", "memory", "alert"],
+            "policy": {"tools": {"allow": ["kaze.*"]}}
+        })))
+        .unwrap();
+        for (family, expression) in [
+            ("ai", "ai.prompt(\"hello\")"),
+            ("tool", "tool.call(\"lookup\")"),
+            ("memory", "memory.save(\"key\", \"value\")"),
+            ("alert", "alert.send(\"message\")"),
+        ] {
+            let source = format!("needs: {family}\naction main():\n    return {expression}\n");
+            let error = run_source(&source, "<source>", &opts).unwrap_err();
+            assert_eq!(error.code, "E_CAP_MISSING", "{expression}: {}", error.message);
+            let prepared = prepare(&source, "<source>").unwrap();
+            let module = isa::deserialize(&isa::serialize(&prepared.module)).unwrap();
+            let error = run_module(module, "<bytecode>", &opts).unwrap_err();
+            assert_eq!(error.code, "E_CAP_MISSING", "{expression}: {}", error.message);
+        }
+    }
+
+    /// A configured store is a real store: the value written comes back from
+    /// the store, not from an echo of the call.
+    #[test]
+    fn a_configured_memory_store_really_stores_and_recalls() {
+        let src = "needs: memory\naction main():\n    remember \"kept\" as \"key\"\n    return memory.recall(\"key\")\n";
+        let opts = RunOptions {
+            grants: grants(&["memory"]),
+            backend: vec![("memory".into(), "ephemeral".into())],
+            policy: test_policy(),
+            ..Default::default()
+        };
+        let report = run(src, &opts);
+        assert_eq!(report.value, "[\"kept\"]");
+    }
+
+    /// A durable store without a path would write somewhere undefined, so it
+    /// is refused before the run starts.
+    #[test]
+    fn a_durable_store_without_a_path_is_refused() {
+        let src = "needs: memory\naction main():\n    remember \"kept\" as \"key\"\n";
+        let opts = RunOptions {
+            grants: grants(&["memory"]),
+            backend: vec![("memory".into(), "file:".into())],
+            policy: test_policy(),
+            ..Default::default()
+        };
+        let err = run_source(src, "<t>", &opts).unwrap_err();
+        assert_eq!(err.code, "E_CONFIG");
+    }
+
+    /// A configured sink really receives the alert.
+    #[test]
+    fn a_configured_alert_sink_really_receives_the_alert() {
+        let path = std::env::temp_dir().join(format!("sofuu-kaze-alert-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let src = "needs: alert\naction main():\n    send alert \"real delivery\"\n";
+        let opts = RunOptions {
+            grants: grants(&["alert"]),
+            backend: vec![("alert".into(), format!("file:{}", path.display()))],
+            policy: test_policy(),
+            ..Default::default()
+        };
+        let report = run(src, &opts);
+        assert!(report.actions.iter().any(|a| a.starts_with("alert.send")), "{:?}", report.actions);
+        let delivered = std::fs::read_to_string(&path).expect("the alert sink received the alert");
+        assert!(delivered.contains("real delivery"), "{}", delivered);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The report names the backend that served each family, so a run that
+    /// used a physical test simulator says so in the machine-readable shape.
+    #[test]
+    fn the_js_report_names_the_backend_that_served_the_run() {
+        let _guard = crate::rt::test_loop_lock();
+        let rt = sofuu_ffi::SofuuRuntime::init().expect("runtime init");
+        let rc = rt.eval_string(
+            r#"
+            var report = sofuu.kaze.run(
+              'needs: drone\naction main():\n    arm drone\n',
+              {},
+              { caps: { drone: 'sim' }, grants: ['drone'],
+                policy: { tools: { allow: ['kaze.drone.*'] } } }
+            );
+            var backends = report.backends || [];
+            if (report.ok !== true) throw new Error('the run failed: ' + JSON.stringify(report));
+            if (backends.length !== 1) throw new Error('the report named no backend');
+            if (backends[0].family !== 'drone' || backends[0].backend !== 'sim' ||
+                backends[0].simulated !== true) {
+              throw new Error('the report did not name the test simulator: ' + JSON.stringify(backends));
+            }
+            if (!report.simulated_families || report.simulated_families.length !== 1 ||
+                report.simulated_families[0] !== 'drone') {
+              throw new Error('the report did not label the simulation');
+            }
+            if (!report.actions || report.actions.length !== 1 ||
+                !report.actions[0].includes('[simulated: sim]')) {
+              throw new Error('the trace does not name the mode and the backend: ' +
+                JSON.stringify(report.actions));
+            }
+            "#,
+            "<kaze-backend-provenance-test>",
+        );
+        assert_eq!(rc, 0);
     }
 }

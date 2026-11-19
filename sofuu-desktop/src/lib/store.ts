@@ -23,6 +23,14 @@ export interface AppState {
   engineReady: boolean;
   bootError: string | null;
   sessions: SessionInfo[];
+  /** Why the session list could not be read (engine unreachable, registry
+   *  unreadable). Set while `sessions` holds whatever the last successful
+   *  read produced — an empty list must never stand for a failed read. */
+  sessionsError: string | null;
+  /** Where the session list came from: the engine's registry, or the
+   *  on-disk registry mirror (the engine did not answer). Null while the
+   *  list is the engine's own. */
+  sessionsSource: string | null;
   /** Id of the session currently shown in the chat pane, or null. */
   activeSessionId: string | null;
   messages: ChatMessage[];
@@ -37,6 +45,10 @@ export interface AppState {
   workspaces: string[];
   /** Tool permission profile: full / edit / plan / prompt (ask). */
   permissions: PermissionProfile;
+  /** Why the profile in force is not the one the shell asked for — the
+   *  engine refused a permission change, so the shown profile is not
+   *  necessarily the one the runtime enforces. */
+  permissionsError: string | null;
   settingsOpen: boolean;
   /** Settings tab the modal opens on (model picker jumps to Providers). */
   settingsTab: string;
@@ -161,6 +173,8 @@ const initialState: AppState = {
   engineReady: false,
   bootError: null,
   sessions: [],
+  sessionsError: null,
+  sessionsSource: null,
   activeSessionId: null,
   messages: [],
   messageCache: {},
@@ -170,6 +184,7 @@ const initialState: AppState = {
   projectDir: null,
   workspaces: storedWorkspaces(),
   permissions: storedPermissions(),
+  permissionsError: null,
   settingsOpen: false,
   settingsTab: "general",
   chatFontSize: 15,
@@ -192,7 +207,7 @@ type Action =
   | { type: "user_submitted"; text: string }
   | { type: "system_row"; text: string }
   | { type: "delete_session"; id: string }
-  | { type: "sessions"; sessions: SessionInfo[]; projectDir?: string | null }
+  | { type: "sessions"; sessions: SessionInfo[]; projectDir?: string | null; error?: string | null; source?: string | null }
   | { type: "workspace_switch"; path: string | null }
   | { type: "sessions_cleared" }
   | { type: "add_session"; session: SessionInfo }
@@ -201,6 +216,7 @@ type Action =
   | { type: "project_dir"; path: string | null }
   | { type: "workspaces"; workspaces: string[] }
   | { type: "permissions"; permissions: PermissionProfile }
+  | { type: "permissions_error"; error: string | null }
   | { type: "settings_open"; open: boolean; tab?: string }
   | { type: "chat_font_size"; size: number }
   | { type: "zoom"; zoom: number }
@@ -219,16 +235,21 @@ function nextId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${seq}`;
 }
 
-/** Optimistic pill row for a session the engine just created. */
-function makeSessionInfo(id: string, cwd: string, model: string, provider: string): SessionInfo {
+/** Optimistic pill row for a session the engine just created.
+ *
+ *  The model/provider are left EMPTY on purpose: the engine has not
+ *  reported which model serves this session yet (it can differ from the
+ *  configured one after a failover), and the config's model is not the
+ *  session's model. The next real session list fills them in. */
+function makeSessionInfo(id: string, cwd: string): SessionInfo {
   const now = Math.floor(Date.now() / 1000);
   return {
     id,
     pid: 0,
     host: "local",
     cwd,
-    model,
-    provider,
+    model: "",
+    provider: "",
     started_at: now,
     last_seen: now,
     task: "",
@@ -746,6 +767,11 @@ function reducer(state: AppState, action: Action): AppState {
       };
     }
     case "sessions": {
+      // A FAILED read keeps the last known list and records why: an empty
+      // strip must never be presented as "this workspace has no chats".
+      if (action.error) {
+        return { ...state, sessionsError: action.error, sessionsSource: action.source ?? null };
+      }
       // Workspace tag: a fetch issued for a folder other than the one
       // currently shown raced a workspace switch (the engine serializes
       // queries, so an in-flight listSessions can execute on either side
@@ -767,13 +793,15 @@ function reducer(state: AppState, action: Action): AppState {
       // While a turn streams, NEVER park the live view: keep the active
       // id and the in-flight messages regardless of list contents.
       if (state.streaming) {
-        return { ...state, sessions: list };
+        return { ...state, sessions: list, sessionsError: null, sessionsSource: action.source ?? null };
       }
       const nextActive =
         state.activeSessionId && list.some((s) => s.id === state.activeSessionId)
           ? state.activeSessionId
           : list[0]?.id ?? null;
-      if (nextActive === state.activeSessionId) return { ...state, sessions: list };
+      if (nextActive === state.activeSessionId) {
+        return { ...state, sessions: list, sessionsError: null, sessionsSource: action.source ?? null };
+      }
       const cache = { ...state.messageCache };
       if (state.activeSessionId) cache[state.activeSessionId] = state.messages;
       const ctxCache = { ...state.ctxCache };
@@ -781,6 +809,8 @@ function reducer(state: AppState, action: Action): AppState {
       return {
         ...state,
         sessions: list,
+        sessionsError: null,
+        sessionsSource: action.source ?? null,
         activeSessionId: nextActive,
         messages: nextActive ? cache[nextActive] ?? [] : [],
         approvals: [],
@@ -850,7 +880,9 @@ function reducer(state: AppState, action: Action): AppState {
     case "workspaces":
       return { ...state, workspaces: action.workspaces };
     case "permissions":
-      return { ...state, permissions: action.permissions };
+      return { ...state, permissions: action.permissions, permissionsError: null };
+    case "permissions_error":
+      return { ...state, permissionsError: action.error };
     case "settings_open":
       return { ...state, settingsOpen: action.open, settingsTab: action.tab ?? state.settingsTab };
     case "chat_font_size":
@@ -909,6 +941,8 @@ function reducer(state: AppState, action: Action): AppState {
         ...state,
         projectDir: action.path,
         sessions: [],
+        sessionsError: null,
+        sessionsSource: null,
         activeSessionId: null,
         messages: [],
         approvals: [],
@@ -926,6 +960,8 @@ function reducer(state: AppState, action: Action): AppState {
       return {
         ...state,
         sessions: [],
+        sessionsError: null,
+        sessionsSource: null,
         activeSessionId: null,
         messages: [],
         approvals: [],
@@ -987,10 +1023,15 @@ export function useAppStore() {
           const kind = typeof raw?.kind === "string" ? raw.kind : "";
           if (kind === "turn_finished" || kind === "done") {
             const ws = projectDirRef.current;
-            backend
-              .listSessions()
-              .then((s) => dispatch({ type: "sessions", sessions: s, projectDir: ws }))
-              .catch(() => {});
+            backend.listSessions().then((r) =>
+              dispatch({
+                type: "sessions",
+                sessions: r.sessions,
+                projectDir: ws,
+                error: r.error ?? null,
+                source: r.source ?? null,
+              })
+            );
           }
         })
         .then((fn) => {
@@ -1027,17 +1068,41 @@ export function useAppStore() {
   useEffect(() => {
     if (!state.engineReady) return;
     const ws = projectDirRef.current;
+    backend.listSessions().then((r) => {
+      dispatch({
+        type: "sessions",
+        sessions: r.sessions,
+        projectDir: ws,
+        error: r.error ?? null,
+        source: r.source ?? null,
+      });
+      if (r.sessions.length) {
+        dispatch({ type: "active_session", id: r.sessions[0].id });
+        backend.resumeSession(r.sessions[0].id).catch(() => {});
+      }
+    });
     backend
-      .listSessions()
-      .then((s) => {
-        dispatch({ type: "sessions", sessions: s, projectDir: ws });
-        if (s.length) {
-          dispatch({ type: "active_session", id: s[0].id });
-          backend.resumeSession(s[0].id).catch(() => {});
+      .setPermissions(storedPermissions())
+      .then((r) => {
+        // The engine's answer is the profile in force — show that, not the
+        // one that was persisted.
+        if (r?.ok && r.permissions) {
+          dispatch({ type: "permissions", permissions: r.permissions as PermissionProfile });
+          return;
         }
+        // The engine did not take the persisted profile: the shell must
+        // not keep showing a policy the runtime is not enforcing.
+        dispatch({
+          type: "permissions_error",
+          error: `the engine refused the persisted permission profile${r?.error ? `: ${r.error}` : ""}`,
+        });
       })
-      .catch(() => {});
-    backend.setPermissions(storedPermissions()).catch(() => {});
+      .catch((e) => {
+        dispatch({
+          type: "permissions_error",
+          error: `the engine did not confirm the permission profile: ${String(e)}`,
+        });
+      });
   }, [state.engineReady]);
 
   // Interface zoom (⌘+/⌘-/⌘0): CSS zoom on the root scales the whole UI,
@@ -1130,10 +1195,14 @@ export function useAppStore() {
 
   const refreshSessions = useCallback(() => {
     const ws = projectDirRef.current;
-    backend
-      .listSessions()
-      .then((s) => dispatch({ type: "sessions", sessions: s, projectDir: ws }))
-      .catch(() => {});
+    backend.listSessions().then((r) =>
+      dispatch({
+        type: "sessions",
+        sessions: r.sessions,
+        projectDir: ws,
+        error: r.error ?? null,
+      })
+    );
   }, []);
 
   const newChat = useCallback(() => {
@@ -1151,19 +1220,21 @@ export function useAppStore() {
       .newSession()
       .then((res) => {
         if (res?.sessionId) {
-          const session = makeSessionInfo(
-            res.sessionId,
-            state.projectDir ?? "",
-            state.config?.model ?? "",
-            state.config?.provider ?? ""
-          );
+          const session = makeSessionInfo(res.sessionId, state.projectDir ?? "");
           dispatch({ type: "add_session", session });
           dispatch({ type: "active_session", id: res.sessionId });
+        } else {
+          dispatch({
+            type: "system_row",
+            text: `New chat failed${res?.error ? `: ${res.error}` : " — the engine returned no session id"}`,
+          });
         }
       })
-      .catch(() => {});
+      .catch((e) => {
+        dispatch({ type: "system_row", text: `New chat failed: ${String(e)}` });
+      });
     dispatch({ type: "new_chat" });
-  }, [state.projectDir, state.config?.model, state.config?.provider, state.sessions]);
+  }, [state.projectDir, state.sessions]);
 
   const handleCommand = useCallback(
     async (raw: string) => {
@@ -1201,9 +1272,15 @@ export function useAppStore() {
             const n = Number(arg.replace(/[^0-9]/g, ""));
             if (Number.isFinite(n) && n >= 1000 && n <= 1000000) {
               try {
-                const c = await backend.updateConfig({ ctx_window: n });
-                systemRow(`Context window → ${n.toLocaleString()} tokens.`);
-                void c;
+                // The backend answers with the PERSISTED config — report
+                // what it now holds, not what was asked for.
+                const c = (await backend.updateConfig({ ctx_window: n })) as Record<string, unknown>;
+                const got = Number(c?.ctx_window);
+                systemRow(
+                  got === n
+                    ? `Context window → ${n.toLocaleString()} tokens.`
+                    : `Context window is ${got.toLocaleString()} tokens — the config did not take ${n.toLocaleString()}.`
+                );
               } catch (e) {
                 systemRow(`ctx: ${String(e)}`);
               }
@@ -1230,8 +1307,13 @@ export function useAppStore() {
           const n = Number(arg.replace(/[^0-9]/g, ""));
           if (Number.isFinite(n) && n >= 256 && n <= 384000) {
             try {
-              await backend.updateConfig({ max_output: n });
-              systemRow(`Max output → ${n.toLocaleString()} tokens.`);
+              const c = (await backend.updateConfig({ max_output: n })) as Record<string, unknown>;
+              const got = Number(c?.max_output);
+              systemRow(
+                got === n
+                  ? `Max output → ${n.toLocaleString()} tokens.`
+                  : `Max output is ${got.toLocaleString()} tokens — the config did not take ${n.toLocaleString()}.`
+              );
             } catch (e) {
               systemRow(`maxout: ${String(e)}`);
             }
@@ -1247,8 +1329,13 @@ export function useAppStore() {
             return;
           }
           try {
-            await backend.updateConfig({ model: arg });
-            systemRow(`Model → ${arg}.`);
+            const c = (await backend.updateConfig({ model: arg })) as Record<string, unknown>;
+            const got = String(c?.model ?? "");
+            systemRow(
+              got === arg
+                ? `Model → ${arg}.`
+                : `Model is ${got || "(none)"} — the config did not take ${arg}.`
+            );
           } catch (e) {
             systemRow(`model: ${String(e)}`);
           }
@@ -1261,8 +1348,13 @@ export function useAppStore() {
             return;
           }
           try {
-            await backend.updateConfig({ provider: arg, active: arg });
-            systemRow(`Provider → ${arg}. Pick a model in Settings → Models if turns fail.`);
+            const c = (await backend.updateConfig({ provider: arg, active: arg })) as Record<string, unknown>;
+            const got = String(c?.active ?? c?.provider ?? "");
+            systemRow(
+              got === arg
+                ? `Provider → ${arg}. Pick a model in Settings → Models if turns fail.`
+                : `Provider is ${got || "(none)"} — the config did not take ${arg}.`
+            );
           } catch (e) {
             systemRow(`provider: ${String(e)}`);
           }
@@ -1280,8 +1372,13 @@ export function useAppStore() {
             return;
           }
           try {
-            await backend.updateConfig({ effort: lvl });
-            systemRow(`Effort → ${lvl}.`);
+            const c = (await backend.updateConfig({ effort: lvl })) as Record<string, unknown>;
+            const got = String(c?.effort ?? "");
+            systemRow(
+              got === lvl
+                ? `Effort → ${lvl}.`
+                : `Effort is ${got || "off"} — the config did not take ${lvl}.`
+            );
           } catch (e) {
             systemRow(`effort: ${String(e)}`);
           }
@@ -1300,8 +1397,13 @@ export function useAppStore() {
             return;
           }
           try {
-            await backend.updateConfig({ brain: on });
-            systemRow(`Brain ${on ? "on — memories persist across sessions" : "off"}.`);
+            const c = (await backend.updateConfig({ brain: on })) as Record<string, unknown>;
+            const got = !!c?.brain;
+            systemRow(
+              got === on
+                ? `Brain ${on ? "on — memories persist across sessions" : "off"}.`
+                : `Brain is ${got ? "on" : "off"} — the config did not take the change.`
+            );
           } catch (e) {
             systemRow(`brain: ${String(e)}`);
           }
@@ -1341,7 +1443,9 @@ export function useAppStore() {
             if (!r?.ok) systemRow(`tools: ${r?.error ?? "unavailable"}`);
             else {
               const b = Array.isArray(r.builtin) ? r.builtin.join(", ") : "—";
-              systemRow(`Built-in: ${b}\nMCP: ${JSON.stringify(r.mcp ?? [])}`);
+              // An unreported MCP surface is "unknown", not an empty list.
+              const mcp = r.mcp == null ? (r.mcpNote ?? "not reported by the engine") : JSON.stringify(r.mcp);
+              systemRow(`Built-in: ${b}\nMCP: ${mcp}`);
             }
           } catch (e) {
             systemRow(`tools: ${String(e)}`);
@@ -1369,8 +1473,13 @@ export function useAppStore() {
             return;
           }
           try {
-            await backend.updateConfig({ rlm: v });
-            systemRow(`RLM → ${v}.`);
+            const c = (await backend.updateConfig({ rlm: v })) as Record<string, unknown>;
+            const got = String(c?.rlm ?? "");
+            systemRow(
+              got === v
+                ? `RLM → ${v}.`
+                : `RLM is ${got || "off"} — the config did not take ${v}.`
+            );
           } catch (e) {
             systemRow(`rlm: ${String(e)}`);
           }
@@ -1389,8 +1498,14 @@ export function useAppStore() {
           }
           if (sub === "on" || sub === "off") {
             try {
-              await backend.updateConfig({ ml: sub === "on" });
-              systemRow(`ML gates ${sub}.`);
+              const want = sub === "on";
+              const c = (await backend.updateConfig({ ml: want })) as Record<string, unknown>;
+              const got = !!c?.ml;
+              systemRow(
+                got === want
+                  ? `ML gates ${sub}.`
+                  : `ML gates are ${got ? "on" : "off"} — the config did not take the change.`
+              );
             } catch (e) {
               systemRow(`ml: ${String(e)}`);
             }
@@ -1400,16 +1515,18 @@ export function useAppStore() {
           return;
         }
         case "sessions": {
-          try {
-            const sessions = await backend.listSessions();
-            systemRow(
-              sessions.length
-                ? sessions.map((s) => `${s.id} · ${s.model || "?"} · ${s.ended ? "ended" : "live"}`).join("\n")
-                : "No sessions in this workspace yet."
-            );
-          } catch (e) {
-            systemRow(`sessions: ${String(e)}`);
-          }
+          const r = await backend.listSessions();
+          // A list served by the on-disk registry mirror is NOT the same
+          // as an engine list: say which one, and why the engine was
+          // bypassed.
+          const srcNote = r.source ? ` (${r.source === "registry-file" ? "from the on-disk registry" : r.source}${r.error ? ` — the engine did not answer: ${r.error}` : ""})` : "";
+          systemRow(
+            r.error && !r.sessions.length
+              ? `sessions unavailable: ${r.error}`
+              : r.sessions.length
+                ? r.sessions.map((s) => `${s.id} · ${s.model || "?"} · ${s.ended ? "ended" : "live"}`).join("\n") + srcNote
+                : `No sessions in this workspace yet.${srcNote}`
+          );
           return;
         }
         case "context": {
@@ -1441,9 +1558,11 @@ export function useAppStore() {
         case "cost": {
           try {
             const st = (await backend.chatState()) as Record<string, unknown>;
-            systemRow(
-              `Session: ${Number(st.sessionSpendUsd ?? 0).toFixed(4)} USD · ${Number(st.sessionTokens ?? 0).toLocaleString()} tokens`
-            );
+            // An unreported number is UNKNOWN, not zero: "0.0000 USD" reads
+            // as a measured zero spend.
+            const spend = typeof st.sessionSpendUsd === "number" ? `$${st.sessionSpendUsd.toFixed(4)}` : "unknown";
+            const tokens = typeof st.sessionTokens === "number" ? `${st.sessionTokens.toLocaleString()} tokens` : "unknown";
+            systemRow(`Session: ${spend} USD · ${tokens}`);
           } catch (e) {
             systemRow(`cost: ${String(e)}`);
           }
@@ -1451,17 +1570,15 @@ export function useAppStore() {
         }
         case "resume": {
           if (!arg) {
-            try {
-              const sessions = await backend.listSessions();
-              systemRow(
-                sessions.length
-                  ? sessions.slice(0, 10).map((s) => `${s.id} · ${s.model || "?"} · ${s.ended ? "ended" : "live"}`).join("\n") +
+            const r = await backend.listSessions();
+            systemRow(
+              r.error
+                ? `sessions unavailable: ${r.error}`
+                : r.sessions.length
+                  ? r.sessions.slice(0, 10).map((s) => `${s.id} · ${s.model || "?"} · ${s.ended ? "ended" : "live"}`).join("\n") +
                     "\n/resume <id> to open one"
                   : "No sessions in this workspace yet."
-              );
-            } catch (e) {
-              systemRow(`resume: ${String(e)}`);
-            }
+            );
             return;
           }
           try {
@@ -1519,14 +1636,14 @@ export function useAppStore() {
             activeId = minted.sessionId;
             dispatch({
               type: "add_session",
-              session: makeSessionInfo(
-                minted.sessionId,
-                state.projectDir ?? "",
-                state.config?.model ?? "",
-                state.config?.provider ?? ""
-              ),
+              session: makeSessionInfo(minted.sessionId, state.projectDir ?? ""),
             });
             dispatch({ type: "active_session", id: minted.sessionId });
+          } else {
+            dispatch({
+              type: "system_row",
+              text: `No session could be created${minted?.error ? `: ${minted.error}` : " — the engine returned no session id"}`,
+            });
           }
         }
         // "Just chat" mode runs the turn without any tools attached.
@@ -1567,23 +1684,24 @@ export function useAppStore() {
           // the engine attached, or (attach failed) the newest pill and
           // point the engine at it — never park on null while pills exist.
           const attached: string | null = res?.sessionId ?? null;
-          return backend.listSessions().then(async (s) => {
-            dispatch({ type: "sessions", sessions: s, projectDir: path });
-            if (attached && s.some((x) => x.id === attached)) {
+          return backend.listSessions().then(async (r) => {
+            dispatch({
+              type: "sessions",
+              sessions: r.sessions,
+              projectDir: path,
+              error: r.error ?? null,
+              source: r.source ?? null,
+            });
+            if (attached && r.sessions.some((x) => x.id === attached)) {
               dispatch({ type: "active_session", id: attached });
               return;
             }
-            if (!s.length) {
+            if (!r.sessions.length) {
               const minted = await backend.newSession();
               if (minted?.sessionId) {
                 dispatch({
                   type: "add_session",
-                  session: makeSessionInfo(
-                    minted.sessionId,
-                    path,
-                    state.config?.model ?? "",
-                    state.config?.provider ?? ""
-                  ),
+                  session: makeSessionInfo(minted.sessionId, path),
                 });
                 dispatch({ type: "active_session", id: minted.sessionId });
               } else {
@@ -1591,15 +1709,19 @@ export function useAppStore() {
               }
               return;
             }
-            dispatch({ type: "active_session", id: s[0].id });
-            backend.resumeSession(s[0].id).catch(() => {});
+            dispatch({ type: "active_session", id: r.sessions[0].id });
+            backend.resumeSession(r.sessions[0].id).catch(() => {});
           });
         })
-        .catch(() => {
+        .catch((e) => {
           // Engine refused the switch — revert so later fetch tags still
-          // match the folder actually loaded.
+          // match the folder actually loaded, and say why.
           projectDirRef.current = prev;
           dispatch({ type: "workspace_switch", path: prev });
+          dispatch({
+            type: "system_row",
+            text: `Workspace switch failed: ${String(e)}`,
+          });
         });
     },
     [state.projectDir, refreshSessions]
@@ -1607,15 +1729,24 @@ export function useAppStore() {
 
   // Delete a chat pill: engine detaches + drops the registry entry, the
   // Rust side removes the session folder. Active page parks to empty.
+  // A refusal keeps the pill and says why — the chat still exists.
   const deleteSession = useCallback(
     (id: string) => {
       backend
         .deleteSession(id)
         .then((res) => {
-          if (res?.ok === false) return;
+          if (res?.ok === false) {
+            dispatch({
+              type: "system_row",
+              text: `Delete failed${res?.error ? `: ${res.error}` : " — the engine refused"}`,
+            });
+            return;
+          }
           dispatch({ type: "delete_session", id });
         })
-        .catch(() => {});
+        .catch((e) => {
+          dispatch({ type: "system_row", text: `Delete failed: ${String(e)}` });
+        });
     },
     []
   );
@@ -1700,23 +1831,57 @@ export function useAppStore() {
   );
 
   // Tool permission profile: applied to the engine immediately and kept
-  // locally so every launch starts with the same policy.
+  // locally so every launch starts with the same policy. The UI only
+  // shows the profile the ENGINE accepted: a refused switch must not
+  // leave the shell claiming a policy the runtime is not enforcing.
   const setPermissions = useCallback((profile: PermissionProfile) => {
-    dispatch({ type: "permissions", permissions: profile });
-    backend.setPermissions(profile).catch(() => {});
+    backend
+      .setPermissions(profile)
+      .then((r) => {
+        if (r?.ok) {
+          dispatch({ type: "permissions", permissions: (r.permissions as PermissionProfile) ?? profile });
+          return;
+        }
+        dispatch({
+          type: "permissions_error",
+          error: `the engine refused the permission change${r?.error ? `: ${r.error}` : ""}`,
+        });
+        dispatch({
+          type: "system_row",
+          text: `Permissions unchanged${r?.error ? `: ${r.error}` : " — the engine refused the change"}`,
+        });
+      })
+      .catch((e) => {
+        dispatch({
+          type: "permissions_error",
+          error: `the engine did not confirm the permission profile: ${String(e)}`,
+        });
+        dispatch({
+          type: "system_row",
+          text: `Permissions unchanged: ${String(e)}`,
+        });
+      });
   }, []);
 
   // Open a past session as a read-only transcript (sidebar / ◷ history).
   // The .qtsq files are encrypted, so turns come through the engine.
+  // A failed read is NOT an empty transcript: the preview says why.
   const openSession = useCallback(async (id: string, label: string) => {
     try {
       const turns = await backend.sessionTurns(id);
-      dispatch({
-        type: "preview",
-        preview: { id, label, turns: Array.isArray(turns) ? turns : [] },
-      });
+      if (!Array.isArray(turns)) {
+        dispatch({
+          type: "system_row",
+          text: `Transcript unavailable for ${label} — the engine returned no turns.`,
+        });
+        return;
+      }
+      dispatch({ type: "preview", preview: { id, label, turns } });
     } catch (e) {
-      console.error(e);
+      dispatch({
+        type: "system_row",
+        text: `Transcript unavailable for ${label}: ${String(e)}`,
+      });
     }
   }, []);
   const closePreview = useCallback(() => dispatch({ type: "preview", preview: null }), []);

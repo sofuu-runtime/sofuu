@@ -21,12 +21,21 @@
 //
 // A declaration is not a grant. Every capability call requires an explicit
 // family grant and a valid, nonempty policy before the host is reached.
+//
+// The physical rules that depend on the vehicle's own state — arming,
+// telemetry freshness, geofence, link loss — are not here, because only the
+// backend that owns that state can know it. They live in `robotics/safety.rs`
+// so the live link and the physical test host apply the same ones.
 
 use serde_json::Value as Json;
 use serde_json::json;
 
 use crate::sfs::arena::Arena;
 use crate::sfs::value::Value;
+
+/// The shared physical safety contract. A drone or rover command is judged by
+/// these rules whichever backend serves it.
+pub use super::safety::{gate_physical_command, is_physical_family, VehicleState};
 
 /// Every registered family requires an explicit host grant.
 pub const EFFECTOR_FAMILIES: &[&str] = crate::sfs::caps::FAMILIES;
@@ -43,7 +52,7 @@ pub struct Denial {
 }
 
 impl Denial {
-    fn new(code: &'static str, rule: &'static str, reason: String) -> Self {
+    pub fn new(code: &'static str, rule: &'static str, reason: String) -> Self {
         Denial { code, rule, reason }
     }
 }
@@ -90,6 +99,10 @@ fn is_link_device(device: &str) -> bool {
 /// grant that says `sensor=bogus` used to be accepted, the run proceeded, and
 /// the simulator answered for a backend nobody had implemented. It fails here
 /// as E_CAP_INVALID instead.
+///
+/// An empty backend is a grant without a device: it selects no implementation,
+/// so every call on that family fails closed at the operation. It never means
+/// "simulate it".
 pub fn validate_grant(family: &str, backend: &str) -> Result<(), Denial> {
     let name = backend.trim();
     if name.is_empty() {
@@ -103,7 +116,10 @@ pub fn validate_grant(family: &str, backend: &str) -> Result<(), Denial> {
         return Ok(());
     }
     if name == "sim" {
-        return if matches!(fam, "drone" | "rover") {
+        // A physical test simulator is a deliberate choice for a drone or
+        // rover test, and nothing else: there is no general-purpose simulator
+        // a workload can fall back to.
+        return if crate::sfs::caps::PHYSICAL_TEST_FAMILIES.contains(&fam) {
             Ok(())
         } else {
             Err(Denial::new("E_CAP_INVALID", "H-2/backend", format!(

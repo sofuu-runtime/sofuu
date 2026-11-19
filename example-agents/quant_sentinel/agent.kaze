@@ -1,6 +1,10 @@
 # Quant Sentinel — illustrative Kaze language example.
-# AI, tool, memory, and alert capabilities can currently use synthetic results;
-# this is not a verified integration or a real-world deployment.
+#
+# Nothing in this repository is connected to a broker, an exchange, a
+# market-data provider, an order router or a risk system, and this routine has
+# never placed an order. "order_router" and "portfolio_rebalancer" are MCP
+# tool names that no shipped configuration provides, so the calls fail closed.
+# Do not point this example at a real trading account.
 
 needs: ai, tool, policy, memory, log, alert
 

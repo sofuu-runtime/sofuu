@@ -290,18 +290,38 @@
     try { r = JSON.parse(sofuu.scouter.contextHealth(history, null, usedCtx)); } catch (e) { /* advisory */ }
     try { st = JSON.parse(sofuu.scouter.status()); } catch (e) { /* advisory */ }
     out('\n\x1b[1m  Scouter Health & Diagnostics\x1b[0m \x1b[90m(Pure Math)\x1b[0m');
-    const cs = (r && typeof r.score === 'number') ? r.score : (st ? st.contextScore : 100);
-    const bs = st ? st.brainScore : 100;
+    const cs = (r && typeof r.score === 'number') ? r.score
+      : (st && st.contextMeasured !== false && typeof st.contextScore === 'number' ? st.contextScore : null);
+    const bs = (st && st.brainMeasured !== false && typeof st.brainScore === 'number' ? st.brainScore : null);
+    /* A score the substrate did not measure is not a healthy score: the
+     * previous code substituted 100 for a missing reading, so a build whose
+     * report could not be read printed a perfect A-grade context and a
+     * "no active threats" banner it had never observed. */
+    if (cs === null && bs === null) {
+      out('\n  \x1b[90m  Scouter report unavailable — no health verdict is available.\x1b[0m\n');
+      return;
+    }
     const cg = (s) => '\x1b[' + (s >= 90 ? T('ok') : (s >= 70 ? T('warn') : T('error'))) + 'm';
-    out('  ' + cg(cs) + '●\x1b[0m \x1b[1mContext:\x1b[0m ' + cg(cs) + cs + '%\x1b[0m \x1b[90m[' + ((r && r.grade) ? r.grade : (cs >= 90 ? 'A' : (cs >= 70 ? 'B' : 'F'))) + ']\x1b[0m');
+    if (cs === null) {
+      out('  \x1b[90m●\x1b[0m \x1b[1mContext:\x1b[0m \x1b[90munavailable — not measured\x1b[0m');
+    } else {
+      out('  ' + cg(cs) + '●\x1b[0m \x1b[1mContext:\x1b[0m ' + cg(cs) + cs + '%\x1b[0m \x1b[90m[' + ((r && r.grade) ? r.grade : (cs >= 90 ? 'A' : (cs >= 70 ? 'B' : 'F'))) + ']\x1b[0m');
+    }
     if (r) out('    \x1b[90mEntropy: ' + (r.max_entropy || 0).toFixed(2) + ' b/B · Zipf Dev: ' + (r.zipf_dev || 0).toFixed(2) + ' · Efficiency: ' + ((r.efficiency_ratio || 1) * 100).toFixed(1) + '%\x1b[0m');
-    out('  ' + cg(bs) + '●\x1b[0m \x1b[1mBrain  :\x1b[0m ' + cg(bs) + bs + '%\x1b[0m \x1b[90m[' + (bs >= 90 ? 'A' : (bs >= 70 ? 'B' : 'F')) + ']\x1b[0m');
-    const ths = (r && r.threats && r.threats.length) ? r.threats : ((st && st.recentThreats) ? st.recentThreats : []);
-    if (ths.length) {
+    if (bs === null) {
+      out('  \x1b[90m●\x1b[0m \x1b[1mBrain  :\x1b[0m \x1b[90munavailable — not measured\x1b[0m');
+    } else {
+      out('  ' + cg(bs) + '●\x1b[0m \x1b[1mBrain  :\x1b[0m ' + cg(bs) + bs + '%\x1b[0m \x1b[90m[' + (bs >= 90 ? 'A' : (bs >= 70 ? 'B' : 'F')) + ']\x1b[0m');
+    }
+    const ths = (r && Array.isArray(r.threats)) ? r.threats
+      : (st && Array.isArray(st.recentThreats) ? st.recentThreats : null);
+    if (ths && ths.length) {
       out('\n  \x1b[1;33m⚠ Active Threats (' + ths.length + '):\x1b[0m');
       for (const t of ths) out('    \x1b[31m▸\x1b[0m \x1b[1m' + t.kind + '\x1b[0m \x1b[90m[' + t.source + ' -' + t.score_impact + ']\x1b[0m: ' + t.detail);
-    } else {
+    } else if (ths) {
       out('\n  \x1b[32m✓ Context & Brain healthy — no active threats.\x1b[0m');
+    } else {
+      out('\n  \x1b[90m  Threat list unavailable — no verdict was read.\x1b[0m');
     }
     out('');
   }

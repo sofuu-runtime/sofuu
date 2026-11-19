@@ -1,5 +1,12 @@
-// t36_best_effort_opt_in.js — R3.3: A best-effort path (mmq) is unreachable
-// without an explicit flag; the default engine path is exact (cpu-tiles).
+// t36_best_effort_opt_in.js — R3.3: a best-effort path (mmq) is not the
+// default; the default engine path is exact (cpu-tiles); and the opt-in knob
+// reaches a child runtime process only when it is passed explicitly.
+//
+// PURE CHECK: it reads the manifest and the child's environment; it runs
+// no model, tool or network exchange. The child environment is filtered to
+// the runtime's allowlist, so the default child carries no opt-in knob.
+//
+// RESOURCE: pure: the capability manifest and the child's environment
 //
 // Run: ./sofuu run scripts/contract/harness/t36_best_effort_opt_in.js
 'use strict';
@@ -37,14 +44,23 @@ async function main() {
     const cpuTiles = caps.engine.paths["cpu-tiles"];
     assert("cpu-tiles is default (default === true, exact path)", cpuTiles && cpuTiles.default === true && cpuTiles.tier === "exact");
 
+    // The suite must exercise the default path: an opt-in knob exported in the
+    // caller's environment would silently turn this case into a best-effort run.
+    assert("the harness environment does not pre-set SOFUU_DECODE_MMQ",
+        !process.env.SOFUU_DECODE_MMQ);
+
+    const binary = process.env.SOFUU_BIN || "./sofuu";
+    assert(`runtime binary '${binary}' exists`, sofuu.fs.existsSync(binary));
+    const bin = `"${binary}"`;
+
     // Test environment flag gating:
     // With no env flag, SOFUU_DECODE_MMQ is unset
-    const rDefault = await sh("./sofuu eval 'console.log(process.env.SOFUU_DECODE_MMQ || \"unset\")'");
-    assert("SOFUU_DECODE_MMQ is unset by default", rDefault.out.trim().indexOf("unset") >= 0);
+    const rDefault = await sh(`${bin} eval 'console.log(process.env.SOFUU_DECODE_MMQ || "unset")'`);
+    assert("SOFUU_DECODE_MMQ is unset in the default child runtime process", rDefault.out.trim().indexOf("unset") >= 0);
 
     // With explicit flag, the opt-in is engaged
-    const rOptIn = await sh("SOFUU_DECODE_MMQ=1 ./sofuu eval 'console.log(process.env.SOFUU_DECODE_MMQ)'");
-    assert("SOFUU_DECODE_MMQ=1 is recognized when explicitly passed", rOptIn.out.trim() === "1");
+    const rOptIn = await sh(`SOFUU_DECODE_MMQ=1 ${bin} eval 'console.log(process.env.SOFUU_DECODE_MMQ)'`);
+    assert("SOFUU_DECODE_MMQ=1 reaches the child runtime process when explicitly passed", rOptIn.out.trim() === "1");
 
     console.log(`\n=== t36 results: ${results.passed} passed, ${results.failed} failed ===`);
     process.exit(results.failed === 0 ? 0 : 1);

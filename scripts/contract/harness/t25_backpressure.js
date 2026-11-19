@@ -2,7 +2,24 @@
 // E_BACKPRESSURE and the provider request is aborted — the queue never grows
 // without bound.
 //
-// Run: ./sofuu run scripts/contract/harness/t25_backpressure.js
+// The backend is the REAL local engine: provider "local" over an existing
+// real-weight GGUF (SOFUU_CONTRACT_MODEL). Every chunk the consumer sees is
+// genuine model output decoded from those weights — the case contains no
+// scripted provider, no canned frame and no fixed answer.
+//
+// The queue that overflows is the runtime's own bounded chunk queue (1024
+// undelivered chunks). The consumer drains three chunks and then stops
+// draining while the model keeps producing, so the bound is reached by real
+// work rather than by an injected burst.
+//
+// A model that stops before the bound is reached cannot exercise the
+// scenario: that is reported as BLOCKED with the chunk count, never as a
+// pass.
+//
+// RESOURCE: real: SOFUU_CONTRACT_MODEL on the local engine's own bounded chunk queue; blocks when unset
+//
+// Run: SOFUU_CONTRACT_MODEL=/path/to/model.gguf \
+//      ./sofuu run scripts/contract/harness/t25_backpressure.js
 'use strict';
 
 const results = { passed: 0, failed: 0 };
@@ -10,45 +27,83 @@ function assert(label, cond) {
     if (cond) { console.log("  ✅ " + label); results.passed++; }
     else { console.error("  ❌ FAIL: " + label); results.failed++; }
 }
-setTimeout(() => { console.error("  ❌ WATCHDOG: harness overran 30 s"); process.exit(1); }, 30000);
+setTimeout(() => { console.error("  ❌ WATCHDOG: harness overran 300 s"); process.exit(1); }, 300000);
+
+const BOUND_MS = 180000;   // how long the model may take to fill the queue
+const MAX_TOKENS = 3000;   // enough headroom for the 1024-chunk bound
+const PROMPT = "Write a numbered list of 400 distinct one-sentence facts about the " +
+    "history of civil engineering. Do not stop before 400.";
+
+/* The real local weights this case may load. The synthetic contract fixture
+ * and the vocabulary-only GGUFs are parser fixtures, never evidence of
+ * inference, so they are refused here. */
+function resolveModel() {
+    const env = String((process.env && process.env.SOFUU_CONTRACT_MODEL) || "").trim();
+    if (!env) {
+        console.error("BLOCKED: set SOFUU_CONTRACT_MODEL to an existing real-weight GGUF " +
+            "(no weights are downloaded; the synthetic contract fixture is a parser fixture)");
+        process.exit(2);
+    }
+    if (!/\.gguf$/i.test(env) || !sofuu.fs.existsSync(env) ||
+        /(^|\/)sofuu-fixture\.gguf$/i.test(env) || /ggml-vocab/i.test(env)) {
+        console.error("BLOCKED: SOFUU_CONTRACT_MODEL must name an existing real-weight GGUF " +
+            "(not a synthetic or vocabulary fixture): " + env);
+        process.exit(2);
+    }
+    return env;
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function main() {
-    // Mock: floods 60 frames per 5 ms tick (1024+ chunks in ~200 ms).
-    let server = null, port = 0;
-    const base = 26700 + (Date.now() % 2000);
-    const handler = (req, res) => {
-        res.writeHead(200, { "Content-Type": "text/event-stream" });
-        let i = 0;
-        const timer = setInterval(() => {
-            i += 1;
-            if (i > 120) { clearInterval(timer); res.write("data: [DONE]\n\n"); res.end(); return; }
-            let batch = "";
-            for (let k = 0; k < 60; k++) {
-                batch += "data: " + JSON.stringify({
-                    choices: [{ delta: { content: "f" + i + "_" + k } }],
-                }) + "\n\n";
-            }
-            res.write(batch);
-        }, 5);
-    };
-    for (let i = 0; i < 6; i++) {
-        const p = base + i * 149;
-        try { server = sofuu.createServer(handler); server.listen(p, "127.0.0.1"); port = p; break; }
-        catch (e) { server = null; }
-    }
-    assert("mock server bound", server != null);
-    const URL = "http://127.0.0.1:" + port + "/v1/chat/completions";
+    const model = resolveModel();
+    console.log("  ℹ model: " + model);
 
     const st = sofuu.ai.stream({
-        provider: "openai", model: "mock", api_key: "x", base_url: URL,
-        messages: [{ role: "user", content: "flood" }],
+        provider: "local", model: model,
+        messages: [{ role: "user", content: PROMPT }],
+        max_tokens: MAX_TOKENS,
     });
+    assert("the stream exposes an abort()", typeof st.abort === "function");
 
-    // Drain 3 frames, then stop draining: the pump's bounded queue overflows.
-    for (let i = 0; i < 3; i++) await st.next();
-    await new Promise((r) => setTimeout(r, 700)); // flood while not draining
+    // Drain three real chunks, then stop draining: the provider keeps
+    // producing while nothing consumes, which is the backpressure condition.
+    let drained = 0, text = "";
+    for (let i = 0; i < 3; i++) {
+        const n = await st.next();
+        if (n.done) break;
+        if (n.value && n.value.text) { drained++; text += n.value.text; }
+    }
+    assert("the real model produced chunks the consumer could read", drained >= 1 && text.trim().length > 0);
+    if (drained < 1) {
+        console.error("BLOCKED: the real model produced no chunk to drain — nothing to exercise");
+        process.exit(2);
+    }
+    console.log("  ℹ drained " + drained + " chunk(s), then stopped draining");
 
-    // Resume: the next delivery is the typed backpressure error.
+    // Wait (without draining) until the bounded queue overflows. The runtime
+    // sets the aborted flag and raises the typed error at the bound.
+    const t0 = Date.now();
+    let overflowed = false;
+    while (Date.now() - t0 < BOUND_MS) {
+        if (st.aborted === true) { overflowed = true; break; }
+        await sleep(100);
+    }
+    const waitMs = Date.now() - t0;
+
+    if (!overflowed) {
+        // The stream finished before the bound: the scenario was not exercised.
+        let tail = null;
+        try { tail = await st.next(); } catch (e) { tail = { error: String((e && e.message) || e) }; }
+        console.error("BLOCKED: the real model finished after " + waitMs +
+            " ms without filling the 1024-chunk queue (last delivery: " +
+            JSON.stringify(tail && tail.value ? tail.value.text : null) +
+            ") — the backpressure bound was not reached, so the case is unverified");
+        process.exit(2);
+    }
+    console.log("  ℹ the queue overflowed after " + waitMs + " ms of not draining");
+
+    // The typed error must reach the consumer on the next delivery.
     let err = null, value = null, done = false;
     try {
         const r = await st.next();
@@ -56,13 +111,10 @@ async function main() {
     } catch (e) { err = e; }
     const msg = String((err && err.message) || "");
     assert("non-draining consumer gets E_BACKPRESSURE",
-        msg.indexOf("E_BACKPRESSURE") >= 0 || (value == null && done === true && !err));
-    if (msg.indexOf("E_BACKPRESSURE") >= 0) {
-        assert("the error names the bound (1024)", msg.indexOf("1024") >= 0);
-    } else {
-        console.log("  ℹ stream ended done instead of throwing:", { done, hasValue: value != null });
-    }
+        !!err && String(err.code) === "E_BACKPRESSURE");
+    assert("the error names the bound (1024)", msg.indexOf("1024") >= 0);
     assert("abort cleaned up the provider side (aborted flag)", st.aborted === true);
+    if (!err) console.log("  ℹ the stream ended instead of throwing:", { done, hasValue: value != null });
 
     console.log(`\n=== t25 results: ${results.passed} passed, ${results.failed} failed ===`);
     process.exit(results.failed === 0 ? 0 : 1);

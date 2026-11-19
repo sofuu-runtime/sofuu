@@ -1,5 +1,10 @@
 // t28_error_shape.js — R2.5: one error shape and one taxonomy on every call.
 //
+// PURE CHECK: the error factory and the taxonomy table only — no
+// provider, tool or network exchange is involved.
+//
+// RESOURCE: pure: the error factory and the taxonomy table in process
+//
 // Run: ./sofuu run scripts/contract/harness/t28_error_shape.js
 'use strict';
 

@@ -1,6 +1,12 @@
 // t44_migration.js — R4.4: Committed v0.2 fixtures (config, session) load;
 // every field survives or is migrated forward losslessly.
 //
+// PURE CHECK: the committed v0.2 config and session fixtures are static
+// data. They exercise the migration and the load path — no provider,
+// tool or network exchange is involved.
+//
+// RESOURCE: pure: the committed v0.2 config and session fixtures
+//
 // Run: ./sofuu run scripts/contract/harness/t44_migration.js
 'use strict';
 

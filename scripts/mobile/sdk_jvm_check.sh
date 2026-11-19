@@ -6,47 +6,119 @@
 # the C ABI, and the runtime's event loop. This script closes the gap between
 # "the Kotlin compiles" and "it works on a phone":
 #
-#   1. compiles bindings/android/sofuu/src/main/cpp/jni_bridge.c — the same
+#   1. builds the runtime (libsofuu) from THIS source tree
+#   2. compiles bindings/android/sofuu/src/main/cpp/jni_bridge.c — the same
 #      file the NDK builds for Android — for the HOST OS, linked against
-#      dist/libsofuu
-#   2. compiles the real Kotlin wrapper (against the Android SDK's android.jar)
-#   3. runs sdk_jvm_check/Check.kt through it: streaming deltas, mid-flight
-#      cancel, the UTF-8 boundary, streamLocal's positional contract, host
-#      tools (sync + deferred from another thread), and close() semantics
+#      that runtime
+#   3. compiles the real Kotlin wrapper (against the Android SDK's android.jar)
+#   4. runs sdk_jvm_check/Check.kt through it: real local inference with an
+#      existing GGUF, streaming deltas, mid-flight cancel, the UTF-8
+#      boundary, streamLocal's positional contract, and host tools (sync +
+#      deferred from another thread) reading a real temporary file
 #
-# Skips cleanly (exit 0, a yellow line saying what is missing) when a host
-# toolchain piece is absent — that is "not verifiable here", not a pass.
-# Needs `make libsofuu` first (dist/libsofuu.{dylib,so}).
+# REAL EXECUTION (RULES.md §1.9): the harness drives the real engine
+# against a real local GGUF — no provider is stubbed, no answer is canned.
+# The camera is NOT covered here: it needs a physical Android device, so the
+# harness records camera coverage as unverified instead of faking it.
+#
+# Reports BLOCKED (exit 2) when a real prerequisite is missing — that is
+# "not verifiable here", not a pass. The result is HOST-JVM coverage: this
+# is not Android device coverage.
+#
+# Usage: bash scripts/mobile/sdk_jvm_check.sh [model.gguf]
+#   model   an existing real-weight GGUF (default: $SOFUU_JVM_CHECK_MODEL,
+#           else ~/Downloads/SmolLM2-360M-Instruct-Q8_0.gguf)
+#
+# Environment:
+#   SOFUU_JVM_CHECK_MODEL   same as the model argument
+#   SOFUU_JVM_CHECK_LIB     use this prebuilt libsofuu instead of building one
 set -euo pipefail
-
-# Check.kt currently substitutes a provider and camera results. Keep the
-# original assertions visible for migration; this is not device evidence.
-printf '%s\n' 'BLOCKED: JVM SDK harness uses simulated AI and host-tool results; real-execution replacement required.' >&2
-exit 2
-
-RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'; DIM=$'\033[2m'; RST=$'\033[0m'
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 CHECK_DIR="$REPO_ROOT/scripts/mobile/sdk_jvm_check"
 BUILD="$REPO_ROOT/dist/sdk-jvm-check"
 
-skip() { printf '%s— %s%s\n' "$YEL" "$1" "$RST"; exit 0; }
+RED=$'\033[31m'; YEL=$'\033[33m'; GRN=$'\033[32m'; DIM=$'\033[2m'; RST=$'\033[0m'
 
-# ── the runtime must already be built ────────────────────────────────
+blocked() { printf '%sBLOCKED%s sdk-jvm-check: %s\n' "$YEL" "$RST" "$1" >&2; exit 2; }
+fail()    { printf '%sFAIL%s sdk-jvm-check: %s\n' "$RED" "$RST" "$1" >&2; exit 1; }
+
+# ── the real local model the inference cases run against ─────────────
+MODEL="${1:-${SOFUU_JVM_CHECK_MODEL:-}}"
+if [ -z "$MODEL" ]; then
+    for candidate in \
+        "$HOME/Downloads/SmolLM2-360M-Instruct-Q8_0.gguf" \
+        "$HOME/Downloads/SmolLM2-360M-Instruct-Q4_K_M.gguf"
+    do
+        if [ -f "$candidate" ]; then MODEL="$candidate"; break; fi
+    done
+fi
+if [ -n "$MODEL" ]; then
+    [ -f "$MODEL" ] || blocked "model file not found: $MODEL"
+    # A synthetic or vocabulary-only fixture is a parser fixture, never
+    # inference coverage.
+    case "$(basename "$MODEL")" in
+        sofuu-fixture.gguf|ggml-vocab-*.gguf)
+            blocked "the synthetic/vocab-only fixture is not real inference coverage: $MODEL" ;;
+    esac
+    MODEL="$(cd "$(dirname "$MODEL")" && pwd)/$(basename "$MODEL")"
+fi
+
+# ── the runtime, built from this source tree ────────────────────────
 case "$(uname -s)" in
-    Darwin) RUNTIME_LIB="$REPO_ROOT/dist/libsofuu.dylib"; SHIM_NAME="libsofuu_jni.dylib"; JDK_OS=darwin ;;
-    Linux)  RUNTIME_LIB="$REPO_ROOT/dist/libsofuu.so";    SHIM_NAME="libsofuu_jni.so";    JDK_OS=linux ;;
-    *)      skip "sdk-jvm-check: unsupported host OS $(uname -s)" ;;
+    Darwin) LIB_NAME="libsofuu.dylib"; SHIM_NAME="libsofuu_jni.dylib"; JDK_OS=darwin ;;
+    Linux)  LIB_NAME="libsofuu.so";    SHIM_NAME="libsofuu_jni.so";    JDK_OS=linux ;;
+    *)      blocked "unsupported host OS $(uname -s)" ;;
 esac
-if [ ! -f "$RUNTIME_LIB" ]; then
-    printf '%s✗%s dist runtime missing (%s) — run `make libsofuu` first\n' \
-        "$RED" "$RST" "$RUNTIME_LIB"
-    exit 1
+
+mkdir -p "$BUILD"
+if [ -n "${SOFUU_JVM_CHECK_LIB:-}" ]; then
+    RUNTIME_SRC="$SOFUU_JVM_CHECK_LIB"
+    [ -f "$RUNTIME_SRC" ] || blocked "SOFUU_JVM_CHECK_LIB not found: $RUNTIME_SRC"
+else
+    CARGO="${CARGO:-cargo}"
+    command -v "$CARGO" >/dev/null 2>&1 || blocked "no cargo ($CARGO not found) — the runtime cannot be built from source"
+    printf '  %sCARGO%s build sofuu-capi (release) — the check runs THIS source tree\n' "$DIM" "$RST"
+    REMAP_FLAGS="$(bash "$REPO_ROOT/scripts/cross/remap_flags.sh" 2>/dev/null || true)"
+    if ! ( cd "$REPO_ROOT" && \
+        CARGO_PROFILE_RELEASE_PANIC=unwind RUSTFLAGS="$REMAP_FLAGS ${RUSTFLAGS:-}" \
+        "$CARGO" build --offline --release -p sofuu-capi ); then
+        blocked "cargo build --offline --release -p sofuu-capi failed — the compiler output above is the reason"
+    fi
+    case "$(uname -s)" in
+        Darwin) RUNTIME_SRC="$REPO_ROOT/target/release/libsofuu_capi.dylib" ;;
+        Linux)  RUNTIME_SRC="$REPO_ROOT/target/release/libsofuu_capi.so" ;;
+    esac
+fi
+[ -f "$RUNTIME_SRC" ] || blocked "runtime library not found after the build: $RUNTIME_SRC"
+
+# Provenance of the library the check runs against: a receipt has to name
+# the binary, not just "the runtime".
+printf '  %sLIB%s %s\n' "$DIM" "$RST" "$RUNTIME_SRC"
+if command -v shasum >/dev/null 2>&1; then
+    printf '  %sSHA%s %s\n' "$DIM" "$RST" "$(shasum -a 256 "$RUNTIME_SRC" | cut -d' ' -f1)"
+fi
+if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    printf '  %sREV%s %s (%s)\n' "$DIM" "$RST" \
+        "$(git -C "$REPO_ROOT" rev-parse --short HEAD)" \
+        "$(git -C "$REPO_ROOT" status --porcelain | grep -q . && echo dirty || echo clean)"
+fi
+
+# The build-tree dylib records its absolute path as its install name; the
+# host-JVM shim loads it by @rpath, so copy it next to the shim and give it
+# the relocatable id (the same treatment `make libsofuu` applies).
+RUNTIME_LIB="$BUILD/$LIB_NAME"
+if [ "$RUNTIME_SRC" != "$RUNTIME_LIB" ]; then
+    cp "$RUNTIME_SRC" "$RUNTIME_LIB"
+fi
+if [ "$(uname -s)" = Darwin ]; then
+    install_name_tool -id "@rpath/$LIB_NAME" "$RUNTIME_LIB" 2>/dev/null || true
+    codesign -s - -f "$RUNTIME_LIB" 2>/dev/null || true
 fi
 
 # ── C compiler ───────────────────────────────────────────────────────
 CC="${CC:-clang}"
-command -v "$CC" >/dev/null 2>&1 || skip "sdk-jvm-check: no C compiler ($CC not found)"
+command -v "$CC" >/dev/null 2>&1 || blocked "no C compiler ($CC not found)"
 
 # ── JDK (with JNI headers — java alone is not enough) ────────────────
 JDK_HOME="${JAVA_HOME:-}"
@@ -54,7 +126,7 @@ if [ -z "$JDK_HOME" ] && command -v /usr/libexec/java_home >/dev/null 2>&1; then
     JDK_HOME="$(/usr/libexec/java_home 2>/dev/null || true)"
 fi
 if [ -z "$JDK_HOME" ] || [ ! -f "$JDK_HOME/include/jni.h" ]; then
-    skip "sdk-jvm-check: no JDK with JNI headers (set JAVA_HOME)"
+    blocked "no JDK with JNI headers (set JAVA_HOME)"
 fi
 JAVA="$JDK_HOME/bin/java"
 
@@ -65,7 +137,7 @@ for candidate in "$SDK_DIR"/platforms/android-*/android.jar; do
     [ -f "$candidate" ] && ANDROID_JAR="$candidate"   # last one wins → highest API
 done
 if [ -z "$ANDROID_JAR" ]; then
-    skip "sdk-jvm-check: no android.jar under $SDK_DIR/platforms (set ANDROID_HOME)"
+    blocked "no android.jar under $SDK_DIR/platforms (set ANDROID_HOME)"
 fi
 
 # ── org.json for the JVM (android.jar's copy is compile-only stubs) ──
@@ -74,13 +146,17 @@ if [ -d "$HOME/.gradle/caches/modules-2" ]; then
     JSON_JAR="$(find "$HOME/.gradle/caches/modules-2" -path '*org.json*' -name 'json-*.jar' \
         ! -name '*-sources.jar' 2>/dev/null | sort | tail -1 || true)"
 fi
+if [ -z "$JSON_JAR" ] && [ -d "$HOME/.m2/repository/org/json" ]; then
+    JSON_JAR="$(find "$HOME/.m2/repository/org/json" -name 'json-*.jar' \
+        ! -name '*-sources.jar' 2>/dev/null | sort | tail -1 || true)"
+fi
 if [ -z "$JSON_JAR" ]; then
     JSON_JAR="$BUILD/json.jar"
     if [ ! -f "$JSON_JAR" ]; then
         mkdir -p "$BUILD"
         curl -sSfL -o "$JSON_JAR" \
             https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar 2>/dev/null \
-            || skip "sdk-jvm-check: org.json jar not in the gradle cache and not fetchable"
+            || blocked "org.json jar not in the gradle cache, the maven cache or $BUILD (and not fetchable)"
     fi
 fi
 
@@ -93,7 +169,7 @@ find_jar() {
 }
 KC="$(find_jar 'kotlin-compiler-embeddable-*.jar')"
 if [ -z "$KC" ]; then
-    skip "sdk-jvm-check: kotlin-compiler-embeddable not in ~/.gradle/caches (run the Android build once to populate it)"
+    blocked "kotlin-compiler-embeddable not in ~/.gradle/caches (run the Android build once to populate it)"
 fi
 # The compiler's version decides the stdlib we may read: a NEWER stdlib in
 # the cache (another project's) has newer metadata and the compiler refuses
@@ -111,7 +187,7 @@ kotlin_jar() { # prefix, e.g. kotlin-stdlib
 }
 STDLIB="$(kotlin_jar kotlin-stdlib)"
 if [ -z "$STDLIB" ]; then
-    skip "sdk-jvm-check: kotlin-stdlib $KC_VER not in ~/.gradle/caches"
+    blocked "kotlin-stdlib $KC_VER not in ~/.gradle/caches"
 fi
 # The compiler's own dependencies; trove4j and annotations are fetched if the
 # cache lacks them (both are small and stable).
@@ -124,7 +200,7 @@ ANNOTATIONS="$(find_jar 'annotations-13*.jar')"
 fetch_if_missing() { # url dest label
     [ -f "$2" ] && return 0
     mkdir -p "$(dirname "$2")"
-    curl -sSfL -o "$2" "$1" 2>/dev/null || skip "sdk-jvm-check: $3 not available (cache miss + no network)"
+    curl -sSfL -o "$2" "$1" 2>/dev/null || blocked "$3 not available (cache miss + no network)"
 }
 if [ -z "$TROVE" ]; then
     TROVE="$BUILD/trove4j.jar"
@@ -146,8 +222,9 @@ printf '  %sCC %s jni_bridge.c → %s\n' "$DIM" "$RST" "$SHIM_NAME"
     -I "$REPO_ROOT/bindings/android/sofuu/src/main/cpp/include" \
     -I "$CHECK_DIR/android_stub" \
     -I "$JDK_HOME/include" -I "$JDK_HOME/include/$JDK_OS" \
-    -L "$(dirname "$RUNTIME_LIB")" -lsofuu \
-    -Wl,-rpath,"$(dirname "$RUNTIME_LIB")"
+    -L "$BUILD" -lsofuu \
+    -Wl,-rpath,"$BUILD" \
+    || fail "the JNI shim did not compile (see the compiler output above)"
 
 # ── 2. the Kotlin wrapper, then the check ────────────────────────────
 SOFUU_KT="$REPO_ROOT/bindings/android/sofuu/src/main/java/com/sofuu/runtime"
@@ -155,15 +232,29 @@ printf '  %sKTC%s SofuuBridge.kt → classes/\n' "$DIM" "$RST"
 "$JAVA" -cp "$COMPILER_CP" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
     -no-stdlib -jvm-target 17 -classpath "$ANDROID_JAR:$STDLIB" \
     -d "$BUILD/classes" \
-    "$SOFUU_KT/SofuuBridge.kt" "$SOFUU_KT/SofuuVoice.kt"
+    "$SOFUU_KT/SofuuBridge.kt" "$SOFUU_KT/SofuuVoice.kt" \
+    || fail "the Kotlin wrapper did not compile (see the compiler output above)"
 printf '  %sKTC%s Check.kt\n' "$DIM" "$RST"
 "$JAVA" -cp "$COMPILER_CP" org.jetbrains.kotlin.cli.jvm.K2JVMCompiler \
     -no-stdlib -jvm-target 17 -classpath "$ANDROID_JAR:$STDLIB:$BUILD/classes:$JSON_JAR" \
-    -d "$BUILD/checkclasses" "$CHECK_DIR/Check.kt"
+    -d "$BUILD/checkclasses" "$CHECK_DIR/Check.kt" \
+    || fail "Check.kt did not compile (see the compiler output above)"
 
 # ── 3. run it (scratch HOME keeps ~/.sofuu untouched) ────────────────
 printf '\n'
+set +e
 HOME="$BUILD/home" "$JAVA" \
     -cp "$BUILD/classes:$BUILD/checkclasses:$STDLIB:$JSON_JAR" \
     -Djava.library.path="$BUILD" \
+    -Dsofuu.jvm.check.model="$MODEL" \
     CheckKt
+rc=$?
+set -e
+
+printf '\n'
+case "$rc" in
+    0) printf '%sOK%s   sdk-jvm-check: host-JVM coverage only — NOT Android device coverage\n' "$GRN" "$RST" ;;
+    2) printf '%sBLOCKED%s sdk-jvm-check: a real prerequisite was unavailable (see the BLOCKED lines above)\n' "$YEL" "$RST" ;;
+    *) printf '%sFAIL%s  sdk-jvm-check: the host-JVM check failed (rc=%s)\n' "$RED" "$RST" "$rc" ;;
+esac
+exit "$rc"

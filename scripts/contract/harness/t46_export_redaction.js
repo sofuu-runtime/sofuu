@@ -2,6 +2,12 @@
 // secrets contains none — redaction is part of the format, on both the
 // append path (R6.6) and the document import/export path.
 //
+// PURE CHECK: the crafted document is static data and the redaction is
+// an in-process computation — no provider, tool or network exchange is
+// involved.
+//
+// RESOURCE: pure: a crafted document redacted in process
+//
 // Run: ./sofuu run scripts/contract/harness/t46_export_redaction.js
 'use strict';
 

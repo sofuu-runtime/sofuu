@@ -1,5 +1,12 @@
-// t31_tier_declared.js — R3.1: Every path in engine.paths has a determinism tier
-// (exact, tolerant, or best-effort), and knobs map to determinism tiers.
+// t31_tier_declared.js — R3.1: every path in engine.paths declares a
+// determinism tier (exact, tolerant, or best-effort), the tolerant paths
+// declare their error bound, and the default path is the exact one.
+//
+// PURE CHECK: it reads the manifest the engine publishes and runs no model,
+// tool or network exchange. The per-knob determinism inventory lives in
+// contract/knobs.json.
+//
+// RESOURCE: pure: the capability manifest published by the running build
 //
 // Run: ./sofuu run scripts/contract/harness/t31_tier_declared.js
 'use strict';
@@ -38,9 +45,15 @@ function main() {
     assert("mmq is declared with tier 'best-effort'",
         paths["mmq"] && paths["mmq"].tier === "best-effort");
 
-    // 3. Tolerant path declares a bound
+    // 3. Tolerant paths declare a bound
     assert("metal-mma tolerant path declares an error bound",
         Boolean(paths["metal-mma"] && paths["metal-mma"].bound));
+    for (const name of pathNames) {
+        const info = paths[name];
+        if (info && info.tier === "tolerant") {
+            assert(`tolerant path '${name}' declares an error bound`, Boolean(info.bound));
+        }
+    }
 
     console.log(`\n=== t31 results: ${results.passed} passed, ${results.failed} failed ===`);
     process.exit(results.failed === 0 ? 0 : 1);

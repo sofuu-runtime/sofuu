@@ -1,5 +1,10 @@
 // t27_deadline.js — R2.2: nested deadline inheritance.
 //
+// PURE CHECK: deadline arithmetic only — no provider, tool or network
+// exchange is involved.
+//
+// RESOURCE: pure: deadline arithmetic in process
+//
 // Run: ./sofuu run scripts/contract/harness/t27_deadline.js
 'use strict';
 

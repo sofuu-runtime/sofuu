@@ -245,8 +245,18 @@ except Exception:
     # ── 6. binary size cap on EVERY artifact (P1-8) ────────────────────────
     # AUDIT-2026-10-31 P1-8: 'make size-check' only ever measured ./sofuu, so
     # three of the four shipped artifacts sat over the 5.5 MB cap with nothing
-    # failing. The cap is the Makefile's SIZE_LIMIT — keep the two in step.
-    size_cap=5767168
+    # failing. The cap is the Makefile's SIZE_LIMIT — read it from there so the
+    # two cannot drift apart — but RULES §3.1 fixes the ceiling at 5,767,168
+    # bytes, so a different value is a failure rather than a new cap.
+    rules_cap=5767168
+    size_cap=$(sed -nE 's/^SIZE_LIMIT \?= *([0-9]+).*/\1/p' "$ROOT/Makefile" 2>/dev/null | head -1)
+    if [ -z "$size_cap" ]; then
+        fail "cannot read SIZE_LIMIT from the Makefile — the binary size cap is no longer enforced"
+        size_cap=$rules_cap
+    elif [ "$size_cap" != "$rules_cap" ]; then
+        fail "the Makefile's SIZE_LIMIT is $size_cap bytes; RULES §3.1 fixes the ceiling at $rules_cap bytes"
+        size_cap=$rules_cap
+    fi
     check_size() { # <file> <label>
         sz=$(stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null) || return 0
         [ -n "${sz:-}" ] || return 0
@@ -263,6 +273,30 @@ except Exception:
         [ "$art" = "$BIN" ] && continue
         check_size "$art" "$(basename "$art")"
     done
+
+    # ── 6b. the size cap on what the ARCHIVE ships ─────────────────────────
+    # The loose-file check above can pass while the published tarball carries
+    # a different, larger binary, so the archived artifact is measured too.
+    STAGE="$(mktemp -d)"
+    for tgz in "$DIST"/sofuu-*.tar.gz; do
+        [ -f "$tgz" ] || continue
+        rm -rf "$STAGE"/* 2>/dev/null || true
+        if ! (cd "$STAGE" && tar -xzf "$tgz" 2>/dev/null); then
+            fail "$(basename "$tgz") could not be unpacked — its contents are unverified"
+            continue
+        fi
+        shipped=0
+        for member in "$STAGE"/sofuu "$STAGE"/sofuu-*; do
+            [ -f "$member" ] || continue
+            case "$member" in *.tar.gz | *.sha256 | *.txt) continue ;; esac
+            shipped=$((shipped + 1))
+            check_size "$member" "$(basename "$tgz"):$(basename "$member")"
+        done
+        if [ "$shipped" -eq 0 ]; then
+            say "OK  $(basename "$tgz") ships no runtime binary (not a release archive)"
+        fi
+    done
+    rm -rf "$STAGE"
 fi
 
 exit $rc

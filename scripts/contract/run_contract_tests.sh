@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
-# run_contract_tests.sh — conformance-suite skeleton (P0).
+# run_contract_tests.sh — conformance suite for the cases in cases.tsv.
 #
-# Runs the 52 cases in cases.tsv against the built binary and reports
-# PASS / FAIL / BLOCKED per case. This is deliberately a skeleton: in P0 most
-# cases are BLOCKED on fixtures that do not exist yet, and the ones that can
-# run are expected to FAIL where the contract is not implemented.
+# Runs every case against the built binary and reports PASS / FAIL / BLOCKED
+# per case. A case either runs against a REAL local resource — the running
+# binary, a real local MCP file server, a real local store, a real child
+# process, or an existing local GGUF — or it BLOCKS with the reason. Nothing
+# is answered from a substitute: a harness that reports "BLOCKED:" is
+# recorded as a coverage gap, never as a pass, and a case that cannot run
+# compliantly keeps the suite out of green.
 #
-# Exit code: 0 only when every case PASSes. P0 is expected to exit non-zero.
+# Every harness case declares the resource it uses ("// RESOURCE: real|pure:")
+# and the case table must agree with that declaration; a case without one
+# fails loudly instead of running unreviewed.
+#
+# Exit code: 0 only when every case PASSes (or when ALLOW_BLOCKED=1 covers
+# blocked RUNNER prerequisites — never a real-execution coverage gap).
 #
 # Usage:
 #   bash scripts/contract/run_contract_tests.sh
@@ -17,7 +25,12 @@
 #     bash scripts/contract/run_contract_tests.sh
 #   SOFUU_CONTRACT_CASES=/absolute/path/to/cases.tsv  # optional subset
 #
-# No dependency beyond bash, grep, tail. Cases never mutate the repository.
+# SOFUU_CONTRACT_MODEL is exported to every case, so all model-dependent
+# cases run against the SAME existing local weights. No weights are ever
+# downloaded (AGENTS.md).
+#
+# No dependency beyond bash, grep, tail, sed. Cases never mutate the
+# repository.
 
 set -u
 
@@ -34,6 +47,10 @@ fi
 GIT_BEFORE="$(cd "$ROOT" && git status --porcelain 2>/dev/null | sort)"
 CASES="${SOFUU_CONTRACT_CASES:-$ROOT/scripts/contract/cases.tsv}"
 SOFUU="${SOFUU_BIN:-$ROOT/sofuu}"
+# A case that resolves its own binary must measure the SAME artifact this
+# suite reports on. Without the export, text_gate.py fell back to a
+# different binary than the suite's.
+export SOFUU_BIN="$SOFUU"
 HTTP_URL="${CONTRACT_HTTP_URL:-}"
 if [ -z "${CONTRACT_LIBSOFUU:-}" ]; then
     for cand in dist/libsofuu.dylib dist/libsofuu.so dist/libsofuu.a; do
@@ -41,6 +58,32 @@ if [ -z "${CONTRACT_LIBSOFUU:-}" ]; then
     done
 fi
 LIBSOFUU="${CONTRACT_LIBSOFUU:-}"
+
+# The model-dependent cases run against an existing local GGUF that the
+# operator selects. The value is exported so every case sees the SAME file:
+# a case must never quietly pick some other weights. An unset value leaves
+# those cases BLOCKED — a visible coverage gap, never a silent pass — and a
+# value that is not usable real weights is a broken prerequisite, so the
+# suite stops before it can report anything green.
+CONTRACT_MODEL="${SOFUU_CONTRACT_MODEL:-}"
+if [ -n "$CONTRACT_MODEL" ]; then
+    if [ ! -f "$CONTRACT_MODEL" ]; then
+        echo "✗ SOFUU_CONTRACT_MODEL does not exist: $CONTRACT_MODEL" >&2
+        exit 2
+    fi
+    case "$CONTRACT_MODEL" in
+        *.gguf) ;;
+        *) echo "✗ SOFUU_CONTRACT_MODEL must name a .gguf weights file: $CONTRACT_MODEL" >&2; exit 2 ;;
+    esac
+    case "$CONTRACT_MODEL" in
+        *sofuu-fixture.gguf|*ggml-vocab-*.gguf)
+            echo "✗ SOFUU_CONTRACT_MODEL must name existing real weights, not a parser fixture: $CONTRACT_MODEL" >&2
+            exit 2 ;;
+    esac
+else
+    echo "note: SOFUU_CONTRACT_MODEL is unset — the model-dependent cases report BLOCKED" >&2
+fi
+export SOFUU_CONTRACT_MODEL="$CONTRACT_MODEL"
 
 if [ ! -x "$SOFUU" ]; then
     echo "✗ binary not executable: $SOFUU (build with make, or set SOFUU_BIN)" >&2
@@ -54,9 +97,35 @@ fi
 pass=0; fail=0; blocked=0; real_execution_blocked=0
 declare -a failures=() blockers=()
 
+# The runtime colours its stderr; the block record has to be recognisable
+# whatever the colour codes around it.
+strip_ansi() { sed $'s/\033\\[[0-9;]*m//g'; }
+
 report_pass()  { pass=$((pass + 1));  printf 'PASS     %-6s %s\n' "$1" "$2"; }
 report_fail()  { fail=$((fail + 1));  failures+=("$1: $2"); printf 'FAIL     %-6s %s\n' "$1" "$2"; }
 report_block() { blocked=$((blocked + 1)); blockers+=("$1: $2"); printf 'BLOCKED  %-6s %s\n' "$1" "$2"; }
+
+# Every harness case declares the resource it runs against, and the case
+# table must agree with that declaration. A harness without one is a review
+# gap, not a pass: the case fails loudly instead of running unreviewed.
+check_case_resource() {
+    local cmd="$1" prereq="$2" file want got path
+    file="$(printf '%s\n' "$cmd" | sed -n 's|.*scripts/contract/harness/\([^ ]*\.js\).*|\1|p')"
+    [ -n "$file" ] || return 0
+    path="$ROOT/scripts/contract/harness/$file"
+    [ -f "$path" ] || return 0
+    got="$(grep -m1 -E '^// RESOURCE: (real|pure):' "$path" | sed -E 's#^// RESOURCE: (real|pure):.*#\1#')"
+    if [ -z "$got" ]; then
+        report_fail "$id" "harness $file declares no resource (// RESOURCE: real|pure:)"
+        return 1
+    fi
+    want="$(printf '%s\n' "$prereq" | sed -nE 's/^(real|pure):.*/\1/p')"
+    if [ -n "$want" ] && [ "$want" != "$got" ]; then
+        report_fail "$id" "the case table says '$want' but $file declares '$got'"
+        return 1
+    fi
+    return 0
+}
 
 run_file_case() {
     local path="$1" expect="$2"
@@ -92,7 +161,7 @@ run_js_case() {
 
 
 run_cli_case() {
-    local envspec="$1" cmd="$2" expect="$3" out code out_tail
+    local envspec="$1" cmd="$2" expect="$3" out code out_tail blockline
     if [ "$envspec" = "-" ]; then
         out="$(cd "$ROOT" && bash -c "$cmd" 2>&1)"; code=$?
     else
@@ -102,9 +171,18 @@ run_cli_case() {
     # its checks to the captured stream; keep a short tail in the FAIL line so
     # the CI gate's report is diagnosable without a local rerun.
     out_tail="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -n 6 | tr '\n' '~' | cut -c1-400)"
-    if [ "$code" -eq 2 ] && printf '%s\n' "$out" | grep -q 'BLOCKED:'; then
-        report_block "$id" "$out_tail"
-        real_execution_blocked=$((real_execution_blocked + 1))
+    # A harness that reports a block has NOT exercised its scenario. That
+    # record wins over the exit status: a block must never be recorded as a
+    # pass, and a block that does not use exit 2 is a broken harness, so it
+    # fails loudly instead of passing the expectation.
+    blockline="$(printf '%s\n' "$out" | strip_ansi | grep -m1 '^BLOCKED:' | cut -c1-300)"
+    if [ -n "$blockline" ]; then
+        if [ "$code" -ne 2 ]; then
+            report_fail "$id" "the harness reported a block but exited $code instead of 2: $blockline"
+        else
+            report_block "$id" "$blockline"
+            real_execution_blocked=$((real_execution_blocked + 1))
+        fi
         return
     fi
     case "$expect" in
@@ -199,14 +277,13 @@ run_cabi_case() {
 while IFS='|' read -r id rule clause kind envspec cmd expect prereq; do
     [ -z "${id:-}" ] && continue
     case "$id" in \#*) continue ;; esac
-    # Preserve these cases and their assertions in cases.tsv while preventing
-    # the aggregate runner from executing scripted providers or synthetic
-    # model inference. Each needs a real-resource replacement or a pure test.
-    case "$id" in
-        T2.2|T2.3|T2.4|T2.5|T2.6|T3.3|T3.5|T6.1|T6.4|T6.5|T6.7|T7.3|T7.4|T7.8)
-            report_block "$id" "real execution replacement required; legacy assertions retained in cases.tsv"
-            real_execution_blocked=$((real_execution_blocked + 1))
-            continue ;;
+    # A case that runs a harness must agree with that harness's own
+    # declaration of the resource it uses (see check_case_resource). The
+    # scripted-provider cases that used to live here were migrated to real
+    # resources; a case without a declaration now fails loudly instead of
+    # running unreviewed.
+    case "$kind" in
+        cli|js) check_case_resource "$cmd" "$prereq" || continue ;;
     esac
     case "$kind" in
         file)   run_file_case "$cmd" "$expect" ;;
@@ -247,6 +324,6 @@ elif [ "${ALLOW_BLOCKED:-0}" = "1" ] && [ "$((pass + blocked))" -eq "$total" ]; 
     echo "contract suite GREEN (0 failures, $blocked blocked runner prerequisite(s) allowed)"
     exit 0
 else
-    echo "contract suite NOT green (expected in P0 — see contract/README.md)"
+    echo "contract suite NOT green (blocked cases are recorded gaps, not passes — see contract/README.md)"
     exit 1
 fi

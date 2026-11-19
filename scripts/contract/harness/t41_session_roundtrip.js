@@ -2,6 +2,14 @@
 // between the JS surface and the CLI with identical turns, tools, usage, and
 // IDs; re-import is idempotent; ids survive a restart.
 //
+// PURE CHECK: the events below are a static fixture. They exercise the
+// session fold, the document format and the CLI/JS parity — no provider, no
+// model and no network exchange is involved, and nothing here is evidence of
+// inference or of an executed tool. The `model` field of the fixture usage
+// records is a literal, not a backend that answered.
+//
+// RESOURCE: pure: a static event fixture folded by the real session store and exported by the real CLI
+//
 // Run: ./sofuu run scripts/contract/harness/t41_session_roundtrip.js
 'use strict';
 
@@ -28,12 +36,12 @@ async function main() {
         mk("prompt", 1, 1, { text: "list the repo" }),
         mk("tool", 1, 2, { id: "c1", name: "bash" }),
         mk("tool_result", 1, 3, { id: "c1", name: "bash", ok: true, ms: 12 }),
-        mk("usage", 1, 4, { in: 21, out: 34, model: "mock", provider: "local" }),
+        mk("usage", 1, 4, { in: 21, out: 34, model: "fixture-model", provider: "local" }),
         mk("stop", 1, 5, { reason: "done" }),
         mk("prompt", 2, 6, { text: "now summarize" }),
         mk("delta", 2, 7, { text: "The repo is " }),
         mk("delta", 2, 8, { text: "quiet." }),
-        mk("usage", 2, 9, { in: 40, out: 8, model: "mock", provider: "local" }),
+        mk("usage", 2, 9, { in: 40, out: 8, model: "fixture-model", provider: "local" }),
     ];
     const ap = P(sofuu.events.append(JSON.stringify({ project: ".", sid: SID, events })));
     assert("events log written", ap.ok === true && ap.written === 9);

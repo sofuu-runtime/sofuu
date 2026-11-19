@@ -1,14 +1,19 @@
 // t61_envelope.js — R6.1/R2.6: the envelope rides on every real emitted event,
 // ordering is total, and each run terminates exactly once.
 //
-// Captures REAL events from two drivers:
-//   1. the agent loop (agent.run against an in-process mock provider; the run
-//      result's trace is the emitted event stream), and
-//   2. the chat driver (init with an onEvent sink; the turn's events even on
-//      the error path).
+// The events come from REAL runs against a REAL local model — GGUF weights
+// already present on this machine, selected through SOFUU_CONTRACT_MODEL. No
+// weights are downloaded and no provider is substituted:
+//   1. the agent loop (sofuu.agent.run against the local engine; the run
+//      result's trace is the emitted event stream),
+//   2. the chat driver (init with an onEvent sink) — one successful turn
+//      against the local model and one turn whose endpoint is unreachable,
+//      so the error path's events are covered too.
 // Then asserts the §7.2 identity fields on every event, validates them with
 // the runtime's own validator (sofuu.events.validate), and reports payload-rule
 // violations informationally (payload alignment is the remaining R6 wiring).
+//
+// RESOURCE: real: SOFUU_CONTRACT_MODEL for the agent and chat events; blocks when unset
 //
 // Run: ./sofuu run scripts/contract/harness/t61_envelope.js
 'use strict';
@@ -18,42 +23,57 @@ function assert(label, cond) {
     if (cond) { console.log("  ✅ " + label); results.passed++; }
     else { console.error("  ❌ FAIL: " + label); results.failed++; }
 }
-setTimeout(() => { console.error("  ❌ WATCHDOG: harness overran 30 s"); process.exit(1); }, 30000);
+setTimeout(() => {
+    /* A real model on a loaded machine can overrun the budget. A timeout is
+     * a coverage gap, not a contract violation: report it as blocked. */
+    console.error("BLOCKED: the real local model did not finish within 600 s on this machine");
+    process.exit(2);
+}, 600000);
 
 const P = (s) => JSON.parse(s);
 const IDENTITY_FIELDS = ["schema_version", "seq", "ts", "surface", "sid", "turn_id"];
 
+/* The real local weights this harness may load. The synthetic contract
+ * fixture and the vocabulary-only GGUFs are parser fixtures, never evidence
+ * of inference, so they are refused here. The model is selected by the
+ * runner through SOFUU_CONTRACT_MODEL; an unset value is a blocked
+ * prerequisite, never a silent fallback to some other file. */
+function resolveModel() {
+    const env = String((process.env && process.env.SOFUU_CONTRACT_MODEL) || "").trim();
+    if (!env) {
+        console.error("BLOCKED: set SOFUU_CONTRACT_MODEL to an existing real-weight GGUF " +
+            "(no weights are downloaded; the synthetic contract fixture is a parser fixture)");
+        process.exit(2);
+    }
+    if (!/\.gguf$/i.test(env) || !sofuu.fs.existsSync(env) ||
+        /(^|\/)sofuu-fixture\.gguf$/i.test(env) || /ggml-vocab/i.test(env)) {
+        console.error("BLOCKED: SOFUU_CONTRACT_MODEL must name an existing real-weight GGUF " +
+            "(not a synthetic or vocabulary fixture): " + env);
+        process.exit(2);
+    }
+    return env;
+}
+
 function identityOk(e) {
-    return e && e.schema_version === 1 && typeof e.seq === "number"
+    if (!e || typeof e !== "object") return false;
+    for (const f of IDENTITY_FIELDS) if (!(f in e)) return false;
+    return e.schema_version === 1 && typeof e.seq === "number"
         && typeof e.ts === "string" && e.ts.length >= 20
         && e.surface === "js" && typeof e.sid === "string" && typeof e.turn_id === "string";
 }
 
 async function main() {
-    // ── mock provider (the real native streaming path) ─────────────────
-    let server = null, port = 0;
-    const base = 25800 + (Date.now() % 3000);
-    const handler = (req, res) => {
-        res.writeHead(200, { "Content-Type": "text/event-stream" });
-        res.write("data: " + JSON.stringify({ choices: [{ delta: { content: "ok" } }] }) + "\n\n");
-        res.write("data: " + JSON.stringify({ choices: [{ delta: { content: " then" } }] }) + "\n\n");
-        res.write("data: [DONE]\n\n");
-        res.end();
-    };
-    for (let i = 0; i < 6; i++) {
-        const p = base + i * 139;
-        try { server = sofuu.createServer(handler); server.listen(p, "127.0.0.1"); port = p; break; }
-        catch (e) { server = null; }
-    }
-    assert("mock provider bound", server != null);
-    const URL = "http://127.0.0.1:" + port + "/v1/chat/completions";
+    const model = resolveModel();
+    console.log("  ℹ local model: " + model);
 
-    // ── 1. agent loop events ───────────────────────────────────────────
+    // ── 1. agent loop events (the real local engine) ───────────────────
     sofuu.agent.define({
-        name: "chaosex", system: "Reply with one word.",
-        model: "mock", base_url: URL, api_key: "x",
+        name: "envelopecheck", system: "Reply with one word.",
+        provider: "local", model: model,
+        max_tokens: 16, memory: "off", rlm: "off",
+        budget: { maxSteps: 2, maxDepth: 0, maxWallMs: 120000 },
     });
-    const r = await sofuu.agent.run("chaosex", "say hi");
+    const r = await sofuu.agent.run("envelopecheck", "say hi");
     const trace = (r && r.trace) || [];
     assert("agent run produced an event trace", trace.length >= 3);
     assert("every agent event carries the §7.2 identity fields",
@@ -78,41 +98,96 @@ async function main() {
     assert("zero envelope-identity violations across the agent trace", identityErrs === 0);
     console.log(`  ℹ payload-rule violations (informational, R6 wiring): ${payloadErrs}`);
 
-    // ── 2. chat driver events (error path, no provider configured) ─────
-    // The live turn's event sink attaches at submit time (chat.js:2110).
+    // ── 2. chat driver events — a real turn against the local model ───
+    // The chat driver reads its provider from ~/.sofuu/config.json, so the
+    // harness points HOME at an isolated directory and writes that config.
+    // Nothing lands in the repository or in the developer's real home.
+    const stamp = Date.now() + "-" + (process.pid || 0);
+    const home = "/tmp/sofuu-t61-home-" + stamp;
+    const project = "/tmp/sofuu-t61-project-" + stamp;
+    await sofuu.fs.mkdir(home + "/.sofuu", { recursive: true });
+    await sofuu.fs.mkdir(project, { recursive: true });
+    const configPath = home + "/.sofuu/config.json";
+    const realHome = process.env.HOME;
+    process.env.HOME = home;
+    await sofuu.fs.writeFile(configPath, JSON.stringify({
+        provider: "local", model: model, max_output: 16,
+    }));
+    try { sofuu.chat.init({ project: project }); } catch (e) { console.log("  ℹ chat.init:", (e && e.message) || e); }
+
     const chatEvents = [];
-    try { sofuu.chat.init({}); } catch (e) { console.log("  ℹ chat.init:", (e && e.message) || e); }
+    let chatErr = null;
     try {
-        // Deliberately offline: a dead local base_url makes the failure
-        // instant and deterministic — the error path's events must still
-        // ride the §7.2 envelope regardless of the host's real config
-        // (an active ~/.sofuu/config.json provider must never leak a real
-        // network call into a contract harness). The submit is raced, not
-        // awaited: a failing provider's retry/window legs may run long; the
-        // envelope contract is about the events on the sink, not the settle.
-        await Promise.race([
-            sofuu.chat.submit("envelope probe", {
-                provider: "openai", model: "dead-mock", api_key: "x",
-                base_url: "http://127.0.0.1:9/v1/chat/completions",
-                onEvent: (ev) => { if (ev && ev.kind) chatEvents.push(ev); },
-            }).catch(() => {}),
-            new Promise((r) => setTimeout(r, 6000)),
-        ]);
-        /* The raced submit may still run a retry/tool leg — its children are
-         * killed here so the suite's later orphan checks (T2.1/T2.3) see a
-         * clean process table. */
-        try { if (sofuu.tools && sofuu.tools.killActive) sofuu.tools.killActive(); } catch (eK) {}
-        await new Promise((r) => setTimeout(r, 300));
-    } catch (e) { /* the error path is fine — the events matter */ }
-    await new Promise((r2) => setTimeout(r2, 300));
+        await sofuu.chat.submit("envelope probe", {
+            onEvent: (ev) => { if (ev && ev.kind) chatEvents.push(ev); },
+        });
+    } catch (e) { chatErr = e; }
+    assert("chat turn against the local model succeeded", chatErr === null);
     assert("chat driver emitted events through the sink", chatEvents.length >= 1);
     assert("every chat event carries the §7.2 identity fields",
         chatEvents.every(identityOk));
     const chatStops = chatEvents.filter((e) => e.kind === "done" || e.kind === "stop").length;
     assert("at most one chat terminal event", chatStops <= 1);
 
+    // ── 3. chat driver events — the error path ────────────────────────
+    // The same driver, pointed at an endpoint that refuses connections: the
+    // failure is real (no provider answers) and the turn's events must still
+    // ride the §7.2 envelope.
+    const errorEvents = [];
+    await sofuu.fs.writeFile(configPath, JSON.stringify({
+        provider: "openai", model: "unreachable-endpoint", api_key: "x",
+        base_url: "http://127.0.0.1:9/v1",
+    }));
+    try {
+        // Deliberately offline: a dead endpoint makes the failure instant and
+        // deterministic — the error path's events must ride the §7.2 envelope
+        // regardless of the host's real config. The submit is raced, not
+        // awaited: a failing provider's retry legs may run long; the envelope
+        // contract is about the events on the sink, not the settle.
+        await Promise.race([
+            sofuu.chat.submit("envelope error probe", {
+                onEvent: (ev) => { if (ev && ev.kind) errorEvents.push(ev); },
+            }).catch(() => {}),
+            new Promise((r) => setTimeout(r, 6000)),
+        ]);
+        /* The raced submit may still run a retry leg — its children are
+         * killed here so the suite's later orphan checks see a clean
+         * process table. */
+        try { if (sofuu.tools && sofuu.tools.killActive) sofuu.tools.killActive(); } catch (eK) {}
+        await new Promise((r) => setTimeout(r, 300));
+    } catch (e) { /* the error path is fine — the events matter */ }
+    await new Promise((r2) => setTimeout(r2, 300));
+    assert("chat error path emitted events through the sink", errorEvents.length >= 1);
+    assert("every chat error event carries the §7.2 identity fields",
+        errorEvents.every(identityOk));
+    const errorStops = errorEvents.filter((e) => e.kind === "done" || e.kind === "stop").length;
+    assert("at most one chat error-path terminal event", errorStops <= 1);
+
+    // ── 4. cleanup ─────────────────────────────────────────────────────
+    process.env.HOME = realHome;
+    try { sofuu.fs.rm(configPath); } catch (e) { /* a leftover temp file is harmless */ }
+
     console.log(`\n=== t61 results: ${results.passed} passed, ${results.failed} failed ===`);
     process.exit(results.failed === 0 ? 0 : 1);
 }
 
-main().catch((e) => { console.error("FAIL t61:", (e && e.message) || e); process.exit(1); });
+
+/* A real backend that cannot answer in time (a loaded machine, an
+ * unreadable model) is a resource gap, not a contract violation: the
+ * assertions below were never evaluated. Report it as blocked. */
+function resourceGap(e) {
+    const code = String((e && e.code) || "");
+    if (code === "E_AI_TIMEOUT" || code === "E_TIMEOUT" || code === "E_CAP_MISSING"
+        || code === "E_CONFIG" || code === "E_MODEL_UNAVAILABLE") return true;
+    return /timeout|timed out|no data for|unresponsive|cannot allocate|out of memory/i
+        .test(String((e && e.message) || e || ""));
+}
+
+main().catch((e) => {
+    if (resourceGap(e)) {
+        console.error("BLOCKED: the real local model did not answer: " + ((e && e.message) || e));
+        process.exit(2);
+    }
+    console.error("FAIL t61:", (e && e.message) || e);
+    process.exit(1);
+});

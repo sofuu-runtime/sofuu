@@ -1,6 +1,12 @@
 // t12_capabilities_parity.js — R1.3: JS, CLI, HTTP, and C ABI return identical
 // capability manifests for the same build.
 //
+// PURE CHECK: the manifests are read from the running build on each
+// surface. No model, tool or network exchange is involved, and nothing
+// here is evidence of inference or of an executed tool.
+//
+// RESOURCE: pure: the capability manifests of the running build on four surfaces
+//
 // Run: ./sofuu run scripts/contract/harness/t12_capabilities_parity.js
 'use strict';
 
@@ -62,7 +68,17 @@ async function abiSymbolCount(libPath, symbol) {
     return { count: count, probe: "dlopen(" + pyBin + ")" };
 }
 
+/* The binary that runs this harness: every surface under test must be the
+ * same build, so the spawned CLI/server is the running artifact itself. */
+function runtimeBinary() {
+    const argv = process.argv || [];
+    if (argv.length > 0 && typeof argv[0] === "string" && argv[0].length > 0) return argv[0];
+    return process.env.SOFUU_BIN || "./sofuu";
+}
+
 async function main() {
+    const binary = runtimeBinary();
+
     // ── 1. JS surface ────────────────────────────────────────────────────────
     const jsRaw = sofuu.capabilities();
     const jsManifest = typeof jsRaw === "string" ? P(jsRaw) : jsRaw;
@@ -70,7 +86,7 @@ async function main() {
         jsManifest && jsManifest.schema === 1 && jsManifest.build && jsManifest.engine);
 
     // ── 2. CLI surface ───────────────────────────────────────────────────────
-    const cliRes = await sh("./sofuu capabilities");
+    const cliRes = await sh(JSON.stringify(binary) + " capabilities");
     assert("CLI: ./sofuu capabilities exits 0", cliRes.code === 0);
     let cliManifest = null;
     try { cliManifest = P(cliRes.out.trim()); } catch (e) {}
@@ -82,9 +98,14 @@ async function main() {
     // ── 3. HTTP surface ──────────────────────────────────────────────────────
     const port = 34500 + (Date.now() % 1200);
     const token = "t12-contract-token";
+    const home = String(process.env.SOFUU_HOME || "");
+    const serveArgs = ["serve", "--port", String(port), "--host", "127.0.0.1", "--token", token];
+    // The served brain stays inside the isolated home: a contract run must
+    // not touch the developer's real brain.
+    if (home) serveArgs.push("--brain", home + "/t12-contract-brain.qtsq");
     const srv = sofuu.spawn({
-        command: "./sofuu",
-        args: ["serve", "--port", String(port), "--host", "127.0.0.1", "--token", token],
+        command: binary,
+        args: serveArgs,
         onStdout: () => {},
         onStderr: () => {},
         onExit: () => {},

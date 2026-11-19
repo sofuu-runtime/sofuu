@@ -1,5 +1,10 @@
 // t66_redaction.js — R6.6: no secret reaches a log, trace, or export.
 //
+// PURE CHECK: the redactor is an in-process computation over a crafted
+// static event — no provider, tool or network exchange is involved.
+//
+// RESOURCE: pure: the in-process redaction choke point
+//
 // Run: ./sofuu run scripts/contract/harness/t66_redaction.js
 'use strict';
 

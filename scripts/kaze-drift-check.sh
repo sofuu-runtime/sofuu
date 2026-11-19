@@ -58,8 +58,14 @@ trap 'rm -rf "$TMP"' EXIT
 
 # (family, verb) pairs from an arity table. One line may carry several verbs
 # ("forward" | "backward"), so each is expanded.
+#
+# The verbs come from the op_arity table only. A capability verb is a
+# registry entry ("drone", "takeoff"); a telemetry reading ("drone",
+# "battery") is a field of one operation, not a verb, and reading the whole
+# file turned every new reading into phantom drift.
 verbs() {
-    grep -oE '\("[a-z_]+", "[^"]+"\)' "$1" \
+    awk '/pub fn op_arity/{inside=1} inside{print} inside && /^}/{exit}' "$1" \
+        | grep -oE '\("[a-z_]+", "[^"]+"\)' \
         | sed -E 's/^\("([a-z_]+)", "(.*)"\)$/\1|\2/' \
         | while IFS='|' read -r fam rest; do
             echo "$rest" | tr '|' '\n' \

@@ -6,6 +6,10 @@
 // Requires SOFUU_CONTRACT_MODEL to name an existing real-weight GGUF and
 // SOFUU_HOME to name a temporary home. No weights are downloaded. The small
 // synthetic contract fixture is a parser fixture, not evidence of inference.
+// The served brain is kept inside SOFUU_HOME, so a contract run never
+// touches the developer's real brain.
+// RESOURCE: real: SOFUU_CONTRACT_MODEL served by the real `sofuu serve`; blocks when unset
+//
 // Run: SOFUU_ALLOW_LOOPBACK=1 SOFUU_CONTRACT_MODEL=/path/to/model.gguf \
 //      SOFUU_HOME=/path/to/temporary/home ./sofuu run scripts/contract/harness/t52_serve_v1.js
 'use strict';
@@ -23,6 +27,14 @@ setTimeout(() => {
 
 const P = (s) => JSON.parse(s);
 
+/* The binary that runs this harness: every surface under test must be the
+ * same build, so the spawned CLI/server is the running artifact itself. */
+function runtimeBinary() {
+    const argv = process.argv || [];
+    if (argv.length > 0 && typeof argv[0] === "string" && argv[0].length > 0) return argv[0];
+    return process.env.SOFUU_BIN || "./sofuu";
+}
+
 // One HTTP round-trip helper against the serve process (curl keeps this a
 // standards check — the assertion is about the wire, not our client).
 function curl(args) {
@@ -31,6 +43,20 @@ function curl(args) {
         sofuu.spawn({
             command: "/usr/bin/curl",
             args: ["-s", "-S", "-f", "-m", "45", "-H", "Authorization: Bearer t52-contract-token"].concat(args),
+            onStdout: (c) => { out += String(c); },
+            onExit: (code) => resolve({ code: code, out: out }),
+        });
+    });
+}
+
+// The same round trip without curl's --fail: an error response body is the
+// thing under test, so the status line must not suppress it.
+function curlBody(args) {
+    return new Promise((resolve) => {
+        let out = "";
+        sofuu.spawn({
+            command: "/usr/bin/curl",
+            args: ["-s", "-S", "-m", "45", "-H", "Authorization: Bearer t52-contract-token"].concat(args),
             onStdout: (c) => { out += String(c); },
             onExit: (code) => resolve({ code: code, out: out }),
         });
@@ -52,12 +78,15 @@ async function main() {
         console.error("BLOCKED: unset SOFUU_SERVE_TOKEN so the harness can use its own test token");
         process.exit(2);
     }
-    const binary = process.env.SOFUU_BIN || "./sofuu";
+    const binary = runtimeBinary();
     const port = 27800 + (Date.now() % 800);
     const modelId = "t52-contract-real-model";
+    // Keep the served brain inside the isolated home: the default path is
+    // the developer's real $HOME brain, which a contract run must not touch.
+    const brain = process.env.SOFUU_HOME + "/t52-contract-brain.qtsq";
     srv = sofuu.spawn({
         command: binary,
-        args: ["serve", "--model", modelPath, "--model-id", modelId, "--port", String(port), "--host", "127.0.0.1", "--token", "t52-contract-token"],
+        args: ["serve", "--model", modelPath, "--model-id", modelId, "--port", String(port), "--host", "127.0.0.1", "--token", "t52-contract-token", "--brain", brain],
         onStdout: () => {},
         onStderr: () => {},
         onExit: () => {},
@@ -121,6 +150,20 @@ async function main() {
                 && typeof j3.choices[0].message.content === "string"
                 && j3.choices[0].message.content.length > 0
                 && j3.object === "chat.completion");
+
+            // ── extra: an unconfigured model is refused, not answered ──
+            // A server that answers every model name with a canned reply
+            // would pass the assertions above; this proves the answer came
+            // from the loaded weights.
+            const r4 = await curlBody(["-X", "POST", base + "/v1/chat/completions",
+                "-H", "Content-Type: application/json",
+                "-d", JSON.stringify({ model: "t52-model-that-was-never-loaded",
+                    messages: [{ role: "user", content: "hi" }], max_tokens: 8 })]);
+            let j4 = null;
+            try { j4 = P(r4.out); } catch (e) {}
+            assert("unknown model is refused with the standard error envelope",
+                r4.code === 0 && j4 && j4.error && typeof j4.error.message === "string"
+                && j4.error.code === "model_not_found");
         }
     } finally {
         try { srv.kill && srv.kill(); } catch (e) {}

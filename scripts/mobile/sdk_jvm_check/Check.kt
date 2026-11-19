@@ -1,35 +1,93 @@
-// Desktop JVM check for the Sofuu Android SDK wrapper (SofuuBridge.kt).
+// scripts/mobile/sdk_jvm_check/Check.kt — desktop JVM check for the Sofuu
+// Android SDK wrapper (SofuuBridge.kt).
 //
 // Run by scripts/mobile/sdk_jvm_check.sh: that script compiles the SAME
 // jni_bridge.c the NDK builds for Android, but for the host OS, links it
-// against dist/libsofuu, compiles the real Kotlin wrapper, and then runs
-// this file. No device and no network are involved.
+// against the runtime built from this source tree, compiles the real Kotlin
+// wrapper, and then runs this file.
+//
+// REAL EXECUTION (RULES.md §1.9)
+//   * Every model call below runs the REAL in-process engine against an
+//     existing local GGUF (SmolLM2-360M-Instruct by default). No provider is
+//     stubbed, no answer is canned: the deltas asserted here are the model's
+//     own, and the token counts come from the engine.
+//   * The host-tool callbacks read a REAL temporary file off disk, and the
+//     answers travel back through the runtime's own tool registry.
+//   * The camera is NOT exercised: a camera needs a physical Android device,
+//     so camera coverage is reported as UNVERIFIED here instead of being
+//     faked with a canned path.
+//
+// SCOPE: host JVM only. This is NOT Android device coverage.
 //
 // What it pins down:
-//   - the UTF-8 boundary (JNI "UTF-8" is CESU-8 for non-BMP text: an emoji
-//     in a prompt used to arrive at serde_json as invalid UTF-8, so the
-//     engine saw no arguments at all)
-//   - streaming deltas and the single terminal `done` event
-//   - mid-flight cancel via the listener returning false
-//   - streamLocal's positional-argument contract
-//   - host tools: sync results, and deferred ones resolved from another
-//     thread (uv_async_send → the engine loop resumes the turn)
+//   - the UTF-8 boundary (JNI "UTF-8" is CESU-8 for non-BMP text) in both
+//     directions: Kotlin → runtime → Kotlin, and file → host tool → runtime
+//   - real streaming deltas from the local engine and the single terminal
+//     `done` event
+//   - mid-flight cancel: the listener returns false and the stream stops
+//   - ai.streamLocal's positional-argument contract, with maxTokens proven
+//     to have reached the engine by the token count it allows
+//   - host tools: a sync answer and one settled from another thread
 //   - close(): the wrapper goes inert and releases its registrations
 
 import com.sofuu.runtime.SofuuBridge
-import java.util.concurrent.CompletableFuture
-import java.util.concurrent.TimeUnit
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
+import java.nio.file.Files
+import kotlin.math.abs
 import kotlin.system.exitProcess
 
+private var checks = 0
 private var failures = 0
+private var blocked = 0
+
 private fun check(cond: Boolean, what: String) {
-    if (cond) println("  ok  : $what") else { failures++; println("  FAIL: $what") }
+    checks++
+    if (cond) {
+        println("  ok  : $what")
+    } else {
+        failures++
+        println("  FAIL: $what")
+    }
 }
 
-private fun jsonQuote(s: String) = org.json.JSONObject.quote(s)
+/** A case that could not run here (no local model, no device). Not a pass. */
+private fun block(what: String, why: String) {
+    blocked++
+    println("  BLOCKED: $what — $why")
+}
 
-// Generic RS256 fixture shared with the Rust crypto tests. The token is
-// signed for https://app.example.com and expires in 2100.
+private fun eventOf(evt: String): JSONObject? = try {
+    JSONObject(evt)
+} catch (e: org.json.JSONException) {
+    null
+}
+
+private fun kindOf(evt: String): String? =
+    eventOf(evt)?.optString("kind")?.takeIf { it.isNotEmpty() }
+
+private fun textOf(evt: String): String =
+    eventOf(evt)?.optString("text") ?: ""
+
+private fun doneEventOf(events: List<String>): JSONObject? =
+    events.lastOrNull { kindOf(it) == "done" }?.let { eventOf(it) }
+
+/** The real local GGUF the model cases run against, or null when none is available. */
+private fun localModel(): String? {
+    val raw = System.getProperty("sofuu.jvm.check.model")
+        ?: System.getenv("SOFUU_JVM_CHECK_MODEL")
+        ?: return null
+    if (raw.isBlank()) return null
+    val f = File(raw)
+    return if (f.isFile) f.absolutePath else null
+}
+
+// Generic RS256 fixture shared with the Rust crypto tests
+// (crates/sofuu-core/src/rt/crypto.rs — tests::TEST_JWK / tests::TEST_JWT).
+// The token is signed for https://app.example.com and expires in 2100; its
+// payload carries the `azp` claim the verifier checks against
+// authorizedParties.
 private const val TEST_JWKS = """
 {"keys":[{
   "kty":"RSA",
@@ -44,71 +102,40 @@ private const val TEST_JWT =
 private const val JWT_OPTIONS =
     """{"issuer":"https://app.example.com","authorizedParties":["https://app.example.com"],"nowMs":1800000000000}"""
 
-/** Mock provider that calls [tool] in round 1 and reports CONFIRMED only
- *  when it sees [token] in the messages it is handed in round 2. */
-private fun mockAgent(token: String, agent: String, tool: String): String = """
-(function(){
-  var TOKEN = ${jsonQuote(token)};
-  var round = 0;
-  sofuu.ai.stream = function(opts) {
-    round++;
-    var toolRound = (round === 1);
-    var chunks;
-    if (toolRound) { chunks = []; }
-    else {
-      var seen = JSON.stringify((opts && opts.messages) || []);
-      chunks = [{ text: seen.indexOf(TOKEN) >= 0 ? "CONFIRMED-TOOL-RESULT" : "MISSING-TOOL-RESULT" }];
-    }
-    var i = 0;
-    var it = {
-      usage: { promptTokens: 11, completionTokens: 3, finishReason: "stop" },
-      toolCalls: toolRound
-        ? [{ index: 0, id: "call_1", function: { name: ${jsonQuote(tool)}, arguments: "{}" } }]
-        : [],
-      abort: function() {},
-      next: function() {
-        if (i < chunks.length) return Promise.resolve({ value: chunks[i++], done: false });
-        return Promise.resolve({ value: undefined, done: true });
-      }
-    };
-    it[Symbol.asyncIterator] = function() { return it; };
-    return it;
-  };
-  sofuu.agent.define({
-    name: ${jsonQuote(agent)},
-    system: "You are a test agent.",
-    provider: "mock",
-    model: "mock-tool-test",
-    tools: [{ builtin: ${jsonQuote(tool)} }],
-    budget: { maxSteps: 4 }
-  });
-})()
-"""
-
-private fun collectAgent(rt: SofuuBridge, target: String): List<String> {
-    val events = mutableListOf<String>()
-    val ok = rt.callStream("agent.run", "{\"target\":\"$target\",\"task\":\"take a photo\"}") { evt ->
-        events.add(evt)
-        true
-    }
-    check(ok, "agent.run dispatches ($target)")
-    return events
-}
-
 fun main() {
     println("== sofuu Kotlin SDK — desktop JVM check ==")
+    val model = localModel()
     val rt = SofuuBridge()
     check(rt.abiVersion == 2, "abiVersion == 2 (got ${rt.abiVersion})")
 
-    // 1) Non-BMP (emoji) round-trip through eval — the CESU-8 boundary
+    // 1) Non-BMP (emoji) round trip through eval — the CESU-8 boundary
     //    both ways. Without the UTF-8 conversion this fails: the JS source
     //    arrives as invalid UTF-8, or the result comes back as mojibake.
     val emoji = "\uD83E\uDD8A\u65E5\u672C" // 🦊日本
     val evalOut = rt.eval("JSON.stringify({t:\"$emoji\"})")
     check(evalOut != null && evalOut.contains(emoji), "eval round-trips emoji + CJK (got: $evalOut)")
 
-    // 2) Crypto/JWT primitives exposed by the same bridge. The fixture is
-    //    generic (app.example.com) and the signature is pre-generated.
+    // 2) The renderer the local engine builds its prompt with: the emoji has
+    //    to survive Kotlin → JSON → JS → prompt → Kotlin, or the engine
+    //    would be prompted with mojibake. The C ABI spreads a JSON array as
+    //    POSITIONAL arguments, so the message array is nested one level.
+    val templateArgs = JSONArray()
+        .put(
+            JSONArray().put(
+                JSONObject().put("role", "user").put("content", emoji)
+            )
+        )
+        .toString()
+    val templateEnvelope = rt.call("ai.applyChatTemplate", templateArgs)
+    check(
+        templateEnvelope != null && templateEnvelope.contains(emoji),
+        "the rendered prompt keeps the emoji intact (got: $templateEnvelope)",
+    )
+
+    // 3) Crypto/JWT primitives exposed by the same bridge. The fixture is
+    //    generic (app.example.com) and the signature is pre-generated: a
+    //    static vector for a deterministic pure computation, not a stand-in
+    //    for a live service.
     val caps = rt.checkCaps()
     check(caps.contains("\"has_crypto\":true"), "checkCaps reports crypto (got: $caps)")
     check(caps.contains("\"has_storage\":true"), "checkCaps reports storage")
@@ -120,6 +147,31 @@ fun main() {
     check(rt.base64urlDecode("aGVsbG8") == "hello", "base64url decodes without padding")
     check(rt.base64urlDecode("aGk==") == null, "base64url rejects over-padding")
 
+    // 3b) The AAR's similarity() helper: the REAL cosine similarity over
+    //     real vectors, unwrapped from the ABI's JSON envelope. A helper
+    //     that answered a constant 0 would look like a measurement, so the
+    //     check pins the actual value the engine computed.
+    val simExposed = rt.eval("typeof sofuu.ai.similarity === 'function' ? 'yes' : 'no'")
+    if (simExposed?.contains("yes") == true) {
+        val v1 = floatArrayOf(1f, 0f, 0f, 0f)
+        val v2 = floatArrayOf(0f, 1f, 0f, 0f)
+        val simSame = rt.similarity(v1, v1)
+        val simOrtho = rt.similarity(v1, v2)
+        check(
+            simSame != null && abs(simSame - 1f) < 1e-5,
+            "similarity of a vector with itself is 1 (got: $simSame)",
+        )
+        check(
+            simOrtho != null && abs(simOrtho) < 1e-5,
+            "similarity of orthogonal vectors is 0 (got: $simOrtho)",
+        )
+    } else {
+        block(
+            "the AAR similarity() helper",
+            "this runtime build does not expose sofuu.ai.similarity",
+        )
+    }
+
     val jwtOut = rt.verifyJWT(TEST_JWT, TEST_JWKS, JWT_OPTIONS)
     check(jwtOut != null && jwtOut.contains("\"ok\":true"), "valid RS256 JWT verifies (got: $jwtOut)")
     check(jwtOut != null && jwtOut.contains("user_test_123"), "verified JWT exposes sub")
@@ -127,7 +179,7 @@ fun main() {
     val bad = rt.verifyJWT(tampered, TEST_JWKS, JWT_OPTIONS)
     check(bad != null && bad.contains("\"ok\":false"), "tampered JWT is rejected (got: $bad)")
 
-    // 3) Malformed argsJson is rejected before it reaches the ABI.
+    // 4) Malformed argsJson is rejected before it reaches the ABI.
     var threw = false
     try {
         rt.callStream("ai.stream", "{not json") { true }
@@ -136,116 +188,239 @@ fun main() {
     }
     check(threw, "callStream rejects malformed argsJson")
 
-    // 4) Streaming: deltas, terminal done, emoji in ARGS and in EVENTS.
-    rt.eval("""
-      sofuu.ai.stream = function(opts){
-        return (async function*(){
-          yield {text: "echo:" + ((opts && opts.prompt) || "")};
-          yield {text: "\u4E16\u754C"};
-          yield {text: "\uD83E\uDD8A"};
-        })();
-      };
-    """.trimIndent())
-    val events = mutableListOf<String>()
-    val ok = rt.callStream("ai.stream", "{\"prompt\":\"$emoji\"}") { evt ->
-        events.add(evt)
-        true
-    }
-    check(ok, "callStream dispatches")
-    check(events.count { it.contains("\"kind\":\"delta\"") } == 3, "three delta events")
-    check(events.count { it.contains("\"kind\":\"done\"") } == 1, "exactly one terminal done event")
-    check(events.last().contains("\"aborted\":false"), "done is not aborted")
-    check(events.any { it.contains("echo:$emoji") }, "emoji survived args → JS → event")
-    check(events.any { it.contains("\uD83E\uDD8A") }, "emoji survived a streamed delta")
+    if (model == null) {
+        block(
+            "real inference cases (ai.stream, ai.streamLocal, agent.run, mid-flight cancel)",
+            "no local GGUF available — set SOFUU_JVM_CHECK_MODEL or pass -Dsofuu.jvm.check.model=<file.gguf>",
+        )
+    } else {
+        println("  ..   model: $model")
+        // ai.streamLocal is the RAW-prompt API: the caller owns the prompt
+        // format, so the chat-formatted prompt the engine would have built
+        // itself is handed over as-is.
+        val rawPrompt = "user\nName three sea birds, one per line.\nassistant\n"
 
-    // 4) Mid-flight cancel: returning false from the listener stops the pump.
-    rt.eval("""
-      sofuu.ai.stream = function(opts){
-        return (async function*(){ for (var i=0;i<1000;i++){ yield {text:"t"+i}; } })();
-      };
-    """.trimIndent())
-    var deltas = 0
-    val ev2 = mutableListOf<String>()
-    val ok2 = rt.callStream("ai.stream", null) { evt ->
-        ev2.add(evt)
-        if (evt.contains("\"kind\":\"delta\"")) { deltas++; deltas < 3 } else true
-    }
-    check(ok2 && deltas == 3, "cancel took effect after 3 deltas (got $deltas)")
-    check(ev2.last().contains("\"aborted\":true"), "done reports aborted:true (got: ${ev2.last()})")
+        // 5) REAL streaming: the local engine decodes a prompt that carries
+        //    the emoji, and the deltas below are the model's own tokens.
+        val streamEvents = mutableListOf<String>()
+        val streamArgs = JSONObject()
+            .put("model", model)
+            .put("prompt", "Reply with one short sentence about $emoji.")
+            .put("maxTokens", 24)
+            .toString()
+        val dispatched = rt.callStream("ai.stream", streamArgs) { evt ->
+            streamEvents.add(evt)
+            true
+        }
+        check(dispatched, "ai.stream dispatched to the local engine")
+        val deltas = streamEvents.filter { kindOf(it) == "delta" }
+        val done = doneEventOf(streamEvents)
+        check(deltas.isNotEmpty(), "the local engine streamed real deltas (${deltas.size})")
+        check(streamEvents.count { kindOf(it) == "done" } == 1, "exactly one terminal done event")
+        check(done?.optJSONObject("error") == null, "the terminal done carries no error")
+        check(done?.optBoolean("aborted") == false, "the terminal done is not aborted")
+        val completionTokens = done?.optJSONObject("usage")?.optInt("completionTokens") ?: 0
+        check(completionTokens > 0, "the engine counted real completion tokens ($completionTokens)")
+        check(deltas.joinToString("") { textOf(it) }.isNotBlank(), "the model produced non-empty text")
+        check(
+            streamEvents.all { eventOf(it) != null && kindOf(it) != null },
+            "every streamed event crossed the JNI boundary as well-formed JSON",
+        )
 
-    // 5) streamLocal: positional args + the options builder, mocked.
-    rt.eval("""
-      sofuu.ai.streamLocal = function(path, prompt, opts){
-        return (async function*(){
-          yield {text: "path=" + path};
-          yield {text: "prompt=" + prompt};
-          yield {text: "max=" + (opts && opts.maxTokens) + " temp=" + (opts && opts.temperature)};
-        })();
-      };
-    """.trimIndent())
-    val ev5 = mutableListOf<String>()
-    val ok5 = rt.streamLocal("/models/x.gguf", "h\u00E9llo $emoji", maxTokens = 7, temperature = 0.3f) { e ->
-        ev5.add(e)
-        true
-    }
-    val j5 = ev5.joinToString("\n")
-    check(ok5, "streamLocal dispatches")
-    check(j5.contains("path=/models/x.gguf"), "streamLocal passes modelPath positionally")
-    check(j5.contains("prompt=h\u00E9llo $emoji"), "streamLocal passes prompt positionally (emoji intact)")
-    check(j5.contains("max=7") && j5.contains("temp=0.3"), "streamLocal builds options (max=7, temp=0.3)")
+        // 6) REAL mid-flight cancel: the listener stops the pump and the
+        //    runtime reports the abort.
+        var cancelDeltas = 0
+        val cancelEvents = mutableListOf<String>()
+        val cancelDispatched = rt.streamLocal(
+            model, rawPrompt, maxTokens = 32, temperature = 0.2f,
+        ) { evt ->
+            cancelEvents.add(evt)
+            if (kindOf(evt) == "delta") { cancelDeltas++; false } else true
+        }
+        check(cancelDispatched, "the cancelled stream dispatched")
+        check(
+            cancelDeltas == 1,
+            "the listener stopped the pump after the first delta (got $cancelDeltas; events: $cancelEvents)",
+        )
+        val cancelDone = doneEventOf(cancelEvents)
+        check(cancelDone?.optBoolean("aborted") == true, "the terminal done reports aborted:true")
+        check(
+            cancelDone?.optInt("deltas") == cancelDeltas,
+            "the terminal counts the deltas that were delivered",
+        )
 
-    // 6) Host tool (sync): its result reaches the model's transcript.
+        // 7) The agent loop on the real engine: the answer comes from the
+        //    local model, not from a scripted provider.
+        val defined = rt.eval(
+            """
+            sofuu.agent.define({
+              name: 'jvm-check-agent',
+              system: 'You answer with one short sentence.',
+              provider: 'local',
+              model: ${JSONObject.quote(model)},
+              budget: { maxSteps: 1 }
+            })
+            """.trimIndent()
+        )
+        check(defined != null && defined.contains("\"ok\":true"), "agent.define accepted the local agent (got: $defined)")
+        val agentEvents = mutableListOf<String>()
+        val agentDispatched = rt.callStream(
+            "agent.run",
+            """{"target":"jvm-check-agent","task":"Say hello in one short sentence."}""",
+        ) { evt ->
+            agentEvents.add(evt)
+            true
+        }
+        check(agentDispatched, "agent.run dispatched to the local engine")
+        val agentDone = doneEventOf(agentEvents)
+        check(
+            agentDone != null && agentDone.optJSONObject("error") == null,
+            "the agent turn ended without an error (got: ${agentDone?.optJSONObject("error")})",
+        )
+        check(
+            agentEvents.filter { kindOf(it) != "done" }.joinToString("").isNotBlank(),
+            "the agent produced a real answer",
+        )
+
+        // 8) streamLocal's positional contract: (modelPath, prompt, options).
+        //    maxTokens is proven to have reached the engine by the number of
+        //    tokens it allows.
+        val localEvents = mutableListOf<String>()
+        val localDispatched = rt.streamLocal(
+            model, rawPrompt, maxTokens = 8, temperature = 0.2f,
+        ) { evt ->
+            localEvents.add(evt)
+            true
+        }
+        check(localDispatched, "streamLocal dispatched")
+        val localDeltas = localEvents.count { kindOf(it) == "delta" }
+        check(localDeltas in 1..8, "streamLocal honoured maxTokens=8 (deltas=$localDeltas; events: $localEvents)")
+        check(localEvents.count { kindOf(it) == "done" } == 1, "streamLocal ends with exactly one done event")
+        check(
+            localEvents.filter { kindOf(it) == "delta" }.joinToString("") { textOf(it) }.isNotBlank(),
+            "streamLocal produced non-empty model text",
+        )
+    }
+
+    // 9) Host tool (sync): the callback reads a REAL temporary file, and
+    //    the answer comes back through the runtime's own tool registry —
+    //    the same entry the agent's tool loop calls.
+    val sample = Files.createTempFile("sofuu-jvm-check-", ".txt")
+    val marker = "host-read-${System.nanoTime()}"
+    val payload = "$marker $emoji"
+    Files.write(sample, payload.toByteArray(Charsets.UTF_8))
     var syncCalls = 0
     val regSync = rt.registerHostTool(
-        "take_photo", "Takes a photo with the device camera",
+        "read_sample", "Reads the check's sample file",
         "{\"type\":\"object\",\"properties\":{}}",
     ) { _, _ ->
         syncCalls++
-        "{\"path\":\"/tmp/TOOLRES-photo-9f3.jpg\"}"
+        JSONObject()
+            .put("content", String(Files.readAllBytes(sample), Charsets.UTF_8))
+            .put("path", sample.toString())
+            .toString()
     }
-    check(regSync, "registerHostTool(take_photo)")
-    rt.eval(mockAgent("TOOLRES-photo-9f3", "photo-agent", "take_photo"))
-    val joined3 = collectAgent(rt, "photo-agent").joinToString("\n")
-    check(syncCalls == 1, "the host tool ran exactly once (got $syncCalls)")
+    check(regSync, "registerHostTool(read_sample)")
+    val syncResult = rt.callResult("tools.TOOLS.read_sample.execute", "{}")
     check(
-        joined3.contains("CONFIRMED-TOOL-RESULT") && !joined3.contains("MISSING-TOOL-RESULT"),
-        "sync tool result reached the model transcript",
+        syncResult != null && syncResult.contains(marker),
+        "the host tool's real file read reached the runtime (got: $syncResult)",
+    )
+    check(
+        syncResult != null && syncResult.contains(emoji),
+        "the file's non-ASCII content survived the host-tool round trip",
+    )
+    check(syncCalls == 1, "the host tool ran exactly once (got $syncCalls)")
+
+    // The agent's tool set picks the host tool up from the runtime's
+    // registry — the same entry the tool loop executes above.
+    val definedWithTool = rt.eval(
+        """
+        sofuu.agent.define({
+          name: 'jvm-check-host-agent',
+          provider: 'local',
+          ${if (model != null) "model: ${JSONObject.quote(model)}," else ""}
+          tools: [{ builtin: 'read_sample' }]
+        })
+        """.trimIndent()
+    )
+    check(
+        definedWithTool != null && definedWithTool.contains("\"ok\":true"),
+        "agent.define accepts the registered host tool (got: $definedWithTool)",
+    )
+    check(
+        definedWithTool != null && definedWithTool.contains("read_sample"),
+        "the agent's tool set carries the host tool",
     )
 
-    // 7) Host tool (deferred): invoke returns null, another thread settles it.
-    val resolved = CompletableFuture<Boolean>()
-    val regSlow = rt.registerHostTool(
-        "slow_photo", "Takes a photo (slowly)",
+    // 10) Host tool (deferred): the callback takes the call, a worker thread
+    //    settles it later, and the runtime's promise resolves with the
+    //    file's real content.
+    var asyncCalls = 0
+    val regAsync = rt.registerHostTool(
+        "read_sample_async", "Reads the check's sample file on a worker thread",
         "{\"type\":\"object\",\"properties\":{}}",
     ) { _, callId ->
+        asyncCalls++
         Thread {
-            Thread.sleep(120)
-            resolved.complete(rt.resolveHostTool(callId, "\"TOOLRES-slow-7c1\"", null))
+            Thread.sleep(150)
+            val content = String(Files.readAllBytes(sample), Charsets.UTF_8)
+            rt.resolveHostTool(callId, JSONObject().put("content", content).toString(), null)
         }.start()
-        null // pending — settled from the other thread
+        null
     }
-    check(regSlow, "registerHostTool(slow_photo)")
-    rt.eval(mockAgent("TOOLRES-slow-7c1", "slow-agent", "slow_photo"))
-    val joined4 = collectAgent(rt, "slow-agent").joinToString("\n")
-    check(resolved.get(10, TimeUnit.SECONDS), "resolveHostTool accepted the id from another thread")
-    check(joined4.contains("CONFIRMED-TOOL-RESULT"), "deferred tool result reached the transcript")
+    check(regAsync, "registerHostTool(read_sample_async)")
+    // A pending host-tool call is a promise, not a libuv handle: the event
+    // loop would drain before the worker answers. A real agent turn keeps
+    // itself alive with its tool-timeout timer; for a direct tool call the
+    // check arms the same keep-alive and clears it when the answer lands.
+    val armed = rt.eval(
+        """
+        (function(){
+          var orig = sofuu.tools.TOOLS.read_sample_async.execute;
+          sofuu.tools.TOOLS.read_sample_async.execute = function(args) {
+            var keep = setTimeout(function () {}, 10000);
+            return orig.call(null, args).then(
+              function (v) { clearTimeout(keep); return v; },
+              function (e) { clearTimeout(keep); throw e; });
+          };
+          return 'armed';
+        })()
+        """.trimIndent()
+    )
+    check(armed != null && armed.contains("armed"), "the deferred tool's keep-alive is armed")
+    val asyncResult = rt.callResult("tools.TOOLS.read_sample_async.execute", "{}")
+    check(
+        asyncResult != null && asyncResult.contains(marker),
+        "the deferred host tool result arrived from the worker thread (got: $asyncResult)",
+    )
+    check(asyncCalls == 1, "the deferred host tool ran exactly once (got $asyncCalls)")
 
-    // 8) Unknown call id is refused, not crashed on.
+    // 11) Unknown call id is refused, not crashed on.
     check(!rt.resolveHostTool(9999, "\"x\"", null), "unknown call id refused")
 
-    // 9) close(): the wrapper goes inert and releases its registrations.
+    // 12) close(): the wrapper goes inert and releases its registrations.
     rt.close()
     check(rt.isClosed, "isClosed after close()")
     check(rt.eval("1+1") == null, "eval inert after close()")
-    check(rt.resolveHostTool(1, "\"x\"", null) == false, "resolve inert after close()")
+    check(!rt.resolveHostTool(1, "\"x\"", null), "resolve inert after close()")
     check(!rt.registerHostTool("x", "x", "{}") { _, _ -> null }, "register inert after close()")
     rt.close() // idempotent
     check(true, "double close() is a no-op")
 
-    if (failures == 0) {
-        println("ALL CHECKS PASSED")
+    Files.deleteIfExists(sample)
+
+    // 13) Camera: NOT covered here. A camera needs a physical Android
+    //     device and the host JVM has none, so camera coverage is recorded
+    //     as UNVERIFIED — it is not simulated and not asserted.
+    println("  UNVERIFIED: camera capture — needs a physical Android device (no camera on the host JVM)")
+
+    println()
+    if (failures == 0 && blocked == 0) {
+        println("ALL CHECKS PASSED ($checks checks) — host-JVM coverage only, not Android device coverage")
     } else {
-        println("$failures CHECK(S) FAILED")
-        exitProcess(1)
+        if (failures > 0) println("$failures CHECK(S) FAILED")
+        if (blocked > 0) println("$blocked CASE(S) BLOCKED")
+        exitProcess(if (failures > 0) 1 else 2)
     }
 }

@@ -1,8 +1,17 @@
 // t21_timeout.js — R2.2: a deadline is enforced independently of output.
 //
-// Spawns a silent child (`sleep 5`), applies a 700 ms deadline, kills it, and
-// asserts the operation terminated within the contract bound (deadline ±2 s,
-// SPEC T2.1) and the child did not survive as an orphan.
+// The operation under test is a REAL child process (a `sleep` the harness
+// spawns); the deadline is the real kill the harness issues, and the orphan
+// check looks at that same real process in the process table. Nothing here
+// is a scripted provider: there is no model, no stub and no canned answer —
+// only the operating system.
+//
+// The case asserts the contract bound (deadline ±2 s, SPEC T2.1), that the
+// child was demonstrably alive when the deadline fired, that the exit is a
+// signal death (not a clean exit), and that no orphan survived the kill.
+//
+// RESOURCE: real: a real child process and the real process table (no
+// provider involved)
 //
 // Run: ./sofuu run scripts/contract/harness/t21_timeout.js
 'use strict';
@@ -35,15 +44,25 @@ async function main() {
     }
 
     const t0 = Date.now();
-    let ended = false, exitInfo = null;
+    let ended = false, exitCode = null, exitSignal = null;
     const child = sofuu.spawn({
         command: "bash",
         args: ["-c", "exec -a " + MARKER + " sleep 5"],
-        onExit: (info) => { ended = true; exitInfo = info; },
+        onExit: (code, signal) => { ended = true; exitCode = code; exitSignal = signal; },
         onStdout: () => {},
         onStderr: () => {},
     });
     assert("spawn returned a handle", child != null);
+
+    // The deadline only means something against an operation that is REALLY
+    // in flight: wait until the child is visible in the process table.
+    let alive = [];
+    const tAlive = Date.now();
+    while (alive.length === 0 && Date.now() - tAlive < 5000) {
+        alive = await pgrepChild();
+        if (alive.length === 0) await new Promise((r) => setTimeout(r, 25));
+    }
+    assert("the child is really running before the deadline fires", alive.length > 0);
 
     setTimeout(() => {
         try { child.kill(); } catch (e) { console.error("  kill error:", e && e.message); }
@@ -75,7 +94,12 @@ async function main() {
         (slack > 0 ? `, incl. ${slack} ms scheduler slack` : "") + ")",
         wall <= wallBound
     );
-    assert("exit reflects the kill, not a clean 5 s sleep", exitInfo == null || true);
+    // The child must have been KILLED, not allowed to finish its 5 s sleep:
+    // a signal death (SIGTERM=15 by default) is the observable proof.
+    assert(
+        `exit reflects the kill, not a clean 5 s sleep (code=${exitCode}, signal=${exitSignal})`,
+        exitSignal === 15 || exitSignal === 9 || (exitCode !== 0 && exitCode !== null)
+    );
 
     // No orphan: the marked child must be gone. Reaping is asynchronous — a
     // killed child can linger in the process table for a scheduler tick

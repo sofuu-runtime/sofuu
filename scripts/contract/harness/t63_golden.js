@@ -1,6 +1,12 @@
 // t63_golden.js — R6.7/T6.3: the deterministic trace renderer matches the
 // committed golden fixture, and rendering is stable across runs.
 //
+// PURE CHECK: the renderer and the canonical-usage normaliser are
+// in-process computations over a committed static fixture — no
+// provider, model or network exchange is involved.
+//
+// RESOURCE: pure: the in-process renderer against committed golden bytes
+//
 // Run: ./sofuu run scripts/contract/harness/t63_golden.js
 // Fixtures: contract/fixtures/golden-trace.ndjson + golden-trace.txt
 // (regenerate the .txt only when the render contract changes — the bytes are

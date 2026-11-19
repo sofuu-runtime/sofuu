@@ -1,12 +1,20 @@
 // t22_cancel_stream.js — R2.3/R2.7: cancel mid-stream terminates promptly and
 // the delivered work is accounted.
 //
-// Streams from an in-process mock provider that emits slow frames, aborts at
-// the first frame, and asserts the consumer loop ended promptly (no hang, no
-// unbounded wait). The mock speaks the real OpenAI SSE wire format so this
-// exercises the native path (ai.rs → curl → SSE parse), not a JS stub.
+// The backend is the REAL model server: `sofuu.serve.start` loads an existing
+// local GGUF (no download, no synthetic weights) and streams genuine
+// inference over OpenAI-compatible SSE on loopback. The client is the real
+// native path (ai.rs → curl → SSE parse); the cancel is the real abort of
+// that in-flight transfer. No scripted provider and no canned frame exists
+// in this case any more.
 //
-// Run: ./sofuu run scripts/contract/harness/t22_cancel_stream.js
+// Requires SOFUU_CONTRACT_MODEL to name an existing real-weight GGUF. A
+// missing model is a blocked prerequisite, never a silent pass.
+//
+// RESOURCE: real: SOFUU_CONTRACT_MODEL (an existing local GGUF) served over a real loopback SSE endpoint; blocks when unset
+//
+// Run: SOFUU_CONTRACT_MODEL=/path/to/model.gguf \
+//      ./sofuu run scripts/contract/harness/t22_cancel_stream.js
 'use strict';
 
 const results = { passed: 0, failed: 0 };
@@ -14,68 +22,96 @@ function assert(label, cond) {
     if (cond) { console.log("  ✅ " + label); results.passed++; }
     else { console.error("  ❌ FAIL: " + label); results.failed++; }
 }
-setTimeout(() => { console.error("  ❌ WATCHDOG: harness overran 25 s"); process.exit(1); }, 25000);
+setTimeout(() => { console.error("  ❌ WATCHDOG: harness overran 180 s"); process.exit(1); }, 180000);
 
-const CANCEL_AFTER_MS = 250;
-const BOUND_MS = 1500;
+const BOUND_MS = 1500;      // the cancel must settle the consumer inside this
+const MAX_TOKENS = 256;     // the budget the cancelled turn was offered
+
+/* The real local weights this case may load. The synthetic contract fixture
+ * and the vocabulary-only GGUFs are parser fixtures — they are refused here,
+ * they are not inference evidence. */
+function resolveModel() {
+    const env = String((typeof process !== 'undefined' && process.env) ? (process.env.SOFUU_CONTRACT_MODEL || "") : "").trim();
+    if (!env) {
+        console.error("BLOCKED: set SOFUU_CONTRACT_MODEL to an existing real-weight GGUF " +
+            "(no weights are downloaded; the synthetic contract fixture is a parser fixture)");
+        process.exit(2);
+    }
+    if (!/\.gguf$/i.test(env) || !sofuu.fs.existsSync(env) ||
+        /(^|\/)sofuu-fixture\.gguf$/i.test(env) || /ggml-vocab-/i.test(env)) {
+        console.error("BLOCKED: SOFUU_CONTRACT_MODEL must name an existing real-weight GGUF " +
+            "(not a synthetic or vocabulary fixture): " + env);
+        process.exit(2);
+    }
+    return env;
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 async function main() {
-    // ── mock provider: 10 frames at 200 ms, then [DONE] ────────────────
-    let server = null, port = 0;
-    const base = 25400 + (Date.now() % 3000);
-    const handler = (req, res) => {
-        res.writeHead(200, { "Content-Type": "text/event-stream" });
-        let i = 0;
-        const timer = setInterval(() => {
-            i += 1;
-            if (i > 10) {
-                clearInterval(timer);
-                res.write("data: " + JSON.stringify({
-                    usage: { prompt_tokens: 3, completion_tokens: 10 },
-                }) + "\n\n");
-                res.write("data: [DONE]\n\n");
-                res.end();
-                return;
-            }
-            res.write("data: " + JSON.stringify({
-                choices: [{ delta: { content: "frame" + i } }],
-            }) + "\n\n");
-        }, 200);
-    };
-    for (let i = 0; i < 6; i++) {
-        const p = base + i * 137;
-        try { server = sofuu.createServer(handler); server.listen(p, "127.0.0.1"); port = p; break; }
-        catch (e) { server = null; }
-    }
-    assert("mock provider bound", server != null);
-    const URL = "http://127.0.0.1:" + port + "/v1/chat/completions";
+    const modelPath = resolveModel();
+    console.log("  ℹ model: " + modelPath);
 
-    // ── 1. full stream: usage arrives (R2.7 accounting baseline) ───────
-    let gotUsage = false, full = "";
-    const stFull = sofuu.ai.stream({
-        provider: "openai", model: "mock", api_key: "x", base_url: URL,
-        messages: [{ role: "user", content: "all" }],
-    });
-    for await (const chunk of stFull) {
-        if (chunk && chunk.text) full += chunk.text;
+    // ── the REAL model server on loopback ──────────────────────────────
+    const modelId = "t22-contract-model";
+    const token = "t22-contract-token";
+    const basePort = 25400 + (Date.now() % 3000);
+    let port = 0, started = null;
+    for (let i = 0; i < 8 && !port; i++) {
+        const p = basePort + i * 131;
+        try {
+            started = sofuu.serve.start({
+                modelPath: modelPath,
+                models: [{ id: modelId, path: modelPath }],
+                token: token,
+                host: "127.0.0.1",
+                port: p,
+                version: "contract-t22",
+                brainPath: "",
+            });
+            if (started && started.ok) port = p;
+        } catch (e) { started = null; }
     }
+    assert("the real model server bound on loopback", port !== 0);
+    if (!port) { console.log(`\n=== t22 results: ${results.passed} passed, ${results.failed} failed ===`); process.exit(1); }
+    const URL = "http://127.0.0.1:" + port + "/v1/chat/completions";
+    const streamOpts = {
+        provider: "openai", model: modelId, api_key: token, base_url: URL,
+        messages: [{ role: "user", content: "List ten colours, one per line." }],
+        max_tokens: MAX_TOKENS,
+    };
+
+    // ── 1. full stream: real output + usage (R2.7 accounting baseline) ──
+    let full = "", chunks = 0, streamErr = null;
+    const stFull = sofuu.ai.stream(streamOpts);
+    try {
+        for await (const chunk of stFull) {
+            if (chunk && chunk.text) { full += chunk.text; chunks++; }
+        }
+    } catch (e) { streamErr = e; }
     const u = stFull.usage || {};
-    gotUsage = (u.promptTokens || 0) > 0 || (u.completionTokens || 0) > 0;
-    assert("full stream completed (10 frames)", full.indexOf("frame10") >= 0);
+    const gotUsage = (u.promptTokens || 0) > 0 || (u.completionTokens || 0) > 0;
+    assert("the real model streamed text over SSE", streamErr == null && chunks >= 1 && full.trim().length > 0);
     assert("usage accounted on completion (R2.7)", gotUsage);
+    console.log(`  ℹ full stream: ${chunks} chunks, ${full.trim().length} chars, usage=${JSON.stringify(u)}`);
 
     // ── 2. cancel mid-stream: prompt termination, no hang ──────────────
-    const st = sofuu.ai.stream({
-        provider: "openai", model: "mock", api_key: "x", base_url: URL,
-        messages: [{ role: "user", content: "cancel me" }],
-    });
+    const st = sofuu.ai.stream(streamOpts);
     assert("stream exposes abort()", typeof st.abort === "function");
-    let sawFrame = false, terminated = false, threw = null;
+    let sawChunk = false, terminated = false, threw = null, abortAt = 0, delivered = "";
     const t0 = Date.now();
     try {
         for await (const chunk of st) {
-            if (chunk && chunk.text) sawFrame = true;
-            if (Date.now() - t0 >= CANCEL_AFTER_MS) { st.abort(); }
+            if (chunk && chunk.text) {
+                sawChunk = true;
+                delivered += chunk.text;
+                /* Cancel as soon as the consumer has read a chunk: the
+                 * transfer is in flight, so this IS a mid-stream cancel.
+                 * Waiting for a wall-clock window instead let a fast model
+                 * finish its whole answer first, and the cancel never
+                 * happened at all — the case then measured nothing. */
+                if (!abortAt) { abortAt = Date.now(); st.abort(); }
+            }
         }
         terminated = true;
     } catch (e) {
@@ -84,10 +120,25 @@ async function main() {
         threw = e;
         terminated = true;
     }
-    const wall = Date.now() - t0;
-    assert("abort terminated the consumer loop", terminated && sawFrame);
+    const wall = abortAt ? Date.now() - abortAt : Date.now() - t0;
+    assert("abort terminated the consumer loop", terminated && sawChunk);
+    assert("the cancelled turn delivered real model text before the abort",
+        sawChunk && delivered.trim().length > 0);
     assert(`prompt termination after abort (${wall} ms < ${BOUND_MS} ms)`, wall < BOUND_MS + 500);
+    assert("the aborted stream reports itself aborted", st.aborted === true);
     if (threw) console.log("  ℹ cancel surfaced as:", (threw && threw.message) || threw);
+    /* An aborted turn must not bill the whole budget it was offered. The
+     * provider's final usage frame never arrives for an aborted HTTP
+     * stream, so the client-side count can be 0 — a missing report, not a
+     * fabricated one. (The completed turn is a DIFFERENT sample of a
+     * stochastic model, so its token count is not a bound for this one;
+     * the exact "delivered tokens are accounted" property is asserted on
+     * the local-engine path in t64.) */
+    const cu = st.usage || {};
+    assert(
+        `the aborted turn did not bill the whole budget (${cu.completionTokens || 0} of ${MAX_TOKENS})`,
+        (cu.completionTokens || 0) < MAX_TOKENS
+    );
 
     console.log(`\n=== t22 results: ${results.passed} passed, ${results.failed} failed ===`);
     process.exit(results.failed === 0 ? 0 : 1);

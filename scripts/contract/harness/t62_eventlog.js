@@ -1,6 +1,13 @@
 // t62_eventlog.js — R6.2/R2.4: the session event log is the turn's source of
 // truth, with a total order and bounded queues.
 //
+// PURE CHECK: the events are a static fixture written to a REAL local
+// store (a temporary directory), so the log, the fold and the bounded
+// queue are exercised against the real filesystem. No provider, model
+// or network exchange is involved.
+//
+// RESOURCE: pure: a static event fixture written to a real local store
+//
 // Run: ./sofuu run scripts/contract/harness/t62_eventlog.js
 'use strict';
 

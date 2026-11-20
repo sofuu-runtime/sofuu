@@ -73,6 +73,11 @@ not proof of compatibility. For the C ABI, platform bindings, inference or
 hardware, run the corresponding crate, platform or real-resource checks and
 record unavailable environments explicitly.
 
+After changing the selection or result-reporting logic itself, run
+`python3 scripts/test-focused-runner.py`. It exercises the real Rust and
+contract runners, so it needs an executable `./sofuu` and an offline Cargo
+build environment; it does not substitute model or tool backends.
+
 ## Full Gates
 
 `make test-rust`, `make test`, and `bash scripts/preflight.sh` retain their

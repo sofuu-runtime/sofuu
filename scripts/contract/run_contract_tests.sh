@@ -24,6 +24,7 @@
 #   SOFUU_CONTRACT_MODEL=/path/to/existing/real-model.gguf \
 #     bash scripts/contract/run_contract_tests.sh
 #   SOFUU_CONTRACT_CASES=/absolute/path/to/cases.tsv  # optional subset
+#   SOFUU_CONTRACT_CASE=T1.1  # exactly one case from the selected table
 #
 # SOFUU_CONTRACT_MODEL is exported to every case, so all model-dependent
 # cases run against the SAME existing local weights. No weights are ever
@@ -92,6 +93,16 @@ fi
 if [ ! -f "$CASES" ]; then
     echo "✗ cases file missing: $CASES" >&2
     exit 2
+fi
+
+CASE_FILTER="${SOFUU_CONTRACT_CASE:-}"
+if [ -n "$CASE_FILTER" ]; then
+    matches=$(awk -F '|' -v id="$CASE_FILTER" '$1 == id { n++ } END { print n+0 }' "$CASES")
+    if [ "$matches" -ne 1 ]; then
+        echo "contract case '$CASE_FILTER' matched $matches rows; expected exactly one" >&2
+        exit 2
+    fi
+    echo "contract scope: $CASE_FILTER only (not the full contract suite)"
 fi
 
 pass=0; fail=0; blocked=0; real_execution_blocked=0
@@ -277,6 +288,7 @@ run_cabi_case() {
 while IFS='|' read -r id rule clause kind envspec cmd expect prereq; do
     [ -z "${id:-}" ] && continue
     case "$id" in \#*) continue ;; esac
+    if [ -n "$CASE_FILTER" ] && [ "$id" != "$CASE_FILTER" ]; then continue; fi
     # A case that runs a harness must agree with that harness's own
     # declaration of the resource it uses (see check_case_resource). The
     # scripted-provider cases that used to live here were migrated to real
@@ -299,6 +311,10 @@ done < "$CASES"
 total=$((pass + fail + blocked))
 echo
 printf 'summary: %d cases — PASS %d · FAIL %d · BLOCKED %d\n' "$total" "$pass" "$fail" "$blocked"
+if [ "$total" -eq 0 ]; then
+    echo "contract suite NOT green: no cases were executed" >&2
+    exit 2
+fi
 if [ "$fail" -gt 0 ]; then
     echo "contract violations:"
     for f in "${failures[@]}"; do echo "  - $f"; done
@@ -318,7 +334,11 @@ if [ "$real_execution_blocked" -gt 0 ]; then
 fi
 
 if [ "$pass" -eq "$total" ]; then
-    echo "contract suite GREEN"
+    if [ -n "$CASE_FILTER" ]; then
+        echo "contract case GREEN ($CASE_FILTER only; full suite not run)"
+    else
+        echo "contract suite GREEN"
+    fi
     exit 0
 elif [ "${ALLOW_BLOCKED:-0}" = "1" ] && [ "$((pass + blocked))" -eq "$total" ]; then
     echo "contract suite GREEN (0 failures, $blocked blocked runner prerequisite(s) allowed)"

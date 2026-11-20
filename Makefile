@@ -36,7 +36,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # Targets
 # ──────────────────────────────────────────────────────────────────
 
-.PHONY: real-mcp-check real-memory-check real-kaze-memory-check real-kaze-memory-durable-check real-kaze-alert-check real-kaze-fail-closed-check real-kaze-gguf-check real-gates kaze-js-boundary-check js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check cold-start-bench all clean install test preflight protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
+.PHONY: real-mcp-check real-memory-check real-kaze-memory-check real-kaze-memory-durable-check real-kaze-alert-check real-kaze-fail-closed-check real-kaze-gguf-check real-gates kaze-js-boundary-check js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check cold-start-bench all clean install test test-area test-rust-filter test-contract-case preflight protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
 	kaze-drift-check kaze-drift-strict clippy-ratchet \
 	observability-stress asan fuzz-simd policy-dx modern-npm sbom sign-dist \
         deps scoreboard scoreboard-check cuda-check \
@@ -370,6 +370,18 @@ clean:
 test-rust:
 	@bash scripts/preflight.sh rust
 
+# Focused development checks never imply the full suite or release passed.
+test-area:
+	@bash scripts/test-area.sh "$(AREA)"
+
+test-rust-filter:
+	@test -n "$(FILTER)" || { echo 'Set FILTER to a non-empty Rust test name filter' >&2; exit 2; }
+	@SOFUU_RUST_FILTER="$(FILTER)" bash scripts/preflight.sh rust
+
+test-contract-case:
+	@test -n "$(CASE)" || { echo 'Set CASE to an exact contract ID, for example T1.1' >&2; exit 2; }
+	@SOFUU_CONTRACT_CASE="$(CASE)" bash scripts/contract/run_contract_tests.sh
+
 # These targeted checks use real temporary resources. Set SOFUU_BIN to the
 # candidate under test; missing prerequisites are reported as blocked.
 real-mcp-check:
@@ -414,9 +426,8 @@ test: $(TARGET) kaze-drift-check clippy-ratchet js-swallow-check env-knobs-check
 	@echo ""
 	@bash scripts/preflight.sh real serve js
 
-# The mandatory pre-commit gate (RULES §3.4): domain isolation, bytecode
-# sync, Kaze drift, the binary size cap, the core unit tests and the
-# real-resource gates.
+# The full integration/release preflight. Focused changes use test-area or
+# the relevant individual sections; see RULES §3.3 and TESTING.md.
 preflight:
 	@bash scripts/preflight.sh
 

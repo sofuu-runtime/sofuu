@@ -13,7 +13,7 @@
 #   bytecode   shipped QuickJS snapshots match their sources (make bc-check)
 #   drift      Kaze product surface vs the prototype copy (make kaze-drift-check)
 #   size       release binary within SIZE_LIMIT (make size-check)
-#   rust       core unit tests: the compliant sofuu-core --lib subset
+#   rust       core unit tests; SOFUU_RUST_FILTER narrows the test names
 #   real       real-resource gates: real MCP, real memory, Kaze memory, real
 #              alert sinks, real local-GGUF inference, the event-loop benchmark
 #   serve      serve acceptance: names the scenarios that are blocked
@@ -170,28 +170,36 @@ PY
 }
 
 section_rust() {
-    local id=rust out rc summary t
-    local -a skip=()
+    local id=rust out rc summary t filter="${SOFUU_RUST_FILTER:-}"
+    local -a skip=() selection=()
     local scripted
     scripted=$(scripted_model_tests)
     while IFS= read -r t; do
         [ -n "$t" ] || continue
+        if [ -n "$filter" ]; then
+            case "$t" in *"$filter"*) ;; *) continue ;; esac
+        fi
         skip+=(--skip "$t")
     done <<< "$scripted"
+    [ -z "$filter" ] || selection+=("$filter")
+    detail "Rust scope: ${filter:-all sofuu-core library tests}; integration, release and other areas are not included"
     if [ "${#skip[@]}" -gt 0 ]; then
-        out=$(SOFUU_ALLOW_LOOPBACK=1 cargo test --offline -p sofuu-core --lib -- "${skip[@]}" 2>&1); rc=$?
+        out=$(SOFUU_ALLOW_LOOPBACK=1 cargo test --offline -p sofuu-core --lib "${selection[@]}" -- "${skip[@]}" 2>&1); rc=$?
     else
-        out=$(SOFUU_ALLOW_LOOPBACK=1 cargo test --offline -p sofuu-core --lib 2>&1); rc=$?
+        out=$(SOFUU_ALLOW_LOOPBACK=1 cargo test --offline -p sofuu-core --lib "${selection[@]}" 2>&1); rc=$?
     fi
     summary=$(printf '%s\n' "$out" | grep -E '^test result:' | tail -1)
     if [ "$rc" -eq 0 ]; then
-        report_pass "$id" "compliant core suite — ${summary:-ok}"
-        detail "not executed (scripted model response, RULES §1.9):"
-        while IFS= read -r t; do
-            [ -n "$t" ] || continue
-            detail "  $t"
-        done <<< "$scripted"
-        report_block "$id" "$(printf '%s\n' "$scripted" | grep -c .) scripted-model RLM test(s) are not executed — they assert the episode loop against a canned model response instead of a real backend"
+        if [ -z "$summary" ] || printf '%s\n' "$summary" | grep -q '^test result: ok\. 0 passed; 0 failed;'; then
+            report_block "$id" "no passing tests in Rust scope '${filter:-all}'; check the filter and ignored tests"
+        else
+            report_pass "$id" "selected core tests — $summary"
+        fi
+        if [ "${#skip[@]}" -gt 0 ]; then
+            detail "not executed (scripted model response, RULES §1.9):"
+            for ((t=1; t<${#skip[@]}; t+=2)); do detail "  ${skip[$t]}"; done
+            report_block "$id" "$((${#skip[@]} / 2)) selected scripted-model test(s) are not executed; real-backend coverage is still needed"
+        fi
     else
         report_fail "$id" "${summary:-cargo test exited $rc}"
         printf '%s\n' "$out" | grep -E '^(test .*FAILED|failures:|error)' | head -20 | while IFS= read -r line; do detail "$line"; done
@@ -468,5 +476,9 @@ if [ "$blocked" -gt 0 ]; then
     echo "preflight NOT GREEN ($blocked blocked check(s))"
     exit 2
 fi
-echo "preflight GREEN"
+if [ "${#sections[@]}" -eq 1 ] && [ "${sections[0]}" = rust ] && [ -n "${SOFUU_RUST_FILTER:-}" ]; then
+    echo "preflight GREEN for the selected Rust scope only (not full preflight)"
+else
+    echo "preflight GREEN for the selected sections"
+fi
 exit 0

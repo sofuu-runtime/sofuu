@@ -529,9 +529,13 @@ SOFUU_QTSQ_DIR=$SOFUU_QTSQ_DIR make
 # 3. Verify health check and QTSQ memory linkage
 ./sofuu doctor
 
-# 4. Run test suite
-make test
+# 4. Run a focused development check, then relevant integration checks
+make test-area AREA=kaze
 ```
+
+See [TESTING.md](TESTING.md) for area and contract-case selection, shared
+dependency checks, and the full integration and release gates. A focused test
+does not claim that the full suite or a release passed.
 
 ---
 

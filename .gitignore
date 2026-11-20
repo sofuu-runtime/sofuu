@@ -166,6 +166,7 @@ logs/
 /sofuu-ios/docs/
 /docs-page-2/
 /landing-page-2/
+/kaze-landing-page/
 
 # P1 verification: a second build tree for the QTSQ-free binary (T1.3)
 /target-noqts/

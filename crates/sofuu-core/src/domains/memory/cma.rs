@@ -16,6 +16,9 @@ pub const TIER_FORGOTTEN: u8 = 3;
 pub const TIER_ENTITY: u8 = 4;
 
 pub const GRAVITY_G: f32 = 0.05;
+pub const GRAVITY_SEED_THRESHOLD: f32 = 0.65;
+pub const GRAVITY_PARTNER_FLOOR: f32 = 0.50;
+pub const GRAVITY_DAMPING: f32 = 0.40;
 pub const CORECALL_MAX: usize = 8;
 pub const DUP_DISTANCE: f32 = 0.05;
 
@@ -1915,15 +1918,26 @@ impl Cma {
         }
         scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
-        // Gravity: co-recall partners of the top-1 get a boost only if the
-        // top-1 seed itself is a confident hit (score >= 0.40) and the partner
-        // is not orthogonal noise (*score >= 0.15).
-        if scored.len() > 1 && !is_working_id(scored[0].0) && scored[0].2 >= 0.40 {
+        // Phase 2.1 (PLAN-BRAIN-RELEVANCE-AND-CLI-GENERALIZATION): Attenuated Co-Recall ("Gravity Field Damping").
+        // A record can only act as a gravity seed if its direct confidence is high
+        // (score >= GRAVITY_SEED_THRESHOLD: 0.65).
+        // Co-recall partners are boosted using the damped link formula:
+        //   s_eff(B) = max(s_direct(B), s(A) * w_link * gamma)
+        // Hard rejection floor: any partner whose effective score < GRAVITY_PARTNER_FLOOR (0.50)
+        // is not boosted, preventing unrelated historical clusters from being dragged in.
+        if scored.len() > 1 && !is_working_id(scored[0].0) && scored[0].2 >= GRAVITY_SEED_THRESHOLD {
             let top1 = scored[0].0;
+            let seed_score = scored[0].2;
             let partners: Vec<u32> = self.records[top1 as usize].corecall_ids.clone();
+            let partner_count = partners.len().max(1) as f32;
             for (id, _, score) in scored.iter_mut().skip(1) {
-                if partners.contains(id) && *score >= 0.15 {
-                    *score *= 1.0 + GRAVITY_G;
+                if partners.contains(id) {
+                    let w_link = 1.0 / partner_count;
+                    let partner_boost = seed_score * w_link * GRAVITY_DAMPING * GRAVITY_G;
+                    let effective = (*score + partner_boost).max(*score * (1.0 + GRAVITY_G * GRAVITY_DAMPING));
+                    if effective >= GRAVITY_PARTNER_FLOOR {
+                        *score = effective;
+                    }
                 }
             }
             scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
@@ -1977,11 +1991,10 @@ impl Cma {
                 }
                 continue;
             }
-            // Reinforce + track recall.
+            // Phase 2.2 (PLAN-BRAIN-RELEVANCE-AND-CLI-GENERALIZATION): Utility-based reinforcement vs. decay.
+            // Passive recall does NOT artificially inflate strength to 1.0. Strength decays naturally
+            // according to half-life. Only active utility (mark_positive) reinforces strength and extends half-life.
             let rec = &mut self.records[id as usize];
-            if score >= 0.45 {
-                rec.strength = (rec.strength * 1.1).min(1.0);
-            }
             rec.last_recalled_at = now;
             if rec.total_recalls < 65535 {
                 rec.total_recalls += 1;
@@ -2394,6 +2407,8 @@ impl Cma {
                     rec.positive_recalls += 1;
                     marked += 1;
                 }
+                // Phase 2.2: Active utility reinforcement restores strength toward 1.0
+                rec.strength = (rec.strength * 1.25).max(0.85).min(1.0);
                 if rec.half_life > 0 {
                     let cap = half_life_cap_for(rec.tier);
                     if rec.half_life < cap {

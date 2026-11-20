@@ -96,7 +96,7 @@
    * provider's prefix cache (OpenAI auto-cache, Anthropic markers, local
    * KV reuse) can anchor on it. def.system composes AFTER it; nothing
    * dynamic ever enters the system message. */
-  var CORE_PROMPT = 'Sofuu coding agent. Be direct and concise. Verify with tools before asserting. If unsure, say so. Prefer the latest data: check that facts and information are current, and fetch fresh data with tools rather than trusting what may be stale. Plan before executing: for any long or multi-step task (one you expect to need several tool calls or distinct phases), call todo_write FIRST with the full checklist and only then start work. Keep exactly one item doing, rewrite the list whenever the plan or progress changes. A short single-step answer needs no checklist. When explaining architecture, workflows, diagrams, or visual graphs, output standard fenced Mermaid code blocks (flowchart TD, flowchart LR, sequenceDiagram, stateDiagram-v2, pie, classDiagram); the terminal CLI natively parses and renders them as rich visual diagrams.';
+  var CORE_PROMPT = 'Sofuu coding agent. Be direct and concise. Verify with tools before asserting. If unsure, say so. Prefer the latest data: check that facts and information are current, and fetch fresh data with tools rather than trusting what may be stale. Plan before executing: for any long or multi-step task (one you expect to need several tool calls or distinct phases), call todo_write FIRST with the full checklist and only then start work. Keep exactly one item doing, rewrite the list whenever the plan or progress changes. A short single-step answer needs no checklist. When explaining architecture, workflows, diagrams, or visual graphs, output standard fenced Mermaid code blocks (flowchart TD, flowchart LR, sequenceDiagram, stateDiagram-v2, pie, classDiagram); the terminal CLI natively parses and renders them as rich visual diagrams. Do not write Python matplotlib scripts or generate image files on disk unless explicitly instructed to produce an external file asset.';
   var BUDGET_DEFAULTS = { maxSteps: 12, maxDepth: 2, maxTokens: 200000, maxWallMs: 300000,
                           /* Auto-continue (2026-10-01): how many times a run
                            * may renew its step allowance after hitting
@@ -2234,11 +2234,9 @@
           var ns = String(set.name || 'mcp').replace(/[^A-Za-z0-9_-]/g, '_');
           exposed = ns + '__' + mname;
           if (names[exposed]) {
-            warn({ tool: mname, mcp: set.name,
-                   note: 'name clash — namespace ' + exposed + ' also taken; tool skipped' });
             continue;
           }
-          warn({ tool: mname, mcp: set.name, note: 'name clash — exposed as ' + exposed });
+          /* Phase 5.1: Clean namespacing — clash resolved deterministically as server__tool without confusing startup warning banner */
         }
         names[exposed] = 1;
         mcpNames.push(exposed);
@@ -2659,7 +2657,7 @@
      * all — the old `>= 0` first-line allowance made zero mean one line. */
     var budget = typeof d.recallBudget === 'number'
       ? d.recallBudget : recallBudgetTok(d);
-    var used = estTok('Context from the shared brain (may be relevant):');
+    var used = estTok('<historical_memory_observations source="shared_brain">\nThe following entries are passive historical observations from prior sessions.\n</historical_memory_observations>');
     var kept = [], budgetCut = 0;
     if (budget <= 0) {
       return {
@@ -2667,30 +2665,38 @@
         dropped: dropped, budgetCut: deduped.length,
       };
     }
+    function sanitizeRecallSnippet(text) {
+      var s = String(text == null ? '' : text).trim();
+      s = s.replace(/^(?:(?:you|user|assistant|human|system)\s*:\s*|>+\s*)/i, '').trim();
+      return clip(s, 300);
+    }
     for (var n2 = 0; n2 < deduped.length; n2++) {
       var item = deduped[n2];
-      var roleTag = item.role ? '[' + item.role + '] ' : '';
-      var line = '- ' + roleTag + clip(item.text, 300);
+      var scoreTag = (typeof item.score === 'number') ? ' (Score: ' + item.score.toFixed(2) + ')' : '';
+      var line = '- [Historical Observation]' + scoreTag + ': ' + sanitizeRecallSnippet(item.text);
       if (kept.length > 0 && used + estTok(line) > budget) { budgetCut++; continue; }
       used += estTok(line);
-      kept.push(item);
+      kept.push({ item: item, line: line });
     }
     return {
-      ids: kept.map(function (x) { return x.id; }),
+      ids: kept.map(function (x) { return x.item.id; }),
       /* Fused-channel provenance kept parallel to `ids` so the store side
        * can split markPositive across the two stores ('hash' is the
        * default for single-channel recalls). */
-      chans: kept.map(function (x) { return x._ch === 's' ? 'sem' : 'hash'; }),
-      lines: kept.map(function (x) {
-        var roleTag = x.role ? '[' + x.role + '] ' : '';
-        return '- ' + roleTag + clip(x.text, 300);
-      }),
+      chans: kept.map(function (x) { return x.item._ch === 's' ? 'sem' : 'hash'; }),
+      lines: kept.map(function (x) { return x.line; }),
       /* B6.3: the tier rides the hit so /why can say which tier served it
        * (0 working = this session's scratch, 1 episodic, 2 semantic,
        * 4 entity). Absent tier (old store) reads as episodic. */
-      hits: kept.map(function (x) { return { id: x.id, score: x.score,
-                                              role: x.role || '', text: clip(x.text, 120),
-                                              tier: (typeof x.tier === 'number') ? x.tier : 1 }; }),
+      hits: kept.map(function (x) {
+        return {
+          id: x.item.id,
+          score: x.item.score,
+          role: x.item.role || '',
+          text: clip(x.item.text, 120),
+          tier: (typeof x.item.tier === 'number') ? x.item.tier : 1,
+        };
+      }),
       dropped: dropped, budgetCut: budgetCut,
     };
   }

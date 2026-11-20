@@ -832,6 +832,30 @@
       out('\x1b[90m  Brain read-out unavailable in this build\x1b[0m\n'); return;
     }
     const parts = String(arg || '').trim().split(/\s+/).filter(Boolean);
+    if (parts[0] === 'search') {
+      const q = parts.slice(1).join(' ').trim();
+      if (!q) { out('  Usage: /memory search <query>\n'); return; }
+      out('\x1b[90m  Searching memories for "' + q + '"...\x1b[0m\n');
+      let res;
+      try { res = JSON.parse(brain.list({ text: q, limit: 20 })); }
+      catch (e) { out('\x1b[31m  ✗ ' + String(e.message || e) + '\x1b[0m\n'); return; }
+      if (!res || !res.records || !res.records.length) {
+        out('\x1b[90m  No memories matched "' + q + '".\x1b[0m\n');
+        return;
+      }
+      out('\n\x1b[1m  Memory Search Hits · "' + q + '"\x1b[0m \x1b[2m(' + res.records.length + ' results)\x1b[0m');
+      for (const r of res.records) {
+        const tier = MEMORY_TIER_NAMES[r.tier] || ('tier' + r.tier);
+        const ent = r.entity ? ' \x1b[35m' + r.entity + '\x1b[0m' : '';
+        const partners = (r.corecall_ids && r.corecall_ids.length)
+          ? ' \x1b[36m[gravity partners: ' + r.corecall_ids.join(', ') + ']\x1b[0m' : '';
+        out('  \x1b[90m#' + r.id + '\x1b[0m \x1b[2m' + tier + '\x1b[0m' + ent +
+            ' \x1b[2m· s' + (r.strength || 0).toFixed(2) + ' · ' + memoryAge(r.age_seconds) + '\x1b[0m' + partners);
+        out('    ' + clip1(r.text, 140));
+      }
+      out('');
+      return;
+    }
     const opts = { limit: 20 };
     let page = 1;
     let label = '';

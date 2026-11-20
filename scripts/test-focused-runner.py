@@ -40,6 +40,14 @@ class FocusedRunnerTests(unittest.TestCase):
         self.assertIn("no passing tests", result.stdout)
         self.assertIn("NOT GREEN", result.stdout)
 
+    def test_filter_cannot_narrow_full_preflight(self):
+        result = self.run_command(
+            "bash", "scripts/preflight.sh",
+            extra_env={"SOFUU_RUST_FILTER": "domains::kaze::"},
+        )
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("unset it for full", result.stdout)
+
     def test_exact_contract_case(self):
         result = self.run_command(
             "bash", "scripts/contract/run_contract_tests.sh",

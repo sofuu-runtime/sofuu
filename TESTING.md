@@ -38,7 +38,9 @@ ignored and filtered counts. No passing tests, an unknown area, or a missing
 filter is not a successful check. A skipped scripted-model test is a reported
 coverage gap, not a pass. Direct Cargo filters are also available when an even
 narrower or different crate test is needed; use `SOFUU_ALLOW_LOOPBACK=1` for
-tests that require the local transport policy.
+tests that require the local transport policy. `SOFUU_RUST_FILTER` is accepted
+only for an explicit `preflight.sh rust` run, preventing an inherited filter
+from silently narrowing a full or multi-section preflight.
 
 Names do not follow dependencies automatically. For example, a Kaze change
 affecting standalone compilation also requires `AREA=compiler`, and possibly

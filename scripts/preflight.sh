@@ -438,6 +438,13 @@ if [ "${#sections[@]}" -eq 0 ]; then
     sections=(isolation bytecode drift size rust real serve js)
 fi
 
+# A filter is allowed only for an explicitly selected Rust-only run. In
+# particular, an inherited environment variable must never narrow preflight.
+if [ -n "${SOFUU_RUST_FILTER:-}" ] && { [ "${#sections[@]}" -ne 1 ] || [ "${sections[0]}" != rust ]; }; then
+    echo 'SOFUU_RUST_FILTER requires an explicit Rust-only run; unset it for full or multi-section preflight' >&2
+    exit 2
+fi
+
 for s in "${sections[@]}"; do
     case "$s" in
         isolation) section_isolation ;;

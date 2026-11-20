@@ -1,10 +1,23 @@
 # Embedded Kaze: current capability status
 
+Kaze's broader goal is a general-purpose language within AI, spanning AI software
+and AI-powered physical systems; it is not intended for general computing
+outside AI. This document describes current embedded capabilities, not the
+full vision or proof of support for every AI application. See
+[KAZE-VISION.md](KAZE-VISION.md).
+
 This document describes the embedded Kaze source in Sofuu, not a published
-binary. The embedded engine reports language version **0.1**, writes bytecode
-format 2, and reads legacy format 1. The separate standalone Kaze project
-reports language version 1.0 and uses bytecode format 4. Aligning them on one
-language contract remains planned; their artifacts are not interchangeable.
+binary. The embedded engine reports language version **1.0**, writes bytecode
+format 2 (with statement line map), and reads formats 1, 2, and 4 (including
+format 4 modules from the standalone prototype). The standalone Kaze project
+also reports language version 1.0 and writes bytecode format 4. Both engines
+implement the unified Kaze 1.0 language contract across all 47 opcodes and 17
+capabilities with 0 drift.
+The intended human-oriented and machine-oriented source syntaxes are also
+planned for one language, not implemented parity or a second permission tier.
+A tagged prefix-tree text form is a proposed machine-syntax candidate, not an
+implemented embedded syntax. Human-syntax polish and compatibility decisions
+are discussed in the local `docs/plans/PLAN-KAZE-DUAL-SYNTAX.md`.
 
 ## Capability authorization
 

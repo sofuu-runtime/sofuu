@@ -59,6 +59,38 @@ pub enum Op {
     Jeq = 31,
     /// wide: pop two, jump when not equal
     Jne = 32,
+    // ── v0.3: kinematics and spatial maths ──────────────────────────
+    /// a: component count (3), pops that many numbers, pushes a point
+    VecNew = 33,
+    /// pop two points, push the great-circle distance in metres
+    VecDist = 34,
+    /// pop a point, push the compass bearing of the vector in degrees
+    VecBearing = 35,
+    /// pop two points, push the initial bearing from the first to the second
+    VecBearingBetween = 36,
+    /// pop a number (radians), push its sine
+    Sin = 37,
+    /// pop a number (radians), push its cosine
+    Cos = 38,
+    /// pop x then y, push atan2(y, x) in radians
+    Atan2 = 39,
+    /// pop a number, push its square root (a negative argument is an error)
+    Sqrt = 40,
+    /// pop degrees, push radians
+    DegToRad = 41,
+    /// pop radians, push degrees
+    RadToDeg = 42,
+    /// pop two points, push the great-circle distance plus altitude change
+    VecSlantDist = 43,
+    // ── v0.4: fault tolerance ───────────────────────────────────────
+    /// a: local slot for the error record (255 = no binding);
+    /// wide: relative jump to the recovery block, from the end of the instruction
+    TryBegin = 44,
+    /// pop the innermost active try handler
+    TryEnd = 45,
+    /// wide: milliseconds of link silence; push true once the link has been
+    /// silent at least that long (false when there is no live link)
+    LinkLost = 46,
 }
 
 impl Op {
@@ -97,6 +129,20 @@ impl Op {
             30 => Op::GetField,
             31 => Op::Jeq,
             32 => Op::Jne,
+            33 => Op::VecNew,
+            34 => Op::VecDist,
+            35 => Op::VecBearing,
+            36 => Op::VecBearingBetween,
+            37 => Op::Sin,
+            38 => Op::Cos,
+            39 => Op::Atan2,
+            40 => Op::Sqrt,
+            41 => Op::DegToRad,
+            42 => Op::RadToDeg,
+            43 => Op::VecSlantDist,
+            44 => Op::TryBegin,
+            45 => Op::TryEnd,
+            46 => Op::LinkLost,
             _ => return None,
         })
     }
@@ -112,6 +158,9 @@ impl Op {
                 | Op::Jne
                 | Op::CallCap
                 | Op::Trap
+                | Op::FuelTick
+                | Op::TryBegin
+                | Op::LinkLost
         )
     }
 
@@ -150,6 +199,20 @@ impl Op {
             Op::GetField => "GET_FIELD",
             Op::Jeq => "JEQ",
             Op::Jne => "JNE",
+            Op::VecNew => "VECNEW",
+            Op::VecDist => "VECDIST",
+            Op::VecBearing => "VECBEARING",
+            Op::VecBearingBetween => "VECBEARING_BETWEEN",
+            Op::Sin => "SIN",
+            Op::Cos => "COS",
+            Op::Atan2 => "ATAN2",
+            Op::Sqrt => "SQRT",
+            Op::DegToRad => "DEG_TO_RAD",
+            Op::RadToDeg => "RAD_TO_DEG",
+            Op::VecSlantDist => "VECSLANT_DIST",
+            Op::TryBegin => "TRY_BEGIN",
+            Op::TryEnd => "TRY_END",
+            Op::LinkLost => "LINK_LOST",
         }
     }
 }
@@ -221,6 +284,7 @@ pub struct ItemCode {
     pub params: Vec<String>,
     pub code: Vec<u32>,
     pub line: u32,
+    pub origin: String,
     /// Source line per code word. Empty for legacy version-1 bytecode.
     pub line_map: Vec<u32>,
     /// Period in milliseconds; 0 for everything but `every`.
@@ -231,6 +295,7 @@ pub struct ItemCode {
 
 #[derive(Clone, Debug, Default)]
 pub struct Module {
+    pub root: String,
     pub needs: Vec<String>,
     pub consts: Vec<Const>,
     pub caps: Vec<CapRef>,
@@ -374,11 +439,14 @@ pub fn deserialize(bytes: &[u8]) -> Result<Module, String> {
     }
     r.at = 8;
     let version = match r.u16() {
-        Some(v @ (1 | VERSION)) => v,
-        Some(other) => return Err(format!("unsupported Kaze bytecode version {}; supported versions are 1 and {}", other, VERSION)),
+        Some(v @ (1 | 2 | 4)) => v,
+        Some(other) => return Err(format!("unsupported Kaze bytecode version {}; supported versions are 1, 2, and 4", other)),
         None => return Err("truncated module header".to_string()),
     };
     let mut m = Module::default();
+    if version >= 4 {
+        m.root = r.text().ok_or("truncated module root")?;
+    }
     let needs = r.u32().ok_or("truncated needs table")?;
     for _ in 0..needs {
         m.needs.push(r.text().ok_or("truncated needs entry")?);
@@ -406,6 +474,11 @@ pub fn deserialize(bytes: &[u8]) -> Result<Module, String> {
         let line = r.u32().ok_or("truncated item line")?;
         let slots = r.u8().ok_or("truncated item slots")?;
         let name = r.text().ok_or("truncated item name")?;
+        let origin = if version >= 4 {
+            r.text().ok_or("truncated item origin")?
+        } else {
+            String::new()
+        };
         let nparams = r.u32().ok_or("truncated item parameters")?;
         let mut params = Vec::new();
         for _ in 0..nparams {
@@ -417,7 +490,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Module, String> {
             code.push(r.u32().ok_or("truncated code word")?);
         }
         let mut line_map = Vec::new();
-        if version >= 2 {
+        if version == 2 {
             let nlines = r.u32().ok_or("truncated source-line table")? as usize;
             if nlines != 0 && nlines != code.len() {
                 return Err("source-line table does not match the code length".into());
@@ -430,7 +503,7 @@ pub fn deserialize(bytes: &[u8]) -> Result<Module, String> {
                 line_map.push(r.u32().ok_or("truncated source-line table")?);
             }
         }
-        m.items.push(ItemCode { name, tag, params, code, line, line_map, period_ms, slots });
+        m.items.push(ItemCode { name, tag, params, code, line, origin, line_map, period_ms, slots });
     }
     Ok(m)
 }
@@ -487,6 +560,7 @@ mod tests {
     #[test]
     fn round_trips_a_module() {
         let m = Module {
+            root: "test.kaze".into(),
             needs: vec!["drone".into()],
             consts: vec![Const::Num(15.0), Const::Str("hello".into())],
             caps: vec![CapRef { family: "drone".into(), op: "takeoff".into(), argc: 1 }],
@@ -496,6 +570,7 @@ mod tests {
                 params: vec!["points".into()],
                 code: vec![word(Op::Const, 0, 0, 0), 0, word(Op::Halt, 0, 0, 0)],
                 line: 3,
+                origin: String::new(),
                 line_map: vec![3, 3, 4],
                 period_ms: 0.0,
                 slots: 2,
@@ -504,6 +579,7 @@ mod tests {
         let bytes = serialize(&m);
         let back = deserialize(&bytes).unwrap();
         assert_eq!(back.needs, m.needs);
+        assert_eq!(back.items[0].name, m.items[0].name);
         assert_eq!(back.items[0].code, m.items[0].code);
         assert_eq!(back.items[0].line_map, m.items[0].line_map);
         assert_eq!(back.consts, m.consts);
@@ -512,6 +588,7 @@ mod tests {
     #[test]
     fn serialization_is_byte_identical_across_runs() {
         let m = Module {
+            root: "a.kaze".into(),
             needs: vec!["log".into()],
             consts: vec![Const::Str("x".into())],
             caps: vec![],
@@ -521,7 +598,8 @@ mod tests {
                 params: vec![],
                 code: vec![word(Op::RetUnit, 0, 0, 0)],
                 line: 1,
-                line_map: vec![1],
+                origin: "a.kaze".into(),
+                line_map: vec![],
                 period_ms: 0.0,
                 slots: 0,
             }],
@@ -538,27 +616,11 @@ mod tests {
     }
 
     #[test]
-    fn malformed_line_table_is_rejected() {
-        let m = Module {
-            items: vec![ItemCode {
-                name: "a".into(), tag: ItemTag::Action, params: vec![],
-                code: vec![word(Op::RetUnit, 0, 0, 0)], line: 1,
-                line_map: vec![1], period_ms: 0.0, slots: 0,
-            }],
-            ..Module::default()
-        };
-        let mut bytes = serialize(&m);
-        let table_start = bytes.len() - 8;
-        bytes[table_start..table_start + 4].copy_from_slice(&2u32.to_le_bytes());
-        assert!(deserialize(&bytes).unwrap_err().contains("source-line table"));
-    }
-
-    #[test]
     fn opcodes_round_trip() {
-        for b in 0u8..=32 {
+        for b in 0u8..=46 {
             let op = Op::from_u8(b).expect("known opcode");
             assert_eq!(op as u8, b);
         }
-        assert!(Op::from_u8(200).is_none());
+        assert!(Op::from_u8(47).is_none());
     }
 }

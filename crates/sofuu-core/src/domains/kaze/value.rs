@@ -19,6 +19,8 @@ pub enum Value {
     Arr(u32),
     /// Index into `Heap::maps`.
     Map(u32),
+    /// Index into `Heap::vecs` — a point or an offset, `[x, y, z]`.
+    Vec(u32),
 }
 
 impl Value {
@@ -30,6 +32,7 @@ impl Value {
             Value::Str(_) => "text",
             Value::Arr(_) => "list",
             Value::Map(_) => "record",
+            Value::Vec(_) => "point",
         }
     }
 
@@ -46,12 +49,12 @@ impl Value {
             Value::Bool(b) => *b,
             Value::Num(n) => *n != 0.0,
             Value::Str(s) => s.len > 0,
-            Value::Arr(_) | Value::Map(_) => true,
+            Value::Arr(_) | Value::Map(_) | Value::Vec(_) => true,
         }
     }
 }
 
-/// The collection heap. `arrays` and `maps` are cleared by `free_wholesale`;
+/// The collection heap. `arrays`, `maps`, and `vecs` are cleared by `free_wholesale`;
 /// an index is never reused within a run, so a stale index cannot alias.
 ///
 /// The heap is **metered** (PLAN-AUDIT-REMEDIATION §3 Task 1.4). Fuel bounds
@@ -64,6 +67,8 @@ impl Value {
 pub struct Heap {
     pub arrays: Vec<Vec<Value>>,
     pub maps: Vec<Vec<(Value, Value)>>,
+    /// Points and offsets: three `f64`s, no pointers, freed wholesale.
+    pub vecs: Vec<[f64; 3]>,
     used_bytes: usize,
     limit: usize,
 }
@@ -81,7 +86,7 @@ impl Heap {
     pub const DEFAULT_LIMIT: usize = 4 * 1024 * 1024;
 
     pub fn new(limit: usize) -> Self {
-        Heap { arrays: Vec::new(), maps: Vec::new(), used_bytes: 0, limit }
+        Heap { arrays: Vec::new(), maps: Vec::new(), vecs: Vec::new(), used_bytes: 0, limit }
     }
 
     /// A read-only heap for rendering a value that owns no collections.
@@ -133,6 +138,18 @@ impl Heap {
         Ok(Value::Map(idx))
     }
 
+    pub fn push_vec(&mut self, v: [f64; 3]) -> Result<Value, String> {
+        let cost = 3 * std::mem::size_of::<f64>();
+        self.charge(cost)?;
+        let idx = self.vecs.len() as u32;
+        self.vecs.push(v);
+        Ok(Value::Vec(idx))
+    }
+
+    pub fn vec3(&self, idx: u32) -> Option<[f64; 3]> {
+        self.vecs.get(idx as usize).copied()
+    }
+
     pub fn array(&self, idx: u32) -> Option<&Vec<Value>> {
         self.arrays.get(idx as usize)
     }
@@ -158,10 +175,11 @@ impl Heap {
     pub fn free_wholesale(&mut self) {
         self.arrays.clear();
         self.maps.clear();
+        self.vecs.clear();
         self.used_bytes = 0;
     }
 
     pub fn used(&self) -> usize {
-        self.arrays.len() + self.maps.len()
+        self.arrays.len() + self.maps.len() + self.vecs.len()
     }
 }

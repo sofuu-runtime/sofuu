@@ -169,12 +169,25 @@ pub struct Vm<'a> {
     pub instructions: u64,
     stack: Vec<Value>,
     locals: Vec<Value>,
+    handlers: Vec<Handler>,
     verdict: Option<Verdict>,
     active_item: Option<u64>,
 }
 
 /// The stack is a fixed-size vector; a script cannot grow it without bound.
 const MAX_STACK: usize = 256;
+
+/// Live `try` handlers. A catchable host failure unwinds to the innermost one.
+const MAX_HANDLERS: usize = 32;
+/// `TRY_BEGIN`'s "do not bind the error record" slot sentinel.
+const NO_ERROR_BINDING: u8 = 255;
+
+struct Handler {
+    target: usize,
+    stack_len: usize,
+    slot: u8,
+    verdict: Option<Verdict>,
+}
 
 impl<'a> Vm<'a> {
     pub fn new(
@@ -230,6 +243,7 @@ impl<'a> Vm<'a> {
             instructions: 0,
             stack: Vec::with_capacity(32),
             locals: Vec::new(),
+            handlers: Vec::new(),
             verdict: None,
             active_item: None,
         }
@@ -279,6 +293,7 @@ impl<'a> Vm<'a> {
         let token = NEXT_CONTINUATION_TOKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| VmError::new("E_KAZE_STATE", "continuation identifiers exhausted"))?;
         self.stack.clear();
+        self.handlers.clear();
         self.locals = vec![Value::Unit; item.slots.max(item.params.len() as u8) as usize];
         for (i, a) in args.iter().enumerate().take(self.locals.len()) {
             self.locals[i] = *a;
@@ -556,15 +571,23 @@ impl<'a> Vm<'a> {
                 Op::CallCap => {
                     let imm = self.imm(code, pc, current_line)? as usize;
                     pc += 1;
-                    if let Some(request) = self.call_cap(imm, field_a(w) as usize, current_line)? {
-                        state.pc = pc;
-                        state.pending = Some(PendingCapability {
-                            id: request.id,
-                            line: request.line,
-                            family: request.family.clone(),
-                            op: request.op.clone(),
-                        });
-                        return Ok(SliceOutcome::Capability(request));
+                    match self.call_cap(imm, field_a(w) as usize, current_line) {
+                        Ok(Some(request)) => {
+                            state.pc = pc;
+                            state.pending = Some(PendingCapability {
+                                id: request.id,
+                                line: request.line,
+                                family: request.family.clone(),
+                                op: request.op.clone(),
+                            });
+                            return Ok(SliceOutcome::Capability(request));
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            if !self.catch_error(&err, &mut pc, current_line)? {
+                                return Err(err);
+                            }
+                        }
                     }
                 }
                 Op::PolicyStop => {
@@ -606,6 +629,124 @@ impl<'a> Vm<'a> {
                     return Err(VmError { code: "E_KAZE_TRAP", msg, line: current_line });
                 }
                 Op::Halt => return Ok(SliceOutcome::Complete(Value::Unit)),
+                Op::VecNew => {
+                    let n = field_a(w) as usize;
+                    if n != 2 && n != 3 {
+                        return Err(VmError::new("E_KAZE_BADCODE", "VECNEW with a bad width"));
+                    }
+                    let mut parts = [0.0f64; 3];
+                    for slot in parts.iter_mut().take(n).rev() {
+                        let v = self.pop(current_line)?;
+                        *slot = self.num_of(v, current_line)?;
+                    }
+                    if parts.iter().any(|c| !c.is_finite()) {
+                        return Err(overflow(current_line));
+                    }
+                    let v = self
+                        .heap
+                        .push_vec(parts)
+                        .map_err(|msg| VmError { code: "E_KAZE_MEMORY", msg, line: current_line })?;
+                    self.push(v, current_line)?;
+                }
+                Op::VecDist | Op::VecSlantDist | Op::VecBearingBetween => {
+                    let b = self.pop(current_line)?;
+                    let a = self.pop(current_line)?;
+                    let (p, q) = (self.place(a, current_line)?, self.place(b, current_line)?);
+                    let n = match op {
+                        Op::VecDist => crate::domains::kaze::geo::haversine_m(p, q),
+                        Op::VecSlantDist => crate::domains::kaze::geo::slant_m(p, q),
+                        _ => crate::domains::kaze::geo::bearing_deg(p, q),
+                    };
+                    if !n.is_finite() {
+                        return Err(overflow(current_line));
+                    }
+                    self.push(Value::Num(n), current_line)?;
+                }
+                Op::VecBearing => {
+                    let v = self.pop(current_line)?;
+                    let p = self.point(v, current_line)?;
+                    let n = crate::domains::kaze::geo::bearing_of(p);
+                    if !n.is_finite() {
+                        return Err(overflow(current_line));
+                    }
+                    self.push(Value::Num(n), current_line)?;
+                }
+                Op::Sin | Op::Cos | Op::Sqrt | Op::DegToRad | Op::RadToDeg => {
+                    let v = self.pop(current_line)?;
+                    let x = self.num_of(v, current_line)?;
+                    let r = match op {
+                        Op::Sin => x.sin(),
+                        Op::Cos => x.cos(),
+                        Op::Sqrt => {
+                            if x < 0.0 {
+                                return Err(VmError {
+                                    code: "E_KAZE_MATH",
+                                    msg: format!("sqrt of {} has no real answer", crate::sfs::arena::fmt_num(x)),
+                                    line: current_line,
+                                });
+                            }
+                            x.sqrt()
+                        }
+                        Op::DegToRad => crate::domains::kaze::geo::to_radians(x),
+                        _ => crate::domains::kaze::geo::to_degrees(x),
+                    };
+                    if !r.is_finite() {
+                        return Err(overflow(current_line));
+                    }
+                    self.push(Value::Num(r), current_line)?;
+                }
+                Op::Atan2 => {
+                    let x = self.pop(current_line)?;
+                    let y = self.pop(current_line)?;
+                    let (x, y) = (self.num_of(x, current_line)?, self.num_of(y, current_line)?);
+                    let r = y.atan2(x);
+                    if !r.is_finite() {
+                        return Err(overflow(current_line));
+                    }
+                    self.push(Value::Num(r), current_line)?;
+                }
+                Op::TryBegin => {
+                    let imm = self.imm(code, pc, current_line)? as i32;
+                    let target = jump(pc + 1, imm, code.len(), current_line)?;
+                    pc += 1;
+                    if self.handlers.len() >= MAX_HANDLERS {
+                        return Err(VmError {
+                            code: "E_KAZE_STACK",
+                            msg: format!("more than {} nested 'try' blocks", MAX_HANDLERS),
+                            line: current_line,
+                        });
+                    }
+                    self.handlers.push(Handler {
+                        target,
+                        stack_len: self.stack.len(),
+                        slot: field_a(w),
+                        verdict: self.verdict.clone(),
+                    });
+                }
+                Op::TryEnd => {
+                    if self.handlers.pop().is_none() {
+                        return Err(VmError::new(
+                            "E_KAZE_BADCODE",
+                            "TRY_END ran without an active try block",
+                        ));
+                    }
+                }
+                Op::LinkLost => {
+                    let after_ms = self.imm(code, pc, current_line)? as u64;
+                    pc += 1;
+                    if after_ms == 0 {
+                        return Err(VmError::new(
+                            "E_KAZE_BADCODE",
+                            "LINK_LOST with a zero window would always be true",
+                        ));
+                    }
+                    let silent = self.host.call("drone", "link_silent_ms", &[], &mut self.arena, &mut self.heap)
+                        .ok()
+                        .and_then(|v| v.as_num())
+                        .map(|n| n as u64);
+                    let lost = silent.is_some_and(|s| s >= after_ms);
+                    self.push(Value::Bool(lost), current_line)?;
+                }
             }
         }
         Ok(SliceOutcome::Complete(Value::Unit))
@@ -728,6 +869,16 @@ impl<'a> Vm<'a> {
                 })?;
                 Ok(Value::Str(r))
             }
+            (Value::Vec(x), Value::Vec(y)) => {
+                let (p, q) = (self.point(Value::Vec(x), line)?, self.point(Value::Vec(y), line)?);
+                let sum = [p[0] + q[0], p[1] + q[1], p[2] + q[2]];
+                if sum.iter().any(|component| !component.is_finite()) {
+                    return Err(overflow(line));
+                }
+                self.heap
+                    .push_vec(sum)
+                    .map_err(|msg| VmError { code: "E_KAZE_MEMORY", msg, line })
+            }
             (a, b) => Err(VmError {
                 code: "E_KAZE_TYPE",
                 msg: format!("cannot add {} to {}", a.type_name(), b.type_name()),
@@ -739,6 +890,10 @@ impl<'a> Vm<'a> {
     fn arith(&mut self, op: Op, line: u32) -> Result<(), VmError> {
         let b = self.pop(line)?;
         let a = self.pop(line)?;
+        if matches!(a, Value::Vec(_)) || matches!(b, Value::Vec(_)) {
+            let v = self.vector_arith(op, a, b, line)?;
+            return self.push(v, line);
+        }
         let (x, y) = match (a, b) {
             (Value::Num(x), Value::Num(y)) => (x, y),
             (a, b) => {
@@ -770,6 +925,137 @@ impl<'a> Vm<'a> {
             return Err(overflow(line));
         }
         self.push(Value::Num(v), line)
+    }
+
+    fn vector_arith(&mut self, op: Op, a: Value, b: Value, line: u32) -> Result<Value, VmError> {
+        let out = match (op, a, b) {
+            (Op::Sub, Value::Vec(x), Value::Vec(y)) => {
+                let p = self.point(Value::Vec(x), line)?;
+                let q = self.point(Value::Vec(y), line)?;
+                [p[0] - q[0], p[1] - q[1], p[2] - q[2]]
+            }
+            (Op::Mul, Value::Vec(x), Value::Num(s))
+            | (Op::Mul, Value::Num(s), Value::Vec(x)) => {
+                let p = self.point(Value::Vec(x), line)?;
+                [p[0] * s, p[1] * s, p[2] * s]
+            }
+            (Op::Div, Value::Vec(x), Value::Num(s)) => {
+                if s == 0.0 {
+                    return Err(divide_by_zero(line));
+                }
+                let p = self.point(Value::Vec(x), line)?;
+                [p[0] / s, p[1] / s, p[2] / s]
+            }
+            _ => {
+                return Err(VmError {
+                    code: "E_KAZE_TYPE",
+                    msg: format!("cannot apply {} to {} and {}", op.name(), a.type_name(), b.type_name()),
+                    line,
+                });
+            }
+        };
+        if out.iter().any(|c| !c.is_finite()) {
+            return Err(overflow(line));
+        }
+        self.heap
+            .push_vec(out)
+            .map_err(|msg| VmError { code: "E_KAZE_MEMORY", msg, line })
+    }
+
+    fn point(&self, v: Value, line: u32) -> Result<[f64; 3], VmError> {
+        match v {
+            Value::Vec(i) => self.heap.vec3(i).ok_or_else(|| VmError {
+                code: "E_KAZE_BADCODE",
+                msg: "a point is missing from the heap".to_string(),
+                line,
+            }),
+            other => Err(VmError {
+                code: "E_KAZE_TYPE",
+                msg: format!("this needs a point, but it is {}", other.type_name()),
+                line,
+            }),
+        }
+    }
+
+    fn place(&self, v: Value, line: u32) -> Result<[f64; 3], VmError> {
+        let p = self.point(v, line)?;
+        let (lat, lon) = (p[0], p[1]);
+        if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
+            return Err(VmError {
+                code: "E_KAZE_RANGE",
+                msg: format!(
+                    "({}, {}, {}) is not a latitude and longitude; for a local offset use 'length of' or 'bearing of'",
+                    crate::sfs::arena::fmt_num(lat),
+                    crate::sfs::arena::fmt_num(lon),
+                    crate::sfs::arena::fmt_num(p[2])
+                ),
+                line,
+            });
+        }
+        Ok(p)
+    }
+
+    fn num_of(&self, v: Value, line: u32) -> Result<f64, VmError> {
+        match v {
+            Value::Num(n) => Ok(n),
+            other => Err(VmError {
+                code: "E_KAZE_TYPE",
+                msg: format!("this needs a number, but it is {}", other.type_name()),
+                line,
+            }),
+        }
+    }
+
+    fn catch_error(&mut self, err: &VmError, pc: &mut usize, line: u32) -> Result<bool, VmError> {
+        if !is_catchable(err.code) {
+            return Ok(false);
+        }
+        let Some(handler) = self.handlers.pop() else {
+            return Ok(false);
+        };
+        self.stack.truncate(handler.stack_len);
+        self.verdict = handler.verdict;
+        if handler.slot != NO_ERROR_BINDING {
+            let record = self.error_record(err, line)?;
+            match self.locals.get_mut(handler.slot as usize) {
+                Some(slot) => *slot = record,
+                None => {
+                    return Err(VmError::new(
+                        "E_KAZE_BADCODE",
+                        "the error slot in TRY_BEGIN does not exist",
+                    ))
+                }
+            }
+        }
+        *pc = handler.target;
+        Ok(true)
+    }
+
+    fn error_record(&mut self, err: &VmError, line: u32) -> Result<Value, VmError> {
+        let code = self.arena.alloc(err.code).map(Value::Str).map_err(|e| VmError {
+            code: "E_KAZE_MEMORY",
+            msg: e,
+            line,
+        })?;
+        let msg = self.arena.alloc(&err.msg).map(Value::Str).map_err(|e| VmError {
+            code: "E_KAZE_MEMORY",
+            msg: e,
+            line,
+        })?;
+        let err_line = Value::Num(err.line as f64);
+        let k_code = self.arena.alloc("code").map_err(|e| VmError { code: "E_KAZE_MEMORY", msg: e, line })?;
+        let k_msg = self.arena.alloc("message").map_err(|e| VmError { code: "E_KAZE_MEMORY", msg: e, line })?;
+        let k_line = self.arena.alloc("line").map_err(|e| VmError { code: "E_KAZE_MEMORY", msg: e, line })?;
+        let fields = vec![
+            (Value::Str(k_code), code),
+            (Value::Str(k_msg), msg),
+            (Value::Str(k_line), err_line),
+        ];
+        self.heap.push_map(fields).map_err(|e| VmError {
+            code: "E_KAZE_MEMORY",
+            msg: e,
+            line,
+        })
     }
 
     fn compare(&self, op: Op, a: Value, b: Value, line: u32) -> Result<bool, VmError> {
@@ -1036,6 +1322,18 @@ fn value_to_json(
             }
             Ok(Json::Object(output))
         }
+        Value::Vec(index) => {
+            let p = heap.vec3(index)
+                .ok_or_else(|| VmError { code: "E_KAZE_BADCODE", msg: "capability argument contains an invalid vector".into(), line })?;
+            let items = p.iter().map(|n| {
+                Number::from_f64(*n).map(Json::Number).ok_or_else(|| VmError {
+                    code: "E_KAZE_TYPE",
+                    msg: "vector components must be finite numbers".into(),
+                    line,
+                })
+            }).collect::<Result<Vec<_>, _>>()?;
+            Ok(Json::Array(items))
+        }
     }
 }
 
@@ -1062,6 +1360,13 @@ fn split_host_code(msg: String) -> (&'static str, String) {
         }
     }
     ("E_KAZE_HOST", msg)
+}
+
+fn is_catchable(code: &str) -> bool {
+    matches!(
+        code,
+        "E_KAZE_LINK" | "E_KAZE_LINK_TIMEOUT" | "E_COMMAND_REJECTED" | "E_ARMING_DENIED" | "E_KAZE_HOST"
+    )
 }
 
 fn jump(pc: usize, imm: i32, len: usize, line: u32) -> Result<usize, VmError> {

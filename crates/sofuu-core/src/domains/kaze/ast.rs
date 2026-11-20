@@ -104,12 +104,49 @@ pub enum Expr {
     Index(Box<Expr>, Box<Expr>),
     /// `[a, b, c]`
     List(Vec<Expr>),
+    /// A pure maths form: `vector(x, y, z)`, `distance between a and b`,
+    /// `bearing to v`, `sin(x)`, `<x> in radians`. No capability, no host.
+    Math { kind: MathKind, args: Vec<Expr>, line: u32 },
+    /// `link lost for 3 seconds` — true when the live link has been silent for
+    /// at least the given duration. A read, not an effect: it never crosses the
+    /// capability gate, and the checker requires `needs: drone`.
+    LinkLost { after_ms: f64, line: u32 },
+}
+
+/// The spatial maths forms. Each one is a pure function of its arguments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MathKind {
+    /// `vector(x, y, z)` — three components.
+    Vector,
+    /// `distance between a and b` — metres on the WGS84 sphere.
+    Distance,
+    /// `bearing of v` — the compass direction of a local offset.
+    BearingOf,
+    /// `bearing from a to b` — the initial bearing to a place. `bearing to b`
+    /// is parsed into this, with `a` read from the machine's own position.
+    BearingFrom,
+    /// `slant distance between a and b` — great circle plus altitude change.
+    SlantDistance,
+    /// `sin(x)`, `cos(x)` — radians in, plain number out.
+    Sin,
+    Cos,
+    /// `atan2(y, x)` — radians, the same convention as `f64::atan2`.
+    Atan2,
+    /// `sqrt(x)` — refuses a negative argument instead of returning NaN.
+    Sqrt,
+    /// `<x> in radians` — degrees to radians.
+    ToRadians,
+    /// `<x> in degrees` — radians to degrees.
+    ToDegrees,
 }
 
 impl Expr {
     pub fn line(&self) -> u32 {
         match self {
-            Expr::Call { line, .. } | Expr::Field { line, .. } => *line,
+            Expr::Call { line, .. }
+            | Expr::Field { line, .. }
+            | Expr::Math { line, .. }
+            | Expr::LinkLost { line, .. } => *line,
             _ => 0,
         }
     }
@@ -138,6 +175,17 @@ pub enum Stmt {
         body: Vec<Stmt>,
         line: u32,
     },
+    /// `try:` … `otherwise [with err]:` — recover from an operational host
+    /// failure (a link, a rejected command, an arming denial). Safety, range,
+    /// fuel and budget errors are never catchable.
+    Try {
+        body: Vec<Stmt>,
+        otherwise: Vec<Stmt>,
+        /// `otherwise with err:` binds the error record (`code`, `message`,
+        /// `line`) to this name inside the recovery block.
+        error_name: Option<String>,
+        line: u32,
+    },
     Return(Option<Expr>, u32),
 }
 
@@ -149,6 +197,7 @@ impl Stmt {
             | Stmt::Eval(_, l)
             | Stmt::ForEach { line: l, .. }
             | Stmt::While { line: l, .. }
+            | Stmt::Try { line: l, .. }
             | Stmt::Return(_, l) => *l,
             Stmt::If { line, .. } => *line,
         }
@@ -176,12 +225,26 @@ pub struct Item {
     pub params: Vec<String>,
     pub body: Vec<Stmt>,
     pub line: u32,
+    /// The file this item came from.
+    pub origin: String,
+}
+
+/// One `use "path"` line. Imports are resolved and inlined before checking and
+/// compilation; the compiled module has no imports left.
+#[derive(Clone, Debug)]
+pub struct Use {
+    pub path: String,
+    pub line: u32,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Program {
     /// Declared capabilities, exactly as written.
     pub needs: Vec<String>,
+    /// `use "path"` directives, in source order.
+    pub uses: Vec<Use>,
+    /// The root module's diagnostic origin (its file name).
+    pub root: String,
     pub items: Vec<Item>,
 }
 

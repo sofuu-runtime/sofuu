@@ -42,6 +42,8 @@ enum Ty {
     Str,
     Bool,
     List,
+    Point,
+    Error,
     Unit,
     Any,
 }
@@ -54,6 +56,8 @@ impl Ty {
             Ty::Str => "text",
             Ty::Bool => "true or false",
             Ty::List => "a list",
+            Ty::Point => "a point",
+            Ty::Error => "an error",
             Ty::Unit => "nothing",
             Ty::Any => "a host value",
         }
@@ -192,6 +196,15 @@ fn check_block(
                 let mut inner = scope.clone();
                 check_block(body, &mut inner, declared, errors);
             }
+            Stmt::Try { body, otherwise, error_name, line: _ } => {
+                let mut inner = scope.clone();
+                check_block(body, &mut inner, declared, errors);
+                let mut inner2 = scope.clone();
+                if let Some(name) = error_name {
+                    inner2.push((name.clone(), Ty::Error));
+                }
+                check_block(otherwise, &mut inner2, declared, errors);
+            }
             Stmt::Return(value, _) => {
                 if let Some(v) = value {
                     infer(v, scope, declared, errors);
@@ -250,13 +263,27 @@ fn infer(
             Ty::Any
         }
         Expr::Field { base, field, line } => {
-            if !scope.iter().rev().any(|(n, _)| n == base) {
+            let rt = match scope.iter().rev().find(|(n, _)| n == base) {
+                Some((_, t)) => *t,
+                None => {
+                    errors.push(e(
+                        *line,
+                        format!("'.{}' reads a field of '{}', which is not a value here", field, base),
+                    ));
+                    Ty::Any
+                }
+            };
+            if rt == Ty::Error && !["code", "message", "line"].contains(&field.as_str()) {
                 errors.push(e(
                     *line,
-                    format!("'.{}' reads a field of '{}', which is not a value here", field, base),
+                    format!("an error record has code, message and line, not '{}'", field),
                 ));
             }
-            Ty::Any
+            match (rt, field.as_str()) {
+                (Ty::Error, "line") => Ty::Num(None),
+                (Ty::Error, "code" | "message") => Ty::Str,
+                _ => Ty::Any,
+            }
         }
         Expr::Not(inner) => {
             let t = infer(inner, scope, declared, errors);
@@ -342,7 +369,146 @@ fn infer(
         Expr::Bin(op, left, right) => {
             let lt = infer(left, scope, declared, errors);
             let rt = infer(right, scope, declared, errors);
-            bin_result(*op, lt, rt)
+            let negation = *op == BinOp::Sub
+                && rt == Ty::Point
+                && matches!(**left, Expr::Num(n, _) if n == 0.0);
+            if negation {
+                return Ty::Point;
+            }
+            point_aware_bin(*op, lt, rt, errors)
+        }
+        Expr::Math { kind, args, line } => infer_math(*kind, args, *line, scope, declared, errors),
+        Expr::LinkLost { after_ms: _, line } => {
+            if !declared.iter().any(|d| caps::family_of(d) == "drone") {
+                errors.push(e(
+                    *line,
+                    "'link lost' reads the drone link; declare it first with 'needs: drone'",
+                ));
+            }
+            Ty::Bool
+        }
+    }
+}
+
+fn point_aware_bin(op: BinOp, lt: Ty, rt: Ty, errors: &mut Vec<CheckError>) -> Ty {
+    use BinOp::*;
+    if lt != Ty::Point && rt != Ty::Point {
+        return bin_result(op, lt, rt);
+    }
+    match (op, lt, rt) {
+        (Add | Sub, Ty::Point, Ty::Point) => Ty::Point,
+        (Add | Sub, Ty::Point, Ty::Any) | (Add | Sub, Ty::Any, Ty::Point) => Ty::Point,
+        (Mul, Ty::Point, Ty::Num(_)) | (Mul, Ty::Num(_), Ty::Point) => Ty::Point,
+        (Div, Ty::Point, Ty::Num(_)) => Ty::Point,
+        (Eq | Ne, Ty::Point, Ty::Point) => Ty::Bool,
+        _ => {
+            errors.push(e(
+                0,
+                format!(
+                    "'{}' does not apply to {} and {}: points add to points, and a number scales one",
+                    op.symbol(),
+                    lt.label(),
+                    rt.label()
+                ),
+            ));
+            Ty::Any
+        }
+    }
+}
+
+fn infer_math(
+    kind: MathKind,
+    args: &[Expr],
+    line: u32,
+    scope: &mut Vec<(String, Ty)>,
+    declared: &[&str],
+    errors: &mut Vec<CheckError>,
+) -> Ty {
+    let tys: Vec<Ty> = args.iter().map(|a| infer(a, scope, declared, errors)).collect();
+    let want = match kind {
+        MathKind::Vector => 2,
+        MathKind::Distance
+        | MathKind::SlantDistance
+        | MathKind::BearingFrom
+        | MathKind::Atan2 => 2,
+        _ => 1,
+    };
+    let wrong_count = match kind {
+        MathKind::Vector => tys.len() != 2 && tys.len() != 3,
+        _ => tys.len() != want,
+    };
+    if wrong_count {
+        let expected = match kind {
+            MathKind::Vector => "2 or 3 values".to_string(),
+            _ => format!("{} value(s)", want),
+        };
+        errors.push(e(
+            line,
+            format!("{:?} takes {}, but {} were given", kind, expected, tys.len()),
+        ));
+        return Ty::Any;
+    }
+    let numeric = |t: Ty| matches!(t, Ty::Num(_) | Ty::Any);
+    let point = |t: Ty| matches!(t, Ty::Point | Ty::Any);
+    match kind {
+        MathKind::Vector => {
+            for t in &tys {
+                if !numeric(*t) {
+                    errors.push(e(line, format!("a point is three numbers, but this is {}", t.label())));
+                }
+            }
+            Ty::Point
+        }
+        MathKind::Distance | MathKind::SlantDistance => {
+            for t in &tys {
+                if !point(*t) {
+                    errors.push(e(
+                        line,
+                        format!("{:?} needs two points, but this is {}", kind, t.label()),
+                    ));
+                }
+            }
+            Ty::Num(Some(Unit::Meter))
+        }
+        MathKind::BearingOf => {
+            if !point(tys[0]) {
+                errors.push(e(
+                    line,
+                    format!("'bearing of' needs a point, but this is {}", tys[0].label()),
+                ));
+            }
+            Ty::Num(Some(Unit::Deg))
+        }
+        MathKind::BearingFrom => {
+            for t in &tys {
+                if !point(*t) {
+                    errors.push(e(
+                        line,
+                        format!("'bearing from ... to' needs two points, but this is {}", t.label()),
+                    ));
+                }
+            }
+            Ty::Num(Some(Unit::Deg))
+        }
+        MathKind::Sin | MathKind::Cos | MathKind::Sqrt => {
+            if !numeric(tys[0]) {
+                errors.push(e(line, format!("{:?} needs a number, but this is {}", kind, tys[0].label())));
+            }
+            Ty::Num(None)
+        }
+        MathKind::Atan2 => {
+            for t in &tys {
+                if !numeric(*t) {
+                    errors.push(e(line, format!("atan2 needs two numbers, but this is {}", t.label())));
+                }
+            }
+            Ty::Num(None)
+        }
+        MathKind::ToRadians | MathKind::ToDegrees => {
+            if !numeric(tys[0]) {
+                errors.push(e(line, format!("a conversion needs a number, but this is {}", tys[0].label())));
+            }
+            Ty::Num(None)
         }
     }
 }
@@ -422,6 +588,7 @@ fn terminates(stmts: &[Stmt]) -> bool {
         Stmt::If { then, otherwise, .. } => {
             !otherwise.is_empty() && terminates(then) && terminates(otherwise)
         }
+        Stmt::Try { body, otherwise, .. } => terminates(body) && terminates(otherwise),
         _ => false,
     }
 }

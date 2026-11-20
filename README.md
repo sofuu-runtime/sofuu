@@ -106,9 +106,20 @@ $ sofuu eval 'const b = sofuu.memory.open("./brain.qtsq", 768); b.remember(sofuu
 
 ---
 
-### 4. Kaze: a domain-specific scripting language
+### 4. Kaze: a language for AI applications
 
-Kaze provides a parser, checker, VM, capability declarations and standalone compilation for bounded agent and device routines. It is not a general-purpose language. A script or compiled agent that declares AI or tool needs runs through an asynchronous bridge that routes AI calls through Sofuu's AI API and tool calls through its built-in tools or MCP client under the applicable policies. **A real Kaze model-and-authorized-tool journey has been exercised on a debug build, through `sofuu.kaze.runAsync`, a compiled agent, and `sofuu script run` for source and bytecode — with a configured remote provider and, separately, with pre-existing local GGUF weights and a real local MCP server.** A script that declares neither capability keeps the engine-free synchronous runner and refuses unavailable AI and tool backends. Memory backends are `memory=ephemeral` (a per-run in-memory CMA store), `memory=durable` and `memory=file:<path>` (persisted across process restarts); alert sinks are `alert=stdout`, `alert=stderr` and `alert=file:<path>`. Sensor, device and physical-hardware operations remain unavailable. Physical simulation is explicitly selected for drone or rover testing. Released binaries, other providers and live hardware still need separate verification. Do not use the examples for real-world actions or treat their output as evidence of verified live integrations.
+Kaze's language core is intended to be independently designed and implemented;
+documented external host and security providers remain dependencies, not
+Kaze-owned code. A Kaze-written compiler is a long-term self-hosting direction,
+not an implemented feature. See [KAZE-VISION.md](KAZE-VISION.md).
+
+The intended design is one Kaze language with human-oriented and
+machine-oriented source syntaxes sharing semantics and safety rules. The
+leading machine-syntax candidate is a tagged prefix-tree text form, subject to
+comparison and further design; human syntax would evolve from current Kaze.
+Machine syntax and conversion are planned, not implemented features.
+
+Kaze is intended as a general-purpose language within AI: its vision spans AI software applications and AI-powered physical systems, not general-purpose computing outside AI. This is a goal, not a claim that every AI use case is supported today; see [KAZE-VISION.md](KAZE-VISION.md). The current embedded engine provides a parser, checker, VM, capability declarations and standalone compilation for supported routines. A script or compiled agent that declares AI or tool needs runs through an asynchronous bridge that routes AI calls through Sofuu's AI API and tool calls through its built-in tools or MCP client under the applicable policies. **A real Kaze model-and-authorized-tool journey has been exercised on a debug build, through `sofuu.kaze.runAsync`, a compiled agent, and `sofuu script run` for source and bytecode — with a configured remote provider and, separately, with pre-existing local GGUF weights and a real local MCP server.** A script that declares neither capability keeps the engine-free synchronous runner and refuses unavailable AI and tool backends. Memory backends are `memory=ephemeral` (a per-run in-memory CMA store), `memory=durable` and `memory=file:<path>` (persisted across process restarts); alert sinks are `alert=stdout`, `alert=stderr` and `alert=file:<path>`. Sensor, device and physical-hardware operations remain unavailable. Physical simulation is explicitly selected for drone or rover testing. Released binaries, other providers and live hardware still need separate verification. Do not use the examples for real-world actions or treat their output as evidence of verified live integrations.
 
 See [embedded Kaze capability status](KAZE-EMBEDDED.md) for policy, backend and verification details.
 
@@ -143,7 +154,7 @@ Sofuu groups the main runtime surfaces and experimental modules below. Core mean
 | **Standalone Compiler** | **Core** | `sofuu compile`: native executables with a 32-byte `SOFUU_BIN_V1` trailer; signing and dependencies vary by platform. |
 | **Vector Memory (QTSQ)** | **Core** | On-device `.qtsq` vector containers, cached KDF v2, plaintext zero-KDF mode, hardware SIMD search. |
 | **Model Context Protocol (MCP)** | **Core** | Native client & server supporting stdio, HTTP, SSE, and direct in-process transports; dynamic tool discovery. |
-| **Kaze Agent Language** | **Core** | Domain-specific scripting language and VM with authorized async model/tool dispatch. The local-GGUF path is verified in source (3/3 runs, source and compiled); the released artifact, other providers and live hardware stay unverified. |
+| **Kaze Language for AI** | **Core** | AI-domain language and VM with authorized async model/tool dispatch. The broad AI application vision is not yet fully implemented. The local-GGUF path is verified in source (3/3 runs, source and compiled); the released artifact, other providers and live hardware stay unverified. |
 | **Security Sandbox** | **Core** | Deterministic path traversal blocking, private CIDR SSRF filtering, credential shielding (`.env`, `id_rsa`). |
 | **Local Inference Engine** | **Preview** | Built-in custom GGUF/SafeTensors engine. (For deployed local inference, use `sofuu-plugin-llamacpp` or remote providers). |
 | **Robotics & MAVLink** | **Preview** | `sofuu drone`, MAVLink v2 codec, and GPIO line timers through hardware safety gates. |

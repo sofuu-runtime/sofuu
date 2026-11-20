@@ -294,6 +294,10 @@ pub fn render_value(v: Value, arena: &Arena, heap: &Heap) -> String {
             }
             None => "{}".to_string(),
         },
+        Value::Vec(i) => match heap.vec3(i) {
+            Some([x, y, z]) => format!("vector({}, {}, {})", fmt_num(x), fmt_num(y), fmt_num(z)),
+            None => "vector(0, 0, 0)".to_string(),
+        },
     }
 }
 

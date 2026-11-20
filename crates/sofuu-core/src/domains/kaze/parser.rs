@@ -239,7 +239,7 @@ impl Parser {
         if items.is_empty() {
             return err(1, 1, "this script is empty: add an action, check, filter, when or every block");
         }
-        Ok(Program { needs: self.needs.clone(), items })
+        Ok(Program { needs: self.needs.clone(), uses: Vec::new(), root: String::new(), items })
     }
 
     fn item(&mut self) -> Result<Item, ParseError> {
@@ -253,7 +253,7 @@ impl Parser {
             self.push_scope();
             let body = self.block()?;
             self.pop_scope();
-            return Ok(Item { name, kind: ItemKind::When(cond), params: Vec::new(), body, line });
+            return Ok(Item { name, kind: ItemKind::When(cond), params: Vec::new(), body, line, origin: String::new() });
         }
         if self.at_ident("every") {
             self.bump();
@@ -274,7 +274,7 @@ impl Parser {
             self.push_scope();
             let body = self.block()?;
             self.pop_scope();
-            return Ok(Item { name, kind: ItemKind::Every(ms), params: Vec::new(), body, line });
+            return Ok(Item { name, kind: ItemKind::Every(ms), params: Vec::new(), body, line, origin: String::new() });
         }
 
         let kind = match self.peek().clone() {
@@ -321,7 +321,7 @@ impl Parser {
         if body.is_empty() {
             return err(line, col, format!("'{}' has an empty body", name));
         }
-        Ok(Item { name, kind, params, body, line })
+        Ok(Item { name, kind, params, body, line, origin: String::new() })
     }
 
     fn block(&mut self) -> Result<Vec<Stmt>, ParseError> {
@@ -427,6 +427,33 @@ impl Parser {
             self.expect_punct(':')?;
             let body = self.block()?;
             return Ok(Stmt::While { cond, body, line });
+        }
+        if self.at_ident("try") {
+            self.bump();
+            self.expect_punct(':')?;
+            let body = self.block()?;
+            if !self.at_ident("otherwise") {
+                let (l, c) = self.here();
+                return err(
+                    l,
+                    c,
+                    "'try' needs an 'otherwise:' block; a try that cannot recover is just a delay",
+                );
+            }
+            self.bump();
+            let mut error_name: Option<String> = None;
+            if self.at_ident("with") {
+                self.bump();
+                error_name = Some(self.expect_ident()?);
+            }
+            self.expect_punct(':')?;
+            self.push_scope();
+            if let Some(name) = &error_name {
+                self.bind(name);
+            }
+            let otherwise = self.block()?;
+            self.pop_scope();
+            return Ok(Stmt::Try { body, otherwise, error_name, line });
         }
         if self.at_ident("return") {
             // `return to launch` is the drone verb; `return` alone ends the action.
@@ -737,8 +764,22 @@ impl Parser {
     }
 
     fn postfix_expr(&mut self) -> Result<Expr, ParseError> {
+        let (line, _) = self.here();
         let mut value = self.primary()?;
         loop {
+            if matches!(self.peek(), Tok::Ident(w) if w == "in")
+                && matches!(self.peek_at(1), Tok::Ident(u) if u == "radians" || u == "degrees")
+            {
+                let to_radians = matches!(self.peek_at(1), Tok::Ident(u) if u == "radians");
+                self.bump();
+                self.bump();
+                value = Expr::Math {
+                    kind: if to_radians { MathKind::ToRadians } else { MathKind::ToDegrees },
+                    args: vec![value],
+                    line,
+                };
+                continue;
+            }
             if self.eat_punct('[') {
                 let idx = self.expr()?;
                 self.expect_punct(']')?;
@@ -794,6 +835,130 @@ impl Parser {
                     self.bump();
                     let inner = self.add_expr()?;
                     return Ok(Expr::Len(Box::new(inner)));
+                }
+                if word == "link" && matches!(self.peek_at(1), Tok::Ident(w) if w == "lost") {
+                    self.bump();
+                    self.bump();
+                    self.expect_word("for")?;
+                    let (num, unit) = self.number_with_unit()?;
+                    if unit != Unit::Sec {
+                        return err(
+                            line,
+                            col,
+                            "link lost needs a time, e.g. 'link lost for 3 seconds' or \
+                             'link lost for 1500 ms'",
+                        );
+                    }
+                    let after_ms = num * 1000.0;
+                    if !after_ms.is_finite() || after_ms < 1.0 || after_ms > u32::MAX as f64 {
+                        return err(
+                            line,
+                            col,
+                            "link lost needs at least 1 millisecond (and less than about 49 \
+                             days); a shorter window cannot be told apart from a healthy link",
+                        );
+                    }
+                    return Ok(Expr::LinkLost { after_ms, line });
+                }
+                if matches!(word.as_str(), "vector" | "sin" | "cos" | "atan2" | "sqrt")
+                    && matches!(self.peek_at(1), Tok::Punct('('))
+                {
+                    self.bump();
+                    self.bump();
+                    let mut args = Vec::new();
+                    if !self.eat_punct(')') {
+                        loop {
+                            args.push(self.expr()?);
+                            if self.eat_punct(',') {
+                                continue;
+                            }
+                            self.expect_punct(')')?;
+                            break;
+                        }
+                    }
+                    let kind = match word.as_str() {
+                        "vector" => MathKind::Vector,
+                        "sin" => MathKind::Sin,
+                        "cos" => MathKind::Cos,
+                        "atan2" => MathKind::Atan2,
+                        _ => MathKind::Sqrt,
+                    };
+                    return Ok(Expr::Math { kind, args, line });
+                }
+                if word == "distance" && matches!(self.peek_at(1), Tok::Ident(w) if w == "between") {
+                    self.bump();
+                    self.bump();
+                    let a = self.add_expr()?;
+                    self.expect_word("and")?;
+                    let b = self.add_expr()?;
+                    return Ok(Expr::Math { kind: MathKind::Distance, args: vec![a, b], line });
+                }
+                if word == "slant" && matches!(self.peek_at(1), Tok::Ident(w) if w == "distance")
+                    && matches!(self.peek_at(2), Tok::Ident(w) if w == "between")
+                {
+                    self.bump();
+                    self.bump();
+                    self.bump();
+                    let a = self.add_expr()?;
+                    self.expect_word("and")?;
+                    let b = self.add_expr()?;
+                    return Ok(Expr::Math { kind: MathKind::SlantDistance, args: vec![a, b], line });
+                }
+                if word == "bearing" {
+                    match self.peek_at(1).clone() {
+                        Tok::Ident(w) if w == "of" => {
+                            self.bump();
+                            self.bump();
+                            let v = self.add_expr()?;
+                            return Ok(Expr::Math { kind: MathKind::BearingOf, args: vec![v], line });
+                        }
+                        Tok::Ident(w) if w == "to" => {
+                            self.bump();
+                            self.bump();
+                            let place = self.add_expr()?;
+                            let family = match self.ambient {
+                                Some(family) => family,
+                                None => {
+                                    return err(
+                                        line,
+                                        col,
+                                        "'bearing to' measures from where the machine is, but this \
+                                         script declares no single hardware capability to read a \
+                                         position from; declare one (needs: drone) or write \
+                                         'bearing from here to target'"
+                                            .to_string(),
+                                    )
+                                }
+                            };
+                            let here = Expr::Math {
+                                kind: MathKind::Vector,
+                                args: vec![
+                                    Expr::Ambient { field: "latitude".to_string(), family },
+                                    Expr::Ambient { field: "longitude".to_string(), family },
+                                    Expr::Num(0.0, Unit::None),
+                                ],
+                                line,
+                            };
+                            return Ok(Expr::Math {
+                                kind: MathKind::BearingFrom,
+                                args: vec![here, place],
+                                line,
+                            });
+                        }
+                        Tok::Ident(w) if w == "from" => {
+                            self.bump();
+                            self.bump();
+                            let a = self.add_expr()?;
+                            self.expect_word("to")?;
+                            let b = self.add_expr()?;
+                            return Ok(Expr::Math {
+                                kind: MathKind::BearingFrom,
+                                args: vec![a, b],
+                                line,
+                            });
+                        }
+                        _ => {}
+                    }
                 }
                 if word == "policy" && matches!(self.peek_at(1), Tok::Ident(w) if w == "detects" || w == "detect") {
                     self.bump();

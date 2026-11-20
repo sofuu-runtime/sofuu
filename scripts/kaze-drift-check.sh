@@ -3,15 +3,14 @@
 #
 # Why this exists: there are two Kaze engines in this tree.
 #
-#   crates/sofuu-core/src/domains/kaze/   THE PRODUCT. Frozen language spec v0.1,
+#   crates/sofuu-core/src/domains/kaze/   THE PRODUCT. Aligned language spec v1.0,
 #                                         compiled into the sofuu binary.
 #   kaze/                                 a standalone prototype crate with its own
 #                                         workspace, its own CLI and its own tests.
 #                                         Not built by make, not built by CI.
 #
-# Two copies of one language drift silently. They already did: the prototype grew
-# device.set_duty and nine vector/trig opcodes that the product never shipped,
-# while the documents pointed at the prototype. This gate makes the drift loud.
+# Both engines implement the unified Kaze 1.0 contract (47 opcodes, 17 capability verbs).
+# This gate enforces strict zero-drift across verbs, opcodes, and version strings.
 #
 # Policy, in order of severity:
 #   FAIL   a capability verb or opcode that the PRODUCT has and the prototype

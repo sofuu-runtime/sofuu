@@ -117,6 +117,10 @@ fn values_equal_at(a: Value, b: Value, arena: &Arena, heap: &Heap, depth: u32) -
             }
             _ => false,
         },
+        (Value::Vec(x), Value::Vec(y)) => match (heap.vec3(x), heap.vec3(y)) {
+            (Some(l), Some(r)) => l == r,
+            _ => false,
+        },
         _ => a == b,
     }
 }

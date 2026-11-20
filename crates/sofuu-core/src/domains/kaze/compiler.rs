@@ -32,9 +32,11 @@ fn e<T>(line: u32, msg: impl Into<String>) -> Result<T, CompileError> {
 }
 
 const MAX_SLOTS: u8 = 255;
+const NO_ERROR_BINDING: u8 = 255;
 
 pub fn compile(program: &Program) -> Result<Module, CompileError> {
     let mut module = Module {
+        root: program.root.clone(),
         needs: program.needs.clone(),
         ..Default::default()
     };
@@ -83,6 +85,7 @@ pub fn compile(program: &Program) -> Result<Module, CompileError> {
             params: item.params.clone(),
             code: std::mem::take(&mut cx.code),
             line: item.line,
+            origin: item.origin.clone(),
             line_map: std::mem::take(&mut cx.line_map),
             period_ms: period,
             slots,
@@ -204,6 +207,27 @@ impl<'a> Cx<'a> {
                 self.jump_back_to(head);
                 self.patch(to_end);
             }
+            Stmt::Try { body, otherwise, error_name, .. } => {
+                let slot = if error_name.is_some() {
+                    self.temp()?
+                } else {
+                    NO_ERROR_BINDING
+                };
+                let handler = self.emit_wide(Op::TryBegin, slot, 0);
+                self.stmts(body)?;
+                self.emit(Op::TryEnd, 0, 0, 0);
+                let to_end = self.emit_wide(Op::Jmp, 0, 0);
+                self.patch(handler);
+                self.scopes.push(Vec::new());
+                if let Some(name) = error_name {
+                    if let Some(top) = self.scopes.last_mut() {
+                        top.push((name.clone(), slot));
+                    }
+                }
+                self.stmts(otherwise)?;
+                self.scopes.pop();
+                self.patch(to_end);
+            }
             Stmt::Return(value, _line) => match value {
                 Some(v) => {
                     self.expr(v)?;
@@ -308,6 +332,36 @@ impl<'a> Cx<'a> {
                 self.expr(list)?;
                 self.expr(idx)?;
                 self.emit(Op::GetIndex, 0, 0, 0);
+            }
+            Expr::Math { kind, args, line: _ } => {
+                for a in args {
+                    self.expr(a)?;
+                }
+                let op = match kind {
+                    MathKind::Vector => Op::VecNew,
+                    MathKind::Distance => Op::VecDist,
+                    MathKind::SlantDistance => Op::VecSlantDist,
+                    MathKind::BearingOf => Op::VecBearing,
+                    MathKind::BearingFrom => Op::VecBearingBetween,
+                    MathKind::Sin => Op::Sin,
+                    MathKind::Cos => Op::Cos,
+                    MathKind::Atan2 => Op::Atan2,
+                    MathKind::Sqrt => Op::Sqrt,
+                    MathKind::ToRadians => Op::DegToRad,
+                    MathKind::ToDegrees => Op::RadToDeg,
+                };
+                let a = if *kind == MathKind::Vector { args.len() as u8 } else { 0 };
+                self.emit(op, a, 0, 0);
+            }
+            Expr::LinkLost { after_ms, line } => {
+                if !after_ms.is_finite() || *after_ms < 1.0 || *after_ms > u32::MAX as f64 {
+                    return e(
+                        *line,
+                        "link lost needs at least 1 millisecond (and less than about 49 days); \
+                         a shorter window cannot be told apart from a healthy link",
+                    );
+                }
+                self.emit_wide(Op::LinkLost, 0, *after_ms as u32);
             }
             Expr::Field { base, field, line } => {
                 match self.resolve(base) {

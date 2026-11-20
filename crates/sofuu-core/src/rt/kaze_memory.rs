@@ -491,6 +491,19 @@ fn to_json(
             }
             Ok(Json::Object(result))
         }
+        Value::Vec(i) => {
+            let p = heap
+                .vec3(i)
+                .ok_or_else(|| "E_KAZE_MEMORY: invalid vector".to_string())?;
+            let mut result = Vec::with_capacity(3);
+            for n in p {
+                let num = Number::from_f64(n)
+                    .map(Json::Number)
+                    .ok_or_else(|| "E_KAZE_MEMORY: memory numbers must be finite".to_string())?;
+                result.push(num);
+            }
+            Ok(Json::Array(result))
+        }
     }
 }
 

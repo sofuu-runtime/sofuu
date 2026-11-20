@@ -4,6 +4,24 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Kaze 1.0 Version Alignment & Full Language Parity — 2026-11-21
+
+- **Unified Language Contract (v1.0):**
+  - Standalone Kaze (`kaze/`) and the embedded engine in Sofuu (`crates/sofuu-core/src/domains/kaze/`) are aligned on language version **1.0**.
+  - Strict drift check (`./scripts/kaze-drift-check.sh --strict`) passes with 0 opcode drift (all 47 opcodes: spatial vectors, spherical geodesy, trigonometric math, and try/otherwise fault tolerance), 0 verb drift (all 17 capabilities), and 0 version drift (`1.0`).
+- **Spatial Kinematics & Error Recovery in Embedded Engine:**
+  - Added pure spherical geodesy ([`geo.rs`](crates/sofuu-core/src/domains/kaze/geo.rs)) for Haversine distance, bearings, slant range, and angle units.
+  - Added 3D vector values (`Value::Vec`), heap vector storage, and vector arithmetic (`vector(x, y, z)`, distance, bearing).
+  - Implemented `try: ... otherwise [with err]: ...` syntax, checker typing, compiler jumps, VM handler stack, and `link lost for <family>` expressions.
+- **Bytecode Format Reconciliation:**
+  - Embedded engine writes Format 2 bytecode with per-item statement line maps for statement-accurate runtime diagnostics in JavaScript and agent traces.
+  - Embedded engine deserializes Format 1, Format 2, and standalone Format 4 modules, ensuring full compatibility with `.kazebc` artifacts compiled by `kaze`.
+- **Verification Gates Passed:**
+  - All 130 tests in `domains::kaze` pass.
+  - All 109 unit tests and all integration suites in `kaze/` pass.
+  - Primary `./sofuu` binary size strictly respects the $5.6\text{ MiB}$ limit ($5,834,144\text{ B} \le 5,872,025\text{ B}$).
+  - All real resource verification gates pass (`fail-closed`, `alert-real`, `memory-durable`, `memory-real`, `js-boundaries`, `local-gguf-real`).
+
 ## Real-Execution Remediation — 2026-11-16
 
 - **Fail-closed capability host (`crates/sofuu-core/src/domains/kaze/caps.rs`):**

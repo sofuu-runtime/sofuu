@@ -14,6 +14,7 @@ pub mod ast;
 pub mod caps;
 pub mod checker;
 pub mod compiler;
+pub mod geo;
 pub mod isa;
 pub mod lexer;
 pub mod parser;
@@ -32,7 +33,7 @@ use crate::sfs::isa::Module;
 use crate::sfs::vm::{CapabilityRequest, ItemContinuation, Limits, SliceOutcome, Vm, VmError, Verdict};
 
 /// Language version reported by `sofuu.sfs.version` and `sofuu script --version`.
-pub const VERSION: &str = "0.1";
+pub const VERSION: &str = "1.0";
 
 const ASYNC_RUN_LIMIT: usize = 32;
 const ASYNC_INSTRUCTION_SLICE: usize = 256;
@@ -1901,7 +1902,7 @@ pub unsafe fn mod_sfs_register(ctx: *mut JSContext) {
         qjs::sofuu_js_set_property_str(ctx, ns, c"check".as_ptr(), check);
         let compile = qjs::sofuu_js_new_cfunction(ctx, js_sfs_compile, c"compile".as_ptr(), 1);
         qjs::sofuu_js_set_property_str(ctx, ns, c"compile".as_ptr(), compile);
-        let version = qjs::sofuu_js_new_string(ctx, c"0.1".as_ptr());
+        let version = qjs::sofuu_js_new_string(ctx, c"1.0".as_ptr());
         qjs::sofuu_js_set_property_str(ctx, ns, c"version".as_ptr(), version);
         let gate = qjs::sofuu_js_new_string(ctx, c"fail-closed-1".as_ptr());
         qjs::sofuu_js_set_property_str(ctx, ns, c"capabilityGate".as_ptr(), gate);

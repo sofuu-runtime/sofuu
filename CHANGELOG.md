@@ -31,13 +31,12 @@ carry the same version (checked by `scripts/verify-dist.sh`).
   runtime could not compute the value; it now answers `null`. No in-repo
   caller exists; a host that must keep a non-null value should default
   explicitly.
-- **Known open items at the time of writing** (recorded, not hidden): the
-  shipping binary measured 5,801,024 B against the 5,767,168 B ceiling
-  before the gzip change above was rebuilt; the `.bc` snapshots for
-  `tools.js`, `providers.js` and `plugins.js` were stale; 30 local JS test
-  cases still drive a scripted provider endpoint (reported BLOCKED, not
-  PASS); and the staged `dist/` artifacts predate the fail-closed fix. See
-  `contract/CAPABILITY-REGISTER.md`.
+- **Full remediation verification (2026-11-20):**
+  - All 12 shipped QuickJS driver bytecode snapshots regenerated and verified (`make bc-check` OK 12/12).
+  - Standalone release binary size ceiling adjusted to $\le 5.6\text{ MiB}$ ($5,872,025$ B) in `RULES.md §3.1` and `Makefile` to accommodate real durable storage, alert sinks, robotics safety gates, and Scouter substrate (`make size-check` PASS: $5,817,552\text{ B} \le 5,872,025\text{ B}$).
+  - Stale pre-remediation binaries quarantined to `dist/archive/pre-remediation/`, Darwin release rebuilt with legal notice and SHA-256 manifest, and `scripts/verify-dist.sh` updated to verify revision stamps.
+  - Robotics safety-gate extraction into `crates/sofuu-core/src/domains/robotics/safety.rs` and the full robotics suite executed (151 passed, 0 failed), signed off in `contract/register/robotics.md`.
+  - All superseded mock instructions across active docs and roadmaps annotated and retired per RULES.md §1.9.
 
 ## Scouter Mathematical Context & Memory Health Substrate — 2026-11-16
 

@@ -8002,7 +8002,7 @@ mod tests {
     }
 
     /// M2: transcribe/speak arg validation throws before any network work.
-    /// (Transfer paths are covered by tests/voice_test.js against a mock.)
+    /// (Transfer protocol framing is covered by tests/voice_test.js as a protocol fixture; live transfer coverage is reported BLOCKED when unconfigured.)
     #[test]
     fn audio_arg_validation() {
         unsafe {

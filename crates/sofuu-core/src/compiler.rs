@@ -2865,7 +2865,9 @@ mod tests {
 
     /// A temporary directory holding one file per name.
     fn temp_files(files: &[(&str, &str)]) -> (PathBuf, Vec<String>) {
-        let dir = std::env::temp_dir().join(format!("sofuu-bootstrap-{}", std::process::id()));
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("sofuu-bootstrap-{}-{}", std::process::id(), seq));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("a temporary directory");
         let paths = files

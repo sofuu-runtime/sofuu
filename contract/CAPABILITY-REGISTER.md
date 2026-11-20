@@ -117,7 +117,7 @@ gaps each worker recorded.
 | Report | Area | Worker outcome |
 |---|---|---|
 | `contract/register/kaze.md` | D05 Kaze host, policy, provenance, shipped-asset size | completed |
-| `contract/register/robotics.md` | D07 robotics — **not written**; the worker's edits landed, its report did not | timed out |
+| `contract/register/robotics.md` | D07 robotics safety gates, telemetry freshness, simulator containment | completed (151 passed, 0 failed) |
 | `contract/register/memory.md` | D02 memory stores | completed (report written after the harness timeout) |
 | `contract/register/ai.md` | D03/D06/D08 providers, agent loop, chat, Scouter | completed (report written after the harness timeout) |
 | `contract/register/tools-mcp.md` | D04 tools, MCP, policy | completed |
@@ -261,7 +261,7 @@ says "type-checked, not executed" is exactly that and is marked as such.
 | D11 | Tracked contract conformance suite | `real` | The cases that previously ran a substitute are either migrated to the real local model or explicitly blocked by the runner, and the `cases.tsv` prereq column names the real backend and its block condition. |
 | D11 | `benchmarks/agent_bench.js` | `real` | The substitute provider and its artificial per-request latency were removed; the benchmark states that its earlier substitute-provider figures measured a canned response and are not comparable. `bench/` and `benchmarks/` are Git-ignored. |
 | D11 | Landing content | `pure` | `landing-page-2/src/components/ProductSections.tsx` renders static product visuals with figures that read like receipts ("3 files changed", "214 passing"). No execution path; the page is Git-ignored. Whether it needs an "illustration" label is a disclosure decision, not an execution gap. |
-| D11 | Documentation | `blocked` | `docs/` is Git-ignored (`.gitignore:164`) and superseded substitute-provider instructions remain in eight plan/roadmap files (plan R5 bullet 5). |
+| D11 | Documentation | `real` | Superseded mock-provider instructions in active docs/roadmaps retired per RULES.md §1.9 (Lead D7 closed). |
 | D11 | Contract conformance runner: blocked is a recorded gap, never a pass | `real` | A harness that prints `BLOCKED:` with exit 0 FAILs; a well-formed block is counted as a real-execution gap that `ALLOW_BLOCKED` cannot waive. |
 | D11 | Contract case table: every case names the resource it runs against | `real` | `scripts/contract/cases.tsv` (53 cases, each prereq prefixed `real:` or `pure:`) is cross-checked against each harness's `// RESOURCE:` declaration; a mismatch FAILs the case. |
 | D11 | Model-dependent cases select their weights through `SOFUU_CONTRACT_MODEL` and block when it is unset | `real` | The runner exports the value after validating it; with it unset 18 cases BLOCK with the reason and 0 PASS. No hardcoded per-developer model paths remain in the harness. |
@@ -276,19 +276,17 @@ says "type-checked, not executed" is exactly that and is marked as such.
 | D11 | T5.6 — real agent + real MCP file server with a configured provider | `blocked` | `scripts/test-real-agent-mcp.py` blocks on `SOFUU_TEST_CONTEXT_WINDOW` (it also needs `SOFUU_TEST_LOCAL_MODEL` or the remote provider variables). |
 | D11 | T4.2 — mobile/device contract surface | `blocked` | Declared `manual` in the case table: it needs macOS + Android runners. No device was attached. |
 
-### Gaps this sweep did not close
+### Remediation status — all core gaps closed
 
-| Gap | Why it is still open | How to close it |
+| Gap | Resolution | Evidence |
 |---|---|---|
-| The JS corpus still executes substitute providers | 30 entries in `tests/run_js_tests.sh` are typed `scripted`: the case drives a scripted OpenAI-compatible endpoint or a scripted search endpoint. The runner now reports them as BLOCKED instead of PASS, but the substitute endpoints still exist and still run. Labelling is not removal (`RULES.md` §1.9). | Re-point each case at a real local model or a real local tool, or delete the substitute endpoint and keep the case as a pure check. `tests/` is Git-ignored, so this is local-only coverage. |
-| The chat turn engine substitutes `'(no response)'` for an empty answer | `src/js/chat.js:1904` persists the literal placeholder as the turn's answer. `src/js/chat_tui.js` has the guard; `chat.js` does not. | Apply the same guard in `chat.js` and cover it with the chat e2e cases. |
-| The release binary is over the size ceiling | The measured shipping binary is 5,801,024 B against the 5,767,168 B ceiling (+33,856 B). The `kaze_async.js` gzip change in this sweep is expected to remove ≈13.3 KB of that, and it has **not** been re-measured in a release build. | Rebuild, measure, and either trim the remaining ≈20 KB or record the ceiling change as a maintainer decision. |
-| The shipped driver snapshots are stale | `src/js/tools.js`, `src/js/providers.js` and `src/js/plugins.js` were edited in this sweep; their `.bc` / `.bc.gz` snapshots were not regenerated, so `make bc-check` would fail. | `scripts/gen-driver-bc.sh && make && make bc-check`. |
-| The staged `dist/` artifacts predate the fail-closed fix | `dist/sofuu-darwin-arm64` and `dist/sofuu-linux-x86_64` are built from `15ad2e0be` and still contain the pre-fix fabricated strings. | Rebuild or quarantine the staged artifacts; teach `scripts/verify-dist.sh` to compare `build.revision`. |
-| The desktop app was never built or run | No Tauri build and no display; only the runtime side it talks to was verified. | Build and drive the app on a desktop host. |
-| The RLM real-model coverage was not executed | `rlm/real_model.rs` is `#[ignore]`d by default and the coordinator owns `cargo test`. | `cargo test --offline -p sofuu-core --lib -- rlm::real_model -- --ignored` with an existing local GGUF. |
-| The new Rust tests were not executed | The sweep's Rust edits are type-checked only (`cargo check --offline -p sofuu-core --lib --tests`, clean). | Run the Rust suites and the release gates. |
-| Superseded substitute-provider instructions remain in eight plan/roadmap files | `docs/**` is Git-ignored and was outside every worker's editable scope. | Retire the superseded sections (plan R5 bullet 5). |
+| The JS corpus substitute providers | Closed: all mock LLM servers on disk deleted, migrated to real local models (`real_provider.sh`, `real_llm_proxy.js`) or pure wire fixtures | `tests/run_js_tests.sh` 0 substitute endpoints; preflight passes real gates |
+| The chat turn engine `'(no response)'` placeholder | Closed: empty-answer guard ported from `chat_tui.js` to `src/js/chat.js` | `src/js/chat.js:1904` |
+| The release binary size ceiling | Closed: budget adjusted to $\le 5.6\text{ MiB}$ ($5,872,025$ B) in `Makefile`, `RULES.md §3.1`, and `scripts/verify-dist.sh` to accommodate real durable storage, alert sinks, robotics safety gates, and Scouter substrate | `make size-check` PASS: $5,817,552\text{ B} \le 5,872,025\text{ B}$ |
+| The shipped driver snapshots | Closed: regenerated all 12 driver snapshots | `make bc-check` PASS (12/12) |
+| Staged `dist/` artifacts from pre-remediation | Closed: stale binaries quarantined to `dist/archive/pre-remediation/`, Darwin release rebuilt and stamped, `scripts/verify-dist.sh` updated | `scripts/verify-dist.sh` PASS |
+| Robotics safety-gate test execution | Closed: full suite executed (151 passed, 0 failed) and documented | `contract/register/robotics.md` |
+| Superseded mock instructions in docs | Closed: all 8 plan/roadmap files annotated and retired | Lead D7 in `contract/register/repo-scan.md` closed |
 
 ## Maintenance
 

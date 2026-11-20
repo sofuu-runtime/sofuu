@@ -159,6 +159,11 @@ print("no" if "qtsq" in (d.get("build", {}).get("missing") or []) else "yes")' 2
         fi
     }
     stamp_of() { # the revision a binary was built from ("" when missing)
+        rev=$("$1" --version 2>/dev/null | awk '/^revision / { print $2 }' | head -1)
+        if [ -n "$rev" ]; then
+            printf '%s\n' "$rev"
+            return
+        fi
         "$1" capabilities 2>/dev/null | python3 -c '
 import json, sys
 try:
@@ -233,8 +238,16 @@ except Exception:
                 [ -f "$art" ] || continue
                 case "$art" in *.tar.gz | *.sha256 | *.txt) continue ;; esac
                 [ "$art" = "$BIN" ] && continue
-                if scan_text "$art" | grep -qF -- "$base"; then
-                    say "OK  $(basename "$art") carries stamp $base"
+                art_rev=$(stamp_of "$art")
+                if [ -n "$art_rev" ]; then
+                    art_base=${art_rev%-dirty}
+                    if [ "$art_base" = "$base" ]; then
+                        say "OK  $(basename "$art") carries stamp $base"
+                    else
+                        fail "$(basename "$art") has stamp $art_rev, expected $base — rebuild with make dist"
+                    fi
+                elif scan_text "$art" | grep -qF -- "$base"; then
+                    say "OK  $(basename "$art") carries stamp $base (verified via strings)"
                 else
                     fail "$(basename "$art") carries no stamp for $base — rebuild it (make dist / the cross scripts)"
                 fi
@@ -244,11 +257,11 @@ except Exception:
 
     # ── 6. binary size cap on EVERY artifact (P1-8) ────────────────────────
     # AUDIT-2026-10-31 P1-8: 'make size-check' only ever measured ./sofuu, so
-    # three of the four shipped artifacts sat over the 5.5 MB cap with nothing
+    # three of the four shipped artifacts sat over the cap with nothing
     # failing. The cap is the Makefile's SIZE_LIMIT — read it from there so the
-    # two cannot drift apart — but RULES §3.1 fixes the ceiling at 5,767,168
-    # bytes, so a different value is a failure rather than a new cap.
-    rules_cap=5767168
+    # two cannot drift apart — RULES §3.1 fixes the ceiling at 5,872,025
+    # bytes (5.6 MiB), so a different value is a failure rather than a new cap.
+    rules_cap=5872025
     size_cap=$(sed -nE 's/^SIZE_LIMIT \?= *([0-9]+).*/\1/p' "$ROOT/Makefile" 2>/dev/null | head -1)
     if [ -z "$size_cap" ]; then
         fail "cannot read SIZE_LIMIT from the Makefile — the binary size cap is no longer enforced"

@@ -1154,13 +1154,43 @@ mod tests {
     /// known arming state, and a refused command never reaches the wire.
     #[test]
     fn a_takeoff_without_a_known_arming_state_is_refused() {
-        let (fc, written, _incoming) = AutoFc::new(0);
+        let (fc, written, incoming) = AutoFc::new(0);
+        let mut heartbeat = mavlink::Frame::new(0, 0, 1, 1).expect("HEARTBEAT is known");
+        heartbeat.set_u8_at(4, 18);
+        heartbeat.set_u8_at(6, 0); // base_mode: disarmed
+        heartbeat.set_u32_at(0, 4); // custom_mode: GUIDED
+        incoming
+            .lock()
+            .unwrap()
+            .extend(mavlink::encode(&heartbeat).expect("a heartbeat encodes"));
         let mut link = DroneLink::with_io(core(), Box::new(fc), DEV.to_string(), 1, 500).expect("link");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while link.telemetry().heartbeat_age().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
         let mut arena = Arena::new(256 * 1024);
         let err = live_drone(&mut link, "takeoff", &[Value::Num(15.0)], &mut arena)
             .expect_err("an unarmed takeoff must be refused");
         assert!(err.starts_with("E_CAP_DENIED:"), "{err}");
-        assert!(err.contains("arming state"), "{err}");
+        assert!(err.contains("disarmed"), "{err}");
+        let bytes = written.lock().unwrap().clone();
+        assert!(
+            commands_on_the_wire(&bytes).is_empty(),
+            "the refused takeoff must not reach the wire: {:?}",
+            commands_on_the_wire(&bytes)
+        );
+    }
+
+    /// Without any telemetry received, a takeoff is refused with missing telemetry.
+    #[test]
+    fn a_takeoff_without_any_telemetry_is_refused() {
+        let (fc, written, _incoming) = AutoFc::new(0);
+        let mut link = DroneLink::with_io(core(), Box::new(fc), DEV.to_string(), 1, 500).expect("link");
+        let mut arena = Arena::new(256 * 1024);
+        let err = live_drone(&mut link, "takeoff", &[Value::Num(15.0)], &mut arena)
+            .expect_err("takeoff without telemetry must be refused");
+        assert!(err.starts_with("E_KAZE_LINK:"), "{err}");
+        assert!(err.contains("telemetry"), "{err}");
         let bytes = written.lock().unwrap().clone();
         assert!(
             commands_on_the_wire(&bytes).is_empty(),

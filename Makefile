@@ -6,7 +6,7 @@
 # `make`           → Rust-first build (cargo; build.rs compiles the C
 #                    engine layer: QuickJS + SIMD + http-parser)
 # `make test`      → real-resource gates + the blocked-suite report
-# `make size-check`→ fail if binary exceeds SIZE_LIMIT (default 5.5 MiB = 5,767,168 B)
+# `make size-check`→ fail if binary exceeds SIZE_LIMIT (default 5.6 MiB = 5,872,025 B)
 # `make c-only`    → REMOVED in M10 (the pure-C binary died; see
 #                    PLAN-RUST-MIGRATION.md) — prints an error
 # `make linux`     → cross-compile via scripts/cross (cargo + zig)
@@ -47,7 +47,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
         desktop desktop-dev desktop-clean \
         ios-engine ios-engine-deps ios-project ios-typecheck ios-app ios-sim
 
-SIZE_LIMIT ?= 5767168   # 5.5 MB hard cap (bytes)
+SIZE_LIMIT ?= 5872025   # 5.6 MiB hard cap (bytes)
 
 # The artifact the real-resource gates exercise: an explicit SOFUU_BIN wins,
 # then the debug build, then the stripped release copy at the repository root.

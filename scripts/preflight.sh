@@ -178,7 +178,11 @@ section_rust() {
         [ -n "$t" ] || continue
         skip+=(--skip "$t")
     done <<< "$scripted"
-    out=$(SOFUU_ALLOW_LOOPBACK=1 cargo test --offline -p sofuu-core --lib -- "${skip[@]}" 2>&1); rc=$?
+    if [ "${#skip[@]}" -gt 0 ]; then
+        out=$(SOFUU_ALLOW_LOOPBACK=1 cargo test --offline -p sofuu-core --lib -- "${skip[@]}" 2>&1); rc=$?
+    else
+        out=$(SOFUU_ALLOW_LOOPBACK=1 cargo test --offline -p sofuu-core --lib 2>&1); rc=$?
+    fi
     summary=$(printf '%s\n' "$out" | grep -E '^test result:' | tail -1)
     if [ "$rc" -eq 0 ]; then
         report_pass "$id" "compliant core suite — ${summary:-ok}"

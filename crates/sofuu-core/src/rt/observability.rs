@@ -382,6 +382,22 @@ pub fn postmortem(args: &Value) -> Value {
         card["trace_path"] = json!(trace);
     }
 
+    let diag = if let Some(d) = args.get("diagnostic") {
+        Some(d.clone())
+    } else if let Some(code) = err.get("code").and_then(Value::as_str).filter(|c| !c.is_empty()) {
+        let msg = err.get("message").and_then(Value::as_str).unwrap_or("");
+        let mut d = crate::rt::diag_contract::Diagnostic::from_code(code, msg);
+        if let Some(stack) = err.get("stack").and_then(Value::as_str) {
+            d.location = crate::rt::diag_contract::first_stack_location(stack);
+        }
+        Some(d.to_json())
+    } else {
+        None
+    };
+    if let Some(d) = diag {
+        card["diagnostic"] = d;
+    }
+
     card = crate::rt::events::redact(&card);
 
     let dir = crashes_dir(&project);

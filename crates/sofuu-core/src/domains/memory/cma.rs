@@ -343,13 +343,6 @@ impl TextKey {
     }
 }
 
-/// W5.1: the text key's verdict for one candidate pair. `None` = the pair
-/// carries no text evidence (at least one side is empty/untokenizable), in
-/// which case the gate uses the distance key alone.
-fn text_key_verdict(incoming: &str, existing: &str) -> Option<bool> {
-    text_key_verdict_with(&TextKey::of(incoming), existing)
-}
-
 /// MEM-049: `text_key_verdict` with the INCOMING text's set already built —
 /// the ingest hot path, where one insert compares against several candidates.
 fn text_key_verdict_with(incoming: &TextKey, existing: &str) -> Option<bool> {
@@ -358,14 +351,6 @@ fn text_key_verdict_with(incoming: &TextKey, existing: &str) -> Option<bool> {
         return None;
     }
     Some(incoming.similarity(&other) >= DUP_TEXT_JACCARD)
-}
-
-/// W5.1: the gate's text-key decision, with the documented no-text
-/// fallback folded in. `true` = this pair passes the text key (including
-/// the vector-only fallback); `false` = the text key VETOES the merge even
-/// though the vectors are close.
-fn text_key_passes(incoming: &str, existing: &str) -> bool {
-    text_key_verdict(incoming, existing).unwrap_or(true)
 }
 
 /// MEM-049: `text_key_passes` for a caller that already built the incoming
@@ -991,7 +976,7 @@ impl Cma {
         for w in &mut self.working {
             let d = sq_dist(w.vector.as_slice(), vec).sqrt();
             let key = incoming_key.get_or_insert_with(|| TextKey::of(text));
-            if (d == 0.0 || d < DUP_DISTANCE && text_key_passes_with(key, &w.text)) {
+            if d == 0.0 || d < DUP_DISTANCE && text_key_passes_with(key, &w.text) {
                 w.created_at = now_secs();
                 if !source.is_empty() {
                     w.source = source.to_string();
@@ -1208,7 +1193,7 @@ impl Cma {
             return false;
         }
         let prof = std::env::var_os("SOFUU_PROFILE").is_some();
-        let mut t = std::time::Instant::now();
+        let t = std::time::Instant::now();
         let t_parse = 0.0f64;
         /* W3.1: with a valid snapshot the index comes from the file; only the
          * record table needs building. */

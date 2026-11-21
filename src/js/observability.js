@@ -478,6 +478,13 @@
       errText += String(err.message || '');
       rows.push.apply(rows, cardRow('error', errText));
     }
+    if (card.diagnostic && typeof card.diagnostic === 'object') {
+      var diag = card.diagnostic;
+      if (diag.reason) rows.push.apply(rows, cardRow('reason', String(diag.reason)));
+      if (Array.isArray(diag.hints) && diag.hints.length) {
+        rows.push.apply(rows, cardRow('help', String(diag.hints[0])));
+      }
+    }
     var bits = [];
     if (ctx.model) bits.push('model=' + String(ctx.model));
     if (ctx.provider) bits.push('provider=' + String(ctx.provider));

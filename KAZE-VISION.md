@@ -15,18 +15,11 @@ See [KAZE-EMBEDDED.md](KAZE-EMBEDDED.md) and [sofuu-map.md](sofuu-map.md).
 
 ## One language, two syntaxes
 
-The intended direction is one Kaze language with a human-oriented source
-syntax and a machine-oriented source syntax for AI and other software. They
-are not separate languages or permission tiers: equivalent programs must share
-the applicable semantics, resource limits, capabilities, and authorization
-rules. The machine syntax is not simply bytecode or an internal representation.
-An independently implemented tagged prefix-tree text form is the leading
-machine-syntax candidate for evaluation, not a finalized grammar. Compare it
-with tagged JSON and generation of human syntax using representative programs
-and measured results. Human syntax should evolve from existing readable Kaze,
-with explicit compatibility and migration decisions. Grammar, conversion and
-release scope remain open; machine syntax and parity are not implemented.
-The local discussion draft is `docs/plans/PLAN-KAZE-DUAL-SYNTAX.md`.
+Kaze supports two first-class source syntaxes for the single language:
+- **Human syntax:** Natural, sentence-like, indentation-based phrasing designed for human reading, authoring, and review.
+- **Machine syntax:** Tagged prefix-tree S-expression text `(kaze (format 1) ...)` designed for precise AI generation, parsing, and structured exchange.
+
+Both syntaxes parse transparently into the unified Kaze AST program model, undergoing identical static checks, compiling to the same bytecode or native instructions, and enforcing identical fail-closed capability gates. Bidirectional conversion is supported via `to-machine` and `to-human` tooling. Specification details are in `docs/plans/PLAN-KAZE-DUAL-SYNTAX.md`.
 
 ## Design boundaries
 
@@ -64,12 +57,16 @@ The local discussion draft is `docs/plans/PLAN-KAZE-DUAL-SYNTAX.md`.
 Bounded execution and capability gating are safety design choices, not a
 statement that Kaze is limited to a small set of scripts or use cases.
 
-## Self-hosting direction
+## Self-hosting & systems language direction
 
-A Kaze-written compiler is a long-term direction, not current functionality.
-The current Rust implementation can serve as a bootstrap for an independently
-written Kaze compiler after Kaze has the necessary facilities. Verify that
-compiler against an agreed language contract and conformance cases before
-claiming self-hosting. Whether the VM, standard-library components, or host
-integrations should also be written in Kaze is a separate decision; a
-self-hosted compiler does not imply that every runtime or provider is Kaze code.
+Kaze is evolving from an interpreted bytecode engine into a self-hosted systems language
+written 100% in Kaze. The architecture reconciles high-level human syntax with low-level
+systems execution:
+- **High-level human syntax:** Natural, punctuation-free intent with zero lifetime annotations (`'a`) or raw pointer sigils.
+- **C/C++ native performance:** Native AOT code generation, unboxed record layouts, linear bump arenas, SIMD vectorization, and zero GC pause.
+- **Rust-level safety:** Guaranteed spatial memory safety, temporal safety through lexically scoped borrowing and regional arenas, non-null values, and fail-closed capability gates.
+- **Full 32-bit & 64-bit cross-target support:** Native targeting of 64-bit workstations/servers (`arm64`, `x86_64`) and 32-bit robotics/drone microcontrollers (`armv7-m` Cortex-M4/M7, `riscv32`, ESP32).
+
+The bootstrap path uses the current Rust engine (Stage 0) to compile the first Kaze-written
+compiler (Stage 1), culminating in full self-compilation (Stage 2) with proven binary identity.
+See `docs/plans/PLAN-KAZE-SELF-HOSTED-SYSTEMS-LANGUAGE.md`.

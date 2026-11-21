@@ -284,7 +284,7 @@ impl KazeError {
     /// The shared diagnostic view. Source excerpts are not emitted here.
     pub fn diagnostic(
         &self,
-        _source_text: Option<&str>,
+        source_text: Option<&str>,
     ) -> crate::rt::diag_contract::Diagnostic {
         let mut d =
             crate::rt::diag_contract::Diagnostic::from_code(&self.code, self.detail());
@@ -300,6 +300,13 @@ impl KazeError {
                 (false, true) => Some("source line stored in bytecode; original source unavailable".into()),
                 (false, false) => None,
             };
+            if let Some(src) = source_text {
+                if loc.line > 0 {
+                    if let Some(line) = src.lines().nth((loc.line - 1) as usize) {
+                        location.snippet = Some(line.to_string());
+                    }
+                }
+            }
             d = d.with_location(location);
         }
         /* A checker failure can carry several errors, newline-joined in the

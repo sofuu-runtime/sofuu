@@ -74,14 +74,23 @@ macro_rules! print {
 }
 macro_rules! println {
     () => {{ $crate::emit_stdout("\n"); }};
-    ($($arg:tt)*) => {{ $crate::emit_stdout(&format!("{}\n", format!($($arg)*))); }};
+    ($($arg:tt)*) => {{
+        let mut __s = format!($($arg)*);
+        __s.push('\n');
+        $crate::emit_stdout(&__s);
+    }};
 }
+#[allow(unused_macros)]
 macro_rules! eprint {
     ($($arg:tt)*) => {{ $crate::emit_stderr(&format!($($arg)*)); }};
 }
 macro_rules! eprintln {
     () => {{ $crate::emit_stderr("\n"); }};
-    ($($arg:tt)*) => {{ $crate::emit_stderr(&format!("{}\n", format!($($arg)*))); }};
+    ($($arg:tt)*) => {{
+        let mut __s = format!($($arg)*);
+        __s.push('\n');
+        $crate::emit_stderr(&__s);
+    }};
 }
 
 /// Skip a test that needs the QTSQ codec when this build has none.

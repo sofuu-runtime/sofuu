@@ -1628,6 +1628,19 @@ export interface SofuuDiagnostics {
   fromError(err: unknown): string;
   /** The shared text sanitizer: ANSI, control characters, secret-shaped strings. */
   redact(text: string): string;
+  /**
+   * Look up the known explanation and safe next step for a taxonomy code.
+   * Returns null when the code is unclassified.
+   */
+  classify(code: string): { subsystem: string; reason: string; hint: string; severity: 'error' | 'warning' | 'rejection' | 'cancellation' } | null;
+  /**
+   * Construct a diagnostic in the versioned shape with optional details.
+   */
+  make(code: string, message: string, options?: { operation?: string; subsystem?: string; location?: DiagnosticLocation; hints?: string[]; reason?: string }): string;
+  /**
+   * Format an error into a standardized event payload with diagnostic details.
+   */
+  event(err: unknown): string;
 }
 
 /**

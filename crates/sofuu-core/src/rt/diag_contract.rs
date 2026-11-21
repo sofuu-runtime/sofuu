@@ -84,6 +84,7 @@ pub struct SourceLocation {
     /// True when this names generated/transformed code, not the user source.
     pub generated: bool,
     pub label: Option<String>,
+    pub snippet: Option<String>,
 }
 
 impl SourceLocation {
@@ -118,6 +119,14 @@ impl SourceLocation {
         });
         self.label = self.label.take().and_then(|s| {
             let s = sanitize_line(&s, 64);
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
+        });
+        self.snippet = self.snippet.take().and_then(|s| {
+            let s = sanitize_line(&s, MAX_SNIPPET_LINE);
             if s.is_empty() {
                 None
             } else {
@@ -375,6 +384,37 @@ impl Diagnostic {
             if let Some(label) = &loc.label {
                 out.push_str(&format!("   = location: {label}\n"));
             }
+            if let (Some(l), Some(raw_snippet)) = (loc.line, loc.snippet.as_ref()) {
+                let l_str = l.to_string();
+                let pad_len = l_str.len();
+                let masked = mask_source_literals(raw_snippet);
+                let sanitized = sanitize_line(&masked, MAX_SNIPPET_LINE);
+                out.push_str("   ");
+                for _ in 0..pad_len { out.push(' '); }
+                out.push_str("|\n ");
+                out.push_str(&l_str);
+                out.push_str(" | ");
+                out.push_str(&sanitized);
+                out.push('\n');
+                if let Some(col) = loc.column {
+                    if col > 0 {
+                        let col_idx = (col - 1) as usize;
+                        let indent_len = col_idx.min(sanitized.len());
+                        out.push_str("   ");
+                        for _ in 0..pad_len { out.push(' '); }
+                        out.push_str("| ");
+                        for _ in 0..indent_len { out.push(' '); }
+                        let span = loc.end_column.map_or(1, |ec| if ec > col { (ec - col) as usize } else { 1 });
+                        let max_carets = sanitized.len().saturating_sub(indent_len).max(1);
+                        let carets_len = span.max(1).min(max_carets);
+                        for _ in 0..carets_len { out.push('^'); }
+                        out.push('\n');
+                    }
+                }
+                out.push_str("   ");
+                for _ in 0..pad_len { out.push(' '); }
+                out.push_str("|\n");
+            }
         }
         if let Some(reason) = self.reason.as_ref() {
             out.push_str(&format!("   = reason: {reason}\n"));
@@ -422,84 +462,103 @@ pub struct CodeInfo {
     pub severity: Severity,
 }
 
+struct CodeEntry {
+    code: &'static str,
+    subsystem: u8,
+    severity: Severity,
+    reason: &'static str,
+    hint: &'static str,
+}
+
+static SUBSYSTEMS: &[&str] = &[
+    "runtime",    // 0
+    "policy",     // 1
+    "deadline",   // 2
+    "validation", // 3
+    "memory",     // 4
+    "mcp",        // 5
+    "network",    // 6
+    "auth",       // 7
+    "provider",   // 8
+    "resilience", // 9
+    "tool",       // 10
+    "agent",      // 11
+    "infer",      // 12
+    "kaze",       // 13
+    "robotics",   // 14
+];
+
+const R_POLICY: &str = "the active policy does not allow this operation";
+const H_POLICY: &str = "review the policy or ask its owner to grant the capability";
+const R_NET: &str = "network connection failed or timed out";
+const H_NET: &str = "verify network connectivity and endpoint availability";
+const R_LINK: &str = "telemetry link silent or disconnected";
+const H_LINK: &str = "handle link-loss with an otherwise block or retry policy";
+
+static CLASSIFIED: &[CodeEntry] = &[
+    CodeEntry { code: "E_TIMEOUT", subsystem: 2, severity: Severity::Error, reason: "the operation exceeded its deadline", hint: "retry only if the operation is safe to repeat" },
+    CodeEntry { code: "E_DENIED", subsystem: 1, severity: Severity::Rejection, reason: R_POLICY, hint: H_POLICY },
+    CodeEntry { code: "E_CAP_DENIED", subsystem: 1, severity: Severity::Rejection, reason: R_POLICY, hint: H_POLICY },
+    CodeEntry { code: "E_POLICY_DENIED", subsystem: 1, severity: Severity::Rejection, reason: R_POLICY, hint: H_POLICY },
+    CodeEntry { code: "E_PERMISSION_DENIED", subsystem: 1, severity: Severity::Rejection, reason: "operation prohibited by security policy", hint: "grant required permissions in policy.json" },
+    CodeEntry { code: "E_CAP_MISSING", subsystem: 1, severity: Severity::Rejection, reason: "required capability is not declared in policy", hint: "add required capability to the script needs section and policy" },
+    CodeEntry { code: "E_PATH_OUTSIDE", subsystem: 1, severity: Severity::Rejection, reason: "file access attempted outside allowed sandbox directory", hint: "ensure path stays within workspace boundaries" },
+    CodeEntry { code: "E_CAPABILITY", subsystem: 0, severity: Severity::Error, reason: "the capability is unavailable in this build", hint: "check the capability manifest with `sofuu doctor`" },
+    CodeEntry { code: "E_SCHEMA", subsystem: 3, severity: Severity::Error, reason: "a value did not match the expected schema", hint: "fix the value or the schema before retrying" },
+    CodeEntry { code: "E_INTERNAL", subsystem: 0, severity: Severity::Error, reason: "the runtime hit an internal invariant", hint: "capture the trace with `sofuu logs --last-error`" },
+    CodeEntry { code: "E_AUTH", subsystem: 7, severity: Severity::Error, reason: "authentication failed or credentials rejected", hint: "verify API keys and environment variables" },
+    CodeEntry { code: "E_NETWORK", subsystem: 6, severity: Severity::Error, reason: R_NET, hint: H_NET },
+    CodeEntry { code: "E_NETWORK_TIMEOUT", subsystem: 6, severity: Severity::Error, reason: R_NET, hint: H_NET },
+    CodeEntry { code: "E_RATE_LIMIT", subsystem: 8, severity: Severity::Error, reason: "provider rate limit exceeded", hint: "wait before retrying or request higher quota" },
+    CodeEntry { code: "E_BACKPRESSURE", subsystem: 0, severity: Severity::Error, reason: "system backpressure limit exceeded", hint: "reduce concurrency or increase queue capacity" },
+    CodeEntry { code: "E_CIRCUIT_OPEN", subsystem: 9, severity: Severity::Error, reason: "circuit breaker is open due to consecutive failures", hint: "wait for cooldown period before retrying" },
+    CodeEntry { code: "E_CANCELLED", subsystem: 0, severity: Severity::Cancellation, reason: "the operation was cancelled by caller or user", hint: "safe to restart when ready" },
+    CodeEntry { code: "E_TOOL", subsystem: 10, severity: Severity::Error, reason: "tool execution returned an error", hint: "check tool arguments and execution environment" },
+    CodeEntry { code: "E_SERVER_ERROR", subsystem: 8, severity: Severity::Error, reason: "remote provider returned an internal error", hint: "retry later or check provider status page" },
+    CodeEntry { code: "E_DIM", subsystem: 4, severity: Severity::Error, reason: "vector dimension does not match store schema", hint: "use matching embedding dimensions or recreate the store" },
+    CodeEntry { code: "E_LOCKED", subsystem: 4, severity: Severity::Error, reason: "vector store is locked by another process", hint: "wait for the active session to finish or check lockfile ownership" },
+    CodeEntry { code: "E_CORRUPT", subsystem: 4, severity: Severity::Error, reason: "storage record or manifest failed integrity check", hint: "run `sofuu brain repair` to quarantine damaged records" },
+    CodeEntry { code: "E_ENOSPC", subsystem: 4, severity: Severity::Error, reason: "storage capacity or quota exceeded", hint: "run `sofuu brain prune` to purge decayed memories" },
+    CodeEntry { code: "E_NONFINITE", subsystem: 4, severity: Severity::Error, reason: "embedding vector contains NaN or infinite components", hint: "verify embedding model output normalization" },
+    CodeEntry { code: "E_MCP_CONNECT", subsystem: 5, severity: Severity::Error, reason: "could not establish connection to the MCP server", hint: "verify the server command and transport configuration in ~/.sofuu/mcp.json" },
+    CodeEntry { code: "E_MCP_TIMEOUT", subsystem: 5, severity: Severity::Error, reason: "MCP server request timed out", hint: "check server responsiveness or increase timeout in config" },
+    CodeEntry { code: "E_MCP_PAYLOAD_TOO_LARGE", subsystem: 5, severity: Severity::Error, reason: "MCP payload exceeded maximum buffer size", hint: "reduce tool output size or chunk the payload" },
+    CodeEntry { code: "E_CONTEXT_CAP", subsystem: 11, severity: Severity::Error, reason: "the agent's context budget was exceeded", hint: "reduce the history, tools or memories before retrying" },
+    CodeEntry { code: "E_STEP_LIMIT", subsystem: 11, severity: Severity::Error, reason: "maximum agent step limit reached before task completion", hint: "increase max_steps or break task into smaller goals" },
+    CodeEntry { code: "E_MODEL_LOAD", subsystem: 12, severity: Severity::Error, reason: "failed to load or map model weights", hint: "verify file existence, permissions, and GGUF format integrity" },
+    CodeEntry { code: "E_MODEL_FORMAT", subsystem: 12, severity: Severity::Error, reason: "unsupported model architecture or quantization format", hint: "use a supported GGUF model architecture and quantization type" },
+    CodeEntry { code: "E_MODEL_CONTEXT", subsystem: 12, severity: Severity::Error, reason: "input sequence exceeds model context window limit", hint: "truncate prompt context or reduce conversation history" },
+    CodeEntry { code: "E_KAZE_PARSE", subsystem: 13, severity: Severity::Error, reason: "the Kaze source did not parse", hint: "fix the reported line and column" },
+    CodeEntry { code: "E_KAZE_CHECK", subsystem: 13, severity: Severity::Error, reason: "the Kaze source failed static validation checks", hint: "review routine arguments, capabilities, and types" },
+    CodeEntry { code: "E_KAZE_PARAM", subsystem: 13, severity: Severity::Error, reason: "one or more required routine parameters were not supplied", hint: "supply via CLI --arg, environment variable AGENT_<PARAM>, or agent.config.json" },
+    CodeEntry { code: "E_KAZE_DIV0", subsystem: 13, severity: Severity::Error, reason: "a Kaze division or modulo used zero", hint: "guard the divisor before dividing" },
+    CodeEntry { code: "E_KAZE_BOUNDS", subsystem: 13, severity: Severity::Error, reason: "array or collection index out of bounds", hint: "guard index within collection length before accessing" },
+    CodeEntry { code: "E_KAZE_ARGS", subsystem: 13, severity: Severity::Error, reason: "invalid configuration or routine arguments", hint: "check CLI flags, environment variables, or config file" },
+    CodeEntry { code: "E_KAZE_MEMORY", subsystem: 13, severity: Severity::Error, reason: "Kaze memory arena or heap limit exceeded", hint: "increase memory limits or release retained objects" },
+    CodeEntry { code: "E_KAZE_ENTRY", subsystem: 13, severity: Severity::Error, reason: "entry routine not found in script", hint: "specify an existing routine with --entry or define a main routine" },
+    CodeEntry { code: "E_KAZE_RESULT", subsystem: 13, severity: Severity::Error, reason: "an asynchronous capability returned a value outside its contract", hint: "review the provider result and validate it before using it" },
+    CodeEntry { code: "E_KAZE_OUTCOME_UNKNOWN", subsystem: 13, severity: Severity::Error, reason: "a dispatched tool may have completed without a received result", hint: "inspect the operation's actual state before deciding whether to retry" },
+    CodeEntry { code: "E_KAZE_LINK", subsystem: 13, severity: Severity::Warning, reason: R_LINK, hint: H_LINK },
+    CodeEntry { code: "E_KAZE_LINK_TIMEOUT", subsystem: 13, severity: Severity::Warning, reason: R_LINK, hint: H_LINK },
+    CodeEntry { code: "E_KAZE_TYPE", subsystem: 13, severity: Severity::Error, reason: "type mismatch in expression or operation", hint: "ensure operands match expected types" },
+    CodeEntry { code: "E_SAFETY_VIOLATION", subsystem: 14, severity: Severity::Rejection, reason: "a safety gate vetoed the action", hint: "review the gate's rule; the veto must not be bypassed" },
+    CodeEntry { code: "E_HEARTBEAT_LOST", subsystem: 14, severity: Severity::Rejection, reason: "heartbeat lost from telemetry source", hint: "check transport connection; vehicle entered failsafe hold" },
+    CodeEntry { code: "E_ACTUATOR_VETO", subsystem: 14, severity: Severity::Rejection, reason: "actuator command vetoed by safety policy", hint: "command exceeded physical or geographic safety envelope" },
+    CodeEntry { code: "E_TELEMETRY_INVALID", subsystem: 14, severity: Severity::Rejection, reason: "telemetry stream contains invalid or corrupted packets", hint: "inspect sensor link integrity; command refused" },
+    CodeEntry { code: "ERR_SOFUU_NATIVE_ADDON", subsystem: 0, severity: Severity::Error, reason: "incompatible package contains compiled C++ V8 addon", hint: "use a pure-JS or WebAssembly alternative (Sofuu runs zero-JIT)" },
+    CodeEntry { code: "ERR_SOFUU_UNSUPPORTED_NODE_API", subsystem: 0, severity: Severity::Error, reason: "unsupported Node.js API in single-address-space runtime", hint: "use in-runtime Sofuu equivalent API" },
+    CodeEntry { code: "ERR_SOFUU_RESOLUTION", subsystem: 0, severity: Severity::Error, reason: "module resolution failed to locate package or entry point", hint: "check node_modules installation and import path specifier" },
+    CodeEntry { code: "ERR_SOFUU_REQUIRE_ESM", subsystem: 0, severity: Severity::Error, reason: "cannot require() ES module in CommonJS mode", hint: "use standard `import` or dynamic `await import()`" },
+];
+
 /// The highest-value codes the tree already publishes. A code absent here is
 /// not guessed: it stays unclassified and its message is shown as written.
 pub fn classify(code: &str) -> Option<CodeInfo> {
-    use Severity::*;
-    let (subsystem, reason, hint, severity) = match code {
-        "E_TIMEOUT" => (
-            "deadline",
-            "the operation exceeded its deadline",
-            "retry only if the operation is safe to repeat",
-            Error,
-        ),
-        "E_DENIED" | "E_CAP_DENIED" | "E_POLICY_DENIED" => (
-            "policy",
-            "the active policy does not allow this operation",
-            "review the policy or ask its owner to grant the capability",
-            Rejection,
-        ),
-        "E_CAPABILITY" => (
-            "runtime",
-            "the capability is unavailable in this build",
-            "check the capability manifest with `sofuu doctor`",
-            Error,
-        ),
-        "E_SCHEMA" => (
-            "validation",
-            "a value did not match the expected schema",
-            "fix the value or the schema before retrying",
-            Error,
-        ),
-        "E_INTERNAL" => (
-            "runtime",
-            "the runtime hit an internal invariant",
-            "capture the trace with `sofuu logs --last-error`",
-            Error,
-        ),
-        "E_KAZE_PARSE" => (
-            "kaze",
-            "the Kaze source did not parse",
-            "fix the reported line and column",
-            Error,
-        ),
-        "E_KAZE_DIV0" => (
-            "kaze",
-            "a Kaze division or modulo used zero",
-            "guard the divisor before dividing",
-            Error,
-        ),
-        "E_KAZE_RESULT" => (
-            "kaze",
-            "an asynchronous capability returned a value outside its contract",
-            "review the provider result and validate it before using it",
-            Error,
-        ),
-        "E_KAZE_OUTCOME_UNKNOWN" => (
-            "kaze",
-            "a dispatched tool may have completed without a received result",
-            "inspect the operation's actual state before deciding whether to retry",
-            Error,
-        ),
-        "E_CONTEXT_CAP" => (
-            "agent",
-            "the agent's context budget was exceeded",
-            "reduce the history, tools or memories before retrying",
-            Error,
-        ),
-        "E_SAFETY_VIOLATION" => (
-            "robotics",
-            "a safety gate vetoed the action",
-            "review the gate's rule; the veto must not be bypassed",
-            Rejection,
-        ),
-        _ => return None,
-    };
-    Some(CodeInfo {
-        subsystem,
-        reason,
-        hint,
-        severity,
+    CLASSIFIED.iter().find(|e| e.code == code).map(|e| CodeInfo {
+        subsystem: SUBSYSTEMS[e.subsystem as usize],
+        reason: e.reason,
+        hint: e.hint,
+        severity: e.severity,
     })
 }
 
@@ -830,7 +889,6 @@ pub fn redact_event_text(s: &str) -> String {
 /// Mask the contents of string literals so a source snippet can be shown
 /// without echoing a secret. The quote characters and line length stay, so a
 /// caret keeps pointing at the same column.
-#[cfg(test)]
 pub fn mask_source_literals(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut quote: Option<char> = None;
@@ -905,6 +963,7 @@ fn location_from_json(v: &Value) -> Option<SourceLocation> {
         end_column: num("end_column"),
         generated: v.get("generated").and_then(Value::as_bool).unwrap_or(false),
         label: v.get("label").and_then(Value::as_str).map(str::to_string),
+        snippet: v.get("snippet").and_then(Value::as_str).map(str::to_string),
     };
     loc.normalize();
     if loc.present() {
@@ -1096,13 +1155,36 @@ unsafe fn read_json_arg(
     if argc < 1 || argv.is_null() {
         return None;
     }
-    let v = qjs::sofuu_js_to_cstring(ctx, *argv);
-    if v.is_null() {
-        return None;
+    let val = *argv;
+    if qjs::is_string(val) {
+        let v = qjs::sofuu_js_to_cstring(ctx, val);
+        if v.is_null() {
+            return None;
+        }
+        let raw = CStr::from_ptr(v).to_string_lossy().into_owned();
+        qjs::sofuu_js_free_cstring(ctx, v);
+        serde_json::from_str::<Value>(&raw).ok()
+    } else if qjs::is_object(val) {
+        let json_val = qjs::JS_JSONStringify(
+            ctx,
+            val,
+            qjs::sofuu_js_undefined(),
+            qjs::sofuu_js_undefined(),
+        );
+        if qjs::is_undefined(json_val) || qjs::is_null(json_val) {
+            return None;
+        }
+        let v = qjs::sofuu_js_to_cstring(ctx, json_val);
+        qjs::sofuu_js_free_value(ctx, json_val);
+        if v.is_null() {
+            return None;
+        }
+        let raw = CStr::from_ptr(v).to_string_lossy().into_owned();
+        qjs::sofuu_js_free_cstring(ctx, v);
+        serde_json::from_str::<Value>(&raw).ok()
+    } else {
+        None
     }
-    let raw = CStr::from_ptr(v).to_string_lossy().into_owned();
-    qjs::sofuu_js_free_cstring(ctx, v);
-    serde_json::from_str::<Value>(&raw).ok()
 }
 
 unsafe fn read_text_arg(
@@ -1168,6 +1250,93 @@ unsafe extern "C" fn js_diag_redact(
     qjs::sofuu_js_new_string(ctx, cs.as_ptr())
 }
 
+unsafe extern "C" fn js_diag_classify(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let code = match unsafe { read_text_arg(ctx, argc, argv) } {
+        Some(c) => c,
+        None => return qjs::sofuu_js_null(),
+    };
+    match classify(&code) {
+        Some(info) => {
+            let obj = unsafe { qjs::sofuu_js_new_object(ctx) };
+            let set_str = |prop: &CStr, val: &str| {
+                let cs_val = CString::new(val).unwrap_or_default();
+                let v = unsafe { qjs::sofuu_js_new_string(ctx, cs_val.as_ptr()) };
+                unsafe { qjs::sofuu_js_set_property_str(ctx, obj, prop.as_ptr(), v) };
+            };
+            set_str(c"subsystem", info.subsystem);
+            set_str(c"reason", info.reason);
+            set_str(c"hint", info.hint);
+            set_str(c"severity", info.severity.as_str());
+            obj
+        }
+        None => qjs::sofuu_js_null(),
+    }
+}
+
+unsafe extern "C" fn js_diag_make(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let code = unsafe { read_text_arg(ctx, argc, argv) }.unwrap_or_else(|| UNCLASSIFIED.to_string());
+    let message = if argc > 1 && !argv.is_null() {
+        unsafe { read_text_arg(ctx, argc - 1, argv.add(1)) }
+            .unwrap_or_else(|| "The operation failed. No further detail was reported.".to_string())
+    } else {
+        "The operation failed. No further detail was reported.".to_string()
+    };
+    let mut d = Diagnostic::from_code(code, message);
+    if argc > 2 && !argv.is_null() {
+        if let Some(opts) = unsafe { read_json_arg(ctx, 1, argv.add(2)) } {
+            if let Some(op) = opts.get("operation").and_then(Value::as_str) {
+                d = d.with_operation(op);
+            }
+            if let Some(sub) = opts.get("subsystem").and_then(Value::as_str) {
+                d.subsystem = normalize_ident(Some(sub.to_string()), 48);
+            }
+            if let Some(reason) = opts.get("reason").and_then(Value::as_str) {
+                d.reason = Some(sanitize_line(reason, MAX_MESSAGE));
+            }
+            if let Some(hints) = opts.get("hints").and_then(Value::as_array) {
+                for h in hints.iter().filter_map(Value::as_str) {
+                    d = d.with_hint(h);
+                }
+            }
+            if let Some(loc_val) = opts.get("location") {
+                if let Some(loc) = location_from_json(loc_val) {
+                    d = d.with_location(loc);
+                }
+            }
+        }
+    }
+    json_string(ctx, &d.to_json())
+}
+
+unsafe extern "C" fn js_diag_event(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let d = if argc < 1 || argv.is_null() {
+        Diagnostic::default()
+    } else {
+        unsafe { from_js_exception(ctx, *argv) }
+    };
+    let mut payload = Map::new();
+    payload.insert("code".into(), json!(d.code));
+    payload.insert("message".into(), json!(d.message));
+    payload.insert("retryable".into(), json!(false));
+    payload.insert("diagnostic".into(), d.to_json());
+    json_string(ctx, &Value::Object(payload))
+}
+
 /// Register `sofuu.diagnostics.*`. Additive: every existing surface and code
 /// is unchanged; this is a new, versioned view of the same failures.
 pub unsafe fn mod_diag_contract_register(ctx: *mut JSContext) {
@@ -1186,11 +1355,14 @@ pub unsafe fn mod_diag_contract_register(ctx: *mut JSContext) {
     let funcs: [(
         &CStr,
         unsafe extern "C" fn(*mut JSContext, JSValueConst, c_int, *const JSValueConst) -> JSValue,
-    ); 4] = [
+    ); 7] = [
         (c"version", js_diag_version),
         (c"render", js_diag_render),
         (c"fromError", js_diag_from_error),
         (c"redact", js_diag_redact),
+        (c"classify", js_diag_classify),
+        (c"make", js_diag_make),
+        (c"event", js_diag_event),
     ];
     for (name, f) in funcs {
         qjs::sofuu_js_set_property_str(

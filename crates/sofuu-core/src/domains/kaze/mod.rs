@@ -17,6 +17,7 @@ pub mod compiler;
 pub mod geo;
 pub mod isa;
 pub mod lexer;
+pub mod machine;
 pub mod parser;
 pub mod value;
 pub mod vm;
@@ -2712,5 +2713,49 @@ mod tests {
             "<kaze-backend-provenance-test>",
         );
         assert_eq!(rc, 0);
+    }
+
+    #[test]
+    fn dual_syntax_human_and_machine_produce_identical_traces() {
+        let human_src = r#"needs: drone, log
+
+action patrol(target_alt):
+    arm drone
+    takeoff to target_alt
+    let loc = vector(47.37, 8.54, target_alt)
+    log.info("patrolling")
+    return loc
+"#;
+        let machine_src = r#"(kaze
+  (format 1)
+  (needs "drone" "log")
+  (action "patrol"
+    (params "target_alt")
+    (body
+      (eval (call "drone" "arm"))
+      (eval (call "drone" "takeoff" (ref "target_alt")))
+      (let "loc" (vector (number "47.37") (number "8.54") (ref "target_alt")))
+      (eval (call "log" "info" (string "patrolling")))
+      (return (ref "loc"))))
+)
+"#;
+        let mut args = serde_json::Map::new();
+        args.insert("target_alt".to_string(), serde_json::json!(15.0));
+
+        let opts = RunOptions {
+            entry: Some("patrol".to_string()),
+            args,
+            backend: vec![("drone".to_string(), "sim".to_string())],
+            grants: vec!["drone".to_string(), "log".to_string()],
+            policy: Some(serde_json::json!({ "tools": { "allow": ["kaze.*"] } })),
+            ..Default::default()
+        };
+
+        let human_report = run_source(human_src, "<human>", &opts).expect("human syntax runs");
+        let machine_report = run_source(machine_src, "<machine>", &opts).expect("machine syntax runs");
+
+        assert_eq!(human_report.value, machine_report.value);
+        assert_eq!(human_report.actions, machine_report.actions);
+        assert_eq!(human_report.instructions, machine_report.instructions);
     }
 }

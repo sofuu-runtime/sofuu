@@ -13,11 +13,13 @@ format 4 modules from the standalone prototype). The standalone Kaze project
 also reports language version 1.0 and writes bytecode format 4. Both engines
 implement the unified Kaze 1.0 language contract across all 47 opcodes and 17
 capabilities with 0 drift.
-The intended human-oriented and machine-oriented source syntaxes are also
-planned for one language, not implemented parity or a second permission tier.
-A tagged prefix-tree text form is a proposed machine-syntax candidate, not an
-implemented embedded syntax. Human-syntax polish and compatibility decisions
-are discussed in the local `docs/plans/PLAN-KAZE-DUAL-SYNTAX.md`.
+The engine supports dual source syntaxes for the single language: human-oriented
+syntax (indentation-based) and machine-oriented syntax (prefix-tree S-expression
+text: `(kaze (format 1) ...)`). Both syntaxes parse transparently via automatic
+header detection into the identical AST program model and share identical capability
+authorization and execution semantics. Bidirectional transpilation is supported via
+`sofuu script to-machine` / `to-human` and `sofuu.kaze.toMachine` / `toHuman`.
+Specification details live in `docs/plans/PLAN-KAZE-DUAL-SYNTAX.md`.
 
 ## Capability authorization
 

@@ -187,6 +187,8 @@ pub fn print_help() {
          \x20 run <file.kaze>      Check, compile and run a script\n\
          \x20 check <file.kaze>    Front end only: parse + check, no execution\n\
          \x20 compile <file.kaze>  Emit the .kazebc module (deterministic bytes)\n\
+         \x20 to-machine <file.kaze>  Transpile human or machine syntax to canonical machine S-expr\n\
+         \x20 to-human <file.kaze>    Transpile machine or human syntax to canonical human syntax\n\
          \x20 repl                 Interactive session: define routines, then .run\n\
          \x20 version              Print the Kaze language version\n\n\
          run options:\n\
@@ -632,6 +634,8 @@ pub fn run(argv: &[String]) -> i32 {
         "run" => cmd_run(rest),
         "check" => cmd_check(rest),
         "compile" => cmd_compile(rest),
+        "to-machine" => cmd_to_machine(rest),
+        "to-human" => cmd_to_human(rest),
         "repl" => cmd_repl(rest),
         other => {
             eprintln!("\x1b[31mError:\x1b[0m unknown script command '{}'", other);
@@ -1109,6 +1113,96 @@ fn cmd_compile(argv: &[String]) -> i32 {
         None => {
             println!("{} bytes ({} words)", bytes.len(), prepared.module.code_bytes() / 4);
             0
+        }
+    }
+}
+
+fn cmd_to_machine(argv: &[String]) -> i32 {
+    let flags = match parse_flags(argv) {
+        Ok(f) => f,
+        Err(e) => {
+            report_cli_failure("E_USAGE", &e, requested_json(argv));
+            return Outcome::Usage.exit_code();
+        }
+    };
+    let Some(path) = flags.positional.first() else {
+        report_cli_failure("E_USAGE", "'sofuu script to-machine' needs a .kaze file", flags.json);
+        return Outcome::Usage.exit_code();
+    };
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            report_cli_failure("E_KAZE_HOST", &format!("cannot read '{}': {}", path, e), flags.json);
+            return Outcome::Error.exit_code();
+        }
+    };
+    match sfs::parser::parse(&src) {
+        Ok(prog) => {
+            let machine_text = sfs::machine::emit_machine(&prog);
+            if let Some(out_path) = &flags.out {
+                if let Err(e) = std::fs::write(out_path, &machine_text) {
+                    report_cli_failure("E_KAZE_HOST", &format!("cannot write '{}': {}", out_path, e), flags.json);
+                    return Outcome::Error.exit_code();
+                }
+                println!("\x1b[32m✓\x1b[0m {} → {}", path, out_path);
+            } else {
+                print!("{}", machine_text);
+            }
+            0
+        }
+        Err(err) => {
+            let kerr = sfs::KazeError::at(err.code, err.render(path), path, err.line, Some(err.col));
+            if flags.json {
+                println!("{}", serde_json::to_string_pretty(&kaze_error_json(&kerr, path)).unwrap_or_default());
+            } else {
+                print_kaze_error(&kerr, path);
+            }
+            Outcome::of_code(&kerr.code).exit_code()
+        }
+    }
+}
+
+fn cmd_to_human(argv: &[String]) -> i32 {
+    let flags = match parse_flags(argv) {
+        Ok(f) => f,
+        Err(e) => {
+            report_cli_failure("E_USAGE", &e, requested_json(argv));
+            return Outcome::Usage.exit_code();
+        }
+    };
+    let Some(path) = flags.positional.first() else {
+        report_cli_failure("E_USAGE", "'sofuu script to-human' needs a .kaze file", flags.json);
+        return Outcome::Usage.exit_code();
+    };
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            report_cli_failure("E_KAZE_HOST", &format!("cannot read '{}': {}", path, e), flags.json);
+            return Outcome::Error.exit_code();
+        }
+    };
+    match sfs::parser::parse(&src) {
+        Ok(prog) => {
+            let human_text = sfs::machine::emit_human(&prog);
+            if let Some(out_path) = &flags.out {
+                if let Err(e) = std::fs::write(out_path, &human_text) {
+                    report_cli_failure("E_KAZE_HOST", &format!("cannot write '{}': {}", out_path, e), flags.json);
+                    return Outcome::Error.exit_code();
+                }
+                println!("\x1b[32m✓\x1b[0m {} → {}", path, out_path);
+            } else {
+                print!("{}", human_text);
+            }
+            0
+        }
+        Err(err) => {
+            let kerr = sfs::KazeError::at(err.code, err.render(path), path, err.line, Some(err.col));
+            if flags.json {
+                println!("{}", serde_json::to_string_pretty(&kaze_error_json(&kerr, path)).unwrap_or_default());
+            } else {
+                print_kaze_error(&kerr, path);
+            }
+            Outcome::of_code(&kerr.code).exit_code()
         }
     }
 }

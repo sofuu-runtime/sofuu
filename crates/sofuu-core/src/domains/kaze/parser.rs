@@ -40,8 +40,11 @@ fn err<T>(line: u32, col: u32, msg: impl Into<String>) -> Result<T, ParseError> 
     Err(ParseError { line, col, msg: msg.into(), code: "E_KAZE_PARSE" })
 }
 
-/// Parse a whole script.
+/// Parse a whole script. Automatically supports both human syntax and machine syntax.
 pub fn parse(src: &str) -> Result<Program, ParseError> {
+    if crate::sfs::machine::is_machine_syntax(src) {
+        return crate::sfs::machine::parse_machine(src);
+    }
     let toks = tokenize(src).map_err(ParseError::from_lex)?;
     let mut p = Parser {
         toks,

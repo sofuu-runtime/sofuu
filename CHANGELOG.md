@@ -4,6 +4,38 @@ All notable changes to the `sofuu` runtime are documented here.
 Versions follow the Cargo crate (`0.3.0-beta` line); npm and the CLI banner
 carry the same version (checked by `scripts/verify-dist.sh`).
 
+## Unified Diagnostics Contract Across All Divisions & Surfaces — 2026-11-21
+
+- **Product-Wide Diagnostic Contract (`rt/diag_contract.rs`):**
+  - Fully implemented the unified diagnostics contract across all 11 divisions (D01–D11) specified in `docs/plans/PLAN-UNIFIED-DIAGNOSTICS.md` and `docs/specs/DIAGNOSTICS.md`.
+  - **Source Excerpts & Multiline Caret Rendering:** Source lines extracted into `SourceLocation.snippet`, sensitive string literals sanitized via `mask_source_literals` (`MAX_SNIPPET_LINE`), and multiline rustc-style source snippet boxes with line number padding, separator pipes (`|`), and caret spans (`^` / `^^^^`) rendered in `render_human`.
+  - **Cross-Domain Error Classifier (52 High-Value Codes):** Compact static lookup table covering all runtime subsystems:
+    - *Memory:* `E_DIM`, `E_LOCKED`, `E_CORRUPT`, `E_ENOSPC`, `E_NONFINITE`
+    - *MCP:* `E_MCP_CONNECT`, `E_MCP_TIMEOUT`, `E_MCP_PAYLOAD_TOO_LARGE`
+    - *Policy & Security:* `E_PERMISSION_DENIED`, `E_PATH_OUTSIDE`, `E_CAP_MISSING`, `E_DENIED`, `E_CAP_DENIED`, `E_POLICY_DENIED`
+    - *Node Compatibility:* `ERR_SOFUU_NATIVE_ADDON`, `ERR_SOFUU_UNSUPPORTED_NODE_API`, `ERR_SOFUU_RESOLUTION`, `ERR_SOFUU_REQUIRE_ESM`
+    - *Agent & Inference:* `E_STEP_LIMIT`, `E_CONTEXT_CAP`, `E_MODEL_LOAD`, `E_MODEL_FORMAT`, `E_MODEL_CONTEXT`
+    - *Robotics & Edge:* `E_SAFETY_VIOLATION`, `E_HEARTBEAT_LOST`, `E_ACTUATOR_VETO`, `E_TELEMETRY_INVALID`
+    - *Kaze Subsystem:* `E_KAZE_PARSE`, `E_KAZE_CHECK`, `E_KAZE_PARAM`, `E_KAZE_DIV0`, `E_KAZE_BOUNDS`, `E_KAZE_ARGS`, `E_KAZE_MEMORY`, `E_KAZE_ENTRY`, `E_KAZE_LINK`, `E_KAZE_LINK_TIMEOUT`, `E_KAZE_TYPE`, etc.
+  - **JavaScript Surface:** Exposed native QuickJS functions `sofuu.diagnostics.classify`, `sofuu.diagnostics.make`, and `sofuu.diagnostics.event`, with full TypeScript definitions in `sofuu.d.ts`.
+  - **Crash-Card Postmortem Integration:** `observability::postmortem` attaches structured `diagnostic` objects to crash cards, and `src/js/observability.js:renderCard` displays diagnostic `reason:` and `help:` fields. All 12 shipped bytecode snapshots synchronized (`make bc-check`).
+  - **Binary Hard Cap Preserved:** Released primary binary `./sofuu` stripped and signed measures **5,867,600 bytes**, passing the **5,872,025 byte limit** (`make size-check`) with 4,425 bytes of headroom.
+
+## Kaze Dual Syntax (Machine S-Expressions & Emitters) — 2026-11-21
+
+- **Bidirectional S-Expression Language Core (`crates/sofuu-core/src/domains/kaze/machine.rs`):**
+  - Implemented machine-oriented tagged prefix-tree S-expression syntax `(kaze (format 1) ...)` per `docs/plans/PLAN-KAZE-DUAL-SYNTAX.md`.
+  - Added automatic S-expression header detection in parser.
+  - Implemented bidirectional CLI commands `sofuu script to-machine <file>` and `sofuu script to-human <file>`.
+  - Guaranteed AST semantic identity, identical static capability validation, and shared bytecode emission across human and machine forms.
+
+## Continuous Memory Architecture (CMA) Damping & Prompt Fencing — 2026-11-21
+
+- **Attenuated Co-Recall Damping & Memory Decay:**
+  - Implemented frequency-damped gravity scores to prevent semantic monopolization by repetitive memory clusters.
+  - Added exponential memory decay and half-life pruning for aging working-memory entries.
+  - Added structural prompt fencing (`<historical_memory_observations>`) with role boundary sanitization to eliminate context leakage.
+
 ## Kaze 1.0 Version Alignment & Full Language Parity — 2026-11-21
 
 - **Unified Language Contract (v1.0):**

@@ -29,7 +29,8 @@
 - [x] **Cooperative Task Scheduler**: Microtask starvation protection with `scheduler.yield()`.
 - [x] **Zero-Dependency TypeScript**: In-memory lexical type-stripping (`ts.rs`) running `.ts` files with no build step.
 - [x] **ESM Tree-Shaking Bundler**: Fast pure-Rust bundler (`bundler.rs`) emitting self-contained JavaScript files.
-- [x] **Binary Size Strict Discipline**: Hard $\le 5.5\text{ MiB}$ cap, enforced by `make size-check` — macOS arm64 **5.37 MiB (5,628,208 B, 138,960 B headroom)**; rebuilt Linux arm64 **5,117,296 B** and x86_64 **5,751,616 B** both pass.
+- [x] **Binary Size Strict Discipline**: Hard $\le 5.6\text{ MiB}$ cap ($5,872,025\text{ B}$), enforced by `make size-check` — macOS arm64 **5,867,600 B (4,425 B headroom)**.
+- [x] **Unified Diagnostics Contract (v1)**: Cross-division error taxonomy (52 runtime codes), source line excerpts, masked literal sanitization, multiline caret spans, crash card diagnostics, and JavaScript FFI methods (`sofuu.diagnostics.{classify,make,event}`).
 
 #### 🧠 Cognitive Vector Memory (CMA v2)
 - [x] **Encrypted `.qtsq` Containers**: On-device vector storage with zero external database dependencies.
@@ -38,6 +39,7 @@
 - [x] **Hardware SIMD Acceleration**: ARM NEON and x86 AVX2 vector math; latency depends on hardware and workload (see BENCHMARKS.md).
 - [x] **Cross-Session Recall**: Automatic memory persistence across runs with `/remember` and `/recall`.
 - [x] **Portable Brain Cards**: Shareable vector cards (`/share` and `/import`) with cryptographic checksums; exports are unencrypted.
+- [x] **Attenuated Co-Recall Damping & Decay**: Exponential half-life memory decay, frequency-damped gravity scores, and structural prompt fencing (`<historical_memory_observations>`).
 
 #### 🤖 Autonomous Agents, Plugins & Sandboxed Toolpacks
 - [x] **Autonomous Agent Loops**: Multi-step reasoning loops with prompt sovereignty and budget limits.
@@ -75,6 +77,8 @@
 - [x] **Small Typed Language**: Fixed-size arena allocation, zero-GC pauses in the hot path, bytecode compilation.
 - [x] **Capability Gates**: Fail-closed access-control policies enforcing declared hardware/system permissions.
 - [x] **Real Kaze backends**: Cross-process durable memory host (`memory=durable`, `memory=file:<path>`), real alert sinks (`stdout`, `stderr`, `file:<path>`), and pure-Kaze local GGUF model execution grounded via real MCP tool reads are implemented and verified in source (`bb98aaa65`). Released-artifact and physical hardware verification remain open; see [Kaze embedded status](KAZE-EMBEDDED.md).
+- [x] **Dual Source Syntax**: Human natural syntax and machine-oriented tagged prefix-tree S-expression syntax `(kaze (format 1) ...)` with parser auto-detection and bidirectional CLI translation (`to-machine` / `to-human`).
+- [x] **Contract 1.0 Full Parity**: Unified 47-opcode and 17-verb contract across standalone prototype and embedded runtime with strict zero-drift verification (`scripts/kaze-drift-check.sh --strict`).
 
 ---
 

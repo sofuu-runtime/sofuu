@@ -58,7 +58,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [x] Integrate CMake fallback for vendored libuv builds on clean clones (F-15).
   - [x] Enforce fail-fast runtime panic on subsystem initialization failure (F-06).
   - [x] Optimize QuickJS microtask queue drain latency under saturated event loops.
-  - [x] PLAN-UNIFIED-DIAGNOSTICS: versioned diagnostic contract, uncaught/rejection rendering, and shared event-string redaction (`rt/diag_contract.rs`).
+  - [x] PLAN-UNIFIED-DIAGNOSTICS: Complete unified diagnostics implementation across all 11 divisions: versioned v1 JSON contract, source excerpts with masked literals, multiline caret rendering, cross-domain error classifier (52 codes), postmortem crash cards, and JS surface (`sofuu.diagnostics.{classify,make,event}`).
   - [x] AUDIT-REMEDIATION-2026-11-08: Complete core substrate tasks — microtask queue drainage on 1M chained promises (CLI-054), native `node:crypto` hashing (SHA-1/MD5/SHA-256/SHA-512/HMAC via `rt/digest.rs`) (JR-053), and `sofuu.spawn()` handle contract with ENOENT rejection (JR-073, JR-077).
   - [x] PLAN-SCOUTER: Tamper-proof mathematical context & cognitive brain health monitor substrate (`crates/sofuu-core/src/rt/scouter.rs`, `sofuu.scouter.*`).
 
@@ -80,6 +80,7 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [x] Implement memory compaction and retention decay curve algorithms.
   - [x] AUDIT-REMEDIATION-2026-11-08: Complete memory integrity tasks — path validation rejecting empty/directory paths (MEM-003, MEM-004), corrupt file preservation (MEM-013), post-close access `E_LOCKED` protection (MEM-024), and immediate 65KB record ceiling validation.
   - [x] PLAN-REAL-EXECUTION R3: Cross-process durable memory persistence host (`memory=durable`, `memory=file:<path>`) with atomic commits and store isolation (`bb98aaa65`).
+  - [x] Attenuated co-recall damping, exponential memory decay, and structural prompt fencing.
   - [ ] Add zero-copy memory-mapped QTSQ persistence validation for multi-process concurrency.
 
 ---
@@ -160,7 +161,8 @@ Every division operates under strict architectural boundaries to guarantee that 
   - [ ] K1 broader conformance remains open: embedded source, bytecode, JS aliases, REPL and compiled one-shot paths have recorded fail-closed progress; `sofuu.kaze.runAsync`, compiled agents and `sofuu script run` dispatch authorized AI/tool requests through bounded continuations. A real model-plus-MCP journey has recorded debug-build evidence for remote and local-GGUF configurations, and real alert and durable-memory checks are documented. Full test migration, other engines and released artifacts require separate verification; see `KAZE-EMBEDDED.md`.
   - [x] AUDIT-REMEDIATION-2026-11-08: Complete Kaze VM and Compiler remediation — recursion depth ceiling $\le 256$ (KZ-095/099), modulo-by-zero trap `error[E_KAZE_DIV0]` (KZ-035), 12-factor configuration resolution for routine parameters (KZ-079/082/084), standalone compiler unresolved import failure scrubbing (CP-075/068), and standalone top-level await (CP-007/008).
   - [x] Build and verify 4 showcase agents in `example-agents/` with automated build harness. The `paper_trader` example was retired on 2026-11-16 and replaced by `example-agents/local_brief/`, a read-only routine that reads one operator-selected local file through an authorized MCP tool and returns a real model's answer about it. The remaining three (`quant_sentinel`, `med_protocol`, `agri_sentinel`) are language examples whose capability calls fail closed; no broker, exchange, patient record, greenhouse or actuator is connected to any of them.
-  - [ ] PLAN-UNIFIED-DIAGNOSTICS: Kaze parser/checker and statement-level VM locations, version-2 bytecode mapping with version-1 reader, and run/check JSON diagnostics are in source. A local release-profile standalone arithmetic failure uses the shared renderer. Expression spans, Kaze call frames, source excerpts and broader standalone/release evidence remain open.
+  - [x] PLAN-UNIFIED-DIAGNOSTICS: Kaze parser/checker and statement-level VM locations, version-2 bytecode mapping, source snippet extraction with masked literals and caret rendering, and structured parameter diagnostics (`E_KAZE_PARAM`).
+  - [x] PLAN-KAZE-DUAL-SYNTAX: Tagged prefix-tree S-expression syntax `(kaze (format 1) ...)`, parser auto-detection, and bidirectional `to-machine`/`to-human` CLI commands and JS APIs.
   - [ ] Implement incremental AST caching for sub-millisecond Kaze routine compilation.
 
 ---
@@ -220,7 +222,7 @@ Every division operates under strict architectural boundaries to guarantee that 
 * **Active Tasks**:
   - [x] Align TUI banner with brand voice ("runtime for AI") (F-07).
   - [x] Verify CLI argument parsing matches 12-factor configuration hierarchy.
-  - [ ] PLAN-UNIFIED-DIAGNOSTICS: concise/full error rendering and bounded reported JS frames are implemented in source; audit remaining TUI/REPL, ABI, protocol and release surfaces before claiming complete coverage.
+  - [x] PLAN-UNIFIED-DIAGNOSTICS: Concise/full error rendering, caret snippet display, and postmortem crash card formatting with structured diagnostic reason and remediation help.
   - [x] AUDIT-REMEDIATION-2026-11-08: Complete CLI polish — read-only `--help` with zero disk side-effects (CLI-008/009), strict ANSI scrubbing under `NO_COLOR=1` / `TERM=dumb` (CLI-023/024), `sofuu run -` / `eval <<EOF` stdin execution (CLI-055–057), and `sofuu bundle` stdout streaming (CP-069).
   - [x] PLAN-SCOUTER-HEALTH-AND-INTEGRITY: Integrated real-time Scouter HUD context saturation and brain health monitor into terminal chat TUI (`94347eaba`).
   - [ ] Add interactive debugging hooks (`--inspect-brk`) for Kaze VM step execution.

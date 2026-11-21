@@ -91,6 +91,11 @@ pub enum Op {
     /// wide: milliseconds of link silence; push true once the link has been
     /// silent at least that long (false when there is no live link)
     LinkLost = 46,
+    // ── v1.1: self-hosting & systems routines ───────────────────────
+    /// a: argument count; wide: item index in the module's items table
+    CallRoutine = 47,
+    /// a: number of key-value pairs (pops 2*a: key, val pairs); pushes a map
+    NewMap = 48,
 }
 
 impl Op {
@@ -143,6 +148,8 @@ impl Op {
             44 => Op::TryBegin,
             45 => Op::TryEnd,
             46 => Op::LinkLost,
+            47 => Op::CallRoutine,
+            48 => Op::NewMap,
             _ => return None,
         })
     }
@@ -161,6 +168,7 @@ impl Op {
                 | Op::FuelTick
                 | Op::TryBegin
                 | Op::LinkLost
+                | Op::CallRoutine
         )
     }
 
@@ -213,6 +221,8 @@ impl Op {
             Op::TryBegin => "TRY_BEGIN",
             Op::TryEnd => "TRY_END",
             Op::LinkLost => "LINK_LOST",
+            Op::CallRoutine => "CALL_ROUTINE",
+            Op::NewMap => "NEWMAP",
         }
     }
 }
@@ -617,10 +627,10 @@ mod tests {
 
     #[test]
     fn opcodes_round_trip() {
-        for b in 0u8..=46 {
+        for b in 0u8..=48 {
             let op = Op::from_u8(b).expect("known opcode");
             assert_eq!(op as u8, b);
         }
-        assert!(Op::from_u8(47).is_none());
+        assert!(Op::from_u8(49).is_none());
     }
 }

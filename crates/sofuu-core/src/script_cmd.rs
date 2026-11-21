@@ -189,6 +189,7 @@ pub fn print_help() {
          \x20 compile <file.kaze>  Emit the .kazebc module (deterministic bytes)\n\
          \x20 to-machine <file.kaze>  Transpile human or machine syntax to canonical machine S-expr\n\
          \x20 to-human <file.kaze>    Transpile machine or human syntax to canonical human syntax\n\
+         \x20 emit-c <file.kaze>      Emit portable ANSI/ISO C99 source code\n\
          \x20 repl                 Interactive session: define routines, then .run\n\
          \x20 version              Print the Kaze language version\n\n\
          run options:\n\
@@ -636,6 +637,7 @@ pub fn run(argv: &[String]) -> i32 {
         "compile" => cmd_compile(rest),
         "to-machine" => cmd_to_machine(rest),
         "to-human" => cmd_to_human(rest),
+        "emit-c" => cmd_emit_c(rest),
         "repl" => cmd_repl(rest),
         other => {
             eprintln!("\x1b[31mError:\x1b[0m unknown script command '{}'", other);
@@ -1205,6 +1207,52 @@ fn cmd_to_human(argv: &[String]) -> i32 {
             Outcome::of_code(&kerr.code).exit_code()
         }
     }
+}
+
+fn cmd_emit_c(argv: &[String]) -> i32 {
+    let flags = match parse_flags(argv) {
+        Ok(f) => f,
+        Err(e) => {
+            report_cli_failure("E_USAGE", &e, requested_json(argv));
+            return Outcome::Usage.exit_code();
+        }
+    };
+    let Some(path) = flags.positional.first() else {
+        report_cli_failure("E_USAGE", "'sofuu script emit-c' needs a .kaze file", flags.json);
+        return Outcome::Usage.exit_code();
+    };
+    let src = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            report_cli_failure("E_KAZE_HOST", &format!("cannot read '{}': {}", path, e), flags.json);
+            return Outcome::Error.exit_code();
+        }
+    };
+    let opts = sfs::c_codegen::CodegenOptions {
+        standalone: true,
+        entry: flags.entry.clone(),
+    };
+    let c_code = match sfs::emit_c_source(&src, path, &opts) {
+        Ok(code) => code,
+        Err(e) => {
+            if flags.json {
+                println!("{}", serde_json::to_string_pretty(&kaze_error_json(&e, path)).unwrap_or_default());
+            } else {
+                print_kaze_error(&e, path);
+            }
+            return Outcome::of_code(&e.code).exit_code();
+        }
+    };
+    if let Some(out_path) = &flags.out {
+        if let Err(e) = std::fs::write(out_path, &c_code) {
+            report_cli_failure("E_KAZE_HOST", &format!("cannot write '{}': {}", out_path, e), flags.json);
+            return Outcome::Error.exit_code();
+        }
+        println!("\x1b[32m✓\x1b[0m {} → {} ({} bytes)", path, out_path, c_code.len());
+    } else {
+        print!("{}", c_code);
+    }
+    0
 }
 
 fn print_report(report: &RunReport) {

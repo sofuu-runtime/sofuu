@@ -106,7 +106,7 @@ pub fn check(p: &Program) -> Result<(), Vec<CheckError>> {
             scope.push((p.clone(), Ty::Any));
         }
         if let ItemKind::When(cond) = &item.kind {
-            let t = infer(cond, &mut scope, &declared, &mut errors);
+            let t = infer(cond, &mut scope, &declared, &p.items, &mut errors);
             if !matches!(t, Ty::Bool | Ty::Any) {
                 errors.push(e(
                     item.line,
@@ -114,7 +114,7 @@ pub fn check(p: &Program) -> Result<(), Vec<CheckError>> {
                 ));
             }
         }
-        check_block(&item.body, &mut scope, &declared, &mut errors);
+        check_block(&item.body, &mut scope, &declared, &p.items, &mut errors);
         if matches!(item.kind, ItemKind::Filter) && !terminates(&item.body) {
             errors.push(e(
                 item.line,
@@ -138,12 +138,13 @@ fn check_block(
     stmts: &[Stmt],
     scope: &mut Vec<(String, Ty)>,
     declared: &[&str],
+    items: &[Item],
     errors: &mut Vec<CheckError>,
 ) {
     for stmt in stmts {
         match stmt {
             Stmt::Let(name, value, line) => {
-                let t = infer(value, scope, declared, errors);
+                let t = infer(value, scope, declared, items, errors);
                 if let Some(slot) = scope.iter_mut().find(|(n, _)| n == name) {
                     slot.1 = t;
                 } else {
@@ -152,16 +153,16 @@ fn check_block(
                 let _ = line;
             }
             Stmt::Set(name, value, line) => {
-                infer(value, scope, declared, errors);
+                infer(value, scope, declared, items, errors);
                 if !scope.iter().any(|(n, _)| n == name) {
                     errors.push(e(*line, format!("'{}' is not defined", name)));
                 }
             }
             Stmt::Eval(expr, _) => {
-                infer(expr, scope, declared, errors);
+                infer(expr, scope, declared, items, errors);
             }
             Stmt::If { cond, then, otherwise, line } => {
-                let t = infer(cond, scope, declared, errors);
+                let t = infer(cond, scope, declared, items, errors);
                 if !matches!(t, Ty::Bool | Ty::Any) {
                     errors.push(e(
                         *line,
@@ -169,12 +170,12 @@ fn check_block(
                     ));
                 }
                 let mut inner = scope.clone();
-                check_block(then, &mut inner, declared, errors);
+                check_block(then, &mut inner, declared, items, errors);
                 let mut inner2 = scope.clone();
-                check_block(otherwise, &mut inner2, declared, errors);
+                check_block(otherwise, &mut inner2, declared, items, errors);
             }
             Stmt::ForEach { var, list, body, line } => {
-                let t = infer(list, scope, declared, errors);
+                let t = infer(list, scope, declared, items, errors);
                 if !matches!(t, Ty::List | Ty::Any) {
                     errors.push(e(
                         *line,
@@ -183,10 +184,10 @@ fn check_block(
                 }
                 let mut inner = scope.clone();
                 inner.push((var.clone(), Ty::Any));
-                check_block(body, &mut inner, declared, errors);
+                check_block(body, &mut inner, declared, items, errors);
             }
             Stmt::While { cond, body, line } => {
-                let t = infer(cond, scope, declared, errors);
+                let t = infer(cond, scope, declared, items, errors);
                 if !matches!(t, Ty::Bool | Ty::Any) {
                     errors.push(e(
                         *line,
@@ -194,20 +195,20 @@ fn check_block(
                     ));
                 }
                 let mut inner = scope.clone();
-                check_block(body, &mut inner, declared, errors);
+                check_block(body, &mut inner, declared, items, errors);
             }
             Stmt::Try { body, otherwise, error_name, line: _ } => {
                 let mut inner = scope.clone();
-                check_block(body, &mut inner, declared, errors);
+                check_block(body, &mut inner, declared, items, errors);
                 let mut inner2 = scope.clone();
                 if let Some(name) = error_name {
                     inner2.push((name.clone(), Ty::Error));
                 }
-                check_block(otherwise, &mut inner2, declared, errors);
+                check_block(otherwise, &mut inner2, declared, items, errors);
             }
             Stmt::Return(value, _) => {
                 if let Some(v) = value {
-                    infer(v, scope, declared, errors);
+                    infer(v, scope, declared, items, errors);
                 }
             }
         }
@@ -219,8 +220,10 @@ fn expr_label(e: &Expr) -> String {
         Expr::Name(n) => n.clone(),
         Expr::Ambient { field, .. } => field.clone(),
         Expr::Call { recv, op, .. } => format!("{}.{}", recv, op),
+        Expr::CallRoutine { name, .. } => format!("{}()", name),
+        Expr::RecordInit { name, .. } => format!("{}(...)", name),
         Expr::Field { base, field, .. } => format!("{}.{}", base, field),
-        other => format!("{:?}", std::mem::discriminant(other)),
+        _ => "an expression".to_string(),
     }
 }
 
@@ -228,17 +231,71 @@ fn infer(
     expr: &Expr,
     scope: &mut Vec<(String, Ty)>,
     declared: &[&str],
+    items: &[Item],
     errors: &mut Vec<CheckError>,
 ) -> Ty {
     match expr {
         Expr::Num(_, unit) => Ty::Num(if *unit == Unit::None { None } else { Some(*unit) }),
         Expr::Str(_) => Ty::Str,
         Expr::Bool(_) => Ty::Bool,
-        Expr::List(items) => {
-            for i in items {
-                infer(i, scope, declared, errors);
+        Expr::List(list_items) => {
+            for i in list_items {
+                infer(i, scope, declared, items, errors);
             }
             Ty::List
+        }
+        Expr::CallRoutine { name, args, line } => {
+            let target = items.iter().find(|it| it.name == *name);
+            match target {
+                Some(it) => {
+                    if it.params.len() != args.len() {
+                        errors.push(e(
+                            *line,
+                            format!("'{}' takes {} value(s), but {} were given", name, it.params.len(), args.len()),
+                        ));
+                    }
+                }
+                None => {
+                    errors.push(e(
+                        *line,
+                        format!("'{}' is not defined; add an action or record '{}'", name, name),
+                    ));
+                }
+            }
+            for a in args {
+                infer(a, scope, declared, items, errors);
+            }
+            Ty::Any
+        }
+        Expr::RecordInit { name, fields, line } => {
+            let target = items.iter().find(|it| it.name == *name);
+            match target {
+                Some(it) => {
+                    if let ItemKind::Record(ref rec_fields) = it.kind {
+                        for (fname, val) in fields {
+                            if !rec_fields.iter().any(|rf| rf.name == *fname) {
+                                errors.push(e(
+                                    *line,
+                                    format!("record '{}' has no field '{}'", name, fname),
+                                ));
+                            }
+                            infer(val, scope, declared, items, errors);
+                        }
+                    } else {
+                        errors.push(e(
+                            *line,
+                            format!("'{}' is not a record", name),
+                        ));
+                    }
+                }
+                None => {
+                    errors.push(e(
+                        *line,
+                        format!("record '{}' is not defined", name),
+                    ));
+                }
+            }
+            Ty::Any
         }
         Expr::Name(name) => match scope.iter().rev().find(|(n, _)| n == name) {
             Some((_, t)) => *t,
@@ -286,22 +343,22 @@ fn infer(
             }
         }
         Expr::Not(inner) => {
-            let t = infer(inner, scope, declared, errors);
+            let t = infer(inner, scope, declared, items, errors);
             if !matches!(t, Ty::Bool | Ty::Any) {
                 errors.push(e(0, format!("'not' needs true or false, but this is {}", t.label())));
             }
             Ty::Bool
         }
         Expr::Len(inner) => {
-            let t = infer(inner, scope, declared, errors);
+            let t = infer(inner, scope, declared, items, errors);
             if !matches!(t, Ty::Str | Ty::List | Ty::Any) {
                 errors.push(e(0, format!("'length of' needs text or a list, but this is {}", t.label())));
             }
             Ty::Num(None)
         }
         Expr::Index(list, idx) => {
-            let lt = infer(list, scope, declared, errors);
-            let it = infer(idx, scope, declared, errors);
+            let lt = infer(list, scope, declared, items, errors);
+            let it = infer(idx, scope, declared, items, errors);
             if !matches!(lt, Ty::List | Ty::Str | Ty::Any) {
                 errors.push(e(0, format!("[ ] needs a list or text, but this is {}", lt.label())));
             }
@@ -314,7 +371,7 @@ fn infer(
             let is_mcp_or_plugin = declared.iter().any(|d| binding_server(d) == Some(recv.as_str()));
             if is_mcp_or_plugin {
                 for a in args {
-                    infer(a, scope, declared, errors);
+                    infer(a, scope, declared, items, errors);
                 }
                 return Ty::Any;
             }
@@ -332,7 +389,7 @@ fn infer(
                     ),
                 ));
             }
-            let arg_tys: Vec<Ty> = args.iter().map(|a| infer(a, scope, declared, errors)).collect();
+            let arg_tys: Vec<Ty> = args.iter().map(|a| infer(a, scope, declared, items, errors)).collect();
             match caps::op_arity(family, op) {
                 None => errors.push(e(
                     *line,
@@ -367,8 +424,8 @@ fn infer(
             capability_result(family, op)
         }
         Expr::Bin(op, left, right) => {
-            let lt = infer(left, scope, declared, errors);
-            let rt = infer(right, scope, declared, errors);
+            let lt = infer(left, scope, declared, items, errors);
+            let rt = infer(right, scope, declared, items, errors);
             let negation = *op == BinOp::Sub
                 && rt == Ty::Point
                 && matches!(**left, Expr::Num(n, _) if n == 0.0);
@@ -377,7 +434,7 @@ fn infer(
             }
             point_aware_bin(*op, lt, rt, errors)
         }
-        Expr::Math { kind, args, line } => infer_math(*kind, args, *line, scope, declared, errors),
+        Expr::Math { kind, args, line } => infer_math(*kind, args, *line, scope, declared, items, errors),
         Expr::LinkLost { after_ms: _, line } => {
             if !declared.iter().any(|d| caps::family_of(d) == "drone") {
                 errors.push(e(
@@ -422,9 +479,10 @@ fn infer_math(
     line: u32,
     scope: &mut Vec<(String, Ty)>,
     declared: &[&str],
+    items: &[Item],
     errors: &mut Vec<CheckError>,
 ) -> Ty {
-    let tys: Vec<Ty> = args.iter().map(|a| infer(a, scope, declared, errors)).collect();
+    let tys: Vec<Ty> = args.iter().map(|a| infer(a, scope, declared, items, errors)).collect();
     let want = match kind {
         MathKind::Vector => 2,
         MathKind::Distance
@@ -556,6 +614,9 @@ fn bin_result(op: BinOp, lt: Ty, rt: Ty) -> Ty {
         Add | Sub | Mul | Div | Mod => {
             if (lt == Ty::Str || rt == Ty::Str) && op == Add {
                 return Ty::Str;
+            }
+            if (lt == Ty::List || rt == Ty::List) && op == Add {
+                return Ty::List;
             }
             let unit = match (lt, rt) {
                 (Ty::Num(a), Ty::Num(b)) => match (a, b) {

@@ -51,6 +51,7 @@ pub fn compile(program: &Program) -> Result<Module, CompileError> {
             scopes: vec![Vec::new()],
             next_slot: 0,
             item_name: item.name.clone(),
+            items: &program.items,
         };
         for p in &item.params {
             cx.bind(p)?;
@@ -66,6 +67,15 @@ pub fn compile(program: &Program) -> Result<Module, CompileError> {
                 cx.patch(skip);
                 cx.emit(Op::RetUnit, 0, 0, 0);
             }
+            ItemKind::Record(fields) => {
+                for (slot, f) in fields.iter().enumerate() {
+                    let k_idx = cx.push_const(Const::Str(f.name.clone()))?;
+                    cx.emit_wide(Op::Const, 0, k_idx);
+                    cx.emit(Op::LoadLocal, slot as u8, 0, 0);
+                }
+                cx.emit(Op::NewMap, fields.len() as u8, 0, 0);
+                cx.emit(Op::Ret, 0, 0, 0);
+            }
             _ => {
                 cx.stmts(&item.body)?;
                 cx.emit(Op::RetUnit, 0, 0, 0);
@@ -77,6 +87,7 @@ pub fn compile(program: &Program) -> Result<Module, CompileError> {
             ItemKind::Filter => (ItemTag::Filter, 0.0),
             ItemKind::When(_) => (ItemTag::When, 0.0),
             ItemKind::Every(ms) => (ItemTag::Every, *ms),
+            ItemKind::Record(_) => (ItemTag::Action, 0.0),
         };
         let slots = cx.next_slot.max(item.params.len() as u8);
         module.items.push(ItemCode {
@@ -104,6 +115,7 @@ struct Cx<'a> {
     scopes: Vec<Vec<(String, u8)>>,
     next_slot: u8,
     item_name: String,
+    items: &'a [Item],
 }
 
 impl<'a> Cx<'a> {
@@ -319,6 +331,39 @@ impl<'a> Cx<'a> {
                 };
                 let cap = self.push_cap(family, op, args.len() as u8)?;
                 self.emit_wide(Op::CallCap, args.len() as u8, cap);
+            }
+            Expr::CallRoutine { name, args, line } => {
+                if args.len() > 255 {
+                    return e(*line, format!("'{}' takes too many values", name));
+                }
+                let target_idx = match self.items.iter().position(|it| it.name == *name) {
+                    Some(i) => i,
+                    None => return e(*line, format!("'{}' is not defined in this module", name)),
+                };
+                for a in args {
+                    self.expr(a)?;
+                }
+                self.emit_wide(Op::CallRoutine, args.len() as u8, target_idx as u32);
+            }
+            Expr::RecordInit { name, fields, line } => {
+                let target_item = match self.items.iter().find(|it| it.name == *name) {
+                    Some(it) => it,
+                    None => return e(*line, format!("record '{}' is not defined in this module", name)),
+                };
+                let rec_fields = match &target_item.kind {
+                    ItemKind::Record(ref f) => f,
+                    _ => return e(*line, format!("'{}' is not a record", name)),
+                };
+                for rf in rec_fields {
+                    let (_, expr) = match fields.iter().find(|(fname, _)| fname == &rf.name) {
+                        Some(p) => p,
+                        None => return e(*line, format!("missing field '{}' in instantiation of record '{}'", rf.name, name)),
+                    };
+                    let k_idx = self.push_const(Const::Str(rf.name.clone()))?;
+                    self.emit_wide(Op::Const, 0, k_idx);
+                    self.expr(expr)?;
+                }
+                self.emit(Op::NewMap, rec_fields.len() as u8, 0, 0);
             }
             Expr::Not(inner) => {
                 self.expr(inner)?;

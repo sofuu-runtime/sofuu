@@ -11,6 +11,7 @@
 
 pub mod arena;
 pub mod ast;
+pub mod c_codegen;
 pub mod caps;
 pub mod checker;
 pub mod compiler;
@@ -431,6 +432,25 @@ pub fn prepare_file(path: &str) -> Result<Prepared, KazeError> {
 /// Front end only — what `sofuu script check` runs.
 pub fn check_source(src: &str, name: &str) -> Result<(), KazeError> {
     prepare(src, name).map(|_| ())
+}
+
+/// Emit ANSI C99 source code.
+pub fn emit_c_source(src: &str, name: &str, opts: &c_codegen::CodegenOptions) -> Result<String, KazeError> {
+    let program = parser::parse(src).map_err(|e| {
+        KazeError::at(e.code, e.render(name), name, e.line, Some(e.col))
+    })?;
+    checker::check(&program).map_err(|errors| {
+        let mut message = String::new();
+        for (i, err) in errors.iter().enumerate() {
+            if i > 0 {
+                message.push_str("\n");
+            }
+            message.push_str(&err.render(name));
+        }
+        let first_line = errors.first().map(|e| e.line).unwrap_or(0);
+        KazeError::at("E_KAZE_CHECK", message, name, first_line, None)
+    })?;
+    Ok(c_codegen::emit_c(&program, opts))
 }
 
 /// Everything a run needs besides the script itself.
@@ -2764,5 +2784,107 @@ action patrol(target_alt):
         assert_eq!(human_report.value, machine_report.value);
         assert_eq!(human_report.actions, machine_report.actions);
         assert_eq!(human_report.instructions, machine_report.instructions);
+    }
+
+    #[test]
+    fn routine_calls_and_record_types_work_end_to_end() {
+        let src = r#"
+needs: log
+
+record Token:
+    kind: str
+    text: str
+    line: num
+
+action make_token(k, t, l):
+    return Token(kind: k, text: t, line: l)
+
+action fib(n):
+    if n <= 1:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+action main():
+    let tok = make_token("IDENT", "foo", 42)
+    let f = fib(6)
+    let list1 = [1, 2]
+    let list2 = [3, 4]
+    let merged = list1 + list2
+    log.info(tok.text)
+    return f + tok.line + length of merged
+"#;
+        let opts = RunOptions {
+            entry: Some("main".to_string()),
+            grants: vec!["log".to_string()],
+            policy: Some(serde_json::json!({ "tools": { "allow": ["kaze.*"] } })),
+            ..Default::default()
+        };
+        let rep = run_source(src, "<test>", &opts).expect("run source");
+        // fib(6) = 8, tok.line = 42, length of [1,2,3,4] = 4 -> 54
+        assert_eq!(rep.value, "54");
+    }
+
+    #[test]
+    fn c99_native_emitter_compiles_and_executes() {
+        let src = r#"
+record Token:
+    kind: str
+    text: str
+    line: num
+
+action make_token(k, t, l):
+    return Token(kind: k, text: t, line: l)
+
+action fib(n):
+    if n <= 1:
+        return n
+    return fib(n - 1) + fib(n - 2)
+
+action main():
+    let tok = make_token("IDENT", "foo", 42)
+    let f = fib(7)
+    let list1 = [10, 20]
+    let list2 = [30, 40]
+    let merged = list1 + list2
+    let ans = f + tok.line + length of merged
+    return ans
+"#;
+        let opts = c_codegen::CodegenOptions {
+            standalone: true,
+            entry: Some("main".to_string()),
+        };
+        let c_code = emit_c_source(src, "<c_test>", &opts).expect("emit c source");
+        assert!(c_code.contains("kz_record_new_Token"));
+        assert!(c_code.contains("kz_fn_fib"));
+
+        let tmp_dir = std::env::temp_dir();
+        let c_file = tmp_dir.join("kaze_test_c99.c");
+        let bin_file = tmp_dir.join("kaze_test_c99_bin");
+
+        std::fs::write(&c_file, &c_code).expect("write c file");
+
+        let status = std::process::Command::new("cc")
+            .arg("-std=c99")
+            .arg("-O2")
+            .arg("-Wall")
+            .arg("-Wextra")
+            .arg("-Wno-unused-function")
+            .arg(&c_file)
+            .arg("-o")
+            .arg(&bin_file)
+            .status();
+
+        if let Ok(st) = status {
+            if st.success() {
+                let output = std::process::Command::new(&bin_file)
+                    .output()
+                    .expect("execute compiled c binary");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // fib(7) = 13, tok.line = 42, length of [10,20,30,40] = 4 -> 59
+                assert_eq!(stdout.trim(), "59");
+            }
+        }
+        let _ = std::fs::remove_file(&c_file);
+        let _ = std::fs::remove_file(&bin_file);
     }
 }

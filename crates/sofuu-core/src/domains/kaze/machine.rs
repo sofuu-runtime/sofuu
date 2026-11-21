@@ -401,6 +401,68 @@ fn lower_item(tag: &str, children: &[SExpr], line: u32) -> Result<Item, ParseErr
                 origin: String::new(),
             })
         }
+        "record" => {
+            if children.len() < 2 {
+                return err(line, 1, "'(record <name> (fields ...))' requires a name");
+            }
+            let name = match &children[1] {
+                SExpr::Atom(s, _, _) | SExpr::String(s, _, _) => s.clone(),
+                _ => return err(line, 1, "record name must be an identifier"),
+            };
+            let mut fields = Vec::new();
+            for child in &children[2..] {
+                match child {
+                    SExpr::List(form, fl, fc) if !form.is_empty() => {
+                        let subtag = match &form[0] {
+                            SExpr::Atom(t, _, _) => t.as_str(),
+                            _ => return err(*fl, *fc, "expected tag symbol"),
+                        };
+                        if subtag == "fields" {
+                            for f in &form[1..] {
+                                match f {
+                                    SExpr::Atom(s, _, _) | SExpr::String(s, _, _) => {
+                                        fields.push(crate::sfs::ast::RecordField {
+                                            name: s.clone(),
+                                            type_name: None,
+                                        });
+                                    }
+                                    SExpr::List(pair, _, _) if !pair.is_empty() => {
+                                        let fname = match &pair[0] {
+                                            SExpr::Atom(s, _, _) | SExpr::String(s, _, _) => s.clone(),
+                                            _ => return err(f.line(), f.col(), "field name must be an identifier"),
+                                        };
+                                        let type_name = if pair.len() > 1 {
+                                            match &pair[1] {
+                                                SExpr::Atom(s, _, _) | SExpr::String(s, _, _) => Some(s.clone()),
+                                                _ => None,
+                                            }
+                                        } else {
+                                            None
+                                        };
+                                        fields.push(crate::sfs::ast::RecordField {
+                                            name: fname,
+                                            type_name,
+                                        });
+                                    }
+                                    _ => return err(f.line(), f.col(), "record field must be identifier or (name type)"),
+                                }
+                            }
+                        } else {
+                            return err(*fl, *fc, format!("unexpected form '{}' in record", subtag));
+                        }
+                    }
+                    _ => return err(child.line(), child.col(), "expected '(fields ...)' in record"),
+                }
+            }
+            Ok(Item {
+                name,
+                kind: ItemKind::Record(fields),
+                params: Vec::new(),
+                body: Vec::new(),
+                line,
+                origin: String::new(),
+            })
+        }
         "when" => {
             if children.len() < 3 {
                 return err(line, 1, "'(when <cond> (body ...))' requires a condition and a body");
@@ -837,6 +899,44 @@ fn lower_expr(sexpr: &SExpr) -> Result<Expr, ParseError> {
                     }
                     Ok(Expr::Call { recv, op, args, line })
                 }
+                "call-routine" => {
+                    if elements.len() < 2 {
+                        return err(line, col, "(call-routine \"<name>\" <args>...) takes at least 1 argument");
+                    }
+                    let name = match &elements[1] {
+                        SExpr::Atom(s, _, _) | SExpr::String(s, _, _) => s.clone(),
+                        _ => return err(line, col, "call-routine name must be an atom or string"),
+                    };
+                    let mut args = Vec::new();
+                    for arg in &elements[2..] {
+                        args.push(lower_expr(arg)?);
+                    }
+                    Ok(Expr::CallRoutine { name, args, line })
+                }
+                "record-init" => {
+                    if elements.len() < 2 {
+                        return err(line, col, "(record-init \"<name>\" (field val)...) takes at least 1 argument");
+                    }
+                    let name = match &elements[1] {
+                        SExpr::Atom(s, _, _) | SExpr::String(s, _, _) => s.clone(),
+                        _ => return err(line, col, "record-init name must be an atom or string"),
+                    };
+                    let mut fields = Vec::new();
+                    for field_sexpr in &elements[2..] {
+                        match field_sexpr {
+                            SExpr::List(pair, pl, pc) if pair.len() == 2 => {
+                                let fname = match &pair[0] {
+                                    SExpr::Atom(s, _, _) | SExpr::String(s, _, _) => s.clone(),
+                                    _ => return err(*pl, *pc, "record field name must be an identifier"),
+                                };
+                                let fval = lower_expr(&pair[1])?;
+                                fields.push((fname, fval));
+                            }
+                            _ => return err(field_sexpr.line(), field_sexpr.col(), "record-init field must be (name val)"),
+                        }
+                    }
+                    Ok(Expr::RecordInit { name, fields, line })
+                }
                 "field" => {
                     if elements.len() != 3 {
                         return err(line, col, "(field \"<base>\" \"<field>\") takes 2 arguments");
@@ -1163,6 +1263,28 @@ fn emit_item_machine(item: &Item, out: &mut String, depth: usize) {
             out.push_str("))\n");
             return;
         }
+        ItemKind::Record(fields) => {
+            out.push_str("(record \"");
+            escape_str_to(&item.name, out);
+            out.push_str("\"\n");
+            push_indent(out, depth + 1);
+            out.push_str("(fields");
+            for f in fields {
+                if let Some(ty) = &f.type_name {
+                    out.push_str(" (");
+                    escape_str_to(&f.name, out);
+                    out.push(' ');
+                    escape_str_to(ty, out);
+                    out.push(')');
+                } else {
+                    out.push_str(" \"");
+                    escape_str_to(&f.name, out);
+                    out.push('"');
+                }
+            }
+            out.push_str("))\n");
+            return;
+        }
         ItemKind::Action => out.push_str("(action \""),
         ItemKind::Check => out.push_str("(check \""),
         ItemKind::Filter => out.push_str("(filter \""),
@@ -1339,6 +1461,30 @@ fn emit_expr_machine(expr: &Expr, out: &mut String) {
             }
             out.push(')');
         }
+        Expr::CallRoutine { name, args, .. } => {
+            out.push_str("(call-routine \"");
+            escape_str_to(name, out);
+            out.push('"');
+            for a in args {
+                out.push(' ');
+                emit_expr_machine(a, out);
+            }
+            out.push(')');
+        }
+        Expr::RecordInit { name, fields, .. } => {
+            out.push_str("(record-init \"");
+            escape_str_to(name, out);
+            out.push('"');
+            for (fname, fval) in fields {
+                out.push_str(" (");
+                escape_str_to(fname, out);
+                out.push(' ');
+                emit_expr_machine(fval, out);
+                out.push(')');
+            }
+            out.push(')');
+        }
+
         Expr::Field { base, field, .. } => {
             out.push_str("(field \"");
             escape_str_to(base, out);
@@ -1501,6 +1647,21 @@ fn emit_item_human(item: &Item, out: &mut String) {
             }
             out.push_str("):\n");
         }
+        ItemKind::Record(fields) => {
+            out.push_str("record ");
+            out.push_str(&item.name);
+            out.push_str(":\n");
+            for f in fields {
+                out.push_str("    ");
+                out.push_str(&f.name);
+                if let Some(ty) = &f.type_name {
+                    out.push_str(": ");
+                    out.push_str(ty);
+                }
+                out.push('\n');
+            }
+            return;
+        }
         ItemKind::When(cond) => {
             out.push_str("when ");
             emit_expr_human(cond, out);
@@ -1651,6 +1812,30 @@ fn emit_expr_human(expr: &Expr, out: &mut String) {
                     out.push_str(", ");
                 }
                 emit_expr_human(a, out);
+            }
+            out.push(')');
+        }
+        Expr::CallRoutine { name, args, .. } => {
+            out.push_str(name);
+            out.push('(');
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                emit_expr_human(a, out);
+            }
+            out.push(')');
+        }
+        Expr::RecordInit { name, fields, .. } => {
+            out.push_str(name);
+            out.push('(');
+            for (i, (fname, fval)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(fname);
+                out.push_str(": ");
+                emit_expr_human(fval, out);
             }
             out.push(')');
         }

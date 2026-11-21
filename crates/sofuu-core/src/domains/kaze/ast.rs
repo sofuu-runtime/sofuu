@@ -97,6 +97,18 @@ pub enum Expr {
     /// Maps have no literal syntax in v0.1; they arrive as arguments, and this
     /// is how a script reads one.
     Field { base: String, field: String, line: u32 },
+    /// `func(arg1, arg2)` — a call to an in-module routine.
+    CallRoutine {
+        name: String,
+        args: Vec<Expr>,
+        line: u32,
+    },
+    /// `RecordName(field1: val1, ...)`
+    RecordInit {
+        name: String,
+        fields: Vec<(String, Expr)>,
+        line: u32,
+    },
     Bin(BinOp, Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
     /// `length of x`
@@ -144,6 +156,8 @@ impl Expr {
     pub fn line(&self) -> u32 {
         match self {
             Expr::Call { line, .. }
+            | Expr::CallRoutine { line, .. }
+            | Expr::RecordInit { line, .. }
             | Expr::Field { line, .. }
             | Expr::Math { line, .. }
             | Expr::LinkLost { line, .. } => *line,
@@ -204,6 +218,12 @@ impl Stmt {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordField {
+    pub name: String,
+    pub type_name: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub enum ItemKind {
     /// `action` — a routine that performs work.
@@ -216,6 +236,8 @@ pub enum ItemKind {
     When(Expr),
     /// `every <period>` — fires on ticks where the period divides.
     Every(f64),
+    /// `record` — a user-defined record layout.
+    Record(Vec<RecordField>),
 }
 
 #[derive(Clone, Debug)]
@@ -253,6 +275,21 @@ impl Program {
         self.items.iter().find(|i| i.name == name)
     }
 
+    pub fn record_fields(&self, name: &str) -> Option<&[RecordField]> {
+        for it in &self.items {
+            if it.name == name {
+                if let ItemKind::Record(ref fields) = it.kind {
+                    return Some(fields);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn is_record(&self, name: &str) -> bool {
+        self.record_fields(name).is_some()
+    }
+
     pub fn items_of_kind(&self, want: &ItemKind) -> impl Iterator<Item = &Item> {
         let want_tag = kind_tag(want);
         self.items
@@ -268,5 +305,6 @@ fn kind_tag(k: &ItemKind) -> u8 {
         ItemKind::Filter => 2,
         ItemKind::When(_) => 3,
         ItemKind::Every(_) => 4,
+        ItemKind::Record(_) => 5,
     }
 }

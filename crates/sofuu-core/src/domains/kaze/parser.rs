@@ -80,6 +80,10 @@ impl Parser {
         &self.toks.get(self.pos + n).map(|t| &t.tok).unwrap_or(&Tok::Eof)
     }
 
+    fn is_named_arg_ahead(&self) -> bool {
+        matches!(self.peek(), Tok::Ident(_)) && matches!(self.peek_at(1), Tok::Punct(':'))
+    }
+
     fn here(&self) -> (u32, u32) {
         self.toks
             .get(self.pos)
@@ -278,6 +282,66 @@ impl Parser {
             let body = self.block()?;
             self.pop_scope();
             return Ok(Item { name, kind: ItemKind::Every(ms), params: Vec::new(), body, line, origin: String::new() });
+        }
+        if self.at_ident("record") {
+            self.bump();
+            let name = self.expect_ident()?;
+            self.expect_punct(':')?;
+            if !matches!(self.peek(), Tok::Newline) {
+                let (l, c) = self.here();
+                return err(l, c, "put record fields on the next line, indented by four spaces");
+            }
+            self.bump();
+            if !matches!(self.peek(), Tok::Indent) {
+                let (l, c) = self.here();
+                return err(l, c, "record needs one indented field at least");
+            }
+            self.bump();
+            let mut fields = Vec::new();
+            let mut field_names = Vec::new();
+            loop {
+                match self.peek() {
+                    Tok::Dedent => {
+                        self.bump();
+                        break;
+                    }
+                    Tok::Eof => {
+                        let (l, c) = self.here();
+                        return err(l, c, "this record is never closed");
+                    }
+                    Tok::Newline => {
+                        self.bump();
+                        continue;
+                    }
+                    _ => {}
+                }
+                let f_name = self.expect_ident()?;
+                let type_name = if self.eat_punct(':') {
+                    Some(self.expect_ident()?)
+                } else {
+                    None
+                };
+                if field_names.contains(&f_name) {
+                    let (l, c) = self.here();
+                    return err(l, c, format!("field '{}' is repeated in record '{}'", f_name, name));
+                }
+                field_names.push(f_name.clone());
+                fields.push(RecordField { name: f_name, type_name });
+                if matches!(self.peek(), Tok::Newline) {
+                    self.bump();
+                }
+            }
+            if fields.is_empty() {
+                return err(line, col, format!("record '{}' has no fields", name));
+            }
+            return Ok(Item {
+                name,
+                kind: ItemKind::Record(fields),
+                params: field_names,
+                body: Vec::new(),
+                line,
+                origin: String::new(),
+            });
         }
 
         let kind = match self.peek().clone() {
@@ -1007,6 +1071,43 @@ impl Parser {
                         }
                     }
                     return Ok(Expr::Call { recv: word, op, args, line });
+                }
+                // Direct routine call `func(args)` or record init `Record(fields)`
+                if self.eat_punct('(') {
+                    let mut args = Vec::new();
+                    let mut named_fields = Vec::new();
+                    let mut is_named = false;
+                    if !self.eat_punct(')') {
+                        loop {
+                            if self.is_named_arg_ahead() {
+                                is_named = true;
+                                let fname = self.expect_ident()?;
+                                self.expect_punct(':')?;
+                                let val = self.expr()?;
+                                named_fields.push((fname, val));
+                            } else {
+                                args.push(self.expr()?);
+                            }
+                            if self.eat_punct(',') {
+                                continue;
+                            }
+                            self.expect_punct(')')?;
+                            break;
+                        }
+                    }
+                    if is_named {
+                        return Ok(Expr::RecordInit {
+                            name: word,
+                            fields: named_fields,
+                            line,
+                        });
+                    } else {
+                        return Ok(Expr::CallRoutine {
+                            name: word,
+                            args,
+                            line,
+                        });
+                    }
                 }
                 if self.is_bound(&word) {
                     return Ok(Expr::Name(word));

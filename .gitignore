@@ -196,6 +196,8 @@ npm/NOTICE
 /mav.parm
 /mav.tlog
 /mav.tlog.raw
+/eeprom.bin
+.sofuu/logs/
 
 # Python bytecode from the check scripts
 __pycache__/

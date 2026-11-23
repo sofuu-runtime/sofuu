@@ -274,6 +274,7 @@ pub fn command_name(cmd: u16) -> Option<&'static str> {
         mavlink::cmd::MISSION_START => "MAV_CMD_MISSION_START",
         mavlink::cmd::PARAM_SET => "PARAM_SET",
         mavlink::cmd::COMPONENT_ARM_DISARM => "MAV_CMD_COMPONENT_ARM_DISARM",
+        mavlink::cmd::SET_MESSAGE_INTERVAL => "MAV_CMD_SET_MESSAGE_INTERVAL",
         _ => return None,
     })
 }

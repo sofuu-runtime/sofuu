@@ -8,10 +8,12 @@ full vision or proof of support for every AI application. See
 
 This document describes the embedded Kaze source in Sofuu, not a published
 binary. The embedded engine reports language version **1.0**, writes bytecode
-format 2 (with statement line map), and reads formats 1, 2, and 4 (including
-format 4 modules from the standalone prototype). The standalone Kaze project
-also reports language version 1.0 and writes bytecode format 4. Both engines
-implement the unified Kaze 1.0 language contract across all 47 opcodes and 17
+format 2 (with statement line map), and reads formats 1, 2, and 4. The standalone
+project now writes format 5; the embedded reader has not been extended to it, so
+a format-5 artifact from the standalone engine is not readable here. The
+standalone project also reports language version 1.0 and writes bytecode
+format 5. Both engines
+implement the unified Kaze 1.0 language contract across all 49 opcodes and 17
 capabilities with 0 drift.
 The engine supports dual source syntaxes for the single language: human-oriented
 syntax (indentation-based) and machine-oriented syntax (prefix-tree S-expression

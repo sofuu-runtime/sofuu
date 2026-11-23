@@ -43,7 +43,7 @@ distributed through Swift Package Manager, CocoaPods, and Gradle:
 | Embed the runtime in an Android app | `implementation 'com.sofuu:sofuu-android:0.3.0'` |
 | Link the C ABI directly | release tarballs → `docs/EMBEDDING-DIST.md` |
 
-See https://sofuu.xyz/docs for the full picture.
+See https://docs.sofuu.xyz for the full picture.
 
 ## Project
 

@@ -222,11 +222,19 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                     val s = ordered.firstOrNull { it.id == sid }
                     val label = if (sid == null) "New chat" else (s?.labelOf(ordered.indexOf(s)) ?: "Chat")
                     // Active pill carries a soft card-tint wash under the film;
-                    // inactive pills are plain glass.
+                    // inactive pills are crisp white in light theme or glass in dark theme.
                     val pillSettings = if (active) {
-                        LocalSoapBubbleSettings.current.copy(tint = c.bgCardHover.toCssRgb(), opacity = 0.6f)
+                        if (c.dark) {
+                            LocalSoapBubbleSettings.current.copy(tint = c.bgCardHover.toCssRgb(), opacity = 0.6f)
+                        } else {
+                            LocalSoapBubbleSettings.current.copy(tint = c.bgCardHover.toCssRgb(), opacity = 0.85f)
+                        }
                     } else {
-                        LocalSoapBubbleSettings.current
+                        if (c.dark) {
+                            LocalSoapBubbleSettings.current
+                        } else {
+                            LocalSoapBubbleSettings.current.copy(tint = "#ffffffff", opacity = 0.85f)
+                        }
                     }
                     SoapBubbleSurface(
                         onClick = {
@@ -249,7 +257,7 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                                 label,
                                 fontSize = 13.sp,
                                 fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
-                                color = if (active) c.text else c.textMuted,
+                                color = if (active) c.text else (if (c.dark) c.textMuted else c.text),
                                 maxLines = 1,
                             )
                             if (active && sid != null) {
@@ -263,7 +271,7 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                                     Icon(
                                         Icons2.Close,
                                         "Delete chat",
-                                        tint = c.textFaint,
+                                        tint = if (c.dark) c.textFaint else c.textMuted,
                                         modifier = Modifier.size(24.dp).padding(5.dp),
                                     )
                                 }
@@ -358,11 +366,14 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
 @Composable
 private fun BarIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, description: String, onClick: () -> Unit) {
     val c = LocalSofuuColors.current
+    val s = LocalSoapBubbleSettings.current
+    val iconSettings = if (c.dark) s else s.copy(tint = "#ffffffff", opacity = 0.9f)
     SoapBubbleIconButton(
         icon = icon,
         contentDescription = description,
         onClick = onClick,
-        contentColor = c.textMuted,
+        settings = iconSettings,
+        contentColor = if (c.dark) c.textMuted else c.text,
         iconSize = 20.dp,
     )
 }
@@ -408,19 +419,25 @@ private fun HomePrompt(subtitle: String?, onPromptSelect: (String) -> Unit = {})
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             starters.forEach { (title, desc) ->
+                val cardSettings = if (c.dark) {
+                    LocalSoapBubbleSettings.current
+                } else {
+                    LocalSoapBubbleSettings.current.copy(tint = "#ffffffff", opacity = 0.92f)
+                }
                 SoapBubbleSurface(
                     onClick = { onPromptSelect(title) },
                     role = Role.Button,
                     radius = 12f,
+                    settings = cardSettings,
                     modifier = Modifier.fillMaxWidth(),
                     contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(Modifier.weight(1f)) {
                             Text(title, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text)
-                            Text(desc, fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                            Text(desc, fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = if (c.dark) c.textFaint else c.textMuted)
                         }
-                        Icon(Icons2.ChevronRight, null, tint = c.textFaint, modifier = Modifier.size(16.dp))
+                        Icon(Icons2.ChevronRight, null, tint = if (c.dark) c.textFaint else c.textMuted, modifier = Modifier.size(16.dp))
                     }
                 }
             }

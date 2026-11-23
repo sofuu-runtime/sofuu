@@ -1,0 +1,22 @@
+{
+  "name": "code-sentinel",
+  "version": "1.0.0",
+  "provider": "anthropic",
+  "model": "claude-3-5-sonnet-20241022",
+  "budget": {
+    "maxSteps": 15,
+    "maxDepth": 2,
+    "maxTokens": 100000,
+    "maxWallMs": 180000,
+    "verify": true
+  },
+  "audit": {
+    "severityFloor": "LOW",
+    "reportOutput": "./security-audit-report.md",
+    "maxFiles": 150
+  },
+  "memory": {
+    "enabled": true,
+    "scope": "agent"
+  }
+}

@@ -272,8 +272,14 @@ internal object SoapBubbleGl {
         filmTexture = uploadFilmTable()
         noiseTexture = uploadNoise()
         emptyTexture = uploadEmpty()
-        lightBackdrop = uploadBackdrop(0xFFFFFF, 0xFAF7F2)
-        darkBackdrop = uploadBackdrop(0x211D19, 0x262219)
+        lightBackdrop = uploadBackdrop(
+            android.graphics.Color.rgb(0xFF, 0xFF, 0xFF),
+            android.graphics.Color.rgb(0xFA, 0xF7, 0xF2),
+        )
+        darkBackdrop = uploadBackdrop(
+            android.graphics.Color.rgb(0x21, 0x1D, 0x19),
+            android.graphics.Color.rgb(0x26, 0x22, 0x19),
+        )
         if (!createAtlas(ATLAS_START)) return fail("atlas failed")
 
         GLES30.glDisable(GLES30.GL_DEPTH_TEST)

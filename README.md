@@ -9,8 +9,8 @@
 [![Binary Size](https://img.shields.io/badge/binary-%3C%2010%20MB-emerald.svg)](https://sofuu.xyz)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](https://sofuu.xyz/install)
 [![TypeScript](https://img.shields.io/badge/TypeScript-Native-blue.svg)](https://sofuu.xyz)
-[![MCP Native](https://img.shields.io/badge/MCP-Native-purple.svg)](https://sofuu.xyz/docs#plugins)
-[![Docs](https://img.shields.io/badge/docs-sofuu.xyz-blue.svg)](https://sofuu.xyz/docs)
+[![MCP Native](https://img.shields.io/badge/MCP-Native-purple.svg)](https://docs.sofuu.xyz/plugins/)
+[![Docs](https://img.shields.io/badge/docs-sofuu.xyz-blue.svg)](https://docs.sofuu.xyz/)
 [![X](https://img.shields.io/badge/follow-%40sofuu__runtime-black?logo=x&logoColor=white)](https://x.com/sofuu_runtime)
 
 > **Active development — iterating fast.** Open-source and MIT-licensed.
@@ -310,7 +310,7 @@ sofuu plugin list                           # View all registered plugins and br
 sofuu plugin serve weather --port=8765 --http # Export 5-shield plugin as Streamable HTTP MCP server
 ```
 
-Documentation: [sofuu.xyz/docs](https://sofuu.xyz/docs)
+Documentation: [docs.sofuu.xyz](https://docs.sofuu.xyz/)
 
 ---
 
@@ -559,5 +559,5 @@ The underlying [QTSQ](https://github.com/haruhito2666/qtsq) cognitive memory eng
 * **Author & Maintainer:** Built and maintained by **Haruhito**.
 * **Governance:** Kaze and Sofuu are maintained exclusively by the author. External pull requests are not accepted.
 * **Website:** [sofuu.xyz](https://sofuu.xyz)
-* **Documentation:** [sofuu.xyz/docs](https://sofuu.xyz/docs)
+* **Documentation:** [docs.sofuu.xyz](https://docs.sofuu.xyz/)
 * **X (Twitter):** [@sofuu_runtime](https://x.com/sofuu_runtime)

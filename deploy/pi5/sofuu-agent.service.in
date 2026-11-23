@@ -24,7 +24,7 @@
 
 [Unit]
 Description=Sofuu ambient device agent
-Documentation=https://sofuu.xyz/docs
+Documentation=https://docs.sofuu.xyz
 # Deliberately no network-online.target: the device must start offline.
 After=network.target
 

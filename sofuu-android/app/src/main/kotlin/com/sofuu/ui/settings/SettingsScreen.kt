@@ -9,7 +9,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -947,30 +949,29 @@ private fun EngineEnvCard(store: AppStore) {
 @Composable
 private fun ToggleRow(label: String, desc: String, checked: Boolean, onChange: (Boolean) -> Unit) {
     val c = LocalSofuuColors.current
-    SoapBubbleSurface(
-        onClick = { onChange(!checked) },
-        role = Role.Button,
-        radius = 8f,
-        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
-        contentPadding = PaddingValues(vertical = 4.dp, horizontal = 2.dp),
-    ) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Column(Modifier.weight(1f).padding(end = 12.dp)) {
-                Text(label, fontSize = 14.5.sp, fontWeight = FontWeight.Bold, color = c.text)
-                Text(desc, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(top = 2.dp))
-            }
-            // The bubble switch: flat track, thumb is a real lens.
-            SoapBubbleToggle(
-                checked = checked,
-                onCheckedChange = onChange,
-                color = c.accent,
-                scale = 0.85f,
-                contentDescription = label,
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 44.dp)
+            .clickable(
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = { onChange(!checked) },
             )
+            .padding(vertical = 4.dp, horizontal = 2.dp),
+    ) {
+        Column(Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(label, fontSize = 14.5.sp, fontWeight = FontWeight.Bold, color = c.text)
+            Text(desc, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(top = 2.dp))
         }
+        SoapBubbleToggle(
+            checked = checked,
+            onCheckedChange = onChange,
+            color = c.accent,
+            scale = 0.85f,
+            contentDescription = label,
+        )
     }
 }
 

@@ -65,7 +65,7 @@ data class SoapBubbleSettings(
     val dispersion: Float = 1f,
     val environment: String = "auto",
     val tilt: Float = 1f,
-    val wobble: Float = 0.4f,
+    val wobble: Float = 0f,
     val speed: Float = 1f,
     val paused: Boolean = false,
     val seed: Float = 7f,
@@ -142,7 +142,10 @@ data class SoapBubbleSettings(
             refraction = 0.15f,
             dispersion = 1f,
             bevel = 14f,
+            wobble = 0f,
             environment = "soft",
+            tint = "#ffffffff",
+            opacity = 0.9f,
         )
 
         private fun Float.clamp(min: Float, max: Float, fallback: Float): Float =

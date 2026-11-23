@@ -6,6 +6,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -45,6 +46,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -52,6 +54,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.FilterQuality
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -200,6 +203,7 @@ fun SoapBubbleSurface(
     fontSize: TextUnit = 16.sp,
     shadow: Boolean = false,
     fallback: Boolean = true,
+    outline: Boolean = true,
     hostSize: DpSize? = null,
     canvasSize: DpSize? = null,
     center: DpOffset? = null,
@@ -274,8 +278,17 @@ fun SoapBubbleSurface(
         }
     } else Modifier
 
+    val shape = remember(radius) {
+        if (radius >= 999f) CircleShape else RoundedCornerShape(radius.dp)
+    }
+    val borderModifier = if (outline && !colors.isDark) {
+        Modifier.border(1.dp, Color.White.copy(alpha = 0.95f), shape)
+    } else Modifier
+
     Box(
         modifier
+            .clip(shape)
+            .then(borderModifier)
             .then(if (shadow) Modifier else Modifier)
             .onGloballyPositioned { coords ->
                 val layoutW = coords.size.width.toFloat()
@@ -362,7 +375,10 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawSoapBubble(
     val h = size.height
     val corner = CornerRadius(min(radiusDp.dp.toPx(), min(w, h) / 2f))
     drawRoundRect(
-        brush = Brush.verticalGradient(listOf(colors.card, colors.cardShade)),
+        brush = Brush.verticalGradient(
+            if (colors.isDark) listOf(colors.card, colors.cardShade)
+            else listOf(Color.White, Color(0xFFFAF7F2))
+        ),
         size = Size(w, h),
         cornerRadius = corner,
     )
@@ -400,6 +416,7 @@ fun SoapBubbleButton(
     minHeight: Dp = 44.dp,
     fillWidth: Boolean = true,
     radius: Float = 9999f,
+    outline: Boolean = true,
     contentPadding: PaddingValues = PaddingValues(horizontal = 20.dp),
     content: @Composable RowScope.() -> Unit,
 ) {
@@ -412,6 +429,7 @@ fun SoapBubbleButton(
         onClick = onClick,
         role = Role.Button,
         fontSize = fontSize,
+        outline = outline,
     ) {
         CompositionLocalProvider(LocalContentColor provides contentColor) {
             Row(
@@ -449,6 +467,7 @@ fun SoapBubbleIconButton(
     settings: SoapBubbleSettings = LocalSoapBubbleSettings.current,
     contentColor: Color = SofuuBubble.colors.foreground,
     iconSize: Dp = 20.dp,
+    outline: Boolean = true,
 ) {
     SoapBubbleSurface(
         modifier = modifier.size(44.dp),
@@ -458,6 +477,7 @@ fun SoapBubbleIconButton(
         enabled = enabled,
         onClick = onClick,
         role = Role.Button,
+        outline = outline,
     ) {
         Box(Modifier.fillMaxWidth().height(44.dp), contentAlignment = Alignment.Center) {
             Icon(
@@ -484,83 +504,70 @@ fun SoapBubbleToggle(
     onCheckedChange: (Boolean) -> Unit,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
-    color: Color = Color(0xFF34C759),
+    color: Color = Color(0xFF2B6CB0),
     scale: Float = 1f,
     contentDescription: String? = null,
 ) {
-    val density = LocalDensity.current
     val reduced = rememberReducedMotion()
+    val isDark = SofuuBubble.colors.isDark
     val s = scale.coerceIn(0.5f, 12f)
-    val trackW = 64f * s
-    val trackH = 28f * s
-    val thumbW = 38f * s
-    val thumbH = 24f * s
-    val inset = (trackH - thumbH) / 2f
-    val travel = trackW - thumbW - inset * 2f
-    val target = if (checked) travel else 0f
-    val animated by androidx.compose.animation.core.animateFloatAsState(
+    val trackW = (48f * s).dp
+    val trackH = (26f * s).dp
+    val thumbSize = (20f * s).dp
+    val inset = (3f * s).dp
+    val travel = trackW - thumbSize - inset * 2
+    val target = if (checked) travel else 0.dp
+    val animatedOffset by androidx.compose.animation.core.animateDpAsState(
         targetValue = target,
         animationSpec = if (reduced) {
-            androidx.compose.animation.core.snap<Float>()
+            androidx.compose.animation.core.snap()
         } else {
-            androidx.compose.animation.core.spring<Float>(
+            androidx.compose.animation.core.spring(
                 dampingRatio = androidx.compose.animation.core.Spring.DampingRatioMediumBouncy,
                 stiffness = androidx.compose.animation.core.Spring.StiffnessMedium,
             )
         },
-        label = "soap-toggle-thumb",
+        label = "toggle-thumb-offset",
     )
-    val centerX = inset + animated + thumbW / 2f
-    val bleedDp = 16f
-    val trackColor = Color(0xFF787880).copy(alpha = 0.22f)
-    val layerPx = with(density) {
-        SoapBubbleLayer(
-            x = 0f,
-            y = 0f,
-            width = trackW.dp.toPx(),
-            height = trackH.dp.toPx(),
-            radius = (trackH / 2f).dp.toPx(),
-            fill = if (trackW > 0f) centerX / trackW else 0f,
-            track = trackColor.toCssRgb(),
-            from = color.toCssRgb(),
-        )
-    }
+    val animatedTrackColor by androidx.compose.animation.animateColorAsState(
+        targetValue = if (checked) color else (if (isDark) Color(0xFF3B352D) else Color(0xFFDDD8C8)),
+        animationSpec = androidx.compose.animation.core.tween(durationMillis = 200),
+        label = "toggle-track-color",
+    )
+
     Box(
-        modifier
-            .size(trackW.dp, trackH.dp)
+        modifier = modifier
+            .size(trackW, trackH)
+            .clip(CircleShape)
+            .background(animatedTrackColor)
+            .then(
+                if (!isDark) Modifier.border(1.dp, Color.White.copy(alpha = 0.85f), CircleShape)
+                else Modifier.border(1.dp, Color(0xFF4A4336), CircleShape)
+            )
+            .clickable(
+                enabled = enabled,
+                role = Role.Switch,
+                interactionSource = remember { MutableInteractionSource() },
+                indication = null,
+                onClick = { onCheckedChange(!checked) },
+            )
             .semantics {
                 contentDescription?.let { this.contentDescription = it }
                 stateDescription = if (checked) "On" else "Off"
             },
     ) {
-        if (!SoapBubbleGl.ready.value) {
-            Box(
-                Modifier
-                    .size(trackW.dp, trackH.dp)
-                    .clip(CircleShape)
-                    .background(if (checked) color else trackColor)
-            )
-            Box(
-                Modifier
-                    .offset(x = (inset + animated).dp, y = inset.dp)
-                    .size(thumbW.dp, thumbH.dp)
-                    .clip(CircleShape)
-                    .background(Color.White.copy(alpha = 0.85f))
-            )
-        }
-        SoapBubbleSurface(
-            modifier = Modifier.size(trackW.dp, trackH.dp),
-            radius = 9999f,
-            interactive = true,
-            enabled = enabled,
-            onClick = { onCheckedChange(!checked) },
-            role = Role.Switch,
-            hostSize = DpSize(thumbW.dp, thumbH.dp),
-            canvasSize = DpSize((trackW + bleedDp * 2f).dp, (trackH + bleedDp * 2f).dp),
-            center = DpOffset(centerX.dp, (trackH / 2f).dp),
-            layer = layerPx,
-            fallback = false,
-        ) {}
+        Box(
+            modifier = Modifier
+                .offset(x = inset + animatedOffset, y = inset)
+                .size(thumbSize)
+                .shadow(elevation = 2.dp, shape = CircleShape)
+                .clip(CircleShape)
+                .background(Color.White)
+                .then(
+                    if (!isDark) Modifier.border(0.5.dp, Color.White, CircleShape)
+                    else Modifier
+                )
+        )
     }
 }
 
@@ -661,6 +668,7 @@ fun SoapBubbleSlider(
                     }
                 },
             radius = 9999f,
+            outline = false,
             interactive = true,
             hostSize = DpSize(thumbW, thumbH),
             canvasSize = DpSize(

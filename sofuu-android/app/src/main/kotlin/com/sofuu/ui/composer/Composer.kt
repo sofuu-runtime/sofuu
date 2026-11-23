@@ -296,17 +296,22 @@ private fun IconAction(
 ) {
     val c = LocalSofuuColors.current
     val s = LocalSoapBubbleSettings.current
+    val actionSettings = if (active) {
+        s.copy(tint = c.accent.toCssRgb(), opacity = 0.3f)
+    } else {
+        if (c.dark) s else s.copy(tint = "#ffffffff", opacity = 0.92f)
+    }
     SoapBubbleSurface(
         onClick = onClick,
         role = Role.Button,
         radius = 999f,
-        settings = if (active) s.copy(tint = c.accent.toCssRgb(), opacity = 0.3f) else s,
+        settings = actionSettings,
         modifier = Modifier.size(40.dp),
     ) {
         Icon(
             icon,
             description,
-            tint = if (active) c.accent else c.textMuted,
+            tint = if (active) c.accent else (if (c.dark) c.textMuted else c.text),
             modifier = Modifier.size(40.dp).padding(10.dp),
         )
     }
@@ -341,9 +346,14 @@ private fun Pill(
     onClick: () -> Unit,
 ) {
     val c = LocalSofuuColors.current
+    val pillSettings = if (c.dark) {
+        LocalSoapBubbleSettings.current.copy(tint = c.bgCardHover.toCssRgb(), opacity = 0.85f)
+    } else {
+        LocalSoapBubbleSettings.current.copy(tint = "#ffffffff", opacity = 0.92f)
+    }
     SoapBubbleButton(
         onClick = onClick,
-        settings = LocalSoapBubbleSettings.current.copy(tint = c.bgCardHover.toCssRgb(), opacity = 0.85f),
+        settings = pillSettings,
         contentColor = c.text,
         fontSize = 13.sp,
         minHeight = 40.dp,
@@ -366,7 +376,7 @@ private fun Pill(
             modifier = if (flexibleLabel) Modifier.weight(1f, fill = false) else Modifier,
         )
         Spacer(Modifier.width(3.dp))
-        Icon(Icons2.Caret, null, tint = c.textFaint, modifier = Modifier.size(13.dp))
+        Icon(Icons2.Caret, null, tint = if (c.dark) c.textFaint else c.textMuted, modifier = Modifier.size(13.dp))
     }
 }
 

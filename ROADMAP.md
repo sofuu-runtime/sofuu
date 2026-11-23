@@ -100,7 +100,7 @@
 - [x] **KIVI & Paged KV-Cache**: Asymmetric 2-bit/4-bit quantization and zero-copy prefix reuse.
 
 #### 🌐 Ecosystem & Public Launch
-- [x] **Official Documentation & Website**: Live at [sofuu.xyz](https://sofuu.xyz) and [sofuu.xyz/docs](https://sofuu.xyz/docs).
+- [x] **Official Documentation & Website**: Live at [sofuu.xyz](https://sofuu.xyz) and [docs.sofuu.xyz](https://docs.sofuu.xyz/).
 - [x] **Official AI Coding Skill**: Machine-readable agent guide deployed at [sofuu.xyz/SKILL.md](https://sofuu.xyz/SKILL.md).
 - [x] **Multi-Provider BYOK Streaming**: Unified streaming for OpenAI, Anthropic, Gemini, Groq, and custom endpoints.
 

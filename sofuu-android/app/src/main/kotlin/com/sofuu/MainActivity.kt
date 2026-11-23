@@ -51,12 +51,15 @@ import java.io.File
 private val ClearLight = SoapBubbleSettings.lightPreset.copy(
     iridescence = 0f,
     dispersion = 0f,
-    wobble = 0.15f,
+    wobble = 0f,
+    bottomShade = false,
+    tint = "#ffffffff",
+    opacity = 0.9f,
 )
 private val ClearDark = SoapBubbleSettings().copy(
     iridescence = 0f,
     dispersion = 0f,
-    wobble = 0.15f,
+    wobble = 0f,
     dark = true,
 )
 

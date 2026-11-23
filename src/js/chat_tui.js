@@ -202,6 +202,7 @@
   let mcpConnected = 0;
   let mcpFailed = 0;
   let mcpConnecting = null; /* in-flight connect promise (dedupe) */
+  let mcpAttempted = false; /* whether lazy connect has been tried this session */
   let warnedShadowed = {}; /* dedupe shadowed tool warnings per session/reload */
   function mcpServersList() {
     try { return JSON.parse(__chat_mcpservers() || '[]'); } catch (e) { return []; }
@@ -211,7 +212,12 @@
     const list = mcpServersList();
     if (!list.length) return;
     if (!sofuu.mcp || !sofuu.mcp.connect) { out('\x1b[33m  ⚠ sofuu.mcp unavailable — tools off\x1b[0m'); return; }
+    mcpAttempted = true;
     mcpConnecting = (async () => {
+      let thisConnected = 0;
+      let thisFailed = 0;
+      const newClients = [];
+      const newTools = [];
       const results = await Promise.allSettled(list.map(async (srv) => {
         const spec = (srv.args && srv.args.length) ? { command: srv.command, args: srv.args } : srv.command;
         const connectTask = async () => {
@@ -227,16 +233,20 @@
       }));
       for (const r of results) {
         if (r.status === 'fulfilled' && r.value) {
-          mcpClients.push({ name: r.value.name, client: r.value.client });
+          newClients.push({ name: r.value.name, client: r.value.client });
           for (const t of (r.value.tools || [])) {
-            mcpTools.push({ server: r.value.name, name: t.name,
+            newTools.push({ server: r.value.name, name: t.name,
                             description: t.description || '', schema: t.inputSchema });
           }
-          mcpConnected++;
+          thisConnected++;
         } else {
-          mcpFailed++;
+          thisFailed++;
         }
       }
+      mcpClients = newClients;
+      mcpTools = newTools;
+      mcpConnected = thisConnected;
+      mcpFailed = thisFailed;
       if (mcpConnected > 0) {
         out('\x1b[90m  ⏺ mcp: ' + mcpConnected + ' server' + (mcpConnected === 1 ? '' : 's') + ' · ' + mcpTools.length + ' tools\x1b[0m');
         if (mcpFailed > 0) out('\x1b[90m  ⚠ ' + mcpFailed + ' MCP server' + (mcpFailed === 1 ? '' : 's') + ' unreachable (see ~/.sofuu/mcp.json)\x1b[0m');
@@ -251,6 +261,10 @@
     }
   }
   function showTools() {
+    if (cfg.tools === false) {
+      out('\n\x1b[90m  Tools are currently toggled OFF (/tools on to enable).\x1b[0m\n');
+      return;
+    }
     let hasAny = false;
     const pKeys = (sofuu.plugins && sofuu.plugins.TOOLS) ? Object.keys(sofuu.plugins.TOOLS) : [];
     if (pKeys.length > 0) {
@@ -371,6 +385,7 @@
     };
   }
   function chatMcpToolDefs(isTight) {
+    if (cfg.tools === false || cfg.permissions === 'plan') return [];
     const defs = [];
     const names = {};
     for (const t of mcpTools) {
@@ -473,6 +488,7 @@
    * execute closures route through the fixed callMcpTool. Inline/builtin
    * tools win on a name clash (A6 namespace rule) with a visible warn. */
   function chatToolDefs() {
+    if (cfg.tools === false || cfg.permissions === 'plan') return [];
     const defs = [];
     const names = {};
     if (sofuu.web && sofuu.web.TOOLS) {
@@ -1817,13 +1833,13 @@
      * An explicit value keeps the caller's number. */
     const capsL = modelCaps() || {};
     const explicit = c.ctx_window_explicit === true;
-    let win = c.ctx_window > 0 ? c.ctx_window
+    let win = (explicit && c.ctx_window > 0) ? c.ctx_window
       : (capsL.ctxWindow > 0 ? capsL.ctxWindow
-      : ({ openai: 128000, anthropic: 128000, local: 32768 }[c.provider] || 32768));
-    if (!explicit && capsL.ctxWindow > 0 && win > capsL.ctxWindow) win = capsL.ctxWindow;
-    let mx = c.max_output > 0 ? c.max_output
-      : (capsL.maxOutput > 0 ? capsL.maxOutput : 0);
-    if (capsL.maxOutput > 0 && mx > capsL.maxOutput) mx = capsL.maxOutput;
+      : (c.ctx_window > 0 ? c.ctx_window
+      : ({ openai: 128000, anthropic: 128000, local: 32768 }[c.provider] || 32768)));
+    let mx = (explicit && c.max_output > 0) ? c.max_output
+      : (capsL.maxOutput > 0 ? capsL.maxOutput
+      : (c.max_output > 0 ? c.max_output : 0));
     return { window: win, maxOutput: mx, known: !!(capsL.known), source: 'legacy',
              clampedConfig: false, thinking: (capsL.thinking || 'unknown') };
   }
@@ -3453,8 +3469,9 @@
     if (TTY) out('\x1b[' + T('accent') + 'm  ⏺ you\x1b[0m \x1b[2m·\x1b[0m ' + typed);
     CURRENT_PHASE = 'Thinking';
     startPhase();
-    /* MCP is lazy: connect on demand only when a tool-using turn starts. */
-    if (mcpTools.length === 0 && mcpServersList().length > 0) {
+    /* MCP is lazy: connect on demand only when tools are active and not yet attempted. */
+    const isToolsOff = cfg.tools === false || cfg.permissions === 'plan';
+    if (!isToolsOff && !mcpAttempted && mcpTools.length === 0 && mcpServersList().length > 0) {
       await connectMcpServers();
     }
     /* Sub-agents (PLAN-AGENTS A8.3): definitions from ~/.sofuu/agents/*.js
@@ -3519,21 +3536,22 @@
     /* Preflight history budget check to ensure context stays within model limits. */
     await trimHistory();
     let noThink = (c.no_think_models || []).indexOf(c.model) >= 0 || (c.effort === 'off') || (resolveCaps().thinking === 'none');
-    /* Local inference engines (ollama, llama.cpp) get the same lean shape as
-     * the in-process local provider: no coding preset, no tool defs, a short
-     * system prompt, so a CPU-bound model is not buried in prompt tokens. */
+    /* Local engines or small-window models (<64k) get a lean shape:
+     * no coding preset, short system prompt, so token overhead does not exhaust budgets. */
     const isLocal = c.provider === 'local' || c.provider === 'ollama' || c.provider === 'llamacpp';
-    const localTools = isLocal ? (mcpTools.length ? chatMcpToolDefs(true) : []) : chatToolDefs();
-    const localSys = isLocal
+    const isSmallWindow = resolveCaps().window > 0 && resolveCaps().window < 65536;
+    const isLean = isLocal || isToolsOff || isSmallWindow;
+    const localTools = isToolsOff ? [] : (isLean ? (mcpTools.length ? chatMcpToolDefs(true) : []) : chatToolDefs());
+    const localSys = isLean
       ? (localTools.length
           ? 'You are a helpful AI assistant. When tools are provided, you MUST execute the appropriate tool call to fulfill the user request. Do not describe or list the tools — call them directly.'
           : 'You are a helpful AI assistant.')
       : sofuu.agent.CORE_PROMPT;
     const def = {
       name: 'chat',
-      preset: isLocal ? undefined : 'coding',
-      /* P1: the byte-stable shared core prompt. For local models, keep
-       * it lean so CPU prefill latency matches direct `sofuu infer`. */
+      preset: isLean ? undefined : 'coding',
+      /* P1: the byte-stable shared core prompt. For lean models, keep
+       * it lean so token overhead does not exhaust small context budgets. */
       system: localSys,
       tools: localTools,
       agents: (isLocal || !subAgentNames.length) ? undefined : subAgentNames,
@@ -4756,10 +4774,19 @@
     const mc = modelCaps();
     const eff = resolveCaps().window;
     const presets = [
-      { id: '0', label: 'default', note: (mc ? 'model default (' + fmtTk(mc.ctxWindow) + ')' : 'provider default (' + fmtTk(eff) + ')') },
-      { id: '32768', label: '32k', note: '32,768 tokens' },
-      { id: '131072', label: '128k', note: '131,072 tokens' },
-      { id: '1048576', label: '1M', note: '1,048,576 tokens' },
+      { id: '0', label: 'default', note: (mc && mc.ctxWindow > 0 ? 'model default (' + fmtTk(mc.ctxWindow) + ')' : 'provider default (' + fmtTk(eff) + ')') },
+      { id: '8192', label: '8k', note: '8,192 tokens (small local / embedded)' },
+      { id: '16384', label: '16k', note: '16,384 tokens' },
+      { id: '32768', label: '32k', note: '32,768 tokens (legacy default)' },
+      { id: '65536', label: '64k', note: '65,536 tokens' },
+      { id: '131072', label: '128k', note: '131,072 tokens (GPT-4o, Llama 3.1)' },
+      { id: '200000', label: '200k', note: '200,000 tokens (Claude 3.5/4, o1, o3)' },
+      { id: '262144', label: '256k', note: '262,144 tokens (DeepSeek V3, GLM, Kimi)' },
+      { id: '400000', label: '400k', note: '400,000 tokens (GPT-5 generation)' },
+      { id: '524288', label: '512k', note: '524,288 tokens' },
+      { id: '1048576', label: '1M', note: '1,048,576 tokens (Gemini, Claude 5, DeepSeek V4)' },
+      { id: '2097152', label: '2M', note: '2,097,152 tokens (Gemini Pro, Grok 4)' },
+      { id: 'custom', label: 'custom...', note: 'enter any token count (e.g. 64k, 256k, 1m)' },
     ];
     const it = await selectMenu({
       title: 'Context window',
@@ -4769,7 +4796,13 @@
       currentId: String(cfg.ctx_window || 0),
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
-    __chat_slash('/ctx ' + it.id);
+    if (it.id === 'custom') {
+      const raw = await __readline('  Context window in tokens (e.g. 64k, 256k, 1m, 1000000, or "default"): ');
+      if (!raw || !raw.trim()) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
+      __chat_slash('/ctx ' + raw.trim());
+    } else {
+      __chat_slash('/ctx ' + it.id);
+    }
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     refreshStatus('');
     maybeRefreshPanel();
@@ -4781,9 +4814,14 @@
           ? "model's max output (" + fmtTk(mc.maxOutput) + ')'
           : 'provider default' },
       { id: '4096', label: '4k', note: '4,096 tokens' },
+      { id: '8192', label: '8k', note: '8,192 tokens' },
+      { id: '16384', label: '16k', note: '16,384 tokens' },
       { id: '32768', label: '32k', note: '32,768 tokens' },
+      { id: '65536', label: '64k', note: '65,536 tokens' },
       { id: '131072', label: '128k', note: '131,072 tokens' },
+      { id: '262144', label: '256k', note: '262,144 tokens' },
       { id: '384000', label: '384k', note: '384,000 tokens (max)' },
+      { id: 'custom', label: 'custom...', note: 'enter any token count' },
     ];
     const it = await selectMenu({
       title: 'Max output tokens',
@@ -4793,7 +4831,13 @@
       currentId: String(cfg.max_output || 0),
     });
     if (!it) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
-    __chat_slash('/maxout ' + it.id);
+    if (it.id === 'custom') {
+      const raw = await __readline('  Max output tokens (e.g. 8k, 64k, 128k, or "default"): ');
+      if (!raw || !raw.trim()) { outLast('\x1b[90m  (unchanged)\x1b[0m'); return; }
+      __chat_slash('/maxout ' + raw.trim());
+    } else {
+      __chat_slash('/maxout ' + it.id);
+    }
     try { cfg = JSON.parse(__chat_getcfg()); } catch (e) { /* a config that will not parse leaves the previous one in place; every caller reads cfg from the last good load */ }
     refreshStatus('');
     maybeRefreshPanel();
@@ -5067,7 +5111,21 @@
           out('\x1b[90m  ✓ session cleared\x1b[0m\n');
         }
         else if (r === 'compact') { await compact(); }
-        else if (r === 'tools') { await connectMcpServers(); showTools(); }
+        else if (r === 'tools') {
+          if (cfg.tools !== false && !mcpAttempted) { await connectMcpServers(); }
+          showTools();
+        }
+        else if (r === 'tools_on') {
+          cfg.tools = true;
+          mcpAttempted = false;
+          out('\x1b[90m  ✓ tools enabled\x1b[0m\n');
+          await connectMcpServers();
+          showTools();
+        }
+        else if (r === 'tools_off') {
+          cfg.tools = false;
+          out('\x1b[90m  ✓ tools disabled — conversational mode (0 tool tokens injected)\x1b[0m\n');
+        }
         else if (r === 'plugins') { await handlePluginsCmd(); }
         else if (r === 'agents') { await handleAgentsCmd(); }
         else if (r === 'scouter' || r === 'health') { showScouterDiagnostics(); }

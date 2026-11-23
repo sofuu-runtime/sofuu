@@ -4158,9 +4158,8 @@
             if (chunk.text) { forwarded = true; parts.push(chunk.text); if (onText && !isCont) onText(chunk.text); }
           }
           var add = parts.text();
-          if (!add.trim() && thinkParts.length()) {
-            add = thinkParts.text().trim();
-          }
+          /* Note: internal reasoning (thinkParts) is strictly observational and HUD-routed;
+           * it must NEVER be substituted as the user-facing answer when parts.text() is empty. */
           if (isCont) {
             add = trimOverlap(acc, add);
             if (onText && add) onText(add);

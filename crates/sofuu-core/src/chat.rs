@@ -467,19 +467,19 @@ impl ChatConfig {
             }
         }
         if !cfg.ctx_window_explicit && !cfg.model.is_empty() {
-            let is_gguf = cfg.model.ends_with(".gguf")
-                || sofuu_core::infer::clean_model_path(&cfg.model).extension().map_or(false, |e| e == "gguf");
-            if is_gguf {
-                let caps = sofuu_core::rt::model_caps::lookup(Some(&cfg.model));
-                if caps.ctx_window > 0 {
-                    cfg.ctx_window = caps.ctx_window as i64;
-                }
-                if caps.max_output > 0 {
-                    cfg.max_output = caps.max_output as i64;
-                }
-                if caps.thinking != sofuu_core::rt::model_caps::Thinking::None && (cfg.effort == "off" || cfg.effort.is_empty()) {
-                    cfg.effort = "high".into();
-                }
+            let caps = sofuu_core::rt::model_caps::lookup(Some(&cfg.model));
+            if caps.ctx_window > 0 {
+                cfg.ctx_window = caps.ctx_window as i64;
+            } else {
+                cfg.ctx_window = 0;
+            }
+            if caps.max_output > 0 {
+                cfg.max_output = caps.max_output as i64;
+            } else {
+                cfg.max_output = 0;
+            }
+            if caps.thinking != sofuu_core::rt::model_caps::Thinking::None && (cfg.effort == "off" || cfg.effort.is_empty()) {
+                cfg.effort = "high".into();
             }
         }
         cfg
@@ -780,7 +780,7 @@ const COMMAND_INFO: &[(&str, &str, &str)] = &[
     ("/ctx", "View/set the context window in tokens", "<tokens> | default  (default = model's real window, max 4M)"),
     ("/maxout", "View/set max output tokens per response", "<tokens> | default  (default = model's real max output, cap 384k)"),
     ("/outputs", "Inspect timestamped model/tool output history", "[list|show <id>|search <text>|context <task>|stats|rebuild-index|prune|on|off]"),
-    ("/tools", "List connected MCP servers + tools", ""),
+    ("/tools", "List connected MCP servers + tools, or toggle", "[on|off]"),
     ("/plugins", "List installed plugins and their circuit status", ""),
     ("/agents", "List agent definitions (+ ~/.sofuu/agents/*.js)", ""),
     ("/sessions", "Browse sessions on this project", "[id]  (bare = picker · ↑↓ + Enter resumes)"),
@@ -1057,6 +1057,23 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                 }
                 if caps.max_output > 0 {
                     cfg.max_output = caps.max_output as i64;
+                }
+                if caps.thinking != sofuu_core::rt::model_caps::Thinking::None {
+                    cfg.effort = "high".to_string();
+                } else {
+                    cfg.effort = "off".to_string();
+                }
+            } else if !cfg.ctx_window_explicit {
+                let caps = sofuu_core::rt::model_caps::lookup(Some(&picked));
+                if caps.ctx_window > 0 {
+                    cfg.ctx_window = caps.ctx_window as i64;
+                } else {
+                    cfg.ctx_window = 0;
+                }
+                if caps.max_output > 0 {
+                    cfg.max_output = caps.max_output as i64;
+                } else {
+                    cfg.max_output = 0;
                 }
                 if caps.thinking != sofuu_core::rt::model_caps::Thinking::None {
                     cfg.effort = "high".to_string();
@@ -1349,7 +1366,11 @@ fn handle_slash(cfg: &mut ChatConfig, cmd: &str) -> &'static str {
                 _ => "outputs",
             }
         }
-        "/tools" => "tools",
+        "/tools" => match arg {
+            "on" => "tools_on",
+            "off" => "tools_off",
+            _ => "tools",
+        },
         "/plugins" => "plugins",
         "/agents" => "agents",
         "/scouter" | "/health" => "scouter",
@@ -1617,7 +1638,7 @@ fn print_help() {
         Row::Cmd("/theme [name]", "switch the TUI color theme (13 dark-blend)"),
         Row::Cmd("/ctx [<tokens>]", "view/set the context window (max 4M)"),
         Row::Cmd("/maxout [<tokens>]", "view/set max output tokens (max 384k)"),
-        Row::Cmd("/tools", "list connected MCP servers + their tools"),
+        Row::Cmd("/tools [on|off]", "list connected tools or toggle tool injection"),
         Row::Cmd("/plugins", "list installed plugins (~/.sofuu/plugins)"),
         Row::Cmd("/agents", "list agent definitions (~/.sofuu/agents/*.js)"),
         Row::Cmd("/scouter", "real-time context & brain health diagnostics"),

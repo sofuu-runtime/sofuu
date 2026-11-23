@@ -76,58 +76,389 @@ static TABLE: &[(&str, i32, i32, Thinking)] = &[
      * `Budget` = an extended-thinking budget ceiling — builders on the
      * other wire translate defensively (e.g. claude over the OpenAI
      * endpoint passes effort levels through; gateways map them). */
-    // GPT-5 generation: huge windows, discrete effort ladder (no "max").
+
+    /* ── OpenAI family ── */
+    // GPT-6 generation (Astra, Sol, Terra, Luna): ~1.05M context, 128k output, effort reasoning
+    ("gpt-6", 1_050_000, 128_000, Thinking::Effort(GPT5_EFFORTS)),
+    // GPT-5.4+ generation (GPT-5.4, GPT-5.5, GPT-5.6 Sol/Terra/Luna): ~1.05M context, 128k output
+    ("gpt-5.6", 1_050_000, 128_000, Thinking::Effort(GPT5_EFFORTS)),
+    ("gpt-5.5", 1_050_000, 128_000, Thinking::Effort(GPT5_EFFORTS)),
+    ("gpt-5.4", 1_050_000, 128_000, Thinking::Effort(GPT5_EFFORTS)),
+    // GPT-5 core generation (GPT-5, 5.1, 5.2, 5.3, mini, nano, pro, codex): 400k context, 128k output
     ("gpt-5", 400_000, 128_000, Thinking::Effort(GPT5_EFFORTS)),
     ("gpt-4.1", 1_000_000, 32_768, Thinking::None),
     ("gpt-4o", 128_000, 16_384, Thinking::None),
     ("chatgpt-4o", 128_000, 16_384, Thinking::None),
     ("gpt-4-turbo", 128_000, 4_096, Thinking::None),
     ("gpt-4", 8_192, 8_192, Thinking::None),
+    ("gpt-3.5-turbo-16k", 16_384, 4_096, Thinking::None),
+    ("gpt-3.5", 4_096, 4_096, Thinking::None),
+    ("gpt-audio", 128_000, 16_384, Thinking::None),
+    ("gpt-oss", 131_072, 117_964, Thinking::Effort(O_EFFORTS)),
+    ("gpt", 1_000_000, 128_000, Thinking::Effort(GPT5_EFFORTS)),
     // o-series reasoners: effort ladder without "minimal"/"max".
+    ("o3-pro", 200_000, 100_000, Thinking::Effort(O_EFFORTS)),
     ("o3", 200_000, 100_000, Thinking::Effort(O_EFFORTS)),
     ("o4-mini", 200_000, 100_000, Thinking::Effort(O_EFFORTS)),
     ("o1", 200_000, 100_000, Thinking::Effort(O_EFFORTS)),
-    /* ── Other openai-compatible families ──────────────────────────── */
-    // DeepSeek thinks via <think> tags in the text (stripped client-side),
-    // not via an API parameter — modeled as Thinking::None here.
-    // V4 generation (V4-Flash / V4.1-Flash): 1M context, 128k output tier
-    // (providers tier higher — up to ~384k; the per-endpoint ladder
-    // (discovered/learned) refines this guess). MUST precede the V3-era
-    // row: first match wins, and the bare prefix would swallow V4 names
-    // into 64k (2026-10-09: footer read 65.5k on a 1M model).
-    ("deepseek-v4", 1_048_576, 131_072, Thinking::None),
-    ("deepseek", 65_536, 8_192, Thinking::None),
-    // Kimi K2.5/K2.6: 256K per Moonshot (HF card + vendor docs) — NOT 1M
-    // (that figure is Kimi K3). Max outputs are provider-tiered; these
-    // conservative tier values defer to discovered/learned evidence.
-    ("kimi-k2.6", 262_144, 32_768, Thinking::None),
-    ("kimi-k2.5", 262_144, 32_768, Thinking::None),
-    ("kimi-k3", 1_048_576, 131_072, Thinking::None),
-    ("qwen3", 131_072, 32_768, Thinking::None),
-    ("qwen", 32_768, 8_192, Thinking::None),
-    ("llama4", 1_000_000, 8_192, Thinking::None),
-    ("llama3.1", 131_072, 4_096, Thinking::None),
-    ("llama3", 8_192, 4_096, Thinking::None),
-    ("llama", 4_096, 2_048, Thinking::None),
-    ("mistral", 32_768, 8_192, Thinking::None),
-    ("mixtral", 32_768, 8_192, Thinking::None),
-    // Grok-4 reasons internally; there is no client-side effort knob.
-    ("grok-4", 256_000, 32_768, Thinking::None),
-    ("grok", 131_072, 8_192, Thinking::None),
-    /* ── Claude family (named for the /v1/messages origin; any endpoint
-     * may serve them — caps stay name-keyed) ───────────────────────── */
+
+    /* ── Claude family ── */
+    // 5th-gen+ (Haiku 5.5, Sonnet 5.5, Opus 5.5, Fable 5.x): 1M context, adaptive thinking up to 128k output
+    ("claude-haiku-5", 1_000_000, 128_000, Thinking::Budget(128_000)),
+    ("claude-sonnet-5", 1_000_000, 128_000, Thinking::Budget(128_000)),
+    ("claude-opus-5", 1_000_000, 128_000, Thinking::Budget(128_000)),
+    ("claude-fable-5", 1_000_000, 128_000, Thinking::Budget(128_000)),
+    ("claude-fable", 1_000_000, 128_000, Thinking::Budget(128_000)),
+    ("claude-haiku-latest", 1_000_000, 128_000, Thinking::Budget(128_000)),
+    ("claude-sonnet-latest", 1_000_000, 128_000, Thinking::Budget(128_000)),
+    ("claude-opus-latest", 1_000_000, 128_000, Thinking::Budget(128_000)),
+    ("claude-5", 1_000_000, 128_000, Thinking::Budget(128_000)),
     // 4th-gen+ extended thinking: budget_tokens only needs to stay below
     // max_tokens, so the practical ceiling IS the output cap. Sofuu sends
     // max_output as max_tokens, which unlocks real 64k thinking budgets.
     ("claude-opus-4", 200_000, 32_000, Thinking::Budget(32_000)),
     ("claude-sonnet-4", 200_000, 64_000, Thinking::Budget(64_000)),
     ("claude-haiku-4", 200_000, 64_000, Thinking::Budget(64_000)),
+    ("claude-4", 200_000, 64_000, Thinking::Budget(64_000)),
     // 3-7 introduced extended thinking.
     ("claude-3-7", 200_000, 64_000, Thinking::Budget(64_000)),
     ("claude-3-5", 200_000, 8_192, Thinking::None),
     ("claude-3", 200_000, 4_096, Thinking::None),
     ("claude-2", 100_000, 4_096, Thinking::None),
     ("claude", 200_000, 8_192, Thinking::None),
+
+    /* ── Google Gemini, Gemma & Lyria ── */
+    // Gemini 4 generation (Argon, Carbon, Hydrogen, Neon): 1M context, huge output ceiling
+    ("gemini-4", 1_048_576, 943_718, Thinking::Budget(128_000)),
+    // Gemini 3.x generation (3.0, 3.1, 3.5, 3.6, 3.7, 3.8 Flash, Flash-Lite, Pro): 1M context, 64k output
+    ("gemini-3", 1_048_576, 65_536, Thinking::Budget(65_536)),
+    // Gemini 2.5 / 2.0 / 1.5
+    ("gemini-2.5", 1_048_576, 65_536, Thinking::None),
+    ("gemini-2.0", 1_048_576, 8_192, Thinking::None),
+    ("gemini-1.5", 1_048_576, 8_192, Thinking::None),
+    ("gemini-nano", 65_536, 58_982, Thinking::None),
+    ("gemini", 1_048_576, 65_536, Thinking::None),
+    // Gemma
+    ("gemma-4", 262_144, 32_768, Thinking::None),
+    ("gemma-3", 131_072, 16_384, Thinking::None),
+    ("gemma-2", 8_192, 2_048, Thinking::None),
+    ("gemma", 8_192, 2_048, Thinking::None),
+    // Lyria
+    ("lyria-3", 1_048_576, 65_536, Thinking::None),
+    ("lyria", 1_048_576, 65_536, Thinking::None),
+
+    /* ── DeepSeek ── */
+    // V4 generation (V4-Flash / V4.1-Flash / V4-Pro): 1M context, up to ~393k output
+    ("deepseek-v4", 1_048_576, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("deepseek-v3", 163_840, 147_456, Thinking::None),
+    ("deepseek-r1", 163_840, 32_000, Thinking::Effort(O_EFFORTS)),
+    ("deepseek-flash", 1_048_576, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("deepseek-pro", 1_048_576, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("deepseek-chat", 65_536, 8_192, Thinking::None),
+    ("deepseek", 65_536, 8_192, Thinking::None),
+
+    /* ── Qwen (Alibaba) ── */
+    ("qwen4", 1_000_000, 131_072, Thinking::None),
+    ("qwen3.8", 1_000_000, 131_072, Thinking::None),
+    ("qwen3.7", 1_000_000, 131_072, Thinking::None),
+    ("qwen3.6", 1_000_000, 65_536, Thinking::None),
+    ("qwen3.5", 1_000_000, 65_536, Thinking::None),
+    ("qwen3-coder-flash", 1_000_000, 65_536, Thinking::None),
+    ("qwen3-coder", 262_144, 65_536, Thinking::None),
+    ("qwen3-vl", 262_144, 32_768, Thinking::None),
+    ("qwen3", 131_072, 32_768, Thinking::None),
+    ("qwq", 131_072, 32_768, Thinking::Effort(O_EFFORTS)),
+    ("qwen-2.5-coder", 128_000, 29_491, Thinking::None),
+    ("qwen-2.5", 128_000, 16_384, Thinking::None),
+    ("qwen", 32_768, 8_192, Thinking::None),
+
+    /* ── Zhipu GLM ── */
+    ("glm-5.3", 1_048_576, 131_072, Thinking::None),
+    ("glm-5.2", 1_048_576, 943_718, Thinking::None),
+    ("glm-5", 204_800, 131_072, Thinking::None),
+    ("glm-4.7", 200_000, 117_964, Thinking::None),
+    ("glm-4.6", 204_800, 131_072, Thinking::None),
+    ("glm-4.5", 131_072, 98_304, Thinking::None),
+    ("glm-4", 131_072, 32_768, Thinking::None),
+    ("glm", 131_072, 32_768, Thinking::None),
+
+    /* ── Moonshot Kimi ── */
+    ("kimi-k3", 1_048_576, 943_718, Thinking::None),
+    ("kimi-k2.7", 262_144, 235_929, Thinking::None),
+    ("kimi-k2.6", 262_144, 235_929, Thinking::None),
+    ("kimi-k2.5", 262_144, 235_929, Thinking::None),
+    ("kimi-k2", 131_072, 98_304, Thinking::None),
+    ("kimi", 262_144, 131_072, Thinking::None),
+
+    /* ── MiniMax ── */
+    ("minimax-m3", 1_048_576, 512_000, Thinking::None),
+    ("minimax-m2.7", 196_608, 131_072, Thinking::None),
+    ("minimax-m2.5", 198_000, 32_768, Thinking::None),
+    ("minimax", 196_608, 131_072, Thinking::None),
+
+    /* ── xAI Grok ── */
+    ("grok-4.7", 500_000, 450_000, Thinking::None),
+    ("grok-4.6", 500_000, 450_000, Thinking::None),
+    ("grok-4.5", 500_000, 450_000, Thinking::None),
+    ("grok-4.3", 1_000_000, 900_000, Thinking::None),
+    ("grok-4.2", 2_000_000, 1_800_000, Thinking::None),
+    ("grok-4", 500_000, 65_536, Thinking::None),
+    ("grok", 131_072, 8_192, Thinking::None),
+
+    /* ── Mistral ── */
+    ("mistral-large-4", 1_048_576, 262_144, Thinking::None),
+    ("mistral-large-25", 262_144, 209_715, Thinking::None),
+    ("mistral-large", 131_072, 104_857, Thinking::None),
+    ("mistral-medium-3", 262_144, 209_715, Thinking::None),
+    ("mistral-small-26", 262_144, 209_715, Thinking::None),
+    ("mistral-small-3", 256_000, 16_384, Thinking::None),
+    ("devstral", 262_144, 209_715, Thinking::None),
+    ("codestral", 256_000, 204_800, Thinking::None),
+    ("pixtral-large", 128_000, 102_400, Thinking::None),
+    ("pixtral-12b", 128_000, 8_192, Thinking::None),
+    ("pixtral", 128_000, 32_768, Thinking::None),
+    ("voxtral-small", 32_768, 26_214, Thinking::Effort(O_EFFORTS)),
+    ("voxtral", 32_768, 26_214, Thinking::Effort(O_EFFORTS)),
+    ("mistral-nemo", 131_072, 16_384, Thinking::None),
+    ("ministral", 262_144, 209_715, Thinking::None),
+    ("mixtral-8x22b", 65_536, 52_428, Thinking::None),
+    ("mixtral", 32_768, 8_192, Thinking::None),
+    ("mistral", 32_768, 8_192, Thinking::None),
+
+    /* ── Meta Llama & Muse ── */
+    ("llama-4", 1_000_000, 32_768, Thinking::None),
+    ("llama4", 1_000_000, 32_768, Thinking::None),
+    ("llama-3.3", 131_072, 115_200, Thinking::None),
+    ("llama3.3", 131_072, 115_200, Thinking::None),
+    ("llama-3.2", 131_072, 117_964, Thinking::None),
+    ("llama3.2", 131_072, 117_964, Thinking::None),
+    ("llama-3.1", 131_072, 16_384, Thinking::None),
+    ("llama3.1", 131_072, 16_384, Thinking::None),
+    ("llama-3", 8_192, 4_096, Thinking::None),
+    ("llama3", 8_192, 4_096, Thinking::None),
+    ("llama", 4_096, 2_048, Thinking::None),
+    ("muse", 1_048_576, 943_718, Thinking::Budget(128_000)),
+    ("ember", 1_048_576, 943_718, Thinking::Effort(O_EFFORTS)),
+
+    /* ── Inclusion Ling & Recursive Flint ── */
+    ("ling-3.2", 1_048_576, 262_144, Thinking::None),
+    ("ling-3.1", 1_000_000, 262_144, Thinking::None),
+    ("ling-3", 262_144, 32_768, Thinking::None),
+    ("flint-v1", 262_144, 235_929, Thinking::None),
+
+    /* ── Xiaomi Mimo ── */
+    ("mimo-v2.6", 1_048_576, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("mimo-v2.5", 1_000_000, 65_536, Thinking::Effort(O_EFFORTS)),
+    ("mimo", 1_000_000, 65_536, Thinking::Effort(O_EFFORTS)),
+
+    /* ── Aion Labs ── */
+    ("aion-3.5", 262_144, 32_768, Thinking::Effort(O_EFFORTS)),
+    ("aion-3", 131_072, 32_768, Thinking::Effort(O_EFFORTS)),
+    ("aion-2", 131_072, 32_768, Thinking::Effort(O_EFFORTS)),
+    ("aion", 131_072, 32_768, Thinking::Effort(O_EFFORTS)),
+
+    /* ── Pareto ── */
+    ("pareto-code", 2_000_000, 128_000, Thinking::Effort(O_EFFORTS)),
+    ("pareto-26.10", 1_048_576, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("pareto-26.9", 262_144, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("pareto", 1_048_576, 131_072, Thinking::Effort(O_EFFORTS)),
+
+    /* ── Perplexity Sonar ── */
+    ("sonar-deep-research", 128_000, 115_200, Thinking::None),
+    ("sonar-reasoning", 128_000, 115_200, Thinking::Effort(O_EFFORTS)),
+    ("sonar-pro", 200_000, 8_000, Thinking::None),
+    ("sonar", 128_000, 115_200, Thinking::None),
+
+    /* ── Tencent Hunyuan & HY ── */
+    ("hy4", 1_048_576, 65_536, Thinking::Effort(O_EFFORTS)),
+    ("hy3", 262_144, 235_929, Thinking::Effort(O_EFFORTS)),
+    ("hy-mt", 8_192, 4_096, Thinking::None),
+    ("hunyuan", 131_072, 117_964, Thinking::None),
+
+    /* ── Sakana AI ── */
+    ("fugu-ultra", 1_000_000, 128_000, Thinking::Effort(O_EFFORTS)),
+    ("fugu-max", 1_000_000, 128_000, Thinking::Effort(O_EFFORTS)),
+    ("fugu", 1_000_000, 128_000, Thinking::Effort(O_EFFORTS)),
+    ("sakana-namazu", 262_144, 65_536, Thinking::None),
+    ("sakana", 262_144, 65_536, Thinking::None),
+
+    /* ── Upstage Solar ── */
+    ("solar-pro", 524_288, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("solar-mini", 524_288, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("solar", 524_288, 131_072, Thinking::Effort(O_EFFORTS)),
+
+    /* ── ThinkingMachines Inkling ── */
+    ("inkling-2", 1_048_576, 943_718, Thinking::Effort(O_EFFORTS)),
+    ("inkling-small", 524_288, 262_144, Thinking::Effort(O_EFFORTS)),
+    ("inkling", 524_288, 471_859, Thinking::Effort(O_EFFORTS)),
+
+    /* ── StepFun Step ── */
+    ("step-5", 1_000_000, 64_000, Thinking::Effort(O_EFFORTS)),
+    ("step-3.7", 262_144, 230_400, Thinking::Effort(O_EFFORTS)),
+    ("step-3.5", 262_144, 65_536, Thinking::Effort(O_EFFORTS)),
+    ("step-3", 262_144, 65_536, Thinking::Effort(O_EFFORTS)),
+    ("step", 262_144, 65_536, Thinking::Effort(O_EFFORTS)),
+
+    /* ── Liquid AI LFM ── */
+    ("lfm-3", 262_144, 32_768, Thinking::None),
+    ("lfm-2.5", 65_536, 8_192, Thinking::None),
+    ("lfm", 65_536, 8_192, Thinking::None),
+
+    /* ── Microsoft Phi ── */
+    ("phi-4", 16_384, 16_384, Thinking::None),
+    ("phi-3.5", 128_000, 4_096, Thinking::None),
+    ("phi-3", 128_000, 4_096, Thinking::None),
+    ("phi", 16_384, 4_096, Thinking::None),
+
+    /* ── Nex-AGI Nex ── */
+    ("nex-n2.6", 262_144, 235_929, Thinking::None),
+    ("nex-n2.5", 262_144, 235_929, Thinking::None),
+    ("nex", 262_144, 235_929, Thinking::None),
+
+    /* ── Morph Studio ── */
+    ("morph-v3-large", 262_144, 131_072, Thinking::None),
+    ("morph-v3-fast", 81_920, 38_000, Thinking::None),
+    ("morph-v3", 131_072, 65_536, Thinking::None),
+    ("morph", 131_072, 65_536, Thinking::None),
+
+    /* ── Relace ── */
+    ("relace-apply-3", 256_000, 128_000, Thinking::None),
+    ("relace-search", 256_000, 128_000, Thinking::None),
+    ("relace", 256_000, 128_000, Thinking::None),
+
+    /* ── Typesafe JEV ── */
+    ("jev-router", 1_000_000, 128_000, Thinking::Effort(O_EFFORTS)),
+    ("jev", 1_000_000, 128_000, Thinking::Effort(O_EFFORTS)),
+
+    /* ── Particle AI ── */
+    ("particle-1", 1_048_576, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("particle", 1_048_576, 131_072, Thinking::Effort(O_EFFORTS)),
+
+    /* ── Prism Ternary Bonsai ── */
+    ("ternary-bonsai-2", 262_144, 65_536, Thinking::Effort(O_EFFORTS)),
+    ("ternary-bonsai", 262_144, 65_536, Thinking::Effort(O_EFFORTS)),
+    ("ternary", 262_144, 65_536, Thinking::Effort(O_EFFORTS)),
+
+    /* ── Dots Studio ── */
+    ("dots-3", 512_000, 460_800, Thinking::Effort(O_EFFORTS)),
+    ("dots", 512_000, 460_800, Thinking::Effort(O_EFFORTS)),
+
+    /* ── Elorian Glimpse ── */
+    ("glimpse", 262_144, 256_000, Thinking::Effort(O_EFFORTS)),
+
+    /* ── IBM Granite ── */
+    ("granite-4.2", 131_072, 117_964, Thinking::Effort(O_EFFORTS)),
+    ("granite-3.2", 131_072, 8_192, Thinking::None),
+    ("granite-3", 131_072, 8_192, Thinking::None),
+    ("granite", 131_072, 8_192, Thinking::None),
+
+    /* ── Nous Hermes ── */
+    ("hermes-4", 131_072, 117_964, Thinking::None),
+    ("hermes-3", 131_072, 8_192, Thinking::None),
+    ("hermes", 131_072, 8_192, Thinking::None),
+
+    /* ── Meituan Longcat ── */
+    ("longcat-2.0", 1_048_576, 262_144, Thinking::None),
+    ("longcat", 1_048_576, 262_144, Thinking::None),
+
+    /* ── Moondream ── */
+    ("moondream3.1", 32_000, 4_096, Thinking::None),
+    ("moondream3", 32_000, 4_096, Thinking::None),
+    ("moondream", 32_000, 4_096, Thinking::None),
+
+    /* ── Motif ── */
+    ("motif-3", 262_144, 235_929, Thinking::None),
+    ("motif", 262_144, 235_929, Thinking::None),
+
+    /* ── Writer Palmyra ── */
+    ("palmyra-x5", 1_040_000, 8_192, Thinking::None),
+    ("palmyra", 1_040_000, 8_192, Thinking::None),
+
+    /* ── Recursive Ripple ── */
+    ("ripple-65b", 1_048_576, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("ripple", 1_048_576, 131_072, Thinking::Effort(O_EFFORTS)),
+
+    /* ── Reka ── */
+    ("reka-flash-3", 65_536, 58_982, Thinking::None),
+    ("reka-edge", 16_384, 14_745, Thinking::None),
+    ("reka", 65_536, 16_384, Thinking::None),
+
+    /* ── Schematron ── */
+    ("schematron-v2", 128_000, 8_192, Thinking::None),
+    ("schematron", 128_000, 8_192, Thinking::None),
+
+    /* ── Beam ── */
+    ("beam-1.0", 1_048_576, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("beam", 1_048_576, 131_072, Thinking::Effort(O_EFFORTS)),
+
+    /* ── TheDrummer models ── */
+    ("cydonia-24b", 131_072, 117_964, Thinking::None),
+    ("cydonia", 131_072, 117_964, Thinking::None),
+    ("daisyrose-27b", 262_144, 235_929, Thinking::Effort(O_EFFORTS)),
+    ("daisyrose", 262_144, 235_929, Thinking::Effort(O_EFFORTS)),
+    ("skyfall-36b", 32_768, 29_491, Thinking::None),
+    ("skyfall", 32_768, 29_491, Thinking::None),
+    ("unslopnemo-12b", 1_024_000, 819_200, Thinking::None),
+    ("unslopnemo", 1_024_000, 819_200, Thinking::None),
+
+    /* ── Amazon Nova ── */
+    ("nova-2-lite", 1_000_000, 65_535, Thinking::None),
+    ("nova-premier", 1_000_000, 32_000, Thinking::None),
+    ("nova-pro", 300_000, 5_120, Thinking::None),
+    ("nova-lite", 300_000, 5_120, Thinking::None),
+    ("nova-micro", 128_000, 5_120, Thinking::None),
+
+    /* ── Baidu Ernie ── */
+    ("ernie-5.5", 1_024_000, 921_600, Thinking::None),
+    ("ernie", 1_024_000, 131_072, Thinking::None),
+
+    /* ── Bytedance Doubao, Seedance & UI-TARS ── */
+    ("doubao-1.5", 262_144, 65_536, Thinking::None),
+    ("doubao", 131_072, 32_768, Thinking::None),
+    ("seedance-2.5", 262_144, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("seedance", 262_144, 131_072, Thinking::Effort(O_EFFORTS)),
+    ("seedream-5", 262_144, 131_072, Thinking::None),
+    ("seedream-4", 262_144, 131_072, Thinking::None),
+    ("seed-2", 262_144, 131_072, Thinking::None),
+    ("ui-tars", 128_000, 2_048, Thinking::None),
+
+    /* ── NVIDIA Nemotron ── */
+    ("nemotron-3.5", 1_048_576, 235_929, Thinking::None),
+    ("nemotron-3", 262_144, 65_536, Thinking::None),
+
+    /* ── Cohere Command & North ── */
+    ("north-mini-code", 256_000, 64_000, Thinking::Effort(O_EFFORTS)),
+    ("north", 256_000, 64_000, Thinking::Effort(O_EFFORTS)),
+    ("command-a", 256_000, 64_000, Thinking::None),
+    ("command-r+", 128_000, 4_000, Thinking::None),
+    ("command-r", 128_000, 4_000, Thinking::None),
+
+    /* ── Meta routers & Utilities ── */
+    ("openrouter/auto", 2_000_000, 128_000, Thinking::Effort(O_EFFORTS)),
+    ("openrouter/free", 200_000, 16_384, Thinking::Effort(O_EFFORTS)),
+    ("auto-code", 2_000_000, 128_000, Thinking::Effort(O_EFFORTS)),
+    ("auto", 2_000_000, 128_000, Thinking::Effort(O_EFFORTS)),
+    ("switchyard", 1_000_000, 128_000, Thinking::None),
+    ("fusion", 1_000_000, 128_000, Thinking::None),
+    ("extract", 1_000_000, 900_000, Thinking::None),
+    ("summarize", 1_000_000, 4_000, Thinking::None),
+
+    /* ── Specialized & Community models ── */
+    ("dolphin-mistral", 128_000, 8_192, Thinking::None),
+    ("dolphin", 128_000, 8_192, Thinking::None),
+    ("mythomax", 8_192, 7_372, Thinking::None),
+    ("perceptron-mk1", 32_768, 8_192, Thinking::None),
+    ("perceptron", 32_768, 8_192, Thinking::None),
+    ("midm-k-3", 261_795, 235_615, Thinking::None),
+    ("midm", 261_795, 235_615, Thinking::None),
+    ("l3.1", 131_072, 16_384, Thinking::None),
+    ("l3", 8_192, 7_372, Thinking::None),
+    ("magnum", 32_768, 4_096, Thinking::None),
+    ("remm-slerp", 6_144, 5_529, Thinking::None),
+    ("weaver", 8_000, 6_000, Thinking::None),
+    ("0gm", 262_144, 32_768, Thinking::Effort(O_EFFORTS)),
+    ("free", 200_000, 16_384, Thinking::Effort(O_EFFORTS)),
+    ("bodybuilder", 128_000, 4_096, Thinking::None),
 ];
 
 fn inspect_gguf_caps(path: &str) -> Option<ModelCaps> {
@@ -224,10 +555,17 @@ pub fn lookup(model: Option<&str>) -> ModelCaps {
         // the old format! built a fresh String per table row per lookup,
         // and lookup runs on every request.
         let hit = m.starts_with(prefix)
-            || m.match_indices('/').any(|(i, _)| m[i + 1..].starts_with(prefix));
+            || m.match_indices(&['/', ':', '.', '@', '~'][..]).any(|(i, _)| m[i + 1..].starts_with(prefix));
         if hit {
             return ModelCaps { ctx_window: *ctx, max_output: *out, thinking: *thinking };
         }
+    }
+    if m.contains("thinking") || m.contains("reasoning") {
+        return ModelCaps {
+            ctx_window: 131_072,
+            max_output: 32_768,
+            thinking: Thinking::Effort(O_EFFORTS),
+        };
     }
     NO_CAPS
 }
@@ -411,6 +749,54 @@ mod tests {
 
         let c = lookup(Some("gpt-4o"));
         assert!(matches!(c.thinking, Thinking::None));
+
+        // 5th-gen Claude (Haiku 5.5): 1M context, 128k output, adaptive thinking budget
+        let c5 = lookup(Some("claude-haiku-5.5"));
+        assert_eq!(c5.ctx_window, 1_000_000);
+        assert_eq!(c5.max_output, 128_000);
+        assert!(matches!(c5.thinking, Thinking::Budget(128_000)));
+
+        // Generic model with thinking/reasoning in name
+        let cr = lookup(Some("custom-provider/my-model-reasoning"));
+        assert_eq!(cr.ctx_window, 131_072);
+        assert!(matches!(cr.thinking, Thinking::Effort(_)));
+
+        // GPT-6 flagship
+        let c6 = lookup(Some("gpt-6.2-sol"));
+        assert_eq!(c6.ctx_window, 1_050_000);
+        assert_eq!(c6.max_output, 128_000);
+        assert!(matches!(c6.thinking, Thinking::Effort(_)));
+
+        // Gemini 4 / 3
+        let cg4 = lookup(Some("google/gemini-4-carbon"));
+        assert_eq!(cg4.ctx_window, 1_048_576);
+        let cg3 = lookup(Some("gemini-3.7-flash"));
+        assert_eq!(cg3.ctx_window, 1_048_576);
+
+        // GLM 5.3 & MiniMax M3
+        assert_eq!(lookup(Some("z-ai/glm-5.3-flash")).ctx_window, 1_048_576);
+        assert_eq!(lookup(Some("minimax/minimax-m3.1-flash")).ctx_window, 1_048_576);
+
+        // Inclusion Ling & Recursive Flint
+        assert_eq!(lookup(Some("inclusionai/ling-3.2-flash:free")).ctx_window, 1_048_576);
+        assert_eq!(lookup(Some("recursive/flint-v1.0:free")).ctx_window, 262_144);
+
+        // Separator matching (dot, colon, slash, tilde)
+        assert_eq!(lookup(Some("bedrock.claude-5-sonnet")).ctx_window, 1_000_000);
+        assert_eq!(lookup(Some("0g/claude-haiku-5.5")).ctx_window, 1_000_000);
+        assert_eq!(lookup(Some("~anthropic/claude-fable-latest")).ctx_window, 1_000_000);
+        assert_eq!(lookup(Some("~openai/gpt-astra-latest")).ctx_window, 1_000_000);
+
+        // New families
+        assert_eq!(lookup(Some("meta/muse-ember")).ctx_window, 1_048_576);
+        assert_eq!(lookup(Some("xiaomi/mimo-v2.6-flash")).ctx_window, 1_048_576);
+        assert_eq!(lookup(Some("perplexity/sonar-pro")).ctx_window, 200_000);
+        assert_eq!(lookup(Some("sakana/fugu-ultra")).ctx_window, 1_000_000);
+        assert_eq!(lookup(Some("tencent/hy4")).ctx_window, 1_048_576);
+        assert_eq!(lookup(Some("microsoft/phi-4")).ctx_window, 16_384);
+        assert_eq!(lookup(Some("upstage/solar-pro4")).ctx_window, 524_288);
+        assert_eq!(lookup(Some("liquid/lfm-3")).ctx_window, 262_144);
+        assert_eq!(lookup(Some("openrouter/auto")).ctx_window, 2_000_000);
 
         // org-prefixed forms match too.
         assert_eq!(lookup(Some("openai/gpt-4.1")).ctx_window, 1_000_000);

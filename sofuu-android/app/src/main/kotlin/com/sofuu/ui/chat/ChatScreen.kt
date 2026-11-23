@@ -43,7 +43,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -57,6 +56,7 @@ import com.sofuu.ui.components.iconFor
 import com.sofuu.ui.soapbubble.SoapBubbleButton
 import com.sofuu.ui.soapbubble.SoapBubbleSurface
 import com.sofuu.ui.theme.LocalSofuuColors
+import com.sofuu.ui.theme.GeistMono
 
 /** The message list: user bubbles, assistant markdown + activity
  *  timeline + thinking + usage, and the live phase line. */
@@ -163,7 +163,7 @@ private fun MessageRow(
             fontSize = (fontSize - 3).sp,
             lineHeight = (fontSize + 4).sp,
             color = c.textMuted,
-            fontFamily = FontFamily.Monospace,
+            fontFamily = GeistMono,
             modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
         )
         MsgRole.ASSISTANT -> Column(Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 10.dp)) {
@@ -180,7 +180,7 @@ private fun MessageRow(
                     liveMetrics,
                     color = c.textFaint,
                     fontSize = (fontSize - 3).sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = GeistMono,
                     modifier = Modifier.padding(bottom = 2.dp),
                 )
             }
@@ -221,7 +221,7 @@ private fun MessageRow(
                     "⌁ ${m.metrics}",
                     color = c.textFaint,
                     fontSize = (fontSize - 4).sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = GeistMono,
                     modifier = Modifier.padding(top = 2.dp),
                 )
             }
@@ -472,7 +472,7 @@ private fun TimelineRow(
                             if (copiedDetail) "Copied" else "Copy",
                             fontSize = 11.sp,
                             color = if (copiedDetail) c.ok else c.textFaint,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = GeistMono,
                         )
                     }
                 }
@@ -481,7 +481,7 @@ private fun TimelineRow(
                     fontSize = 12.sp,
                     lineHeight = 17.sp,
                     color = c.textMuted,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = GeistMono,
                 )
             }
         }

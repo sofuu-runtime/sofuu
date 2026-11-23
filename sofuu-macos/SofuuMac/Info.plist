@@ -30,6 +30,8 @@
 	<string>MIT License</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>ATSApplicationFontsPath</key>
+	<string>.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Sofuu can transcribe speech you send to the agent.</string>
 	<key>NSHighResolutionCapable</key>

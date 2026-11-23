@@ -1,4 +1,6 @@
+import CoreText
 import SwiftUI
+import UIKit
 
 /// The desktop palette (styles.css `:root` tokens, cream light + warm dark),
 /// ported token-for-token through the Android app's `Color.kt`.
@@ -162,21 +164,65 @@ extension EnvironmentValues {
     }
 }
 
+/// Geist Mono — the app's only typeface. The static faces ship in
+/// `SofuuApp/Resources` and are registered through `UIAppFonts` in
+/// Info.plist. Declaring each weight keeps SwiftUI from synthesising a
+/// different family when a view asks for medium/semibold/bold.
+enum SofuuFont {
+    static func postScriptName(weight: Font.Weight) -> String {
+        switch weight {
+        case .medium: return "GeistMono-Medium"
+        case .semibold: return "GeistMono-SemiBold"
+        case .bold, .heavy, .black: return "GeistMono-Bold"
+        default: return "GeistMono-Regular"
+        }
+    }
+
+    static func font(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .custom(postScriptName(weight: weight), size: size)
+    }
+
+    /// Dynamic body face for `AttributedString` attributes.
+    static let body = Font.custom("GeistMono-Regular", size: 15, relativeTo: .body)
+
+    static func uiFont(_ size: CGFloat, weight: UIFont.Weight = .regular) -> UIFont {
+        let name: String
+        switch weight {
+        case .medium: name = "GeistMono-Medium"
+        case .semibold: name = "GeistMono-SemiBold"
+        case .bold, .heavy, .black: name = "GeistMono-Bold"
+        default: name = "GeistMono-Regular"
+        }
+        return UIFont(name: name, size: size)
+            ?? UIFont.monospacedSystemFont(ofSize: size, weight: weight)
+    }
+
+    /// Belt-and-suspenders for builds whose Info.plist is regenerated:
+    /// registering the same URLs twice is harmless.
+    static func registerBundledFonts() {
+        for url in Bundle.main.urls(forResourcesWithExtension: "ttf", subdirectory: nil) ?? [] {
+            CTFontManagerRegisterFontsForURL(url as CFURL, .process, nil)
+        }
+    }
+}
+
+extension View {
+    /// Geist Mono for text. SF Symbol images keep their own system font.
+    func sofMono(_ size: CGFloat, weight: Font.Weight = .regular) -> some View {
+        font(SofuuFont.font(size, weight: weight))
+    }
+}
+
 /// The app's theme root: picks the palette and provides it to the tree.
-/// JetBrains Mono is not bundled on iOS (the Android app ships the TTFs);
-/// the monospace system face carries the same "terminal, but warm" feel
-/// without a font license to ship.
 struct SofuuTheme<Content: View>: View {
     let dark: Bool
     @ViewBuilder var content: Content
 
     var body: some View {
         content
+            .font(SofuuFont.font(15))
             .environment(\.sofuuColors, dark ? .dark : .light)
             .preferredColorScheme(dark ? .dark : .light)
             .tint((dark ? SofuuColors.dark : SofuuColors.light).accent)
     }
 }
-
-/// The monospace face used for code, fields and the composer.
-let sofMono = Font.system(.body, design: .monospaced)

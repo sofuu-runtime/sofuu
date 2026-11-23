@@ -15,6 +15,10 @@ import SwiftUI
 struct SofuuApp: App {
     @StateObject private var store = AppStore()
 
+    init() {
+        SofuuFont.registerBundledFonts()
+    }
+
     var body: some Scene {
         WindowGroup {
             Root(store: store)

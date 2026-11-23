@@ -108,7 +108,13 @@ targets:
         # anyway — `cargo rustc --crate-type staticlib` does not link, so
         # rustc's link directives never reach the app. The app link is
         # Xcode's, which is why the flag lives here.
-        OTHER_LDFLAGS: "$(inherited) -lc++"
+        #
+        # `-lz` covers src/metal/metal_engine.mm's inflate()/inflateInit2_()
+        # calls used to unpack the embedded MSL fallback. Those symbols are
+        # in the engine archive but zlib is a system library, so the app has
+        # to ask for it explicitly (the QTSQ build.rs branch that adds `-lz`
+        # is deliberately off for iOS).
+        OTHER_LDFLAGS: "$(inherited) -lc++ -lz"
     dependencies:
       # Built by `make ios-engine` → scripts/dist/ios.sh
       - framework: ../dist/libsofuu.xcframework

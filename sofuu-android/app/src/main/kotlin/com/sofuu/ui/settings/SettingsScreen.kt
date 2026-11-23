@@ -54,7 +54,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -67,6 +66,7 @@ import com.sofuu.ui.soapbubble.SoapBubbleSurface
 import com.sofuu.ui.soapbubble.SoapBubbleToggle
 import com.sofuu.ui.soapbubble.toCssRgb
 import com.sofuu.ui.theme.LocalSofuuColors
+import com.sofuu.ui.theme.GeistMono
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -318,8 +318,8 @@ private fun Segmented(options: List<String>, selected: String, onSelect: (String
                 minHeight = 32.dp,
                 fillWidth = false,
                 radius = 7f,
-                modifier = Modifier.weight(1f, fill = false),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 7.dp),
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
             ) {
                 Text(
                     label,
@@ -348,7 +348,7 @@ private fun TextFieldRow(
     }
     val commonStyle = androidx.compose.ui.text.TextStyle(
         color = c.text,
-        fontFamily = FontFamily.Monospace,
+        fontFamily = GeistMono,
         fontSize = 13.sp,
         fontWeight = FontWeight.Medium,
         platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false),
@@ -449,7 +449,7 @@ private fun EngineCell(key: String, value: String, mono: Boolean = false) {
             fontSize = 13.sp,
             color = c.text,
             fontWeight = if (mono) FontWeight.Medium else FontWeight.SemiBold,
-            fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
+            fontFamily = GeistMono,
             maxLines = 1,
             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
         )
@@ -511,7 +511,7 @@ private fun VectorEngineCard(store: AppStore) {
                             fontSize = 12.5.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = if (avail) c.text else c.err,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = GeistMono,
                             modifier = Modifier.weight(1f),
                         )
                         if (dim > 0) {
@@ -520,7 +520,7 @@ private fun VectorEngineCard(store: AppStore) {
                                 fontSize = 11.5.sp,
                                 fontWeight = FontWeight.Medium,
                                 color = c.textMuted,
-                                fontFamily = FontFamily.Monospace,
+                                fontFamily = GeistMono,
                                 modifier = Modifier.padding(end = 6.dp),
                             )
                         }
@@ -567,7 +567,7 @@ private fun VectorEngineCard(store: AppStore) {
                         .border(1.dp, c.border, RoundedCornerShape(8.dp))
                         .padding(10.dp),
                 ) {
-                    Text(res, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textMuted, fontFamily = FontFamily.Monospace)
+                    Text(res, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textMuted, fontFamily = GeistMono)
                 }
             }
             LaunchedEffect(probing, probe) {
@@ -654,7 +654,7 @@ private fun GeneralPane(store: AppStore) {
                         .border(1.dp, c.border, RoundedCornerShape(8.dp))
                         .padding(horizontal = 12.dp, vertical = 10.dp),
                 ) {
-                    Text(state.projectDir ?: "(none)", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.text, fontFamily = FontFamily.Monospace)
+                    Text(state.projectDir ?: "(none)", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = c.text, fontFamily = GeistMono)
                 }
             })
             CardDivider()
@@ -825,7 +825,7 @@ private fun PhoneToolsCard(store: AppStore) {
                             .border(0.5.dp, c.border, RoundedCornerShape(6.dp))
                             .padding(horizontal = 8.dp, vertical = 5.dp),
                     ) {
-                        Text(t, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace)
+                        Text(t, fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = GeistMono)
                     }
                 }
             }
@@ -1075,7 +1075,7 @@ private fun ModelsPane(store: AppStore) {
                                     fontSize = 13.5.sp,
                                     fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
                                     color = if (active) c.accent else c.text,
-                                    fontFamily = FontFamily.Monospace,
+                                    fontFamily = GeistMono,
                                 )
                                 if (active) {
                                     Row(
@@ -1190,7 +1190,7 @@ private fun ModelsPane(store: AppStore) {
                                             fontSize = 13.sp,
                                             fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
                                             color = if (active) c.accent else c.text,
-                                            fontFamily = FontFamily.Monospace,
+                                            fontFamily = GeistMono,
                                             modifier = Modifier.weight(1f),
                                         )
                                         if (active) {
@@ -1556,7 +1556,7 @@ private fun UsagePane(store: AppStore) {
                 fontSize = 24.sp,
                 fontWeight = FontWeight.ExtraBold,
                 color = c.text,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = GeistMono,
                 modifier = Modifier.padding(vertical = 4.dp),
             )
             Row(
@@ -1567,11 +1567,11 @@ private fun UsagePane(store: AppStore) {
             ) {
                 Column {
                     Text("Prompt tokens", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
-                    Text("%,.0f".format(pt), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace)
+                    Text("%,.0f".format(pt), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = GeistMono)
                 }
                 Column {
                     Text("Completion tokens", fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
-                    Text("%,.0f".format(ct), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace)
+                    Text("%,.0f".format(ct), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = GeistMono)
                 }
             }
             // The same totals, split the way they are actually spent. A local
@@ -1594,12 +1594,12 @@ private fun UsagePane(store: AppStore) {
                 Text(
                     "Local  %,.0f in · %,.0f out".format(localPt, localCt),
                     fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.textMuted,
-                    fontFamily = FontFamily.Monospace, modifier = Modifier.padding(top = 6.dp),
+                    fontFamily = GeistMono, modifier = Modifier.padding(top = 6.dp),
                 )
                 Text(
                     "Cloud  %,.0f in · %,.0f out".format(cloudPt, cloudCt),
                     fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.textMuted,
-                    fontFamily = FontFamily.Monospace, modifier = Modifier.padding(top = 2.dp),
+                    fontFamily = GeistMono, modifier = Modifier.padding(top = 2.dp),
                 )
             }
         }
@@ -1636,7 +1636,7 @@ private fun UsagePane(store: AppStore) {
                         Text(
                             "%,.0f in · %,.0f out".format(m.optDouble("pt"), m.optDouble("ct")),
                             fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = c.textMuted,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = GeistMono,
                         )
                     }
                 }
@@ -1665,7 +1665,7 @@ private fun UsagePane(store: AppStore) {
                             fontSize = 12.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = c.textMuted,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = GeistMono,
                         )
                     }
                 }
@@ -1694,14 +1694,14 @@ private fun UsagePane(store: AppStore) {
                                 maxLines = 1,
                                 overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
                             )
-                            Text(d.optString("model"), fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint, fontFamily = FontFamily.Monospace)
+                            Text(d.optString("model"), fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint, fontFamily = GeistMono)
                         }
                         Text(
                             "$" + "%.4f".format(d.optDouble("cost")),
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = c.text,
-                            fontFamily = FontFamily.Monospace,
+                            fontFamily = GeistMono,
                         )
                     }
                 }
@@ -1817,12 +1817,12 @@ private fun BrainPane(store: AppStore) {
                     val i = info!!
                     Text(
                         "${i.optLong("count")} memories",
-                        fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, color = c.text, fontFamily = FontFamily.Monospace,
+                        fontSize = 22.sp, fontWeight = FontWeight.ExtraBold, color = c.text, fontFamily = GeistMono,
                     )
                     Text(
                         "space ${i.optString("backend") ?: "?"} · ${i.optInt("dim")}-dim" +
                             if (i.optBoolean("semantic")) " · semantic channel on" else "",
-                        fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, fontFamily = GeistMono,
                         modifier = Modifier.padding(top = 2.dp, bottom = 10.dp),
                     )
                 }
@@ -1881,7 +1881,7 @@ private fun BrainPane(store: AppStore) {
                             )
                             Text(
                                 "score ${"%.3f".format(o.optDouble("score"))} · ${o.optString("tier")}",
-                                fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint, fontFamily = FontFamily.Monospace,
+                                fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint, fontFamily = GeistMono,
                             )
                         }
                         if (id >= 0) {
@@ -1947,7 +1947,7 @@ private fun BrainPane(store: AppStore) {
                 val ws = m.optJSONObject("workset")
                 Text(
                     "${ws?.optLong("runs") ?: 0} runs · ${ws?.optLong("calls") ?: 0} calls · ${ws?.optLong("segments") ?: 0} segments",
-                    fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace,
+                    fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = GeistMono,
                 )
                 // The gate map is `gates` (name → "on"/"off" STRINGS); the
                 // pane used to read a non-existent `on` object of booleans,
@@ -1962,7 +1962,7 @@ private fun BrainPane(store: AppStore) {
                         Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
                             Text(
                                 k, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
-                                fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
+                                fontFamily = GeistMono, modifier = Modifier.weight(1f),
                             )
                             Text(
                                 st.ifEmpty { "off" }, fontSize = 12.5.sp, fontWeight = FontWeight.Bold,
@@ -2078,7 +2078,7 @@ private fun BrainPane(store: AppStore) {
                         fontSize = 13.5.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = if (r.optBoolean("ok")) c.text else c.warn,
-                        fontFamily = FontFamily.Monospace,
+                        fontFamily = GeistMono,
                     )
                 }
             }
@@ -2092,7 +2092,7 @@ private fun BrainPane(store: AppStore) {
                 CardDivider()
                 Text(
                     "cosine similarity: ${"%.4f".format(it.optDouble("similarity"))} · ${it.optInt("dim")}-dim",
-                    fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = FontFamily.Monospace,
+                    fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = c.text, fontFamily = GeistMono,
                 )
             }
         }
@@ -2105,7 +2105,7 @@ private fun SpaceLine(text: Color, err: Color, faint: Color, label: String, dim:
     Row(Modifier.fillMaxWidth().padding(vertical = 3.dp)) {
         Text(
             label, fontSize = 13.5.sp, fontWeight = FontWeight.SemiBold, color = if (available) text else err,
-            fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
+            fontFamily = GeistMono, modifier = Modifier.weight(1f),
         )
         Text(
             if (available) "$dim-dim" else "artifact unavailable",
@@ -2194,7 +2194,7 @@ private fun AgentsPane(store: AppStore) {
                             Text(
                                 agentName,
                                 fontSize = 15.sp, fontWeight = FontWeight.Bold, color = c.text,
-                                fontFamily = FontFamily.Monospace, modifier = Modifier.weight(1f),
+                                fontFamily = GeistMono, modifier = Modifier.weight(1f),
                             )
                             Text(
                                 if (runAgentName == agentName) "run target" else "select",
@@ -2382,7 +2382,7 @@ private fun AgentsPane(store: AppStore) {
                     Text(
                         "${a.optInt("steps")} steps" + (a.optString("stopped").takeIf { it.isNotEmpty() && it != "null" }
                             ?.let { " · stopped: $it" } ?: ""),
-                        fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, fontFamily = FontFamily.Monospace,
+                        fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint, fontFamily = GeistMono,
                     )
                     Text(
                         a.optString("answer"),

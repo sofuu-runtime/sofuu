@@ -57,13 +57,13 @@ struct ChatSearchBar: View {
                     .foregroundStyle(c.textFaint)
                 TextField(L10n.t("search.placeholder"), text: $query)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 13))
+                    .font(SofuuFont.font(13))
                     .foregroundStyle(c.text)
                     .focused($focused)
                     .onSubmit { step(1) }
                 if !hits.isEmpty {
                     Text("\(min(selectedIndex + 1, hits.count))/\(hits.count)")
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(SofuuFont.font(11))
                         .foregroundStyle(c.textFaint)
                 }
                 hudButton("chevron.up", L10n.t("search.prev")) { step(-1) }
@@ -80,12 +80,12 @@ struct ChatSearchBar: View {
 
             if query.isEmpty {
                 Text(L10n.t("search.hint"))
-                    .font(.system(size: 11))
+                    .font(SofuuFont.font(11))
                     .foregroundStyle(c.textFaint)
                     .padding(10)
             } else if hits.isEmpty {
                 Text(L10n.t("search.noMatches"))
-                    .font(.system(size: 12))
+                    .font(SofuuFont.font(12))
                     .foregroundStyle(c.textFaint)
                     .padding(10)
             } else {
@@ -95,12 +95,12 @@ struct ChatSearchBar: View {
                             Button { jump(i) } label: {
                                 HStack(alignment: .top, spacing: 8) {
                                     Text(hit.role)
-                                        .font(.system(size: 10, weight: .semibold))
+                                        .font(SofuuFont.font(10, weight: .semibold))
                                         .foregroundStyle(hit.role == "You" ? c.textMuted : c.accent)
                                         .frame(width: 36, alignment: .leading)
                                         .padding(.top, 1)
                                     Text(hit.snippet)
-                                        .font(.system(size: 12))
+                                        .font(SofuuFont.font(12))
                                         .foregroundStyle(c.text)
                                         .lineLimit(2)
                                         .multilineTextAlignment(.leading)

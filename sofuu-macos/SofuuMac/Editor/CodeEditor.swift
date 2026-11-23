@@ -45,15 +45,14 @@ struct CodeEditor: NSViewRepresentable {
     static let gutterTopInset: CGFloat = 6
     static let gutterWidth: CGFloat = 46
 
-    /// The editor typeface resolves from prefs (Settings  Appearance);
-    /// unknown families fall back to the system monospaced.
-    static func makeFont(family: String?, size: Int) -> NSFont {
-        if let family, let f = NSFont(name: family, size: CGFloat(size)) {
-            return f
-        }
-        return NSFont.monospacedSystemFont(ofSize: CGFloat(size), weight: .regular)
+    /// Geist Mono is the only editor typeface. The `family` argument is kept
+    /// so existing prefs/config calls still compile, but it is deliberately
+    /// ignored — a stale preference must not reintroduce another font.
+    static func makeFont(family: String? = nil, size: Int) -> NSFont {
+        _ = family
+        return SofuuFont.nsFont(CGFloat(size))
     }
-    static var font: NSFont { makeFont(family: nil, size: 13) }
+    static var font: NSFont { makeFont(size: 13) }
 
     private var language: Language { Languages.language(forPath: path) }
 
@@ -188,7 +187,7 @@ struct CodeEditor: NSViewRepresentable {
         var isDark = true
         var path: String?
         var fontKey: (family: String?, size: Int) = (nil, 13)
-        var currentFont: NSFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        var currentFont: NSFont = SofuuFont.nsFont(13)
         var restoredPath: String?
         var fontSize: Int = 13
         var indentUnitWidth: CGFloat?
@@ -1308,7 +1307,7 @@ struct LineGutter: View {
         let diagLines = Dictionary(diags.map { ($0.line, $0.severity) },
                                    uniquingKeysWith: { a, b in min(a, b) })
 
-        let font = Font.system(size: max(9, Double(coordinator.fontSize - 2)), design: .monospaced).monospacedDigit()
+        let font = SofuuFont.font(CGFloat(max(9, coordinator.fontSize - 2))).monospacedDigit()
         let lineColor = Color.primary.opacity(0.45)
 
         var i = max(0, Int(((scrollY - inset) / step).rounded(.down)))

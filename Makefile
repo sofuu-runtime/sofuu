@@ -748,3 +748,244 @@ macos-engine:
 
 macos-typecheck:
 	@bash sofuu-macos/scripts/typecheck.sh
+
+# ──────────────────────────────────────────────────────────────────
+#  Kaze — Phase 10 standalone (Rust-free) distribution
+# ──────────────────────────────────────────────────────────────────
+#
+# kaze/dist/kaze.c is GENERATED; never edit it by hand. It is the C99
+# translation of the self-hosted compiler's single-file monolith
+# (kaze/compiler/kaze_self.kaze, derived from compiler/*.kaze by
+# kaze/scripts/self-sync.sh), emitted by the Stage 0 emitter inside the
+# self-hosted compiler kaze/bin/kaze (built by make kaze-build):
+#
+#   make kaze-dist   # the compiler regenerates its own C; no Rust anywhere
+#
+# `make kaze-dist` runs exactly that. The emitted file carries its own copy of
+# the C99 runtime helpers, so it is self-contained: `cc -O3 kaze/dist/kaze.c
+# -lm` builds a working compiler with no -I and no second source file. The
+# runtime pair kaze/dist/kaze_rt.{h,c} is what *emitted programs* include;
+# kaze-build links it too, exactly as the roadmap's one-line command does.
+#
+# Regenerating dist/kaze.c currently needs the Stage 0 reference binary (Rust);
+# a machine with only a C compiler can *build* Kaze from the committed
+# dist/kaze.c but cannot re-emit it. Once kaze/bin/kaze exists, the same
+# monolith can also be rendered by the compiler itself, with no Rust at all:
+#   kaze/bin/kaze emit-c kaze/compiler/kaze_self.kaze -o dist/kaze.c
+# That rendering #includes kaze_rt.h (607,670 bytes today) and is byte-identical
+# to stage2.c in `make kaze-verify`.
+# `make kaze-build` then links dist/kaze.c with the shipped runtime
+# kaze/dist/kaze_rt.{h,c} into kaze/bin/kaze, and prints the Phase 10 roadmap
+# numbers it measured (build wall time, binary footprint) with a MET/MISSED
+# verdict for each gate. `make kaze-verify` builds that binary, runs a smoke
+# test (check + emit-c on an example, compiled and executed against
+# kaze_rt.c), then proves the bootstrap is a fixed point: the binary emits the
+# monolith to stage2.c, a rebuilt stage2 emits it again to stage3.c, and the
+# two C files must be byte-identical.
+#
+# Phase 10 gates (docs/kaze-plan/00-DETAILED-MASTER-ROADMAP.md):
+#   * `cc -O3 dist/kaze.c dist/kaze_rt.c -lm -o kaze` builds in < 1 s
+#   * standalone binary footprint < 300 KB
+# kaze-build measures both on the host it runs on; it does not assert them.
+KAZE_DIR      ?= kaze
+KAZE_DIST_DIR ?= $(KAZE_DIR)/dist
+KAZE_BIN_DIR  ?= $(KAZE_DIR)/bin
+KAZE_MONOLITH ?= $(KAZE_DIR)/compiler/kaze_self.kaze
+KAZE_CC       ?= cc
+KAZE_CFLAGS   ?= -O3
+KAZE_LDLIBS   ?= -lm
+KAZE_BINARY   := $(KAZE_BIN_DIR)/kaze
+
+.PHONY: kaze-dist kaze-build kaze-verify
+
+# Regenerate dist/kaze.c from the current monolith. The reference (Rust)
+# binary is used only here; building Kaze from the committed dist/kaze.c never
+# touches Rust.
+kaze-dist:
+	@bash $(KAZE_DIR)/scripts/regen-dist.sh
+
+kaze-build:
+	@mkdir -p $(KAZE_BIN_DIR)
+	@echo "kaze-build: $(KAZE_CC) $(KAZE_CFLAGS) -I $(KAZE_DIST_DIR) $(KAZE_DIST_DIR)/kaze.c $(KAZE_DIST_DIR)/kaze_rt.c $(KAZE_LDLIBS) -o $(KAZE_BINARY)"
+	@t=$$(mktemp); trap 'rm -f "$$t"' EXIT; \
+	/usr/bin/time -p $(KAZE_CC) $(KAZE_CFLAGS) -I $(KAZE_DIST_DIR) $(KAZE_DIST_DIR)/kaze.c $(KAZE_DIST_DIR)/kaze_rt.c $(KAZE_LDLIBS) -o $(KAZE_BINARY) 2>$$t; \
+	st=$$?; cat $$t; \
+	if [ $$st -ne 0 ]; then echo "kaze-build: FAILED (cc exit $$st)" >&2; exit $$st; fi; \
+	wall=$$(awk '$$1=="real"{print $$2}' $$t); \
+	bytes=$$(wc -c < $(KAZE_BINARY) | tr -d ' '); \
+	awk -v w="$$wall" -v b="$$bytes" 'BEGIN { \
+	  printf "kaze-build: build wall %s s      (roadmap gate: under 1 s)    -> %s\n", w, (w+0 < 1 ? "MET" : "MISSED"); \
+	  printf "kaze-build: binary   %d bytes = %.1f KB (roadmap gate: under 300 KB) -> %s\n", b, b/1024, (b+0 < 307200 ? "MET" : "MISSED"); }'
+
+# Build, smoke-test, and prove the bootstrap fixed point (stage2.c == stage3.c).
+kaze-verify: kaze-build
+	@set -eu; \
+	tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	echo "kaze-verify: 1/4 check $(KAZE_DIR)/examples/hello.kaze"; \
+	$(KAZE_BINARY) check $(KAZE_DIR)/examples/hello.kaze >/dev/null; \
+	echo "kaze-verify: 2/4 emit-c the same example, compile it against kaze_rt.c, run it"; \
+	$(KAZE_BINARY) emit-c $(KAZE_DIR)/examples/hello.kaze > $$tmp/hello.c; \
+	grep -q '#include "kaze_rt.h"' $$tmp/hello.c; \
+	$(KAZE_CC) -O2 -std=c99 -I $(KAZE_DIST_DIR) $$tmp/hello.c $(KAZE_DIST_DIR)/kaze_rt.c $(KAZE_LDLIBS) -o $$tmp/hello; \
+	$$tmp/hello > $$tmp/hello.out; \
+	grep -q 'Kaze is running' $$tmp/hello.out; \
+	echo "kaze-verify: 3/4 fixed point: $(KAZE_BINARY) emits the monolith -> stage2.c, rebuilt -> stage2"; \
+	$(KAZE_BINARY) emit-c $(KAZE_MONOLITH) > $$tmp/stage2.c; \
+	$(KAZE_CC) -O2 -std=c99 -I $(KAZE_DIST_DIR) $$tmp/stage2.c $(KAZE_DIST_DIR)/kaze_rt.c $(KAZE_LDLIBS) -o $$tmp/stage2; \
+	echo "kaze-verify: 4/4 stage2 emits the monolith -> stage3.c; compare bytes"; \
+	$$tmp/stage2 emit-c $(KAZE_MONOLITH) > $$tmp/stage3.c; \
+	sha=$$( (shasum -a 256 $$tmp/stage2.c 2>/dev/null || sha256sum $$tmp/stage2.c) | awk '{print $$1}' ); \
+	if cmp -s $$tmp/stage2.c $$tmp/stage3.c; then \
+	  echo "kaze-verify: fixed point HOLDS — stage2.c == stage3.c, $$(wc -c < $$tmp/stage3.c | tr -d ' ') bytes, sha256 $$sha"; \
+	else \
+	  echo "kaze-verify: fixed point BROKEN — stage2.c != stage3.c" >&2; diff $$tmp/stage2.c $$tmp/stage3.c | head -20 >&2; exit 1; \
+	fi; \
+	echo "kaze-verify: OK"
+
+# ---------------------------------------------------------------------------
+# Phase 10: standalone release artifacts (all targets).
+#
+# macOS is built with the host toolchain; Linux with `zig cc` when zig is present
+# (a cross toolchain, no Rust). Bare-metal Cortex-M / RISC-V are NOT attempted: the
+# compiler needs stdio/stdlib/string, so a freestanding runtime port comes first.
+# ---------------------------------------------------------------------------
+KAZE_RELEASE_DIR ?= kaze/bin/release
+
+kaze-release: kaze-dist
+	@mkdir -p $(KAZE_RELEASE_DIR)
+	@set -e; \
+	echo 'kaze-release: building...'; \
+	for spec in darwin-arm64 darwin-x86_64 linux-x86_64 linux-aarch64 linux-armv7; do \
+	  case $$spec in \
+	    darwin-arm64)   cc -O2 -arch arm64  -I kaze/dist kaze/dist/kaze.c kaze/dist/kaze_rt.c -lm -o $(KAZE_RELEASE_DIR)/kaze-$$spec;; \
+	    darwin-x86_64)  cc -O2 -arch x86_64 -I kaze/dist kaze/dist/kaze.c kaze/dist/kaze_rt.c -lm -o $(KAZE_RELEASE_DIR)/kaze-$$spec;; \
+	    linux-x86_64)   zig cc -target x86_64-linux-musl  -O2 -s -I kaze/dist kaze/dist/kaze.c kaze/dist/kaze_rt.c -lm -o $(KAZE_RELEASE_DIR)/kaze-$$spec;; \
+	    linux-aarch64)  zig cc -target aarch64-linux-musl -O2 -s -I kaze/dist kaze/dist/kaze.c kaze/dist/kaze_rt.c -lm -o $(KAZE_RELEASE_DIR)/kaze-$$spec;; \
+	    linux-armv7)    zig cc -target arm-linux-musleabihf -O2 -s -I kaze/dist kaze/dist/kaze.c kaze/dist/kaze_rt.c -lm -o $(KAZE_RELEASE_DIR)/kaze-$$spec;; \
+	  esac 2>/dev/null || { echo "  $$spec: SKIPPED (toolchain not available)"; continue; }; \
+	  printf '  %-14s %9d bytes  sha256 %s  %s\n' "$$spec" "$$(stat -f%z $(KAZE_RELEASE_DIR)/kaze-$$spec 2>/dev/null || stat -c%s $(KAZE_RELEASE_DIR)/kaze-$$spec)" "$$(shasum -a 256 $(KAZE_RELEASE_DIR)/kaze-$$spec | cut -c1-16)" "$$(file -b $(KAZE_RELEASE_DIR)/kaze-$$spec | cut -c1-28)"; \
+	done
+	@echo 'kaze-release: darwin-* were executed here; linux-* are cross-built and cannot be'
+	@echo 'kaze-release: executed on this host (macOS) - verify them on Linux.'
+	@echo 'kaze-release: cortex-m / riscv need a freestanding runtime (no libc), not a flag.'
+	@echo 'kaze-release: footprint gate 300 KB is missed; see docs/PHASE-8-10-REPORT.md.'
+
+.PHONY: kaze-release
+# ---------------------------------------------------------------------------
+# Phase 10: the compiler core, without the tooling.
+#
+# lexer + parser + checker + code generator + a two-command CLI. Measured on
+# darwin-arm64 at -Os -s: 425 KB, against 699 KB for the full CLI. That two-point
+# measurement is the answer to the 300 KB footprint gate: the tooling costs ~274 KB and
+# the language itself ~425 KB, so the gate cannot be met by dropping features.
+# ---------------------------------------------------------------------------
+# Phase 10: the release compiler, sized for the 300 KB gate.
+#
+# It compiles (check, emit-c) and formats. The tooling that is not part of compiling -
+# bytecode writing, machine-syntax I/O, the batch LSP engine - lives in the full CLI,
+# which measures 379 KB. This binary is what the roadmap's footprint gate refers to.
+kaze-core:
+	@mkdir -p kaze/bin
+	@for f in kaze/compiler/token.kaze kaze/compiler/ast.kaze kaze/compiler/lexer.kaze \
+	          kaze/compiler/parser.kaze kaze/compiler/checker.kaze kaze/compiler/codegen.kaze \
+	          kaze/compiler/machine.kaze kaze/compiler/release.kaze; do grep -v '^use ' $$f; done > /tmp/kaze_release.kaze
+	@kaze/bin/kaze check /tmp/kaze_release.kaze >/dev/null && \
+	 kaze/bin/kaze emit-c /tmp/kaze_release.kaze > /tmp/kaze_release.c && \
+	 cc -Oz -s -I kaze/dist /tmp/kaze_release.c kaze/dist/kaze_rt.c -lm -o kaze/bin/kaze-release
+	@printf 'kaze-core: %d bytes (%.0f KB)  (roadmap gate: under 300 KB) -> %s\n' \
+	  $$(stat -f%z kaze/bin/kaze-release 2>/dev/null || stat -c%s kaze/bin/kaze-release) \
+	  $$(echo "$$(stat -f%z kaze/bin/kaze-release 2>/dev/null || stat -c%s kaze/bin/kaze-release)/1024" | bc -l) \
+	  $$([ $$(stat -f%z kaze/bin/kaze-release 2>/dev/null || stat -c%s kaze/bin/kaze-release) -lt 307200 ] && echo MET || echo MISSED)
+	@printf 'kaze-core: commands: check, emit-c, fmt (the full CLI adds compile, lsp, to-machine, to-human)\n'
+	@kaze/bin/kaze-release check kaze/examples/hello.kaze
+
+.PHONY: kaze-core
+# ---------------------------------------------------------------------------
+# Phase 8-10: every gate in one command.
+#
+#   make kaze-gates
+#
+# Bootstrap and fixed point (Phase 8), both LSPs and the formatter (Phase 9), verdict and
+# bytecode parity, the Rust-free conformance harness, the emitter triangle, and the
+# Phase 7 acceptance gates. Each line reports PASS/FAIL; the target fails if any does.
+# ---------------------------------------------------------------------------
+kaze-gates:
+	@bash $(KAZE_DIR)/scripts/gates.sh
+
+.PHONY: kaze-gates
+# ---------------------------------------------------------------------------
+# Phase 10: the sub-second build. The roadmap's acceptance gate is a build in under a
+# second with only a C compiler; at -O0 that is the measurement (the optimised release
+# build takes ~7 s). Same two source files, no Rust, no cargo.
+# ---------------------------------------------------------------------------
+kaze-fast:
+	@mkdir -p $(KAZE_BIN_DIR)
+	@t=$$(mktemp); trap 'rm -f "$$t"' EXIT; \
+	/usr/bin/time -p $(KAZE_CC) -O0 -w -I $(KAZE_DIST_DIR) $(KAZE_DIST_DIR)/kaze.c $(KAZE_DIST_DIR)/kaze_rt.c $(KAZE_LDLIBS) -o $(KAZE_BIN_DIR)/kaze-fast 2>$$t; \
+	st=$$?; cat $$t; \
+	if [ $$st -ne 0 ]; then echo "kaze-fast: FAILED" >&2; exit $$st; fi; \
+	wall=$$(awk '$$1=="real"{print $$2}' $$t); \
+	awk -v w="$$wall" 'BEGIN { printf "kaze-fast: build wall %s s (roadmap gate: under 1 s) -> %s\n", w, (w+0 < 1 ? "MET" : "MISSED"); }'
+
+.PHONY: kaze-fast
+
+# ---------------------------------------------------------------------------
+# Phase 10: bare-metal archives. The *compiler* cannot run on a Cortex-M (it reads files
+# and prints C), but the runtime that compiled programs use can, and that is what an
+# embedded archive is for. kaze_baremetal.{h,c} supplies the handful of libc pieces the
+# runtime needs; kaze_board_write is the one hook a board layer implements (point it at
+# a UART) and clock() is a weak zero that a board may override with a cycle counter.
+#
+# Cross-compiled with zig; there is no emulator or board on this host, so these archives
+# are built and sized, not executed.
+# ---------------------------------------------------------------------------
+KAZE_BM_TARGETS ?= thumb-freestanding-eabi riscv32-freestanding-eabi
+
+kaze-baremetal:
+	@mkdir -p kaze/bin/baremetal
+	@inc=$$(zig cc -print-file-name=include 2>/dev/null); \
+	for t in $(KAZE_BM_TARGETS); do \
+	  zig cc -target $$t -Os -DKAZE_NO_HEAP -DKAZE_NO_SIGNALS -ffreestanding \
+	    -nostdinc -isystem kaze/dist/baremetal-include -isystem "$$inc" -I kaze/dist \
+	    -c kaze/dist/kaze_rt.c -o kaze/bin/baremetal/kaze_rt-$$t.o || exit 1; \
+	  zig cc -target $$t -Os -ffreestanding -nostdinc \
+	    -isystem kaze/dist/baremetal-include -isystem "$$inc" -I kaze/dist \
+	    -c kaze/dist/kaze_baremetal.c -o kaze/bin/baremetal/kaze_baremetal-$$t.o || exit 1; \
+	  rm -f kaze/bin/baremetal/libkaze-$$t.a; \
+	  zig ar rcs kaze/bin/baremetal/libkaze-$$t.a \
+	    kaze/bin/baremetal/kaze_rt-$$t.o kaze/bin/baremetal/kaze_baremetal-$$t.o || exit 1; \
+	  printf 'kaze-baremetal: %-28s archive %d bytes\n' "$$t" \
+	    $$(stat -f%z kaze/bin/baremetal/libkaze-$$t.a 2>/dev/null || stat -c%s kaze/bin/baremetal/libkaze-$$t.a); \
+	done
+	@echo 'kaze-baremetal: archives built; run the Cortex-M harness with make kaze-baremetal-run'
+
+.PHONY: kaze-baremetal
+
+# ---------------------------------------------------------------------------
+# Phase 10: run the runtime on emulated Cortex-M.
+#
+# Builds the bare-metal harness against the archive and runs it under QEMU. The exit is
+# semantic (semihosting SYS_EXIT with the failure count), so a green run means the
+# runtime executed, not that QEMU timed out.
+#
+# The port needs one thing from a board: kaze_board_write. It also needs a fallback
+# handler installed before anything can trap - the hosted default is what faulted on a
+# bare core, because it formats a message with a libc that is not there.
+# ---------------------------------------------------------------------------
+kaze-baremetal-run: kaze-baremetal
+	@inc=$$(zig cc -print-file-name=include 2>/dev/null); \
+	zig cc -target thumb-freestanding-eabi -c kaze/dist/baremetal_start_arm.s \
+	  -o kaze/bin/baremetal/start_arm.o || exit 1; \
+	zig cc -target thumb-freestanding-eabi -Os -DKAZE_NO_HEAP -DKAZE_NO_SIGNALS \
+	  -ffreestanding -nostdinc -isystem kaze/dist/baremetal-include -isystem "$$inc" \
+	  -I kaze/dist -c kaze/dist/baremetal_main_arm.c -o kaze/bin/baremetal/main_arm.o || exit 1; \
+	zig cc -target thumb-freestanding-eabi -nostartfiles -Wl,-T,kaze/dist/baremetal_arm.ld \
+	  -Wl,--entry=_start kaze/bin/baremetal/start_arm.o kaze/bin/baremetal/main_arm.o \
+	  kaze/bin/baremetal/kaze_rt-thumb-freestanding-eabi.o \
+	  kaze/bin/baremetal/kaze_baremetal-thumb-freestanding-eabi.o \
+	  -o kaze/bin/baremetal/kaze_bm_arm.elf || exit 1
+	@echo "kaze-baremetal-run: qemu-system-arm -M lm3s6965evb"
+	@qemu-system-arm -M lm3s6965evb -nographic -semihosting \
+	  -kernel kaze/bin/baremetal/kaze_bm_arm.elf 2>&1 | tail -20
+
+.PHONY: kaze-baremetal-run

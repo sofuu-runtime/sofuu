@@ -36,12 +36,12 @@ struct GitPanel: View {
 
             if store.state.gitBranch.isEmpty && store.state.gitFiles.isEmpty {
                 Text(L10n.t("git.notRepo"))
-                    .font(.system(size: 12))
+                    .font(SofuuFont.font(12))
                     .foregroundStyle(c.textFaint)
                     .padding(14)
             } else if staged.isEmpty && unstaged.isEmpty {
                 Text(L10n.t("git.clean"))
-                    .font(.system(size: 12))
+                    .font(SofuuFont.font(12))
                     .foregroundStyle(c.textFaint)
                     .padding(14)
             } else {
@@ -58,7 +58,7 @@ struct GitPanel: View {
             }
             if let errorText {
                 Text(errorText)
-                    .font(.system(size: 11))
+                    .font(SofuuFont.font(11))
                     .foregroundStyle(c.err)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
@@ -77,7 +77,7 @@ struct GitPanel: View {
                 .font(.system(size: 11))
                 .foregroundStyle(c.textMuted)
             Text(store.state.gitBranch.isEmpty ? L10n.t("git.title") : "\(L10n.t("git.title")) · \(store.state.gitBranch)")
-                .font(.system(size: 12, weight: .semibold))
+                .font(SofuuFont.font(12, weight: .semibold))
                 .foregroundStyle(c.text)
             Spacer(minLength: 8)
             Button {
@@ -110,7 +110,7 @@ struct GitPanel: View {
     private func section(_ label: String, _ files: [GitFileState], isStaged: Bool) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(label)
-                .font(.system(size: 10, weight: .semibold))
+                .font(SofuuFont.font(10, weight: .semibold))
                 .tracking(0.8)
                 .foregroundStyle(c.textFaint)
                 .padding(.horizontal, 12)
@@ -176,13 +176,13 @@ struct GitPanel: View {
         let list = hunks[key] ?? []
         if loading.contains(key) {
             Text(L10n.t("git.loadingHunks"))
-                .font(.system(size: 10))
+                .font(SofuuFont.font(10))
                 .foregroundStyle(c.textFaint)
                 .padding(.leading, 42)
                 .padding(.vertical, 3)
         } else if list.isEmpty {
             Text(L10n.t("git.noHunks"))
-                .font(.system(size: 10))
+                .font(SofuuFont.font(10))
                 .foregroundStyle(c.textFaint)
                 .padding(.leading, 42)
                 .padding(.vertical, 3)
@@ -190,18 +190,18 @@ struct GitPanel: View {
             ForEach(list) { h in
                 HStack(spacing: 8) {
                     Text(h.header)
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(SofuuFont.font(10))
                         .foregroundStyle(c.textMuted)
                         .lineLimit(1)
                     Text("+\(h.added) −\(h.removed)")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(SofuuFont.font(9))
                         .foregroundStyle(c.textFaint)
                     Spacer(minLength: 8)
                     Button(isStaged ? L10n.t("git.unstageHunk") : L10n.t("git.stageHunk")) {
                         applyHunk(relative, hunk: h, isStaged: isStaged)
                     }
                     .buttonStyle(.plain)
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(SofuuFont.font(10, weight: .semibold))
                     .foregroundStyle(c.accent)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 2)
@@ -238,7 +238,7 @@ struct GitPanel: View {
                 } label: {
                     Image(systemName: expandedHunks(f, isStaged: isStaged)
                             ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 8, weight: .bold))
+                        .font(SofuuFont.font(8, weight: .bold))
                         .foregroundStyle(c.textFaint)
                         .frame(width: 12, height: 12)
                         .contentShape(Rectangle())
@@ -249,18 +249,18 @@ struct GitPanel: View {
                 Color.clear.frame(width: 12, height: 12)
             }
             Text(f.staged?.glyph ?? (f.unstaged?.glyph ?? "M"))
-                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                .font(SofuuFont.font(10, weight: .bold))
                 .foregroundStyle(f.unstaged != nil ? c.warn : c.textMuted)
                 .frame(width: 14)
             Button(tail) {
                 store.openFile(store.state.projectDir.map { $0 + "/" + f.relative } ?? f.relative)
             }
             .buttonStyle(.plain)
-            .font(.system(size: 12, design: .monospaced))
+            .font(SofuuFont.font(12))
             .foregroundStyle(c.text)
             .lineLimit(1)
             Text(f.relative)
-                .font(.system(size: 10))
+                .font(SofuuFont.font(10))
                 .foregroundStyle(c.textFaint)
                 .lineLimit(1)
                 .truncationMode(.head)
@@ -293,13 +293,13 @@ struct GitPanel: View {
         HStack(spacing: 8) {
             TextField(L10n.t("git.messagePlaceholder"), text: $message, axis: .vertical)
                 .textFieldStyle(.plain)
-                .font(.system(size: 12))
+                .font(SofuuFont.font(12))
                 .foregroundStyle(c.text)
                 .lineLimit(1...3)
                 .focused($messageFocused)
             Button(action: commit) {
                 Text(L10n.t("git.commit"))
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(SofuuFont.font(11, weight: .semibold))
                     .foregroundStyle(c.accentContrast)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 5)

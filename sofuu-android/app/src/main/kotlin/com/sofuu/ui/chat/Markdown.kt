@@ -35,7 +35,6 @@ import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.ExperimentalTextApi
 import androidx.compose.ui.text.buildAnnotatedString
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -45,6 +44,7 @@ import androidx.compose.ui.unit.sp
 import com.sofuu.ui.components.Icons2
 import com.sofuu.ui.soapbubble.SoapBubbleButton
 import com.sofuu.ui.theme.LocalSofuuColors
+import com.sofuu.ui.theme.GeistMono
 import com.sofuu.ui.theme.SofuuColors
 import kotlin.math.max
 
@@ -151,7 +151,7 @@ private fun CodeBlock(code: String, lang: String, fontSize: Int, bg: Color, fg: 
                 color = c.textMuted,
                 fontSize = 11.sp,
                 fontWeight = FontWeight.Medium,
-                fontFamily = FontFamily.Monospace,
+                fontFamily = GeistMono,
                 modifier = Modifier.weight(1f),
             )
             SoapBubbleButton(
@@ -176,7 +176,7 @@ private fun CodeBlock(code: String, lang: String, fontSize: Int, bg: Color, fg: 
                     if (copied) "Copied" else "Copy",
                     fontSize = 11.sp,
                     color = if (copied) c.ok else c.textFaint,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = GeistMono,
                 )
             }
         }
@@ -185,7 +185,7 @@ private fun CodeBlock(code: String, lang: String, fontSize: Int, bg: Color, fg: 
             color = fg,
             fontSize = (fontSize - 1).sp,
             lineHeight = (fontSize + 5).sp,
-            fontFamily = FontFamily.Monospace,
+            fontFamily = GeistMono,
             modifier = Modifier
                 .horizontalScroll(rememberScrollState())
                 .padding(10.dp),
@@ -270,7 +270,7 @@ private fun buildInline(s: String, c: SofuuColors, from: Int = 0, to: Int = s.le
 @OptIn(ExperimentalTextApi::class)
 private fun AnnotatedString.Builder.scanInline(s: String, c: SofuuColors, from: Int, to: Int) {
     var i = from
-    val mono = SpanStyle(fontFamily = FontFamily.Monospace, background = c.codeChip)
+    val mono = SpanStyle(fontFamily = GeistMono, background = c.codeChip)
 
     while (i < to) {
         when {

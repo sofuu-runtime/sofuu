@@ -16,7 +16,7 @@ enum IDEHUD {
         let contentHeight = CGFloat(lines.count) * 16 + 20
         let frame = hoveringRect(anchor: anchor, contentHeight: contentHeight)
         let view = NSHostingView(rootView:
-            ScrollView { Text(text).font(.system(size: 12)) .frame(maxWidth: 420, alignment: .leading).padding(10) }
+            ScrollView { Text(text).font(SofuuFont.font(12)) .frame(maxWidth: 420, alignment: .leading).padding(10) }
                 .background(CompositedTheme.surface)
         )
         present(&hoverPanel, content: view, frame: frame)
@@ -213,12 +213,12 @@ struct CompletionList: View {
             ForEach(Array((model.completions ?? []).enumerated()), id: \.offset) { index, item in
                 HStack {
                     Text(item.label)
-                        .font(.system(size: 12, design: .monospaced))
+                        .font(SofuuFont.font(12))
                         .lineLimit(1)
                     Spacer(minLength: 8)
                     if let detail = item.detail ?? item.documentation {
                         Text(detail.replacingOccurrences(of: "\n", with: " "))
-                            .font(.system(size: 10))
+                            .font(SofuuFont.font(10))
                             .foregroundColor(.secondary)
                             .lineLimit(1)
                     }
@@ -246,7 +246,7 @@ struct OutlineList: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text("Document outline")
-                .font(.system(size: 10, weight: .semibold))
+                .font(SofuuFont.font(10, weight: .semibold))
                 .foregroundColor(.secondary)
                 .padding(8)
             ScrollView {
@@ -257,14 +257,14 @@ struct OutlineList: View {
                         } label: {
                             HStack(spacing: 6) {
                                 Text(row.depthLabel)
-                                    .font(.system(size: 9))
+                                    .font(SofuuFont.font(9))
                                     .foregroundColor(.secondary)
                                 Text(row.node.name)
-                                    .font(.system(size: 12, design: .monospaced))
+                                    .font(SofuuFont.font(12))
                                     .lineLimit(1)
                                 Spacer()
                                 Text(String(row.node.line + 1))
-                                    .font(.system(size: 10))
+                                    .font(SofuuFont.font(10))
                                     .foregroundColor(.secondary)
                             }
                             .padding(.horizontal, 10)
@@ -308,7 +308,7 @@ private struct DiffPanelView: View {
                     .font(.system(size: 11))
                     .foregroundColor(.secondary)
                 Text(title)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(SofuuFont.font(12, weight: .semibold))
                     .foregroundStyle(c.text)
                     .lineLimit(1)
                 Spacer(minLength: 8)
@@ -352,17 +352,17 @@ private struct PromptPanelView: View {
     var body: some View {
         HStack(spacing: 10) {
             Text(title)
-                .font(.system(size: 12, weight: .semibold))
+                .font(SofuuFont.font(12, weight: .semibold))
                 .foregroundStyle(c.text)
             TextField(placeholder, text: $text)
                 .textFieldStyle(.plain)
-                .font(.system(size: 12, design: .monospaced))
+                .font(SofuuFont.font(12))
                 .focused($focused)
                 .onSubmit(commit)
                 .frame(maxWidth: .infinity)
             Button("Go", action: commit)
                 .buttonStyle(.plain)
-                .font(.system(size: 11, weight: .semibold))
+                .font(SofuuFont.font(11, weight: .semibold))
                 .foregroundStyle(c.accentContrast)
                 .padding(.horizontal, 10).padding(.vertical, 4)
                 .background(c.accent, in: Capsule())
@@ -404,7 +404,7 @@ private struct ListPanelView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Text(title)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(SofuuFont.font(11, weight: .semibold))
                     .foregroundStyle(c.textMuted)
                 Spacer()
                 Button {
@@ -426,7 +426,7 @@ private struct ListPanelView: View {
                             onPick(index)
                         } label: {
                             Text(item)
-                                .font(.system(size: 12, design: .monospaced))
+                                .font(SofuuFont.font(12))
                                 .foregroundStyle(c.text)
                                 .lineLimit(1)
                                 .padding(.horizontal, 12).padding(.vertical, 5)

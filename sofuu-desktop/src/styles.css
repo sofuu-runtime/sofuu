@@ -1,24 +1,26 @@
 /* styles.css — Sofuu Desktop themes (PLAN-DESKTOP §4a, locked).
    Warm cream (light) / warm dark, hairline borders, purple accent,
    generous whitespace. Every color is a token in :root, re-mapped under
-   [data-theme="dark"]; components never hardcode hex. Type: JetBrains
-   Mono variable (user choice). */
+   [data-theme="dark"]; components never hardcode hex. Type: Geist Mono
+   variable (the same face as the website and native apps). */
 
-/* JetBrains Mono variable (OFL; weights 100–800, upright + italic) */
+/* Geist Mono variable (OFL; weights 100–900, upright + italic) */
 @font-face {
-  font-family: "JetBrains Mono";
-  src: url("./assets/fonts/JetBrainsMono-Variable.woff2") format("woff2-variations");
-  font-weight: 100 800;
+  font-family: "Geist Mono";
+  src: url("./assets/fonts/GeistMono-Variable.woff2") format("woff2-variations");
+  font-weight: 100 900;
   font-style: normal;
-  font-display: swap;
+  /* The font ships inside the app bundle; block instead of swapping so no
+     other family can flash before Geist Mono resolves. */
+  font-display: block;
 }
 
 @font-face {
-  font-family: "JetBrains Mono";
-  src: url("./assets/fonts/JetBrainsMono-VariableItalic.woff2") format("woff2-variations");
-  font-weight: 100 800;
+  font-family: "Geist Mono";
+  src: url("./assets/fonts/GeistMono-VariableItalic.woff2") format("woff2-variations");
+  font-weight: 100 900;
   font-style: italic;
-  font-display: swap;
+  font-display: block;
 }
 
 :root {
@@ -105,9 +107,9 @@
   --shadow-pop: 0 4px 14px rgba(0, 0, 0, 0.06), 0 12px 32px rgba(0, 0, 0, 0.08);
   --shadow-modal: 0 12px 32px rgba(0, 0, 0, 0.08), 0 24px 64px rgba(0, 0, 0, 0.12);
 
-  /* Type — JetBrains Mono everywhere (UI + code), per user request */
-  --font-ui: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* Type — Geist Mono everywhere (UI + code), no fallback family. */
+  --font-ui: "Geist Mono";
+  --font-mono: "Geist Mono";
 }
 
 /* Warm dark: same hue family as the cream (brown-amber greys, not
@@ -338,7 +340,7 @@ textarea:focus-visible,
 }
 
 /* Unified button grid: every control is 36px tall. Chrome glyphs are
-   22px SVGs, flex-centered — Unicode symbols in JetBrains Mono do not
+   22px SVGs, flex-centered — Unicode symbols in Geist Mono do not
    sit on the optical center of the box. All sizes even numbers. */
 .icon {
   display: block;
@@ -1602,7 +1604,7 @@ span.topbar-tab { cursor: pointer; user-select: none; }
 .msg-system {
   color: var(--text-faint);
   font-size: 12.5px;
-  font-family: var(--font-mono, ui-monospace, monospace);
+  font-family: var(--font-mono);
   white-space: pre-wrap;
   margin: 4px 0;
   padding: 6px 10px;
@@ -1612,7 +1614,7 @@ span.topbar-tab { cursor: pointer; user-select: none; }
 /* ── Approval diff view (edit_file / write_file gates) ─────────── */
 
 .approval-path {
-  font-family: var(--font-mono, ui-monospace, monospace);
+  font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text-faint);
   margin-bottom: 6px;
@@ -1626,7 +1628,7 @@ span.topbar-tab { cursor: pointer; user-select: none; }
 
 /* bash approval: the command itself, readable, not JSON-escaped. */
 .approval-cmd {
-  font-family: var(--font-mono, ui-monospace, monospace);
+  font-family: var(--font-mono);
   font-size: 12.5px;
   line-height: 1.5;
   margin: 0 0 6px;
@@ -1638,7 +1640,7 @@ span.topbar-tab { cursor: pointer; user-select: none; }
 }
 
 .diff-view {
-  font-family: var(--font-mono, ui-monospace, monospace);
+  font-family: var(--font-mono);
   font-size: 11.5px;
   line-height: 1.45;
   max-height: 260px;
@@ -1684,7 +1686,7 @@ span.topbar-tab { cursor: pointer; user-select: none; }
 }
 .tl-notice .tl-notice-kind {
   flex: none;
-  font-family: var(--font-mono, ui-monospace, monospace);
+  font-family: var(--font-mono);
   font-size: 10.5px;
   color: var(--accent);
   text-transform: uppercase;

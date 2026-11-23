@@ -32,14 +32,14 @@ struct AgentsPane: View {
             SectionCard(label: "REGISTERED") {
                 if agents.isEmpty {
                     Text("No agents defined yet. Add one below.")
-                        .font(.system(size: 12)).foregroundStyle(c.textFaint)
+                        .font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
                 } else {
                     ForEach(Array(agents.enumerated()), id: \.offset) { _, a in
                         VStack(alignment: .leading, spacing: 1) {
                             Text(a.optString("name"))
-                                .font(.system(size: 13, design: .monospaced)).foregroundStyle(c.text)
+                                .font(SofuuFont.font(13)).foregroundStyle(c.text)
                             Text(describe(a))
-                                .font(.system(size: 11)).foregroundStyle(c.textFaint)
+                                .font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
                         }
                         .padding(.vertical, 3)
                     }
@@ -77,7 +77,7 @@ struct AgentsPane: View {
                         }
                     }
                     if let note {
-                        Text(note).font(.system(size: 11))
+                        Text(note).font(SofuuFont.font(11))
                             .foregroundStyle(note.hasPrefix("Could not") ? c.err : c.textFaint)
                     }
                 }
@@ -105,18 +105,18 @@ struct AgentsPane: View {
                     if let a = answer {
                         if (a["ok"] as? Bool) != true {
                             Text(a.optString("error").isEmpty ? "run failed" : a.optString("error"))
-                                .font(.system(size: 12)).foregroundStyle(c.err)
+                                .font(SofuuFont.font(12)).foregroundStyle(c.err)
                         } else {
                             let stopped = a.optString("stopped")
                             Text("\(a.optInt("steps")) steps"
                                 + (stopped.isEmpty || stopped == "null" ? "" : " · stopped: \(stopped)"))
-                                .font(.system(size: 11, design: .monospaced))
+                                .font(SofuuFont.font(11))
                                 .foregroundStyle(c.textFaint)
                         }
                     }
                 }
                 if let a = answer, (a["ok"] as? Bool) == true {
-                    Text(a.optString("answer")).font(.system(size: 12))
+                    Text(a.optString("answer")).font(SofuuFont.font(12))
                         .foregroundStyle(c.text)
                 }
             }
@@ -215,16 +215,16 @@ struct BrainPane: View {
     private var storedSection: some View {
         SectionCard(label: "STORED") {
             if let brainErr {
-                Text(brainErr).font(.system(size: 12)).foregroundStyle(c.err)
+                Text(brainErr).font(SofuuFont.font(12)).foregroundStyle(c.err)
             } else if let i = info {
                 Text("\(i.optInt("count")) memories")
-                    .font(.system(size: 18, design: .monospaced)).foregroundStyle(c.text)
+                    .font(SofuuFont.font(18)).foregroundStyle(c.text)
                 Text("space \(i.optString("backend")) · \(i.optInt("dim"))-dim"
                     + ((i["semantic"] as? Bool) == true ? " · semantic channel on" : ""))
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(SofuuFont.font(11))
                     .foregroundStyle(c.textFaint)
             } else {
-                Text("Reading the brain…").font(.system(size: 12)).foregroundStyle(c.textFaint)
+                Text("Reading the brain…").font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
             }
 
             HStack(spacing: 8) {
@@ -251,7 +251,7 @@ struct BrainPane: View {
             }
             if decayArmed {
                 Text("Decay weakens and prunes old memories. Click again to run it.")
-                    .font(.system(size: 10)).foregroundStyle(c.warn)
+                    .font(SofuuFont.font(10)).foregroundStyle(c.warn)
             }
         }
     }
@@ -266,16 +266,16 @@ struct BrainPane: View {
                 }
                 if hits.isEmpty {
                     Text("Scored nearest memories — forget with the ✕.")
-                        .font(.system(size: 10)).foregroundStyle(c.textFaint)
+                        .font(SofuuFont.font(10)).foregroundStyle(c.textFaint)
                 }
             }
             ForEach(Array(hits.enumerated()), id: \.offset) { _, h in
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(h.optString("text").isEmpty ? h.optString("kind") : h.optString("text"))
-                            .font(.system(size: 12)).foregroundStyle(c.text)
+                            .font(SofuuFont.font(12)).foregroundStyle(c.text)
                         Text(String(format: "score %.3f · %@", h.optDouble("score"), h.optString("tier")))
-                            .font(.system(size: 10, design: .monospaced)).foregroundStyle(c.textFaint)
+                            .font(SofuuFont.font(10)).foregroundStyle(c.textFaint)
                     }
                     Spacer()
                     let id = h.optInt("id", -1)
@@ -303,14 +303,14 @@ struct BrainPane: View {
             if let m = ml, (m["ok"] as? Bool) == true {
                 let ws = m["workset"] as? JSONObject
                 Text("\(ws?.optInt("runs") ?? 0) runs · \(ws?.optInt("calls") ?? 0) calls · \(ws?.optInt("segments") ?? 0) segments")
-                    .font(.system(size: 12, design: .monospaced)).foregroundStyle(c.text)
+                    .font(SofuuFont.font(12)).foregroundStyle(c.text)
                 if let on = (m["info"] as? JSONObject)?["on"] as? JSONObject {
                     ForEach(on.keys.sorted(), id: \.self) { k in
                         HStack {
-                            Text(k).font(.system(size: 11, design: .monospaced)).foregroundStyle(c.textFaint)
+                            Text(k).font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
                             Spacer()
                             Text((on[k] as? Bool) == true ? "on" : "off")
-                                .font(.system(size: 11))
+                                .font(SofuuFont.font(11))
                                 .foregroundStyle((on[k] as? Bool) == true ? c.accent : c.textMuted)
                         }
                     }
@@ -336,15 +336,15 @@ struct BrainPane: View {
                     }
                 }
                 if let labelNote {
-                    Text(labelNote).font(.system(size: 10))
+                    Text(labelNote).font(SofuuFont.font(10))
                         .foregroundStyle(labelNote.hasPrefix("Label recorded") ? c.textFaint : c.warn)
                 }
             } else if let m = ml {
                 Text(m.optString("error").isEmpty ? "The sofuu.ml layer is not loaded in this build." : m.optString("error"))
-                    .font(.system(size: 12)).foregroundStyle(c.err)
+                    .font(SofuuFont.font(12)).foregroundStyle(c.err)
             } else {
                 Text("The sofuu.ml layer is not loaded in this build.")
-                    .font(.system(size: 12)).foregroundStyle(c.textFaint)
+                    .font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
             }
         }
     }
@@ -369,10 +369,10 @@ struct BrainPane: View {
                         let nudge = v.optString("nudge")
                         Text(String(format: "pass · %@ · %.3f", v.optString("source"), v.optDouble("score"))
                             + (nudge.isEmpty || nudge == "null" ? "" : " · nudge: \(nudge)"))
-                            .font(.system(size: 11)).foregroundStyle(c.textMuted)
+                            .font(SofuuFont.font(11)).foregroundStyle(c.textMuted)
                     } else {
                         Text("blocked · \(v.optString("reason"))")
-                            .font(.system(size: 11)).foregroundStyle(c.warn)
+                            .font(SofuuFont.font(11)).foregroundStyle(c.warn)
                     }
                 }
             }
@@ -391,7 +391,7 @@ struct BrainPane: View {
                     }
                 }
                 if let gcNote {
-                    Text(gcNote).font(.system(size: 11)).foregroundStyle(c.textFaint)
+                    Text(gcNote).font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
                 }
             }
         }
@@ -408,18 +408,18 @@ struct BrainPane: View {
                     spaceLine("semantic v2", dim: v2.optInt("dimension"), available: (v2["available"] as? Bool) ?? false)
                 }
             } else {
-                Text("No embedding manifest yet.").font(.system(size: 12)).foregroundStyle(c.textFaint)
+                Text("No embedding manifest yet.").font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
             }
         }
     }
 
     private func spaceLine(_ label: String, dim: Int, available: Bool) -> some View {
         HStack {
-            Text(label).font(.system(size: 12, design: .monospaced))
+            Text(label).font(SofuuFont.font(12))
                 .foregroundStyle(available ? c.text : c.err)
             Spacer()
             Text(available ? "\(dim)-dim" : "artifact unavailable")
-                .font(.system(size: 11))
+                .font(SofuuFont.font(11))
                 .foregroundStyle(available ? c.textFaint : c.err)
         }
     }
@@ -435,7 +435,7 @@ struct BrainPane: View {
                 }
                 if let s = sim {
                     Text(String(format: "cosine %.4f · %d-dim", s.optDouble("similarity"), s.optInt("dim")))
-                        .font(.system(size: 12, design: .monospaced)).foregroundStyle(c.text)
+                        .font(SofuuFont.font(12)).foregroundStyle(c.text)
                 }
             }
         }
@@ -454,10 +454,10 @@ struct BrainPane: View {
                     Button { Task { @MainActor in await store.pickLocalModel(u.path) } } label: {
                         HStack(spacing: 8) {
                             Text(LocalModels.label(u))
-                                .font(.system(size: 12, design: .monospaced))
+                                .font(SofuuFont.font(12))
                                 .foregroundStyle(active ? c.accent : c.text)
                             if active {
-                                Text("in use — runs locally").font(.system(size: 10)).foregroundStyle(c.textFaint)
+                                Text("in use — runs locally").font(SofuuFont.font(10)).foregroundStyle(c.textFaint)
                             }
                         }
                     }

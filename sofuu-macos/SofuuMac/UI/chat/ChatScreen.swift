@@ -86,7 +86,7 @@ private struct MessageRow: View {
                 Spacer(minLength: 40)
                 VStack(alignment: .trailing, spacing: 3) {
                     Text(m.content)
-                        .font(.system(size: CGFloat(fontSize)))
+                        .font(SofuuFont.font(CGFloat(fontSize)))
                         .lineSpacing(4)
                         .foregroundStyle(c.text)
                         .padding(.horizontal, 14).padding(.vertical, 10)
@@ -115,7 +115,7 @@ private struct MessageRow: View {
 
         case .system:
             Text(m.content)
-                .font(.system(size: CGFloat(fontSize - 3), design: .monospaced))
+                .font(SofuuFont.font(CGFloat(fontSize - 3)))
                 .foregroundStyle(c.textMuted)
                 .padding(.horizontal, 8).padding(.vertical, 6)
 
@@ -137,7 +137,7 @@ private struct MessageRow: View {
                     HStack(alignment: .bottom, spacing: 2) {
                         if showSource {
                             Text(m.content)
-                                .font(.system(size: CGFloat(fontSize - 1), design: .monospaced))
+                                .font(SofuuFont.font(CGFloat(fontSize - 1)))
                                 .foregroundStyle(c.textMuted)
                                 .textSelection(.enabled)
                         } else {
@@ -148,7 +148,7 @@ private struct MessageRow: View {
                 }
                 if m.status == "error", let error = m.error {
                     Text(error)
-                        .font(.system(size: CGFloat(fontSize - 2)))
+                        .font(SofuuFont.font(CGFloat(fontSize - 2)))
                         .foregroundStyle(c.err)
                         .padding(10)
                         .background(c.errBg, in: RoundedRectangle(cornerRadius: 8))
@@ -156,7 +156,7 @@ private struct MessageRow: View {
                 }
                 if m.status == "done", let usage = m.usage, let line = usage.line() {
                     Text(line)
-                        .font(.system(size: CGFloat(fontSize - 4)))
+                        .font(SofuuFont.font(CGFloat(fontSize - 4)))
                         .foregroundStyle(c.textFaint)
                         .padding(.top, 4)
                 }
@@ -226,7 +226,7 @@ struct TUILiveLine: View {
     /// italic monospace (the TUI's `outLast('  ▸ thinking ' + …)` line).
     private func thinkLine(_ think: String) -> Text {
         var attrs = AttributeContainer()
-        attrs.font = .system(size: CGFloat(fontSize), weight: .regular, design: .monospaced)
+        attrs.font = SofuuFont.font(CGFloat(fontSize))
         attrs.foregroundColor = c.textFaint
         return Text(AttributedString("▸ thinking \(think)", attributes: attrs))
     }
@@ -238,7 +238,7 @@ struct TUILiveLine: View {
         let chars = Array(label)
         for (i, ch) in chars.enumerated() {
             var a = AttributeContainer()
-                .font(.system(size: 13, design: .monospaced))
+                .font(SofuuFont.font(13))
             a.foregroundColor = i == frame % chars.count ? c.textFaint : c.textMuted
             out.append(AttributedString(String(ch), attributes: a))
         }
@@ -258,7 +258,7 @@ struct SpinnerCursor: View {
 
     var body: some View {
         Text(Self.frames[abs(frame) % Self.frames.count])
-            .font(.system(size: 14, design: .monospaced))
+            .font(SofuuFont.font(14))
             .foregroundStyle(c.textMuted)
     }
 }
@@ -344,14 +344,14 @@ private struct TimelineRowView: View {
                     .foregroundStyle(row.icon == Timeline.iconWarn ? c.warn : c.textFaint)
                     .frame(width: 14)
                 Text(row.title)
-                    .font(.system(size: 13, weight: .medium))
+                    .font(SofuuFont.font(13, weight: .medium))
                     .foregroundStyle(c.textMuted)
                 if let badge = row.badge {
-                    Text(badge).font(.system(size: 12)).foregroundStyle(c.textFaint)
+                    Text(badge).font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
                 }
                 if let ok = row.ok {
                     Text(ok ? "✓" : "✗")
-                        .font(.system(size: 12))
+                        .font(SofuuFont.font(12))
                         .foregroundStyle(ok ? c.ok : c.err)
                 }
                 if onToggle != nil {
@@ -363,7 +363,7 @@ private struct TimelineRowView: View {
             }
             if expanded, let detail = row.detail {
                 Text(String(detail.prefix(1500)))
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(SofuuFont.font(12))
                     .foregroundStyle(c.textFaint)
                     .padding(8)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -389,7 +389,7 @@ private struct PreviewPane: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 4) {
                 Text("Read-only transcript · \(preview.label) · \(preview.turns.count) turns")
-                    .font(.system(size: 12))
+                    .font(SofuuFont.font(12))
                     .foregroundStyle(c.textFaint)
                     .padding(.bottom, 8)
 
@@ -397,7 +397,7 @@ private struct PreviewPane: View {
                     HStack {
                         Spacer(minLength: 40)
                         Text(t.prompt)
-                            .font(.system(size: CGFloat(fontSize)))
+                            .font(SofuuFont.font(CGFloat(fontSize)))
                             .foregroundStyle(c.text)
                             .padding(.horizontal, 14).padding(.vertical, 10)
                             .background(c.bgCard, in: RoundedRectangle(cornerRadius: 14))

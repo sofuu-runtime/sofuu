@@ -47,7 +47,7 @@ export class ErrorBoundary extends React.Component<
             justifyContent: "center",
             gap: 12,
             padding: 32,
-            fontFamily: "ui-monospace, monospace",
+            fontFamily: '"Geist Mono"',
             fontSize: 13,
             color: "#b3362b",
             textAlign: "center",

@@ -39,7 +39,6 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -53,6 +52,7 @@ import com.sofuu.ui.soapbubble.SoapBubbleButton
 import com.sofuu.ui.soapbubble.SoapBubbleSurface
 import com.sofuu.ui.soapbubble.toCssRgb
 import com.sofuu.ui.theme.LocalSofuuColors
+import com.sofuu.ui.theme.GeistMono
 
 /**
  * The composer card: text input on top, bottom bar with model/effort
@@ -157,10 +157,9 @@ fun Composer(
                                 opacity = 0.9f,
                             ),
                             modifier = Modifier.size(18.dp).align(Alignment.TopEnd),
+                            contentAlignment = Alignment.Center,
                         ) {
-                            Box(Modifier.fillMaxWidth().height(18.dp), contentAlignment = Alignment.Center) {
-                                Text("×", color = androidx.compose.ui.graphics.Color.White, fontSize = 11.sp)
-                            }
+                            Icon(Icons2.Close, "Remove", tint = androidx.compose.ui.graphics.Color.White, modifier = Modifier.size(10.dp))
                         }
                     }
                 }
@@ -211,7 +210,7 @@ fun Composer(
                         text = it
                         slashIdx = 0
                     },
-                    textStyle = TextStyle(color = c.text, fontSize = 15.sp, fontWeight = FontWeight.Medium, fontFamily = FontFamily.Monospace),
+                    textStyle = TextStyle(color = c.text, fontSize = 15.sp, fontWeight = FontWeight.Medium, fontFamily = GeistMono),
                     cursorBrush = SolidColor(c.accent),
                     modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp, max = 160.dp),
                     decorationBox = { inner ->
@@ -221,7 +220,7 @@ fun Composer(
                                 color = c.textFaint,
                                 fontSize = 15.sp,
                                 fontWeight = FontWeight.Medium,
-                                fontFamily = FontFamily.Monospace,
+                                fontFamily = GeistMono,
                             )
                         }
                         inner()
@@ -307,12 +306,13 @@ private fun IconAction(
         radius = 999f,
         settings = actionSettings,
         modifier = Modifier.size(40.dp),
+        contentAlignment = Alignment.Center,
     ) {
         Icon(
             icon,
             description,
             tint = if (active) c.accent else (if (c.dark) c.textMuted else c.text),
-            modifier = Modifier.size(40.dp).padding(10.dp),
+            modifier = Modifier.size(20.dp),
         )
     }
 }
@@ -356,11 +356,11 @@ private fun Pill(
         settings = pillSettings,
         contentColor = c.text,
         fontSize = 13.sp,
-        minHeight = 40.dp,
+        minHeight = 36.dp,
         fillWidth = false,
         radius = 999f,
         modifier = modifier,
-        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
     ) {
         if (icon != null) {
             Icon(icon, null, tint = c.accent, modifier = Modifier.size(14.dp))
@@ -390,12 +390,13 @@ private fun SendButton(icon: androidx.compose.ui.graphics.vector.ImageVector, ti
         radius = 999f,
         settings = LocalSoapBubbleSettings.current.copy(tint = tint.toCssRgb(), opacity = 0.9f),
         modifier = Modifier.size(42.dp),
+        contentAlignment = Alignment.Center,
     ) {
         Icon(
             icon,
             null,
             tint = androidx.compose.ui.graphics.Color.White,
-            modifier = Modifier.size(42.dp).padding(11.dp),
+            modifier = Modifier.size(20.dp),
         )
     }
 }
@@ -464,10 +465,10 @@ private fun SlashPalette(commands: List<com.sofuu.store.SlashCommand>, activeIdx
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("/${cmd.name}", color = c.accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, fontFamily = FontFamily.Monospace)
+                        Text("/${cmd.name}", color = c.accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, fontFamily = GeistMono)
                         if (cmd.arg != null) {
                             Spacer(Modifier.width(4.dp))
-                            Text(cmd.arg, color = c.textFaint, fontSize = 13.sp, fontFamily = FontFamily.Monospace)
+                            Text(cmd.arg, color = c.textFaint, fontSize = 13.sp, fontFamily = GeistMono)
                         }
                         Spacer(Modifier.width(8.dp))
                         Text(cmd.desc, color = c.textMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)

@@ -74,7 +74,7 @@ struct SettingsScreen: View {
                     Image(systemName: "chevron.left")
                         .font(.system(size: 12, weight: .semibold))
                     Text("Back")
-                        .font(.system(size: 13))
+                        .font(SofuuFont.font(13))
                 }
                 .foregroundStyle(c.accent)
                 .padding(.horizontal, 12).padding(.vertical, 7)
@@ -86,7 +86,7 @@ struct SettingsScreen: View {
             .help("Back to the chat (Esc)")
 
             Text("Settings")
-                .font(.system(size: 20, weight: .semibold))
+                .font(SofuuFont.font(20, weight: .semibold))
                 .foregroundStyle(c.text)
             Spacer(minLength: 0)
         }
@@ -100,7 +100,7 @@ struct SettingsScreen: View {
                 let active = t == tab
                 Button { tab = t } label: {
                     Text(t.prefix(1).uppercased() + t.dropFirst())
-                        .font(.system(size: 12))
+                        .font(SofuuFont.font(12))
                         .foregroundStyle(active ? c.accentContrast : c.textMuted)
                         .padding(.horizontal, 13).padding(.vertical, 7)
                         .background(active ? c.accent : c.bgCard, in: Capsule())
@@ -127,12 +127,12 @@ struct SectionCard<Content: View>: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text(label)
-                .font(.system(size: 11, weight: .semibold))
+                .font(SofuuFont.font(11, weight: .semibold))
                 .foregroundStyle(c.textFaint)
             content
             if let footer {
                 Text(footer)
-                    .font(.system(size: 10))
+                    .font(SofuuFont.font(10))
                     .foregroundStyle(c.textFaint)
             }
         }
@@ -153,9 +153,9 @@ struct ControlRow<Control: View>: View {
     var body: some View {
         HStack(alignment: .center, spacing: 16) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(label).font(.system(size: 13)).foregroundStyle(c.text)
+                Text(label).font(SofuuFont.font(13)).foregroundStyle(c.text)
                 if let desc {
-                    Text(desc).font(.system(size: 11)).foregroundStyle(c.textFaint)
+                    Text(desc).font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
                 }
             }
             Spacer(minLength: 12)
@@ -176,9 +176,9 @@ struct StackRow<Control: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(label).font(.system(size: 13)).foregroundStyle(c.text)
+            Text(label).font(SofuuFont.font(13)).foregroundStyle(c.text)
             if let desc {
-                Text(desc).font(.system(size: 11)).foregroundStyle(c.textFaint)
+                Text(desc).font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
             }
             control
                 .frame(maxWidth: controlWidth, alignment: .leading)
@@ -199,9 +199,9 @@ struct ToggleRow: View {
         Button(action: onToggle) {
             HStack(alignment: .center, spacing: 16) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(label).font(.system(size: 13)).foregroundStyle(c.text)
+                    Text(label).font(SofuuFont.font(13)).foregroundStyle(c.text)
                     if let desc {
-                        Text(desc).font(.system(size: 11)).foregroundStyle(c.textFaint)
+                        Text(desc).font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
                     }
                 }
                 Spacer(minLength: 12)
@@ -230,7 +230,7 @@ struct Segmented: View {
                 let active = o == selected
                 Button { onSelect(o) } label: {
                     Text(display(o))
-                        .font(.system(size: 12))
+                        .font(SofuuFont.font(12))
                         .foregroundStyle(active ? c.text : c.textMuted)
                         .padding(.horizontal, 11).padding(.vertical, 6)
                         .background(active ? c.bgRaised : .clear, in: RoundedRectangle(cornerRadius: 6))
@@ -266,7 +266,7 @@ struct TextFieldRow: View {
                 TextField(placeholder, text: $text)
             }
         }
-        .font(.system(size: 12, design: .monospaced))
+        .font(SofuuFont.font(12))
         .foregroundStyle(c.text)
         .tint(c.accent)
         .textFieldStyle(.plain)
@@ -292,7 +292,7 @@ struct AccentButton: View {
 
     var body: some View {
         Button(action: onClick) {
-            Text(label).font(.system(size: 12)).foregroundStyle(c.accentContrast)
+            Text(label).font(SofuuFont.font(12)).foregroundStyle(c.accentContrast)
                 .padding(.horizontal, 14).padding(.vertical, 8)
                 .background(c.accent, in: Capsule())
         }
@@ -309,7 +309,7 @@ struct SmallButton: View {
 
     var body: some View {
         Button { action() } label: {
-            Text(label).font(.system(size: 12)).foregroundStyle(fg)
+            Text(label).font(SofuuFont.font(12)).foregroundStyle(fg)
                 .padding(.horizontal, 12).padding(.vertical, 7)
                 .background(bg, in: Capsule())
         }
@@ -341,26 +341,26 @@ private struct GeneralPane: View {
                     engineLine("Context", "\(grouped(e.optInt("contextTokens"))) tk")
                     engineLine("Spend", "$\(String(format: "%.4f", e.optDouble("sessionSpendUsd")))")
                     if e.optBool("streaming") {
-                        Text("Generating…").font(.system(size: 11)).foregroundStyle(c.accent)
+                        Text("Generating…").font(SofuuFont.font(11)).foregroundStyle(c.accent)
                     }
                     if e.optInt("pendingApprovals") > 0 {
                         Text("\(e.optInt("pendingApprovals")) awaiting approval")
-                            .font(.system(size: 11)).foregroundStyle(c.warn)
+                            .font(SofuuFont.font(11)).foregroundStyle(c.warn)
                     }
                 } else {
                     Text(state.engineReady ? "Connected — waiting for engine state…" : "Engine not connected.")
-                        .font(.system(size: 12)).foregroundStyle(c.textFaint)
+                        .font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
                 }
             }
 
             SectionCard(label: "WORKSPACE") {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Project folder").font(.system(size: 13)).foregroundStyle(c.text)
+                    Text("Project folder").font(SofuuFont.font(13)).foregroundStyle(c.text)
                     Text("Workspace root; sessions, memory and settings live in its .sofuu/")
-                        .font(.system(size: 11)).foregroundStyle(c.textFaint)
+                        .font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
                     HStack(alignment: .center, spacing: 10) {
                         Text(state.projectDir ?? "(none)")
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(SofuuFont.font(11))
                             .foregroundStyle(c.textMuted)
                             .lineLimit(1)
                             .truncationMode(.head)
@@ -435,9 +435,9 @@ private struct GeneralPane: View {
 
     private func engineLine(_ label: String, _ value: String) -> some View {
         HStack(alignment: .top) {
-            Text(label).font(.system(size: 12)).foregroundStyle(c.textFaint)
+            Text(label).font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
                 .frame(width: 72, alignment: .leading)
-            Text(value).font(.system(size: 12, design: .monospaced)).foregroundStyle(c.text)
+            Text(value).font(SofuuFont.font(12)).foregroundStyle(c.text)
             Spacer(minLength: 0)
         }
     }
@@ -472,13 +472,13 @@ struct MacToolsList: View {
         VStack(alignment: .leading, spacing: 4) {
             if tools.isEmpty {
                 Text("None registered yet.")
-                    .font(.system(size: 12)).foregroundStyle(c.textFaint)
+                    .font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
             } else {
                 ForEach(tools, id: \.self) { t in
                     HStack(spacing: 6) {
                         Image(systemName: Icons2.check)
                             .font(.system(size: 9)).foregroundStyle(c.ok)
-                        Text(t).font(.system(size: 12, design: .monospaced)).foregroundStyle(c.text)
+                        Text(t).font(SofuuFont.font(12)).foregroundStyle(c.text)
                     }
                 }
             }
@@ -633,7 +633,7 @@ private struct AppearancePane: View {
                         }
                     } label: {
                         Text(L10n.languages.first { $0.code == appLanguage }?.name ?? appLanguage)
-                            .font(.system(size: 11))
+                            .font(SofuuFont.font(11))
                             .foregroundStyle(c.text)
                     }
                     .menuStyle(.borderedButton)
@@ -649,23 +649,6 @@ private struct AppearancePane: View {
                             onPlus: { store.setEditorFont(size: min(24, store.editorFontSize + 1)) },
                             reset: { store.setEditorFont(size: 13) })
                 }
-                if #available(macOS 13.0, *) {
-                    ControlRow(label: "Editor typeface",
-                               desc: "Fixed-pitch families installed on this Mac") {
-                        Menu {
-                            Button("System Mono") { store.setEditorFontFamily(nil) }
-                            ForEach(availableMonoFamilies, id: \.self) { family in
-                                Button(family) { store.setEditorFontFamily(family) }
-                            }
-                        } label: {
-                            Text(store.editorFontFamily ?? "System Mono")
-                                .font(.system(size: 12))
-                                .frame(width: 180)
-                        }
-                        .menuStyle(.borderedButton)
-                        .frame(width: 190)
-                    }
-                }
                 ToggleRow(label: "Indent guides",
                           desc: "Faint vertical columns at each indent level",
                           on: store.indentGuidesOn) { store.setIndentGuides(!store.indentGuidesOn) }
@@ -677,14 +660,6 @@ private struct AppearancePane: View {
         }
     }
 
-    private var availableMonoFamilies: [String] {
-        let wanted = ["SF Mono", "Menlo", "JetBrains Mono", "Fira Code", "Hack",
-                      "Source Code Pro", "IBM Plex Mono", "Cascadia Code",
-                      "Monaco", "Andale Mono", "Courier New"]
-        let installed = NSFontManager.shared.availableFontFamilies
-        return wanted.filter { installed.contains($0) }
-    }
-
     private func stepper(value: String,
                          onMinus: @escaping () -> Void,
                          onPlus: @escaping () -> Void,
@@ -692,7 +667,7 @@ private struct AppearancePane: View {
         HStack(spacing: 8) {
             SmallButton(label: "−", bg: c.bgRaised, fg: c.text, action: onMinus)
             Text(value)
-                .font(.system(size: 12, design: .monospaced)).foregroundStyle(c.text)
+                .font(SofuuFont.font(12)).foregroundStyle(c.text)
                 .frame(minWidth: 52)
             SmallButton(label: "+", bg: c.bgRaised, fg: c.text, action: onPlus)
             if let reset {
@@ -759,10 +734,10 @@ private struct ModelsPane: View {
                     let entry = state.modelsCache[p.name]
                     VStack(alignment: .leading, spacing: 5) {
                         HStack {
-                            Text(p.name).font(.system(size: 12, weight: .medium)).foregroundStyle(c.text)
+                            Text(p.name).font(SofuuFont.font(12, weight: .medium)).foregroundStyle(c.text)
                             Spacer()
                             Text(entry?.error ?? entry?.note ?? "\(entry?.models.count ?? 0) cached")
-                                .font(.system(size: 10)).foregroundStyle(c.textFaint)
+                                .font(SofuuFont.font(10)).foregroundStyle(c.textFaint)
                         }
                         if let models = entry?.models, !models.isEmpty {
                             VStack(alignment: .leading, spacing: 0) {
@@ -770,10 +745,10 @@ private struct ModelsPane: View {
                                     Button { store.pickModel(p.name, m) } label: {
                                         HStack(spacing: 6) {
                                             Text(m)
-                                                .font(.system(size: 11, design: .monospaced))
+                                                .font(SofuuFont.font(11))
                                                 .foregroundStyle(m == p.model ? c.accent : c.textMuted)
                                             if m == p.model {
-                                                Text("current").font(.system(size: 9)).foregroundStyle(c.accent)
+                                                Text("current").font(SofuuFont.font(9)).foregroundStyle(c.accent)
                                             }
                                             Spacer(minLength: 0)
                                         }
@@ -797,7 +772,7 @@ private struct ModelsPane: View {
             SectionCard(label: "ON-DEVICE GGUF MODELS",
                         footer: "Runs locally, no network. Imports land in ~/.sofuu/models.") {
                 if store.localModelURLs.isEmpty {
-                    Text("No models imported.").font(.system(size: 12)).foregroundStyle(c.textFaint)
+                    Text("No models imported.").font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
                 }
                 ForEach(store.localModelURLs, id: \.path) { u in
                     let active = state.config?.model == u.path
@@ -805,10 +780,10 @@ private struct ModelsPane: View {
                         Button { Task { await store.pickLocalModel(u.path) } } label: {
                             HStack(spacing: 8) {
                                 Text(LocalModels.label(u))
-                                    .font(.system(size: 12, design: .monospaced))
+                                    .font(SofuuFont.font(12))
                                     .foregroundStyle(active ? c.accent : c.text)
                                 if active {
-                                    Text("in use").font(.system(size: 10)).foregroundStyle(c.accent)
+                                    Text("in use").font(SofuuFont.font(10)).foregroundStyle(c.accent)
                                 }
                             }
                         }
@@ -846,7 +821,7 @@ private struct ProvidersPane: View {
             SectionCard(label: "CONFIGURED PROVIDERS") {
                 if (state.config?.providers ?? []).isEmpty {
                     Text("No providers yet — add one below.")
-                        .font(.system(size: 12)).foregroundStyle(c.textFaint)
+                        .font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
                 }
                 ForEach(state.config?.providers ?? []) { p in
                     ProviderRow(store: store, p: p, isActive: p.name == state.config?.active)
@@ -914,20 +889,20 @@ private struct ProviderRow: View {
             HStack(alignment: .center, spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 8) {
-                        Text(p.name).font(.system(size: 13, weight: .medium)).foregroundStyle(c.text)
+                        Text(p.name).font(SofuuFont.font(13, weight: .medium)).foregroundStyle(c.text)
                         if isActive {
-                            Text("active").font(.system(size: 10)).foregroundStyle(c.accentContrast)
+                            Text("active").font(SofuuFont.font(10)).foregroundStyle(c.accentContrast)
                                 .padding(.horizontal, 7).padding(.vertical, 2)
                                 .background(c.accent, in: Capsule())
                         }
                     }
                     Text(p.endpoint.isEmpty ? p.profile : p.endpoint)
-                        .font(.system(size: 11)).foregroundStyle(c.textFaint).lineLimit(1)
+                        .font(SofuuFont.font(11)).foregroundStyle(c.textFaint).lineLimit(1)
                 }
                 Spacer(minLength: 12)
                 if isActive {
                     Text(p.hasApiKey ? "Keychain" : "no key")
-                        .font(.system(size: 11))
+                        .font(SofuuFont.font(11))
                         .foregroundStyle(p.hasApiKey ? c.ok : c.warn)
                 } else {
                     SmallButton(label: "Use", bg: c.bgRaised, fg: c.text) {

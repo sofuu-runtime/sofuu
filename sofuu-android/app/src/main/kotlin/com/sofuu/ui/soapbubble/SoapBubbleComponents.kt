@@ -209,6 +209,7 @@ fun SoapBubbleSurface(
     center: DpOffset? = null,
     layer: SoapBubbleLayer? = null,
     contentPadding: PaddingValues = PaddingValues(0.dp),
+    contentAlignment: Alignment = Alignment.Center,
     content: @Composable BoxScope.() -> Unit,
 ) {
     val colors = SofuuBubble.colors
@@ -333,6 +334,7 @@ fun SoapBubbleSurface(
                 )
             }
             .padding(contentPadding),
+        contentAlignment = contentAlignment,
         content = content,
     )
 }
@@ -417,11 +419,11 @@ fun SoapBubbleButton(
     fillWidth: Boolean = true,
     radius: Float = 9999f,
     outline: Boolean = true,
-    contentPadding: PaddingValues = PaddingValues(horizontal = 20.dp),
+    contentPadding: PaddingValues = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
     content: @Composable RowScope.() -> Unit,
 ) {
     SoapBubbleSurface(
-        modifier = modifier.heightIn(min = minHeight),
+        modifier = (if (fillWidth) modifier.fillMaxWidth() else modifier).heightIn(min = minHeight),
         settings = settings,
         radius = radius,
         interactive = true,
@@ -430,13 +432,13 @@ fun SoapBubbleButton(
         role = Role.Button,
         fontSize = fontSize,
         outline = outline,
+        contentAlignment = Alignment.Center,
     ) {
         CompositionLocalProvider(LocalContentColor provides contentColor) {
             Row(
-                Modifier
+                modifier = (if (fillWidth) Modifier.fillMaxWidth() else Modifier)
                     .defaultMinSize(minHeight = minHeight)
-                    .padding(contentPadding)
-                    .then(if (fillWidth) Modifier.fillMaxWidth() else Modifier),
+                    .padding(contentPadding),
                 horizontalArrangement = Arrangement.Center,
                 verticalAlignment = Alignment.CenterVertically,
                 content = content,
@@ -478,15 +480,14 @@ fun SoapBubbleIconButton(
         onClick = onClick,
         role = Role.Button,
         outline = outline,
+        contentAlignment = Alignment.Center,
     ) {
-        Box(Modifier.fillMaxWidth().height(44.dp), contentAlignment = Alignment.Center) {
-            Icon(
-                icon,
-                contentDescription = contentDescription,
-                tint = contentColor,
-                modifier = Modifier.size(iconSize),
-            )
-        }
+        Icon(
+            icon,
+            contentDescription = contentDescription,
+            tint = contentColor,
+            modifier = Modifier.size(iconSize),
+        )
     }
 }
 

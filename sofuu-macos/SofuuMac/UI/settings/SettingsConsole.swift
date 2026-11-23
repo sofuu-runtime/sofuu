@@ -29,17 +29,17 @@ struct ConsolePane: View {
                     Spacer()
                     Toggle("Wrap lines", isOn: $wrap)
                         .toggleStyle(.checkbox)
-                        .font(.system(size: 11))
+                        .font(SofuuFont.font(11))
                         .foregroundStyle(c.textMuted)
                     Text("\(rows.count) lines")
-                        .font(.system(size: 11))
+                        .font(SofuuFont.font(11))
                         .foregroundStyle(c.textFaint)
                 }
                 .padding(.bottom, 8)
 
                 if rows.isEmpty {
                     Text("Nothing yet — the console fills as the engine logs.")
-                        .font(.system(size: 12))
+                        .font(SofuuFont.font(12))
                         .foregroundStyle(c.textFaint)
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.vertical, 40)
@@ -73,7 +73,7 @@ private struct ConsoleLogList: View {
             LazyVStack(alignment: .leading, spacing: 1) {
                 ForEach(Array(reversed.enumerated()), id: \.offset) { _, line in
                     Text(line)
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(SofuuFont.font(10))
                         .foregroundStyle(.primary.opacity(0.85))
                         .lineLimit(wrap ? nil : 1)
                 }

@@ -100,7 +100,7 @@ struct Composer: View {
                 // the desktop composer's input sits straight on the card.
                 TextField(L10n.t("composer.placeholder"), text: $text, axis: .vertical)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 15, design: .monospaced))
+                    .font(SofuuFont.font(15))
                     .foregroundStyle(c.text)
                     .tint(c.accent)
                     .lineLimit(2...10)
@@ -128,7 +128,7 @@ struct Composer: View {
                     if voiceAvailable, onVoice != nil { micButton }
                     if let voiceError {
                         Text(voiceError)
-                            .font(.system(size: 11))
+                            .font(SofuuFont.font(11))
                             .foregroundStyle(c.err)
                             .lineLimit(1)
                     }
@@ -191,7 +191,7 @@ struct Composer: View {
                         }
                         Button { onRemoveImage(i) } label: {
                             Text("×")
-                                .font(.system(size: 11))
+                                .font(SofuuFont.font(11))
                                 .foregroundStyle(.white)
                                 .frame(width: 18, height: 18)
                                 .background(c.errStrong, in: Circle())
@@ -498,7 +498,7 @@ struct Pill: View {
                 if let icon {
                     Image(systemName: icon).font(.system(size: 11)).foregroundStyle(c.accent)
                 }
-                Text(label).font(.system(size: 13)).foregroundStyle(c.text).lineLimit(1)
+                Text(label).font(SofuuFont.font(13)).foregroundStyle(c.text).lineLimit(1)
                 Image(systemName: Icons2.caret).font(.system(size: 9)).foregroundStyle(c.textFaint)
             }
             .padding(.horizontal, 12)
@@ -584,22 +584,22 @@ private struct CtxHoverCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Context window").font(.system(size: 12, weight: .medium)).foregroundStyle(c.text)
+            Text("Context window").font(SofuuFont.font(12, weight: .medium)).foregroundStyle(c.text)
             Text("\(grouped(ctx.used)) / \(grouped(ctx.window)) tk (\(ctx.pct)%)")
-                .font(.system(size: 13, design: .monospaced)).foregroundStyle(c.textMuted)
+                .font(SofuuFont.font(13)).foregroundStyle(c.textMuted)
 
             if let s = ctx.sections {
                 sectionBar(s)
             }
             if let hit = ctx.cacheHit {
                 Text("Cache hit (this turn) \(Int(hit * 100))%")
-                    .font(.system(size: 11)).foregroundStyle(c.textFaint)
+                    .font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
             }
             Text("window: \(sourceLine)")
-                .font(.system(size: 11)).foregroundStyle(c.textFaint)
+                .font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
             if ctx.clampedConfig {
                 Text("config override clamped to the model's real limit")
-                    .font(.system(size: 11)).foregroundStyle(c.warn)
+                    .font(SofuuFont.font(11)).foregroundStyle(c.warn)
             }
         }
         .padding(14)
@@ -631,9 +631,9 @@ private struct CtxHoverCard: View {
                 ForEach(Array(rows.enumerated()), id: \.offset) { _, r in
                     HStack {
                         Circle().fill(r.2).frame(width: 6, height: 6)
-                        Text(r.0).font(.system(size: 11)).foregroundStyle(c.textMuted)
+                        Text(r.0).font(SofuuFont.font(11)).foregroundStyle(c.textMuted)
                         Spacer()
-                        Text(grouped(Int(r.1))).font(.system(size: 11, design: .monospaced)).foregroundStyle(c.textFaint)
+                        Text(grouped(Int(r.1))).font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
                     }
                 }
             }
@@ -663,7 +663,7 @@ private struct SlashPalette: View {
                                 Spacer(minLength: 8)
                                 Text(cmd.desc).foregroundStyle(c.textMuted).lineLimit(1)
                             }
-                            .font(.system(size: 13, design: .monospaced))
+                            .font(SofuuFont.font(13))
                             .padding(.horizontal, 10).padding(.vertical, 7)
                             .background(i == selectedIndex ? c.hoverVeil : Color.clear, in: RoundedRectangle(cornerRadius: 6))
                             .contentShape(Rectangle())
@@ -683,7 +683,7 @@ private struct SlashPalette: View {
         .background(c.bgRaised, in: RoundedRectangle(cornerRadius: 10))
         .overlay(alignment: .bottom) {
             Text("↑↓ navigate   ↵ select   tab complete   esc dismiss")
-                .font(.system(size: 10, design: .monospaced))
+                .font(SofuuFont.font(10))
                 .foregroundStyle(c.textFaint)
                 .padding(.vertical, 4)
         }

@@ -26,7 +26,7 @@ struct UsagePane: View {
             } else {
                 SectionCard(label: "TOTALS") {
                     Text(usage == nil ? "Reading usage from the engine…" : "No usage yet — send a message first.")
-                        .font(.system(size: 12)).foregroundStyle(c.textFaint)
+                        .font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
                 }
             }
 
@@ -70,12 +70,12 @@ struct UsagePane: View {
 
     private func statCard(_ label: String, _ value: String, highlight: String?) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(label).font(.system(size: 10, weight: .medium)).foregroundStyle(c.textFaint)
+            Text(label).font(SofuuFont.font(10, weight: .medium)).foregroundStyle(c.textFaint)
             Text(value)
-                .font(.system(size: 14, design: .monospaced)).foregroundStyle(c.text)
+                .font(SofuuFont.font(14)).foregroundStyle(c.text)
                 .lineSpacing(1)
             if let highlight {
-                Text(highlight).font(.system(size: 10)).foregroundStyle(c.accent)
+                Text(highlight).font(SofuuFont.font(10)).foregroundStyle(c.accent)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -84,7 +84,7 @@ struct UsagePane: View {
     }
 
     private func mono(_ s: String) -> some View {
-        Text(s).font(.system(size: 11, design: .monospaced))
+        Text(s).font(SofuuFont.font(11))
             .foregroundStyle(c.textMuted)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 2)
@@ -143,7 +143,7 @@ private struct UsageChart: View {
                                 }
                                 .frame(maxHeight: .infinity, alignment: .bottom)
                                 Text(i % dayLabelsEvery == 0 ? String(d.day.suffix(2)) : " ")
-                                    .font(.system(size: 8, design: .monospaced))
+                                    .font(SofuuFont.font(8))
                                     .foregroundStyle(c.textFaint)
                                     .frame(height: 12)
                             }
@@ -157,7 +157,7 @@ private struct UsageChart: View {
                     swatch(c.accent.opacity(0.45), "prompt tokens")
                     Spacer()
                 }
-                .font(.system(size: 9))
+                .font(SofuuFont.font(9))
                 .foregroundStyle(c.textFaint)
             }
         }
@@ -193,12 +193,12 @@ struct ShortcutsPane: View {
                 SectionCard(label: g.uppercased()) {
                     ForEach(SHORTCUTS.filter { $0.group == g }) { s in
                         HStack {
-                            Text(s.label).font(.system(size: 13)).foregroundStyle(c.text)
+                            Text(s.label).font(SofuuFont.font(13)).foregroundStyle(c.text)
                             Spacer()
                             HStack(spacing: 3) {
                                 ForEach(s.keys, id: \.self) { k in
                                     Text(k)
-                                        .font(.system(size: 11, design: .monospaced))
+                                        .font(SofuuFont.font(11))
                                         .foregroundStyle(c.textMuted)
                                         .padding(.horizontal, 6).padding(.vertical, 2)
                                         .background(c.bgRaised, in: RoundedRectangle(cornerRadius: 4))

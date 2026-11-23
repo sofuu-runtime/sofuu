@@ -22,7 +22,7 @@ struct SettingsScreen: View {
             c.bgApp.ignoresSafeArea()
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
-                    Text("Settings").font(.system(size: 20, weight: .medium)).foregroundStyle(c.text)
+                    Text("Settings").font(SofuuFont.font(20, weight: .medium)).foregroundStyle(c.text)
                     Spacer()
                     Button(action: onClose) {
                         Image(systemName: Icons2.close)
@@ -39,7 +39,7 @@ struct SettingsScreen: View {
                             let active = t == tab
                             Button { tab = t } label: {
                                 Text(t.prefix(1).uppercased() + t.dropFirst())
-                                    .font(.system(size: 13))
+                                    .font(SofuuFont.font(13))
                                     .foregroundStyle(active ? c.accentContrast : c.textMuted)
                                     .padding(.horizontal, 14).padding(.vertical, 8)
                                     .background(active ? c.accent : c.bgCard, in: Capsule())
@@ -77,7 +77,7 @@ private struct Section: View {
     let label: String
     @Environment(\.sofuuColors) private var c
     var body: some View {
-        Text(label).font(.system(size: 12)).foregroundStyle(c.textFaint)
+        Text(label).font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
             .padding(.top, 22).padding(.bottom, 6)
     }
 }
@@ -90,9 +90,9 @@ private struct RowBox<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text(label).font(.system(size: 14)).foregroundStyle(c.text)
+            Text(label).font(SofuuFont.font(14)).foregroundStyle(c.text)
             if let desc {
-                Text(desc).font(.system(size: 11)).foregroundStyle(c.textFaint).padding(.bottom, 6)
+                Text(desc).font(SofuuFont.font(11)).foregroundStyle(c.textFaint).padding(.bottom, 6)
             }
             content
         }
@@ -114,7 +114,7 @@ private struct Segmented: View {
                 let active = o == selected
                 Button { onSelect(o) } label: {
                     Text(o.prefix(1).uppercased() + o.dropFirst())
-                        .font(.system(size: 12))
+                        .font(SofuuFont.font(12))
                         .foregroundStyle(active ? c.text : c.textMuted)
                         .padding(.horizontal, 12).padding(.vertical, 8)
                         .background(active ? c.bgRaised : .clear, in: RoundedRectangle(cornerRadius: 6))
@@ -137,7 +137,7 @@ private struct TextFieldRow: View {
 
     var body: some View {
         TextField(placeholder, text: $text)
-            .font(.system(size: 13, design: .monospaced))
+            .font(SofuuFont.font(13))
             .foregroundStyle(c.text)
             .tint(c.accent)
             .textFieldStyle(.plain)
@@ -159,7 +159,7 @@ private struct AccentButton: View {
 
     var body: some View {
         Button(action: onClick) {
-            Text(label).font(.system(size: 13)).foregroundStyle(c.accentContrast)
+            Text(label).font(SofuuFont.font(13)).foregroundStyle(c.accentContrast)
                 .padding(.horizontal, 16).padding(.vertical, 10)
                 .background(c.accent, in: Capsule())
         }
@@ -179,7 +179,7 @@ private struct GeneralPane: View {
             RowBox(label: "Project folder",
                    desc: "Workspace root and per-project storage (.sofuu/ — sessions, memory, settings).") {
                 Text(state.projectDir ?? "(none)")
-                    .font(.system(size: 12, design: .monospaced)).foregroundStyle(c.textMuted)
+                    .font(SofuuFont.font(12)).foregroundStyle(c.textMuted)
             }
             RowBox(label: "Tool permission profile", desc: "Applied live in the engine and re-applied on launch.") {
                 Segmented(options: ["full", "edit", "plan", "prompt"], selected: state.permissions) {
@@ -243,12 +243,12 @@ private struct PhoneToolsSection: View {
         VStack(alignment: .leading, spacing: 0) {
             Section(label: "Phone tools")
             Text("Native capabilities the agent can call. Registered on the engine at boot, so they obey the permission profile and show up in /tools.")
-                .font(.system(size: 11)).foregroundStyle(c.textFaint).padding(.bottom, 6)
+                .font(SofuuFont.font(11)).foregroundStyle(c.textFaint).padding(.bottom, 6)
             if tools.isEmpty {
-                Text("None registered yet.").font(.system(size: 12)).foregroundStyle(c.textFaint)
+                Text("None registered yet.").font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
             } else {
                 ForEach(tools, id: \.self) { t in
-                    Text("  ·  \(t)").font(.system(size: 12, design: .monospaced))
+                    Text("  ·  \(t)").font(SofuuFont.font(12))
                         .foregroundStyle(c.text).padding(.vertical, 2)
                 }
             }
@@ -287,36 +287,36 @@ private struct EngineEnvSection: View {
      VStack(alignment: .leading, spacing: 0) {
         Section(label: "Engine controls")
         Text("These are the runtime's own environment knobs, set before the engine boots. Most take effect on the next message.")
-            .font(.system(size: 11)).foregroundStyle(c.textFaint).padding(.bottom, 6)
+            .font(SofuuFont.font(11)).foregroundStyle(c.textFaint).padding(.bottom, 6)
 
         Toggle(isOn: Binding(
             get: { noTools }, set: { noTools = $0; store.runtimeEnv.noTools = $0; store.applyRuntimeEnv() })) {
-            Text("Coding tools").font(.system(size: 14)).foregroundStyle(c.text)
+            Text("Coding tools").font(SofuuFont.font(14)).foregroundStyle(c.text)
         }
         Text("All 8 built-ins (read/write/edit/grep/glob/dir/bash/todo) off. Web and MCP tools still work.")
-            .font(.system(size: 11)).foregroundStyle(c.textFaint)
+            .font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
 
         Toggle(isOn: Binding(
             get: { noShell }, set: { noShell = $0; store.runtimeEnv.noShell = $0; store.applyRuntimeEnv() })) {
-            Text("Shell").font(.system(size: 14)).foregroundStyle(c.text)
+            Text("Shell").font(SofuuFont.font(14)).foregroundStyle(c.text)
         }
         Text("Keep bash listed but refuse every invocation. Does not stop an MCP server that shells out itself.")
-            .font(.system(size: 11)).foregroundStyle(c.textFaint)
+            .font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
 
         Toggle(isOn: Binding(
             get: { noMl }, set: { noMl = $0; store.runtimeEnv.noMl = $0; store.restartEngineForEnv() })) {
-            Text("Context gates (ML)").font(.system(size: 14)).foregroundStyle(c.text)
+            Text("Context gates (ML)").font(SofuuFont.font(14)).foregroundStyle(c.text)
         }
         Text("Drop the whole sofuu.ml gate layer. This one needs a restart — it is decided when the engine loads.")
-            .font(.system(size: 11)).foregroundStyle(c.textFaint)
+            .font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
 
         Toggle(isOn: Binding(
             get: { allowInternal },
             set: { allowInternal = $0; store.runtimeEnv.webAllowInternal = $0; store.applyRuntimeEnv() })) {
-            Text("Allow private addresses").font(.system(size: 14)).foregroundStyle(c.text)
+            Text("Allow private addresses").font(SofuuFont.font(14)).foregroundStyle(c.text)
         }
         Text("Let web.open reach loopback and LAN addresses. The SSRF guard blocks them otherwise.")
-            .font(.system(size: 11)).foregroundStyle(c.textFaint)
+            .font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
 
         RowBox(label: "Memory backend",
                desc: "Auto uses the semantic projector when its artifact is present, else hash-768.") {
@@ -402,12 +402,12 @@ private struct ModelsPane: View {
                     let models = state.modelsCache[p.name]?.models ?? []
                     if models.isEmpty {
                         Text("No model list yet — tap refresh.")
-                            .font(.system(size: 12)).foregroundStyle(c.textFaint)
+                            .font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
                     } else {
                         ForEach(models.prefix(30), id: \.self) { m in
                             Button { store.pickModel(p.name, m) } label: {
                                 Text(m)
-                                    .font(.system(size: 13, design: .monospaced))
+                                    .font(SofuuFont.font(13))
                                     .foregroundStyle(m == p.model ? c.accent : c.text)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .frame(minHeight: 44)
@@ -481,26 +481,26 @@ private struct ProviderRow: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(p.name).font(.system(size: 14)).foregroundStyle(c.text)
-                    Text(p.endpoint).font(.system(size: 11)).foregroundStyle(c.textFaint).lineLimit(1)
+                    Text(p.name).font(SofuuFont.font(14)).foregroundStyle(c.text)
+                    Text(p.endpoint).font(SofuuFont.font(11)).foregroundStyle(c.textFaint).lineLimit(1)
                     Text(p.hasApiKey ? "key saved · Keychain" : "no key")
-                        .font(.system(size: 11))
+                        .font(SofuuFont.font(11))
                         .foregroundStyle(p.hasApiKey ? c.ok : c.warn)
                 }
                 Spacer()
                 if !isActive {
                     Button { _ = store.removeProvider(p.name) } label: {
-                        Text("Remove").font(.system(size: 12)).foregroundStyle(c.errStrong).padding(8)
+                        Text("Remove").font(SofuuFont.font(12)).foregroundStyle(c.errStrong).padding(8)
                     }
                     .buttonStyle(.plain)
                 } else {
-                    Text("active").font(.system(size: 11)).foregroundStyle(c.accent).padding(8)
+                    Text("active").font(SofuuFont.font(11)).foregroundStyle(c.accent).padding(8)
                 }
             }
             // Key entry: explicit save (never a write per keystroke).
             if keyText.isEmpty && p.hasApiKey {
                 Button { keyText = " " } label: {
-                    Text("Replace key").font(.system(size: 12)).foregroundStyle(c.accent).padding(.vertical, 6)
+                    Text("Replace key").font(SofuuFont.font(12)).foregroundStyle(c.accent).padding(.vertical, 6)
                 }
                 .buttonStyle(.plain)
             } else {
@@ -513,7 +513,7 @@ private struct ProviderRow: View {
                         if !t.isEmpty { store.setProviderKey(p.name, t); keyText = "" }
                     }
                     Button { store.setProviderKey(p.name, ""); keyText = "" } label: {
-                        Text("Clear").font(.system(size: 12)).foregroundStyle(c.errStrong)
+                        Text("Clear").font(SofuuFont.font(12)).foregroundStyle(c.errStrong)
                             .padding(.horizontal, 14).padding(.vertical, 8)
                             .background(c.bgCardHover, in: Capsule())
                     }
@@ -542,13 +542,13 @@ private struct UsagePane: View {
                             totals?.optDouble("cost") ?? 0,
                             grouped(Int(totals?.optDouble("pt") ?? 0)),
                             grouped(Int(totals?.optDouble("ct") ?? 0))))
-                    .font(.system(size: 13, design: .monospaced)).foregroundStyle(c.text)
+                    .font(SofuuFont.font(13)).foregroundStyle(c.text)
             }
 
             Section(label: "Per day")
             let days = usage?.optArray("days") ?? []
             if days.isEmpty {
-                Text("No usage yet.").font(.system(size: 13)).foregroundStyle(c.textFaint)
+                Text("No usage yet.").font(SofuuFont.font(13)).foregroundStyle(c.textFaint)
             } else {
                 ForEach(Array(days.enumerated()), id: \.offset) { _, d in
                     if let d = d as? JSONObject {
@@ -560,7 +560,7 @@ private struct UsagePane: View {
             Section(label: "Per session")
             let sess = usage?.optArray("sessions") ?? []
             if sess.isEmpty {
-                Text("No sessions yet.").font(.system(size: 13)).foregroundStyle(c.textFaint)
+                Text("No sessions yet.").font(SofuuFont.font(13)).foregroundStyle(c.textFaint)
             } else {
                 ForEach(Array(sess.prefix(20).enumerated()), id: \.offset) { _, s in
                     if let s = s as? JSONObject {
@@ -573,7 +573,7 @@ private struct UsagePane: View {
             Section(label: "Per model")
             let models = usage?.optArray("models") ?? []
             if models.isEmpty {
-                Text("No usage yet.").font(.system(size: 13)).foregroundStyle(c.textFaint)
+                Text("No usage yet.").font(SofuuFont.font(13)).foregroundStyle(c.textFaint)
             } else {
                 ForEach(Array(models.enumerated()), id: \.offset) { _, m in
                     if let m = m as? JSONObject {
@@ -587,7 +587,7 @@ private struct UsagePane: View {
     }
 
     private func mono(_ s: String) -> some View {
-        Text(s).font(.system(size: 12, design: .monospaced))
+        Text(s).font(SofuuFont.font(12))
             .foregroundStyle(c.textMuted)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 3)
@@ -624,14 +624,14 @@ private struct AgentsPane: View {
             Section(label: "Registered")
             if agents.isEmpty {
                 Text("No agents defined yet. Add one below.")
-                    .font(.system(size: 12)).foregroundStyle(c.textFaint)
+                    .font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
             } else {
                 ForEach(Array(agents.enumerated()), id: \.offset) { _, a in
                     VStack(alignment: .leading, spacing: 1) {
                         Text(a.optString("name"))
-                            .font(.system(size: 14, design: .monospaced)).foregroundStyle(c.text)
+                            .font(SofuuFont.font(14)).foregroundStyle(c.text)
                         Text(describe(a))
-                            .font(.system(size: 11)).foregroundStyle(c.textFaint)
+                            .font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
                     }
                     .padding(.vertical, 4)
                 }
@@ -642,23 +642,23 @@ private struct AgentsPane: View {
             TextFieldRow(placeholder: "what this agent is for", value: "") { system = $0 }
             TextFieldRow(placeholder: "24", value: "") { maxSteps = $0 }
             Toggle(isOn: $withWeb) {
-    Text("Web tools").font(.system(size: 14)).foregroundStyle(c.text)
+    Text("Web tools").font(SofuuFont.font(14)).foregroundStyle(c.text)
 }
-.font(.system(size: 12))
+.font(SofuuFont.font(12))
 .tint(c.accent)
 .padding(.vertical, 4)
 .overlay(alignment: .bottomLeading) {
-    Text("web_search and web_open").font(.system(size: 11)).foregroundStyle(c.textFaint)
+    Text("web_search and web_open").font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
     .offset(y: 16)
 }
             Toggle(isOn: $withCode) {
-    Text("Coding tools").font(.system(size: 14)).foregroundStyle(c.text)
+    Text("Coding tools").font(SofuuFont.font(14)).foregroundStyle(c.text)
 }
-.font(.system(size: 12))
+.font(SofuuFont.font(12))
 .tint(c.accent)
 .padding(.vertical, 4)
 .overlay(alignment: .bottomLeading) {
-    Text("the 8 built-ins: read/write/edit/grep/glob/dir/bash/todo").font(.system(size: 11)).foregroundStyle(c.textFaint)
+    Text("the 8 built-ins: read/write/edit/grep/glob/dir/bash/todo").font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
     .offset(y: 16)
 }
             HStack(spacing: 6) {
@@ -683,7 +683,7 @@ private struct AgentsPane: View {
             }
             .padding(.top, 10)
             if let note {
-                Text(note).font(.system(size: 11)).foregroundStyle(c.textFaint).padding(.top, 6)
+                Text(note).font(SofuuFont.font(11)).foregroundStyle(c.textFaint).padding(.top, 6)
             }
 
             Section(label: "Run headlessly")
@@ -704,18 +704,18 @@ private struct AgentsPane: View {
                 }
             }
             Text("A run goes through the same agent loop, tools, budget and brain as a chat turn — the only difference is that the answer is collected instead of streamed.")
-                .font(.system(size: 10)).foregroundStyle(c.textFaint).padding(.top, 6)
+                .font(SofuuFont.font(10)).foregroundStyle(c.textFaint).padding(.top, 6)
             if let a = answer {
                 if (a["ok"] as? Bool) != true {
                     Text(a.optString("error").isEmpty ? "run failed" : a.optString("error"))
-                        .font(.system(size: 12)).foregroundStyle(c.err).padding(.top, 8)
+                        .font(SofuuFont.font(12)).foregroundStyle(c.err).padding(.top, 8)
                 } else {
                     let stopped = a.optString("stopped")
                     let head = "\(a.optInt("steps")) steps"
                         + (stopped.isEmpty || stopped == "null" ? "" : " · stopped: \(stopped)")
-                    Text(head).font(.system(size: 11, design: .monospaced))
+                    Text(head).font(SofuuFont.font(11))
                         .foregroundStyle(c.textFaint).padding(.top, 8)
-                    Text(a.optString("answer")).font(.system(size: 13))
+                    Text(a.optString("answer")).font(SofuuFont.font(13))
                         .foregroundStyle(c.text).padding(.top, 4)
                 }
             }
@@ -823,16 +823,16 @@ private struct BrainPane: View {
     private var StoredSection: some View {
         Section(label: "Stored")
         if let err {
-            Text(err).font(.system(size: 12)).foregroundStyle(c.err)
+            Text(err).font(SofuuFont.font(12)).foregroundStyle(c.err)
         } else if let i = info {
             Text("\(i.optInt("count")) memories")
-                .font(.system(size: 20, design: .monospaced)).foregroundStyle(c.text)
+                .font(SofuuFont.font(20)).foregroundStyle(c.text)
             let sub = "space \(i.optString("backend")) · \(i.optInt("dim"))-dim"
                 + ((i["semantic"] as? Bool) == true ? " · semantic channel on" : "")
-            Text(sub).font(.system(size: 11, design: .monospaced))
+            Text(sub).font(SofuuFont.font(11))
                 .foregroundStyle(c.textFaint).padding(.top, 2)
         } else {
-            Text("Reading the brain…").font(.system(size: 12)).foregroundStyle(c.textFaint)
+            Text("Reading the brain…").font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
         }
 
         HStack(spacing: 6) {
@@ -860,7 +860,7 @@ private struct BrainPane: View {
         .padding(.top, 10)
         if decayArmed {
             Text("Decay weakens and prunes old memories. Tap again to run it.")
-                .font(.system(size: 10)).foregroundStyle(c.warn).padding(.top, 4)
+                .font(SofuuFont.font(10)).foregroundStyle(c.warn).padding(.top, 4)
         }
     }
 
@@ -871,7 +871,7 @@ private struct BrainPane: View {
         TextFieldRow(placeholder: "a fact to recall", value: "") { recall = $0 }
         if !recall.isEmpty {
             Button { Task { await runRecall() } } label: {
-                Text("Recall").font(.system(size: 12)).foregroundStyle(c.accentContrast)
+                Text("Recall").font(SofuuFont.font(12)).foregroundStyle(c.accentContrast)
                     .padding(.horizontal, 14).padding(.vertical, 8)
                     .background(c.accent, in: Capsule())
             }
@@ -881,9 +881,9 @@ private struct BrainPane: View {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text(h.optString("text").isEmpty ? h.optString("kind") : h.optString("text"))
-                        .font(.system(size: 12)).foregroundStyle(c.text)
+                        .font(SofuuFont.font(12)).foregroundStyle(c.text)
                     Text(String(format: "score %.3f · %@", h.optDouble("score"), h.optString("tier")))
-                        .font(.system(size: 10, design: .monospaced)).foregroundStyle(c.textFaint)
+                        .font(SofuuFont.font(10)).foregroundStyle(c.textFaint)
                 }
                 Spacer()
                 let id = h.optInt("id", -1)
@@ -911,14 +911,14 @@ private struct BrainPane: View {
         if let m = ml, (m["ok"] as? Bool) == true {
             let ws = m["workset"] as? JSONObject
             Text("\(ws?.optInt("runs") ?? 0) runs · \(ws?.optInt("calls") ?? 0) calls · \(ws?.optInt("segments") ?? 0) segments")
-                .font(.system(size: 12, design: .monospaced)).foregroundStyle(c.text)
+                .font(SofuuFont.font(12)).foregroundStyle(c.text)
             if let on = (m["info"] as? JSONObject)?["on"] as? JSONObject {
                 ForEach(on.keys.sorted(), id: \.self) { k in
                     HStack {
-                        Text(k).font(.system(size: 11, design: .monospaced)).foregroundStyle(c.textFaint)
+                        Text(k).font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
                         Spacer()
                         Text((on[k] as? Bool) == true ? "on" : "off")
-                            .font(.system(size: 11))
+                            .font(SofuuFont.font(11))
                             .foregroundStyle((on[k] as? Bool) == true ? c.accent : c.textMuted)
                     }
                 }
@@ -945,16 +945,16 @@ private struct BrainPane: View {
             }
             .padding(.top, 8)
             if let labelNote {
-                Text(labelNote).font(.system(size: 10))
+                Text(labelNote).font(SofuuFont.font(10))
                     .foregroundStyle(labelNote.hasPrefix("Label recorded") ? c.textFaint : c.warn)
                     .padding(.top, 4)
             }
         } else if let m = ml {
             Text(m.optString("error").isEmpty ? "The sofuu.ml layer is not loaded in this build." : m.optString("error"))
-                .font(.system(size: 12)).foregroundStyle(c.err)
+                .font(SofuuFont.font(12)).foregroundStyle(c.err)
         } else {
             Text("The sofuu.ml layer is not loaded in this build.")
-                .font(.system(size: 12)).foregroundStyle(c.textFaint)
+                .font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
         }
     }
 
@@ -963,7 +963,7 @@ private struct BrainPane: View {
     private var GateCheckSection: some View {
         Section(label: "Gate check")
         Text("Ask what the gates would say about a call before the agent makes it.")
-            .font(.system(size: 11)).foregroundStyle(c.textFaint)
+            .font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
         TextFieldRow(placeholder: "read_file", value: "") { probeTool = $0 }
         TextFieldRow(placeholder: "{\"path\":\"README.md\"}", value: "") { probeArgs = $0 }
         SmallButton(label: "Check", bg: c.accent, fg: c.accentContrast) {
@@ -980,10 +980,10 @@ private struct BrainPane: View {
                 let nudge = v.optString("nudge")
                 let s = String(format: "pass · %@ · %.3f", v.optString("source"), v.optDouble("score"))
                     + (nudge.isEmpty || nudge == "null" ? "" : " · nudge: \(nudge)")
-                Text(s).font(.system(size: 11)).foregroundStyle(c.textMuted).padding(.top, 6)
+                Text(s).font(SofuuFont.font(11)).foregroundStyle(c.textMuted).padding(.top, 6)
             } else {
                 Text("blocked · \(v.optString("reason"))")
-                    .font(.system(size: 11)).foregroundStyle(c.warn).padding(.top, 6)
+                    .font(SofuuFont.font(11)).foregroundStyle(c.warn).padding(.top, 6)
             }
         }
     }
@@ -993,7 +993,7 @@ private struct BrainPane: View {
     private var MemorySection: some View {
         Section(label: "Memory")
         Text("One runtime lives for the whole process on a phone, so nothing else would run the collector at the moment a big fan-out wants it.")
-            .font(.system(size: 11)).foregroundStyle(c.textFaint)
+            .font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
         SmallButton(label: "Collect garbage", bg: c.accent, fg: c.accentContrast) {
             Task { @MainActor in
                 let ok = await RuntimeSurface(engine: store.engine).collectGarbage()
@@ -1001,7 +1001,7 @@ private struct BrainPane: View {
             }
         }
         if let gcNote {
-            Text(gcNote).font(.system(size: 11)).foregroundStyle(c.textFaint).padding(.top, 4)
+            Text(gcNote).font(SofuuFont.font(11)).foregroundStyle(c.textFaint).padding(.top, 4)
         }
     }
 
@@ -1017,7 +1017,7 @@ private struct BrainPane: View {
                 SpaceLine(label: "semantic v2", dim: v2.optInt("dimension"), available: (v2["available"] as? Bool) ?? false)
             }
         } else {
-            Text("No embedding manifest yet.").font(.system(size: 12)).foregroundStyle(c.textFaint)
+            Text("No embedding manifest yet.").font(SofuuFont.font(12)).foregroundStyle(c.textFaint)
         }
     }
 
@@ -1032,7 +1032,7 @@ private struct BrainPane: View {
         }
         if let s = sim {
             Text(String(format: "cosine %.4f · %d-dim", s.optDouble("similarity"), s.optInt("dim")))
-                .font(.system(size: 12, design: .monospaced)).foregroundStyle(c.text).padding(.top, 6)
+                .font(SofuuFont.font(12)).foregroundStyle(c.text).padding(.top, 6)
         }
     }
 
@@ -1041,7 +1041,7 @@ private struct BrainPane: View {
     private var LocalModelsSection: some View {
         Section(label: "On this device")
         Text("A .gguf runs entirely on the phone — no network, no API key. It must live in the app's container, because the engine opens models by absolute path.")
-            .font(.system(size: 11)).foregroundStyle(c.textFaint)
+            .font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
         SmallButton(label: importingModel ? "Choose a file…" : "Import a model", bg: c.accent, fg: c.accentContrast) {
             importingModel = true
         }
@@ -1052,10 +1052,10 @@ private struct BrainPane: View {
                 Button { Task { @MainActor in await store.pickLocalModel(u.path) } } label: {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(LocalModels.label(u))
-                            .font(.system(size: 13, design: .monospaced))
+                            .font(SofuuFont.font(13))
                             .foregroundStyle(active ? c.accent : c.text)
                         if active {
-                            Text("in use — runs locally").font(.system(size: 11)).foregroundStyle(c.textFaint)
+                            Text("in use — runs locally").font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
                         }
                     }
                 }
@@ -1072,7 +1072,7 @@ private struct BrainPane: View {
         }
         if store.state.config?.model.hasSuffix(".gguf") == true {
             Text("Switching back to a hosted provider: pick one in Models.")
-                .font(.system(size: 11)).foregroundStyle(c.textFaint).padding(.top, 4)
+                .font(SofuuFont.font(11)).foregroundStyle(c.textFaint).padding(.top, 4)
         }
     }
 
@@ -1096,11 +1096,11 @@ private struct SpaceLine: View {
 
     var body: some View {
         HStack {
-            Text(label).font(.system(size: 12, design: .monospaced))
+            Text(label).font(SofuuFont.font(12))
                 .foregroundStyle(available ? c.text : c.err)
             Spacer()
             Text(available ? "\(dim)-dim" : "artifact unavailable")
-                .font(.system(size: 11))
+                .font(SofuuFont.font(11))
                 .foregroundStyle(available ? c.textFaint : c.err)
         }
         .padding(.vertical, 3)
@@ -1115,7 +1115,7 @@ private struct SmallButton: View {
 
     var body: some View {
         Button { action() } label: {
-            Text(label).font(.system(size: 12)).foregroundStyle(fg)
+            Text(label).font(SofuuFont.font(12)).foregroundStyle(fg)
                 .padding(.horizontal, 14).padding(.vertical, 8)
                 .background(bg, in: Capsule())
         }

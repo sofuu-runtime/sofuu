@@ -1,5 +1,5 @@
 // Icon.tsx — chrome glyphs drawn as 24×24 SVGs so they sit on the optical
-// center of the 36px button grid. JetBrains Mono's symbol characters (⚙ ◷
+// center of the 36px button grid. Geist Mono's symbol characters (⚙ ◷
 // ⎘ ≣ ▼ ✦) have uneven ink boxes and will not center with flex/line-height.
 
 import type { ReactNode, SVGProps } from "react";

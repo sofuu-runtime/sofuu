@@ -121,7 +121,7 @@ struct FileTree: View {
             } else {
                 Spacer()
                 Text("No workspace open")
-                    .font(.system(size: 11))
+                    .font(SofuuFont.font(11))
                     .foregroundColor(.secondary)
                 Spacer()
             }
@@ -172,14 +172,14 @@ struct FileTree: View {
                     .foregroundColor(.secondary)
                 TextField("Search this workspace", text: $searchQuery)
                     .textFieldStyle(.plain)
-                    .font(.system(size: 12))
+                    .font(SofuuFont.font(12))
                     .onSubmit { runSearch() }
                 Button {
                     searchCase.toggle()
                     if !searchQuery.isEmpty { runSearch() }
                 } label: {
                     Text("Aa")
-                        .font(.system(size: 10, weight: searchCase ? .bold : .regular))
+                        .font(SofuuFont.font(10, weight: searchCase ? .bold : .regular))
                         .foregroundColor(searchCase ? Color.accentColor : .secondary)
                         .frame(width: 22, height: 20)
                         .contentShape(Rectangle())
@@ -212,15 +212,15 @@ struct FileTree: View {
                     VStack(alignment: .leading, spacing: 1) {
                         HStack(spacing: 4) {
                             Text((hit.path as NSString).lastPathComponent)
-                                .font(.system(size: 11, design: .monospaced))
+                                .font(SofuuFont.font(11))
                                 .foregroundColor(Color.accentColor)
                             Text(":\(hit.line)")
-                                .font(.system(size: 10, design: .monospaced))
+                                .font(SofuuFont.font(10))
                                 .foregroundColor(.secondary)
                             Spacer(minLength: 0)
                         }
                         Text(hit.snippet)
-                            .font(.system(size: 10))
+                            .font(SofuuFont.font(10))
                             .foregroundColor(.primary.opacity(0.7))
                             .lineLimit(1)
                     }
@@ -232,12 +232,12 @@ struct FileTree: View {
             }
             if searchHits.count > 120 {
                 Text("…and \(searchHits.count - 120) more")
-                    .font(.system(size: 10))
+                    .font(SofuuFont.font(10))
                     .foregroundColor(.secondary)
                     .padding(.horizontal, 10)
             } else if searchHits.isEmpty && !searchQuery.isEmpty && !searching {
                 Text("No matches.")
-                    .font(.system(size: 11))
+                    .font(SofuuFont.font(11))
                     .foregroundColor(.secondary)
                     .padding(.horizontal, 10)
             }
@@ -294,7 +294,7 @@ struct FileTree: View {
     private var header: some View {
         HStack(spacing: 4) {
             Text(store.state.projectDir.map { URL(fileURLWithPath: $0).lastPathComponent } ?? "FILES")
-                .font(.system(size: 11, weight: .semibold))
+                .font(SofuuFont.font(11, weight: .semibold))
                 .foregroundColor(.secondary)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -421,7 +421,7 @@ private struct DirectoryRows: View {
             }
             if entries.isEmpty && composer?.dir != dir {
                 Text(depth == 0 ? "Empty workspace" : "empty folder")
-                    .font(.system(size: 11))
+                    .font(SofuuFont.font(11))
                     .foregroundColor(Color.secondary.opacity(0.7))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.leading, CGFloat(depth) * 12 + 30)
@@ -471,7 +471,7 @@ private struct EntryRow: View {
                     .foregroundColor(entry.isDir ? Color.secondary : (isSelected ? Color.accentColor : Color.secondary))
 
                 Text(entry.name)
-                    .font(.system(size: 12))
+                    .font(SofuuFont.font(12))
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .foregroundColor(isSelected ? .primary : Color.primary.opacity(0.85))
@@ -607,7 +607,7 @@ private struct RowComposer: View {
                 get: { composer?.initial ?? "" },
                 set: { composer?.initial = $0 }))
                 .textFieldStyle(.plain)
-                .font(.system(size: 12))
+                .font(SofuuFont.font(12))
                 .focused(focused)
                 .onSubmit { commit() }
                 .onExitCommand { composer = nil }

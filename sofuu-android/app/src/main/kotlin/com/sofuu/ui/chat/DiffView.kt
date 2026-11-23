@@ -19,10 +19,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sofuu.ui.theme.LocalSofuuColors
+import com.sofuu.ui.theme.GeistMono
 
 private const val MAX_LINES = 400
 
@@ -109,17 +109,17 @@ fun DiffView(oldText: String, newText: String, modifier: Modifier = Modifier) {
                     },
                     color = fg,
                     fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = GeistMono,
                     modifier = Modifier.width(16.dp),
                 )
                 Text(
                     n?.toString().orEmpty(),
                     color = c.textFaint,
                     fontSize = 12.sp,
-                    fontFamily = FontFamily.Monospace,
+                    fontFamily = GeistMono,
                     modifier = Modifier.width(36.dp),
                 )
-                Text(r.text.ifEmpty { " " }, color = fg, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+                Text(r.text.ifEmpty { " " }, color = fg, fontSize = 12.sp, fontFamily = GeistMono)
             }
         }
     }

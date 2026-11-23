@@ -13,10 +13,10 @@ struct WelcomeCard: View {
         scrim {
             VStack(alignment: .leading, spacing: 0) {
                 Text(L10n.t("onboarding.title"))
-                    .font(.system(size: 30, weight: .bold, design: .serif))
+                    .font(SofuuFont.font(30, weight: .bold))
                     .foregroundStyle(c.text)
                 Text("A local-first coding agent for macOS — chat with it, or hand it a folder and let it work in the built-in IDE.")
-                    .font(.system(size: 13))
+                    .font(SofuuFont.font(13))
                     .foregroundStyle(c.textMuted)
                     .padding(.top, 8)
                     .fixedSize(horizontal: false, vertical: true)
@@ -40,7 +40,7 @@ struct WelcomeCard: View {
                         store.showShortcutHelp()
                     } label: {
                         Text("Keyboard Shortcuts")
-                            .font(.system(size: 12, weight: .medium))
+                            .font(SofuuFont.font(12, weight: .medium))
                             .foregroundStyle(c.textMuted)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 8)
@@ -51,7 +51,7 @@ struct WelcomeCard: View {
                         store.dismissOnboarding()
                     } label: {
                         Text(L10n.t("onboarding.getStarted"))
-                            .font(.system(size: 12, weight: .semibold))
+                            .font(SofuuFont.font(12, weight: .semibold))
                             .foregroundStyle(c.accentContrast)
                             .padding(.horizontal, 16)
                             .padding(.vertical, 8)
@@ -77,10 +77,10 @@ struct WelcomeCard: View {
                 .frame(width: 24, height: 24)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(SofuuFont.font(13, weight: .semibold))
                     .foregroundStyle(c.text)
                 Text(detail)
-                    .font(.system(size: 12))
+                    .font(SofuuFont.font(12))
                     .foregroundStyle(c.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -106,7 +106,7 @@ struct ShortcutSheet: View {
             VStack(alignment: .leading, spacing: 0) {
                 HStack {
                     Text("Keyboard Shortcuts")
-                        .font(.system(size: 17, weight: .semibold))
+                        .font(SofuuFont.font(17, weight: .semibold))
                         .foregroundStyle(c.text)
                     Spacer(minLength: 0)
                     Button {
@@ -141,13 +141,13 @@ struct ShortcutSheet: View {
             ForEach(sections, id: \.0) { section in
                 VStack(alignment: .leading, spacing: 6) {
                     Text(section.0)
-                        .font(.system(size: 10, weight: .semibold))
+                        .font(SofuuFont.font(10, weight: .semibold))
                         .tracking(0.8)
                         .foregroundStyle(c.textFaint)
                     ForEach(section.1, id: \.label) { row in
                         HStack {
                             Text(row.label)
-                                .font(.system(size: 12.5))
+                                .font(SofuuFont.font(12.5))
                                 .foregroundStyle(c.text)
                             Spacer(minLength: 12)
                             keyCaps(row.combo)
@@ -165,7 +165,7 @@ struct ShortcutSheet: View {
         HStack(spacing: 3) {
             ForEach(Array(combo), id: \.self) { ch in
                 Text(String(ch))
-                    .font(.system(size: 11, weight: .medium))
+                    .font(SofuuFont.font(11, weight: .medium))
                     .foregroundStyle(c.textMuted)
                     .frame(minWidth: 20, minHeight: 20)
                     .background(c.bgCardHover, in: RoundedRectangle(cornerRadius: 5))

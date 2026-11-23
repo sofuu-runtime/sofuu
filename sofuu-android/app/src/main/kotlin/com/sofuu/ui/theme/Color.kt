@@ -1,6 +1,7 @@
 package com.sofuu.ui.theme
 
 import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Typography
 import androidx.compose.material3.darkColorScheme
@@ -9,10 +10,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.LineHeightStyle
 import androidx.compose.ui.unit.sp
 import com.sofuu.R
 
@@ -173,25 +177,43 @@ val DarkColors = SofuuColors(
     scrollThumb = DkScrollThumb, backdropVeil = DkBackdropVeil,
 )
 
-// JetBrains Mono everywhere, per the desktop recipe. The variable TTF is
-// bundled in res/font (converted from the desktop woff2); static weights
-// keep minSdk 24 happy.
-val JetBrainsMono = FontFamily(
-    Font(R.font.jetbrains_mono_regular, FontWeight.Normal),
-    Font(R.font.jetbrains_mono_medium, FontWeight.Medium),
-    Font(R.font.jetbrains_mono_bold, FontWeight.Bold),
+// Geist Mono everywhere. Static faces are bundled in res/font (the same
+// OFL typeface the web properties ship); declaring every weight keeps
+// minSdk 24 from synthesising a different family.
+val GeistMono = FontFamily(
+    Font(R.font.geist_mono_regular, FontWeight.Normal, FontStyle.Normal),
+    Font(R.font.geist_mono_medium, FontWeight.Medium, FontStyle.Normal),
+    Font(R.font.geist_mono_semibold, FontWeight.SemiBold, FontStyle.Normal),
+    Font(R.font.geist_mono_bold, FontWeight.Bold, FontStyle.Normal),
+    Font(R.font.geist_mono_italic, FontWeight.Normal, FontStyle.Italic),
+    Font(R.font.geist_mono_medium_italic, FontWeight.Medium, FontStyle.Italic),
+)
+
+private val BaseMonoStyle = TextStyle(
+    fontFamily = GeistMono,
+    platformStyle = PlatformTextStyle(includeFontPadding = false),
+    lineHeightStyle = LineHeightStyle(
+        alignment = LineHeightStyle.Alignment.Center,
+        trim = LineHeightStyle.Trim.Both,
+    ),
 )
 
 val SofuuTypography = Typography(
-    bodyLarge = TextStyle(fontFamily = JetBrainsMono, fontSize = 14.sp, lineHeight = 21.sp),
-    bodyMedium = TextStyle(fontFamily = JetBrainsMono, fontSize = 13.sp, lineHeight = 19.sp),
-    bodySmall = TextStyle(fontFamily = JetBrainsMono, fontSize = 12.sp, lineHeight = 17.sp),
-    titleLarge = TextStyle(fontFamily = JetBrainsMono, fontSize = 17.sp, fontWeight = FontWeight.Medium, lineHeight = 24.sp),
-    titleMedium = TextStyle(fontFamily = JetBrainsMono, fontSize = 15.sp, fontWeight = FontWeight.Medium, lineHeight = 21.sp),
-    titleSmall = TextStyle(fontFamily = JetBrainsMono, fontSize = 13.sp, fontWeight = FontWeight.Medium, lineHeight = 18.sp),
-    labelLarge = TextStyle(fontFamily = JetBrainsMono, fontSize = 13.sp, fontWeight = FontWeight.Medium),
-    labelMedium = TextStyle(fontFamily = JetBrainsMono, fontSize = 12.sp, fontWeight = FontWeight.Medium),
-    labelSmall = TextStyle(fontFamily = JetBrainsMono, fontSize = 11.sp, fontWeight = FontWeight.Normal),
+    displayLarge = BaseMonoStyle.copy(fontSize = 32.sp, fontWeight = FontWeight.Bold, lineHeight = 40.sp),
+    displayMedium = BaseMonoStyle.copy(fontSize = 28.sp, fontWeight = FontWeight.Bold, lineHeight = 36.sp),
+    displaySmall = BaseMonoStyle.copy(fontSize = 24.sp, fontWeight = FontWeight.SemiBold, lineHeight = 32.sp),
+    headlineLarge = BaseMonoStyle.copy(fontSize = 22.sp, fontWeight = FontWeight.SemiBold, lineHeight = 30.sp),
+    headlineMedium = BaseMonoStyle.copy(fontSize = 20.sp, fontWeight = FontWeight.SemiBold, lineHeight = 28.sp),
+    headlineSmall = BaseMonoStyle.copy(fontSize = 18.sp, fontWeight = FontWeight.SemiBold, lineHeight = 26.sp),
+    bodyLarge = BaseMonoStyle.copy(fontSize = 14.sp, lineHeight = 21.sp),
+    bodyMedium = BaseMonoStyle.copy(fontSize = 13.sp, lineHeight = 19.sp),
+    bodySmall = BaseMonoStyle.copy(fontSize = 12.sp, lineHeight = 17.sp),
+    titleLarge = BaseMonoStyle.copy(fontSize = 17.sp, fontWeight = FontWeight.Medium, lineHeight = 24.sp),
+    titleMedium = BaseMonoStyle.copy(fontSize = 15.sp, fontWeight = FontWeight.Medium, lineHeight = 21.sp),
+    titleSmall = BaseMonoStyle.copy(fontSize = 13.sp, fontWeight = FontWeight.Medium, lineHeight = 18.sp),
+    labelLarge = BaseMonoStyle.copy(fontSize = 13.sp, fontWeight = FontWeight.Medium),
+    labelMedium = BaseMonoStyle.copy(fontSize = 12.sp, fontWeight = FontWeight.Medium),
+    labelSmall = BaseMonoStyle.copy(fontSize = 11.sp, fontWeight = FontWeight.Normal),
 )
 
 /** Local composition so any composable can read the resolved tokens. */
@@ -230,7 +252,10 @@ fun SofuuTheme(
             error = colors.err,
         )
     }
-    androidx.compose.runtime.CompositionLocalProvider(LocalSofuuColors provides colors) {
+    CompositionLocalProvider(
+        LocalSofuuColors provides colors,
+        LocalTextStyle provides BaseMonoStyle.copy(color = colors.text),
+    ) {
         MaterialTheme(colorScheme = scheme, typography = SofuuTypography, content = content)
     }
 }

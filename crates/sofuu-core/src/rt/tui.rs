@@ -54,6 +54,9 @@ thread_local! {
     /* Default text ink (256-palette index) for light themes (-1 leaves
      * terminal default fg untouched for dark themes). */
     static G_FG: Cell<i32> = const { Cell::new(-1) };
+    /* Whether this session emitted an OSC 50 font request, so exit knows
+       whether to restore xterm's default menu entry. */
+    static G_FONT_REQ: Cell<i32> = const { Cell::new(0) };
     /* Accent palette index for the selection bar (set alongside G_BG on
      * every theme sync), or -1 for the classic raw-inverse look. */
     static G_SEL: Cell<i32> = const { Cell::new(-1) };
@@ -541,6 +544,24 @@ pub unsafe extern "C" fn tui_init() {
     G_INIT_DONE.with(|d| d.set(1));
 }
 
+/// Best-effort typeface request for the terminal emulator.
+///
+/// A TUI does not own its font: the terminal does. xterm-compatible
+/// terminals implement `OSC 50` (set font), so the TUI asks for the same
+/// Geist Mono face the native apps bundle. Terminals that do not implement
+/// the sequence ignore it, and `SOFUU_TUI_FONT=off` disables the request.
+/// A different value names another terminal font for that session.
+fn tui_font_request() -> Option<String> {
+    let value = std::env::var("SOFUU_TUI_FONT").unwrap_or_else(|_| "Geist Mono".to_string());
+    // Control characters would let the environment inject an extra escape.
+    let name: String = value.chars().filter(|c| !c.is_control()).collect();
+    let name = name.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    Some(format!("\x1b]50;{name}\x07"))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn tui_enter() {
     tui_init();
@@ -555,6 +576,10 @@ pub unsafe extern "C" fn tui_enter() {
     // The clear carries the theme background so the whole fresh window
     // opens themed (an erase fills with the current bg color).
     write_out("\x1b[?1049h\x1b[?25l");
+    if let Some(request) = tui_font_request() {
+        write_out(&request);
+        G_FONT_REQ.with(|f| f.set(1));
+    }
     write_out(&format!("{}\x1b[2J\x1b[H", tui_bg_prefix()));
     tui_render_conversation();
 }
@@ -577,6 +602,17 @@ pub unsafe extern "C" fn tui_exit() {
     G_SEL_FG.with(|g| g.set(16));
     G_PANEL.with(|p| p.borrow_mut().clear());
     G_SUBTLE.with(|s| s.borrow_mut().clear());
+    /* Undo a best-effort OSC 50 font request: the empty value restores
+       xterm's own menu entry. Emulators that ignored the request ignore
+       this too. */
+    let mut requested = 0;
+    G_FONT_REQ.with(|f| {
+        requested = f.get();
+        f.set(0);
+    });
+    if requested != 0 {
+        write_out("\x1b]50;\x07");
+    }
     write_out("\x1b[?25h\x1b[?1049l"); /* cursor back, alt screen off */
 }
 

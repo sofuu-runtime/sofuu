@@ -30,11 +30,11 @@ struct MarkdownBody: View {
         case .code(let code, let lang):
             VStack(alignment: .leading, spacing: 0) {
                 if !lang.isEmpty {
-                    Text(lang).font(.system(size: 10, design: .monospaced)).foregroundStyle(c.textFaint)
+                    Text(lang).font(SofuuFont.font(10)).foregroundStyle(c.textFaint)
                 }
                 ScrollView(.horizontal, showsIndicators: false) {
                     Text(code.trimmingCharacters(in: .whitespacesAndNewlines))
-                        .font(.system(size: CGFloat(fontSize - 1), design: .monospaced))
+                        .font(SofuuFont.font(CGFloat(fontSize - 1)))
                         .foregroundStyle(c.text)
                 }
             }
@@ -45,13 +45,13 @@ struct MarkdownBody: View {
 
         case .heading(let t):
             Text(inlineMd(t, c))
-                .font(.system(size: CGFloat(fontSize + 4), weight: .bold))
+                .font(SofuuFont.font(CGFloat(fontSize + 4), weight: .bold))
                 .foregroundStyle(c.text)
                 .padding(.top, 10).padding(.bottom, 4)
 
         case .paragraph(let t):
             Text(inlineMd(t, c))
-                .font(.system(size: CGFloat(fontSize)))
+                .font(SofuuFont.font(CGFloat(fontSize)))
                 .lineSpacing(4)
                 .foregroundStyle(c.text)
                 .padding(.vertical, 2)
@@ -61,7 +61,7 @@ struct MarkdownBody: View {
                 Text("·  ").foregroundStyle(c.textMuted)
                 Text(inlineMd(t, c)).foregroundStyle(c.text)
             }
-            .font(.system(size: CGFloat(fontSize)))
+            .font(SofuuFont.font(CGFloat(fontSize)))
             .padding(.vertical, 1)
 
         case .numbered(let idx, let t):
@@ -69,12 +69,12 @@ struct MarkdownBody: View {
                 Text("\(idx).  ").foregroundStyle(c.textMuted)
                 Text(inlineMd(t, c)).foregroundStyle(c.text)
             }
-            .font(.system(size: CGFloat(fontSize)))
+            .font(SofuuFont.font(CGFloat(fontSize)))
             .padding(.vertical, 1)
 
         case .quote(let t):
             Text(inlineMd(t, c))
-                .font(.system(size: CGFloat(fontSize)))
+                .font(SofuuFont.font(CGFloat(fontSize)))
                 .foregroundStyle(c.textMuted)
                 .padding(.horizontal, 8).padding(.vertical, 4)
                 .background(c.hoverVeil, in: RoundedRectangle(cornerRadius: 4))
@@ -110,7 +110,7 @@ func inlineMd(_ s: String, _ c: SofuuColors) -> AttributedString {
     }
     for r in unsafeRanges { a[r].link = nil }
     for r in codeRanges {
-        a[r].font = .system(.body, design: .monospaced)
+        a[r].font = SofuuFont.body
         a[r].backgroundColor = c.codeChip
     }
     return a

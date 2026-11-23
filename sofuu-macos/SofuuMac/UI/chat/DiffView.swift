@@ -68,7 +68,7 @@ struct DiffView: View {
             Text(marker).frame(width: 16, alignment: .leading)
             Text(r.text.isEmpty ? " " : r.text)
         }
-        .font(.system(size: 12, design: .monospaced))
+        .font(SofuuFont.font(12))
         .foregroundStyle(fg)
         .padding(.vertical, 1)
         .frame(maxWidth: .infinity, alignment: .leading)

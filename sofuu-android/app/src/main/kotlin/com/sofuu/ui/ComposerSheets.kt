@@ -44,6 +44,7 @@ import com.sofuu.ui.soapbubble.SoapBubbleButton
 import com.sofuu.ui.soapbubble.SoapBubbleSurface
 import com.sofuu.ui.soapbubble.SoapBubbleToggle
 import com.sofuu.ui.soapbubble.toCssRgb
+import com.sofuu.ui.theme.GeistMono
 import com.sofuu.ui.theme.LocalSofuuColors
 import org.json.JSONArray
 import org.json.JSONObject
@@ -222,6 +223,7 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
                 singleLine = true,
                 textStyle = androidx.compose.ui.text.TextStyle(
                     color = c.text,
+                    fontFamily = GeistMono,
                     fontSize = 13.5.sp,
                     fontWeight = FontWeight.Medium,
                     platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false),
@@ -295,6 +297,7 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
                 singleLine = true,
                 textStyle = androidx.compose.ui.text.TextStyle(
                     color = c.text,
+                    fontFamily = GeistMono,
                     fontSize = 13.5.sp,
                     fontWeight = FontWeight.Medium,
                     platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false),

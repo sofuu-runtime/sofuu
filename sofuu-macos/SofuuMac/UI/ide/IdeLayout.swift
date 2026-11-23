@@ -102,7 +102,7 @@ struct IdeLayout: View {
                         .font(.system(size: 11))
                         .foregroundStyle(c.textFaint)
                     Text("Read-only — this file is larger than the 1 MB edit cap.")
-                        .font(.system(size: 11))
+                        .font(SofuuFont.font(11))
                         .foregroundStyle(c.textMuted)
                     Spacer()
                 }
@@ -116,19 +116,19 @@ struct IdeLayout: View {
                         .font(.system(size: 11))
                         .foregroundStyle(.yellow)
                     Text("\((path as NSString).lastPathComponent) changed on disk while you were editing.")
-                        .font(.system(size: 12))
+                        .font(SofuuFont.font(12))
                         .foregroundStyle(c.text)
                         .lineLimit(1)
                     Spacer(minLength: 8)
                     Button("Load disk") { store.reloadExternalEdit(path) }
                         .buttonStyle(.plain)
-                        .font(.system(size: 11, weight: .semibold))
+                        .font(SofuuFont.font(11, weight: .semibold))
                         .foregroundStyle(c.accentContrast)
                         .padding(.horizontal, 10).padding(.vertical, 4)
                         .background(c.accent, in: Capsule())
                     Button("Keep mine") { store.dismissExternalEdit(path) }
                         .buttonStyle(.plain)
-                        .font(.system(size: 11, weight: .medium))
+                        .font(SofuuFont.font(11, weight: .medium))
                         .foregroundStyle(c.textMuted)
                 }
                 .padding(.horizontal, 12).padding(.vertical, 7)
@@ -157,7 +157,7 @@ struct IdeLayout: View {
                 Text(store.state.openTabs.isEmpty
                         ? "Open a file from the tree"
                         : "Select a tab")
-                    .font(.system(size: 12))
+                    .font(SofuuFont.font(12))
                     .foregroundStyle(c.textFaint)
             }
         }
@@ -227,7 +227,7 @@ struct IdeLayout: View {
                 } label: {
                     Image(systemName: store.state.splitEnabled
                             ? "rectangle.split.2x1.fill" : "rectangle.split.2x1")
-                        .font(.system(size: 12))
+                        .font(SofuuFont.font(12))
                         .foregroundStyle(store.state.splitEnabled ? c.accent : c.textFaint)
                         .frame(width: 28, height: 28)
                         .contentShape(Rectangle())
@@ -289,7 +289,7 @@ struct IdeLayout: View {
             if !store.recentFiles.isEmpty {
                 Divider()
                 Text("Recent")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(SofuuFont.font(10, weight: .semibold))
                     .foregroundColor(.secondary)
                 ForEach(store.recentFiles.prefix(6), id: \.self) { p in
                     Button { store.openFile(p) } label: {
@@ -329,10 +329,10 @@ struct IdeLayout: View {
                     if store.state.messages.isEmpty {
                         VStack(spacing: 5) {
                             Text("Agent")
-                                .font(.system(size: 17, weight: .medium))
+                                .font(SofuuFont.font(17, weight: .medium))
                                 .foregroundStyle(c.text)
                             Text("Ask it to build or change what you have open.")
-                                .font(.system(size: 11))
+                                .font(SofuuFont.font(11))
                                 .foregroundStyle(c.textFaint)
                                 .multilineTextAlignment(.center)
                         }
@@ -422,7 +422,7 @@ struct IdeLayout: View {
     private var agentHeader: some View {
         HStack(spacing: 2) {
             Text("AGENT")
-                .font(.system(size: 11, weight: .semibold))
+                .font(SofuuFont.font(11, weight: .semibold))
                 .foregroundStyle(c.textFaint)
             Spacer(minLength: 0)
             agentButton("plus", "New chat (⌘N)") { store.newChat() }
@@ -465,7 +465,7 @@ private struct EditorTab: View {
     var body: some View {
         HStack(spacing: 6) {
             Text(name)
-                .font(.system(size: 11.5, design: .monospaced))
+                .font(SofuuFont.font(11.5))
                 .foregroundStyle(active ? c.text : c.textMuted)
                 .lineLimit(1)
                 .fixedSize()
@@ -476,7 +476,7 @@ private struct EditorTab: View {
             // the two-step "again ✓" arm guards dirty ones.
             if closeArm {
                 Text("again ✓")
-                    .font(.system(size: 9))
+                    .font(SofuuFont.font(9))
                     .foregroundStyle(c.errStrong)
                     .onTapGesture {
                         closeArm = false
@@ -526,7 +526,7 @@ private struct IdeBanner: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: 12))
+            .font(SofuuFont.font(12))
             .foregroundStyle(isError ? c.err : c.text)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 12).padding(.vertical, 9)
@@ -546,20 +546,20 @@ private struct IdeApprovalCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text("Approve \(approval.tool)?")
-                .font(.system(size: 13, weight: .medium))
+                .font(SofuuFont.font(13, weight: .medium))
                 .foregroundStyle(c.text)
 
             let args = approval.args
             if approval.tool == "edit_file", args.has("old_string"), args.has("new_string") {
                 Text(args.optString("path"))
-                    .font(.system(size: 11))
+                    .font(SofuuFont.font(11))
                     .foregroundStyle(c.textFaint)
                     .padding(.top, 3)
                 DiffView(oldText: args.optString("old_string"), newText: args.optString("new_string"))
                     .padding(.top, 6)
             } else if approval.tool == "write_file", args.has("content") {
                 Text(args.optString("path"))
-                    .font(.system(size: 11))
+                    .font(SofuuFont.font(11))
                     .foregroundStyle(c.textFaint)
                     .padding(.top, 3)
                 DiffView(oldText: "", newText: args.optString("content"))
@@ -567,7 +567,7 @@ private struct IdeApprovalCard: View {
             } else if approval.tool == "bash", let cmd = args["command"] as? String {
                 ScrollView {
                     Text(cmd)
-                        .font(.system(size: 12, design: .monospaced))
+                        .font(SofuuFont.font(12))
                         .foregroundStyle(c.text)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -578,7 +578,7 @@ private struct IdeApprovalCard: View {
             } else {
                 ScrollView {
                     Text(String(jsonEncode(args).prefix(600)))
-                        .font(.system(size: 12, design: .monospaced))
+                        .font(SofuuFont.font(12))
                         .foregroundStyle(c.textMuted)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -614,7 +614,7 @@ private struct IdeApprovalButton: View {
     var body: some View {
         Button(action: onClick) {
             Text(label)
-                .font(.system(size: 11))
+                .font(SofuuFont.font(11))
                 .foregroundStyle(fg)
                 .padding(.horizontal, 11)
                 .padding(.vertical, 7)
@@ -750,7 +750,7 @@ struct FindBar: View {
                 .foregroundColor(.secondary)
             TextField("Find in file", text: $query)
                 .textFieldStyle(.plain)
-                .font(.system(size: 12))
+                .font(SofuuFont.font(12))
                 .frame(width: 220)
                 .focused($fieldFocused)
                 .onSubmit { store.ideCoordinator?.selectMatch(query: query, caseSensitive: caseSensitive, forward: true) }
@@ -759,18 +759,18 @@ struct FindBar: View {
                     if !query.isEmpty { store.ideCoordinator?.selectMatch(query: query, caseSensitive: caseSensitive, forward: true) }
                 }
             Text(count > 0 ? "\(count) match\(count == 1 ? "" : "es")" : "no matches")
-                .font(.system(size: 11))
+                .font(SofuuFont.font(11))
                 .foregroundColor(.secondary)
             TextField("Replace with", text: $replacement)
                 .textFieldStyle(.plain)
-                .font(.system(size: 12))
+                .font(SofuuFont.font(12))
                 .frame(width: 180)
                 .help("Replacement")
             Button {
                 store.ideCoordinator?.replaceOne(query: query, replacement: replacement, caseSensitive: caseSensitive)
             } label: {
                 Text("Rep")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(SofuuFont.font(11, weight: .medium))
                     .frame(width: 26, height: 22)
                     .contentShape(Rectangle())
             }
@@ -782,7 +782,7 @@ struct FindBar: View {
                 if n > 0 { store.systemRow("Replaced \(n) \(n == 1 ? "occurrence" : "occurrences").") }
             } label: {
                 Text("All")
-                    .font(.system(size: 11, weight: .medium))
+                    .font(SofuuFont.font(11, weight: .medium))
                     .frame(width: 26, height: 22)
                     .contentShape(Rectangle())
             }
@@ -807,7 +807,7 @@ struct FindBar: View {
                 count = store.ideCoordinator?.findMatches(query: query, caseSensitive: caseSensitive) ?? 0
             } label: {
                 Text("Aa")
-                    .font(.system(size: 11, weight: caseSensitive ? .bold : .regular))
+                    .font(SofuuFont.font(11, weight: caseSensitive ? .bold : .regular))
                     .foregroundColor(caseSensitive ? .accentColor : .secondary)
                     .frame(width: 24, height: 24)
                     .contentShape(Rectangle())
@@ -902,7 +902,7 @@ struct EditorStatus: View {
                     .foregroundStyle(.yellow.opacity(0.9))
             }
         }
-        .font(.system(size: 11))
+        .font(SofuuFont.font(11))
         .foregroundColor(.secondary)
         .padding(.horizontal, 12)
         .padding(.vertical, 4)

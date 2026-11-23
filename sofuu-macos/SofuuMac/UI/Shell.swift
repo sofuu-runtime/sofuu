@@ -78,7 +78,7 @@ struct Shell: View {
 
             HStack {
                 Text("Workspaces")
-                    .font(.system(size: 13, weight: .medium))
+                    .font(SofuuFont.font(13, weight: .medium))
                     .foregroundStyle(c.textMuted)
                 Spacer(minLength: 0)
                 Button { addWorkspaceFolder() } label: {
@@ -101,7 +101,7 @@ struct Shell: View {
                     }
                     if store.state.workspaces.isEmpty {
                         Text("No open workspaces")
-                            .font(.system(size: 12))
+                            .font(SofuuFont.font(12))
                             .foregroundStyle(c.textFaint)
                             .padding(12)
                     }
@@ -112,7 +112,7 @@ struct Shell: View {
             Divider().overlay(c.separator)
             HStack {
                 Text("Sofuu")
-                    .font(.system(size: 11))
+                    .font(SofuuFont.font(11))
                     .foregroundStyle(c.textFaint)
                 Spacer()
                 Button { store.openSettings(true) } label: {
@@ -146,14 +146,14 @@ struct Shell: View {
                 .font(.system(size: 12))
                 .foregroundStyle(active ? c.accent : c.textFaint)
             Text(name.isEmpty ? ws : name)
-                .font(.system(size: 13))
+                .font(SofuuFont.font(13))
                 .foregroundStyle(c.text)
                 .lineLimit(1)
                 .help(ws)
             Spacer(minLength: 2)
             if removeArm == ws {
                 Text("again ✓")
-                    .font(.system(size: 10))
+                    .font(SofuuFont.font(10))
                     .foregroundStyle(c.errStrong)
                     .onTapGesture {
                         removeArm = nil
@@ -297,7 +297,7 @@ struct Shell: View {
                         .font(.system(size: 11))
                         .foregroundStyle(c.accent)
                     Text("Read-only · \(preview.label)")
-                        .font(.system(size: 12))
+                        .font(SofuuFont.font(12))
                         .foregroundStyle(c.textMuted)
                         .lineLimit(1)
                 }
@@ -377,7 +377,7 @@ struct Shell: View {
                 Circle().fill(c.accent).frame(width: 5, height: 5)
             }
             Text(label)
-                .font(.system(size: 12))
+                .font(SofuuFont.font(12))
                 .foregroundStyle(active ? c.text : c.textMuted)
                 .lineLimit(1)
             if active, let sid {
@@ -448,7 +448,7 @@ private struct Banner: View {
 
     var body: some View {
         Text(text)
-            .font(.system(size: 12))
+            .font(SofuuFont.font(12))
             .foregroundStyle(isError ? c.err : c.text)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 12).padding(.vertical, 9)
@@ -468,7 +468,7 @@ private struct PreviewBar: View {
                 .font(.system(size: 12))
                 .foregroundStyle(c.accent)
             Text("Read-only · \(label)")
-                .font(.system(size: 12))
+                .font(SofuuFont.font(12))
                 .foregroundStyle(c.textMuted)
                 .lineLimit(1)
             Spacer(minLength: 8)
@@ -495,11 +495,11 @@ private struct HomePrompt: View {
     var body: some View {
         VStack(spacing: 6) {
             Text("What should we work on?")
-                .font(.system(size: 24, weight: .medium))
+                .font(SofuuFont.font(24, weight: .medium))
                 .foregroundStyle(c.text)
             if let subtitle {
                 Text(subtitle)
-                    .font(.system(size: 13))
+                    .font(SofuuFont.font(13))
                     .foregroundStyle(c.textFaint)
             }
         }
@@ -525,13 +525,13 @@ private struct HistoryList: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text("Chat history")
-                .font(.system(size: 11, weight: .medium))
+                .font(SofuuFont.font(11, weight: .medium))
                 .foregroundStyle(c.textMuted)
                 .padding(10)
 
             if store.state.sessions.isEmpty {
                 Text("No chats yet")
-                    .font(.system(size: 12))
+                    .font(SofuuFont.font(12))
                     .foregroundStyle(c.textFaint)
                     .padding(12)
             }
@@ -540,12 +540,12 @@ private struct HistoryList: View {
                 Button { onResume(s) } label: {
                     HStack(spacing: 8) {
                         Text(store.sessionTitle(s, index: store.state.sessions.firstIndex { $0.id == s.id } ?? 0))
-                            .font(.system(size: 12))
+                            .font(SofuuFont.font(12))
                             .foregroundStyle(c.text)
                             .lineLimit(1)
                         Spacer(minLength: 8)
                         Text(ageOf(s.lastSeen))
-                            .font(.system(size: 10))
+                            .font(SofuuFont.font(10))
                             .foregroundStyle(c.textFaint)
                     }
                     .padding(.horizontal, 10)
@@ -575,7 +575,7 @@ private struct HistoryList: View {
                     }
                 } label: {
                     Text(clearArmed ? "Click again to confirm" : "Delete all chats in workspace")
-                        .font(.system(size: 11))
+                        .font(SofuuFont.font(11))
                         .foregroundStyle(c.errStrong)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(10)
@@ -615,20 +615,20 @@ private struct ApprovalCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text("Approve \(approval.tool)?")
-                .font(.system(size: 13, weight: .medium))
+                .font(SofuuFont.font(13, weight: .medium))
                 .foregroundStyle(c.text)
 
             let args = approval.args
             if approval.tool == "edit_file", args.has("old_string"), args.has("new_string") {
                 Text(args.optString("path"))
-                    .font(.system(size: 11))
+                    .font(SofuuFont.font(11))
                     .foregroundStyle(c.textFaint)
                     .padding(.top, 3)
                 DiffView(oldText: args.optString("old_string"), newText: args.optString("new_string"))
                     .padding(.top, 6)
             } else if approval.tool == "write_file", args.has("content") {
                 Text(args.optString("path"))
-                    .font(.system(size: 11))
+                    .font(SofuuFont.font(11))
                     .foregroundStyle(c.textFaint)
                     .padding(.top, 3)
                 DiffView(oldText: "", newText: args.optString("content"))
@@ -636,7 +636,7 @@ private struct ApprovalCard: View {
             } else if approval.tool == "bash", let cmd = args["command"] as? String {
                 ScrollView {
                     Text(cmd)
-                        .font(.system(size: 12, design: .monospaced))
+                        .font(SofuuFont.font(12))
                         .foregroundStyle(c.text)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -647,7 +647,7 @@ private struct ApprovalCard: View {
             } else {
                 ScrollView {
                     Text(String(jsonEncode(args).prefix(600)))
-                        .font(.system(size: 12, design: .monospaced))
+                        .font(SofuuFont.font(12))
                         .foregroundStyle(c.textMuted)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
@@ -683,7 +683,7 @@ private struct ApprovalButton: View {
     var body: some View {
         Button(action: onClick) {
             Text(label)
-                .font(.system(size: 12))
+                .font(SofuuFont.font(12))
                 .foregroundStyle(fg)
                 .padding(.horizontal, 13)
                 .padding(.vertical, 8)

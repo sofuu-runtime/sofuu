@@ -43,7 +43,7 @@ private struct SheetTitle: View {
     let t: String
     @Environment(\.sofuuColors) private var c
     var body: some View {
-        Text(t).font(.system(size: 13)).foregroundStyle(c.textMuted).padding(.bottom, 8)
+        Text(t).font(SofuuFont.font(13)).foregroundStyle(c.textMuted).padding(.bottom, 8)
     }
 }
 
@@ -59,11 +59,11 @@ private struct SheetRow: View {
         Button(action: onClick) {
             HStack {
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(label).font(.system(size: 14)).foregroundStyle(c.text)
-                    if let hint { Text(hint).font(.system(size: 11)).foregroundStyle(c.textFaint) }
+                    Text(label).font(SofuuFont.font(14)).foregroundStyle(c.text)
+                    if let hint { Text(hint).font(SofuuFont.font(11)).foregroundStyle(c.textFaint) }
                 }
                 Spacer()
-                if selected { Text("✓").font(.system(size: 14)).foregroundStyle(c.accent) }
+                if selected { Text("✓").font(SofuuFont.font(14)).foregroundStyle(c.accent) }
             }
             .frame(minHeight: 48)
             .padding(.horizontal, 12).padding(.vertical, 10)
@@ -86,8 +86,8 @@ private struct ToggleRow: View {
         Button(action: onToggle) {
             HStack {
                 VStack(alignment: .leading, spacing: 1) {
-                    Text(label).font(.system(size: 14)).foregroundStyle(c.text)
-                    Text(hint).font(.system(size: 11)).foregroundStyle(c.textFaint)
+                    Text(label).font(SofuuFont.font(14)).foregroundStyle(c.text)
+                    Text(hint).font(SofuuFont.font(11)).foregroundStyle(c.textFaint)
                 }
                 Spacer()
                 ZStack(alignment: on ? .trailing : .leading) {
@@ -111,7 +111,7 @@ private struct SheetButton: View {
 
     var body: some View {
         Button(action: onClick) {
-            Text(label).font(.system(size: 13)).foregroundStyle(fg)
+            Text(label).font(SofuuFont.font(13)).foregroundStyle(fg)
                 .padding(.horizontal, 16).padding(.vertical, 12)
                 .background(bg, in: Capsule())
         }
@@ -146,7 +146,7 @@ private struct ModelSheet: View {
         SheetTitle(t: "Select a provider")
         if providers.isEmpty {
             Text("No model selected — connect a provider first.")
-                .font(.system(size: 13)).foregroundStyle(c.textFaint).padding(12)
+                .font(SofuuFont.font(13)).foregroundStyle(c.textFaint).padding(12)
             SheetRow(label: "＋ Add provider", hint: nil, selected: false) {
                 store.openSettings(true, tab: "providers")
                 onClose()
@@ -186,7 +186,7 @@ private struct ModelSheet: View {
 
         if all.count > 1 {
             TextField("Search models…", text: $search)
-                .font(.system(size: 13))
+                .font(SofuuFont.font(13))
                 .textFieldStyle(.plain)
                 .padding(.horizontal, 12).padding(.vertical, 12)
                 .frame(minHeight: 44)
@@ -194,14 +194,14 @@ private struct ModelSheet: View {
                 .padding(.top, 6)
         }
         if let err = cached?.error {
-            Text(err).font(.system(size: 12)).foregroundStyle(c.err).padding(.top, 8)
+            Text(err).font(SofuuFont.font(12)).foregroundStyle(c.err).padding(.top, 8)
         }
 
         if all.isEmpty {
             Text("No model list for this provider — set a model name by hand below, or reconnect the provider.")
-                .font(.system(size: 13)).foregroundStyle(c.textFaint).padding(12)
+                .font(SofuuFont.font(13)).foregroundStyle(c.textFaint).padding(12)
             TextField("Type a model name…", text: $manual)
-                .font(.system(size: 13))
+                .font(SofuuFont.font(13))
                 .textFieldStyle(.plain)
                 .padding(.horizontal, 12).padding(.vertical, 12)
                 .frame(minHeight: 44)

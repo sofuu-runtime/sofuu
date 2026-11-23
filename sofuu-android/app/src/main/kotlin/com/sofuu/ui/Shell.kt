@@ -267,12 +267,13 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                                     role = Role.Button,
                                     radius = 999f,
                                     modifier = Modifier.size(24.dp),
+                                    contentAlignment = Alignment.Center,
                                 ) {
                                     Icon(
                                         Icons2.Close,
                                         "Delete chat",
                                         tint = if (c.dark) c.textFaint else c.textMuted,
-                                        modifier = Modifier.size(24.dp).padding(5.dp),
+                                        modifier = Modifier.size(13.dp),
                                     )
                                 }
                             }
@@ -460,8 +461,9 @@ private fun PreviewBar(label: String, onClose: () -> Unit) {
             role = Role.Button,
             radius = 999f,
             modifier = Modifier.size(24.dp),
+            contentAlignment = Alignment.Center,
         ) {
-            Icon(Icons2.Close, "Close", tint = c.textFaint, modifier = Modifier.size(24.dp).padding(5.dp))
+            Icon(Icons2.Close, "Close", tint = c.textFaint, modifier = Modifier.size(13.dp))
         }
     }
 }
@@ -767,8 +769,9 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                     role = Role.Button,
                     radius = 999f,
                     modifier = Modifier.size(28.dp),
+                    contentAlignment = Alignment.Center,
                 ) {
-                    Icon(Icons2.Close, "Close", tint = c.textMuted, modifier = Modifier.size(28.dp).padding(6.dp))
+                    Icon(Icons2.Close, "Close", tint = c.textMuted, modifier = Modifier.size(14.dp))
                 }
             }
             if (state.sessions.isEmpty()) {
@@ -788,7 +791,7 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(8.dp))
                             .heightIn(min = 44.dp)
-                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
                         // Tap the label = read-only preview (never touches the
@@ -801,14 +804,15 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                             role = Role.Button,
                             radius = 6f,
                             modifier = Modifier.weight(1f),
-                            contentPadding = PaddingValues(vertical = 4.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 6.dp),
+                            contentAlignment = Alignment.CenterStart,
                         ) {
                             Column {
                                 Text(s.labelOf(ordered.indexOf(s)), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = c.text, maxLines = 1)
-                                Text(ageOf(s.lastSeen), fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
+                                Text(ageOf(s.lastSeen), fontSize = 11.sp, fontWeight = FontWeight.Medium, color = c.textFaint, modifier = Modifier.padding(top = 2.dp))
                             }
                         }
-                        Spacer(Modifier.width(12.dp))
+                        Spacer(Modifier.width(8.dp))
                         SoapBubbleButton(
                             onClick = {
                                 onClose()
@@ -816,53 +820,59 @@ private fun HistorySheet(store: AppStore, onClose: () -> Unit) {
                                 store.setActiveSession(s.id)
                             },
                             fontSize = 11.5.sp,
-                            minHeight = 30.dp,
+                            minHeight = 28.dp,
                             fillWidth = false,
                             radius = 999f,
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
                         ) {
                             Text("Open", fontSize = 11.5.sp, fontWeight = FontWeight.SemiBold, color = c.accent)
                         }
-                        SoapBubbleButton(
-                            onClick = {
-                                if (deleteArmed == s.id) {
+                        Spacer(Modifier.width(6.dp))
+                        if (deleteArmed == s.id) {
+                            SoapBubbleButton(
+                                onClick = {
                                     deleteArmed = null
                                     store.deleteSession(s.id)
-                                } else deleteArmed = s.id
-                            },
-                            fontSize = 11.5.sp,
-                            minHeight = 30.dp,
-                            fillWidth = false,
-                            radius = 999f,
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp),
-                        ) {
-                            Text(
-                                if (deleteArmed == s.id) "sure?" else "×",
-                                fontSize = if (deleteArmed == s.id) 11.5.sp else 16.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = if (deleteArmed == s.id) c.errStrong else c.textFaint,
-                            )
+                                },
+                                fontSize = 11.sp,
+                                minHeight = 28.dp,
+                                fillWidth = false,
+                                radius = 999f,
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+                            ) {
+                                Text("sure?", fontSize = 11.sp, fontWeight = FontWeight.SemiBold, color = c.errStrong)
+                            }
+                        } else {
+                            SoapBubbleSurface(
+                                onClick = { deleteArmed = s.id },
+                                role = Role.Button,
+                                radius = 999f,
+                                modifier = Modifier.size(28.dp),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(Icons2.Close, "Delete", tint = c.textFaint, modifier = Modifier.size(14.dp))
+                            }
                         }
                     }
                 }
             }
             if (state.sessions.isNotEmpty()) {
-                Spacer(Modifier.height(6.dp))
+                Spacer(Modifier.height(8.dp))
                 Box(Modifier.fillMaxWidth().height(1.dp).background(c.separator))
+                Spacer(Modifier.height(6.dp))
                 SoapBubbleButton(
                     onClick = { if (clearArmed) { onClose(); store.clearSessions() } else clearArmed = true },
                     fontSize = 12.sp,
                     minHeight = 36.dp,
                     fillWidth = true,
                     radius = 8f,
-                    contentPadding = PaddingValues(10.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                 ) {
                     Text(
                         if (clearArmed) "Click again to confirm" else "Delete all chats in workspace",
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = c.errStrong,
-                        textAlign = TextAlign.Center,
                     )
                 }
             }

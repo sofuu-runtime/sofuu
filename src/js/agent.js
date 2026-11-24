@@ -2526,8 +2526,8 @@
     if (opts && opts.provider) o.provider = opts.provider; else if (d.provider) o.provider = d.provider;
     if (opts && opts.model) o.model = opts.model; else if (d.model) o.model = d.model;
     if (opts && opts.effort) o.effort = opts.effort; else if (d.effort) o.effort = d.effort;
-    if (opts && opts.api_key) o.api_key = opts.api_key; else if (d.apiKey) o.api_key = d.apiKey;
-    if (opts && opts.base_url) o.base_url = opts.base_url; else if (d.baseUrl) o.base_url = d.baseUrl;
+    if (opts && (opts.api_key || opts.apiKey)) o.api_key = opts.api_key || opts.apiKey; else if (d.apiKey || d.api_key) o.api_key = d.apiKey || d.api_key;
+    if (opts && (opts.base_url || opts.baseUrl)) o.base_url = opts.base_url || opts.baseUrl; else if (d.baseUrl || d.base_url) o.base_url = d.baseUrl || d.base_url;
     if (opts && opts.profile) o.profile = opts.profile; else if (d.profile) o.profile = d.profile;
     if (opts && opts.threads) o.threads = opts.threads; else if (d.threads) o.threads = d.threads;
     /* Dynamic output cap: explicit def/opts value wins, else the model's

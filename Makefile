@@ -914,6 +914,16 @@ kaze-gates:
 
 .PHONY: kaze-gates
 # ---------------------------------------------------------------------------
+# Phase 12: tensor / native-AI gates (tensor runtime, GGUF/SafeTensors,
+# tokenizer parity, autograd, GEMM, compiler shape algebra, Kaze inference).
+#
+#   make kaze-phase12
+# ---------------------------------------------------------------------------
+kaze-phase12:
+	@bash $(KAZE_DIR)/scripts/phase12/phase12-gates.sh
+
+.PHONY: kaze-phase12
+# ---------------------------------------------------------------------------
 # Phase 10: the sub-second build. The roadmap's acceptance gate is a build in under a
 # second with only a C compiler; at -O0 that is the measurement (the optimised release
 # build takes ~7 s). Same two source files, no Rust, no cargo.

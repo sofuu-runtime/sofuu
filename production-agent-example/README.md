@@ -64,37 +64,43 @@ sequenceDiagram
 
 ---
 
-## 3. Quickstart & CLI Usage
+## 3. Quickstart & Zero-Friction Provider Setup
 
-### A. Display CLI Help
+### A. Zero-Config Execution (Auto-Detects Active Sofuu Setup)
+If you already use Sofuu (`sofuu chat` or configured providers in `~/.sofuu/config.json`), Sentinel automatically inherits your active model, provider, and credentials:
 ```bash
-./sofuu run production-agent-example/index.js --help
+# Automatically uses your active Sofuu cloud/local provider
+./sofuu run production-agent-example/index.js -i
 ```
 
-### B. Run an Automated Audit on the Current Directory
+### B. Interactive Provider Setup Wizard (`--setup`)
+To switch or configure providers with an interactive terminal wizard:
 ```bash
-# Uses default provider (Anthropic or configured SOFUU_PROVIDER)
+./sofuu run production-agent-example/index.js --setup
+```
+
+### C. Smart Shorthand Aliases
+No need to type full model strings or base URLs:
+```bash
+# Use Claude 3.5 Sonnet
+./sofuu run production-agent-example/index.js -i --model sonnet
+
+# Use Claude 3.5 Haiku
+./sofuu run production-agent-example/index.js -i --model haiku
+
+# Use OpenAI GPT-4o
+./sofuu run production-agent-example/index.js -i --model 4o
+
+# Use any provider saved in ~/.sofuu/config.json (e.g. 0g, openrouter)
+./sofuu run production-agent-example/index.js -i --provider openrouter
+```
+
+### D. Automated Audit & CI/CD Mode
+```bash
+# Headless run on a target folder
 ./sofuu run production-agent-example/index.js --target ./src
 
-# Explicit model and provider
-./sofuu run production-agent-example/index.js \
-  --provider anthropic \
-  --model claude-3-5-sonnet-20241022 \
-  --target ./src \
-  --report ./audit-report.md
-```
-
-### C. Connect to Local Models (Ollama, vLLM, Local GGUF)
-```bash
-./sofuu run production-agent-example/index.js \
-  --provider ollama \
-  --model qwen2.5-coder:7b \
-  --base-url http://localhost:11434/v1 \
-  --target ./src
-```
-
-### D. CI/CD Gate Mode (Pure Machine-Readable JSON)
-```bash
+# CI/CD Gate Mode (Pure Machine-Readable JSON)
 ./sofuu run production-agent-example/index.js --target ./src --json
 ```
 - **Exit Code 0:** Clean or low-risk audit (Risk Score $\ge 85$).

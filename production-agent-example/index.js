@@ -13,6 +13,7 @@ import { defineSentinelAgent } from './lib/sentinel.js';
 import { astScanTool } from './lib/tools/ast_scan.js';
 import { reportGenTool } from './lib/tools/report_gen.js';
 import { gitDiffTool } from './lib/tools/git_diff.js';
+import { resolveProviderConfig, runInteractiveSetup } from './lib/provider.js';
 
 export function printHelp() {
   console.log(`
@@ -21,24 +22,33 @@ Usage: sofuu run production-agent-example/index.js [options]
 Autonomous Production Code Intelligence & Security Sentinel.
 
 Options:
+  --interactive, -i        Launch interactive multi-turn session with Sentinel
+  --setup                  Interactive wizard to select/configure AI cloud providers
   --target, --dir <path>   Directory or file to audit (default: current directory)
   --task <prompt>          Specific audit instructions or focus area
-  --provider <name>        LLM provider (anthropic, openai, gemini, groq, ollama, local)
-  --model <name>           Model identifier (e.g. claude-3-5-sonnet-20241022, gpt-4o)
-  --api-key <key>          Provider API key (defaults to environment variables)
-  --base-url <url>         Custom endpoint base URL (e.g. http://localhost:11434/v1)
+  --provider <name>        LLM provider (e.g. 0g, openrouter, anthropic, openai, ollama)
+  --model <name>           Model identifier or alias (e.g. sonnet, haiku, 4o, 4o-mini, deepseek)
+  --api-key <key>          Provider API key (defaults to active Sofuu config / env)
+  --base-url <url>         Custom endpoint base URL (e.g. https://api.deepseek.com/v1)
   --report <path>          Output path for generated markdown report (default: ./security-audit-report.md)
   --json                   Output pure machine-readable JSON (ideal for CI/CD gates)
-  --interactive, -i        Launch interactive multi-turn session with Sentinel
   --config <path>          Path to agent.config.json configuration file
   --help, -h               Show this help message and exit
 
-Environment Variables:
+Shorthand Aliases:
+  --model sonnet           Claude 3.5 Sonnet (Anthropic)
+  --model haiku            Claude 3.5 Haiku (Anthropic)
+  --model 4o               GPT-4o (OpenAI)
+  --model 4o-mini          GPT-4o Mini (OpenAI)
+  --model deepseek         DeepSeek-V3 Chat (Custom Endpoint)
+  --model qwen             Qwen 2.5 Coder 7B (Ollama)
+  --provider <name>        Any named provider from ~/.sofuu/config.json (e.g. 0g, openrouter)
+
+Environment Variables (Auto-detected from shell or .env):
   ANTHROPIC_API_KEY        Default key for Anthropic provider
-  OPENAI_API_KEY           Default key for OpenAI provider
-  GEMINI_API_KEY           Default key for Google Gemini provider
-  SOFUU_PROVIDER           Default provider override
-  SOFUU_MODEL              Default model override
+  OPENAI_API_KEY           Default key for OpenAI / OpenRouter provider
+  SOFUU_PROVIDER           Active provider override
+  SOFUU_MODEL              Active model override
 `);
 }
 
@@ -53,6 +63,7 @@ export function parseArgs(rawArgs) {
     report: 'security-audit-report.md',
     json: false,
     interactive: false,
+    setup: false,
     config: path.resolve(process.cwd(), 'production-agent-example/agent.config.json'),
   };
 
@@ -61,6 +72,10 @@ export function parseArgs(rawArgs) {
     if (a === '--help' || a === '-h') {
       printHelp();
       process.exit(0);
+    }
+    if (a === '--setup') {
+      args.setup = true;
+      continue;
     }
     if (a === '--json') {
       args.json = true;
@@ -124,17 +139,12 @@ export async function runAudit(options = {}) {
     options.config || path.resolve(process.cwd(), 'production-agent-example/agent.config.json')
   );
 
-  const provider =
-    options.provider ||
-    process.env.SOFUU_PROVIDER ||
-    cfg.provider ||
-    'anthropic';
+  const resolved = resolveProviderConfig(options, cfg);
 
-  const model =
-    options.model ||
-    process.env.SOFUU_MODEL ||
-    cfg.model ||
-    'claude-3-5-sonnet-20241022';
+  const provider = resolved.provider;
+  const model = resolved.model;
+  const apiKey = resolved.apiKey;
+  const baseUrl = resolved.baseUrl;
 
   const targetDir = path.resolve(process.cwd(), options.target || '.');
   const reportPath = path.resolve(
@@ -160,8 +170,8 @@ export async function runAudit(options = {}) {
   const runOpts = {
     provider,
     model,
-    apiKey: options.apiKey || null,
-    baseUrl: options.baseUrl || null,
+    apiKey,
+    baseUrl,
     onStep: options.onStep || null,
   };
 
@@ -173,23 +183,38 @@ async function main() {
   const rawArgs = Array.prototype.slice.call(process.argv, 2);
   const cliArgs = parseArgs(rawArgs);
 
+  // Dedicated Setup Command
+  if (cliArgs.setup) {
+    await runInteractiveSetup(cliArgs.config);
+    process.exit(0);
+  }
+
+  const cfg = loadConfigFile(cliArgs.config);
+  const resolved = resolveProviderConfig(cliArgs, cfg);
+
   if (!cliArgs.json) {
     console.log('\n🛡️  Sofuu Code Sentinel — Production AI Agent');
     console.log('─────────────────────────────────────────────');
     console.log(`• Target Directory : ${path.resolve(process.cwd(), cliArgs.target)}`);
+    console.log(`• AI Provider      : \x1b[32m${resolved.provider}\x1b[0m`);
+    console.log(`• Model Identifier : \x1b[36m${resolved.model}\x1b[0m`);
+    if (resolved.baseUrl) {
+      console.log(`• Custom Endpoint  : ${resolved.baseUrl}`);
+    }
     console.log(`• Report Output    : ${path.resolve(process.cwd(), cliArgs.report)}`);
     console.log('─────────────────────────────────────────────\n');
   }
 
   // Interactive Session Handler
   if (cliArgs.interactive) {
-    defineSentinelAgent();
+    defineSentinelAgent(cfg.budget || {});
     console.log('Launching interactive Sentinel TUI session...\n');
     await sofuu.agent.interact('code_sentinel', {
-      provider: cliArgs.provider,
-      model: cliArgs.model,
-      apiKey: cliArgs.apiKey,
-      baseUrl: cliArgs.baseUrl,
+      provider: resolved.provider,
+      model: resolved.model,
+      apiKey: resolved.apiKey,
+      baseUrl: resolved.baseUrl,
+      task: cliArgs.task || null,
     });
     return;
   }

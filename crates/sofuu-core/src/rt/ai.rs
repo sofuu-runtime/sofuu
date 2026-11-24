@@ -61,7 +61,7 @@ enum Provider {
 
 fn parse_provider(name: Option<&str>) -> Provider {
     match name {
-        None => Provider::OpenAi,
+        None | Some("openai") => Provider::OpenAi,
         Some("anthropic") => Provider::Anthropic,
         /* Legacy configs may still say "ollama" — treat it as local. */
         Some("ollama") => Provider::Local,
@@ -4085,12 +4085,18 @@ unsafe fn parse_ai_args(
         qjs::sofuu_js_free_value(ctx, v);
 
         v = qjs::sofuu_js_get_property_str(ctx, opts, c"api_key".as_ptr());
+        if qjs::is_undefined(v) {
+            v = qjs::sofuu_js_get_property_str(ctx, opts, c"apiKey".as_ptr());
+        }
         if !qjs::is_undefined(v) {
             cfg.api_key = cstr_opt(ctx, v);
         }
         qjs::sofuu_js_free_value(ctx, v);
 
         v = qjs::sofuu_js_get_property_str(ctx, opts, c"base_url".as_ptr());
+        if qjs::is_undefined(v) {
+            v = qjs::sofuu_js_get_property_str(ctx, opts, c"baseUrl".as_ptr());
+        }
         if !qjs::is_undefined(v) {
             cfg.base_url = cstr_opt(ctx, v);
         }
@@ -4365,12 +4371,18 @@ unsafe fn parse_embed_args(
         qjs::sofuu_js_free_value(ctx, v);
 
         v = qjs::sofuu_js_get_property_str(ctx, opts, c"api_key".as_ptr());
+        if qjs::is_undefined(v) {
+            v = qjs::sofuu_js_get_property_str(ctx, opts, c"apiKey".as_ptr());
+        }
         if !qjs::is_undefined(v) {
             cfg.api_key = cstr_opt(ctx, v);
         }
         qjs::sofuu_js_free_value(ctx, v);
 
         v = qjs::sofuu_js_get_property_str(ctx, opts, c"base_url".as_ptr());
+        if qjs::is_undefined(v) {
+            v = qjs::sofuu_js_get_property_str(ctx, opts, c"baseUrl".as_ptr());
+        }
         if !qjs::is_undefined(v) {
             cfg.base_url = cstr_opt(ctx, v);
         }

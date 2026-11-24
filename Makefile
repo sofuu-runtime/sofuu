@@ -924,6 +924,25 @@ kaze-phase12:
 
 .PHONY: kaze-phase12
 # ---------------------------------------------------------------------------
+# Phase 16: formal verification. Builds bin/kaze-verify (a separate binary from
+# the compiler's own front end) and runs the eight verification gates: stdlib
+# certification, SMT-LIB2 + Z3 proofs, Horn certificates, contract invariance,
+# rejection of unproven boundaries, proof-carrying assertion elision, artifact
+# binding, and certificate determinism.
+#
+#   make kaze-phase16          # all eight gates
+#   make kaze-formal-verify    # just the verifier binary
+# ---------------------------------------------------------------------------
+kaze-phase16:
+	@bash $(KAZE_DIR)/scripts/phase16-gates.sh
+
+.PHONY: kaze-phase16
+
+kaze-formal-verify:
+	@bash $(KAZE_DIR)/scripts/phase16/build-kaze-verify.sh
+
+.PHONY: kaze-formal-verify
+# ---------------------------------------------------------------------------
 # Phase 10: the sub-second build. The roadmap's acceptance gate is a build in under a
 # second with only a C compiler; at -O0 that is the measurement (the optimised release
 # build takes ~7 s). Same two source files, no Rust, no cargo.

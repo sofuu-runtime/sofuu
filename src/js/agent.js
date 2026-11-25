@@ -7288,8 +7288,19 @@
       return parts.join(' ');
     }
 
+    var inThinking = false;
+    var hasStdoutWrite = typeof process !== 'undefined' && process.stdout && typeof process.stdout.write === 'function';
+
+    function endThinking() {
+      if (!inThinking) return;
+      inThinking = false;
+      if (hasStdoutWrite) {
+        process.stdout.write(c.reset + '\n');
+      }
+    }
+
     function onStep(e) {
-      if (quiet) return;
+      if (!e || quiet) return;
       if (isJson) {
         try {
           console.error(JSON.stringify(e));
@@ -7299,6 +7310,10 @@
 
       var kind = e.kind;
       var p = e.payload || {};
+
+      if (kind !== 'think' && kind !== 'thought') {
+        endThinking();
+      }
 
       switch (kind) {
         case 'start':
@@ -7312,7 +7327,16 @@
         case 'think':
         case 'thought':
           if (p.text) {
-            console.log(c.dim + '💭 ' + clip(p.text.trim().replace(/\n/g, ' '), 120) + c.reset);
+            var chunk = String(p.text);
+            if (hasStdoutWrite) {
+              if (!inThinking) {
+                process.stdout.write(c.dim + '💭 Thinking:\n  ');
+                inThinking = true;
+              }
+              process.stdout.write(c.dim + chunk.replace(/\r?\n/g, '\n  ') + c.reset);
+            } else {
+              console.log(c.dim + '💭 ' + clip(chunk.trim().replace(/\n/g, ' '), 120) + c.reset);
+            }
           }
           break;
         case 'tool':
@@ -7347,6 +7371,7 @@
     }
 
     function onApproval(name, args, apId) {
+      endThinking();
       if (!isTTY || opts.headless) {
         return false; /* Fail-closed in non-interactive/headless environments */
       }
@@ -7370,11 +7395,13 @@
     }
 
     function renderAnswer(answer) {
+      endThinking();
       if (!answer || isJson) return;
       console.log('\n' + c.bold + c.green + 'Answer:' + c.reset + '\n' + answer);
     }
 
     function renderSummary(res) {
+      endThinking();
       if (isJson || quiet || !res) return;
       var usage = res.usage || {};
       var steps = res.steps || 0;

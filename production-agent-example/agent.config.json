@@ -1,8 +1,6 @@
 {
   "name": "code-sentinel",
   "version": "1.0.0",
-  "provider": "anthropic",
-  "model": "claude-3-5-sonnet-20241022",
   "budget": {
     "maxSteps": 15,
     "maxDepth": 2,

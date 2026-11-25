@@ -1,0 +1,21 @@
+{
+  "active": "default",
+  "providers": {
+    "default": {
+      "provider": "openai",
+      "model": "gpt-4o",
+      "api_key": "env:OPENAI_API_KEY"
+    },
+    "anthropic": {
+      "provider": "anthropic",
+      "model": "claude-3-5-sonnet-20241022",
+      "api_key": "env:ANTHROPIC_API_KEY"
+    },
+    "custom": {
+      "provider": "custom",
+      "model": "your-model-id",
+      "base_url": "https://your-provider-endpoint/v1",
+      "api_key": "env:CUSTOM_API_KEY"
+    }
+  }
+}

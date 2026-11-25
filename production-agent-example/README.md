@@ -52,7 +52,8 @@ sequenceDiagram
 | File | Purpose |
 | :--- | :--- |
 | [`index.js`](index.js) | Production CLI executable and programmatic SDK entry point |
-| [`agent.config.json`](agent.config.json) | 12-factor default configuration (model, budgets, thresholds) |
+| [`models.json`](models.json) | Dedicated per-agent providers & models configuration file |
+| [`agent.config.json`](agent.config.json) | Agent behavior configuration (budgets, thresholds, memory scope) |
 | [`lib/sentinel.js`](lib/sentinel.js) | Supervisor agent definition (`code_sentinel`) and orchestration |
 | [`lib/specialists/security.js`](lib/specialists/security.js) | Vulnerability triage sub-agent (`security_scanner`) |
 | [`lib/specialists/quality.js`](lib/specialists/quality.js) | Software architecture sub-agent (`quality_expert`) |
@@ -64,53 +65,63 @@ sequenceDiagram
 
 ---
 
-## 3. Quickstart & Zero-Friction Provider Setup
+## 3. Quickstart: Two Generalized Ways to Configure Models & Providers
 
-### A. Zero-Config Execution (Auto-Detects Active Sofuu Setup)
-If you already use Sofuu (`sofuu chat` or configured providers in `~/.sofuu/config.json`), Sentinel automatically inherits your active model, provider, and credentials:
-```bash
-# Automatically uses your active Sofuu cloud/local provider
-./sofuu run production-agent-example/index.js -i
+Every agent in Sofuu (both JS scripts and compiled binaries) supports **two simple ways** to configure providers and models:
+
+### Way 1: Per-Agent Config File (`models.json`)
+Edit [`models.json`](models.json) next to the agent (or `<binary-name>.models.json` next to a compiled binary):
+```json
+{
+  "active": "anthropic",
+  "providers": {
+    "anthropic": {
+      "provider": "anthropic",
+      "model": "claude-3-5-sonnet-20241022",
+      "api_key": "env:ANTHROPIC_API_KEY"
+    },
+    "openai": {
+      "provider": "openai",
+      "model": "gpt-4o",
+      "api_key": "env:OPENAI_API_KEY"
+    }
+  }
+}
 ```
+> `"api_key"` supports `"env:VAR_NAME"` or a literal API key string.
 
-### B. Interactive Provider Setup Wizard (`--setup`)
-To switch or configure providers with an interactive terminal wizard:
+### Way 2: Built-In Commands (`--setup-model`, `--edit-model`, `--list-models`)
+Works identically on **compiled standalone binaries** (`./code-sentinel`) and **`sofuu run`**:
+
 ```bash
-./sofuu run production-agent-example/index.js --setup
+# 1. Compile to standalone native binary
+./sofuu compile production-agent-example/index.js -o ./code-sentinel
+
+# 2. Add a provider & model interactively
+./code-sentinel --setup-model
+
+# 3. Edit, switch active, add, or delete providers/models
+./code-sentinel --edit-model
+
+# 4. Inspect configured models for this binary
+./code-sentinel --list-models
 ```
+*(When running as a script, use the same flags with `sofuu run production-agent-example/index.js --setup-model` / `--edit-model` / `--list-models`.)*
 
-### C. Smart Shorthand Aliases
-No need to type full model strings or base URLs:
+### Running the Agent
 ```bash
-# Use Claude 3.5 Sonnet
-./sofuu run production-agent-example/index.js -i --model sonnet
+# Interactive TUI chat
+./sofuu run production-agent-example/index.js --interactive
+# or with compiled binary:
+./code-sentinel -i
 
-# Use Claude 3.5 Haiku
-./sofuu run production-agent-example/index.js -i --model haiku
-
-# Use OpenAI GPT-4o
-./sofuu run production-agent-example/index.js -i --model 4o
-
-# Use any provider saved in ~/.sofuu/config.json (e.g. 0g, openrouter)
-./sofuu run production-agent-example/index.js -i --provider openrouter
-```
-
-### D. Automated Audit & CI/CD Mode
-```bash
-# Headless run on a target folder
-./sofuu run production-agent-example/index.js --target ./src
-
-# CI/CD Gate Mode (Pure Machine-Readable JSON)
+# Override profile or model for a single run
+./code-sentinel -i --provider openai
 ./sofuu run production-agent-example/index.js --target ./src --json
 ```
 - **Exit Code 0:** Clean or low-risk audit (Risk Score $\ge 85$).
 - **Exit Code 1:** Critical or High security flaws detected (Blocks CI merge).
 - **Exit Code 2:** Runtime or configuration error.
-
-### E. Interactive TUI Session
-```bash
-./sofuu run production-agent-example/index.js --interactive
-```
 
 ---
 

@@ -4090,9 +4090,19 @@ fn main() -> ExitCode {
             if clean.len() < 3 {
                 eprintln!("\x1b[31mError:\x1b[0m 'sofuu run' requires a file argument");
                 eprintln!(
-                    "\x1b[90m  flags: --policy <file> --read-only --no-net --confirm-all\x1b[0m"
+                    "\x1b[90m  flags: --policy <file> --read-only --no-net --confirm-all --setup-model --edit-model --list-models\x1b[0m"
                 );
                 return ExitCode::FAILURE;
+            }
+            let is_file_script = clean[2] != "-e" && clean[2] != "--eval" && clean[2] != "-";
+            let script_target = sofuu_core::model_config::AgentTarget::script(&clean[2]);
+            let script_args: Vec<String> = clean[2..].to_vec();
+            if is_file_script {
+                if let Some(code) =
+                    sofuu_core::model_config::handle_cli_command(&script_args, &script_target)
+                {
+                    return code;
+                }
             }
             let rt = match SofuuRuntime::init() {
                 Some(rt) => rt,
@@ -4101,6 +4111,14 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            if is_file_script {
+                let resolved_models =
+                    sofuu_core::model_config::apply_runtime_config(&script_args, &script_target);
+                let _ = rt.eval_string(
+                    &sofuu_core::model_config::js_prelude_for(&resolved_models),
+                    "<models-config>",
+                );
+            }
             if let Err(e) = install_command_policy(&rt, policy.as_deref(), guard) {
                 eprintln!("\x1b[31mError:\x1b[0m {e}");
                 return ExitCode::FAILURE;

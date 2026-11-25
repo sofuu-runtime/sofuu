@@ -3,52 +3,45 @@
  * production-agent-example/index.js
  *
  * Production CLI Runner & Programmatic SDK for Code Sentinel.
- * Supports headless CI/CD execution, interactive TUI sessions,
- * and 12-factor configuration (CLI Flags > Env Vars > Config File).
+ * Demonstrates Sofuu's generalized per-agent model config (`models.json`)
+ * and built-in `--setup-model` / `--edit-model` binary commands.
  */
 
 import fs from 'fs';
 import path from 'path';
 import { defineSentinelAgent } from './lib/sentinel.js';
-import { astScanTool } from './lib/tools/ast_scan.js';
-import { reportGenTool } from './lib/tools/report_gen.js';
-import { gitDiffTool } from './lib/tools/git_diff.js';
-import { resolveProviderConfig, runInteractiveSetup } from './lib/provider.js';
+import './lib/tools/ast_scan.js';
+import './lib/tools/report_gen.js';
+import './lib/tools/git_diff.js';
 
 export function printHelp() {
   console.log(`
-Usage: sofuu run production-agent-example/index.js [options]
+Usage:
+  sofuu run production-agent-example/index.js [options] [target_dir]
+  ./code-sentinel [options] [target_dir]
 
 Autonomous Production Code Intelligence & Security Sentinel.
 
-Options:
-  --interactive, -i        Launch interactive multi-turn session with Sentinel
-  --setup                  Interactive wizard to select/configure AI cloud providers
-  --target, --dir <path>   Directory or file to audit (default: current directory)
+Model & Provider Configuration (Two Generalized Ways):
+  1. Per-Agent Config File: ./models.json (or ./<binary>.models.json)
+  2. Binary/CLI Commands:
+     --setup-model          Interactive wizard to add a provider & model
+     --edit-model [name]    Edit, switch active, add, or delete providers/models
+     --list-models          List configured providers & models for this agent
+     --models-config <path> Path to a specific models.json file
+
+Runtime Options:
+  --interactive, -i        Launch interactive multi-turn chat session
+  --target, --dir <path>   Directory or file to audit (or pass as positional arg)
   --task <prompt>          Specific audit instructions or focus area
-  --provider <name>        LLM provider (e.g. 0g, openrouter, anthropic, openai, ollama)
-  --model <name>           Model identifier or alias (e.g. sonnet, haiku, 4o, 4o-mini, deepseek)
-  --api-key <key>          Provider API key (defaults to active Sofuu config / env)
-  --base-url <url>         Custom endpoint base URL (e.g. https://api.deepseek.com/v1)
-  --report <path>          Output path for generated markdown report (default: ./security-audit-report.md)
-  --json                   Output pure machine-readable JSON (ideal for CI/CD gates)
-  --config <path>          Path to agent.config.json configuration file
+  --provider, -p <name>    Override provider or profile name from models.json
+  --model, -m <name>       Override model identifier
+  --api-key <key>          Override API key for this run
+  --base-url <url>         Override endpoint base URL
+  --report <path>          Output path for markdown report (default: ./security-audit-report.md)
+  --json                   Output pure machine-readable JSON (ideal for CI/CD)
+  --config, -c <path>      Path to agent.config.json (budgets & audit settings)
   --help, -h               Show this help message and exit
-
-Shorthand Aliases:
-  --model sonnet           Claude 3.5 Sonnet (Anthropic)
-  --model haiku            Claude 3.5 Haiku (Anthropic)
-  --model 4o               GPT-4o (OpenAI)
-  --model 4o-mini          GPT-4o Mini (OpenAI)
-  --model deepseek         DeepSeek-V3 Chat (Custom Endpoint)
-  --model qwen             Qwen 2.5 Coder 7B (Ollama)
-  --provider <name>        Any named provider from ~/.sofuu/config.json (e.g. 0g, openrouter)
-
-Environment Variables (Auto-detected from shell or .env):
-  ANTHROPIC_API_KEY        Default key for Anthropic provider
-  OPENAI_API_KEY           Default key for OpenAI / OpenRouter provider
-  SOFUU_PROVIDER           Active provider override
-  SOFUU_MODEL              Active model override
 `);
 }
 
@@ -63,19 +56,15 @@ export function parseArgs(rawArgs) {
     report: 'security-audit-report.md',
     json: false,
     interactive: false,
-    setup: false,
     config: path.resolve(process.cwd(), 'production-agent-example/agent.config.json'),
   };
 
   for (let i = 0; i < rawArgs.length; i++) {
     const a = rawArgs[i];
+    if (a === '--') continue;
     if (a === '--help' || a === '-h') {
       printHelp();
       process.exit(0);
-    }
-    if (a === '--setup') {
-      args.setup = true;
-      continue;
     }
     if (a === '--json') {
       args.json = true;
@@ -93,11 +82,11 @@ export function parseArgs(rawArgs) {
       args.task = rawArgs[++i];
       continue;
     }
-    if (a === '--provider' && i + 1 < rawArgs.length) {
+    if ((a === '--provider' || a === '-p') && i + 1 < rawArgs.length) {
       args.provider = rawArgs[++i];
       continue;
     }
-    if (a === '--model' && i + 1 < rawArgs.length) {
+    if ((a === '--model' || a === '-m') && i + 1 < rawArgs.length) {
       args.model = rawArgs[++i];
       continue;
     }
@@ -113,9 +102,16 @@ export function parseArgs(rawArgs) {
       args.report = rawArgs[++i];
       continue;
     }
-    if (a === '--config' && i + 1 < rawArgs.length) {
+    if ((a === '--config' || a === '-c') && i + 1 < rawArgs.length) {
       args.config = rawArgs[++i];
       continue;
+    }
+    if (a === '--models-config' && i + 1 < rawArgs.length) {
+      i++;
+      continue;
+    }
+    if (!a.startsWith('-')) {
+      args.target = a;
     }
   }
 
@@ -132,19 +128,34 @@ export function loadConfigFile(configPath) {
 }
 
 /**
+ * Resolves runtime model settings from Sofuu's generalized agent model config
+ * (`models.json` + CLI overrides) with optional programmatic overrides.
+ */
+export function resolveActiveModel(options = {}) {
+  const mc = typeof sofuu.agent.getModelConfig === 'function' ? sofuu.agent.getModelConfig() : {};
+  const provider = options.provider || mc.provider || process.env.SOFUU_PROVIDER || '';
+  const model = options.model || mc.model || process.env.SOFUU_MODEL || '';
+  const baseUrl = options.baseUrl || mc.baseUrl || null;
+  const apiKey = options.apiKey || null;
+  return {
+    configPath: mc.configPath || null,
+    activeProfile: mc.active || null,
+    provider,
+    model,
+    baseUrl,
+    apiKey,
+    hasApiKey: mc.hasApiKey || !!apiKey,
+  };
+}
+
+/**
  * Programmatic execution interface for external tools or scripts.
  */
 export async function runAudit(options = {}) {
   const cfg = loadConfigFile(
     options.config || path.resolve(process.cwd(), 'production-agent-example/agent.config.json')
   );
-
-  const resolved = resolveProviderConfig(options, cfg);
-
-  const provider = resolved.provider;
-  const model = resolved.model;
-  const apiKey = resolved.apiKey;
-  const baseUrl = resolved.baseUrl;
+  const resolved = resolveActiveModel(options);
 
   const targetDir = path.resolve(process.cwd(), options.target || '.');
   const reportPath = path.resolve(
@@ -168,10 +179,10 @@ export async function runAudit(options = {}) {
   const finalTask = options.task || defaultPrompt;
 
   const runOpts = {
-    provider,
-    model,
-    apiKey,
-    baseUrl,
+    provider: resolved.provider || undefined,
+    model: resolved.model || undefined,
+    apiKey: resolved.apiKey || undefined,
+    baseUrl: resolved.baseUrl || undefined,
     onStep: options.onStep || null,
   };
 
@@ -182,27 +193,30 @@ export async function runAudit(options = {}) {
 async function main() {
   const rawArgs = Array.prototype.slice.call(process.argv, 2);
   const cliArgs = parseArgs(rawArgs);
-
-  // Dedicated Setup Command
-  if (cliArgs.setup) {
-    await runInteractiveSetup(cliArgs.config);
-    process.exit(0);
-  }
-
   const cfg = loadConfigFile(cliArgs.config);
-  const resolved = resolveProviderConfig(cliArgs, cfg);
+  const resolved = resolveActiveModel(cliArgs);
 
   if (!cliArgs.json) {
     console.log('\n🛡️  Sofuu Code Sentinel — Production AI Agent');
     console.log('─────────────────────────────────────────────');
     console.log(`• Target Directory : ${path.resolve(process.cwd(), cliArgs.target)}`);
-    console.log(`• AI Provider      : \x1b[32m${resolved.provider}\x1b[0m`);
-    console.log(`• Model Identifier : \x1b[36m${resolved.model}\x1b[0m`);
+    console.log(`• Model Config     : ${resolved.configPath || '(none — run --setup-model)'}`);
+    console.log(
+      `• Active Model     : ${resolved.provider || '(unset)'} / ${resolved.model || '(unset)'}${resolved.activeProfile ? ` [${resolved.activeProfile}]` : ''}`
+    );
     if (resolved.baseUrl) {
       console.log(`• Custom Endpoint  : ${resolved.baseUrl}`);
     }
     console.log(`• Report Output    : ${path.resolve(process.cwd(), cliArgs.report)}`);
     console.log('─────────────────────────────────────────────\n');
+  }
+
+  if (!resolved.provider || !resolved.model) {
+    console.error('❌ No provider/model configured for this agent.');
+    console.error('   Configure using either:');
+    console.error('     1. Edit or create models.json alongside this agent');
+    console.error('     2. Run with --setup-model to launch the setup wizard\n');
+    process.exit(2);
   }
 
   // Interactive Session Handler
@@ -212,8 +226,8 @@ async function main() {
     await sofuu.agent.interact('code_sentinel', {
       provider: resolved.provider,
       model: resolved.model,
-      apiKey: resolved.apiKey,
-      baseUrl: resolved.baseUrl,
+      apiKey: resolved.apiKey || undefined,
+      baseUrl: resolved.baseUrl || undefined,
       task: cliArgs.task || null,
     });
     return;
@@ -242,10 +256,10 @@ async function main() {
     const result = await runAudit({
       target: cliArgs.target,
       task: cliArgs.task,
-      provider: cliArgs.provider,
-      model: cliArgs.model,
-      apiKey: cliArgs.apiKey,
-      baseUrl: cliArgs.baseUrl,
+      provider: resolved.provider,
+      model: resolved.model,
+      apiKey: resolved.apiKey,
+      baseUrl: resolved.baseUrl,
       report: cliArgs.report,
       config: cliArgs.config,
       onStep,
@@ -258,12 +272,13 @@ async function main() {
       console.log('─────────────────────────────────────────────');
       console.log(result.answer || 'Audit completed with no output.');
       console.log('─────────────────────────────────────────────');
-      console.log(
-        `Total Steps Taken : ${result.steps ? result.steps.length : 'N/A'}`
-      );
-      console.log(
-        `Token Usage        : In=${result.usage?.input || 0}, Out=${result.usage?.output || 0}`
-      );
+      const stepsDisplay = Array.isArray(result.steps)
+        ? result.steps.length
+        : (typeof result.steps === 'number' ? result.steps : 'N/A');
+      const inTok = result.usage?.promptTokens ?? result.usage?.input ?? 0;
+      const outTok = result.usage?.completionTokens ?? result.usage?.output ?? 0;
+      console.log(`Total Steps Taken : ${stepsDisplay}`);
+      console.log(`Token Usage        : In=${inTok}, Out=${outTok}`);
     }
 
     process.exit(0);

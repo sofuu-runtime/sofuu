@@ -245,26 +245,55 @@ pub fn brain_path() -> Option<String> {
 
 // ── E2: headless request defaults (provider / model / base_url) ──
 //
-// These exist ONLY to save an embedder from repeating them per call. They
-// are read exclusively from the runtime's installed settings (never the
-// process globals), so runtime B's defaults can never retarget runtime A —
-// the same isolation the api_keys reader has.
+// These exist ONLY to save an embedder or agent binary from repeating them
+// per call. Per-runtime settings (capi) are read exclusively when present so
+// runtime B can never retarget runtime A; CLI/agent binaries without capi
+// settings fall back to the process-global defaults loaded from models.json.
 
-/// The runtime's default provider name, if the host configured one.
+static DEFAULT_PROVIDER: Mutex<Option<String>> = Mutex::new(None);
+static DEFAULT_MODEL: Mutex<Option<String>> = Mutex::new(None);
+static DEFAULT_BASE_URL: Mutex<Option<String>> = Mutex::new(None);
+
+/// Set process-global default provider / model / base_url for CLI and
+/// compiled standalone agent binaries.
+pub fn set_defaults(
+    provider: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+) {
+    if let Ok(mut p) = DEFAULT_PROVIDER.lock() {
+        *p = provider;
+    }
+    if let Ok(mut m) = DEFAULT_MODEL.lock() {
+        *m = model;
+    }
+    if let Ok(mut u) = DEFAULT_BASE_URL.lock() {
+        *u = base_url;
+    }
+}
+
+/// The runtime's default provider name, if configured.
 pub fn default_provider() -> Option<String> {
-    current_settings()?.default_provider
+    if let Some(s) = current_settings() {
+        return s.default_provider;
+    }
+    DEFAULT_PROVIDER.lock().ok()?.clone()
 }
 
-/// The runtime's default model, if the host configured one.
+/// The runtime's default model, if configured.
 pub fn default_model() -> Option<String> {
-    current_settings()?.default_model
+    if let Some(s) = current_settings() {
+        return s.default_model;
+    }
+    DEFAULT_MODEL.lock().ok()?.clone()
 }
 
-/// The runtime's default endpoint override, if the host configured one.
-/// This is what lets an embedder point the whole runtime at a local
-/// OpenAI-compatible server (Ollama, vLLM, LM Studio) in one place.
+/// The runtime's default endpoint override, if configured.
 pub fn default_base_url() -> Option<String> {
-    current_settings()?.default_base_url
+    if let Some(s) = current_settings() {
+        return s.default_base_url;
+    }
+    DEFAULT_BASE_URL.lock().ok()?.clone()
 }
 
 #[cfg(test)]

@@ -14,7 +14,6 @@ import { gitDiffTool } from '../lib/tools/git_diff.js';
 import { defineSentinelAgent } from '../lib/sentinel.js';
 import { defineSecuritySpecialist } from '../lib/specialists/security.js';
 import { defineQualitySpecialist } from '../lib/specialists/quality.js';
-import { resolveProviderConfig, MODEL_ALIASES } from '../lib/provider.js';
 
 let passed = 0;
 let failed = 0;
@@ -139,27 +138,20 @@ async function runTests() {
     assert(typeof diffRes.totalChangedFiles === 'number', 'git_diff returned totalChangedFiles count');
   }
 
-  // Test 5: Provider & Model Auto-Configuration
-  console.log('\n5. Testing Provider & Model Resolution');
+  // Test 5: Generalized Per-Agent Model Config (models.json & runtime API)
+  console.log('\n5. Testing Per-Agent Model Configuration');
   {
-    // Shorthand alias resolution
-    const sonnetCfg = resolveProviderConfig({ model: 'sonnet' });
-    assert(sonnetCfg.provider === 'anthropic', 'sonnet alias resolves provider to anthropic');
-    assert(sonnetCfg.model === 'claude-3-5-sonnet-20241022', 'sonnet alias resolves model correctly');
+    const modelsJsonPath = path.resolve(process.cwd(), 'production-agent-example/models.json');
+    assert(fs.existsSync(modelsJsonPath), 'production-agent-example/models.json exists');
 
-    const gptCfg = resolveProviderConfig({ model: '4o' });
-    assert(gptCfg.provider === 'openai', '4o alias resolves provider to openai');
-    assert(gptCfg.model === 'gpt-4o', '4o alias resolves model correctly');
+    const modelsData = JSON.parse(fs.readFileSync(modelsJsonPath, 'utf8'));
+    assert(typeof modelsData.active === 'string' && modelsData.active.length > 0, 'models.json declares an active profile');
+    assert(modelsData.providers && typeof modelsData.providers[modelsData.active] === 'object', 'models.json active profile exists in providers map');
+    assert(!('budget' in modelsData) && !('audit' in modelsData), 'models.json is dedicated solely to providers and models');
 
-    // Named provider lookup
-    const openrouterCfg = resolveProviderConfig({ provider: 'openrouter' });
-    assert(openrouterCfg.provider === 'custom', 'openrouter maps to custom wire');
-    assert(typeof openrouterCfg.baseUrl === 'string' && openrouterCfg.baseUrl.includes('openrouter.ai'), 'openrouter auto-loads endpoint');
-
-    // Zero-config auto-detection
-    const autoCfg = resolveProviderConfig({});
-    assert(typeof autoCfg.provider === 'string' && autoCfg.provider.length > 0, 'Auto-detected provider exists');
-    assert(typeof autoCfg.model === 'string' && autoCfg.model.length > 0, 'Auto-detected model exists');
+    assert(typeof sofuu.agent.getModelConfig === 'function', 'sofuu.agent.getModelConfig() runtime API is available');
+    const runtimeMc = sofuu.agent.getModelConfig();
+    assert(typeof runtimeMc === 'object' && typeof runtimeMc.providers === 'object', 'getModelConfig() returns structured model config');
   }
 
   console.log('\n─────────────────────────────────────────────');

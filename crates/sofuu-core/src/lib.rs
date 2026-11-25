@@ -160,6 +160,7 @@ pub use domains::infer; // CPU-first GGUF inference engine (encapsulated under d
 pub mod mcp;
 pub use domains::memory; // CMA cognitive memory (encapsulated under domains::memory)
 pub mod ml; // PLAN-ML-GATES: context-economy models + the in-memory working set
+pub mod model_config; // Per-agent models.json + --setup-model / --edit-model
 pub mod modules; // M2: console shell (more land in later phases)
 pub mod npm;
 pub mod rlm;

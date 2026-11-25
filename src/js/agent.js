@@ -2981,12 +2981,54 @@
   /**
    * sofuu.agent.run(handleOrNameOrDef, task, opts) → Promise<AgentResult>
    */
+  function getModelConfig() {
+    var am = (typeof globalThis !== 'undefined' && globalThis.__sofuu_agent_models)
+      ? globalThis.__sofuu_agent_models
+      : null;
+    if (!am || typeof am !== 'object') {
+      return {
+        configPath: null,
+        active: null,
+        provider: '',
+        model: '',
+        baseUrl: null,
+        hasApiKey: false,
+        providers: {},
+      };
+    }
+    return {
+      configPath: am.configPath || null,
+      active: am.active || null,
+      provider: am.provider || '',
+      model: am.model || '',
+      baseUrl: am.baseUrl || null,
+      hasApiKey: !!am.hasApiKey,
+      providers: am.providers || {},
+    };
+  }
+
+  function applyAgentModelDefaults(d, opts) {
+    var am = getModelConfig();
+    var reqProv = opts && opts.provider ? String(opts.provider) : '';
+    if (reqProv && am.providers && am.providers[reqProv]) {
+      var prof = am.providers[reqProv];
+      opts.provider = prof.provider || reqProv;
+      if (!opts.model && prof.model) opts.model = prof.model;
+      if (!opts.base_url && !opts.baseUrl && prof.baseUrl) opts.base_url = prof.baseUrl;
+    }
+    var patch = {};
+    if (!d.provider && am.provider) patch.provider = am.provider;
+    if (!d.model && am.model) patch.model = am.model;
+    if (!d.baseUrl && am.baseUrl) patch.baseUrl = am.baseUrl;
+    return Object.keys(patch).length > 0 ? Object.assign({}, d, patch) : d;
+  }
+
   function run(target, task, opts) {
     opts = opts || {};
     if (opts.resumeFrom && opts.resumeFrom._sofuu_resume_unavailable === true) {
       throw makeError('E_CAPABILITY', 'The checkpoint was redacted or incomplete and cannot be resumed safely; start a new run with the required inputs.');
     }
-    var d = resolveDef(target);
+    var d = applyAgentModelDefaults(resolveDef(target), opts);
     /* SPEC §3: resolve the error policy BEFORE the run registers itself
      * (ACTIVE/SIGNALS/run counter) — an unknown mode is REFUSED here, so a
      * typo can never leave a half-open run behind or silently mean some
@@ -7374,7 +7416,7 @@
 
   async function interact(target, opts) {
     opts = opts || {};
-    var d = resolveDef(target);
+    var d = applyAgentModelDefaults(resolveDef(target), opts);
     var tui = createTUI(opts);
     var promptFn = (typeof globalThis !== 'undefined' && typeof globalThis.__prompt === 'function')
       ? globalThis.__prompt
@@ -7382,7 +7424,22 @@
 
     var initialTask = opts.task || opts.initialTask;
     if (!initialTask && typeof sofuu !== 'undefined' && Array.isArray(sofuu.args) && sofuu.args.length > 0) {
-      var positional = sofuu.args.filter(function (a) { return !a.startsWith('--'); });
+      var valFlags = {
+        '--provider': 1, '-p': 1, '--model': 1, '-m': 1, '--api-key': 1,
+        '--base-url': 1, '--profile': 1, '--models-config': 1, '--config': 1,
+        '-c': 1, '--arg': 1, '--edit-model': 1
+      };
+      var positional = [];
+      for (var ai = 0; ai < sofuu.args.length; ai++) {
+        var arg = String(sofuu.args[ai]);
+        if (arg === '--') {
+          positional = positional.concat(sofuu.args.slice(ai + 1));
+          break;
+        }
+        if (valFlags[arg]) { ai++; continue; }
+        if (arg.startsWith('-')) continue;
+        positional.push(arg);
+      }
       if (positional.length > 0) {
         initialTask = positional.join(' ');
       }
@@ -7464,6 +7521,7 @@
     return { ok: true, permissions: v };
   };
   A.getPermissions = function () { return PERMISSION_PROFILE; };
+  A.getModelConfig = getModelConfig;
   A.define = define;
   A.run = run;
   A.runMany = runMany;

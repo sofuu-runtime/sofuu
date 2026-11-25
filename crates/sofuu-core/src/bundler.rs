@@ -79,6 +79,73 @@ fn skip_block_comment(src: &[u8], mut pos: usize, len: usize) -> usize {
     pos
 }
 
+/// Returns true when `/` at `pos` starts a regex literal (not `//`, `/*`, or division).
+fn is_regex_start(src: &[u8], pos: usize, len: usize) -> bool {
+    if pos >= len || src[pos] != b'/' {
+        return false;
+    }
+    if pos + 1 < len && (src[pos + 1] == b'/' || src[pos + 1] == b'*' || src[pos + 1] == b'=') {
+        return false;
+    }
+    // Look backward past horizontal whitespace.
+    let mut k = pos;
+    while k > 0 && (src[k - 1] == b' ' || src[k - 1] == b'\t') {
+        k -= 1;
+    }
+    if k == 0 {
+        return true;
+    }
+    let prev = src[k - 1];
+    if matches!(
+        prev,
+        b'=' | b':' | b'(' | b'[' | b'{' | b',' | b';' | b'!' | b'&' | b'|' | b'?'
+            | b'+' | b'-' | b'*' | b'%' | b'^' | b'~' | b'<' | b'>' | b'\n' | b'\r'
+    ) {
+        return true;
+    }
+    // Keywords that can precede a regex literal: return, throw, case, typeof, void, delete, in, of, await, yield, else
+    let word_end = k;
+    while k > 0 && is_id_cont(src[k - 1]) {
+        k -= 1;
+    }
+    let word = &src[k..word_end];
+    matches!(
+        word,
+        b"return" | b"throw" | b"case" | b"typeof" | b"void" | b"delete"
+            | b"in" | b"of" | b"await" | b"yield" | b"else"
+    )
+}
+
+/// Skips a JS regex literal `/.../` including `[...]` char classes and `\.` escapes.
+fn skip_regex(src: &[u8], mut pos: usize, len: usize) -> usize {
+    pos += 1; // skip opening '/'
+    let mut in_class = false;
+    while pos < len {
+        let b = src[pos];
+        if b == b'\\' {
+            pos += if pos + 1 < len { 2 } else { 1 };
+            continue;
+        }
+        if b == b'\n' || b == b'\r' {
+            // Unterminated on this line; bail safely.
+            return pos;
+        }
+        if b == b'[' {
+            in_class = true;
+        } else if b == b']' && in_class {
+            in_class = false;
+        } else if b == b'/' && !in_class {
+            pos += 1;
+            while pos < len && src[pos].is_ascii_alphabetic() {
+                pos += 1;
+            }
+            return pos;
+        }
+        pos += 1;
+    }
+    pos
+}
+
 fn skip_ws(src: &[u8], mut pos: usize, len: usize) -> usize {
     while pos < len && (src[pos] == b' ' || src[pos] == b'\t') {
         pos += 1;
@@ -551,9 +618,9 @@ fn resolve_id_in_graph(
     npm_resolve: &dyn Fn(&Path, &str) -> Option<PathBuf>,
 ) -> String {
     let mod_dir = mod_abs.parent().unwrap_or(Path::new("."));
-    if let Some((dep_abs, dep_id)) = resolve_specifier(spec, mod_dir, &graph.root_dir, npm_resolve) {
-        if graph.mods.iter().any(|x| x.abs_path == dep_abs) {
-            return dep_id;
+    if let Some((dep_abs, _)) = resolve_specifier(spec, mod_dir, &graph.root_dir, npm_resolve) {
+        if let Some(found) = graph.mods.iter().find(|x| x.abs_path == dep_abs) {
+            return found.id.clone();
         }
     }
     spec.to_string()
@@ -613,6 +680,12 @@ pub fn transform_module(
     let len = bytes.len();
     let mut out = String::new();
     let mut p = 0usize;
+    if len >= 2 && bytes[0] == b'#' && bytes[1] == b'!' {
+        p = skip_line_comment(bytes, 0, len);
+        if p < len && bytes[p] == b'\n' {
+            p += 1;
+        }
+    }
 
     while p < len {
         let c = bytes[p];
@@ -638,6 +711,12 @@ pub fn transform_module(
         }
         if c == b'/' && p + 1 < len && bytes[p + 1] == b'*' {
             let end = skip_block_comment(bytes, p, len);
+            out.push_str(&src[p..end]);
+            p = end;
+            continue;
+        }
+        if c == b'/' && is_regex_start(bytes, p, len) {
+            let end = skip_regex(bytes, p, len);
             out.push_str(&src[p..end]);
             p = end;
             continue;
@@ -877,46 +956,52 @@ pub fn transform_module(
                     ep += 1;
                 }
                 let name = &src[name_start..ep];
-                let mut rest = String::new();
+                let rest_start = ep;
                 let mut d = 0i32;
                 while ep < len {
-                    /* proc-12: skip string literals FIRST — a `;` inside
-                     * `"a;b"` (or a `{`/`}` in a string) must not touch the
-                     * depth counter or end the initializer. */
+                    /* proc-12: skip string, template, regex, and comment literals
+                     * FIRST so quotes/braces/semicolons inside them never desync. */
                     let b0 = bytes[ep];
                     if b0 == b'"' || b0 == b'\'' {
-                        let e = skip_string(bytes, ep, len);
-                        rest.push_str(&String::from_utf8_lossy(&bytes[ep..e]));
-                        ep = e;
+                        ep = skip_string(bytes, ep, len);
                         continue;
                     }
                     if b0 == b'`' {
-                        let e = skip_template(bytes, ep, len);
-                        rest.push_str(&String::from_utf8_lossy(&bytes[ep..e]));
-                        ep = e;
+                        ep = skip_template(bytes, ep, len);
                         continue;
                     }
-                    if bytes[ep] == b'{' || bytes[ep] == b'(' || bytes[ep] == b'[' {
+                    if b0 == b'/' && ep + 1 < len && bytes[ep + 1] == b'/' {
+                        ep = skip_line_comment(bytes, ep, len);
+                        continue;
+                    }
+                    if b0 == b'/' && ep + 1 < len && bytes[ep + 1] == b'*' {
+                        ep = skip_block_comment(bytes, ep, len);
+                        continue;
+                    }
+                    if b0 == b'/' && is_regex_start(bytes, ep, len) {
+                        ep = skip_regex(bytes, ep, len);
+                        continue;
+                    }
+                    if b0 == b'{' || b0 == b'(' || b0 == b'[' {
                         d += 1;
                     }
-                    if bytes[ep] == b'}' || bytes[ep] == b')' || bytes[ep] == b']' {
+                    if b0 == b'}' || b0 == b')' || b0 == b']' {
                         d -= 1;
                     }
-                    if d == 0 && bytes[ep] == b';' {
-                        rest.push(';');
+                    if d == 0 && b0 == b';' {
                         ep += 1;
                         break;
                     }
                     if d < 0 {
                         break;
                     }
-                    rest.push(bytes[ep] as char);
                     ep += 1;
                 }
+                let rest = &src[rest_start..ep];
                 out.push_str(kw);
                 out.push(' ');
                 out.push_str(name);
-                out.push_str(if rest.is_empty() { ";" } else { &rest });
+                out.push_str(if rest.is_empty() { ";" } else { rest });
                 out.push_str(&format!("\nexports.{name}={name};"));
                 p = ep;
                 if p < len && bytes[p] == b'\n' {
@@ -926,32 +1011,86 @@ pub fn transform_module(
                 continue;
             }
 
-            // export function foo() {} / export class Foo {}
-            if ep0 + 8 <= len
-                && (&bytes[ep0..ep0 + 8] == b"function" || &bytes[ep0..ep0 + 5] == b"class")
+            // export [async] function foo() {} / export class Foo {}
+            let fn_kw_end = if ep0 + 5 <= len
+                && &bytes[ep0..ep0 + 5] == b"async"
+                && (ep0 + 5 >= len || !is_id_cont(bytes[ep0 + 5]))
             {
-                let kw_start = ep0;
-                let mut ep = ep0;
-                while ep < len && !bytes[ep].is_ascii_whitespace() && bytes[ep] != b'(' {
-                    ep += 1;
+                let after_async = skip_ws(bytes, ep0 + 5, len);
+                if after_async + 8 <= len
+                    && &bytes[after_async..after_async + 8] == b"function"
+                    && (after_async + 8 >= len || !is_id_cont(bytes[after_async + 8]))
+                {
+                    Some(after_async + 8)
+                } else {
+                    None
                 }
-                ep = skip_ws(bytes, ep, len);
+            } else if ep0 + 8 <= len
+                && &bytes[ep0..ep0 + 8] == b"function"
+                && (ep0 + 8 >= len || !is_id_cont(bytes[ep0 + 8]))
+            {
+                Some(ep0 + 8)
+            } else if ep0 + 5 <= len
+                && &bytes[ep0..ep0 + 5] == b"class"
+                && (ep0 + 5 >= len || !is_id_cont(bytes[ep0 + 5]))
+            {
+                Some(ep0 + 5)
+            } else {
+                None
+            };
+
+            if let Some(kw_end) = fn_kw_end {
+                let kw_start = ep0;
+                let mut ep = skip_ws(bytes, kw_end, len);
                 let name_start = ep;
                 while ep < len && is_id_cont(bytes[ep]) {
                     ep += 1;
                 }
                 let name = &src[name_start..ep];
                 let mut d = 0i32;
+                let mut paren_d = 0i32;
                 let mut in_block = false;
                 while ep < len {
-                    if bytes[ep] == b'{' {
-                        d += 1;
-                        in_block = true;
+                    let b0 = bytes[ep];
+                    if b0 == b'"' || b0 == b'\'' {
+                        ep = skip_string(bytes, ep, len);
+                        continue;
                     }
-                    if bytes[ep] == b'}' {
+                    if b0 == b'`' {
+                        ep = skip_template(bytes, ep, len);
+                        continue;
+                    }
+                    if b0 == b'/' && ep + 1 < len && bytes[ep + 1] == b'/' {
+                        ep = skip_line_comment(bytes, ep, len);
+                        continue;
+                    }
+                    if b0 == b'/' && ep + 1 < len && bytes[ep + 1] == b'*' {
+                        ep = skip_block_comment(bytes, ep, len);
+                        continue;
+                    }
+                    if b0 == b'/' && is_regex_start(bytes, ep, len) {
+                        ep = skip_regex(bytes, ep, len);
+                        continue;
+                    }
+                    if !in_block {
+                        if b0 == b'(' {
+                            paren_d += 1;
+                        } else if b0 == b')' && paren_d > 0 {
+                            paren_d -= 1;
+                        } else if b0 == b'{' && paren_d == 0 {
+                            d = 1;
+                            in_block = true;
+                        }
+                        ep += 1;
+                        continue;
+                    }
+                    if b0 == b'{' {
+                        d += 1;
+                    }
+                    if b0 == b'}' {
                         d -= 1;
                         ep += 1;
-                        if in_block && d == 0 {
+                        if d == 0 {
                             break;
                         }
                         continue;

@@ -288,7 +288,7 @@ struct Flags {
     caps: Vec<String>,
     /// `family -> device` from `--cap family=device`; empty means no backend.
     backend: Vec<(String, String)>,
-    /// `device -> pin` from `--pin` (Kaze v0.2 GPIO).
+    /// `device -> pin` from `--pin` (Kaze 1.0 GPIO).
     pins: Vec<(String, u16)>,
     entry: Option<String>,
     config_file: Option<String>,

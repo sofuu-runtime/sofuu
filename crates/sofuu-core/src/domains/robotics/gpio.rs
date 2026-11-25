@@ -1,4 +1,4 @@
-//! Kaze v0.2 (P-K1) — Linux GPIO, zero dependencies.
+//! Kaze 1.0 (P-K1) — Linux GPIO, zero dependencies.
 //!
 //! Two backends, one API:
 //!

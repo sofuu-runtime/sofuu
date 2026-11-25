@@ -487,11 +487,11 @@ pub struct RunOptions {
     /// capability; an embedded caller cannot broaden it with `policy`.
     pub runtime_policy: Option<serde_json::Value>,
     /// `device name -> GPIO line` (`--pin fan=17`). Non-empty puts the real
-    /// pins behind the `device` family (Kaze v0.2, P-K1).
+    /// pins behind the `device` family (Kaze 1.0, P-K1).
     pub pins: Vec<(String, u16)>,
     /// `family -> device`. A device other than `sim` (for example
     /// `drone -> udp:127.0.0.1:14550`) puts the live backend behind that family
-    /// (Kaze v0.2, P-K1). An empty backend does not select a simulator.
+    /// (Kaze 1.0, P-K1). An empty backend does not select a simulator.
     pub backend: Vec<(String, String)>,
 }
 
@@ -1191,7 +1191,7 @@ pub(crate) fn json_to_value(
 //   sofuu.sfs.run(pathOrSource, args?, opts?)  -> report object
 //   sofuu.sfs.check(pathOrSource)              -> { ok, errors }
 //   sofuu.sfs.compile(pathOrSource)            -> { ok, bytes, items, caps, consts }
-//   sofuu.sfs.version                          -> "0.1"
+//   sofuu.sfs.version                          -> "1.0"
 //
 // A report always comes back (no throw): a tool loop can branch on `ok`
 // without wrapping every call, and a failure still carries its code.
@@ -1930,7 +1930,8 @@ pub unsafe fn mod_sfs_register(ctx: *mut JSContext) {
         qjs::sofuu_js_set_property_str(ctx, ns, c"check".as_ptr(), check);
         let compile = qjs::sofuu_js_new_cfunction(ctx, js_sfs_compile, c"compile".as_ptr(), 1);
         qjs::sofuu_js_set_property_str(ctx, ns, c"compile".as_ptr(), compile);
-        let version = qjs::sofuu_js_new_string(ctx, c"1.0".as_ptr());
+        let version_c = CString::new(VERSION).unwrap_or_default();
+        let version = qjs::sofuu_js_new_string(ctx, version_c.as_ptr());
         qjs::sofuu_js_set_property_str(ctx, ns, c"version".as_ptr(), version);
         let gate = qjs::sofuu_js_new_string(ctx, c"fail-closed-1".as_ptr());
         qjs::sofuu_js_set_property_str(ctx, ns, c"capabilityGate".as_ptr(), gate);
@@ -2462,7 +2463,7 @@ mod tests {
 
     #[test]
     fn a_record_argument_is_read_by_field() {
-        // Maps have no literal syntax in v0.1: they arrive as arguments, and
+        // Maps have no literal syntax in Kaze 1.0: they arrive as arguments, and
         // `record.field` is how a script reads one.
         let src = "action main(record):\n    return record.level\n";
         let mut args = serde_json::Map::new();

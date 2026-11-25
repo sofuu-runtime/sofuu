@@ -119,8 +119,8 @@ else
     "$PROTO_BIN" surface > "$TMP/proto_surface"
     grep -v '^opcode ' "$TMP/proto_surface" | sed -E 's/\./ /' | sort -u > "$TMP/proto_verbs"
     sed -n 's/^opcode //p' "$TMP/proto_surface" | sed -E 's/@/ /' | awk '{print $1"@"$2}' | sort > "$TMP/proto_ops"
-    # the pure tree carries no version constant yet; it targets the same frozen spec
-    PROTO_V="1.0"
+    PROTO_V="$("$PROTO_BIN" version | awk 'NR==1 {print $2}')"
+    if [ -z "$PROTO_V" ]; then PROTO_V="unknown"; fi
     PROTO_KINDS="pure"
 fi
 

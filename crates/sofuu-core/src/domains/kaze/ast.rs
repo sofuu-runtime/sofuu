@@ -94,7 +94,7 @@ pub enum Expr {
         line: u32,
     },
     /// `record.field` — a field read on a map value (a host-provided record).
-    /// Maps have no literal syntax in v0.1; they arrive as arguments, and this
+    /// Maps have no literal syntax in Kaze 1.0; they arrive as arguments, and this
     /// is how a script reads one.
     Field { base: String, field: String, line: u32 },
     /// `func(arg1, arg2)` — a call to an in-module routine.

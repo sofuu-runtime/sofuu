@@ -8,7 +8,7 @@
 // same bytes on every machine — the determinism invariant (§2) has to include
 // the artefact, not just the run.
 
-/// The v0.1 opcode set. Numbers are part of the on-disk format: never reuse one.
+/// The Kaze 1.0 opcode set. Numbers are part of the on-disk format: never reuse one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Op {
@@ -59,7 +59,7 @@ pub enum Op {
     Jeq = 31,
     /// wide: pop two, jump when not equal
     Jne = 32,
-    // ── v0.3: kinematics and spatial maths ──────────────────────────
+    // ── kinematics and spatial maths (Kaze 1.0) ─────────────────────
     /// a: component count (3), pops that many numbers, pushes a point
     VecNew = 33,
     /// pop two points, push the great-circle distance in metres
@@ -82,7 +82,7 @@ pub enum Op {
     RadToDeg = 42,
     /// pop two points, push the great-circle distance plus altitude change
     VecSlantDist = 43,
-    // ── v0.4: fault tolerance ───────────────────────────────────────
+    // ── fault tolerance (Kaze 1.0) ─────────────────────────────────
     /// a: local slot for the error record (255 = no binding);
     /// wide: relative jump to the recovery block, from the end of the instruction
     TryBegin = 44,

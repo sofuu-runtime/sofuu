@@ -85,7 +85,7 @@ pub fn values_equal(a: Value, b: Value, arena: &Arena, heap: &Heap) -> bool {
 }
 
 /// Belt and braces for a future that allows mutation. Collections are immutable
-/// in v0.1 (the grammar has no field or element assignment), so a cycle cannot
+/// in Kaze 1.0 (the grammar has no field or element assignment), so a cycle cannot
 /// exist today and this recursion always terminates.
 const MAX_EQUAL_DEPTH: u32 = 64;
 

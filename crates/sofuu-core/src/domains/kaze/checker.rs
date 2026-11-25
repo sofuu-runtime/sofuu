@@ -5,7 +5,7 @@
 // before a single instruction runs:
 //
 //   * every capability family used is declared in `needs:` (H-1, early);
-//   * every operation is a real v0.1 operation with the right argument count;
+//   * every operation is a real Kaze 1.0 operation with the right argument count;
 //   * every name resolves to a binding (no accidental ambient state);
 //   * a comparison between `meters` and `m/s` is refused;
 //   * a `filter` ends in `allow` or `reject` on every path — a guardrail that

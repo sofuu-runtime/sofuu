@@ -1,6 +1,6 @@
-//! Kaze v0.2 (P-K1) — the live capability backends behind `CapHost`.
+//! Kaze 1.0 (P-K1) — the live capability backends behind `CapHost`.
 //!
-//! v0.1 answered every capability call in-process (`sfs::caps::SimHost`). P-K1
+//! Earlier development answered capability calls in-process (`sfs::caps::SimHost`). P-K1
 //! puts real hardware behind the same trait:
 //!
 //! * [`DroneLink`] — a live MAVLink link (`udp:host:port`, or `uart:/dev/ttyAMA0@921600`)
@@ -885,7 +885,7 @@ fn safety_gate(
         .map_err(|d| format!("{}: {} ({})", d.code, d.reason, d.rule))
 }
 
-/// The v0.2 command map: one Kaze verb, one MAV_CMD, through the gate.
+/// The Kaze 1.0 command map: one Kaze verb, one MAV_CMD, through the gate.
 fn live_drone(link: &mut DroneLink, op: &str, args: &[Value], arena: &mut Arena) -> Result<Value, String> {
     let num = |i: usize| args.get(i).and_then(|v| v.as_num()).filter(|n| n.is_finite())
         .ok_or_else(|| "E_KAZE_RANGE: drone command requires finite numeric arguments".to_string());

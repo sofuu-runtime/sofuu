@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use crate::components::plot::measure_plot;
+use crate::components::stat::measure_stat;
 use crate::ir::{Align, Axis, Node, NodeKind, SizeSpec};
 use crate::text::GlyphAtlas;
 
@@ -21,14 +23,31 @@ pub struct ComputedRect {
     pub folded: bool,
 }
 
+/// Deterministic initial path hash for the root UI node.
+pub const ROOT_PATH_HASH: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Compute a deterministic, collision-free tree path hash for a child node.
+#[inline]
+pub fn child_path_hash(parent_hash: u64, slot: usize, id: &str) -> u64 {
+    let mut h = parent_hash ^ 0x9e37_79b9_7f4a_7c15_u64.wrapping_add(slot as u64);
+    h = h.wrapping_mul(0x1000_0000_01b3);
+    for &b in id.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct LayoutMap {
     rects: HashMap<String, ComputedRect>,
+    rects_by_path: HashMap<u64, ComputedRect>,
 }
 
 impl LayoutMap {
     pub fn clear(&mut self) {
         self.rects.clear();
+        self.rects_by_path.clear();
     }
 
     #[inline]
@@ -36,13 +55,40 @@ impl LayoutMap {
         self.rects.get(id).copied()
     }
 
+    #[inline]
+    pub fn get_path(&self, path_hash: u64) -> Option<ComputedRect> {
+        self.rects_by_path.get(&path_hash).copied()
+    }
+
     /// Solve the full tree into `self` for the given viewport `[width, height]`.
     pub fn solve(&mut self, root: &Node, viewport: [f32; 2], atlas: &GlyphAtlas) {
+        self.solve_with_top_inset(root, viewport, 0.0, atlas);
+    }
+
+    /// Solve the tree below a platform top chrome/safe-area inset (e.g. borderless traffic lights).
+    pub fn solve_with_top_inset(
+        &mut self,
+        root: &Node,
+        viewport: [f32; 2],
+        top_inset: f32,
+        atlas: &GlyphAtlas,
+    ) {
         self.rects.clear();
+        self.rects_by_path.clear();
         if !root.visible {
             return;
         }
-        self.place_node(root, 0.0, 0.0, viewport[0].max(0.0), viewport[1].max(0.0), atlas);
+        let y0 = top_inset.max(0.0);
+        let h0 = (viewport[1] - y0).max(0.0);
+        self.place_node(
+            root,
+            0.0,
+            y0,
+            viewport[0].max(0.0),
+            h0,
+            ROOT_PATH_HASH,
+            atlas,
+        );
     }
 
     /// Intrinsic minimum/preferred size `(w, h)` when unconstrained or within `avail_w`.
@@ -73,6 +119,21 @@ impl LayoutMap {
             }
             NodeKind::Rule { thickness, .. } => (0.0, (*thickness).max(1.0)),
             NodeKind::Spacer => (0.0, 0.0),
+            NodeKind::ThemeToggle { size } => ((*size).max(24.0), (*size).max(24.0)),
+            NodeKind::Segmented { options, .. } => {
+                let mut total = 8.0f32;
+                for o in options {
+                    let (ow, _) = atlas.measure(o, 12.0, true);
+                    total += ow + 20.0;
+                }
+                (total.max(80.0), 34.0)
+            }
+            NodeKind::Button { label, .. } => {
+                let (lw, _) = atlas.measure(label, 12.5, true);
+                (lw + 24.0, 34.0)
+            }
+            NodeKind::Stat(data) => measure_stat(data, inner_avail_w),
+            NodeKind::Plot(data) => measure_plot(data, inner_avail_w),
             NodeKind::Surface { child, .. } => {
                 if let Some(c) = child {
                     self.measure_intrinsic(c, inner_avail_w, atlas)
@@ -135,11 +196,12 @@ impl LayoutMap {
                 children,
                 ..
             } => {
-                let cols = resolve_grid_cols(*columns, *min_col_width, *gap, inner_avail_w);
+                let visible: Vec<&Node> = children.iter().filter(|c| c.visible).collect();
+                let cols =
+                    resolve_grid_cols(*columns, *min_col_width, *gap, inner_avail_w, visible.len());
                 let col_w =
                     ((inner_avail_w - *gap * (cols.saturating_sub(1)) as f32) / cols as f32)
                         .max(0.0);
-                let visible: Vec<&Node> = children.iter().filter(|c| c.visible).collect();
                 let mut total_h = 0.0f32;
                 let mut row_idx = 0usize;
                 for row in visible.chunks(cols) {
@@ -177,6 +239,7 @@ impl LayoutMap {
         y: f32,
         w: f32,
         h: f32,
+        path_hash: u64,
         atlas: &GlyphAtlas,
     ) {
         if !node.visible {
@@ -195,7 +258,8 @@ impl LayoutMap {
                 if let Some(c) = child {
                     let (_, ch) = self.measure_intrinsic(c, iw, atlas);
                     content_h = ch + node.padding.vertical();
-                    self.place_node(c, ix, iy, iw, ih, atlas);
+                    let ch_hash = child_path_hash(path_hash, 0, &c.id);
+                    self.place_node(c, ix, iy, iw, ih, ch_hash, atlas);
                 }
             }
             NodeKind::Tabs { items, active } => {
@@ -206,7 +270,8 @@ impl LayoutMap {
                     let body_h = (ih - bar_h - gap).max(0.0);
                     let (_, ch) = self.measure_intrinsic(&item.child, iw, atlas);
                     content_h = bar_h + gap + ch + node.padding.vertical();
-                    self.place_node(&item.child, ix, body_y, iw, body_h, atlas);
+                    let ch_hash = child_path_hash(path_hash, *active, &item.child.id);
+                    self.place_node(&item.child, ix, body_y, iw, body_h, ch_hash, atlas);
                 }
             }
             NodeKind::Container {
@@ -228,6 +293,7 @@ impl LayoutMap {
                     iy,
                     iw,
                     ih,
+                    path_hash,
                     atlas,
                 ) + node.padding.vertical();
             }
@@ -246,26 +312,33 @@ impl LayoutMap {
                     ix,
                     iy,
                     iw,
+                    path_hash,
                     atlas,
                 ) + node.padding.vertical();
             }
-            NodeKind::Text { .. } | NodeKind::Rule { .. } | NodeKind::Spacer => {
+            NodeKind::Text { .. }
+            | NodeKind::Rule { .. }
+            | NodeKind::Spacer
+            | NodeKind::ThemeToggle { .. }
+            | NodeKind::Segmented { .. }
+            | NodeKind::Button { .. }
+            | NodeKind::Stat(_)
+            | NodeKind::Plot(_) => {
                 let (_, mh) = self.measure_intrinsic(node, w, atlas);
                 content_h = mh;
             }
         }
 
-        self.rects.insert(
-            node.id.clone(),
-            ComputedRect {
-                x,
-                y,
-                w,
-                h,
-                content_h,
-                folded,
-            },
-        );
+        let rect = ComputedRect {
+            x,
+            y,
+            w,
+            h,
+            content_h,
+            folded,
+        };
+        self.rects.insert(node.id.clone(), rect);
+        self.rects_by_path.insert(path_hash, rect);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -279,9 +352,14 @@ impl LayoutMap {
         iy: f32,
         iw: f32,
         ih: f32,
+        parent_hash: u64,
         atlas: &GlyphAtlas,
     ) -> f32 {
-        let visible: Vec<&Node> = children.iter().filter(|c| c.visible).collect();
+        let visible: Vec<(usize, &Node)> = children
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.visible)
+            .collect();
         if visible.is_empty() {
             return 0.0;
         }
@@ -290,9 +368,10 @@ impl LayoutMap {
         // First pass: measure fixed/auto sizes and accumulate Fill weights along primary axis.
         let mut intrinsic: Vec<(f32, f32)> = Vec::with_capacity(visible.len());
         let mut fill_sum = 0.0f32;
-        let mut fixed_sum = total_gaps;
+        let mut px_sum = 0.0f32;
+        let mut auto_sum = 0.0f32;
 
-        for child in &visible {
+        for (_, child) in &visible {
             let spec = match axis {
                 Axis::Row => child.width,
                 Axis::Column => child.height,
@@ -303,13 +382,13 @@ impl LayoutMap {
                     fill_sum += weight.max(0.0);
                 }
                 SizeSpec::Px(px) => {
-                    fixed_sum += px.max(match axis {
+                    px_sum += px.max(match axis {
                         Axis::Row => child.min_width,
                         Axis::Column => child.min_height,
                     });
                 }
                 SizeSpec::Auto => {
-                    fixed_sum += match axis {
+                    auto_sum += match axis {
                         Axis::Row => meas.0,
                         Axis::Column => meas.1,
                     };
@@ -322,7 +401,15 @@ impl LayoutMap {
             Axis::Row => iw,
             Axis::Column => ih,
         };
+        let fixed_sum = total_gaps + px_sum + auto_sum;
         let remaining = (main_avail - fixed_sum).max(0.0);
+        // Prevent Auto children in a Row from ever overflowing horizontally and colliding.
+        let auto_scale = if axis == Axis::Row && fixed_sum > main_avail && auto_sum > 0.0 {
+            let avail_for_auto = (main_avail - total_gaps - px_sum).max(0.0);
+            (avail_for_auto / auto_sum).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
 
         let mut cursor = match axis {
             Axis::Row => ix,
@@ -330,7 +417,7 @@ impl LayoutMap {
         };
         let mut total_used_h = 0.0f32;
 
-        for (i, child) in visible.iter().enumerate() {
+        for (i, (slot, child)) in visible.iter().enumerate() {
             if i > 0 {
                 cursor += gap;
                 if axis == Axis::Column {
@@ -347,7 +434,7 @@ impl LayoutMap {
                 SizeSpec::Fill(_) => 0.0,
                 SizeSpec::Px(px) => px,
                 SizeSpec::Auto => match axis {
-                    Axis::Row => mw,
+                    Axis::Row => mw * auto_scale,
                     Axis::Column => mh,
                 },
             };
@@ -367,7 +454,12 @@ impl LayoutMap {
                         Align::Center => iy + (ih - cross_size) * 0.5,
                         Align::End => iy + (ih - cross_size),
                     };
-                    (cursor, cy, main_size.max(child.min_width), cross_size)
+                    let cw = if auto_scale < 1.0 && matches!(child.width, SizeSpec::Auto) {
+                        main_size
+                    } else {
+                        main_size.max(child.min_width)
+                    };
+                    (cursor, cy, cw, cross_size)
                 }
                 Axis::Column => {
                     let cross_size = match child.width {
@@ -387,7 +479,8 @@ impl LayoutMap {
                 }
             };
 
-            self.place_node(child, cx, cy, cw, ch, atlas);
+            let ch_hash = child_path_hash(parent_hash, *slot, &child.id);
+            self.place_node(child, cx, cy, cw, ch, ch_hash, atlas);
             cursor += match axis {
                 Axis::Row => cw,
                 Axis::Column => ch,
@@ -410,13 +503,18 @@ impl LayoutMap {
         ix: f32,
         iy: f32,
         iw: f32,
+        parent_hash: u64,
         atlas: &GlyphAtlas,
     ) -> f32 {
-        let visible: Vec<&Node> = children.iter().filter(|c| c.visible).collect();
+        let visible: Vec<(usize, &Node)> = children
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.visible)
+            .collect();
         if visible.is_empty() {
             return 0.0;
         }
-        let cols = resolve_grid_cols(columns, min_col_width, gap, iw);
+        let cols = resolve_grid_cols(columns, min_col_width, gap, iw, visible.len());
         let col_w = ((iw - gap * (cols.saturating_sub(1)) as f32) / cols as f32).max(0.0);
 
         let mut cy = iy;
@@ -428,16 +526,17 @@ impl LayoutMap {
                 total_h += gap;
             }
             let mut row_h = 0.0f32;
-            for child in row {
+            for (_, child) in row {
                 let ch = match child.height {
                     SizeSpec::Px(px) => px,
                     _ => self.measure_intrinsic(child, col_w, atlas).1,
                 };
                 row_h = row_h.max(ch.max(child.min_height));
             }
-            for (col_idx, child) in row.iter().enumerate() {
+            for (col_idx, (slot, child)) in row.iter().enumerate() {
                 let cx = ix + col_idx as f32 * (col_w + gap);
-                self.place_node(child, cx, cy, col_w, row_h, atlas);
+                let ch_hash = child_path_hash(parent_hash, *slot, &child.id);
+                self.place_node(child, cx, cy, col_w, row_h, ch_hash, atlas);
             }
             cy += row_h;
             total_h += row_h;
@@ -459,7 +558,14 @@ fn resolve_axis(axis: Axis, fold_width: Option<f32>, avail_w: f32) -> Axis {
 }
 
 #[inline]
-fn resolve_grid_cols(columns: usize, min_col_width: f32, gap: f32, avail_w: f32) -> usize {
+fn resolve_grid_cols(
+    columns: usize,
+    min_col_width: f32,
+    gap: f32,
+    avail_w: f32,
+    item_count: usize,
+) -> usize {
+    let items = item_count.max(1);
     if columns > 0 {
         if min_col_width > 0.0 {
             let max_fit = (((avail_w + gap) / (min_col_width + gap)).floor() as usize).max(1);
@@ -468,9 +574,10 @@ fn resolve_grid_cols(columns: usize, min_col_width: f32, gap: f32, avail_w: f32)
         return columns;
     }
     if min_col_width <= 1.0 {
-        return 1;
+        return items;
     }
-    (((avail_w + gap) / (min_col_width + gap)).floor() as usize).max(1)
+    let max_fit = (((avail_w + gap) / (min_col_width + gap)).floor() as usize).max(1);
+    max_fit.min(items)
 }
 
 #[cfg(test)]

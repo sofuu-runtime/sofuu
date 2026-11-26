@@ -1,6 +1,6 @@
-//! Packed GPU instance primitives and clip tables for Sofuu's 2D GPU UI compositor.
+//! Packed GPU instance primitives, ordered draw batches, and clip tables for Sofuu's 2D GPU UI compositor.
 //!
-//! All structs here are `#[repr(C)]` with explicit 16/32/64-byte alignment matching
+//! All structs here are `#[repr(C)]` with explicit 16-byte alignment matching
 //! the Metal (MSL), GLSL, and SPIR-V vertex/fragment shaders byte-for-byte.
 
 /// Pack 8-bit sRGBA channels into a little-endian `u32` (`0xAABBGGRR` in memory `[r, g, b, a]`).
@@ -57,7 +57,7 @@ pub fn lerp_rgba8(a: u32, b: u32, t: f32) -> u32 {
     rgba8(mix(ar, br), mix(ag, bg), mix(ab, bb), mix(aa, ba))
 }
 
-/// 80-byte instanced SDF rounded box (card, button, pill, shadow, border, vertical gradient).
+/// 80-byte instanced SDF rounded box (card, button, pill, candle body, shadow, border, vertical gradient).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct QuadInstance {
@@ -96,7 +96,25 @@ impl Default for QuadInstance {
     }
 }
 
-/// 32-byte instanced antialiased vector line capsule (charts, graphs, dividers, connectors).
+/// 48-byte instanced sloped 2D trapezoid/ribbon slice for smooth area fills, stacked bands, and oscillator spreads.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RibbonInstance {
+    pub x0: f32,
+    pub y0_top: f32,
+    pub y0_bot: f32,
+    pub x1: f32,
+    pub y1_top: f32,
+    pub y1_bot: f32,
+    /// Fill color at the top boundary (`y*_top`), packed RGBA8.
+    pub color_top: u32,
+    /// Fill color at the bottom boundary (`y*_bot`), packed RGBA8.
+    pub color_bottom: u32,
+    pub clip_id: u32,
+    pub _pad: [u32; 3],
+}
+
+/// 48-byte instanced antialiased vector line capsule with optional GPU dashing (solid when `dash_len <= 0.0`).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StrokeInstance {
@@ -104,11 +122,57 @@ pub struct StrokeInstance {
     pub p1: [f32; 2],
     pub width: f32,
     pub feather: f32,
+    /// Dash length in logical pixels (`0.0` = solid line).
+    pub dash_len: f32,
+    /// Gap length between dashes in logical pixels (`0.0` = solid line).
+    pub gap_len: f32,
     pub color: u32,
     pub clip_id: u32,
+    pub _pad: [u32; 2],
 }
 
-/// 48-byte instanced SDF/MSDF glyph quad sampled from the pre-baked single-channel/RGB atlas.
+impl StrokeInstance {
+    #[inline]
+    pub const fn solid(p0: [f32; 2], p1: [f32; 2], width: f32, feather: f32, color: u32, clip_id: u32) -> Self {
+        Self {
+            p0,
+            p1,
+            width,
+            feather,
+            dash_len: 0.0,
+            gap_len: 0.0,
+            color,
+            clip_id,
+            _pad: [0; 2],
+        }
+    }
+
+    #[inline]
+    pub const fn dashed(
+        p0: [f32; 2],
+        p1: [f32; 2],
+        width: f32,
+        feather: f32,
+        dash_len: f32,
+        gap_len: f32,
+        color: u32,
+        clip_id: u32,
+    ) -> Self {
+        Self {
+            p0,
+            p1,
+            width,
+            feather,
+            dash_len,
+            gap_len,
+            color,
+            clip_id,
+            _pad: [0; 2],
+        }
+    }
+}
+
+/// 48-byte instanced SDF glyph quad sampled from the pre-baked single-channel atlas.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GlyphInstance {
@@ -156,6 +220,22 @@ impl ClipRect {
     }
 }
 
+/// Pipeline kind identifier for ordered GPU command batches (`DrawCmd::kind`).
+pub const DRAW_KIND_QUAD: u32 = 0;
+pub const DRAW_KIND_RIBBON: u32 = 1;
+pub const DRAW_KIND_STROKE: u32 = 2;
+pub const DRAW_KIND_GLYPH: u32 = 3;
+
+/// 16-byte GPU draw batch preserving exact painter's order across shader pipelines.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrawCmd {
+    pub kind: u32,
+    pub start: u32,
+    pub count: u32,
+    pub _pad: u32,
+}
+
 /// 32-byte per-frame GPU uniform block shared across all shader passes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -175,8 +255,10 @@ pub struct FrameUniforms {
 #[derive(Clone, Debug, Default)]
 pub struct DrawList {
     pub quads: Vec<QuadInstance>,
+    pub ribbons: Vec<RibbonInstance>,
     pub strokes: Vec<StrokeInstance>,
     pub glyphs: Vec<GlyphInstance>,
+    pub cmds: Vec<DrawCmd>,
     pub clips: Vec<ClipRect>,
     clip_stack: Vec<u32>,
 }
@@ -191,14 +273,32 @@ impl DrawList {
     /// Reset buffers while preserving heap capacity across frames (zero steady-state allocs).
     pub fn reset(&mut self, viewport: [f32; 2]) {
         self.quads.clear();
+        self.ribbons.clear();
         self.strokes.clear();
         self.glyphs.clear();
+        self.cmds.clear();
         self.clips.clear();
         self.clip_stack.clear();
         // clip_id 0 is always the full viewport.
         self.clips
             .push(ClipRect::new(0.0, 0.0, viewport[0].max(0.0), viewport[1].max(0.0)));
         self.clip_stack.push(0);
+    }
+
+    #[inline]
+    fn record_cmd(&mut self, kind: u32, start: usize) {
+        if let Some(last) = self.cmds.last_mut() {
+            if last.kind == kind && (last.start + last.count) as usize == start {
+                last.count += 1;
+                return;
+            }
+        }
+        self.cmds.push(DrawCmd {
+            kind,
+            start: start as u32,
+            count: 1,
+            _pad: 0,
+        });
     }
 
     #[inline]
@@ -230,19 +330,53 @@ impl DrawList {
     #[inline]
     pub fn push_quad(&mut self, mut quad: QuadInstance) {
         quad.clip_id = self.current_clip_id();
+        let idx = self.quads.len();
         self.quads.push(quad);
+        self.record_cmd(DRAW_KIND_QUAD, idx);
+    }
+
+    #[inline]
+    pub fn push_ribbon(&mut self, mut ribbon: RibbonInstance) {
+        ribbon.clip_id = self.current_clip_id();
+        let idx = self.ribbons.len();
+        self.ribbons.push(ribbon);
+        self.record_cmd(DRAW_KIND_RIBBON, idx);
     }
 
     #[inline]
     pub fn push_stroke(&mut self, mut stroke: StrokeInstance) {
         stroke.clip_id = self.current_clip_id();
+        let idx = self.strokes.len();
         self.strokes.push(stroke);
+        self.record_cmd(DRAW_KIND_STROKE, idx);
     }
 
     #[inline]
     pub fn push_glyph(&mut self, mut glyph: GlyphInstance) {
         glyph.clip_id = self.current_clip_id();
+        let idx = self.glyphs.len();
         self.glyphs.push(glyph);
+        self.record_cmd(DRAW_KIND_GLYPH, idx);
+    }
+
+    /// Record a batch of `count` glyphs already appended directly to `self.glyphs`.
+    #[inline]
+    pub fn record_glyph_batch(&mut self, start: usize, count: usize) {
+        if count == 0 {
+            return;
+        }
+        if let Some(last) = self.cmds.last_mut() {
+            if last.kind == DRAW_KIND_GLYPH && (last.start + last.count) as usize == start {
+                last.count += count as u32;
+                return;
+            }
+        }
+        self.cmds.push(DrawCmd {
+            kind: DRAW_KIND_GLYPH,
+            start: start as u32,
+            count: count as u32,
+            _pad: 0,
+        });
     }
 }
 
@@ -254,11 +388,14 @@ mod tests {
     #[test]
     fn gpu_struct_sizes_match_shader_layout() {
         assert_eq!(size_of::<QuadInstance>(), 80);
-        assert_eq!(size_of::<StrokeInstance>(), 32);
+        assert_eq!(size_of::<RibbonInstance>(), 48);
+        assert_eq!(size_of::<StrokeInstance>(), 48);
         assert_eq!(size_of::<GlyphInstance>(), 48);
         assert_eq!(size_of::<ClipRect>(), 16);
+        assert_eq!(size_of::<DrawCmd>(), 16);
         assert_eq!(size_of::<FrameUniforms>(), 32);
         assert!(align_of::<QuadInstance>() >= 4);
+        assert!(align_of::<RibbonInstance>() >= 4);
         assert!(align_of::<StrokeInstance>() >= 4);
         assert!(align_of::<GlyphInstance>() >= 4);
     }
@@ -276,7 +413,7 @@ mod tests {
         dl.pop_clip();
         assert_eq!(dl.current_clip_id(), 1);
         dl.pop_clip();
-        dl.pop_clip(); // extra pop stays at 0
+        dl.pop_clip();
         assert_eq!(dl.current_clip_id(), 0);
     }
 

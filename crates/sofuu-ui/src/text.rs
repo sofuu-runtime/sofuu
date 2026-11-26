@@ -1,27 +1,27 @@
 //! Pre-baked pure-Rust Signed Distance Field (SDF) glyph atlas & text layout engine.
 //!
-//! Zero OS font dependencies and zero per-frame CPU rasterization:
-//! At startup (`GlyphAtlas::builtin()`), analytic vector stroke segments for ASCII `0x20..=0x7E`
-//! plus a fallback glyph are evaluated once into a compact `512x192` `R8` SDF texture atlas
-//! (`96 KB` in GPU memory). At runtime, shaders sample the atlas with `fwidth`-based antialiasing
-//! for razor-sharp, resolution-independent typography across Retina, HD, and fractional DPI displays.
+//! Default embedded font: **Geist Mono** (`assets/geist_mono.sfdf`), baked offline at 6x
+//! supersampling from `GeistMono-Regular.ttf` into a compact `768x288` `R8` SDF texture atlas.
+//! Zero OS font dependencies and zero per-frame CPU rasterization across Metal, OpenGL, and Vulkan.
 
-use crate::draw::GlyphInstance;
+use crate::draw::{DrawList, GlyphInstance};
 
-const ATLAS_COLS: u32 = 16;
-const ATLAS_ROWS: u32 = 6;
-const CELL_SIZE: u32 = 32;
-/// Signed distance spread in atlas texels (`px_range` passed directly to GPU shaders).
-pub const SDF_PX_RANGE: f32 = 3.5;
+const DEFAULT_FONT_SFDF: &[u8] = include_bytes!("../assets/geist_mono.sfdf");
 
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphMetrics {
     /// Normalized atlas UVs `[u0, v0, u1, v1]`.
     pub uv: [f32; 4],
-    /// Advance width as a multiple of font `px_size` (proportional).
-    pub advance: f32,
-    /// Fixed advance width for monospace mode as a multiple of `px_size`.
-    pub mono_advance: f32,
+    /// Top-left quad X offset from pen origin as a multiple of `px_size`.
+    pub quad_offset_x_em: f32,
+    /// Top-left quad Y offset from line top as a multiple of `px_size`.
+    pub quad_offset_y_em: f32,
+    /// Quad width as a multiple of `px_size`.
+    pub quad_w_em: f32,
+    /// Quad height as a multiple of `px_size`.
+    pub quad_h_em: f32,
+    /// Horizontal pen advance as a multiple of `px_size`.
+    pub advance_em: f32,
 }
 
 /// CPU-owned SDF texture atlas ready to upload once to an `R8Unorm` GPU texture.
@@ -32,62 +32,114 @@ pub struct GlyphAtlas {
     /// Row-major `width * height` `R8` SDF bytes (`128` = contour edge, `>128` = inside).
     pub pixels: Vec<u8>,
     pub px_range: f32,
-    /// Metrics for ASCII `0x20..=0x7E` (95 entries) + index `95` fallback box.
+    pub advance_em: f32,
+    pub ascender_em: f32,
+    pub line_height_em: f32,
+    /// Optical cap-height ink top & vertical center in `em` units (derived automatically from `'M'`/`'0'`).
+    pub cap_top_em: f32,
+    pub cap_center_em: f32,
+    /// Metrics for ASCII `0x20..=0x7E` (95 entries) + index `95` fallback `.notdef`.
     metrics: Vec<GlyphMetrics>,
 }
 
-/// Vector primitive in a `[0..10] x [0..14]` design grid (cap height `2..11`, descender `11..13.5`).
-#[derive(Clone, Copy)]
-enum Prim {
-    Line(f32, f32, f32, f32),
-    /// Axis-aligned ellipse/circle arc: `(cx, cy, rx, ry, start_deg, end_deg)`.
-    Arc(f32, f32, f32, f32, f32, f32),
-}
-
 impl GlyphAtlas {
-    /// Build the default analytic vector SDF atlas once (~2ms).
+    /// Load the built-in default **Geist Mono** SDF atlas (`O(1)` decode from embedded bytes).
     pub fn builtin() -> Self {
-        let width = ATLAS_COLS * CELL_SIZE;
-        let height = ATLAS_ROWS * CELL_SIZE;
-        let mut pixels = vec![0u8; (width * height) as usize];
-        let mut metrics = Vec::with_capacity(96);
+        Self::from_sfdf(DEFAULT_FONT_SFDF).expect("embedded geist_mono.sfdf must be valid")
+    }
 
-        let inv_w = 1.0 / width as f32;
-        let inv_h = 1.0 / height as f32;
+    /// Parse any pre-baked `SFDF` atlas binary blob (allows custom runtime font swaps cleanly).
+    pub fn from_sfdf(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < 32 || &data[0..4] != b"SFDF" {
+            return Err("invalid SFDF header");
+        }
+        let read_u32 = |off: usize| -> u32 {
+            u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+        };
+        let read_f32 = |off: usize| -> f32 {
+            f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+        };
 
-        for idx in 0..96u32 {
-            let ch = if idx < 95 {
-                (0x20u8 + idx as u8) as char
-            } else {
-                '\u{FFFD}'
-            };
-            let col = idx % ATLAS_COLS;
-            let row = idx / ATLAS_COLS;
-            let ox = col * CELL_SIZE;
-            let oy = row * CELL_SIZE;
+        let width = read_u32(4);
+        let height = read_u32(8);
+        let px_range = read_f32(12);
+        let glyph_count = read_u32(16) as usize;
+        let advance_em = read_f32(20);
+        let ascender_em = read_f32(24);
+        let line_height_em = read_f32(28);
 
-            let (prims, adv_units) = glyph_vector(ch);
-            bake_cell(&mut pixels, width, ox, oy, &prims);
+        let entry_bytes = glyph_count * 32;
+        let pixel_bytes = (width as usize) * (height as usize);
+        if data.len() < 32 + entry_bytes + pixel_bytes || glyph_count < 96 {
+            return Err("truncated SFDF payload");
+        }
 
+        let mut metrics = Vec::with_capacity(glyph_count);
+        for i in 0..glyph_count {
+            let base = 32 + i * 32;
             metrics.push(GlyphMetrics {
                 uv: [
-                    (ox as f32 + 1.0) * inv_w,
-                    (oy as f32 + 1.0) * inv_h,
-                    ((ox + CELL_SIZE) as f32 - 1.0) * inv_w,
-                    ((oy + CELL_SIZE) as f32 - 1.0) * inv_h,
+                    read_f32(base),
+                    read_f32(base + 4),
+                    read_f32(base + 8),
+                    read_f32(base + 12),
                 ],
-                advance: (adv_units / 14.0).max(0.28),
-                mono_advance: 0.62,
+                quad_offset_x_em: read_f32(base + 16),
+                quad_offset_y_em: read_f32(base + 20),
+                quad_w_em: read_f32(base + 24),
+                quad_h_em: read_f32(base + 28),
+                advance_em,
             });
         }
 
-        Self {
+        let pixels = data[32 + entry_bytes..32 + entry_bytes + pixel_bytes].to_vec();
+        let (cap_top_em, cap_center_em) =
+            measure_cap_optics(width, height, &pixels, &metrics, ascender_em);
+        Ok(Self {
             width,
             height,
             pixels,
-            px_range: SDF_PX_RANGE,
+            px_range,
+            advance_em,
+            ascender_em,
+            line_height_em,
+            cap_top_em,
+            cap_center_em,
             metrics,
-        }
+        })
+    }
+
+    /// Compute `pen_y` so the optical cap center of `px_size` lands exactly at `rect_y + rect_h * 0.5`.
+    #[inline]
+    pub fn centered_pen_y(&self, rect_y: f32, rect_h: f32, px_size: f32) -> f32 {
+        rect_y + rect_h * 0.5 - self.cap_center_em * px_size
+    }
+
+    /// Compute `pen_y` for a secondary smaller font size `sub_px` so its baseline aligns cleanly
+    /// with a primary headline rendered at `(primary_y, primary_px)`.
+    #[inline]
+    pub fn baseline_aligned_y(&self, primary_y: f32, primary_px: f32, sub_px: f32) -> f32 {
+        primary_y + (primary_px - sub_px) * self.ascender_em
+    }
+
+    /// Draw single-line text centered horizontally and optically centered vertically inside `[x, y, w, h]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layout_centered(
+        &self,
+        text: &str,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        px_size: f32,
+        color: u32,
+        mono: bool,
+        dl: &mut DrawList,
+    ) {
+        let (tw, _) = self.measure(text, px_size, mono);
+        let tx = x + (w - tw) * 0.5;
+        let ty = self.centered_pen_y(y, h, px_size);
+        self.layout_dl(text, tx, ty, px_size, color, mono, None, dl);
     }
 
     #[inline]
@@ -98,12 +150,20 @@ impl GlyphAtlas {
         } else {
             95
         };
-        self.metrics[idx]
+        let mut m = self.metrics[idx];
+        m.advance_em = self.advance_em;
+        m
+    }
+
+    /// Compatibility alias returning `(em_advance, mono_em_advance)`.
+    #[inline]
+    pub fn char_advance_em(&self, ch: char, _mono: bool) -> f32 {
+        self.metrics(ch).advance_em
     }
 
     /// Measure single-line or multi-line (`\n`) text block in logical pixels.
-    pub fn measure(&self, text: &str, px_size: f32, mono: bool) -> (f32, f32) {
-        let line_h = px_size * 1.35;
+    pub fn measure(&self, text: &str, px_size: f32, _mono: bool) -> (f32, f32) {
+        let line_h = px_size * self.line_height_em;
         let mut max_w: f32 = 0.0;
         let mut cur_w: f32 = 0.0;
         let mut lines = 1usize;
@@ -118,16 +178,15 @@ impl GlyphAtlas {
             if ch == '\r' {
                 continue;
             }
-            let m = self.metrics(ch);
-            let adv = if mono { m.mono_advance } else { m.advance };
-            cur_w += adv * px_size;
+            cur_w += self.metrics(ch).advance_em * px_size;
         }
         max_w = max_w.max(cur_w);
         (max_w, lines as f32 * line_h)
     }
 
-    /// Emit `GlyphInstance` quads into `out` starting at top-left `(x, y)` within optional `max_width`.
-    pub fn layout_into(
+    /// Emit `GlyphInstance` quads directly into a `DrawList` and record an ordered glyph batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layout_dl(
         &self,
         text: &str,
         x: f32,
@@ -136,12 +195,30 @@ impl GlyphAtlas {
         color: u32,
         mono: bool,
         max_width: Option<f32>,
+        dl: &mut DrawList,
+    ) {
+        let clip = dl.current_clip_id();
+        let start = dl.glyphs.len();
+        self.layout_into(text, x, y, px_size, color, mono, max_width, &mut dl.glyphs, clip);
+        let added = dl.glyphs.len() - start;
+        dl.record_glyph_batch(start, added);
+    }
+
+    /// Emit `GlyphInstance` quads into `out` starting at top-left `(x, y)` within optional `max_width`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layout_into(
+        &self,
+        text: &str,
+        x: f32,
+        y: f32,
+        px_size: f32,
+        color: u32,
+        _mono: bool,
+        max_width: Option<f32>,
         out: &mut Vec<GlyphInstance>,
         clip_id: u32,
     ) {
-        let quad_h = px_size * 1.25;
-        let quad_w = quad_h;
-        let line_h = px_size * 1.35;
+        let line_h = px_size * self.line_height_em;
         let mut pen_x = x;
         let mut pen_y = y;
 
@@ -155,7 +232,7 @@ impl GlyphAtlas {
                 continue;
             }
             let m = self.metrics(ch);
-            let adv = (if mono { m.mono_advance } else { m.advance }) * px_size;
+            let adv = m.advance_em * px_size;
             if let Some(limit) = max_width {
                 if (pen_x - x) + adv > limit && pen_x > x {
                     pen_x = x;
@@ -163,12 +240,12 @@ impl GlyphAtlas {
                 }
             }
             if ch != ' ' {
-                // Center the square glyph quad horizontally around its proportional advance.
-                let glyph_x = pen_x - (quad_w - adv) * 0.35;
-                let glyph_y = pen_y - px_size * 0.08;
                 out.push(GlyphInstance {
-                    pos: [glyph_x, glyph_y],
-                    size: [quad_w, quad_h],
+                    pos: [
+                        pen_x + m.quad_offset_x_em * px_size,
+                        pen_y + m.quad_offset_y_em * px_size,
+                    ],
+                    size: [m.quad_w_em * px_size, m.quad_h_em * px_size],
                     uv: m.uv,
                     color,
                     px_range: self.px_range,
@@ -181,523 +258,41 @@ impl GlyphAtlas {
     }
 }
 
-fn bake_cell(buf: &mut [u8], atlas_w: u32, ox: u32, oy: u32, prims: &[Prim]) {
-    // Design box [0..10, 0..14] mapped centered inside [4..28] of the 32x32 cell.
-    let margin = 4.0f32;
-    let span = CELL_SIZE as f32 - margin * 2.0; // 24 texels
-    let scale_x = span / 14.0;
-    let scale_y = span / 14.0;
-    let stroke_r_texels = 1.40f32; // clean medium-weight geometric stroke (~2.8 texels diameter)
-
-    for py in 0..CELL_SIZE {
-        for px in 0..CELL_SIZE {
-            let dist_texels = if prims.is_empty() {
-                -SDF_PX_RANGE
-            } else {
-                // Map texel center to design grid coords [ -2..12, 0..14 ].
-                let gx = (px as f32 + 0.5 - margin) / scale_x - 2.0;
-                let gy = (py as f32 + 0.5 - margin) / scale_y;
-                let mut min_d = f32::INFINITY;
-                for p in prims {
-                    let d = match *p {
-                        Prim::Line(x0, y0, x1, y1) => dist_segment(gx, gy, x0, y0, x1, y1),
-                        Prim::Arc(cx, cy, rx, ry, a0, a1) => {
-                            dist_arc(gx, gy, cx, cy, rx, ry, a0, a1)
-                        }
-                    };
-                    if d < min_d {
-                        min_d = d;
-                    }
+/// Inspect `'M'` (fallback `'0'`) SDF ink bounds once at atlas load so optical vertical centering
+/// adapts automatically to any loaded SFDF font without hardcoded magic offsets.
+fn measure_cap_optics(
+    atlas_w: u32,
+    atlas_h: u32,
+    pixels: &[u8],
+    metrics: &[GlyphMetrics],
+    ascender_em: f32,
+) -> (f32, f32) {
+    let idx = ('M' as usize).saturating_sub(0x20);
+    if let Some(m) = metrics.get(idx) {
+        let x0 = (m.uv[0] * atlas_w as f32).round() as u32;
+        let y0 = (m.uv[1] * atlas_h as f32).round() as u32;
+        let x1 = (m.uv[2] * atlas_w as f32).round().min(atlas_w as f32) as u32;
+        let y1 = (m.uv[3] * atlas_h as f32).round().min(atlas_h as f32) as u32;
+        let cell_h = y1.saturating_sub(y0).max(1) as f32;
+        let mut min_row = u32::MAX;
+        let mut max_row = 0u32;
+        for py in y0..y1 {
+            for px in x0..x1 {
+                if pixels[(py * atlas_w + px) as usize] >= 128 {
+                    let rel = py - y0;
+                    min_row = min_row.min(rel);
+                    max_row = max_row.max(rel);
                 }
-                let d_tex = min_d * scale_y;
-                stroke_r_texels - d_tex // positive inside stroke, negative outside
-            };
-
-            let norm = (dist_texels / SDF_PX_RANGE) * 0.5 + 0.5;
-            let byte = (norm.clamp(0.0, 1.0) * 255.0).round() as u8;
-            let dst = ((oy + py) * atlas_w + (ox + px)) as usize;
-            buf[dst] = byte;
+            }
+        }
+        if min_row <= max_row {
+            let em_top = m.quad_offset_y_em + (min_row as f32 / cell_h) * m.quad_h_em;
+            let em_bot = m.quad_offset_y_em + ((max_row + 1) as f32 / cell_h) * m.quad_h_em;
+            return (em_top, (em_top + em_bot) * 0.5);
         }
     }
-}
-
-#[inline]
-fn dist_segment(px: f32, py: f32, x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
-    let vx = x1 - x0;
-    let vy = y1 - y0;
-    let wx = px - x0;
-    let wy = py - y0;
-    let len_sq = vx * vx + vy * vy;
-    let t = if len_sq > 1e-6 {
-        ((wx * vx + wy * vy) / len_sq).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    let dx = px - (x0 + t * vx);
-    let dy = py - (y0 + t * vy);
-    (dx * dx + dy * dy).sqrt()
-}
-
-fn dist_arc(
-    px: f32,
-    py: f32,
-    cx: f32,
-    cy: f32,
-    rx: f32,
-    ry: f32,
-    start_deg: f32,
-    end_deg: f32,
-) -> f32 {
-    // Subdivide arc into 10 chord segments for exact capsule-strip distance without ellipse roots.
-    const SEGS: usize = 10;
-    let a0 = start_deg.to_radians();
-    let a1 = end_deg.to_radians();
-    let mut min_d = f32::INFINITY;
-    let mut prev_x = cx + rx * a0.cos();
-    let mut prev_y = cy + ry * a0.sin();
-    for i in 1..=SEGS {
-        let t = i as f32 / SEGS as f32;
-        let ang = a0 + (a1 - a0) * t;
-        let nx = cx + rx * ang.cos();
-        let ny = cy + ry * ang.sin();
-        min_d = min_d.min(dist_segment(px, py, prev_x, prev_y, nx, ny));
-        prev_x = nx;
-        prev_y = ny;
-    }
-    min_d
-}
-
-/// Clean geometric sans-serif / tabular vector glyph definitions on `[0..10] x [0..14]`.
-/// Returns `(primitives, advance_in_grid_units)`.
-fn glyph_vector(ch: char) -> (Vec<Prim>, f32) {
-    use Prim::{Arc as A, Line as L};
-    let (p, adv): (Vec<Prim>, f32) = match ch {
-        ' ' => (vec![], 5.0),
-        '!' => (vec![L(5., 2., 5., 8.5), L(5., 10.6, 5., 11.0)], 4.5),
-        '"' => (vec![L(3.6, 2., 3.6, 4.2), L(6.4, 2., 6.4, 4.2)], 6.0),
-        '#' => (
-            vec![
-                L(3.5, 2.5, 2.5, 11.),
-                L(7.0, 2.5, 6.0, 11.),
-                L(1.5, 5.2, 8.2, 5.2),
-                L(1.0, 8.2, 7.7, 8.2),
-            ],
-            8.5,
-        ),
-        '$' => (
-            vec![
-                L(5.0, 1.3, 5.0, 12.0),
-                A(5.0, 4.4, 2.5, 2.0, -30.0, -260.0),
-                A(5.0, 8.6, 2.5, 2.1, -90.0, 150.0),
-            ],
-            8.0,
-        ),
-        '%' => (
-            vec![
-                L(2.2, 10.8, 7.8, 2.4),
-                A(2.8, 3.6, 1.2, 1.2, 0.0, 360.0),
-                A(7.2, 9.6, 1.2, 1.2, 0.0, 360.0),
-            ],
-            9.0,
-        ),
-        '&' => (
-            vec![
-                A(4.6, 4.0, 1.9, 1.8, -40.0, 260.0),
-                A(4.6, 8.6, 2.6, 2.3, 45.0, 315.0),
-                L(3.3, 5.3, 8.0, 11.0),
-            ],
-            8.5,
-        ),
-        '\'' => (vec![L(5.0, 2.0, 5.0, 4.4)], 4.2),
-        '(' => (vec![A(6.5, 6.8, 3.0, 5.4, 115.0, 245.0)], 5.2),
-        ')' => (vec![A(3.5, 6.8, 3.0, 5.4, -65.0, 65.0)], 5.2),
-        '*' => (
-            vec![
-                L(5.0, 3.0, 5.0, 7.4),
-                L(3.0, 4.1, 7.0, 6.3),
-                L(7.0, 4.1, 3.0, 6.3),
-            ],
-            7.0,
-        ),
-        '+' => (vec![L(5.0, 4.0, 5.0, 9.4), L(2.3, 6.7, 7.7, 6.7)], 8.0),
-        ',' => (vec![L(5.2, 10.6, 4.4, 12.6)], 4.5),
-        '-' => (vec![L(2.4, 6.8, 7.6, 6.8)], 6.5),
-        '.' => (vec![L(5.0, 10.7, 5.0, 11.0)], 4.5),
-        '/' => (vec![L(7.2, 2.0, 2.8, 11.5)], 6.5),
-        '0' => (
-            vec![A(5.0, 6.5, 2.8, 4.5, 0.0, 360.0), L(3.2, 9.4, 6.8, 3.6)],
-            8.2,
-        ),
-        '1' => (vec![L(3.4, 3.6, 5.2, 2.0), L(5.2, 2.0, 5.2, 11.0), L(3.0, 11.0, 7.2, 11.0)], 7.2),
-        '2' => (
-            vec![
-                A(5.0, 4.4, 2.6, 2.4, 195.0, 385.0),
-                L(7.4, 5.3, 2.3, 11.0),
-                L(2.3, 11.0, 7.7, 11.0),
-            ],
-            8.0,
-        ),
-        '3' => (
-            vec![
-                A(4.8, 4.2, 2.6, 2.2, 210.0, 450.0),
-                A(4.8, 8.7, 2.8, 2.3, -90.0, 160.0),
-            ],
-            8.0,
-        ),
-        '4' => (
-            vec![
-                L(6.6, 11.0, 6.6, 2.0),
-                L(6.6, 2.0, 2.0, 8.2),
-                L(2.0, 8.2, 8.2, 8.2),
-            ],
-            8.2,
-        ),
-        '5' => (
-            vec![
-                L(7.4, 2.0, 2.8, 2.0),
-                L(2.8, 2.0, 2.6, 5.8),
-                A(4.9, 8.3, 2.7, 2.7, -125.0, 155.0),
-            ],
-            8.0,
-        ),
-        '6' => (
-            vec![
-                A(5.2, 6.5, 2.8, 4.5, 110.0, 325.0),
-                A(5.0, 8.4, 2.6, 2.6, 0.0, 360.0),
-            ],
-            8.0,
-        ),
-        '7' => (vec![L(2.2, 2.0, 7.8, 2.0), L(7.8, 2.0, 3.8, 11.0)], 8.0),
-        '8' => (
-            vec![
-                A(5.0, 4.2, 2.3, 2.2, 0.0, 360.0),
-                A(5.0, 8.7, 2.7, 2.3, 0.0, 360.0),
-            ],
-            8.2,
-        ),
-        '9' => (
-            vec![
-                A(5.0, 4.6, 2.6, 2.6, 0.0, 360.0),
-                A(4.8, 6.5, 2.8, 4.5, -60.0, 145.0),
-            ],
-            8.0,
-        ),
-        ':' => (vec![L(5.0, 5.4, 5.0, 5.8), L(5.0, 10.6, 5.0, 11.0)], 4.5),
-        ';' => (vec![L(5.0, 5.4, 5.0, 5.8), L(5.2, 10.6, 4.4, 12.6)], 4.5),
-        '<' => (vec![L(7.4, 3.6, 2.6, 6.7), L(2.6, 6.7, 7.4, 9.8)], 8.0),
-        '=' => (vec![L(2.2, 5.3, 7.8, 5.3), L(2.2, 8.1, 7.8, 8.1)], 8.0),
-        '>' => (vec![L(2.6, 3.6, 7.4, 6.7), L(7.4, 6.7, 2.6, 9.8)], 8.0),
-        '?' => (
-            vec![
-                A(5.0, 4.2, 2.6, 2.2, 185.0, 430.0),
-                L(5.0, 6.4, 5.0, 8.2),
-                L(5.0, 10.6, 5.0, 11.0),
-            ],
-            7.6,
-        ),
-        '@' => (
-            vec![
-                A(5.0, 6.6, 3.6, 4.2, -20.0, 310.0),
-                A(4.9, 6.8, 1.7, 1.9, 0.0, 360.0),
-                L(6.6, 5.2, 6.6, 8.5),
-            ],
-            9.5,
-        ),
-        'A' => (vec![L(1.8, 11.0, 5.0, 2.0), L(5.0, 2.0, 8.2, 11.0), L(2.9, 8.0, 7.1, 8.0)], 8.8),
-        'B' => (
-            vec![
-                L(2.4, 2.0, 2.4, 11.0),
-                L(2.4, 2.0, 5.4, 2.0),
-                L(2.4, 6.3, 5.6, 6.3),
-                L(2.4, 11.0, 5.6, 11.0),
-                A(5.4, 4.15, 2.2, 2.15, -90.0, 90.0),
-                A(5.6, 8.65, 2.4, 2.35, -90.0, 90.0),
-            ],
-            8.6,
-        ),
-        'C' => (vec![A(5.6, 6.5, 3.4, 4.5, 42.0, 318.0)], 8.6),
-        'D' => (
-            vec![
-                L(2.4, 2.0, 2.4, 11.0),
-                L(2.4, 2.0, 4.8, 2.0),
-                L(2.4, 11.0, 4.8, 11.0),
-                A(4.8, 6.5, 3.4, 4.5, -90.0, 90.0),
-            ],
-            8.8,
-        ),
-        'E' => (
-            vec![
-                L(2.6, 2.0, 2.6, 11.0),
-                L(2.6, 2.0, 7.6, 2.0),
-                L(2.6, 6.3, 6.8, 6.3),
-                L(2.6, 11.0, 7.6, 11.0),
-            ],
-            8.0,
-        ),
-        'F' => (
-            vec![L(2.6, 2.0, 2.6, 11.0), L(2.6, 2.0, 7.6, 2.0), L(2.6, 6.3, 6.8, 6.3)],
-            7.8,
-        ),
-        'G' => (
-            vec![
-                A(5.4, 6.5, 3.4, 4.5, 25.0, 325.0),
-                L(5.4, 6.8, 8.4, 6.8),
-                L(8.4, 6.8, 8.4, 10.6),
-            ],
-            9.0,
-        ),
-        'H' => (vec![L(2.2, 2.0, 2.2, 11.0), L(7.8, 2.0, 7.8, 11.0), L(2.2, 6.3, 7.8, 6.3)], 9.0),
-        'I' => (vec![L(5.0, 2.0, 5.0, 11.0), L(3.2, 2.0, 6.8, 2.0), L(3.2, 11.0, 6.8, 11.0)], 5.6),
-        'J' => (
-            vec![
-                L(6.8, 2.0, 6.8, 8.6),
-                A(4.6, 8.6, 2.2, 2.4, 0.0, 165.0),
-            ],
-            7.4,
-        ),
-        'K' => (vec![L(2.4, 2.0, 2.4, 11.0), L(7.8, 2.0, 2.6, 6.8), L(3.8, 5.8, 8.0, 11.0)], 8.6),
-        'L' => (vec![L(2.6, 2.0, 2.6, 11.0), L(2.6, 11.0, 7.6, 11.0)], 7.6),
-        'M' => (
-            vec![
-                L(1.6, 11.0, 1.6, 2.0),
-                L(1.6, 2.0, 5.0, 7.8),
-                L(5.0, 7.8, 8.4, 2.0),
-                L(8.4, 2.0, 8.4, 11.0),
-            ],
-            9.8,
-        ),
-        'N' => (vec![L(2.2, 11.0, 2.2, 2.0), L(2.2, 2.0, 7.8, 11.0), L(7.8, 11.0, 7.8, 2.0)], 9.0),
-        'O' => (vec![A(5.0, 6.5, 3.3, 4.5, 0.0, 360.0)], 9.2),
-        'P' => (
-            vec![
-                L(2.4, 2.0, 2.4, 11.0),
-                L(2.4, 2.0, 5.4, 2.0),
-                L(2.4, 6.6, 5.4, 6.6),
-                A(5.4, 4.3, 2.3, 2.3, -90.0, 90.0),
-            ],
-            8.2,
-        ),
-        'Q' => (vec![A(5.0, 6.5, 3.3, 4.5, 0.0, 360.0), L(5.8, 8.4, 8.5, 11.6)], 9.2),
-        'R' => (
-            vec![
-                L(2.4, 2.0, 2.4, 11.0),
-                L(2.4, 2.0, 5.4, 2.0),
-                L(2.4, 6.5, 5.4, 6.5),
-                A(5.4, 4.25, 2.25, 2.25, -90.0, 90.0),
-                L(5.2, 6.5, 7.8, 11.0),
-            ],
-            8.6,
-        ),
-        'S' => (
-            vec![
-                A(5.0, 4.2, 2.5, 2.2, -30.0, -260.0),
-                A(5.0, 8.7, 2.6, 2.3, -90.0, 150.0),
-            ],
-            8.2,
-        ),
-        'T' => (vec![L(1.6, 2.0, 8.4, 2.0), L(5.0, 2.0, 5.0, 11.0)], 8.2),
-        'U' => (
-            vec![
-                L(2.2, 2.0, 2.2, 8.2),
-                L(7.8, 2.0, 7.8, 8.2),
-                A(5.0, 8.2, 2.8, 2.8, 0.0, 180.0),
-            ],
-            8.8,
-        ),
-        'V' => (vec![L(1.8, 2.0, 5.0, 11.0), L(5.0, 11.0, 8.2, 2.0)], 8.6),
-        'W' => (
-            vec![
-                L(1.2, 2.0, 3.1, 11.0),
-                L(3.1, 11.0, 5.0, 4.8),
-                L(5.0, 4.8, 6.9, 11.0),
-                L(6.9, 11.0, 8.8, 2.0),
-            ],
-            10.2,
-        ),
-        'X' => (vec![L(2.0, 2.0, 8.0, 11.0), L(8.0, 2.0, 2.0, 11.0)], 8.4),
-        'Y' => (
-            vec![L(2.0, 2.0, 5.0, 6.6), L(8.0, 2.0, 5.0, 6.6), L(5.0, 6.6, 5.0, 11.0)],
-            8.2,
-        ),
-        'Z' => (
-            vec![L(2.0, 2.0, 8.0, 2.0), L(8.0, 2.0, 2.0, 11.0), L(2.0, 11.0, 8.0, 11.0)],
-            8.2,
-        ),
-        '[' => (vec![L(6.6, 1.6, 4.0, 1.6), L(4.0, 1.6, 4.0, 12.0), L(4.0, 12.0, 6.6, 12.0)], 5.6),
-        '\\' => (vec![L(2.8, 2.0, 7.2, 11.5)], 6.5),
-        ']' => (vec![L(3.4, 1.6, 6.0, 1.6), L(6.0, 1.6, 6.0, 12.0), L(6.0, 12.0, 3.4, 12.0)], 5.6),
-        '^' => (vec![L(2.5, 5.6, 5.0, 2.2), L(5.0, 2.2, 7.5, 5.6)], 7.6),
-        '_' => (vec![L(1.5, 12.2, 8.5, 12.2)], 7.8),
-        '`' => (vec![L(4.2, 1.8, 5.8, 3.6)], 5.0),
-        'a' => (
-            vec![
-                A(4.7, 8.0, 2.5, 3.0, 30.0, 330.0),
-                L(7.2, 5.2, 7.2, 11.0),
-            ],
-            7.8,
-        ),
-        'b' => (
-            vec![L(2.6, 1.8, 2.6, 11.0), A(5.2, 8.0, 2.6, 3.0, -145.0, 145.0)],
-            8.0,
-        ),
-        'c' => (vec![A(5.4, 8.0, 2.8, 3.0, 42.0, 318.0)], 7.4),
-        'd' => (
-            vec![L(7.4, 1.8, 7.4, 11.0), A(4.8, 8.0, 2.6, 3.0, 35.0, 325.0)],
-            8.0,
-        ),
-        'e' => (
-            vec![
-                L(2.3, 7.8, 7.6, 7.8),
-                A(5.0, 8.0, 2.7, 3.0, 35.0, 360.0),
-            ],
-            7.8,
-        ),
-        'f' => (
-            vec![
-                A(6.3, 3.4, 1.8, 1.8, 180.0, 325.0),
-                L(4.5, 3.4, 4.5, 11.0),
-                L(2.6, 5.4, 6.8, 5.4),
-            ],
-            5.8,
-        ),
-        'g' => (
-            vec![
-                A(4.8, 7.8, 2.5, 2.8, 0.0, 360.0),
-                L(7.3, 5.2, 7.3, 11.2),
-                A(5.0, 11.2, 2.3, 2.1, 0.0, 155.0),
-            ],
-            8.0,
-        ),
-        'h' => (
-            vec![
-                L(2.6, 1.8, 2.6, 11.0),
-                A(5.0, 7.2, 2.4, 2.2, 180.0, 360.0),
-                L(7.4, 7.2, 7.4, 11.0),
-            ],
-            7.8,
-        ),
-        'i' => (vec![L(5.0, 2.4, 5.0, 2.8), L(5.0, 5.0, 5.0, 11.0)], 4.2),
-        'j' => (
-            vec![
-                L(6.2, 2.4, 6.2, 2.8),
-                L(6.2, 5.0, 6.2, 11.2),
-                A(4.4, 11.2, 1.8, 2.0, 0.0, 160.0),
-            ],
-            4.8,
-        ),
-        'k' => (vec![L(2.6, 1.8, 2.6, 11.0), L(7.2, 5.0, 2.8, 8.4), L(4.2, 7.4, 7.4, 11.0)], 7.4),
-        'l' => (vec![L(5.0, 1.8, 5.0, 11.0)], 4.2),
-        'm' => (
-            vec![
-                L(1.5, 5.0, 1.5, 11.0),
-                A(3.25, 6.9, 1.75, 1.9, 180.0, 360.0),
-                L(5.0, 6.9, 5.0, 11.0),
-                A(6.75, 6.9, 1.75, 1.9, 180.0, 360.0),
-                L(8.5, 6.9, 8.5, 11.0),
-            ],
-            10.2,
-        ),
-        'n' => (
-            vec![
-                L(2.6, 5.0, 2.6, 11.0),
-                A(5.0, 7.2, 2.4, 2.2, 180.0, 360.0),
-                L(7.4, 7.2, 7.4, 11.0),
-            ],
-            7.8,
-        ),
-        'o' => (vec![A(5.0, 8.0, 2.7, 3.0, 0.0, 360.0)], 8.0),
-        'p' => (
-            vec![L(2.6, 5.0, 2.6, 13.4), A(5.2, 8.0, 2.6, 3.0, -145.0, 145.0)],
-            8.0,
-        ),
-        'q' => (
-            vec![L(7.4, 5.0, 7.4, 13.4), A(4.8, 8.0, 2.6, 3.0, 35.0, 325.0)],
-            8.0,
-        ),
-        'r' => (vec![L(3.2, 5.0, 3.2, 11.0), A(5.5, 7.0, 2.3, 2.0, 180.0, 330.0)], 6.0),
-        's' => (
-            vec![
-                A(5.0, 6.4, 2.1, 1.5, -25.0, -255.0),
-                A(5.0, 9.5, 2.2, 1.6, -90.0, 155.0),
-            ],
-            7.2,
-        ),
-        't' => (
-            vec![L(4.6, 2.4, 4.6, 9.4), L(2.6, 5.2, 6.8, 5.2), A(5.8, 9.4, 1.2, 1.4, 50.0, 180.0)],
-            5.8,
-        ),
-        'u' => (
-            vec![
-                L(2.6, 5.0, 2.6, 8.8),
-                L(7.4, 5.0, 7.4, 11.0),
-                A(5.0, 8.8, 2.4, 2.2, 0.0, 180.0),
-            ],
-            7.8,
-        ),
-        'v' => (vec![L(2.2, 5.0, 5.0, 11.0), L(5.0, 11.0, 7.8, 5.0)], 7.4),
-        'w' => (
-            vec![
-                L(1.5, 5.0, 3.2, 11.0),
-                L(3.2, 11.0, 5.0, 6.2),
-                L(5.0, 6.2, 6.8, 11.0),
-                L(6.8, 11.0, 8.5, 5.0),
-            ],
-            9.6,
-        ),
-        'x' => (vec![L(2.4, 5.0, 7.6, 11.0), L(7.6, 5.0, 2.4, 11.0)], 7.4),
-        'y' => (
-            vec![
-                L(2.2, 5.0, 5.0, 10.6),
-                L(7.8, 5.0, 4.0, 13.4),
-            ],
-            7.4,
-        ),
-        'z' => (
-            vec![L(2.4, 5.0, 7.6, 5.0), L(7.6, 5.0, 2.4, 11.0), L(2.4, 11.0, 7.6, 11.0)],
-            7.4,
-        ),
-        '{' => (
-            vec![
-                A(6.4, 3.2, 1.8, 1.6, 180.0, 270.0),
-                L(4.6, 3.2, 4.6, 5.8),
-                L(4.6, 5.8, 3.2, 6.8),
-                L(3.2, 6.8, 4.6, 7.8),
-                L(4.6, 7.8, 4.6, 10.4),
-                A(6.4, 10.4, 1.8, 1.6, 90.0, 180.0),
-            ],
-            5.8,
-        ),
-        '|' => (vec![L(5.0, 1.6, 5.0, 12.2)], 4.4),
-        '}' => (
-            vec![
-                A(3.6, 3.2, 1.8, 1.6, -90.0, 0.0),
-                L(5.4, 3.2, 5.4, 5.8),
-                L(5.4, 5.8, 6.8, 6.8),
-                L(6.8, 6.8, 5.4, 7.8),
-                L(5.4, 7.8, 5.4, 10.4),
-                A(3.6, 10.4, 1.8, 1.6, 0.0, 90.0),
-            ],
-            5.8,
-        ),
-        '~' => (
-            vec![
-                A(3.5, 6.8, 1.5, 1.1, 190.0, 350.0),
-                A(6.5, 6.8, 1.5, 1.1, 10.0, 170.0),
-            ],
-            7.8,
-        ),
-        // Fallback box for unknown / non-ASCII codepoints
-        _ => (
-            vec![
-                L(2.4, 2.2, 7.6, 2.2),
-                L(7.6, 2.2, 7.6, 10.8),
-                L(7.6, 10.8, 2.4, 10.8),
-                L(2.4, 10.8, 2.4, 2.2),
-            ],
-            8.2,
-        ),
-    };
-    (p, adv)
+    let fallback_top = ascender_em * 0.28;
+    (fallback_top, (fallback_top + ascender_em) * 0.5)
 }
 
 #[cfg(test)]
@@ -705,33 +300,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_atlas_has_valid_sdf_range_and_metrics() {
+    fn geist_mono_sfdf_loads_with_valid_sdf_range_and_metrics() {
         let atlas = GlyphAtlas::builtin();
-        assert_eq!(atlas.width, 512);
-        assert_eq!(atlas.height, 192);
-        assert_eq!(atlas.pixels.len(), (512 * 192) as usize);
+        assert_eq!(atlas.width, 768);
+        assert_eq!(atlas.height, 288);
+        assert_eq!(atlas.pixels.len(), (768 * 288) as usize);
+        assert!((atlas.advance_em - 0.60).abs() < 0.02);
 
-        // Verify glyph 'A' (index 33) has both strong interior (>180) and exterior (<60) SDF values.
+        // Verify glyph 'A' (index 33) has crisp interior (>180) and exterior (<30) SDF contrast.
         let idx = ('A' as u32) - 0x20;
-        let ox = (idx % ATLAS_COLS) * CELL_SIZE;
-        let oy = (idx / ATLAS_COLS) * CELL_SIZE;
+        let ox = (idx % 16) * 48;
+        let oy = (idx / 16) * 48;
         let mut min_v = 255u8;
         let mut max_v = 0u8;
-        for py in 0..CELL_SIZE {
-            for px in 0..CELL_SIZE {
+        for py in 0..48 {
+            for px in 0..48 {
                 let v = atlas.pixels[((oy + py) * atlas.width + (ox + px)) as usize];
                 min_v = min_v.min(v);
                 max_v = max_v.max(v);
             }
         }
-        assert!(min_v <= 50, "expected outside SDF <= 50, got {min_v}");
-        assert!(max_v >= 175, "expected inside SDF >= 175, got {max_v}");
+        assert!(min_v <= 20, "expected outside SDF <= 20, got {min_v}");
+        assert!(max_v >= 180, "expected inside SDF >= 180, got {max_v}");
 
-        let (w, h) = atlas.measure("Sofuu UI", 16.0, false);
-        assert!(w > 40.0 && h > 16.0);
+        let (w, h) = atlas.measure("Geist Mono", 16.0, true);
+        assert!(w > 80.0 && h > 16.0);
 
         let mut instances = Vec::new();
-        atlas.layout_into("Hello\nWorld", 10.0, 20.0, 14.0, 0xffffffff, false, None, &mut instances, 0);
-        assert_eq!(instances.len(), 10); // space skipped in HelloWorld (10 visible glyphs)
+        atlas.layout_into(
+            "Hello\nWorld",
+            10.0,
+            20.0,
+            14.0,
+            0xffffffff,
+            true,
+            None,
+            &mut instances,
+            0,
+        );
+        assert_eq!(instances.len(), 10);
     }
 }

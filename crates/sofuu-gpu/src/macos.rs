@@ -54,10 +54,14 @@ extern "C" {
         clips_count: u32,
         quads: *const c_void,
         quads_count: u32,
+        ribbons: *const c_void,
+        ribbons_count: u32,
         strokes: *const c_void,
         strokes_count: u32,
         glyphs: *const c_void,
         glyphs_count: u32,
+        cmds: *const c_void,
+        cmds_count: u32,
     );
     fn sofuu_macos_poll_or_wait(
         win: *mut SofuuMacWindow,
@@ -136,6 +140,7 @@ where
     F: FnOnce(UiHandle),
 {
     let mut engine = UiEngine::new(initial_scene, [config.width, config.height]);
+    engine.set_top_inset(28.0);
     let mut draw_list = DrawList::new();
 
     let title_c = CString::new(config.title.as_str()).unwrap_or_else(|_| CString::new("Sofuu").unwrap());
@@ -226,10 +231,14 @@ where
                     draw_list.clips.len() as u32,
                     draw_list.quads.as_ptr().cast(),
                     draw_list.quads.len() as u32,
+                    draw_list.ribbons.as_ptr().cast(),
+                    draw_list.ribbons.len() as u32,
                     draw_list.strokes.as_ptr().cast(),
                     draw_list.strokes.len() as u32,
                     draw_list.glyphs.as_ptr().cast(),
                     draw_list.glyphs.len() as u32,
+                    draw_list.cmds.as_ptr().cast(),
+                    draw_list.cmds.len() as u32,
                 );
             }
         }

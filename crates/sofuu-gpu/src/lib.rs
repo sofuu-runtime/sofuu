@@ -113,6 +113,7 @@ mod tests {
     fn msl_shader_source_is_nonempty_and_declares_all_three_kernels() {
         let src = include_str!("shaders/msl/ui_shaders.metal");
         assert!(src.contains("quad_vert") && src.contains("quad_frag"));
+        assert!(src.contains("ribbon_vert") && src.contains("ribbon_frag"));
         assert!(src.contains("stroke_vert") && src.contains("stroke_frag"));
         assert!(src.contains("glyph_vert") && src.contains("glyph_frag"));
     }

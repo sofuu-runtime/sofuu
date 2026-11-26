@@ -10,8 +10,8 @@ use crate::draw::{hex_rgba, rgba8};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ThemeMode {
-    #[default]
     Dark,
+    #[default]
     Light,
 }
 
@@ -138,6 +138,6 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Self::dark()
+        Self::light()
     }
 }

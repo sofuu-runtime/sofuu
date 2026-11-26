@@ -10,10 +10,10 @@ use sofuu_ui::{
 };
 
 fn build_demo_scene() -> Scene {
-    let t = Theme::dark();
+    let t = Theme::light();
     Scene::new(
         "Sofuu 2D GPU Base Engine (Metal)",
-        ThemeMode::Dark,
+        ThemeMode::Light,
         Node::new(
             "root",
             NodeKind::Container {
@@ -27,7 +27,7 @@ fn build_demo_scene() -> Scene {
                     Node::new(
                         "header",
                         NodeKind::Surface {
-                            style: BoxStyle::card(t.surface_1, t.border, t.radius_card),
+                            style: BoxStyle::card(t.radius_card),
                             interactive: false,
                             child: Some(Box::new(Node::new(
                                 "header_row",
@@ -84,7 +84,7 @@ fn build_demo_scene() -> Scene {
                                                 Node::new(
                                                     "card_a",
                                                     NodeKind::Surface {
-                                                        style: BoxStyle::card(t.surface_1, t.border, t.radius_card),
+                                                        style: BoxStyle::card(t.radius_card),
                                                         interactive: true,
                                                         child: Some(Box::new(Node::new(
                                                             "card_a_txt",
@@ -92,7 +92,7 @@ fn build_demo_scene() -> Scene {
                                                                 content: "Interactive Surface A\nHover & Click (120Hz Spring)".into(),
                                                                 size: 14.0,
                                                                 color: None,
-                                                                mono: false,
+                                                                mono: true,
                                                                 wrap: true,
                                                             },
                                                         ))),
@@ -103,25 +103,16 @@ fn build_demo_scene() -> Scene {
                                                 Node::new(
                                                     "card_b",
                                                     NodeKind::Surface {
-                                                        style: BoxStyle {
-                                                            bg: Some(t.surface_1),
-                                                            bg_bottom: Some(t.surface_2),
-                                                            hover_bg: Some(t.surface_3),
-                                                            border: Some(t.border),
-                                                            border_width: 1.0,
-                                                            radius: [t.radius_card; 4],
-                                                            shadow_blur: 18.0,
-                                                            shadow_offset_y: 6.0,
-                                                            opacity: 1.0,
-                                                        },
+                                                        style: BoxStyle::card(t.radius_card)
+                                                            .with_shadow(18.0, 6.0, None),
                                                         interactive: true,
                                                         child: Some(Box::new(Node::new(
                                                             "card_b_txt",
                                                             NodeKind::Text {
-                                                                content: "Gradient + Analytic Shadow\n0% CPU/GPU when idle".into(),
+                                                                content: "Explicit Opt-In Shadow\n0% CPU/GPU when idle".into(),
                                                                 size: 14.0,
                                                                 color: None,
-                                                                mono: false,
+                                                                mono: true,
                                                                 wrap: true,
                                                             },
                                                         ))),
@@ -138,7 +129,7 @@ fn build_demo_scene() -> Scene {
                                     child: Node::new(
                                         "arch_box",
                                         NodeKind::Surface {
-                                            style: BoxStyle::card(t.surface_1, t.border, t.radius_card),
+                                            style: BoxStyle::card(t.radius_card),
                                             interactive: false,
                                             child: Some(Box::new(Node::new(
                                                 "arch_txt",

@@ -1,9 +1,10 @@
 // Sofuu Custom 2D GPU UI Engine — Base Metal Shading Language (MSL) Kernels
 //
-// Three instanced shaders covering 100% of 2D precision UI rendering directly on GPU:
-// 1. sdf_quad:   Rounded boxes, per-corner radii, vertical gradients, borders, analytic soft shadows
-// 2. aa_stroke:  Antialiased vector line capsules for plots, graphs, connectors, sparklines
-// 3. sdf_text:   Resolution-independent signed-distance typography from R8 atlas
+// Four instanced shaders covering 100% of precision 2D GPU UI & charting:
+// 1. sdf_quad:   Rounded boxes, candles, pills, vertical gradients, opt-in borders & soft shadows
+// 2. ribbon:     Smooth sloped trapezoid/band fills (area charts, stacked bands, oscillator spreads)
+// 3. aa_stroke:  Antialiased solid & GPU-dashed vector line capsules (lines, wicks, crosshairs, grids)
+// 4. sdf_text:   Resolution-independent signed-distance typography (Geist Mono R8 atlas)
 
 #include <metal_stdlib>
 using namespace metal;
@@ -37,13 +38,32 @@ struct QuadInstance {
     uint _pad2;
 };
 
+struct RibbonInstance {
+    float x0;
+    float y0_top;
+    float y0_bot;
+    float x1;
+    float y1_top;
+    float y1_bot;
+    uint color_top;
+    uint color_bottom;
+    uint clip_id;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
 struct StrokeInstance {
     float2 p0;
     float2 p1;
     float width;
     float feather;
+    float dash_len;
+    float gap_len;
     uint color;
     uint clip_id;
+    uint _pad0;
+    uint _pad1;
 };
 
 struct GlyphInstance {
@@ -87,7 +107,6 @@ inline float sd_rounded_box(float2 p, float2 half_size, float4 radii) {
 }
 
 inline float2 unit_quad_corner(uint vid) {
-    // 2 triangles covering [0,1]x[0,1]: (0,1,2) and (2,1,3) -> 0,1,2, 2,1,3
     constexpr float2 corners[6] = {
         float2(0.0, 0.0),
         float2(1.0, 0.0),
@@ -123,7 +142,7 @@ vertex QuadOut quad_vert(
     QuadInstance q = quads[iid];
     float blur = max(q.params.y, 0.0);
     float off_y = q.params.z;
-    float margin = blur + abs(off_y) + 2.0;
+    float margin = (blur > 0.01 ? blur + abs(off_y) : 0.0) + 1.5;
 
     float2 corner = unit_quad_corner(vid);
     float2 origin = q.rect.xy - float2(margin);
@@ -165,7 +184,6 @@ fragment float4 quad_frag(
 
     float dist = sd_rounded_box(p, half_size, in.radii);
 
-    // Soft analytic drop shadow evaluated cleanly outside the fill shape.
     float4 accum = float4(0.0);
     if (shadow_blur > 0.01 && in.shadow_color.a > 0.001) {
         float sd_shadow = sd_rounded_box(p - float2(0.0, shadow_off_y), half_size, in.radii);
@@ -174,13 +192,11 @@ fragment float4 quad_frag(
         accum = float4(in.shadow_color.rgb * sh_a, sh_a);
     }
 
-    // Fill with vertical gradient
     float fill_cov = 1.0 - smoothstep(-aa, aa, dist);
     if (fill_cov > 0.001) {
         float grad_t = clamp((in.logical_pos.y - in.rect.y) / max(in.rect.w, 1.0), 0.0, 1.0);
         float4 fill = mix(in.color_top, in.color_bottom, grad_t);
 
-        // Crisp inner hairline border
         if (border_w > 0.01 && in.border_color.a > 0.001) {
             float inner_cov = 1.0 - smoothstep(-aa, aa, dist + border_w);
             float border_cov = clamp(fill_cov - inner_cov, 0.0, 1.0);
@@ -202,7 +218,55 @@ fragment float4 quad_frag(
     return accum;
 }
 
-// ── 2. Antialiased Stroke Capsule Shader ────────────────────────────────────────────────
+// ── 2. Smooth Sloped Trapezoid / Ribbon Shader ──────────────────────────────────────────
+
+struct RibbonOut {
+    float4 position [[position]];
+    float2 logical_pos;
+    float v_t;
+    float4 color_top;
+    float4 color_bottom;
+    uint clip_id [[flat]];
+};
+
+vertex RibbonOut ribbon_vert(
+    uint vid [[vertex_id]],
+    uint iid [[instance_id]],
+    constant FrameUniforms& u [[buffer(0)]],
+    const device RibbonInstance* ribbons [[buffer(1)]]
+) {
+    RibbonInstance r = ribbons[iid];
+    float2 corner = unit_quad_corner(vid);
+    float x = mix(r.x0, r.x1, corner.x);
+    float y_top = mix(r.y0_top, r.y1_top, corner.x);
+    float y_bot = mix(r.y0_bot, r.y1_bot, corner.x);
+    float y = mix(y_top, y_bot, corner.y);
+
+    RibbonOut out;
+    out.position = float4(to_ndc(float2(x, y), u.viewport_size), 0.0, 1.0);
+    out.logical_pos = float2(x, y);
+    out.v_t = corner.y;
+    out.color_top = unpack_rgba8(r.color_top);
+    out.color_bottom = unpack_rgba8(r.color_bottom);
+    out.clip_id = r.clip_id;
+    return out;
+}
+
+fragment float4 ribbon_frag(
+    RibbonOut in [[stage_in]],
+    constant ClipRect* clips [[buffer(1)]]
+) {
+    if (clip_discard(in.logical_pos, clips, in.clip_id)) {
+        discard_fragment();
+    }
+    float4 col = mix(in.color_top, in.color_bottom, clamp(in.v_t, 0.0, 1.0));
+    if (col.a <= 0.001) {
+        discard_fragment();
+    }
+    return float4(col.rgb * col.a, col.a);
+}
+
+// ── 3. Antialiased Solid & Dashed Stroke Capsule Shader ─────────────────────────────────
 
 struct StrokeOut {
     float4 position [[position]];
@@ -211,6 +275,8 @@ struct StrokeOut {
     float2 p1;
     float half_w;
     float feather;
+    float dash_len;
+    float gap_len;
     float4 color;
     uint clip_id [[flat]];
 };
@@ -237,6 +303,8 @@ vertex StrokeOut stroke_vert(
     out.p1 = s.p1;
     out.half_w = half_w;
     out.feather = max(s.feather, 0.75 / max(u.scale_factor, 1.0));
+    out.dash_len = s.dash_len;
+    out.gap_len = s.gap_len;
     out.color = unpack_rgba8(s.color);
     out.clip_id = s.clip_id;
     return out;
@@ -244,7 +312,6 @@ vertex StrokeOut stroke_vert(
 
 fragment float4 stroke_frag(
     StrokeOut in [[stage_in]],
-    constant FrameUniforms& u [[buffer(0)]],
     constant ClipRect* clips [[buffer(1)]]
 ) {
     if (clip_discard(in.logical_pos, clips, in.clip_id)) {
@@ -252,11 +319,21 @@ fragment float4 stroke_frag(
     }
     float2 pa = in.logical_pos - in.p0;
     float2 ba = in.p1 - in.p0;
-    float denom = max(dot(ba, ba), 1e-6);
-    float h = clamp(dot(pa, ba) / denom, 0.0, 1.0);
+    float len_sq = max(dot(ba, ba), 1e-6);
+    float h = clamp(dot(pa, ba) / len_sq, 0.0, 1.0);
     float d = length(pa - ba * h) - in.half_w;
 
     float cov = 1.0 - smoothstep(-in.feather, in.feather, d);
+    if (in.dash_len > 0.01 && in.gap_len > 0.01) {
+        float seg_len = sqrt(len_sq);
+        float along = h * seg_len;
+        float period = in.dash_len + in.gap_len;
+        float phase = fmod(along, period);
+        float dash_cov = smoothstep(0.0, 0.75, phase) *
+                         (1.0 - smoothstep(in.dash_len - 0.75, in.dash_len + 0.25, phase));
+        cov *= dash_cov;
+    }
+
     float a = in.color.a * cov;
     if (a <= 0.001) {
         discard_fragment();
@@ -264,7 +341,7 @@ fragment float4 stroke_frag(
     return float4(in.color.rgb * a, a);
 }
 
-// ── 3. SDF Text Shader ──────────────────────────────────────────────────────────────────
+// ── 4. SDF Text Shader ──────────────────────────────────────────────────────────────────
 
 struct GlyphOut {
     float4 position [[position]];

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::layout::ComputedRect;
+use crate::theme::ThemeMode;
 
 /// Raw OS input events dispatched from `sofuu-gpu` (Thread 0) into `UiEngine`.
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +26,9 @@ pub enum InputEvent {
 pub enum UIEvent {
     Click { id: String },
     TabChanged { id: String, index: usize },
+    SegmentedChanged { id: String, index: usize },
+    ThemeChanged { id: String, mode: ThemeMode },
+    SeriesToggled { id: String, series_index: usize },
     Scrolled { id: String, offset_y: f32 },
     WindowClosed,
 }
@@ -32,7 +36,13 @@ pub enum UIEvent {
 #[derive(Clone, Debug)]
 pub enum HitKind {
     Surface { id: String },
+    Stat { id: String },
     TabButton { tabs_id: String, index: usize },
+    SegmentedItem { seg_id: String, index: usize },
+    Button { id: String },
+    ThemeToggle { id: String },
+    PlotArea { id: String },
+    PlotLegendChip { plot_id: String, series_index: usize },
     ScrollContainer { id: String, max_scroll_y: f32 },
 }
 
@@ -90,6 +100,8 @@ pub struct InteractionState {
     pub pressed_key: Option<String>,
     pub hits: Vec<HitRegion>,
     pub scrolls: HashMap<String, KineticScroll>,
+    pub plot_hover: HashMap<String, [f32; 2]>,
+    pub dragging_plot: Option<(String, f32, f32)>,
 }
 
 impl InteractionState {
@@ -109,11 +121,32 @@ impl InteractionState {
                 continue;
             }
             match &region.kind {
-                HitKind::Surface { id } => return Some((id.clone(), &region.kind)),
+                HitKind::Surface { id } => return Some((format!("surf::{id}"), &region.kind)),
+                HitKind::Stat { id } => return Some((format!("stat::{id}"), &region.kind)),
                 HitKind::TabButton { tabs_id, index } => {
                     return Some((format!("{tabs_id}::tab::{index}"), &region.kind))
                 }
-                HitKind::ScrollContainer { .. } => {}
+                HitKind::SegmentedItem { seg_id, index } => {
+                    return Some((format!("{seg_id}::seg::{index}"), &region.kind))
+                }
+                HitKind::Button { id } => return Some((format!("btn::{id}"), &region.kind)),
+                HitKind::ThemeToggle { id } => return Some((format!("toggle::{id}"), &region.kind)),
+                HitKind::PlotLegendChip {
+                    plot_id,
+                    series_index,
+                } => return Some((format!("{plot_id}::legend::{series_index}"), &region.kind)),
+                HitKind::PlotArea { .. } | HitKind::ScrollContainer { .. } => {}
+            }
+        }
+        None
+    }
+
+    pub fn hit_plot_area(&self, x: f32, y: f32) -> Option<(String, ComputedRect)> {
+        for region in self.hits.iter().rev() {
+            if region.contains(x, y) {
+                if let HitKind::PlotArea { id } = &region.kind {
+                    return Some((id.clone(), region.rect));
+                }
             }
         }
         None

@@ -56,7 +56,7 @@ def main():
           const cycle = {}; cycle.self = cycle;
           if (api.run(src, cycle).code !== 'E_KAZE_ARGS') throw Error('cycle accepted');
         }
-        const memory = 'needs: memory\\naction main():\\n    memory.save("key", "real")\\n    return memory.recall("key")\\n';
+        const memory = 'needs: memory\\naction main():\\n    memory.save("key", "real")\\n    return memory.recall("key") otherwise []\\n';
         const opts = {caps:{memory:'ephemeral'}, policy:{tools:{allow:['kaze.memory.*']}}};
         for (const api of [sofuu.kaze, sofuu.sfs]) {
           sofuu.policy.set(JSON.stringify({tools:{deny:['kaze.memory.*']}}));

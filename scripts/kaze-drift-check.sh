@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # scripts/kaze-drift-check.sh — the Kaze surface gate (PLAN-AUDIT-REMEDIATION §4 Task 2.1).
 #
-# Why this exists: there are two Kaze engines in this tree.
+# Plan 14 moved the Rust engine to domains/kaze_engine/ and made
+# `domains/kaze/` a thin re-export; `deps/kaze/` is the vendored C snapshot
+# compiled by crates/sofuu-ffi/build.rs. The surface comparison still runs
+# against the Rust compatibility facade, so a new verb or opcode cannot land
+# on one side only. The snapshot check below proves the C files Cargo builds
+# are exactly the C files kaze/dist ships.
 #
-#   crates/sofuu-core/src/domains/kaze/   THE PRODUCT. Aligned language spec v1.0,
-#                                         compiled into the sofuu binary.
-#   kaze/                                 a standalone prototype crate with its own
-#                                         workspace, its own CLI and its own tests.
-#                                         Not built by make, not built by CI.
-#
-# Both engines implement the unified Kaze 1.0 contract (47 opcodes, 17 capability verbs).
-# This gate enforces strict zero-drift across verbs, opcodes, and version strings.
+#   crates/sofuu-core/src/domains/kaze_engine/  THE PRODUCT SURFACE (Rust facade)
+#   kaze/                                       the standalone pure-Kaze/C99 tree
+#   deps/kaze/                                  the C snapshot linked into sofuu
 #
 # Policy, in order of severity:
 #   FAIL   a capability verb or opcode that the PRODUCT has and the prototype
@@ -28,6 +28,35 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SHIP="$ROOT/crates/sofuu-core/src/domains/kaze"
 PROTO="$ROOT/kaze"
+VENDOR="$ROOT/deps/kaze"
+
+# The library Cargo compiles must be the library the standalone tree ships.
+snapshot_fail=0
+if [ ! -d "$VENDOR" ]; then
+    echo "kaze-drift: missing $VENDOR (the Cargo build needs the vendored C snapshot)" >&2
+    snapshot_fail=1
+elif [ ! -d "$PROTO/dist" ]; then
+    for f in kaze_rt.c kaze_rt.h kaze_vm.c kaze_vm.h kaze_embed.c kaze_embed.h; do
+        if [ ! -f "$VENDOR/$f" ]; then
+            echo "kaze-drift: missing $VENDOR/$f" >&2
+            snapshot_fail=1
+        fi
+    done
+else
+    for f in kaze_rt.c kaze_rt.h kaze_vm.c kaze_vm.h kaze_embed.c kaze_embed.h; do
+        if [ ! -f "$PROTO/dist/$f" ]; then
+            echo "kaze-drift: missing $PROTO/dist/$f" >&2
+            snapshot_fail=1
+        elif ! cmp -s "$PROTO/dist/$f" "$VENDOR/$f"; then
+            echo "kaze-drift: deps/kaze/$f differs from kaze/dist/$f" >&2
+            snapshot_fail=1
+        fi
+    done
+fi
+if [ "$snapshot_fail" -ne 0 ]; then
+    echo "kaze-drift: run 'make kaze-embed' to refresh the vendored C snapshot" >&2
+    exit 1
+fi
 
 STRICT=0
 case "${1:-}" in
@@ -51,7 +80,7 @@ if [ ! -d "$PROTO/src" ] && [ ! -d "$PROTO/compiler" ]; then
     exit 0
 fi
 
-for f in "$SHIP/caps.rs" "$SHIP/isa.rs" "$SHIP/mod.rs"; do
+for f in "$SHIP/caps.rs" "$SHIP/mod.rs"; do
     if [ ! -f "$f" ]; then
         echo "kaze-drift: missing $f" >&2
         echo "kaze-drift: the gate is stale — fix the path before trusting a green run" >&2
@@ -98,7 +127,18 @@ version() {
 }
 
 verbs   "$SHIP/caps.rs" >"$TMP/ship_verbs"
-opcodes "$SHIP/isa.rs"  >"$TMP/ship_ops"
+if [ -f "$SHIP/isa.rs" ]; then
+    opcodes "$SHIP/isa.rs" >"$TMP/ship_ops"
+else
+    VM_C="$ROOT/deps/kaze/kaze_vm.c"
+    if [ ! -f "$VM_C" ]; then
+        echo "kaze-drift: missing $SHIP/isa.rs and $VM_C" >&2
+        exit 2
+    fi
+    grep -oE '^    case [0-9]+:' "$VM_C" \
+        | sed -E 's/^    case ([0-9]+):/opcode@\1/' \
+        | sort -u >"$TMP/ship_ops"
+fi
 SHIP_V="$(version "$SHIP/mod.rs")"
 
 # Phase 10 removed the prototype's Rust sources. When they are gone the standalone
@@ -118,7 +158,11 @@ else
     fi
     "$PROTO_BIN" surface > "$TMP/proto_surface"
     grep -v '^opcode ' "$TMP/proto_surface" | sed -E 's/\./ /' | sort -u > "$TMP/proto_verbs"
-    sed -n 's/^opcode //p' "$TMP/proto_surface" | sed -E 's/@/ /' | awk '{print $1"@"$2}' | sort > "$TMP/proto_ops"
+    if [ -f "$SHIP/isa.rs" ]; then
+        sed -n 's/^opcode //p' "$TMP/proto_surface" | sed -E 's/@/ /' | awk '{print $1"@"$2}' | sort > "$TMP/proto_ops"
+    else
+        sed -n 's/^opcode //p' "$TMP/proto_surface" | sed -E 's/.*@([0-9]+).*/opcode@\1/' | sort -u > "$TMP/proto_ops"
+    fi
     PROTO_V="$("$PROTO_BIN" version | awk 'NR==1 {print $2}')"
     if [ -z "$PROTO_V" ]; then PROTO_V="unknown"; fi
     PROTO_KINDS="pure"
@@ -134,7 +178,7 @@ count()   { wc -l <"$1" | tr -d ' '; }
 
 fail=0
 echo ""
-echo "Kaze surface drift — product (domains/kaze) vs prototype (kaze/)"
+echo "Kaze surface drift — product (domains/kaze + deps/kaze) vs prototype (kaze/)"
 echo "  product   $SHIP"
 echo "  prototype $PROTO"
 echo "  verbs     $(count "$TMP/ship_verbs") product · $(count "$TMP/proto_verbs") prototype"

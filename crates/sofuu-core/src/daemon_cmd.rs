@@ -1149,10 +1149,8 @@ fn cmd_run(args: &[String]) -> i32 {
             fs::read(target_path)
                 .map_err(|e| crate::sfs::KazeError::new("E_KAZE_IO", e.to_string()))
                 .and_then(|bytes| {
-                    crate::sfs::isa::deserialize(&bytes)
-                        .map_err(|e| crate::sfs::KazeError::new("E_KAZE_BADCODE", e))
+                    crate::sfs::run_module(bytes, &target_path.to_string_lossy(), &opts)
                 })
-                .and_then(|m| crate::sfs::run_module(m, &target_path.to_string_lossy(), &opts))
         } else {
             crate::sfs::run_file(&target_path.to_string_lossy(), &opts)
         };
@@ -1181,10 +1179,10 @@ fn cmd_run(args: &[String]) -> i32 {
                 }
                 if let Some(ref v) = report.verdict {
                     match v {
-                        crate::sfs::vm::Verdict::Allow(r) => {
+                        crate::sfs::Verdict::Allow(r) => {
                             println!("\x1b[1m[VERDICT]\x1b[0m \x1b[32mALLOW\x1b[0m {r}");
                         }
-                        crate::sfs::vm::Verdict::Reject(r) => {
+                        crate::sfs::Verdict::Reject(r) => {
                             println!("\x1b[1m[VERDICT]\x1b[0m \x1b[31mREJECT\x1b[0m {r}");
                         }
                     }

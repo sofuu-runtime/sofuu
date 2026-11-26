@@ -1451,28 +1451,28 @@ fn generate_kaze_agent_bootstrap(entry_path: &Path, kaze_bytes: &[u8]) -> Result
         })
         .unwrap_or("agent");
 
-    let parsed_prog = crate::domains::kaze::parser::parse(&kaze_src).ok();
-    let default_entry = parsed_prog.as_ref().and_then(|p| {
-        if p.item("main").is_some() {
+    let prepared_meta = crate::sfs::prepare(&kaze_src, &entry_path.to_string_lossy()).ok();
+    let default_entry = prepared_meta.as_ref().and_then(|p| {
+        if p.items.iter().any(|i| i.name == "main") {
             Some("main".to_string())
         } else {
             p.items
                 .iter()
-                .find(|i| matches!(i.kind, crate::domains::kaze::ast::ItemKind::Action | crate::domains::kaze::ast::ItemKind::Filter | crate::domains::kaze::ast::ItemKind::Check))
+                .find(|i| matches!(i.tag.as_str(), "action" | "filter" | "check"))
                 .map(|i| i.name.clone())
         }
     });
     let default_entry_json = serde_json::to_string(&default_entry).unwrap_or_else(|_| "null".to_string());
 
     let mut routine_signatures: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    if let Some(ref p) = parsed_prog {
+    if let Some(ref p) = prepared_meta {
         for item in &p.items {
             routine_signatures.insert(item.name.clone(), item.params.clone());
         }
     }
     let routine_signatures_json = serde_json::to_string(&routine_signatures).unwrap_or_else(|_| "{}".to_string());
 
-    let kaze_needs: Vec<String> = parsed_prog
+    let kaze_needs: Vec<String> = prepared_meta
         .as_ref()
         .map(|p| p.needs.clone())
         .unwrap_or_default();

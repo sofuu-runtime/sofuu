@@ -26,8 +26,7 @@
 use std::io::{BufRead, Write};
 
 use crate::sfs::caps::SimState;
-use crate::sfs::vm::Verdict;
-use crate::sfs::{self, isa, RunOptions, RunReport};
+use crate::sfs::{self, Limits, RunOptions, RunReport, Verdict};
 
 /// What a run ended with, named for machine callers.
 ///
@@ -595,12 +594,12 @@ fn options_from(f: &Flags) -> Result<RunOptions, OptErr> {
         ambient_args: true,
         config_path: f.config_file.clone(),
         grants: f.caps.clone(),
-        fuel: f.fuel.unwrap_or(sfs::vm::Limits::default().fuel),
+        fuel: f.fuel.unwrap_or(Limits::default().fuel),
         timeout_ms: sfs::RunOptions::default().timeout_ms,
         heap_bytes: f
             .heap_kb
             .map(|kb| (kb as usize).saturating_mul(1024))
-            .unwrap_or(sfs::vm::Limits::default().heap_bytes),
+            .unwrap_or(Limits::default().heap_bytes),
         ticks: f.ticks.unwrap_or(0),
         tick_ms: f.tick_ms.unwrap_or(100),
         sim,
@@ -730,17 +729,13 @@ fn cmd_run(argv: &[String]) -> i32 {
         ))),
         Ok(bytes) => {
             if path.ends_with(".kazebc") || bytes.starts_with(b"KAZEBC1\0") {
-                isa::deserialize(&bytes)
-                    .map_err(|e| CliFailure::kaze(sfs::KazeError::new("E_KAZE_BADCODE", e)))
-                    .and_then(|module| {
-                        if declares_async_capability(&module.needs) {
-                            // A compiled artifact that declares ai or tool runs
-                            // through the same bridge; the bridge resolves the
-                            // path itself, so the artifact the CLI accepted is
-                            // the artifact that runs.
+                sfs::load_bytecode(bytes, path)
+                    .map_err(CliFailure::kaze)
+                    .and_then(|prepared| {
+                        if declares_async_capability(&prepared.needs) {
                             run_async_bridge(path, path, &opts, &flags)
                         } else {
-                            sfs::run_module(module, path, &opts).map_err(CliFailure::kaze)
+                            sfs::run_prepared_source(prepared, &opts).map_err(CliFailure::kaze)
                         }
                     })
             } else {
@@ -748,7 +743,7 @@ fn cmd_run(argv: &[String]) -> i32 {
                     .and_then(|src| sfs::prepare(&src, path).map(|prepared| (src, prepared)))
                     .map_err(CliFailure::kaze)
                     .and_then(|(src, prepared)| {
-                        if declares_async_capability(&prepared.module.needs) {
+                        if declares_async_capability(&prepared.needs) {
                             run_async_bridge(path, &src, &opts, &flags)
                         } else {
                             sfs::run_prepared_source(prepared, &opts).map_err(CliFailure::kaze)
@@ -1036,20 +1031,20 @@ fn cmd_check(argv: &[String]) -> i32 {
             if flags.json {
                 let json = serde_json::json!({
                     "ok": true,
-                    "items": prepared.module.items.len(),
-                    "caps": prepared.module.caps.len(),
-                    "consts": prepared.module.consts.len(),
-                    "code_bytes": prepared.module.code_bytes(),
+                    "items": prepared.items.len(),
+                    "caps": prepared.cap_count,
+                    "consts": prepared.const_count,
+                    "code_bytes": prepared.code_bytes,
                 });
                 println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
             } else {
                 println!(
                     "\x1b[32m✓\x1b[0m {} — {} routines, {} capabilities, {} constants, {} bytes of code",
                     path,
-                    prepared.module.items.len(),
-                    prepared.module.caps.len(),
-                    prepared.module.consts.len(),
-                    prepared.module.code_bytes()
+                    prepared.items.len(),
+                    prepared.cap_count,
+                    prepared.const_count,
+                    prepared.code_bytes
                 );
             }
             0
@@ -1092,12 +1087,17 @@ fn cmd_compile(argv: &[String]) -> i32 {
             return Outcome::of_code(&err.code).exit_code();
         }
     };
-    let bytes = isa::serialize(&prepared.module);
+    let bytes = &prepared.bytecode;
     if flags.disasm {
-        print!("{}", isa::disassemble(&prepared.module));
+        println!(
+            "# KAZEBC1 ({} bytes, {} routines, {} code bytes)",
+            bytes.len(),
+            prepared.items.len(),
+            prepared.code_bytes
+        );
     }
     match &flags.out {
-        Some(out) => match std::fs::write(out, &bytes) {
+        Some(out) => match std::fs::write(out, bytes) {
             Ok(()) => {
                 println!(
                     "\x1b[32m✓\x1b[0m {} → {} ({} bytes, revision-stable)",
@@ -1113,7 +1113,7 @@ fn cmd_compile(argv: &[String]) -> i32 {
             }
         },
         None => {
-            println!("{} bytes ({} words)", bytes.len(), prepared.module.code_bytes() / 4);
+            println!("{} bytes ({} words)", bytes.len(), prepared.code_bytes / 4);
             0
         }
     }
@@ -1138,9 +1138,8 @@ fn cmd_to_machine(argv: &[String]) -> i32 {
             return Outcome::Error.exit_code();
         }
     };
-    match sfs::parser::parse(&src) {
-        Ok(prog) => {
-            let machine_text = sfs::machine::emit_machine(&prog);
+    match sfs::to_machine(&src, path) {
+        Ok(machine_text) => {
             if let Some(out_path) = &flags.out {
                 if let Err(e) = std::fs::write(out_path, &machine_text) {
                     report_cli_failure("E_KAZE_HOST", &format!("cannot write '{}': {}", out_path, e), flags.json);
@@ -1152,8 +1151,7 @@ fn cmd_to_machine(argv: &[String]) -> i32 {
             }
             0
         }
-        Err(err) => {
-            let kerr = sfs::KazeError::at(err.code, err.render(path), path, err.line, Some(err.col));
+        Err(kerr) => {
             if flags.json {
                 println!("{}", serde_json::to_string_pretty(&kaze_error_json(&kerr, path)).unwrap_or_default());
             } else {
@@ -1183,9 +1181,8 @@ fn cmd_to_human(argv: &[String]) -> i32 {
             return Outcome::Error.exit_code();
         }
     };
-    match sfs::parser::parse(&src) {
-        Ok(prog) => {
-            let human_text = sfs::machine::emit_human(&prog);
+    match sfs::to_human(&src, path) {
+        Ok(human_text) => {
             if let Some(out_path) = &flags.out {
                 if let Err(e) = std::fs::write(out_path, &human_text) {
                     report_cli_failure("E_KAZE_HOST", &format!("cannot write '{}': {}", out_path, e), flags.json);
@@ -1197,8 +1194,7 @@ fn cmd_to_human(argv: &[String]) -> i32 {
             }
             0
         }
-        Err(err) => {
-            let kerr = sfs::KazeError::at(err.code, err.render(path), path, err.line, Some(err.col));
+        Err(kerr) => {
             if flags.json {
                 println!("{}", serde_json::to_string_pretty(&kaze_error_json(&kerr, path)).unwrap_or_default());
             } else {
@@ -1228,11 +1224,7 @@ fn cmd_emit_c(argv: &[String]) -> i32 {
             return Outcome::Error.exit_code();
         }
     };
-    let opts = sfs::c_codegen::CodegenOptions {
-        standalone: true,
-        entry: flags.entry.clone(),
-    };
-    let c_code = match sfs::emit_c_source(&src, path, &opts) {
+    let c_code = match sfs::emit_c_source(&src, path, true) {
         Ok(code) => code,
         Err(e) => {
             if flags.json {
@@ -1361,7 +1353,7 @@ fn cmd_repl(argv: &[String]) -> i32 {
             let candidate = format!("{}{}\n", needs_line(&needs), pending);
             match sfs::prepare(&candidate, "<repl>") {
                 Ok(prepared) => {
-                    let added = prepared.module.items.len();
+                    let added = prepared.items.len();
                     body.push_str(&pending);
                     println!("\x1b[32m✓\x1b[0m added {} routine(s)", added);
                 }

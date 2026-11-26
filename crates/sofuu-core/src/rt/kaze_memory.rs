@@ -59,9 +59,7 @@ use std::path::PathBuf;
 use serde_json::{Map, Number, Value as Json};
 
 use crate::memory::cma::Cma;
-use crate::sfs::arena::Arena;
 use crate::sfs::caps::{Action, ActionMode, CapHost, RuntimeHost};
-use crate::sfs::value::{Heap, Value};
 
 const DIM: usize = 64;
 const MAX_RECORDS: usize = 256;
@@ -70,23 +68,20 @@ const MAX_LABEL_BYTES: usize = 1024;
 const MAX_VALUE_DEPTH: usize = 16;
 const MAX_VALUE_NODES: usize = 4096;
 
-/// The backend names the trace records, so a reader can tell a per-run
-/// store from a committed one without reading the prose beside the line.
 const EPHEMERAL_MEMORY_BACKEND: &str = "memory-ephemeral";
 const DURABLE_MEMORY_BACKEND: &str = "memory-durable";
 
-fn validate_label(value: Option<&Value>, arena: &Arena) -> Result<String, String> {
-    let Some(Value::Str(text)) = value else {
+fn validate_label(value: Option<&Json>) -> Result<String, String> {
+    let Some(Json::String(text)) = value else {
         return Err("E_KAZE_MEMORY: memory label must be nonempty text".into());
     };
-    let text = arena.get(*text);
     if text.is_empty() || text.len() > MAX_LABEL_BYTES {
         return Err(format!(
             "E_KAZE_MEMORY: memory label must contain 1 to {} bytes",
             MAX_LABEL_BYTES
         ));
     }
-    Ok(text.to_string())
+    Ok(text.clone())
 }
 
 pub(crate) struct EphemeralMemoryHost {
@@ -108,17 +103,17 @@ impl EphemeralMemoryHost {
         }
     }
 
-    fn label(value: Option<&Value>, arena: &Arena) -> Result<String, String> {
-        validate_label(value, arena)
+    fn label(value: Option<&Json>) -> Result<String, String> {
+        validate_label(value)
     }
 
-    fn save(&mut self, args: &[Value], arena: &Arena, heap: &Heap) -> Result<Value, String> {
+    fn save(&mut self, args: &[Json]) -> Result<Json, String> {
         if args.len() != 2 {
             return Err("E_KAZE_MEMORY: memory.save requires a label and a value".into());
         }
-        let label = Self::label(args.first(), arena)?;
+        let label = Self::label(args.first())?;
         let mut nodes = 0;
-        let value = to_json(args[1], arena, heap, 0, &mut nodes)?;
+        let value = validate_json(&args[1], 0, &mut nodes)?;
         let record = serde_json::json!({"label": label, "value": value}).to_string();
         if self.store.len() >= MAX_RECORDS
             || self.accepted_bytes.saturating_add(record.len()) > MAX_BYTES
@@ -136,39 +131,27 @@ impl EphemeralMemoryHost {
             ActionMode::Real,
             EPHEMERAL_MEMORY_BACKEND,
         );
-        Ok(Value::Unit)
+        Ok(Json::Null)
     }
 
-    fn recall(
-        &mut self,
-        args: &[Value],
-        arena: &mut Arena,
-        heap: &mut Heap,
-    ) -> Result<Value, String> {
+    fn recall(&mut self, args: &[Json]) -> Result<Json, String> {
         if args.len() != 1 {
             return Err("E_KAZE_MEMORY: memory.recall requires one label".into());
         }
-        let label = Self::label(args.first(), arena)?;
+        let label = Self::label(args.first())?;
         let mut matches = Vec::new();
-        // Exact matching is deliberately distinct from CMA's approximate
-        // vector retrieval. This run owns all records in this ephemeral CMA.
         for stored in &self.store.records {
             let record: Json = serde_json::from_str(&stored.text)
                 .map_err(|_| "E_KAZE_MEMORY: unreadable in-memory record".to_string())?;
             if record.get("label").and_then(Json::as_str) == Some(label.as_str()) {
                 let value = record
                     .get("value")
+                    .cloned()
                     .ok_or_else(|| "E_KAZE_MEMORY: invalid in-memory record".to_string())?;
-                matches.push(
-                    crate::sfs::json_to_value(value, arena, heap)
-                        .map_err(|e| format!("E_KAZE_MEMORY: {}", e))?,
-                );
+                matches.push(value);
             }
         }
         let count = matches.len();
-        let value = heap
-            .push_array(matches)
-            .map_err(|e| format!("E_KAZE_MEMORY: {}", e))?;
         self.base.note_with_backend(
             "memory",
             "recall",
@@ -177,29 +160,22 @@ impl EphemeralMemoryHost {
             ActionMode::Real,
             EPHEMERAL_MEMORY_BACKEND,
         );
-        Ok(value)
+        Ok(Json::Array(matches))
     }
 }
 
 impl CapHost for EphemeralMemoryHost {
-    fn call(
-        &mut self,
-        family: &str,
-        op: &str,
-        args: &[Value],
-        arena: &mut Arena,
-        heap: &mut Heap,
-    ) -> Result<Value, String> {
+    fn call(&mut self, family: &str, op: &str, args: &[Json]) -> Result<Json, String> {
         match (family, op) {
             ("memory", "save") => {
                 self.base.check_trace_capacity()?;
-                self.save(args, arena, heap)
+                self.save(args)
             }
             ("memory", "recall") => {
                 self.base.check_trace_capacity()?;
-                self.recall(args, arena, heap)
+                self.recall(args)
             }
-            _ => self.base.call(family, op, args, arena, heap),
+            _ => self.base.call(family, op, args),
         }
     }
 
@@ -355,13 +331,13 @@ impl DurableMemoryHost {
         }
     }
 
-    fn save(&mut self, args: &[Value], arena: &Arena, heap: &Heap) -> Result<Value, String> {
+    fn save(&mut self, args: &[Json]) -> Result<Json, String> {
         if args.len() != 2 {
             return Err("E_KAZE_MEMORY: memory.save requires a label and a value".into());
         }
-        let label = validate_label(args.first(), arena)?;
+        let label = validate_label(args.first())?;
         let mut nodes = 0;
-        let value = to_json(args[1], arena, heap, 0, &mut nodes)?;
+        let value = validate_json(&args[1], 0, &mut nodes)?;
         self.ensure_writer()?;
         let mut records = self.read_records()?;
         if records.len() >= MAX_RECORDS {
@@ -377,33 +353,22 @@ impl DurableMemoryHost {
             ActionMode::Real,
             DURABLE_MEMORY_BACKEND,
         );
-        Ok(Value::Unit)
+        Ok(Json::Null)
     }
 
-    fn recall(
-        &mut self,
-        args: &[Value],
-        arena: &mut Arena,
-        heap: &mut Heap,
-    ) -> Result<Value, String> {
+    fn recall(&mut self, args: &[Json]) -> Result<Json, String> {
         if args.len() != 1 {
             return Err("E_KAZE_MEMORY: memory.recall requires one label".into());
         }
-        let label = validate_label(args.first(), arena)?;
+        let label = validate_label(args.first())?;
         let records = self.read_records()?;
         let mut matches = Vec::new();
         for record in records {
             if record.label == label {
-                matches.push(
-                    crate::sfs::json_to_value(&record.value, arena, heap)
-                        .map_err(|e| format!("E_KAZE_MEMORY: {}", e))?,
-                );
+                matches.push(record.value);
             }
         }
         let count = matches.len();
-        let value = heap
-            .push_array(matches)
-            .map_err(|e| format!("E_KAZE_MEMORY: {}", e))?;
         self.base.note_with_backend(
             "memory",
             "recall",
@@ -412,29 +377,22 @@ impl DurableMemoryHost {
             ActionMode::Real,
             DURABLE_MEMORY_BACKEND,
         );
-        Ok(value)
+        Ok(Json::Array(matches))
     }
 }
 
 impl CapHost for DurableMemoryHost {
-    fn call(
-        &mut self,
-        family: &str,
-        op: &str,
-        args: &[Value],
-        arena: &mut Arena,
-        heap: &mut Heap,
-    ) -> Result<Value, String> {
+    fn call(&mut self, family: &str, op: &str, args: &[Json]) -> Result<Json, String> {
         match (family, op) {
             ("memory", "save") => {
                 self.base.check_trace_capacity()?;
-                self.save(args, arena, heap)
+                self.save(args)
             }
             ("memory", "recall") => {
                 self.base.check_trace_capacity()?;
-                self.recall(args, arena, heap)
+                self.recall(args)
             }
-            _ => self.base.call(family, op, args, arena, heap),
+            _ => self.base.call(family, op, args),
         }
     }
 
@@ -446,63 +404,35 @@ impl CapHost for DurableMemoryHost {
     }
 }
 
-fn to_json(
-    value: Value,
-    arena: &Arena,
-    heap: &Heap,
-    depth: usize,
-    nodes: &mut usize,
-) -> Result<Json, String> {
+fn validate_json(value: &Json, depth: usize, nodes: &mut usize) -> Result<Json, String> {
     *nodes += 1;
     if depth > MAX_VALUE_DEPTH || *nodes > MAX_VALUE_NODES {
         return Err("E_KAZE_MEMORY: memory value is too deeply nested or complex".into());
     }
     match value {
-        Value::Unit => Ok(Json::Null),
-        Value::Bool(b) => Ok(Json::Bool(b)),
-        Value::Num(n) => Number::from_f64(n)
-            .map(Json::Number)
-            .ok_or_else(|| "E_KAZE_MEMORY: memory numbers must be finite".into()),
-        Value::Str(s) => Ok(Json::String(arena.get(s).to_string())),
-        Value::Arr(i) => {
-            let entries = heap
-                .array(i)
-                .ok_or_else(|| "E_KAZE_MEMORY: invalid list".to_string())?;
+        Json::Null | Json::Bool(_) | Json::String(_) => Ok(value.clone()),
+        Json::Number(n) => {
+            let f = n
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| "E_KAZE_MEMORY: memory numbers must be finite".to_string())?;
+            Number::from_f64(f)
+                .map(Json::Number)
+                .ok_or_else(|| "E_KAZE_MEMORY: memory numbers must be finite".into())
+        }
+        Json::Array(entries) => {
             let mut result = Vec::with_capacity(entries.len());
             for entry in entries {
-                result.push(to_json(*entry, arena, heap, depth + 1, nodes)?);
+                result.push(validate_json(entry, depth + 1, nodes)?);
             }
             Ok(Json::Array(result))
         }
-        Value::Map(i) => {
-            let entries = heap
-                .map(i)
-                .ok_or_else(|| "E_KAZE_MEMORY: invalid record".to_string())?;
+        Json::Object(entries) => {
             let mut result = Map::new();
             for (key, entry) in entries {
-                let Value::Str(key) = key else {
-                    return Err("E_KAZE_MEMORY: record keys must be text".into());
-                };
-                let key = arena.get(*key).to_string();
-                if result.contains_key(&key) {
-                    return Err("E_KAZE_MEMORY: duplicate record key".into());
-                }
-                result.insert(key, to_json(*entry, arena, heap, depth + 1, nodes)?);
+                result.insert(key.clone(), validate_json(entry, depth + 1, nodes)?);
             }
             Ok(Json::Object(result))
-        }
-        Value::Vec(i) => {
-            let p = heap
-                .vec3(i)
-                .ok_or_else(|| "E_KAZE_MEMORY: invalid vector".to_string())?;
-            let mut result = Vec::with_capacity(3);
-            for n in p {
-                let num = Number::from_f64(n)
-                    .map(Json::Number)
-                    .ok_or_else(|| "E_KAZE_MEMORY: memory numbers must be finite".to_string())?;
-                result.push(num);
-            }
-            Ok(Json::Array(result))
         }
     }
 }
@@ -531,29 +461,21 @@ mod tests {
     }
 
     fn save_text(host: &mut dyn CapHost, label: &str, value: &str) -> Result<(), String> {
-        let mut arena = Arena::new(1024);
-        let mut heap = Heap::default();
-        let l = Value::Str(arena.alloc(label)?);
-        let v = Value::Str(arena.alloc(value)?);
-        host.call("memory", "save", &[l, v], &mut arena, &mut heap)
+        host.call("memory", "save", &[Json::String(label.into()), Json::String(value.into())])
             .map(|_| ())
     }
 
     fn recall_texts(host: &mut dyn CapHost, label: &str) -> Result<Vec<String>, String> {
-        let mut arena = Arena::new(1024);
-        let mut heap = Heap::default();
-        let l = Value::Str(arena.alloc(label)?);
-        let out = host.call("memory", "recall", &[l], &mut arena, &mut heap)?;
-        let Value::Arr(idx) = out else {
+        let out = host.call("memory", "recall", &[Json::String(label.into())])?;
+        let Json::Array(entries) = out else {
             return Err("recall must return a list".into());
         };
-        let entries = heap.array(idx).ok_or("recall must return a list")?;
         let mut texts = Vec::new();
         for entry in entries {
-            let Value::Str(s) = entry else {
+            let Json::String(s) = entry else {
                 return Err("recall must return text values".into());
             };
-            texts.push(arena.get(*s).to_string());
+            texts.push(s);
         }
         Ok(texts)
     }
@@ -562,20 +484,18 @@ mod tests {
     fn a_full_trace_refuses_the_memory_write_before_it_occurs() {
         let base = RuntimeHost::new(SimState::default(), Vec::new(), Vec::new());
         let mut host = EphemeralMemoryHost::new(base);
-        let mut arena = Arena::new(1024);
-        let mut heap = Heap::default();
-        let detector = Value::Str(arena.alloc("secrets").unwrap());
-        let data = Value::Str(arena.alloc("value").unwrap());
-        let label = Value::Str(arena.alloc("label").unwrap());
+        let detector = Json::String("secrets".into());
+        let data = Json::String("value".into());
+        let label = Json::String("label".into());
         let mut full = false;
         for _ in 0..10_000 {
-            if host.call("policy", "detects", &[detector, data], &mut arena, &mut heap).is_err() {
+            if host.call("policy", "detects", &[detector.clone(), data.clone()]).is_err() {
                 full = true;
                 break;
             }
         }
         assert!(full, "the trace must have a finite limit");
-        let error = host.call("memory", "save", &[label, data], &mut arena, &mut heap).unwrap_err();
+        let error = host.call("memory", "save", &[label, data]).unwrap_err();
         assert!(error.starts_with("E_KAZE_MEMORY:"));
         assert_eq!(host.store.len(), 0);
     }
@@ -624,13 +544,14 @@ mod tests {
     #[test]
     fn a_value_that_cannot_be_encoded_is_refused() {
         let mut host = EphemeralMemoryHost::new(base_host());
-        let mut arena = Arena::new(1024);
-        let mut heap = Heap::default();
-        let label = Value::Str(arena.alloc("label-a").unwrap());
-        let value = Value::Num(f64::NAN);
-        let error = host.call("memory", "save", &[label, value], &mut arena, &mut heap).unwrap_err();
+        let label = Json::String("label-a".into());
+        let mut deep = Json::Number(Number::from(1));
+        for _ in 0..=MAX_VALUE_DEPTH {
+            deep = Json::Array(vec![deep]);
+        }
+        let error = host.call("memory", "save", &[label, deep]).unwrap_err();
         assert!(error.starts_with("E_KAZE_MEMORY:"), "{error}");
-        assert!(error.contains("finite"), "{error}");
+        assert!(error.contains("deeply nested"), "{error}");
         assert_eq!(host.store.len(), 0, "a refused value must not be stored");
     }
 

@@ -30,9 +30,6 @@
 use serde_json::Value as Json;
 use serde_json::json;
 
-use crate::sfs::arena::Arena;
-use crate::sfs::value::Value;
-
 /// The shared physical safety contract. A drone or rover command is judged by
 /// these rules whichever backend serves it.
 pub use super::safety::{gate_physical_command, is_physical_family, VehicleState};
@@ -275,11 +272,11 @@ pub fn authorise_runtime_policy(policy: &Json, family: &str, op: &str) -> Result
     evaluate_verdict(&crate::rt::policy::evaluate(&req, policy), family, op)
 }
 
-fn num_arg(args: &[Value], idx: usize) -> Option<f64> {
-    args.get(idx).and_then(|v| v.as_num())
+fn num_arg(args: &[Json], idx: usize) -> Option<f64> {
+    args.get(idx).and_then(Json::as_f64)
 }
 
-fn range(family: &str, op: &str, idx: usize, args: &[Value], lo: f64, hi: f64, unit: &str) -> Result<(), Denial> {
+fn range(family: &str, op: &str, idx: usize, args: &[Json], lo: f64, hi: f64, unit: &str) -> Result<(), Denial> {
     let Some(n) = num_arg(args, idx) else {
         return Err(Denial::new(
             "E_KAZE_RANGE",
@@ -298,10 +295,10 @@ fn range(family: &str, op: &str, idx: usize, args: &[Value], lo: f64, hi: f64, u
                 "{}.{} got {} {}, which is outside the permitted range {} to {} {} (rejected, not clamped)",
                 family,
                 op,
-                crate::sfs::arena::fmt_num(n),
+                crate::sfs::caps::fmt_num(n),
                 unit,
-                crate::sfs::arena::fmt_num(lo),
-                crate::sfs::arena::fmt_num(hi),
+                crate::sfs::caps::fmt_num(lo),
+                crate::sfs::caps::fmt_num(hi),
                 unit
             ),
         ));
@@ -312,18 +309,14 @@ fn range(family: &str, op: &str, idx: usize, args: &[Value], lo: f64, hi: f64, u
 /// H-4: physical argument ranges. Out-of-range values are refused, never
 /// adjusted — a machine that flew to the clamped altitude instead of the one
 /// in the script is a machine acting on a lie.
-pub fn validate_arguments(family: &str, op: &str, args: &[Value], _arena: &Arena) -> Result<(), Denial> {
+pub fn validate_arguments(family: &str, op: &str, args: &[Json]) -> Result<(), Denial> {
     match (family, op) {
         ("drone", "takeoff") => range(family, op, 0, args, 0.0, 500.0, "meters")?,
         ("drone", "goto") => {
-            // A position target needs valid coordinates as well as altitude.
-            // Until structured waypoints have a validated contract, refusing
-            // them is safer than using the previous or a default position.
             range(family, op, 0, args, -90.0, 90.0, "latitude degrees")?;
             if args.len() >= 3 {
                 range(family, op, 1, args, -180.0, 180.0, "longitude degrees")?;
             }
-            // goto(lat, lon, alt) uses index 2; goto(lat, alt) uses index 1.
             let idx = if args.len() >= 3 { 2 } else { 1 };
             range(family, op, idx, args, 0.0, 500.0, "meters")?
         }
@@ -340,7 +333,7 @@ pub fn validate_arguments(family: &str, op: &str, args: &[Value], _arena: &Arena
                     "sensor.read needs a pin or sensor name as argument 1, but got none (rejected, not clamped)".to_string(),
                 ));
             }
-            if matches!(args.first(), Some(Value::Num(_))) {
+            if matches!(args.first(), Some(Json::Number(_))) {
                 range(family, op, 0, args, 0.0, 255.0, "pin")?;
             }
         }
@@ -410,89 +403,73 @@ mod tests {
 
     #[test]
     fn a_missing_argument_is_refused_not_ignored() {
-        let a = Arena::new(1024);
-        let d = validate_arguments("drone", "takeoff", &[], &a).unwrap_err();
+        let d = validate_arguments("drone", "takeoff", &[]).unwrap_err();
         assert_eq!(d.code, "E_KAZE_RANGE");
     }
 
     #[test]
     fn goto_three_arg_checks_altitude_not_longitude() {
-        let a = Arena::new(1024);
-        // Valid western-hemisphere waypoints must be accepted
-        assert!(validate_arguments("drone", "goto", &[Value::Num(52.1), Value::Num(-4.1), Value::Num(15.0)], &a).is_ok());
-        assert!(validate_arguments("drone", "goto", &[Value::Num(40.7), Value::Num(-74.0), Value::Num(30.0)], &a).is_ok());
+        assert!(validate_arguments("drone", "goto", &[json!(52.1), json!(-4.1), json!(15.0)]).is_ok());
+        assert!(validate_arguments("drone", "goto", &[json!(40.7), json!(-74.0), json!(30.0)]).is_ok());
     }
 
     #[test]
     fn goto_three_arg_rejects_over_altitude() {
-        let a = Arena::new(1024);
-        let d = validate_arguments("drone", "goto", &[Value::Num(52.1), Value::Num(4.1), Value::Num(900.0)], &a).unwrap_err();
+        let d = validate_arguments("drone", "goto", &[json!(52.1), json!(4.1), json!(900.0)]).unwrap_err();
         assert_eq!(d.code, "E_KAZE_RANGE");
         assert_eq!(d.rule, "H-4/range");
     }
 
     #[test]
     fn goto_rejects_invalid_or_missing_coordinates() {
-        let a = Arena::new(1024);
         for args in [
-            vec![Value::Num(91.0), Value::Num(0.0), Value::Num(15.0)],
-            vec![Value::Num(-91.0), Value::Num(0.0), Value::Num(15.0)],
-            vec![Value::Num(0.0), Value::Num(181.0), Value::Num(15.0)],
-            vec![Value::Num(0.0), Value::Num(-181.0), Value::Num(15.0)],
-            vec![Value::Unit, Value::Num(15.0)],
-            vec![Value::Num(0.0), Value::Unit, Value::Num(15.0)],
-            vec![Value::Num(f64::NAN), Value::Num(15.0)],
+            vec![json!(91.0), json!(0.0), json!(15.0)],
+            vec![json!(-91.0), json!(0.0), json!(15.0)],
+            vec![json!(0.0), json!(181.0), json!(15.0)],
+            vec![json!(0.0), json!(-181.0), json!(15.0)],
+            vec![Json::Null, json!(15.0)],
+            vec![json!(0.0), Json::Null, json!(15.0)],
         ] {
-            assert_eq!(validate_arguments("drone", "goto", &args, &a).unwrap_err().code, "E_KAZE_RANGE");
+            assert_eq!(validate_arguments("drone", "goto", &args).unwrap_err().code, "E_KAZE_RANGE");
         }
-        assert!(validate_arguments("drone", "goto", &[Value::Num(-90.0), Value::Num(180.0), Value::Num(15.0)], &a).is_ok());
+        assert!(validate_arguments("drone", "goto", &[json!(-90.0), json!(180.0), json!(15.0)]).is_ok());
     }
 
     #[test]
     fn goto_two_arg_still_checks_altitude() {
-        let a = Arena::new(1024);
-        let d = validate_arguments("drone", "goto", &[Value::Num(52.1), Value::Num(900.0)], &a).unwrap_err();
+        let d = validate_arguments("drone", "goto", &[json!(52.1), json!(900.0)]).unwrap_err();
         assert_eq!(d.code, "E_KAZE_RANGE");
     }
 
     #[test]
     fn a_duty_cycle_outside_zero_to_hundred_percent_is_refused() {
-        let arena = Arena::new(1024);
-        let d = validate_arguments("device", "set_duty", &[Value::Unit, Value::Num(101.0)], &arena)
+        let d = validate_arguments("device", "set_duty", &[Json::Null, json!(101.0)])
             .unwrap_err();
         assert_eq!(d.code, "E_KAZE_RANGE");
         assert_eq!(d.rule, "H-4/range");
         assert!(d.reason.contains("percent"), "{}", d.reason);
-        assert!(validate_arguments("device", "set_duty", &[Value::Unit, Value::Num(40.0)], &arena)
+        assert!(validate_arguments("device", "set_duty", &[Json::Null, json!(40.0)])
             .is_ok());
     }
 
     #[test]
     fn out_of_range_arguments_are_rejected_not_clamped() {
-        let arena = Arena::new(1024);
-        let d = validate_arguments("drone", "takeoff", &[Value::Num(900.0)], &arena).unwrap_err();
+        let d = validate_arguments("drone", "takeoff", &[json!(900.0)]).unwrap_err();
         assert_eq!(d.code, "E_KAZE_RANGE");
         assert!(d.reason.contains("not clamped"), "{}", d.reason);
-        assert!(validate_arguments("drone", "takeoff", &[Value::Num(15.0)], &arena).is_ok());
+        assert!(validate_arguments("drone", "takeoff", &[json!(15.0)]).is_ok());
     }
 
-    /// RB-09: the refusal happens AT the ceiling, not somewhere near it. A
-    /// takeoff one metre past the limit fails and the message reports the
-    /// altitude the script asked for — a clamped 500 m flight would be a
-    /// machine acting on a number nobody wrote.
     #[test]
     fn a_takeoff_past_the_ceiling_is_rejected_at_the_boundary() {
-        let arena = Arena::new(1024);
-        assert!(validate_arguments("drone", "takeoff", &[Value::Num(500.0)], &arena).is_ok());
-        let d = validate_arguments("drone", "takeoff", &[Value::Num(501.0)], &arena).unwrap_err();
+        assert!(validate_arguments("drone", "takeoff", &[json!(500.0)]).is_ok());
+        let d = validate_arguments("drone", "takeoff", &[json!(501.0)]).unwrap_err();
         assert_eq!(d.code, "E_KAZE_RANGE");
         assert_eq!(d.rule, "H-4/range");
         assert!(d.reason.contains("got 501 meters"), "{}", d.reason);
         assert!(d.reason.contains("not clamped"), "{}", d.reason);
-        for bad in [-1.0, f64::NAN, f64::INFINITY] {
-            let d = validate_arguments("drone", "takeoff", &[Value::Num(bad)], &arena).unwrap_err();
-            assert_eq!(d.code, "E_KAZE_RANGE", "takeoff {} was not refused", bad);
-        }
+        let d = validate_arguments("drone", "takeoff", &[json!(-1.0)]).unwrap_err();
+        assert_eq!(d.code, "E_KAZE_RANGE");
     }
 
     /// RB-08: a `--cap family=backend` grant is judged at grant time. A typo is

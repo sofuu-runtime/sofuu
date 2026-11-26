@@ -4,6 +4,8 @@ members = [
     "crates/sofuu-core",
     "crates/sofuu-ffi",
     "crates/sofuu-capi",
+    "crates/sofuu-ui",
+    "crates/sofuu-gpu",
     "sofuu-desktop/src-tauri",
     "crates/ml-train",
 ]
@@ -14,6 +16,8 @@ members = [
 # default-members (still in `members`) — a bare `cargo test`/`cargo build`
 # used to compile the whole Tauri desktop stack + its system deps on CLI
 # runners. Build the desktop app explicitly with -p or from sofuu-desktop/.
+# Default workspace builds keep CLI/agent binaries strictly separate from the standalone GPU UI library.
+# Build/test the UI library separately with: `cargo build -p sofuu-gpu --release` / `cargo test -p sofuu-ui -p sofuu-gpu`.
 default-members = [
     "crates/sofuu-core",
     "crates/sofuu-ffi",

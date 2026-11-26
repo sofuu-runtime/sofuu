@@ -1,0 +1,11 @@
+{
+  "active": "fortytwo",
+  "providers": {
+    "fortytwo": {
+      "provider": "custom",
+      "model": "deepseek/deepseek-v4.1-flash-1017",
+      "base_url": "https://api.fortytwo.network/v1",
+      "api_key": "sk-ft-v1-01a20c1b-fa73-7c62-a65a-b30296f72318.P5Is0HMcR2l0F4K3Nl4sM3k9PKXL2pBnbZGt_B3DfKQ"
+    }
+  }
+}

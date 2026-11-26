@@ -1,0 +1,435 @@
+#!/usr/bin/env sofuu
+/**
+ * production-agent-example/market-sentinel/index.js
+ *
+ * 24/7 Real-Time Market Sentinel Agent (Pure JS + Sofuu).
+ *
+ * Monitors any selected stocks, cryptocurrencies, and currencies (FX),
+ * evaluates built-in + user-added custom algorithms, combines mathematical
+ * signals with the active AI model (`models.json`), and dispatches
+ * target-price & opportunity alerts 24/7.
+ */
+
+import fs from 'fs';
+import path from 'path';
+import { fetchAssetData } from './lib/feeds.js';
+import { loadAlgorithms, evaluateAssetAlgorithms } from './lib/algorithms.js';
+import { detectTriggers, dispatchNotification } from './lib/notifier.js';
+import {
+  loadWatchlist,
+  saveWatchlist,
+  synthesizeAlertWithAI,
+  defineMarketAgent,
+} from './lib/agent.js';
+
+function defaultWatchlistPath() {
+  const local = path.resolve(process.cwd(), 'watchlist.json');
+  if (fs.existsSync(local)) return local;
+  return 'production-agent-example/market-sentinel/watchlist.json';
+}
+
+function printHelp() {
+  console.log(`
+Usage:
+  sofuu run production-agent-example/market-sentinel/index.js [mode] [options]
+  ./market-sentinel [mode] [options]
+
+24/7 Real-Time Stock, Crypto & Currency Sentinel (Algorithms + AI).
+
+Modes:
+  --watch, --daemon        Run continuous 24/7 monitoring loop
+  --once                   Run one full live scan cycle and exit (default)
+  --interactive, -i        Launch interactive AI chat with live market tools
+  --list-algos             List active built-in and custom algorithms (algos/*.js)
+
+Watchlist Management:
+  --add <symbol>           Add or update an asset (pair with --type, --above, --below)
+  --type <kind>            stock | crypto | currency (default: stock)
+  --above <price>          Upper target price trigger
+  --below <price>          Lower target price trigger
+  --remove <symbol>        Remove an asset from watchlist.json
+  --watchlist <path>       Custom watchlist JSON file
+
+Watch & Notification Options:
+  --every, --interval <d>  Poll interval (e.g. 15s, 1m, 5m; default: watchlist.json)
+  --force-alert            Ignore cooldowns during --once scan
+  --no-ai                  Skip LLM synthesis (pure deterministic algo scan)
+  --json                   Output structured JSON (for --once)
+
+Model & Provider Options (shared Sofuu generalized system):
+  --setup-model            Configure provider & model into models.json
+  --edit-model [name]      Edit, switch, add, or remove providers/models
+  --list-models            Show configured providers & models
+`);
+}
+
+function parseDurationMs(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim().toLowerCase();
+  if (s.endsWith('ms')) return Math.max(1000, parseInt(s, 10) || 1000);
+  if (s.endsWith('s')) return Math.max(1000, (parseFloat(s) || 10) * 1000);
+  if (s.endsWith('m')) return Math.max(1000, (parseFloat(s) || 1) * 60 * 1000);
+  if (s.endsWith('h')) return Math.max(1000, (parseFloat(s) || 1) * 3600 * 1000);
+  const num = parseFloat(s);
+  return Number.isFinite(num) ? Math.max(1000, num * 1000) : null;
+}
+
+function parseCli(rawArgs) {
+  const args = {
+    mode: 'once',
+    watchlist: defaultWatchlistPath(),
+    everyMs: null,
+    forceAlert: false,
+    noAi: false,
+    json: false,
+    addSymbol: null,
+    removeSymbol: null,
+    type: 'stock',
+    above: undefined,
+    below: undefined,
+    provider: null,
+    model: null,
+    apiKey: null,
+    baseUrl: null,
+  };
+
+  for (let i = 0; i < rawArgs.length; i++) {
+    const a = rawArgs[i];
+    if (a === '--') continue;
+    if (a === '--help' || a === '-h') {
+      printHelp();
+      process.exit(0);
+    }
+    if (a === '--watch' || a === '--daemon' || a === '-d') {
+      args.mode = 'watch';
+      continue;
+    }
+    if (a === '--once') {
+      args.mode = 'once';
+      continue;
+    }
+    if (a === '--interactive' || a === '-i') {
+      args.mode = 'interactive';
+      continue;
+    }
+    if (a === '--list-algos') {
+      args.mode = 'list_algos';
+      continue;
+    }
+    if (a === '--force-alert') {
+      args.forceAlert = true;
+      continue;
+    }
+    if (a === '--no-ai') {
+      args.noAi = true;
+      continue;
+    }
+    if (a === '--json') {
+      args.json = true;
+      continue;
+    }
+    if (a === '--watchlist' && i + 1 < rawArgs.length) {
+      args.watchlist = rawArgs[++i];
+      continue;
+    }
+    if ((a === '--every' || a === '--interval') && i + 1 < rawArgs.length) {
+      args.everyMs = parseDurationMs(rawArgs[++i]);
+      continue;
+    }
+    if (a === '--add' && i + 1 < rawArgs.length) {
+      args.mode = 'add';
+      args.addSymbol = rawArgs[++i];
+      continue;
+    }
+    if (a === '--remove' && i + 1 < rawArgs.length) {
+      args.mode = 'remove';
+      args.removeSymbol = rawArgs[++i];
+      continue;
+    }
+    if (a === '--type' && i + 1 < rawArgs.length) {
+      args.type = rawArgs[++i];
+      continue;
+    }
+    if (a === '--above' && i + 1 < rawArgs.length) {
+      args.above = Number(rawArgs[++i]);
+      continue;
+    }
+    if (a === '--below' && i + 1 < rawArgs.length) {
+      args.below = Number(rawArgs[++i]);
+      continue;
+    }
+    if ((a === '--provider' || a === '-p') && i + 1 < rawArgs.length) {
+      args.provider = rawArgs[++i];
+      continue;
+    }
+    if ((a === '--model' || a === '-m') && i + 1 < rawArgs.length) {
+      args.model = rawArgs[++i];
+      continue;
+    }
+    if (a === '--api-key' && i + 1 < rawArgs.length) {
+      args.apiKey = rawArgs[++i];
+      continue;
+    }
+    if (a === '--base-url' && i + 1 < rawArgs.length) {
+      args.baseUrl = rawArgs[++i];
+      continue;
+    }
+    if (a === '--models-config' && i + 1 < rawArgs.length) {
+      i++;
+      continue;
+    }
+  }
+  return args;
+}
+
+function resolveModelOpts(cliArgs) {
+  const mc =
+    typeof sofuu !== 'undefined' && sofuu.agent && typeof sofuu.agent.getModelConfig === 'function'
+      ? sofuu.agent.getModelConfig()
+      : {};
+  return {
+    configPath: mc.configPath || null,
+    activeProfile: mc.active || null,
+    provider: cliArgs.provider || mc.provider || process.env.SOFUU_PROVIDER || '',
+    model: cliArgs.model || mc.model || process.env.SOFUU_MODEL || '',
+    baseUrl: cliArgs.baseUrl || mc.baseUrl || null,
+    apiKey: cliArgs.apiKey || null,
+  };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatPrice(val) {
+  if (typeof val !== 'number') return String(val);
+  if (val >= 1000) return val.toFixed(2);
+  if (val >= 10) return val.toFixed(3);
+  return val.toFixed(4);
+}
+
+/**
+ * Executes one live market scan cycle across all watchlist assets.
+ */
+export async function runScanCycle(watchlistPath, modelOpts, cliArgs) {
+  const wl = loadWatchlist(watchlistPath);
+  const algos = await loadAlgorithms(wl.algorithms?.customDir, wl.algorithms?.enabled);
+  const threshold = Number(wl.opportunityScoreThreshold ?? 40);
+  const cooldownMin = Number(wl.cooldownMinutes ?? 30);
+
+  const cycleReport = {
+    timestamp: new Date().toISOString(),
+    algorithmsLoaded: algos.length,
+    assets: [],
+    alerts: [],
+  };
+
+  for (const asset of wl.assets || []) {
+    try {
+      const marketData = await fetchAssetData(asset);
+      const evalRes = await evaluateAssetAlgorithms(marketData, algos, threshold);
+      const triggers = detectTriggers(asset, evalRes, {
+        cooldownMinutes: cooldownMin,
+        ignoreCooldown: cliArgs.forceAlert,
+      });
+
+      const entry = {
+        symbol: evalRes.symbol,
+        type: evalRes.type,
+        price: evalRes.price,
+        currency: marketData.currency,
+        changePct24h: evalRes.changePct24h,
+        targets: asset.targets || {},
+        compositeScore: evalRes.compositeScore,
+        direction: evalRes.direction,
+        isOpportunity: evalRes.isOpportunity,
+        signals: evalRes.signals,
+        triggers,
+        source: marketData.source,
+      };
+      cycleReport.assets.push(entry);
+
+      if (triggers.length > 0) {
+        let aiBriefing = '';
+        if (!cliArgs.noAi && modelOpts.provider && modelOpts.model) {
+          aiBriefing = await synthesizeAlertWithAI(
+            asset,
+            marketData,
+            evalRes,
+            triggers,
+            modelOpts
+          );
+        } else {
+          aiBriefing = evalRes.signals
+            .filter((s) => s.signal !== 'NEUTRAL')
+            .map((s) => `• ${s.name}: ${s.reason}`)
+            .join('\n');
+        }
+
+        const alertPacket = {
+          timestamp: new Date().toISOString(),
+          symbol: evalRes.symbol,
+          type: evalRes.type,
+          price: evalRes.price,
+          currency: marketData.currency,
+          compositeScore: evalRes.compositeScore,
+          direction: evalRes.direction,
+          triggers,
+          signals: evalRes.signals,
+          aiBriefing,
+        };
+
+        await dispatchNotification(alertPacket, wl.notifications || {}, {
+          silent: cliArgs.json,
+        });
+        cycleReport.alerts.push(alertPacket);
+      }
+    } catch (err) {
+      cycleReport.assets.push({
+        symbol: asset.symbol,
+        type: asset.type,
+        error: err.message,
+      });
+    }
+  }
+
+  return cycleReport;
+}
+
+function printCycleSummary(report) {
+  const ts = new Date().toLocaleTimeString();
+  console.log(`\n📊 Market Scan [${ts}] · ${report.algorithmsLoaded} algorithm(s) active`);
+  console.log('─────────────────────────────────────────────────────────────────────────────');
+  for (const a of report.assets) {
+    if (a.error) {
+      console.log(`  \x1b[31m✗ ${a.symbol.padEnd(10)}\x1b[0m (${a.type}) error: ${a.error}`);
+      continue;
+    }
+    const chg = a.changePct24h >= 0 ? `\x1b[32m+${a.changePct24h}%\x1b[0m` : `\x1b[31m${a.changePct24h}%\x1b[0m`;
+    const scoreColor = a.compositeScore >= 25 ? '\x1b[32m' : a.compositeScore <= -25 ? '\x1b[31m' : '\x1b[90m';
+    const tgt = `above:${a.targets?.above ?? '-'} below:${a.targets?.below ?? '-'}`;
+    const flag = a.triggers.length > 0 ? ' \x1b[1;33m🚨 TRIGGERED\x1b[0m' : '';
+    console.log(
+      `  \x1b[1m${a.symbol.padEnd(10)}\x1b[0m [${a.type.slice(0, 6).padEnd(6)}]  ${formatPrice(a.price).padStart(10)} ${a.currency}  (${chg})  score:${scoreColor}${String(a.compositeScore).padStart(4)}\x1b[0m  ${tgt}${flag}`
+    );
+    const activeSigs = (a.signals || []).filter((s) => s.signal !== 'NEUTRAL');
+    for (const s of activeSigs) {
+      console.log(`      └─ ${s.name}: ${s.reason}`);
+    }
+  }
+  console.log('─────────────────────────────────────────────────────────────────────────────');
+}
+
+async function main() {
+  const rawArgs = Array.prototype.slice.call(process.argv, 2);
+  const cliArgs = parseCli(rawArgs);
+  const modelOpts = resolveModelOpts(cliArgs);
+
+  // Add/update watchlist asset
+  if (cliArgs.mode === 'add') {
+    const wl = loadWatchlist(cliArgs.watchlist);
+    const sym = String(cliArgs.addSymbol || '').trim().toUpperCase();
+    wl.assets = wl.assets || [];
+    const existing = wl.assets.find((a) => a.symbol.toUpperCase() === sym);
+    const targets = Object.assign({}, existing?.targets || {});
+    if (Number.isFinite(cliArgs.above)) targets.above = cliArgs.above;
+    if (Number.isFinite(cliArgs.below)) targets.below = cliArgs.below;
+    if (existing) {
+      existing.type = cliArgs.type || existing.type;
+      existing.targets = targets;
+    } else {
+      wl.assets.push({ symbol: sym, type: cliArgs.type || 'stock', targets });
+    }
+    saveWatchlist(cliArgs.watchlist, wl);
+    console.log(`✓ Saved ${sym} (${cliArgs.type}) targets=${JSON.stringify(targets)} in ${cliArgs.watchlist}`);
+    return;
+  }
+
+  // Remove watchlist asset
+  if (cliArgs.mode === 'remove') {
+    const wl = loadWatchlist(cliArgs.watchlist);
+    const sym = String(cliArgs.removeSymbol || '').trim().toUpperCase();
+    const before = (wl.assets || []).length;
+    wl.assets = (wl.assets || []).filter((a) => a.symbol.toUpperCase() !== sym);
+    saveWatchlist(cliArgs.watchlist, wl);
+    console.log(`✓ Removed ${before - wl.assets.length} matching asset(s) for ${sym}`);
+    return;
+  }
+
+  // List loaded algorithms
+  if (cliArgs.mode === 'list_algos') {
+    const wl = loadWatchlist(cliArgs.watchlist);
+    const algos = await loadAlgorithms(wl.algorithms?.customDir, wl.algorithms?.enabled);
+    console.log('\nLoaded Quantitative Algorithms:');
+    for (const a of algos) {
+      const origin = a.builtin ? 'built-in' : `custom (${path.basename(a.file)})`;
+      console.log(`  • ${a.id.padEnd(20)} ${a.name} [${origin}]`);
+    }
+    console.log('');
+    return;
+  }
+
+  // Interactive Chat Mode
+  if (cliArgs.mode === 'interactive') {
+    defineMarketAgent(cliArgs.watchlist);
+    console.log('\n📈 Sofuu Market Sentinel — Interactive Chat');
+    console.log(`• Model Config : ${modelOpts.configPath || '(env / defaults)'}`);
+    console.log(`• Active Model : ${modelOpts.provider || '(unset)'} / ${modelOpts.model || '(unset)'}`);
+    console.log(`• Watchlist    : ${cliArgs.watchlist}\n`);
+    await sofuu.agent.interact('market_sentinel', {
+      provider: modelOpts.provider || undefined,
+      model: modelOpts.model || undefined,
+      apiKey: modelOpts.apiKey || undefined,
+      baseUrl: modelOpts.baseUrl || undefined,
+    });
+    return;
+  }
+
+  // Single Scan (--once)
+  if (cliArgs.mode === 'once') {
+    const report = await runScanCycle(cliArgs.watchlist, modelOpts, cliArgs);
+    if (cliArgs.json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      printCycleSummary(report);
+    }
+    return;
+  }
+
+  // 24/7 Continuous Watch Loop (--watch / --daemon)
+  const wl = loadWatchlist(cliArgs.watchlist);
+  const intervalMs = cliArgs.everyMs || Math.max(5, Number(wl.intervalSeconds || 60)) * 1000;
+  let stopping = false;
+
+  if (typeof process !== 'undefined' && typeof process.on === 'function') {
+    process.on('SIGINT', () => {
+      console.log('\n[Market Sentinel] Shutting down 24/7 monitor cleanly...');
+      stopping = true;
+    });
+    process.on('SIGTERM', () => {
+      console.log('\n[Market Sentinel] Received SIGTERM, stopping...');
+      stopping = true;
+    });
+  }
+
+  console.log('\n📡 Sofuu 24/7 Market Sentinel Started');
+  console.log('─────────────────────────────────────────────────────────────────────────────');
+  console.log(`• Watchlist    : ${cliArgs.watchlist} (${(wl.assets || []).length} assets)`);
+  console.log(`• Poll Interval: ${Math.round(intervalMs / 1000)}s`);
+  console.log(`• AI Engine    : ${modelOpts.provider || 'disabled'} / ${modelOpts.model || 'none'}`);
+  console.log('• Press Ctrl+C to stop');
+  console.log('─────────────────────────────────────────────────────────────────────────────');
+
+  while (!stopping) {
+    try {
+      const report = await runScanCycle(cliArgs.watchlist, modelOpts, cliArgs);
+      printCycleSummary(report);
+    } catch (err) {
+      console.error(`[Market Sentinel] Cycle error (will retry): ${err.message}`);
+    }
+    if (stopping) break;
+    await sleep(intervalMs);
+  }
+}
+
+main();

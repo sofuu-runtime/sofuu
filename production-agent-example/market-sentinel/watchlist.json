@@ -1,0 +1,47 @@
+{
+  "intervalSeconds": 60,
+  "cooldownMinutes": 30,
+  "opportunityScoreThreshold": 40,
+  "notifications": {
+    "console": true,
+    "desktop": true,
+    "bell": true,
+    "webhookUrl": "",
+    "logFile": "./market-alerts.jsonl"
+  },
+  "algorithms": {
+    "enabled": [
+      "rsi_reversion",
+      "ema_crossover",
+      "bollinger_squeeze",
+      "zscore_breakout"
+    ],
+    "customDir": "./production-agent-example/market-sentinel/algos"
+  },
+  "assets": [
+    {
+      "symbol": "BTC-USD",
+      "type": "crypto",
+      "targets": {
+        "above": 65000,
+        "below": 55000
+      }
+    },
+    {
+      "symbol": "NVDA",
+      "type": "stock",
+      "targets": {
+        "above": 170,
+        "below": 140
+      }
+    },
+    {
+      "symbol": "USD/INR",
+      "type": "currency",
+      "targets": {
+        "above": 94.0,
+        "below": 91.0
+      }
+    }
+  ]
+}

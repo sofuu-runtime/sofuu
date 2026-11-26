@@ -14,10 +14,16 @@ import './lib/tools/ast_scan.js';
 import './lib/tools/report_gen.js';
 import './lib/tools/git_diff.js';
 
+function defaultAgentConfigPath() {
+  const local = path.resolve(process.cwd(), 'agent.config.json');
+  if (fs.existsSync(local)) return local;
+  return path.resolve(process.cwd(), 'production-agent-example/code-sentinel/agent.config.json');
+}
+
 export function printHelp() {
   console.log(`
 Usage:
-  sofuu run production-agent-example/index.js [options] [target_dir]
+  sofuu run production-agent-example/code-sentinel/index.js [options] [target_dir]
   ./code-sentinel [options] [target_dir]
 
 Autonomous Production Code Intelligence & Security Sentinel.
@@ -56,7 +62,7 @@ export function parseArgs(rawArgs) {
     report: 'security-audit-report.md',
     json: false,
     interactive: false,
-    config: path.resolve(process.cwd(), 'production-agent-example/agent.config.json'),
+    config: defaultAgentConfigPath(),
   };
 
   for (let i = 0; i < rawArgs.length; i++) {
@@ -153,7 +159,7 @@ export function resolveActiveModel(options = {}) {
  */
 export async function runAudit(options = {}) {
   const cfg = loadConfigFile(
-    options.config || path.resolve(process.cwd(), 'production-agent-example/agent.config.json')
+    options.config || defaultAgentConfigPath()
   );
   const resolved = resolveActiveModel(options);
 

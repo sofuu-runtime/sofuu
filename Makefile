@@ -37,7 +37,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
 # ──────────────────────────────────────────────────────────────────
 
 .PHONY: real-mcp-check real-memory-check real-kaze-memory-check real-kaze-memory-durable-check real-kaze-alert-check real-kaze-fail-closed-check real-kaze-gguf-check real-gates kaze-js-boundary-check js-swallow-check env-knobs-check swiftpm-consistency-check event-loop-check cold-start-bench all clean install test test-area test-rust-filter test-contract-case preflight protocol-test serve-test c-only size-check docs-lint bc-check cargo-build sandbox-stress \
-	kaze-drift-check kaze-drift-strict clippy-ratchet \
+	kaze-drift-check kaze-drift-strict kaze-embed embedded-kaze-gates clippy-ratchet \
 	observability-stress asan fuzz-simd policy-dx modern-npm sbom sign-dist \
         deps scoreboard scoreboard-check cuda-check \
         libsofuu libsofuu-linux-x86_64 zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
@@ -462,6 +462,21 @@ kaze-drift-check:
 kaze-drift-strict:
 	@scripts/kaze-drift-check.sh --strict
 
+# Refresh the reentrant compiler library and the vendored C snapshot together.
+# `kaze-bootstrap` is the compiler monolith (dist/kaze.c) built by kaze-dist;
+# the user-facing bin/kaze is the multi-command CLI and does not carry the
+# emit-lib-c mode itself.
+kaze-embed: kaze-dist
+	@cd $(KAZE_DIR) && ./bin/kaze-bootstrap emit-lib-c compiler/kaze_self.kaze > dist/kaze_embed.c
+	@mkdir -p deps/kaze
+	@cp $(KAZE_DIR)/dist/kaze_rt.c $(KAZE_DIR)/dist/kaze_rt.h \
+	    $(KAZE_DIR)/dist/kaze_vm.c $(KAZE_DIR)/dist/kaze_vm.h \
+	    $(KAZE_DIR)/dist/kaze_embed.c $(KAZE_DIR)/dist/kaze_embed.h deps/kaze/
+	@echo "kaze-embed: dist/kaze_embed.c and deps/kaze/ refreshed"
+
+embedded-kaze-gates:
+	@scripts/embedded-kaze-c-gates.sh
+
 # The clippy warning ratchet (PLAN-AUDIT-REMEDIATION §5 Task 3.2). Warnings may
 # fall, never rise; the baseline in .ci/clippy-baseline.txt is the number to beat.
 clippy-ratchet:
@@ -805,17 +820,7 @@ kaze-dist:
 	@bash $(KAZE_DIR)/scripts/regen-dist.sh
 
 kaze-build:
-	@mkdir -p $(KAZE_BIN_DIR)
-	@echo "kaze-build: $(KAZE_CC) $(KAZE_CFLAGS) -I $(KAZE_DIST_DIR) $(KAZE_DIST_DIR)/kaze.c $(KAZE_DIST_DIR)/kaze_rt.c $(KAZE_LDLIBS) -o $(KAZE_BINARY)"
-	@t=$$(mktemp); trap 'rm -f "$$t"' EXIT; \
-	/usr/bin/time -p $(KAZE_CC) $(KAZE_CFLAGS) -I $(KAZE_DIST_DIR) $(KAZE_DIST_DIR)/kaze.c $(KAZE_DIST_DIR)/kaze_rt.c $(KAZE_LDLIBS) -o $(KAZE_BINARY) 2>$$t; \
-	st=$$?; cat $$t; \
-	if [ $$st -ne 0 ]; then echo "kaze-build: FAILED (cc exit $$st)" >&2; exit $$st; fi; \
-	wall=$$(awk '$$1=="real"{print $$2}' $$t); \
-	bytes=$$(wc -c < $(KAZE_BINARY) | tr -d ' '); \
-	awk -v w="$$wall" -v b="$$bytes" 'BEGIN { \
-	  printf "kaze-build: build wall %s s      (roadmap gate: under 1 s)    -> %s\n", w, (w+0 < 1 ? "MET" : "MISSED"); \
-	  printf "kaze-build: binary   %d bytes = %.1f KB (roadmap gate: under 300 KB) -> %s\n", b, b/1024, (b+0 < 307200 ? "MET" : "MISSED"); }'
+	@bash $(KAZE_DIR)/scripts/build-cli.sh
 
 # Build, smoke-test, and prove the bootstrap fixed point (stage2.c == stage3.c).
 kaze-verify: kaze-build

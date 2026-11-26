@@ -166,7 +166,7 @@ fn with_compiler<T>(f: impl FnOnce(&mut sofuu_ffi::kaze::Compiler) -> T) -> Resu
 
     static COMPILER: OnceLock<Mutex<SendCompiler>> = OnceLock::new();
     let lock = COMPILER.get_or_init(|| {
-        let compiler = sofuu_ffi::kaze::Compiler::new(32 * 1024 * 1024)
+        let compiler = sofuu_ffi::kaze::Compiler::new(16 * 1024 * 1024)
             .expect("libsofuu_kaze compiler allocation failed");
         Mutex::new(SendCompiler(compiler))
     });

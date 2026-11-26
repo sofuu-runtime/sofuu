@@ -273,9 +273,47 @@ static size_t kaze_arena_growth_size(const kaze_arena_t *arena, size_t size)
 /* Chain a block that can serve size bytes and make it current. The previous
  * block keeps its contents; nothing is freed, because pointers into it are
  * still live until reset. */
+/* Hard ceiling for the whole chain, in bytes. 0 or unset means uncapped, which
+ * is the right default for a hosted build but the wrong one for an unattended
+ * run: without a ceiling a runaway script or a compiler regression grows until
+ * the host starts swapping. The block count is logarithmic, so summing it is
+ * cheap and needs no extra field in the arena header. */
+static size_t kaze_arena_max_bytes(void)
+{
+    const char *env = getenv("KAZE_ARENA_MAX_BYTES");
+    if (env != NULL && env[0] != 0) {
+        long n = strtol(env, NULL, 10);
+        if (n > 0) {
+            return (size_t)n;
+        }
+    }
+    return 0u;
+}
+
+static size_t kaze_arena_live_bytes(const kaze_arena_t *arena)
+{
+    const kaze_arena_block_t *block = arena->first;
+    size_t total = 0u;
+
+    while (block != NULL) {
+        total += block->cap;
+        block = block->next;
+    }
+    return total;
+}
+
 static void *kaze_arena_grow(kaze_arena_t *arena, size_t size)
 {
-    kaze_arena_block_t *block = kaze_arena_block_new(kaze_arena_growth_size(arena, size));
+    size_t target = kaze_arena_growth_size(arena, size);
+    size_t limit = kaze_arena_max_bytes();
+
+    if (limit != 0u && kaze_arena_live_bytes(arena) + target > limit) {
+        (void)kaze_trap(KAZE_ERR_OOM,
+                        "the arena reached KAZE_ARENA_MAX_BYTES; raise the cap or reduce the working set");
+        exit(70);
+    }
+
+    kaze_arena_block_t *block = kaze_arena_block_new(target);
 
     if (block == NULL) {
         return NULL;

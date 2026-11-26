@@ -1,0 +1,19 @@
+[package]
+name = "sofuu-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Direct OS windowing and native Metal/Vulkan/OpenGL 2D GPU backends for sofuu-ui"
+
+[lib]
+name = "sofuu_gpu"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+sofuu-ui = { path = "../sofuu-ui" }
+libc = "0.2"
+serde_json = { version = "1", default-features = false, features = ["std"] }
+
+[build-dependencies]
+cc = "1"

@@ -557,6 +557,32 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
             Some(crate::shipped::STORAGE_BC),
             "<storage-driver>",
         );
+        // PLAN-AUTONOMOUS-REACTIVE-RUNTIME P1: operational state. After
+        // storage (the commit discipline is shared) and before triggers.js,
+        // which opens a state namespace at registration time.
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::STATE_JS,
+            Some(crate::shipped::STATE_BC),
+            "<state-driver>",
+        );
+        // P3: the deterministic evaluator loader. Before triggers so a gate
+        // can use sofuu.evaluators on its first tick.
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::EVALUATORS_JS,
+            Some(crate::shipped::EVALUATORS_BC),
+            "<evaluators-driver>",
+        );
+        // P2: the reactive trigger engine (sofuu.triggers). It only defines
+        // state until register()/start() is called, so a non-reactive
+        // process pays nothing.
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::TRIGGERS_JS,
+            Some(crate::shipped::TRIGGERS_BC),
+            "<triggers-driver>",
+        );
         // PLAN-DESKTOP C: the chat turn engine (sofuu.chat.*) — last, since
         // it builds on the agent/web/tools drivers above.
         crate::shipped::eval_shipped_with_bytecode(
@@ -573,6 +599,15 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
             crate::shipped::SERVE_JS,
             Some(crate::shipped::SERVE_BC),
             "<serve-driver>",
+        );
+        // Generalized messaging channels (PLAN-GENERALIZED-CHANNELS): pure JS
+        // over fetch/crypto/spawn/state/http. After serve so a process that
+        // already has the edge server can accept channel webhooks on it.
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::CHANNELS_JS,
+            Some(crate::shipped::CHANNELS_BC),
+            "<channels-driver>",
         );
         // PLAN-PLUGIN-AND-EXTENSIBILITY-STANDARD: the extensibility standard driver
         // (sofuu.plugins.*, defineTool, defineProvider, defineService, defineStorage, useOpenAPI).

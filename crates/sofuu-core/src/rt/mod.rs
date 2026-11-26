@@ -48,6 +48,7 @@ pub use crate::domains::robotics::{
     drone_ops, gpio, hardware, kaze_live, mavlink, mavlink_gate, mavlink_js, mavlink_link,
 };
 pub mod events; // P2 (R6): the unified event envelope + session event log
+pub mod state; // PLAN-AUTONOMOUS-REACTIVE-RUNTIME P1: `sofuu.state` operational KV/cooldowns
 pub mod observability; // OBSERVABILITY: run logs, checkpoints, crash cards (reads `events`)
 pub mod async_contract; // P2 (R2): one error taxonomy, nested deadlines, queue bounds
 pub mod crypto; // sofuu.crypto: SHA-256/base64url + RS256 JWT verification

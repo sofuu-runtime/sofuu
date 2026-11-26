@@ -8,25 +8,38 @@
 import fs from 'fs';
 import path from 'path';
 
-const DEFAULT_STATE_PATH = path.resolve(process.cwd(), '.sofuu/market-cooldowns.json');
+/* Operational cooldowns live in the runtime's atomic state store
+ * (sofuu.state) instead of a hand-rolled JSON file: check-and-stamp is one
+ * operation, so two overlapping scan cycles cannot both alert. The store is
+ * opened once per process and persists under .sofuu/state/. */
+const COOLDOWN_NAMESPACE = 'market-sentinel';
+let cooldownStore = null;
 
-export function loadCooldownState(statePath = DEFAULT_STATE_PATH) {
+function store() {
+  if (cooldownStore) return cooldownStore;
   try {
-    if (fs.existsSync(statePath)) {
-      return JSON.parse(fs.readFileSync(statePath, 'utf8')) || {};
+    if (typeof sofuu !== 'undefined' && sofuu.state) {
+      cooldownStore = sofuu.state.open(COOLDOWN_NAMESPACE);
     }
-  } catch (_) {}
-  return {};
+  } catch (_) {
+    cooldownStore = null;
+  }
+  return cooldownStore;
 }
 
-export function saveCooldownState(state, statePath = DEFAULT_STATE_PATH) {
-  try {
-    const dir = path.dirname(statePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-    fs.writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf8');
-  } catch (_) {}
+/* Tests (and embedded callers) may inject a plain object plus a fixed clock;
+ * keep that path dependency-free and deterministic. */
+function injectedStore(obj, now) {
+  return {
+    allowAfterCooldown(key, cooldownMs) {
+      const last = obj[key];
+      if (!last || cooldownMs <= 0 || now - last >= cooldownMs) {
+        obj[key] = now;
+        return true;
+      }
+      return false;
+    },
+  };
 }
 
 /**
@@ -37,72 +50,49 @@ export function detectTriggers(assetCfg, evalResult, opts = {}) {
   const price = evalResult.price;
   const targets = assetCfg.targets || {};
   const cooldownMs = Math.max(0, Number(opts.cooldownMinutes ?? 30)) * 60 * 1000;
-  const now = opts.nowMs || Date.now();
-  const statePath = opts.statePath || DEFAULT_STATE_PATH;
-  const state = opts.stateObj || loadCooldownState(statePath);
+  const clock = opts.nowMs || Date.now();
+  const state = opts.stateObj ? injectedStore(opts.stateObj, clock) : store();
 
-  function shouldFire(key) {
-    if (opts.ignoreCooldown) return true;
-    const last = state[key];
-    return !last || now - last >= cooldownMs;
-  }
+  // ignoreCooldown asks the same atomic gate for a zero window, so the stamp
+  // is still taken and the next real scan does not double-fire.
+  const shouldFire = (key) =>
+    !state || state.allowAfterCooldown(key, opts.ignoreCooldown ? 0 : cooldownMs);
 
-  function markFired(key) {
-    state[key] = now;
+  function push(kind, key, extra) {
+    if (!shouldFire(key)) return;
+    triggers.push({
+      kind,
+      key,
+      symbol: evalResult.symbol,
+      price,
+      ...extra,
+    });
   }
 
   // 1. Target price crossed above
   if (typeof targets.above === 'number' && price >= targets.above) {
-    const key = `${evalResult.symbol}:TARGET_ABOVE:${targets.above}`;
-    if (shouldFire(key)) {
-      triggers.push({
-        kind: 'TARGET_ABOVE',
-        key,
-        symbol: evalResult.symbol,
-        price,
-        target: targets.above,
-        headline: `${evalResult.symbol} reached upper target ${targets.above} (now ${price})`,
-      });
-      markFired(key);
-    }
+    push('TARGET_ABOVE', `${evalResult.symbol}:TARGET_ABOVE:${targets.above}`, {
+      target: targets.above,
+      headline: `${evalResult.symbol} reached upper target ${targets.above} (now ${price})`,
+    });
   }
 
   // 2. Target price crossed below
   if (typeof targets.below === 'number' && price <= targets.below) {
-    const key = `${evalResult.symbol}:TARGET_BELOW:${targets.below}`;
-    if (shouldFire(key)) {
-      triggers.push({
-        kind: 'TARGET_BELOW',
-        key,
-        symbol: evalResult.symbol,
-        price,
-        target: targets.below,
-        headline: `${evalResult.symbol} reached lower target ${targets.below} (now ${price})`,
-      });
-      markFired(key);
-    }
+    push('TARGET_BELOW', `${evalResult.symbol}:TARGET_BELOW:${targets.below}`, {
+      target: targets.below,
+      headline: `${evalResult.symbol} reached lower target ${targets.below} (now ${price})`,
+    });
   }
 
   // 3. Algorithmic Opportunity Trigger
   if (evalResult.isOpportunity) {
     const dir = evalResult.direction;
-    const key = `${evalResult.symbol}:OPPORTUNITY:${dir}`;
-    if (shouldFire(key)) {
-      triggers.push({
-        kind: 'ALGO_OPPORTUNITY',
-        key,
-        symbol: evalResult.symbol,
-        price,
-        score: evalResult.compositeScore,
-        direction: dir,
-        headline: `${evalResult.symbol} ${dir} opportunity (score ${evalResult.compositeScore}/100 at ${price})`,
-      });
-      markFired(key);
-    }
-  }
-
-  if (triggers.length > 0 && !opts.stateObj) {
-    saveCooldownState(state, statePath);
+    push('ALGO_OPPORTUNITY', `${evalResult.symbol}:OPPORTUNITY:${dir}`, {
+      score: evalResult.compositeScore,
+      direction: dir,
+      headline: `${evalResult.symbol} ${dir} opportunity (score ${evalResult.compositeScore}/100 at ${price})`,
+    });
   }
 
   return triggers;
@@ -151,7 +141,7 @@ function sendDesktopNotification(title, body) {
  * Dispatches an alert payload (triggers + AI synthesis) across configured channels.
  */
 export async function dispatchNotification(alertPacket, notifyCfg = {}, opts = {}) {
-  const channels = { console: false, desktop: false, webhook: false, logFile: false, memory: false };
+  const channels = { console: false, desktop: false, webhook: false, logFile: false, memory: false, channels: false };
   const title = `Market Sentinel: ${alertPacket.symbol}`;
   const headline = alertPacket.triggers.map((t) => t.headline).join(' | ');
   const summaryText = alertPacket.aiBriefing || headline;
@@ -170,13 +160,41 @@ export async function dispatchNotification(alertPacket, notifyCfg = {}, opts = {
     channels.console = true;
   }
 
-  // 2. Native OS Desktop Notification
-  if (notifyCfg.desktop && !opts.skipDesktop) {
+  // 2. Sofuu channel profiles (preferred): Telegram, WhatsApp, generic
+  // webhook or desktop through one domain-agnostic API. No transport code
+  // lives in this example.
+  let channelDelivered = false;
+  if (notifyCfg.channels !== false && typeof sofuu !== 'undefined' &&
+      sofuu.channels && typeof sofuu.channels.send === 'function') {
+    let profiles = [];
+    try { profiles = sofuu.channels.list(); } catch (_) { profiles = []; }
+    if (profiles.length > 0) {
+      try {
+        const severity = alertPacket.triggers.some((t) => t.kind === 'TARGET_BELOW') ? 'warn' : 'info';
+        const sent = await sofuu.channels.send({
+          title,
+          text: headline + '\n\n' + summaryText,
+          severity,
+          actions: [
+            { id: 'ack:' + alertPacket.symbol, label: 'Acknowledge' },
+            { id: 'mute:' + alertPacket.symbol, label: 'Mute' },
+          ],
+        });
+        channels.channels = !!(sent && sent.ok);
+        channelDelivered = channels.channels;
+      } catch (err) {
+        channels.channels = false;
+        channels.channelError = err.message;
+      }
+    }
+  }
+
+  // 3. Legacy fallbacks — only when no channel profile carried the alert.
+  if (!channelDelivered && notifyCfg.desktop && !opts.skipDesktop) {
     channels.desktop = await sendDesktopNotification(title, `${headline} — ${summaryText.slice(0, 180)}`);
   }
 
-  // 3. Optional Webhook POST (Slack / Discord / ntfy / custom URL)
-  if (notifyCfg.webhookUrl && typeof fetch === 'function') {
+  if (!channelDelivered && notifyCfg.webhookUrl && typeof fetch === 'function') {
     try {
       const res = await fetch(notifyCfg.webhookUrl, {
         method: 'POST',

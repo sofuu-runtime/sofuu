@@ -9,7 +9,6 @@
 export default {
   id: 'vwap_dip',
   name: 'Session VWAP Deviation (Custom)',
-  alwaysEnabled: true,
 
   /**
    * @param {object} data Normalized market telemetry: { symbol, type, price, candles, ... }

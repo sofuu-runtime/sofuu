@@ -208,6 +208,7 @@ fn print_help() {
     println!("  sofuu brain restore <b> <d> Rebuild a healthy brain store from an archive backup");
     println!("  sofuu brain migrate <path> Convert legacy v1 flat .qtsq file to v2 segmented store");
     println!("  sofuu serve --brain <p>  Serve cognitive memory and agent APIs over HTTP/SSE (--port, --host, --token)");
+    println!("  sofuu gateway            Loopback webhook ingress for channels.json (--port, --host)");
     println!();
     println!("\x1b[1mRobotics, Drones & Physical Computing:\x1b[0m");
     println!("  sofuu drone status       Query autopilot link, heartbeat, GPS fix, battery, and flight mode");
@@ -339,6 +340,7 @@ fn wants_help(args: &[String]) -> bool {
 fn print_subcommand_help(cmd: &str) -> bool {
     match cmd {
         "serve" => print_serve_help(),
+        "gateway" => print_gateway_help(),
         "infer" => print_infer_help(),
         "dev" | "web" => print_dev_help(),
         "chat" => print_chat_help(),
@@ -460,6 +462,8 @@ fn print_serve_help() {
            -t, --token <secret>   Bearer token; SOFUU_SERVE_TOKEN (env) wins and is\n\
                                   preferred, because --token is visible in `ps`\n\
                --policy <file>    policy file applied before the server starts\n\
+               --channels-config <path>  channels.json for /webhooks/* routes\n\
+               --channel <name>   select the active channel profile for this run\n\
                --public-health    answer GET /health without a token, for container\n\
                                   probes (tokenless /healthz and /livez always work)\n\n\
          \x1b[1mEnvironment:\x1b[0m\n\
@@ -469,6 +473,27 @@ fn print_serve_help() {
          Without a token, one is generated and written to ~/.sofuu/serve_token.\n\
          \x1b[90mThis page is documentation only: `sofuu serve --help` starts no\n\
          listener and creates no token.\x1b[0m\n"
+    );
+}
+
+fn print_gateway_help() {
+    println!(
+        "\x1b[1mUsage:\x1b[0m sofuu gateway [options]\n\n\
+         Run the channel webhook ingress for channels.json. WhatsApp Cloud API\n\
+         verification and signed event delivery arrive here; validated messages\n\
+         are dispatched to `sofuu.channels.listen()` subscribers in-process.\n\n\
+         \x1b[1mOptions:\x1b[0m\n\
+           -p, --port <n>          listen port 0-65535 (default: 8788)\n\
+               --host <addr>       listen address (default 127.0.0.1)\n\
+               --channels-config <path>  channels.json file to use\n\
+               --channel <name>    select the active channel profile\n\
+               --policy <file>     policy applied before the gateway starts\n\n\
+         \x1b[1mPublic ingress:\x1b[0m\n\
+           A non-loopback --host is refused unless the policy opts in with\n\
+           `channels.inbound.allow_public_bind: true`. Prefer a loopback bind\n\
+           behind cloudflared / Tailscale Funnel / nginx TLS.\n\n\
+         \x1b[1mEnvironment:\x1b[0m\n\
+           SOFUU_CHANNELS_CONFIG   channels.json path (takes precedence)\n"
     );
 }
 
@@ -520,7 +545,11 @@ fn print_run_help(cmd: &str) {
                1    an uncaught exception, an unhandled promise rejection, or a\n\
                     microtask-queue overflow\n\
                N    whatever the script passed to process.exit(N), or set via\n\
-                    process.exitCode = N\n"
+                    process.exitCode = N\n\n\
+             \x1b[1mPer-agent configuration:\x1b[0m\n\
+               --setup-model, --edit-model, --list-models, --models-config\n\
+               --setup-channel, --edit-channel, --list-channels, --channels-config\n\
+               --channel <name>   select a channels.json profile for this run\n"
         );
     } else {
         println!(
@@ -590,6 +619,13 @@ fn print_resume_help() {
                --agent=<name>     which definition to re-enter (default: the\n\
                                   run_start event's name)\n\
                --on-error=<mode>  auto-retry | fail-stop | interactive\n\
+               --allow            approve a run parked with approvalMode 'async'\n\
+                                  and continue it (token read from .sofuu/state)\n\
+               --deny             deny the parked tool call and let the run\n\
+                                  continue in-band with the refusal\n\
+               --approval-token=<t>  token from the approval request, when the\n\
+                                  state store is not reachable from here\n\
+               --approval-id=<id> approval id echoed in the request\n\
                --json             emit the result as JSON\n\
                --policy <file>    policy file applied before the run resumes\n"
     );
@@ -1386,12 +1422,52 @@ fn cmd_resume(rt: &SofuuRuntime, args: &[String]) -> i32 {
     let mut force = false;
     let mut agent: Option<String> = None;
     let mut on_error: Option<String> = None;
+    let mut decision: Option<String> = None;
+    let mut approval_token: Option<String> = None;
+    let mut approval_id: Option<String> = None;
     let mut json = false;
     let mut i = 2;
     while i < args.len() {
         let a = args[i].as_str();
         if a == "--force" {
             force = true;
+            i += 1;
+        } else if a == "--allow" {
+            decision = Some("allow".to_string());
+            i += 1;
+        } else if a == "--deny" {
+            decision = Some("deny".to_string());
+            i += 1;
+        } else if a == "--approval-token" || a == "--token" {
+            match args.get(i + 1) {
+                Some(v) => {
+                    approval_token = Some(v.clone());
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m {a} wants a token");
+                    return 2;
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--approval-token=") {
+            approval_token = Some(v.to_string());
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("--token=") {
+            approval_token = Some(v.to_string());
+            i += 1;
+        } else if a == "--approval-id" {
+            match args.get(i + 1) {
+                Some(v) => {
+                    approval_id = Some(v.clone());
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m --approval-id wants an id");
+                    return 2;
+                }
+            }
+        } else if let Some(v) = a.strip_prefix("--approval-id=") {
+            approval_id = Some(v.to_string());
             i += 1;
         } else if a == "--json" {
             json = true;
@@ -1466,6 +1542,18 @@ fn cmd_resume(rt: &SofuuRuntime, args: &[String]) -> i32 {
         None => "null".to_string(),
     };
     let json_js = if json { "true" } else { "false" };
+    let decision_js = match decision {
+        Some(d) => serde_json::to_string(&d).unwrap_or_else(|_| "null".into()),
+        None => "null".to_string(),
+    };
+    let approval_token_js = match approval_token {
+        Some(t) => serde_json::to_string(&t).unwrap_or_else(|_| "null".into()),
+        None => "null".to_string(),
+    };
+    let approval_id_js = match approval_id {
+        Some(id) => serde_json::to_string(&id).unwrap_or_else(|_| "null".into()),
+        None => "null".to_string(),
+    };
     let code = format!(
         r#"(async function () {{
   const runId = {run_id_js};
@@ -1474,6 +1562,9 @@ fn cmd_resume(rt: &SofuuRuntime, args: &[String]) -> i32 {
   const agentFlag = {agent_js};
   const onError = {on_error_js};
   const asJson = {json_js};
+  const decision = {decision_js};
+  const approvalToken = {approval_token_js};
+  const approvalId = {approval_id_js};
 
   /* Host functions take ONE JSON string and answer with one JSON string (the
    * sofuu.events.append convention); a missing one collapses to null so every
@@ -1516,6 +1607,59 @@ fn cmd_resume(rt: &SofuuRuntime, args: &[String]) -> i32 {
       try {{ const v = JSON.parse(s); if (v && typeof v === 'object') out.push(v); }} catch (e) {{}}
     }}
     return out;
+  }}
+
+  /* P4 async HITL: `sofuu resume <id> --allow|--deny` reads the parked
+   * checkpoint from the operational state store (the same namespace the
+   * driver writes), then hands the token to the driver's constant-time
+   * validator. `--approval-token` is the escape hatch for an operator who
+   * holds the token but not the state directory. */
+  if (decision) {{
+    let parked = null;
+    try {{
+      if (sofuu.state && typeof sofuu.state.open === 'function') {{
+        parked = sofuu.state.open('agent-approvals').get('run:' + runId);
+      }}
+    }} catch (eState) {{
+      console.error('resume: cannot read the approval state store: ' + String((eState && eState.message) || eState));
+      process.exit(1);
+    }}
+    if (!parked && !approvalToken) {{
+      console.error('resume: no parked approval for run ' + runId +
+                    ' (pass --approval-token if the state store lives elsewhere)');
+      process.exit(1);
+    }}
+    const token = approvalToken || String((parked && parked.approvalToken) || '');
+    if (!token) {{
+      console.error('resume: the parked approval for run ' + runId + ' carries no token');
+      process.exit(1);
+    }}
+    let ar;
+    try {{
+      ar = await sofuu.agent.resume(runId, {{
+        approvalId: approvalId || String((parked && parked.approvalId) || ''),
+        approvalToken: token,
+        decision: decision
+      }});
+    }} catch (eA) {{
+      const code = String((eA && eA.code) || '');
+      console.error('resume: ' + (code ? code + ': ' : '') + String((eA && eA.message) || eA));
+      process.exit(1);
+    }}
+    if (asJson) {{
+      console.log(JSON.stringify({{
+        answer: ar.answer, steps: ar.steps, stopped: ar.stopped, usage: ar.usage,
+        decision: decision, runId: (ar && ar.runId) || runId
+      }}, null, 2));
+    }} else {{
+      const u = ar.usage || {{}};
+      console.log('');
+      console.log(ar.answer);
+      console.log(' ' + decision + 'd approval for ' + runId + ' · ' + ar.steps + ' steps · ' +
+                  (u.llmCalls || 0) + ' llm calls · ' + (u.toolCalls || 0) + ' tool calls' +
+                  (ar.stopped ? ' · stopped: ' + ar.stopped : ''));
+    }}
+    return;
   }}
 
   const loc = await locate();
@@ -1895,6 +2039,19 @@ fn run_compiled_payload(payload: &sofuu_core::compiler::EmbeddedPayload) -> Exit
         }
     };
     install_compiled_prelude(&rt, brain.as_ref());
+
+    /* Compiled artifacts based on the full binary take the same channel
+     * config path as the lean base: the file is discovered from argv[0] and
+     * injected before the program runs. */
+    let payload_args: Vec<String> = env::args().collect();
+    if let Some(program) = payload_args.first() {
+        let target = sofuu_core::model_config::AgentTarget::binary(program);
+        let resolved_channels = sofuu_core::channel_config::apply_runtime_config(&payload_args, &target);
+        let _ = rt.eval_string(
+            &sofuu_core::channel_config::js_prelude_for(&resolved_channels),
+            "<channels-config>",
+        );
+    }
 
     // SAFETY: engine_ctx() is this runtime's live QuickJS context.
     let rc = unsafe {
@@ -2718,6 +2875,81 @@ fn cmd_outputs(args: &[String]) -> i32 {
 /// F11: serve the brain over HTTP. The server runs as a shipped JS file
 /// through the normal runtime — endpoints: GET /health, POST /remember,
 /// GET /recall, POST /share. Auth: Bearer token (generated or supplied).
+/// `sofuu gateway [--host 127.0.0.1] [--port 8788]` — the channel webhook
+/// ingress. The routes and signature checks live in `src/js/channels.js`; this
+/// call only resolves the per-agent channels file and hands it to the driver.
+fn cmd_gateway(rt: &SofuuRuntime, args: &[String], load_layered_policy: bool) -> i32 {
+    let mut host = "127.0.0.1".to_string();
+    let mut port: u16 = 8788;
+    let mut i = 2usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => match value_arg(args, i) {
+                Some(v) => {
+                    host = v;
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m --host needs a value");
+                    return 1;
+                }
+            },
+            "--port" | "-p" => match value_arg(args, i) {
+                Some(v) => {
+                    if let Ok(p) = v.parse::<u16>() {
+                        port = p;
+                    } else {
+                        eprintln!("\x1b[33mWarning:\x1b[0m --port wants 0-65535; keeping {port}");
+                    }
+                    i += 2;
+                }
+                None => {
+                    eprintln!("\x1b[31mError:\x1b[0m --port needs a value");
+                    return 1;
+                }
+            },
+            _ => i += 1,
+        }
+    }
+
+    let target = sofuu_core::model_config::AgentTarget::binary(&args[0]);
+    let resolved = sofuu_core::channel_config::apply_runtime_config(args, &target);
+    if resolved.profiles.is_empty() {
+        eprintln!("\x1b[31mError:\x1b[0m no channels configured");
+        eprintln!("  Run `{} --setup-channel` or pass --channels-config <path>.", args[0]);
+        return 2;
+    }
+    if rt.eval_string(
+        &sofuu_core::channel_config::js_prelude_for(&resolved),
+        "<channels-config>",
+    ) != 0 {
+        eprintln!("\x1b[31mError:\x1b[0m channel config prelude failed");
+        return 1;
+    }
+    // Layer ~/.sofuu/policy.json and ./.sofuu/policy.json only when the caller
+    // did not pass --policy: `sofuu.policy.load()` replaces the installed
+    // document with the layered merge, so calling it after an explicit
+    // --policy would silently discard the operator's file.
+    if load_layered_policy {
+        let _ = rt.eval_string(
+            "try{if(sofuu.policy&&typeof sofuu.policy.load==='function')sofuu.policy.load();}catch(e){}",
+            "<gateway-policy>",
+        );
+    }
+    let cfg = serde_json::json!({ "host": host, "port": port });
+    let code = format!("sofuu.channels.startGateway({cfg})");
+    let rc = rt.eval_string(&code, "<gateway>");
+    if rc == 0 {
+        println!("\x1b[32m✓\x1b[0m channel gateway listening on http://{host}:{port}");
+        println!("  GET  /webhooks/whatsapp   (Meta verification)");
+        println!("  POST /webhooks/whatsapp   (signed events)");
+        println!("  GET  /healthz, /livez");
+        println!();
+        rt.run_jobs();
+    }
+    rc
+}
+
 fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     // Local-inference prefill on large models can legitimately produce no
     // response bytes for many minutes (e.g. a 27B ternary prompt decode) —
@@ -2732,6 +2964,16 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     }
     if std::env::var_os("SOFUU_HTTP_IDLE_MS").is_none() {
         std::env::set_var("SOFUU_HTTP_IDLE_MS", "0");
+    }
+    /* The edge server shares the channel webhook router. Resolve channels.json
+     * before booting it; a server with no channel file is unchanged. */
+    let channel_target = sofuu_core::model_config::AgentTarget::binary(&args[0]);
+    let resolved_channels = sofuu_core::channel_config::apply_runtime_config(args, &channel_target);
+    if !resolved_channels.profiles.is_empty() {
+        let _ = rt.eval_string(
+            &sofuu_core::channel_config::js_prelude_for(&resolved_channels),
+            "<channels-config>",
+        );
     }
     let mut brain_path = String::new();
     let mut model_path = String::new();
@@ -2941,6 +3183,9 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     eprintln!("\x1b[2m    GET  /memories?tier=…&role=…&text=…&offset=…&limit=…\x1b[0m");
     eprintln!("\x1b[2m    POST /forget               {{id}}\x1b[0m");
     eprintln!("\x1b[2m    POST /share                (export card: records + vectors + manifest)\x1b[0m");
+    if !resolved_channels.profiles.is_empty() {
+        eprintln!("\x1b[2m    GET/POST /webhooks/*        (channel ingress; provider-signed)\x1b[0m");
+    }
     eprintln!();
 
     /* Workstream H1: the handler lives in src/js/serve.js (a shipped
@@ -4103,6 +4348,11 @@ fn main() -> ExitCode {
                 {
                     return code;
                 }
+                if let Some(code) =
+                    sofuu_core::channel_config::handle_cli_command(&script_args, &script_target)
+                {
+                    return code;
+                }
             }
             let rt = match SofuuRuntime::init() {
                 Some(rt) => rt,
@@ -4117,6 +4367,12 @@ fn main() -> ExitCode {
                 let _ = rt.eval_string(
                     &sofuu_core::model_config::js_prelude_for(&resolved_models),
                     "<models-config>",
+                );
+                let resolved_channels =
+                    sofuu_core::channel_config::apply_runtime_config(&script_args, &script_target);
+                let _ = rt.eval_string(
+                    &sofuu_core::channel_config::js_prelude_for(&resolved_channels),
+                    "<channels-config>",
                 );
             }
             if let Err(e) = install_command_policy(&rt, policy.as_deref(), guard) {
@@ -4377,6 +4633,29 @@ fn main() -> ExitCode {
                 }
             }
             let rc = cmd_serve(&rt, &clean);
+            if rc == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        "gateway" => {
+            let (policy, clean) = take_policy_arg(&args);
+            let rt = match SofuuRuntime::init() {
+                Some(rt) => rt,
+                None => {
+                    eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let had_policy = policy.is_some();
+            if let Some(p) = policy {
+                if let Err(e) = apply_policy_file(&rt, &p) {
+                    eprintln!("\x1b[31mError:\x1b[0m {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let rc = cmd_gateway(&rt, &clean, !had_policy);
             if rc == 0 {
                 ExitCode::SUCCESS
             } else {

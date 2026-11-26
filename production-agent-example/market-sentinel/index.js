@@ -40,6 +40,7 @@ Modes:
   --watch, --daemon        Run continuous 24/7 monitoring loop
   --once                   Run one full live scan cycle and exit (default)
   --interactive, -i        Launch interactive AI chat with live market tools
+  --listen                 Stay up and answer inbound channel messages (implies --watch)
   --list-algos             List active built-in and custom algorithms (algos/*.js)
 
 Watchlist Management:
@@ -60,6 +61,13 @@ Model & Provider Options (shared Sofuu generalized system):
   --setup-model            Configure provider & model into models.json
   --edit-model [name]      Edit, switch, add, or remove providers/models
   --list-models            Show configured providers & models
+
+Messaging Channels (shared Sofuu generalized system):
+  --setup-channel          Configure Telegram/WhatsApp/webhook/desktop into channels.json
+  --edit-channel [name]    Edit, switch, add, or remove channel profiles
+  --list-channels          Show configured channels (secrets masked)
+  --channels-config <path> Use a specific channels.json file
+  --channel <name>         Override the active channel for this run
 `);
 }
 
@@ -82,6 +90,7 @@ function parseCli(rawArgs) {
     forceAlert: false,
     noAi: false,
     json: false,
+    listen: false,
     addSymbol: null,
     removeSymbol: null,
     type: 'stock',
@@ -114,6 +123,11 @@ function parseCli(rawArgs) {
     }
     if (a === '--list-algos') {
       args.mode = 'list_algos';
+      continue;
+    }
+    if (a === '--listen') {
+      args.listen = true;
+      args.mode = 'watch';
       continue;
     }
     if (a === '--force-alert') {
@@ -178,6 +192,10 @@ function parseCli(rawArgs) {
       i++;
       continue;
     }
+    if ((a === '--channels-config' || a === '--channel') && i + 1 < rawArgs.length) {
+      i++;
+      continue;
+    }
   }
   return args;
 }
@@ -197,10 +215,6 @@ function resolveModelOpts(cliArgs) {
   };
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 function formatPrice(val) {
   if (typeof val !== 'number') return String(val);
   if (val >= 1000) return val.toFixed(2);
@@ -209,9 +223,11 @@ function formatPrice(val) {
 }
 
 /**
- * Executes one live market scan cycle across all watchlist assets.
+ * Deterministic first stage: fetch every asset and evaluate the algorithm
+ * suite. Returns the cycle report plus the alerts that deserve AI synthesis.
+ * This function performs zero model calls.
  */
-export async function runScanCycle(watchlistPath, modelOpts, cliArgs) {
+export async function scanWatchlist(watchlistPath, cliArgs) {
   const wl = loadWatchlist(watchlistPath);
   const algos = await loadAlgorithms(wl.algorithms?.customDir, wl.algorithms?.enabled);
   const threshold = Number(wl.opportunityScoreThreshold ?? 40);
@@ -223,6 +239,7 @@ export async function runScanCycle(watchlistPath, modelOpts, cliArgs) {
     assets: [],
     alerts: [],
   };
+  const pending = [];
 
   for (const asset of wl.assets || []) {
     try {
@@ -250,39 +267,24 @@ export async function runScanCycle(watchlistPath, modelOpts, cliArgs) {
       cycleReport.assets.push(entry);
 
       if (triggers.length > 0) {
-        let aiBriefing = '';
-        if (!cliArgs.noAi && modelOpts.provider && modelOpts.model) {
-          aiBriefing = await synthesizeAlertWithAI(
-            asset,
-            marketData,
-            evalRes,
-            triggers,
-            modelOpts
-          );
-        } else {
-          aiBriefing = evalRes.signals
-            .filter((s) => s.signal !== 'NEUTRAL')
-            .map((s) => `• ${s.name}: ${s.reason}`)
-            .join('\n');
-        }
-
-        const alertPacket = {
-          timestamp: new Date().toISOString(),
-          symbol: evalRes.symbol,
-          type: evalRes.type,
-          price: evalRes.price,
-          currency: marketData.currency,
-          compositeScore: evalRes.compositeScore,
-          direction: evalRes.direction,
+        pending.push({
+          asset,
+          marketData,
+          evalRes,
           triggers,
-          signals: evalRes.signals,
-          aiBriefing,
-        };
-
-        await dispatchNotification(alertPacket, wl.notifications || {}, {
-          silent: cliArgs.json,
+          alertPacket: {
+            timestamp: new Date().toISOString(),
+            symbol: evalRes.symbol,
+            type: evalRes.type,
+            price: evalRes.price,
+            currency: marketData.currency,
+            compositeScore: evalRes.compositeScore,
+            direction: evalRes.direction,
+            triggers,
+            signals: evalRes.signals,
+            aiBriefing: '',
+          },
         });
-        cycleReport.alerts.push(alertPacket);
       }
     } catch (err) {
       cycleReport.assets.push({
@@ -293,7 +295,101 @@ export async function runScanCycle(watchlistPath, modelOpts, cliArgs) {
     }
   }
 
-  return cycleReport;
+  return { report: cycleReport, pending, notifications: wl.notifications || {} };
+}
+
+/**
+ * Second stage: synthesize and dispatch the alerts a gate let through.
+ */
+export async function deliverAlerts(pending, report, notifications, modelOpts, cliArgs) {
+  for (const item of pending) {
+    let aiBriefing = '';
+    if (!cliArgs.noAi && modelOpts.provider && modelOpts.model) {
+      aiBriefing = await synthesizeAlertWithAI(
+        item.asset,
+        item.marketData,
+        item.evalRes,
+        item.triggers,
+        modelOpts
+      );
+    } else {
+      aiBriefing = item.evalRes.signals
+        .filter((s) => s.signal !== 'NEUTRAL')
+        .map((s) => `• ${s.name}: ${s.reason}`)
+        .join('\n');
+    }
+    item.alertPacket.aiBriefing = aiBriefing;
+    await dispatchNotification(item.alertPacket, notifications, {
+      silent: cliArgs.json,
+    });
+    report.alerts.push(item.alertPacket);
+  }
+}
+
+/**
+ * Executes one full live market scan cycle across all watchlist assets.
+ */
+export async function runScanCycle(watchlistPath, modelOpts, cliArgs) {
+  const { report, pending, notifications } = await scanWatchlist(watchlistPath, cliArgs);
+  await deliverAlerts(pending, report, notifications, modelOpts, cliArgs);
+  return report;
+}
+
+/**
+ * Two-way channel bridge. This is the ONLY inbound code in the example: the
+ * transport, verification, allowlist and per-sender session are all supplied
+ * by `sofuu.channels`. Commands are intentionally domain-level (market scan),
+ * never platform boilerplate.
+ */
+function startChannelListener(watchlistPath, modelOpts, cliArgs) {
+  if (typeof sofuu === 'undefined' || !sofuu.channels || typeof sofuu.channels.listen !== 'function') {
+    console.warn('[Market Sentinel] sofuu.channels is unavailable in this build.');
+    return null;
+  }
+  let profiles = [];
+  try { profiles = sofuu.channels.list(); } catch (err) { profiles = []; }
+  if (!profiles.length) {
+    console.warn('[Market Sentinel] No channels configured; run --setup-channel to enable two-way chat.');
+    return null;
+  }
+  try { defineMarketAgent(watchlistPath); } catch (err) {
+    /* Already registered is the normal case when the chat surface ran first. */
+  }
+
+  const sub = sofuu.channels.listen({
+    permissionProfile: 'plan',
+    onMessage: async (msg) => {
+      const text = String(msg.text || '').trim();
+      const lower = text.toLowerCase();
+      if (!text || lower === 'help' || lower === 'start') {
+        return [
+          'Market Sentinel commands:',
+          '  status  — watchlist and engine state',
+          '  scan    — run one live scan cycle',
+          '  <text>  — ask the market agent',
+        ].join('\n');
+      }
+      if (lower === 'status') {
+        const wl = loadWatchlist(watchlistPath);
+        return `Market Sentinel\nAssets: ${(wl.assets || []).length}\nInterval: ${Math.max(5, Number(wl.intervalSeconds || 60))}s\nModel: ${modelOpts.provider || 'disabled'} / ${modelOpts.model || 'none'}`;
+      }
+      if (lower === 'scan') {
+        const report = await runScanCycle(watchlistPath, modelOpts, cliArgs);
+        const hits = report.alerts.map((a) => `${a.symbol} @ ${a.price}`).join(', ');
+        return `Scan: ${report.assets.length} assets, ${report.alerts.length} alert(s)${hits ? ' — ' + hits : ''}`;
+      }
+      if (!modelOpts.provider || !modelOpts.model) {
+        return 'No model configured on this agent; use `status`, `scan`, or configure one with --setup-model.';
+      }
+      const result = await sofuu.agent.run('market_sentinel', msg.prompt, {
+        permissionProfile: 'plan',
+        sessionKey: 'channel:' + msg.channel + ':' + msg.senderId,
+      });
+      return (result && result.answer) || 'No answer.';
+    },
+  });
+  console.log('[Market Sentinel] Listening on ' + profiles.map((p) => p.name).join(', '));
+  return sub;
 }
 
 function printCycleSummary(report) {
@@ -398,19 +494,16 @@ async function main() {
 
   // 24/7 Continuous Watch Loop (--watch / --daemon)
   const wl = loadWatchlist(cliArgs.watchlist);
-  const intervalMs = cliArgs.everyMs || Math.max(5, Number(wl.intervalSeconds || 60)) * 1000;
-  let stopping = false;
-
-  if (typeof process !== 'undefined' && typeof process.on === 'function') {
-    process.on('SIGINT', () => {
-      console.log('\n[Market Sentinel] Shutting down 24/7 monitor cleanly...');
-      stopping = true;
-    });
-    process.on('SIGTERM', () => {
-      console.log('\n[Market Sentinel] Received SIGTERM, stopping...');
-      stopping = true;
-    });
-  }
+  const envInterval = (() => {
+    try {
+      const n = Number(process.env.SOFUU_DAEMON_INTERVAL_MS);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch (_) {
+      return 0;
+    }
+  })();
+  const intervalMs =
+    cliArgs.everyMs || envInterval || Math.max(5, Number(wl.intervalSeconds || 60)) * 1000;
 
   console.log('\n📡 Sofuu 24/7 Market Sentinel Started');
   console.log('─────────────────────────────────────────────────────────────────────────────');
@@ -420,16 +513,33 @@ async function main() {
   console.log('• Press Ctrl+C to stop');
   console.log('─────────────────────────────────────────────────────────────────────────────');
 
-  while (!stopping) {
-    try {
-      const report = await runScanCycle(cliArgs.watchlist, modelOpts, cliArgs);
-      printCycleSummary(report);
-    } catch (err) {
+  if (cliArgs.listen) startChannelListener(cliArgs.watchlist, modelOpts, cliArgs);
+
+  // Stage 1 (gate) is deterministic market work; stage 2 (onTrigger) is the
+  // only place a model is called. A quiet scan therefore costs 0 tokens.
+  const runner = sofuu.triggers.register({
+    id: 'market-sentinel',
+    kind: 'interval',
+    every: intervalMs,
+    nonOverlapping: true,
+    jitterPct: 10,
+    backoff: { initialMs: 2000, maxMs: 60_000, multiplier: 2 },
+    async gate() {
+      const scan = await scanWatchlist(cliArgs.watchlist, cliArgs);
+      printCycleSummary(scan.report);
+      if (scan.pending.length === 0) return null;
+      return scan;
+    },
+    async onTrigger(payload) {
+      await deliverAlerts(payload.pending, payload.report, payload.notifications, modelOpts, cliArgs);
+    },
+    onError(err) {
       console.error(`[Market Sentinel] Cycle error (will retry): ${err.message}`);
-    }
-    if (stopping) break;
-    await sleep(intervalMs);
-  }
+    },
+  });
+
+  await runner.start();
+  console.log('\n[Market Sentinel] Shutting down 24/7 monitor cleanly...');
 }
 
 main();

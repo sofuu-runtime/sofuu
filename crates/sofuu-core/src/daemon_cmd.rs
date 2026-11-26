@@ -258,6 +258,9 @@ fn cmd_install(args: &[String]) -> i32 {
     let is_kaze = canonical_target
         .extension()
         .is_some_and(|ext| ext == "kaze" || ext == "kazebc");
+    let is_js = canonical_target.extension().is_some_and(|ext| {
+        matches!(ext.to_str(), Some("js" | "mjs" | "cjs" | "ts"))
+    });
 
     let sofuu_exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
@@ -266,7 +269,27 @@ fn cmd_install(args: &[String]) -> i32 {
     let mut exec_args: Vec<String> = Vec::new();
     let exec_cmd: String;
 
-    if is_kaze {
+    if is_js {
+        // PLAN-AUTONOMOUS-REACTIVE-RUNTIME P2: a reactive JS agent runs its
+        // trigger loop in ONE resident process under launchd/systemd instead
+        // of being re-spawned every interval. `daemon run` also exports
+        // SOFUU_DAEMON_INTERVAL_MS, so a spec that omits `every` inherits the
+        // service cadence on its first tick.
+        exec_cmd = sofuu_exe;
+        exec_args.push("daemon".to_string());
+        exec_args.push("run".to_string());
+        exec_args.push(canonical_target.to_string_lossy().to_string());
+        exec_args.push("--every".to_string());
+        exec_args.push(interval.clone());
+        for ap in &arg_pairs {
+            exec_args.push("--arg".to_string());
+            exec_args.push(ap.clone());
+        }
+        for c in &caps {
+            exec_args.push("--cap".to_string());
+            exec_args.push(c.clone());
+        }
+    } else if is_kaze {
         exec_cmd = sofuu_exe;
         exec_args.push("daemon".to_string());
         exec_args.push("run".to_string());
@@ -526,6 +549,83 @@ WantedBy=default.target
 
 // ── Command: status ────────────────────────────────────────────────
 
+/// PLAN-AUTONOMOUS-REACTIVE-RUNTIME P2: surface the loop's own health,
+/// published by `sofuu.triggers` into `<cwd>/.sofuu/state/triggers.json`.
+/// The service's WorkingDirectory is the agent's project root, so the file
+/// is read there (or under SOFUU_STATE_ROOT when the operator set one).
+fn print_trigger_health(work_dir: &str) {
+    let root = match std::env::var_os("SOFUU_STATE_ROOT") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => Path::new(work_dir).join(".sofuu").join("state"),
+    };
+    let path = root.join("triggers.json");
+    let Ok(raw) = fs::read(&path) else { return };
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return;
+    };
+    let Some(entries) = doc.get("entries").and_then(|v| v.as_object()) else {
+        return;
+    };
+    let mut rows: Vec<&String> = entries
+        .keys()
+        .filter(|k| k.starts_with("health:"))
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    rows.sort();
+    println!("\n  \x1b[1mTrigger Health\x1b[0m ({})", path.display());
+    for key in rows {
+        let health = &entries[key];
+        let field = |name: &str| {
+            health
+                .get(name)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
+        };
+        println!(
+            "    {:<28} ticks={} gate-skips={} gate-hits={} ai-calls={} errors={} next={}",
+            key.trim_start_matches("health:"),
+            field("ticks"),
+            field("gateSkips"),
+            field("gateHits"),
+            field("aiCalls"),
+            field("errors"),
+            field("nextRunAt")
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn print_trigger_health_from_plist(plist: &Path) {
+    let Ok(text) = fs::read_to_string(plist) else { return };
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if line.contains("<key>WorkingDirectory</key>") {
+            if let Some(value) = lines.next() {
+                let wd = value
+                    .trim()
+                    .trim_start_matches("<string>")
+                    .trim_end_matches("</string>");
+                print_trigger_health(wd);
+            }
+            return;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn print_trigger_health_from_unit(unit: &Path) {
+    let Ok(text) = fs::read_to_string(unit) else { return };
+    if let Some(wd) = text
+        .lines()
+        .find_map(|l| l.strip_prefix("WorkingDirectory="))
+        .map(str::trim)
+    {
+        print_trigger_health(wd);
+    }
+}
+
 fn cmd_status(args: &[String]) -> i32 {
     let name_query = args.first().map(|s| clean_service_name(s));
 
@@ -600,6 +700,7 @@ fn cmd_status(args: &[String]) -> i32 {
                     }
                 }
             }
+            print_trigger_health_from_plist(&plist);
             println!();
             return 0;
         }
@@ -673,6 +774,7 @@ fn cmd_status(args: &[String]) -> i32 {
                 let text = String::from_utf8_lossy(&out.stdout);
                 println!("\n{text}");
             }
+            print_trigger_health_from_unit(&unit);
             return 0;
         }
 
@@ -1053,6 +1155,46 @@ fn cmd_run(args: &[String]) -> i32 {
     let is_kaze = target_path
         .extension()
         .is_some_and(|ext| ext == "kaze" || ext == "kazebc");
+    let is_js = target_path.extension().is_some_and(|ext| {
+        matches!(ext.to_str(), Some("js" | "mjs" | "cjs" | "ts"))
+    });
+
+    // A reactive JS agent runs through `sofuu run <script> --daemon --every …`
+    // (PLAN-AUTONOMOUS-REACTIVE-RUNTIME P2). Executing the .js file directly
+    // only works when it happens to be marked executable and its shebang
+    // resolves, and it bypasses the runtime's flag handling.
+    if is_js {
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("sofuu"));
+        let mut cmd = Command::new(exe);
+        cmd.arg("run").arg(target_path);
+        cmd.arg("--daemon").arg("--every").arg(&interval_raw);
+        cmd.env("SOFUU_DAEMON", "1");
+        cmd.env("SOFUU_DAEMON_INTERVAL_MS", interval_ms.to_string());
+        for ap in &arg_pairs {
+            cmd.arg("--arg").arg(ap);
+        }
+        for c in &caps {
+            cmd.arg("--cap").arg(c);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let err = cmd.exec();
+            eprintln!("\x1b[31mError:\x1b[0m failed to exec '{}': {err}", target_path.display());
+            return 1;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("\x1b[31mError:\x1b[0m failed to spawn '{}': {e}", target_path.display());
+                    return 1;
+                }
+            };
+            return child.wait().map(|s| s.code().unwrap_or(0)).unwrap_or(1);
+        }
+    }
 
     // If it's a standalone binary executable, delegate directly to its built-in daemon loop!
     if !is_kaze {

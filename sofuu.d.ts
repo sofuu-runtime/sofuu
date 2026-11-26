@@ -1468,6 +1468,99 @@ export interface AgentInteractOptions extends AgentTuiOptions {
   [k: string]: unknown;
 }
 
+/**
+ * Structured codes introduced by the autonomous reactive runtime. They ride
+ * normal `Error.code` (RULES.md §3.5) and are included in `ErrorCodeLike`
+ * through its open string arm.
+ */
+export type ReactiveErrorCode =
+  | 'E_TRIGGER_INVALID'
+  | 'E_EVALUATOR_CONTRACT'
+  | 'E_STATE_IO'
+  | 'E_APPROVAL_EXPIRED'
+  | 'E_APPROVAL_TOKEN_INVALID'
+  | 'E_BUDGET_EXCEEDED';
+
+/**
+ * How a run handles a tool that asks for approval. 'deny' (the default) and
+ * 'interactive' preserve the existing fail-closed / tty paths; 'async' must
+ * be opted into explicitly and parks the run without holding a socket.
+ */
+export type ApprovalMode = 'interactive' | 'async' | 'deny';
+export type ApprovalDecision = 'allow' | 'deny';
+
+/** Delivered to `opts.onApprovalRequest` when an async run parks. */
+export interface AsyncApprovalRequest {
+  runId: string;
+  approvalId: string;
+  /** 32 random bytes, hex. Never log it; send it over an authenticated channel. */
+  approvalToken: string;
+  tool: string;
+  args: Record<string, unknown>;
+  /** Epoch milliseconds after which the checkpoint is refused and consumed. */
+  expiresAt: number;
+  step: number;
+  risky: boolean;
+  mode: string;
+}
+
+/** The crash-safe checkpoint behind `sofuu.agent.resume(runId, ...)`. */
+export interface AsyncApprovalCheckpoint {
+  schema: 'sofuu-approval@1';
+  status: 'awaiting_approval';
+  runId: string;
+  approvalId: string;
+  approvalToken: string;
+  createdAt: number;
+  expiresAt: number;
+  agentName: string;
+  task: string;
+  model?: string;
+  provider?: string;
+  step: number;
+  tokens?: { prompt?: number; completion?: number };
+  permissionProfile?: string;
+  policySnapshot?: string | null;
+  pending: { id: string; name: string; args: Record<string, unknown>; risky: boolean };
+  messages: unknown[];
+  baseMessages: unknown[];
+}
+
+export interface AgentRunOptions {
+  approvalMode?: ApprovalMode;
+  /** TTL of a parked approval (default 24h). */
+  approvalTimeoutMs?: number;
+  /** Override the operational state root for the approval checkpoint. */
+  approvalStateRoot?: string;
+  /** Override the `agent-approvals` state namespace. */
+  approvalNamespace?: string;
+  /** The only notification hook for a parked run; must be explicit. */
+  onApprovalRequest?(request: AsyncApprovalRequest): void | Promise<void>;
+  onStep?(event: { kind: string; payload?: Record<string, unknown>; [k: string]: unknown }): void;
+  onError?: OnErrorMode;
+  [extension: string]: unknown;
+}
+
+export interface AgentResumeOptions extends AgentRunOptions {
+  approvalId?: string;
+  approvalToken?: string;
+  decision?: ApprovalDecision;
+  /** Legacy `{allow:true}` shorthand, accepted by the driver. */
+  allow?: boolean;
+}
+
+export interface AgentRunResult {
+  ok?: boolean;
+  answer: string;
+  runId?: string;
+  steps: number;
+  stopped?: string | null;
+  approvalId?: string;
+  expiresAt?: number;
+  usage?: Record<string, number>;
+  trace?: Array<{ kind: string; payload?: Record<string, unknown>; [k: string]: unknown }>;
+}
+
 export interface SofuuAgent {
   classifyError?(err: unknown): SofuuClassifiedError;
   /** The mode a run defaults to: interactive on a TTY, auto-retry otherwise. */
@@ -1478,6 +1571,14 @@ export interface SofuuAgent {
   tui?(opts?: AgentTuiOptions): AgentTui;
   /** Execute an interactive multi-turn terminal shell or single-task agent run. */
   interact?(target: unknown, opts?: AgentInteractOptions): Promise<any>;
+  /** Run a named/defined agent. With approvalMode:'async' a sensitive tool parks the run. */
+  run?(target: unknown, task: string, opts?: AgentRunOptions): Promise<AgentRunResult>;
+  /**
+   * Resume from a trace checkpoint, or from a parked async approval when the
+   * run has an `agent-approvals` checkpoint. The token is compared in constant
+   * time, single-use, and checked for expiry and R7 policy drift.
+   */
+  resume?(runId: string, opts?: AgentResumeOptions): Promise<AgentRunResult>;
   [extension: string]: unknown;
 }
 
@@ -1643,6 +1744,429 @@ export interface SofuuDiagnostics {
   event(err: unknown): string;
 }
 
+/* ================================================================== 
+ * sofuu.state — operational KV, atomic cooldowns, rolling windows
+ * (PLAN-AUTONOMOUS-REACTIVE-RUNTIME P1)
+ * ================================================================== */
+
+export interface SofuuStateOptions {
+  /** Override the state root (defaults to SOFUU_STATE_ROOT or .sofuu/state). */
+  root?: string;
+}
+
+export interface SofuuStateSetOptions {
+  /** Entry expires after this many milliseconds. */
+  ttlMs?: number;
+}
+
+export interface SofuuStateCooldownOptions {
+  /** Answer without taking the cooldown slot. */
+  dryRun?: boolean;
+}
+
+export interface SofuuStateWindowResult {
+  count: number;
+  allowed: boolean;
+}
+
+/**
+ * One operational namespace, persisted as `<root>/<namespace>.json` with
+ * atomic temp-write + rename and `0600` permissions on Unix.
+ */
+export interface SofuuStateStore {
+  readonly namespace: string;
+  get<T = unknown>(key: string): T | null;
+  set(key: string, value: unknown, opts?: SofuuStateSetOptions): boolean;
+  delete(key: string): boolean;
+  keys(prefix?: string): string[];
+  /** Atomic check-and-stamp; only one racing caller can receive true. */
+  allowAfterCooldown(key: string, cooldownMs: number, opts?: SofuuStateCooldownOptions): boolean;
+  resetCooldown(key: string): boolean;
+  /** Rolling-window counter; with maxAllowed the count saturates at the cap. */
+  incrementWindow(key: string, windowMs: number, maxAllowed?: number): SofuuStateWindowResult;
+  close(): boolean;
+}
+
+export interface SofuuState {
+  open(namespace?: string, opts?: SofuuStateOptions): SofuuStateStore;
+  StateStore: new (namespace?: string, opts?: SofuuStateOptions) => SofuuStateStore;
+}
+
+/* ================================================================== 
+ * sofuu.triggers — reactive loops with pre-LLM gates
+ * (PLAN-AUTONOMOUS-REACTIVE-RUNTIME P2)
+ * ================================================================== */
+
+export type TriggerKind = 'interval' | 'cron' | 'watch' | 'stream' | 'event';
+
+export interface TriggerWatchEvent {
+  path: string;
+  mtimeMs: number;
+  size: number;
+  isDir: boolean;
+}
+
+export interface TriggerSignal {
+  kind: TriggerKind | 'once';
+  triggerId: string;
+  tick: number;
+  nowMs: number;
+  /** kind: 'watch' — the watched roots for this tick. */
+  paths?: string[];
+  /** kind: 'watch' — debounced changed paths. */
+  events?: TriggerWatchEvent[];
+  /** kind: 'stream' — the pushed payload. */
+  event?: unknown;
+}
+
+export interface TriggerContext {
+  triggerId: string;
+  tick: number;
+  nowMs: number;
+  /** The runner's operational state store (null only when unavailable). */
+  state: SofuuStateStore | null;
+  signal: TriggerSignal;
+  runner: SofuuTriggerRunner;
+}
+
+export interface TriggerBackoff {
+  initialMs?: number;
+  maxMs?: number;
+  multiplier?: number;
+}
+
+export interface TriggerBudget {
+  maxTriggersPerHour?: number;
+  maxRunsPerHour?: number;
+  maxAiCallsPerDay?: number;
+  maxAiCallsPerHour?: number;
+  /** Throw E_BUDGET_EXCEEDED instead of skipping quietly. */
+  throwOnExceed?: boolean;
+}
+
+export interface TriggerSpec<TPayload = unknown> {
+  id?: string;
+  kind: TriggerKind;
+  /** interval: duration such as '30s', '5m', or 30000 (ms). */
+  every?: string | number;
+  /** cron: standard five fields, evaluated in `timezone`. */
+  cron?: string;
+  expression?: string;
+  timezone?: 'utc' | 'local' | (string & {});
+  /** watch: one root or a list of roots. */
+  paths?: string | string[];
+  watch?: string | string[];
+  pollMs?: string | number;
+  debounceMs?: string | number;
+  depth?: number;
+  emitInitial?: boolean;
+  /** Default true: a tick during an in-flight onTrigger is skipped. */
+  nonOverlapping?: boolean;
+  /** Randomize interval ticks by ± this percentage (0–100). */
+  jitterPct?: number;
+  /** interval: fire once at start (default true). */
+  immediate?: boolean;
+  backoff?: TriggerBackoff;
+  budget?: TriggerBudget;
+  /** Supply an already-open store instead of the default `triggers` namespace. */
+  state?: SofuuStateStore;
+  /**
+   * Stage 1, deterministic and token-free. Return null/false/undefined to
+   * skip the tick; any other value is passed to onTrigger.
+   */
+  gate?(ctx: TriggerContext): TPayload | null | false | undefined | Promise<TPayload | null | false | undefined>;
+  /** Stage 2, the only place a model should be called. */
+  onTrigger(payload: TPayload, ctx: TriggerContext): void | Promise<void>;
+  onError?(err: unknown, ctx: TriggerContext): void;
+  onSkip?(info: { reason: string; triggerId: string; payload: TPayload }, ctx: TriggerContext): void;
+}
+
+export interface TriggerStats {
+  id: string;
+  kind: TriggerKind;
+  running: boolean;
+  ticks: number;
+  gateSkips: number;
+  gateHits: number;
+  aiCalls: number;
+  overlapSkips: number;
+  budgetSkips: number;
+  errors: number;
+  lastError: { stage: string; code: string; message: string; at: number } | null;
+  lastRunAt: number;
+  nextRunAt: number;
+  lastDurationMs: number;
+  failures: number;
+  stopped: string;
+}
+
+export interface TriggerFireResult {
+  fired?: boolean;
+  skipped?: 'gate' | 'overlap' | 'budget' | 'stopped' | 'error' | (string & {});
+  payload?: unknown;
+  tick?: number;
+  error?: string;
+}
+
+export interface SofuuTriggerRunner {
+  readonly id: string;
+  readonly kind: TriggerKind;
+  /** Resolves when the loop stops (signal, stop(), or a fatal cron error). */
+  start(): Promise<{ id: string; stopped: string; stats: TriggerStats }>;
+  stop(reason?: string): Promise<{ id: string; stopped: string; stats: TriggerStats }>;
+  /** Feed a `kind: 'stream'` runner (webhook/channel events). */
+  push(payload: unknown): Promise<TriggerFireResult>;
+  emit(payload: unknown): Promise<TriggerFireResult>;
+  stats(): TriggerStats;
+}
+
+export interface SofuuTriggers {
+  register<TPayload = unknown>(spec: TriggerSpec<TPayload>): SofuuTriggerRunner;
+  get(id: string): SofuuTriggerRunner | null;
+  stats(id: string): TriggerStats | null;
+  stats(): TriggerStats[];
+  stopAll(reason?: string): void;
+  emit(id: string, payload: unknown): Promise<TriggerFireResult>;
+  /** One gate/trigger pass without starting a loop (uses stream semantics). */
+  runOnce<TPayload = unknown>(spec: TriggerSpec<TPayload>): Promise<TriggerFireResult>;
+  parseCron(expr: string): unknown;
+  nextCronMs(expr: string, fromMs?: number, tz?: string): number;
+  parseDuration(value: string | number, name?: string): number;
+  TriggerRunner: new (spec: TriggerSpec) => SofuuTriggerRunner;
+}
+
+/* ================================================================== 
+ * sofuu.evaluators — deterministic rule contract + composite scorer
+ * (PLAN-AUTONOMOUS-REACTIVE-RUNTIME P3)
+ * ================================================================== */
+
+/** The normalized envelope every evaluator is reduced to. */
+export interface EvaluatedSignal {
+  id: string;
+  name: string;
+  signal: string;
+  /** Clamped to [-100, 100]. */
+  score: number;
+  /** Clamped to [0, 1]. */
+  confidence: number;
+  metrics: Record<string, number | string | boolean>;
+  reason: string;
+  /** Composite weight (default 1), present in `score()` results. */
+  weight?: number;
+  error?: { code: string; message: string };
+}
+
+/** The contract a module dropped into an evaluator directory must satisfy. */
+export interface EvaluatorContract<TInput = unknown> {
+  id: string;
+  name?: string;
+  weight?: number;
+  evaluate(input: TInput): Partial<EvaluatedSignal> | Promise<Partial<EvaluatedSignal>>;
+}
+
+export interface EvaluatorLoadError {
+  file: string;
+  id: string;
+  error: { code: string; message: string };
+}
+
+export interface EvaluatorLoadResult {
+  dir: string;
+  evaluators: Array<EvaluatorContract & { file: string }>;
+  /** Broken modules are reported here; they never reject the load. */
+  errors: EvaluatorLoadError[];
+  timeoutMs: number;
+}
+
+export interface EvaluatorScoreOptions {
+  threshold?: number;
+  timeoutMs?: number;
+  includeNeutral?: boolean;
+}
+
+export interface EvaluatorScoreResult {
+  signals: EvaluatedSignal[];
+  errors: Array<{ id: string; error: { code: string; message: string } }>;
+  compositeScore: number;
+  maxAbsScore: number;
+  confidence: number;
+  threshold: number;
+  /** Deterministic pre-LLM gate flag. */
+  triggered: boolean;
+}
+
+export interface SofuuEvaluators {
+  loadDir(dirPath: string, opts?: { timeoutMs?: number; extensions?: string[] }): Promise<EvaluatorLoadResult>;
+  score<TInput = unknown>(
+    input: TInput,
+    evaluators: Array<EvaluatorContract<TInput> & { weight?: number }>,
+    opts?: EvaluatorScoreOptions
+  ): Promise<EvaluatorScoreResult>;
+  normalize(output: unknown, evaluator?: Partial<EvaluatorContract>): EvaluatedSignal;
+  candidateOf(mod: unknown): EvaluatorContract | null;
+  validate(list: EvaluatorContract[]): EvaluatorContract[];
+}
+
+/* ================================================================== 
+ * sofuu.crypto — hashing, HMAC and constant-time comparison
+ * ================================================================== */
+
+export type CryptoDigestAlgorithm = 'sha256' | 'sha1' | 'md5' | 'sha512' | (string & {});
+
+export interface SofuuCrypto {
+  /** Hex SHA-256 of the UTF-8 input. */
+  sha256(text: string): string;
+  /** Hex digest; the algorithm name is resolved against the real primitive. */
+  digest(alg: CryptoDigestAlgorithm, dataHex: string): string;
+  /** RFC 2104 HMAC. `keyHex` and `dataHex` are hex-encoded bytes; returns hex. */
+  hmac(alg: CryptoDigestAlgorithm, keyHex: string, dataHex: string): string;
+  /**
+   * Constant-time equality for equal-length strings. The length itself is
+   * folded into the comparison, so a mismatch never short-circuits early.
+   * Used by the channel HMAC/verify-token checks.
+   */
+  timingSafeEqual(a: string, b: string): boolean;
+  base64urlEncode(text: string): string;
+  /** Decodes base64url and returns the decoded UTF-8 text. */
+  base64urlDecode(text: string): string;
+  verifyJWT(token: string, jwks: unknown, options?: Record<string, unknown>): unknown;
+  randomUUID(): string;
+  /** Fills a TypedArray/DataView in place from the OS CSPRNG. */
+  randomFill<T extends ArrayBufferView>(buffer: T): T;
+}
+
+/* ================================================================== 
+ * sofuu.channels — generalized messaging channels
+ * ================================================================== */
+
+/** Inline action rendered as a Telegram/WhatsApp button. */
+export interface ChannelAction {
+  id: string;
+  label: string;
+}
+
+export interface OutboundMessage {
+  /** Profile name in channels.json (defaults to the active profile). */
+  channel?: string;
+  /** Override the profile's default_recipient. */
+  to?: string;
+  title?: string;
+  text: string;
+  severity?: 'info' | 'warn' | 'critical' | (string & {});
+  actions?: ChannelAction[];
+  /** Return before touching the network (configuration validation only). */
+  dryRun?: boolean;
+}
+
+export interface ChannelSendResult {
+  ok: boolean;
+  channel: string;
+  type: 'telegram' | 'whatsapp' | 'webhook' | 'desktop' | (string & {});
+  messageId: string;
+  status?: number;
+  dryRun?: boolean;
+}
+
+export interface InboundMessage {
+  channel: string;
+  type: 'telegram' | 'whatsapp' | 'webhook' | (string & {});
+  /** Verified Telegram chat id or WhatsApp phone number. */
+  senderId: string;
+  senderName: string;
+  text: string;
+  /**
+   * Prompt-injection-tagged form of `text`. Use this as the agent task; the
+   * tag tells the model the message is untrusted external input.
+   */
+  prompt: string;
+  messageId: string;
+  timestamp: number;
+  raw: unknown;
+  /** Reply through the same channel profile and sender. */
+  reply(text: string, opts?: Partial<OutboundMessage>): Promise<ChannelSendResult>;
+  /** Run an agent with this message's tagged prompt and per-sender session. */
+  run(agent: string, opts?: Record<string, unknown>): Promise<unknown>;
+}
+
+export interface ChannelActionEvent {
+  channel: string;
+  type: string;
+  id: string;
+  data: string;
+  label: string;
+  text: string;
+  senderId: string;
+  senderName: string;
+  messageId: string;
+  timestamp: number;
+  raw: unknown;
+  reply(text: string, opts?: Partial<OutboundMessage>): Promise<ChannelSendResult>;
+}
+
+export interface ChannelSubscription {
+  closed: boolean;
+  channel: string | null;
+  channels: string[];
+  polling: number;
+  close(): void;
+}
+
+export interface ChannelListenOptions {
+  channel?: string | string[];
+  onMessage?(msg: InboundMessage): void | string | Promise<void | string>;
+  onAction?(action: ChannelActionEvent): void | Promise<void>;
+  /** Zero-boilerplate route: run this agent and reply with its answer. */
+  agent?: string;
+  agentOptions?: Record<string, unknown>;
+  /** Permission profile for `agent` (default: 'plan'). */
+  permissionProfile?: 'full' | 'edit' | 'plan';
+  /** Keep a bounded per-sender history in sofuu.state (default: true). */
+  sessionHistory?: boolean;
+  autoReply?: boolean;
+  actionAck?: string;
+  /** Telegram getUpdates long-poll seconds (default: 25). */
+  pollTimeout?: number;
+}
+
+export interface ChannelProfileInfo {
+  name: string;
+  type: string;
+  active: boolean;
+  defaultRecipient: string | null;
+  allowedSenders: string[];
+  allowAnonymous: boolean;
+  networkMode: string;
+}
+
+export interface ChannelGatewayOptions {
+  host?: string;
+  port?: number;
+}
+
+export interface SofuuChannels {
+  VERSION: string;
+  types: string[];
+  send(msg: OutboundMessage): Promise<ChannelSendResult>;
+  listen(opts: ChannelListenOptions): ChannelSubscription;
+  configure(cfg: unknown): ChannelProfileInfo[];
+  load(path: string): Promise<ChannelProfileInfo[]>;
+  reload(cfg?: unknown): ChannelProfileInfo[];
+  list(): ChannelProfileInfo[];
+  profile(name?: string): { name: string; p: Record<string, unknown> };
+  /** HTTP handler shared by `sofuu serve` and `sofuu gateway`. */
+  handleWebhook(req: unknown, res: unknown, path: string): Promise<boolean>;
+  /** Returns a bound webhook handler for a host's own HTTP server. */
+  createWebhookHandler(): (req: unknown, res: unknown, path?: string) => Promise<boolean>;
+  startGateway(opts?: ChannelGatewayOptions): {
+    ok: boolean;
+    host: string;
+    port: number;
+    channels: ChannelProfileInfo[];
+  };
+  stop(): { ok: boolean; closed: number };
+  state(): Record<string, unknown>;
+}
+
 /**
  * The Sofuu runtime as a plugin sees it. Only namespaces the drivers actually
  * install are listed; anything else is undefined at runtime.
@@ -1661,8 +2185,22 @@ export interface SofuuRuntime {
   policy?: SofuuPolicy;
   /** The QTSQ structured store (src/js/storage.js). */
   storage?: SofuuStorage;
+  /**
+   * Operational state — atomic cooldowns, cursors, counters and rate
+   * windows (src/js/state.js, PLAN-AUTONOMOUS-REACTIVE-RUNTIME P1). This is
+   * deliberately separate from QTSQ/CMA semantic memory.
+   */
+  state?: SofuuState;
+  /** Reactive loops with pre-LLM gates (src/js/triggers.js, P2). */
+  triggers?: SofuuTriggers;
+  /** Deterministic evaluator plugins + composite scoring (P3). */
+  evaluators?: SofuuEvaluators;
   /** The agent runtime (src/js/agent.js) and its error policy. */
   agent?: SofuuAgent;
+  /** Generalized messaging channels (src/js/channels.js). */
+  channels?: SofuuChannels;
+  /** Hashing, HMAC, JWT verification and constant-time comparison. */
+  crypto: SofuuCrypto;
   /** Run logs, checkpoints and crash cards (src/js/observability.js). */
   observability?: SofuuObservability;
   /** The versioned diagnostic view over every surface's existing codes. */

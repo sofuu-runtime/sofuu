@@ -6,6 +6,7 @@
     "console": true,
     "desktop": true,
     "bell": true,
+    "channels": true,
     "webhookUrl": "",
     "logFile": "./market-alerts.jsonl"
   },

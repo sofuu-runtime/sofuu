@@ -45,8 +45,12 @@ Runtime Options:
   --api-key <key>          Override API key for this run
   --base-url <url>         Override endpoint base URL
   --report <path>          Output path for markdown report (default: ./security-audit-report.md)
+  --notify                 Send the completed audit summary through channels.json
+  --listen                 Stay up and answer inbound channel messages with the sentinel
   --json                   Output pure machine-readable JSON (ideal for CI/CD)
   --config, -c <path>      Path to agent.config.json (budgets & audit settings)
+  --channels-config <path> Path to a specific channels.json file
+  --channel <name>         Override the active channel profile for this run
   --help, -h               Show this help message and exit
 `);
 }
@@ -62,6 +66,8 @@ export function parseArgs(rawArgs) {
     report: 'security-audit-report.md',
     json: false,
     interactive: false,
+    listen: false,
+    notify: false,
     config: defaultAgentConfigPath(),
   };
 
@@ -78,6 +84,14 @@ export function parseArgs(rawArgs) {
     }
     if (a === '--interactive' || a === '-i') {
       args.interactive = true;
+      continue;
+    }
+    if (a === '--listen') {
+      args.listen = true;
+      continue;
+    }
+    if (a === '--notify') {
+      args.notify = true;
       continue;
     }
     if ((a === '--target' || a === '--dir') && i + 1 < rawArgs.length) {
@@ -113,6 +127,10 @@ export function parseArgs(rawArgs) {
       continue;
     }
     if (a === '--models-config' && i + 1 < rawArgs.length) {
+      i++;
+      continue;
+    }
+    if ((a === '--channels-config' || a === '--channel') && i + 1 < rawArgs.length) {
       i++;
       continue;
     }
@@ -195,6 +213,80 @@ export async function runAudit(options = {}) {
   return await sofuu.agent.run(sentinel, finalTask, runOpts);
 }
 
+function channelProfiles() {
+  try {
+    if (typeof sofuu !== 'undefined' && sofuu.channels && typeof sofuu.channels.list === 'function') {
+      return sofuu.channels.list();
+    }
+  } catch (_) {}
+  return [];
+}
+
+/**
+ * Send the completed audit through channels.json. Transport, retries and
+ * platform formatting are the runtime's job; this example only supplies the
+ * domain summary.
+ */
+async function notifyChannels(result) {
+  if (!sofuu.channels || typeof sofuu.channels.send !== 'function') {
+    console.warn('⚠️  --notify: sofuu.channels is unavailable in this build.');
+    return false;
+  }
+  if (channelProfiles().length === 0) {
+    console.warn('⚠️  --notify: no channels configured (run --setup-channel).');
+    return false;
+  }
+  const answer = String((result && result.answer) || 'Audit completed with no output.');
+  const severity = /critical|high severity|vulnerability found/i.test(answer) ? 'critical' : 'info';
+  try {
+    const sent = await sofuu.channels.send({
+      title: 'Code Sentinel audit',
+      text: answer,
+      severity,
+    });
+    console.log(`📣 Notified channel: ${sent.channel} (${sent.type})`);
+    return !!sent.ok;
+  } catch (err) {
+    console.warn(`⚠️  Channel notification failed: ${err.message}`);
+    return false;
+  }
+}
+
+/**
+ * Two-way mode. One `listen` call covers Telegram polling and the gateway's
+ * WhatsApp/webhook routes; verification, allowlists, per-sender history and
+ * the remote `plan` permission profile are all runtime defaults.
+ */
+async function startChannelListener(cfg, resolved) {
+  if (!sofuu.channels || typeof sofuu.channels.listen !== 'function') {
+    console.error('❌ --listen: sofuu.channels is unavailable in this build.');
+    process.exit(2);
+  }
+  const profiles = channelProfiles();
+  if (profiles.length === 0) {
+    console.error('❌ --listen: no channels configured. Run --setup-channel first.');
+    process.exit(2);
+  }
+  defineSentinelAgent(cfg.budget || {});
+  sofuu.channels.listen({
+    permissionProfile: 'plan',
+    onMessage: async (msg) => {
+      const result = await sofuu.agent.run('code_sentinel', msg.prompt, {
+        permissionProfile: 'plan',
+        sessionKey: 'channel:' + msg.channel + ':' + msg.senderId,
+        provider: resolved.provider || undefined,
+        model: resolved.model || undefined,
+        apiKey: resolved.apiKey || undefined,
+        baseUrl: resolved.baseUrl || undefined,
+      });
+      return (result && result.answer) || 'Audit completed with no output.';
+    },
+  });
+  console.log('📡 Listening on ' + profiles.map((p) => p.name).join(', '));
+  console.log('   Remote senders run with the `plan` permission profile.');
+  await new Promise(() => {});
+}
+
 // CLI Execution Path
 async function main() {
   const rawArgs = Array.prototype.slice.call(process.argv, 2);
@@ -223,6 +315,12 @@ async function main() {
     console.error('     1. Edit or create models.json alongside this agent');
     console.error('     2. Run with --setup-model to launch the setup wizard\n');
     process.exit(2);
+  }
+
+  // Two-Way Channel Mode
+  if (cliArgs.listen) {
+    await startChannelListener(cfg, resolved);
+    return;
   }
 
   // Interactive Session Handler
@@ -270,6 +368,8 @@ async function main() {
       config: cliArgs.config,
       onStep,
     });
+
+    if (cliArgs.notify) await notifyChannels(result);
 
     if (cliArgs.json) {
       console.log(JSON.stringify(result, null, 2));

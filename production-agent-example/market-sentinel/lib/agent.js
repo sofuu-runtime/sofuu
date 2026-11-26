@@ -18,7 +18,7 @@ export function loadWatchlist(watchlistPath) {
       intervalSeconds: 60,
       cooldownMinutes: 30,
       opportunityScoreThreshold: 40,
-      notifications: { console: true, desktop: true, bell: true, webhookUrl: '', logFile: './market-alerts.jsonl' },
+      notifications: { console: true, desktop: true, bell: true, channels: true, webhookUrl: '', logFile: './market-alerts.jsonl' },
       algorithms: { enabled: ['rsi_reversion', 'ema_crossover', 'bollinger_squeeze', 'zscore_breakout'], customDir: './production-agent-example/market-sentinel/algos' },
       assets: [],
     };

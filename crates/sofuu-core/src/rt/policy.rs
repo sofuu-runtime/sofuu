@@ -168,6 +168,29 @@ const POLICY_SCHEMA: &[(&str, Ty)] = &[
         ]),
     ),
     ("memory", Ty::Section(&[("write", Ty::OneOf(&["on", "off"]))])),
+    /* PLAN-GENERALIZED-CHANNELS §3.2: the messaging surface. `allow` is the
+     * transport allowlist checked before any adapter runs; `inbound` carries
+     * the fail-closed sender/loopback/rate rules enforced by channels.js. */
+    (
+        "channels",
+        Ty::Section(&[
+            ("allow", Ty::StrList { single: false }),
+            (
+                "inbound",
+                Ty::Section(&[
+                    ("require_allowlist", Ty::Bool),
+                    ("requireAllowlist", Ty::Bool),
+                    ("allow_anonymous", Ty::Bool),
+                    ("allowAnonymous", Ty::Bool),
+                    ("bind", Ty::Str),
+                    ("allow_public_bind", Ty::Bool),
+                    ("allowPublicBind", Ty::Bool),
+                    ("max_msgs_per_minute", Ty::Num),
+                    ("maxMsgsPerMinute", Ty::Num),
+                ]),
+            ),
+        ]),
+    ),
     /* PLAN-DRONES-MAVLINK §4.3: the tenth section. Absent or `enabled:false`
      * means the `sofuu.mavlink` surface is never registered — no door beats a
      * locked door. Enforcement lives in `rt/mavlink_gate.rs`; this is the
@@ -2278,8 +2301,25 @@ mod tests {
             "approval": { "mode": "per-run", "cache": true },
             "secrets": { "source": "file", "file": "/tmp/secrets.json" },
             "memory": { "write": "off" },
+            "channels": {
+                "allow": ["telegram", "desktop"],
+                "inbound": {
+                    "require_allowlist": true,
+                    "allow_anonymous": false,
+                    "bind": "127.0.0.1",
+                    "allow_public_bind": false,
+                    "max_msgs_per_minute": 20
+                }
+            },
         }))
         .is_ok());
+        /* The camelCase spellings are accepted too. */
+        assert!(validate_policy(&serde_json::json!({
+            "channels": { "inbound": { "allowPublicBind": true, "maxMsgsPerMinute": 5 } }
+        })).is_ok());
+        let e = validate_policy(&serde_json::json!({"channels":{"inbound":{"allow_public_bind":"yes"}}}))
+            .expect_err("a string boolean must be refused");
+        assert!(e.contains("channels.inbound.allow_public_bind"), "{e}");
         /* The forms the fs resolver really understands. */
         assert!(validate_policy(&serde_json::json!({"fs":{"write":false}})).is_ok());
         assert!(validate_policy(&serde_json::json!({"fs":{"write":["/a","/b"]}})).is_ok());

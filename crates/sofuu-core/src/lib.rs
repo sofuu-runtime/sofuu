@@ -16,6 +16,7 @@
 pub mod bundler;
 pub mod brain_cmd; // W7: `sofuu brain verify|repair|stats|backup|restore|migrate`
 pub mod capabilities; // R1: the capability manifest (sofuu.capabilities)
+pub mod channel_config; // Per-agent channels.json + --setup-channel / --edit-channel
 pub mod compiler; // `sofuu compile`: append-trailer standalone agent binaries
 pub mod daemon_cmd; // `sofuu daemon`: 24/7 autonomous background agent supervisor
 pub mod embedding; // compact learned semantic projector for memory recall

@@ -27,3 +27,24 @@ Autonomous multi-agent codebase auditor built with pure JS on Sofuu (`code_senti
 # Run tests
 ./sofuu run production-agent-example/code-sentinel/tests/test_sentinel.js --models-config production-agent-example/code-sentinel/models.json
 ```
+
+## Messaging Channels
+
+Code Sentinel uses the generalized `sofuu.channels` layer — there is no
+Telegram/WhatsApp/HTTP code in this example.
+
+```bash
+# Configure one or more channels into channels.json
+./sofuu run production-agent-example/code-sentinel/index.js --setup-channel
+
+# Send the completed audit summary through the active channel
+./sofuu run production-agent-example/code-sentinel/index.js --target ./src --notify
+
+# Two-way: answer audit requests from Telegram (or a gateway)
+./sofuu run production-agent-example/code-sentinel/index.js --listen
+```
+
+`--listen` uses outbound Telegram long polling (zero public ports). For
+WhatsApp Cloud API or generic webhooks, run `sofuu gateway` (loopback by
+default) in front of the same `channels.json`. Remote senders run the sentinel
+with the `plan` permission profile — read-only analysis, no writes or shell.

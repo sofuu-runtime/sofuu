@@ -28,3 +28,15 @@ This directory contains **two completely separate, standalone, production-grade 
 ```
 
 Both agents support Sofuu's generalized two-way provider configuration (per-agent `models.json` + `--setup-model` / `--edit-model` / `--list-models`, including when compiled with `sofuu compile`).
+
+Both agents also support the generalized messaging layer: `--setup-channel` /
+`--list-channels` write a per-agent `channels.json`, alerts and audit summaries
+go through `sofuu.channels.send`, and `--listen` answers inbound Telegram (or
+gateway-forwarded WhatsApp/webhook) messages. No example contains bespoke
+platform HTTP code.
+
+```bash
+./sofuu run production-agent-example/market-sentinel/index.js --setup-channel
+./sofuu run production-agent-example/market-sentinel/index.js --watch --listen
+./sofuu run production-agent-example/code-sentinel/index.js --target ./src --notify
+```

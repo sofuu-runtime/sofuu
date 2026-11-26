@@ -146,8 +146,8 @@
     }
   }
   var PERMISSION_PROFILE = 'full';
-  function permissionBlocked(name) {
-    var p = PERMISSION_PROFILE;
+  function permissionBlocked(name, profile) {
+    var p = (profile === undefined || profile === null) ? PERMISSION_PROFILE : String(profile);
     if (p === 'full') return null;                  /* pass everything */
     if (AUTO_PASS_TOOLS[name]) return null;         /* read-only */
     if (p === 'edit' && EDIT_TOOLS[name]) return null; /* jailed edits */
@@ -669,6 +669,96 @@
     } catch (e) { /* the retry probe fell through: the caller rethrows the original error with its own context. */ }
     return Math.floor(Math.random() * 0xffffffff).toString(36) +
            Math.floor(Math.random() * 0xffffffff).toString(36);
+  }
+  /* ── P4 async HITL (PLAN-AUTONOMOUS-REACTIVE-RUNTIME) ────────────────
+   * A background run that needs a human decision parks its exact
+   * conversation state in the operational state store (`sofuu.state`,
+   * namespace `agent-approvals`) and returns. The approval token only ever
+   * goes to the host callback (or an authenticated HTTP response); it is
+   * never emitted into the run log. Resolution validates the token in
+   * constant time, refuses an expired checkpoint, consumes it exactly once
+   * and re-runs the parked tool call through the SAME policy floor. */
+  var APPROVAL_MODES = { deny: 1, interactive: 1, async: 1 };
+  var APPROVAL_NAMESPACE = 'agent-approvals';
+  function approvalModeOf(opts, d) {
+    var mode = String((opts && opts.approvalMode) || (d && d.approvalMode) || '');
+    if (!mode) {
+      mode = (opts && (typeof opts.onApproval === 'function' || opts.approveInteractive === true))
+        ? 'interactive' : 'deny';
+    }
+    if (!APPROVAL_MODES[mode]) {
+      throw makeError('E_INVALID_ARGS',
+        'approvalMode must be interactive | async | deny (got \'' + mode + '\')');
+    }
+    return mode;
+  }
+  function newApprovalToken() {
+    try {
+      if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+        var b = new Uint8Array(32);
+        crypto.getRandomValues(b);
+        var r = '';
+        for (var i = 0; i < b.length; i++) r += (b[i] < 16 ? '0' : '') + b[i].toString(16);
+        return r;
+      }
+    } catch (e) { /* fall through to the native crypto surface */ }
+    try {
+      if (typeof sofuu !== 'undefined' && sofuu.crypto && typeof sofuu.crypto.randomFill === 'function') {
+        var arr = new Uint8Array(32);
+        sofuu.crypto.randomFill(arr);
+        var out = '';
+        for (var j = 0; j < arr.length; j++) out += (arr[j] < 16 ? '0' : '') + arr[j].toString(16);
+        return out;
+      }
+    } catch (e2) { /* last resort below */ }
+    /* Two independent sources, still 128+ bits: a host without either
+     * binding is already outside the security envelope this token assumes. */
+    return approvalRand() + approvalRand() + approvalRand() + approvalRand();
+  }
+  /* Constant-time equality: a length leak is unavoidable in JS, but no
+   * early return may reveal the first differing byte. */
+  function approvalTokenEq(a, b) {
+    var x = String(a == null ? '' : a);
+    var y = String(b == null ? '' : b);
+    if (x.length !== y.length) return false;
+    var diff = 0;
+    for (var i = 0; i < x.length; i++) diff |= (x.charCodeAt(i) ^ y.charCodeAt(i));
+    return diff === 0;
+  }
+  function approvalStore(opts) {
+    try {
+      if (typeof sofuu !== 'undefined' && sofuu.state && typeof sofuu.state.open === 'function') {
+        var ns = (opts && opts.approvalNamespace) ? String(opts.approvalNamespace) : APPROVAL_NAMESPACE;
+        var root = (opts && opts.approvalStateRoot) ? { root: String(opts.approvalStateRoot) } : undefined;
+        return sofuu.state.open(ns, root);
+      }
+    } catch (e) { /* reported by the caller with the operation it needed */ }
+    return null;
+  }
+  function approvalKey(runId) { return 'run:' + String(runId); }
+  function loadApprovalCheckpoint(runId, opts) {
+    var store = approvalStore(opts);
+    if (!store) return null;
+    try { return store.get(approvalKey(runId)); }
+    catch (e) { return null; }
+  }
+  function saveApprovalCheckpoint(cp, opts) {
+    var store = approvalStore(opts);
+    if (!store) {
+      throw makeError('E_CAPABILITY',
+        'approvalMode:async needs sofuu.state (the operational state store is unavailable in this build)');
+    }
+    store.set(approvalKey(cp.runId), cp);
+    return store;
+  }
+  /* Permission profiles are ordered by reach: plan < edit < full. A resume
+   * may only ever narrow the originating run's snapshot, never widen it. */
+  var PROFILE_RANK = { plan: 0, edit: 1, full: 2 };
+  function stricterProfile(a, b) {
+    var x = PROFILE_RANK[String(a)] === undefined ? 2 : PROFILE_RANK[String(a)];
+    var y = PROFILE_RANK[String(b)] === undefined ? 2 : PROFILE_RANK[String(b)];
+    return x <= y ? (String(a) in PROFILE_RANK ? String(a) : 'full')
+                  : (String(b) in PROFILE_RANK ? String(b) : 'full');
   }
   var TOOL_RESULT_CAP_CHARS = 4000; /* floor for tiny windows */
   var TOOL_RESULT_HEAD_RATIO = 0.7;
@@ -1212,6 +1302,9 @@
      * decision is the host's (opts.onApproval); fail-closed without one. */
     d.approve = (def.approve === 'all' || def.approve === 'sensitive')
       ? String(def.approve) : 'none';
+    /* P4 async HITL: a def may park instead of denying when no approval
+     * host is present. approvalModeOf validates the value at run start. */
+    if (def.approvalMode !== undefined) d.approvalMode = String(def.approvalMode);
     /* P2.2 policy knobs: shell 'default' (unchanged) | 'readonly'
      * (read-only command allow-list) | array of anchored patterns; net
      * allow/deny consulted by the web tools (infra SSRF guards stay). */
@@ -3025,6 +3118,9 @@
 
   function run(target, task, opts) {
     opts = opts || {};
+    /* A channel bridge passes a stable per-sender sessionKey; it is the
+     * session identity even when the caller never minted a sessionId. */
+    if (!opts.sessionId && opts.sessionKey) opts.sessionId = String(opts.sessionKey);
     if (opts.resumeFrom && opts.resumeFrom._sofuu_resume_unavailable === true) {
       throw makeError('E_CAPABILITY', 'The checkpoint was redacted or incomplete and cannot be resumed safely; start a new run with the required inputs.');
     }
@@ -3034,6 +3130,15 @@
      * typo can never leave a half-open run behind or silently mean some
      * other policy. */
     var errorMode = onErrorMode(opts);
+    /* P4: approvalMode is validated before the run opens any state. The
+     * default preserves the historical fail-closed behavior (deny unless a
+     * host callback or the interactive parking lot exists). */
+    var approvalMode = approvalModeOf(opts, d);
+    if (approvalMode !== d.approvalMode) d = Object.assign({}, d, { approvalMode: approvalMode });
+    var runPermissionProfile = String(opts.permissionProfile || PERMISSION_PROFILE);
+    /* The R7 document this run is operating under. A parked async approval
+     * carries it; resume refuses to run under a different one. */
+    var runPolicySnapshot = policySnapshot();
     var parentCtx = (typeof sofuu !== 'undefined' && sofuu.context && typeof sofuu.context.getStore === 'function')
       ? sofuu.context.getStore()
       : null;
@@ -3093,6 +3198,7 @@
       chain: chain.slice(),
       traceId: opts.traceId || (parentCtx && parentCtx.traceId) || runId,
       sessionId: opts.sessionId || (parentCtx && parentCtx.sessionId) || null,
+      sessionKey: opts.sessionKey || null,
       signal: cancelId,
       budget: d.budget,
       state: state,
@@ -3315,6 +3421,17 @@
         d = Object.assign({}, d, { provider: String(obsResumeFrom.provider) });
       }
     }
+    /* P4: the exact pre-task context (system + task + history) a parked
+     * checkpoint captured. Keeping it preserves the conversation the human
+     * was asked about instead of rebuilding a possibly-different prompt. */
+    var resumeBaseMessages = Array.isArray(opts.resumeBaseMessages)
+      ? opts.resumeBaseMessages.slice() : null;
+    /* P4: one parked call is replayed before the model gets the turn back.
+     * allow -> execute it through the normal policy/tool path (approval is
+     * already satisfied); deny -> answer it in-band so the model can react. */
+    var resumeApproval = (opts._resumeApproval && typeof opts._resumeApproval === 'object')
+      ? opts._resumeApproval : null;
+    var approvedToolCallId = opts._approvedToolCallId ? String(opts._approvedToolCallId) : '';
     function turnTranscript() {
       return loopMsgs.filter(function (m) {
         if (m.role === 'assistant' && m.tool_calls) return true;
@@ -4436,10 +4553,12 @@
        * enumerable so the wire builders' JSON.stringify never sends it. */
       Object.defineProperty(taskMsg, '_sofuu_task', { value: true, enumerable: false });
       var histClean = foldHistoricalToolResults(Array.isArray(opts.history) ? opts.history : []);
-      var messages = [{ role: 'system', content: d.system + identityLine }]
-        .concat(ctxParts.length ? [{ role: 'user', content: ctxParts.join('\n\n') }] : [])
-        .concat(histClean)
-        .concat([taskMsg]);
+      var messages = (resumeBaseMessages && resumeBaseMessages.length)
+        ? resumeBaseMessages
+        : [{ role: 'system', content: d.system + identityLine }]
+          .concat(ctxParts.length ? [{ role: 'user', content: ctxParts.join('\n\n') }] : [])
+          .concat(histClean)
+          .concat([taskMsg]);
 
       /* ── P4.2 estimate mode (2026-10-16): project the run's costs
        * WITHOUT any model call, tool resolution (MCP would spawn
@@ -4926,6 +5045,74 @@
         }
       }
 
+      /* P4: park the exact run state and unwind. The sentinel is caught by
+       * execToolWithPolicy (rethrow), execDelegate (rethrow) and runCore's
+       * terminal catch (which returns the awaiting_approval result instead
+       * of logging a fatal error). */
+      function parkForApproval(name, args, callId, approvalId, risky, modeLabel) {
+        var ttl = Number(opts.approvalTimeoutMs || d.approvalTimeoutMs || 86400000);
+        if (!Number.isFinite(ttl) || ttl <= 0) ttl = 86400000;
+        var createdAt = Date.now();
+        var expiresAt = createdAt + Math.floor(ttl);
+        var approvalToken = newApprovalToken();
+        var cp = {
+          schema: 'sofuu-approval@1',
+          status: 'awaiting_approval',
+          runId: runId,
+          approvalId: approvalId,
+          approvalToken: approvalToken,
+          createdAt: createdAt,
+          expiresAt: expiresAt,
+          agentName: d.name,
+          task: String(task == null ? '' : task),
+          model: String(opts.model || d.model || ''),
+          provider: String(opts.provider || d.provider || ''),
+          step: stepsTotal,
+          tokens: { prompt: own.promptTokens, completion: own.completionTokens },
+          budget: d.budget,
+          approve: d.approve,
+          approvalMode: approvalMode,
+          permissionProfile: runPermissionProfile,
+          policySnapshot: runPolicySnapshot,
+          pending: { id: String(callId || ''), name: String(name || ''), args: args || {}, risky: !!risky },
+          messages: loopMsgs.slice(),
+          baseMessages: (typeof messages !== 'undefined' && messages) ? messages.slice() : []
+        };
+        saveApprovalCheckpoint(cp, opts);
+        var request = {
+          runId: runId, approvalId: approvalId, approvalToken: approvalToken,
+          tool: String(name || ''), args: args || {}, expiresAt: expiresAt,
+          step: stepsTotal, risky: !!risky, mode: modeLabel || 'sensitive'
+        };
+        emit('approval_request', {
+          id: approvalId, tool: name, args: clip(JSON.stringify(args || {}), 200),
+          risky: !!risky, approve: modeLabel, mode: 'async',
+          expires_at: new Date(expiresAt).toISOString(), parked: true
+        });
+        obsEmit(runId, obsPath, 'checkpoint', stepsTotal, {
+          status: 'awaiting_approval', approval_id: approvalId,
+          tool: String(name || ''), expires_at: expiresAt,
+          _sofuu_resume_unavailable: false
+        }, true);
+        if (typeof opts.onApprovalRequest === 'function') {
+          try {
+            var reqRun = opts.onApprovalRequest(request);
+            if (reqRun && typeof reqRun.catch === 'function') {
+              reqRun.catch(function () { /* the host notification is best effort; the checkpoint is already durable. */ });
+            }
+          } catch (eReq) { /* same contract: a failed notification cannot lose the parked run. */ }
+        }
+        var park = new Error('awaiting approval for ' + name + ' (run ' + runId + ')');
+        park.code = 'E_APPROVAL_PENDING';
+        park._sofuuApprovalPark = true;
+        park.result = {
+          ok: false, stopped: 'awaiting_approval', runId: runId,
+          approvalId: approvalId, name: d.name, expiresAt: expiresAt,
+          approvalRequest: request, steps: stepsTotal, usage: own, trace: trace
+        };
+        throw park;
+      }
+
       async function execOneTool(name, args, callId) {
         own.toolCalls++; tree.toolCalls++;
         var toolStartedAt = Date.now();
@@ -4991,7 +5178,7 @@
          * never executes — the model gets the same explanatory string the
          * desktop gate returns (chat.js blockedTool), so it can react
          * instead of the run dying. */
-        var gateWhy = permissionBlocked(name);
+        var gateWhy = permissionBlocked(name, runPermissionProfile);
         if (gateWhy) {
           var gateMsg = 'Blocked by permissions policy (' + gateWhy + '): ' + name;
           emit('tool_result', { name: name, blocked: gateWhy, result: clip(gateMsg, 200),
@@ -5061,6 +5248,13 @@
             else if (ann.readOnlyHint === true) risky = false;
           }
           var needAsk = forceAsk || d.approve === 'all' || risky;
+          /* P4: the one parked call the human already approved resumes
+           * without asking again. The policy floor above still ran, and the
+           * id is consumed below so a later call cannot inherit the grant. */
+          if (approvedToolCallId && String(callId || '') === approvedToolCallId) {
+            needAsk = false;
+            approvedToolCallId = '';
+          }
           var modeLabel = forceAsk ? 'always' : (d.approve || 'none');
           var askKey = name === 'bash'
             ? 'bash\u0001' + ledgerNorm(String((args && args.command) || ''))
@@ -5082,6 +5276,12 @@
              *    tool budget either).
              * 3. neither — deny by policy (an interactive gate must never
              *    default to executing). */
+            /* P4: async mode never blocks stdin or holds a socket. Park the
+             * checkpoint, notify the host through the explicit callback, and
+             * unwind the run with awaiting_approval. */
+            if (approvalMode === 'async') {
+              parkForApproval(name, args, callId, apId, risky, modeLabel);
+            }
             var apFn = null;
             var pendingPromise = null;
             if (typeof opts.onApproval === 'function') {
@@ -5480,6 +5680,9 @@
           try {
             text = await execOneTool(name, args, callId);
           } catch (eTool) {
+            /* P4: a parked async approval is not a tool fault — it must
+             * unwind the whole run so the checkpoint can survive it. */
+            if (eTool && eTool._sofuuApprovalPark) throw eTool;
             /* execOneTool catches its own throws; belt and braces so no
              * policy path can ever leak an exception into the loop. */
             threw = eTool;
@@ -5675,6 +5878,8 @@
             },
           });
         } catch (e) {
+          /* P4: a parked child must park the tree, not become a tool error. */
+          if (e && e._sofuuApprovalPark) throw e;
           /* A child that REJECTED (dead endpoint etc.) used to vanish
            * from subRuns entirely — the bench showed 5 of 6 in the tree
            * and the failure was only visible as the parent's tool error
@@ -5783,6 +5988,7 @@
                      toolTimeoutMs: opts.toolTimeoutMs, budget: mBudget },
           });
         } catch (e) {
+          if (e && e._sofuuApprovalPark) throw e;
           /* Reduce-run rejection (or mapContext throwing before its own
            * try/catch): mirror the execDelegate failure contract — the
            * fan-out must not vanish from subRuns, and the parent loop
@@ -5837,6 +6043,32 @@
         if (validated) validatedData = sOutP.data;
         await storeAndFinish(answer);
         return finish(answer);
+      }
+
+      /* P4: replay the parked tool call before the model speaks again. An
+       * allow runs through the normal exec path — the policy floor above
+       * still applies — while a deny becomes a normal tool result the model
+       * can reason about. Either way the transcript matches the checkpoint. */
+      if (resumeApproval && resumeApproval.pending) {
+        var rp = resumeApproval.pending;
+        var rpId = String(rp.id || ('call_' + runId + '_resume'));
+        var rpAllowed = resumeApproval.decision === 'allow';
+        var rpResult;
+        if (rpAllowed) {
+          approvedToolCallId = rpId;
+          rpResult = await execToolWithPolicy(String(rp.name || ''), rp.args || {}, rpId);
+        } else {
+          rpResult = 'denied by user (async approval)';
+        }
+        loopMsgs.push({
+          role: 'assistant', content: null,
+          tool_calls: [{ id: rpId, type: 'function',
+                         function: { name: String(rp.name || ''), arguments: JSON.stringify(rp.args || {}) } }]
+        });
+        loopMsgs.push({ role: 'tool', tool_call_id: rpId, content: String(rpResult == null ? '' : rpResult) });
+        emit('approval_resolved', { id: String(resumeApproval.approvalId || ''), tool: String(rp.name || ''),
+                                    allowed: rpAllowed, resumed: true, source: 'async' });
+        resumeApproval = null;
       }
 
       /* Stream-first loop for EVERY provider (F4b landed): OpenAI-compatible
@@ -6792,6 +7024,27 @@
         } catch (e) { /* memory storage is best effort: the answer is delivered either way. */ }
       }
     } catch (e) {
+      /* P4: an async approval park is a clean suspension, not a failure.
+       * The checkpoint is already durable; release this run's slots and
+       * return the documented awaiting_approval shape. No fatal card and no
+       * terminal stop event: the run can still be resumed. */
+      if (e && e._sofuuApprovalPark) {
+        try { if (sofuu.tools && sofuu.tools.endRunScope) sofuu.tools.endRunScope(String(runId)); }
+        catch (eSc) { /* bookkeeping only — the checkpoint is durable. */ }
+        delete ACTIVE[runId];
+        delete SIGNALS[cancelId];
+        ACTIVE_COUNT--;
+        if (ACTIVE_COUNT === 0) runTick(mcpIdleDisconnect);
+        if (traceStorage && traceStorage.db && typeof traceStorage.db.flush === 'function') {
+          try { traceStorage.db.flush(); }
+          catch (eFl) { /* the checkpoint lives in sofuu.state, not this trace store. */ }
+        }
+        if (depth === 0) {
+          try { if (typeof __sofuu_gc === 'function') __sofuu_gc(); }
+          catch (eGc) { /* a host without GC can still park. */ }
+        }
+        return e.result;
+      }
       /* SPEC §3 fatal path: fatal_error -> halt -> crash card, then the
        * existing cleanup untouched. A thrown run must never leave the log
        * without a terminal event; a CANCEL is a stop, not a failure, so it
@@ -6862,9 +7115,102 @@
     return resTrace;
   }
 
+  /* P4: the effective R7 document, canonicalised for equality checks. Null
+   * means "no policy surface", which is itself a snapshot value. */
+  function policySnapshot() {
+    try {
+      if (typeof sofuu === 'undefined' || !sofuu.policy || typeof sofuu.policy.get !== 'function') return null;
+      var raw = sofuu.policy.get();
+      if (raw === undefined || raw === null) return null;
+      var obj = (typeof raw === 'string') ? JSON.parse(raw) : raw;
+      return JSON.stringify(obj);
+    } catch (e) { return null; }
+  }
+
+  /* P4 resolution path. The token check is constant time, expiry is checked
+   * before the single-use consume, and the originating policy document must
+   * still match — a resume can never widen R7. */
+  async function resumeParkedApproval(cp, runId, opts) {
+    if (!cp || cp.schema !== 'sofuu-approval@1' || cp.status !== 'awaiting_approval' ||
+        String(cp.runId || '') !== String(runId)) {
+      throw makeError('E_APPROVAL_TOKEN_INVALID',
+        'resume: no usable async approval checkpoint for run ' + runId);
+    }
+    var token = opts.approvalToken;
+    if (!token) {
+      throw makeError('E_APPROVAL_TOKEN_INVALID',
+        'resume: approvalToken is required for an async approval');
+    }
+    if (opts.approvalId !== undefined && opts.approvalId !== null &&
+        String(opts.approvalId) !== String(cp.approvalId)) {
+      throw makeError('E_APPROVAL_TOKEN_INVALID',
+        'resume: approvalId does not match the parked checkpoint');
+    }
+    if (!approvalTokenEq(token, cp.approvalToken)) {
+      throw makeError('E_APPROVAL_TOKEN_INVALID',
+        'resume: approvalToken is invalid for run ' + runId);
+    }
+    if (!Number.isFinite(Number(cp.expiresAt)) || Date.now() > Number(cp.expiresAt)) {
+      var expStore = approvalStore(opts);
+      if (expStore) { try { expStore.delete(approvalKey(runId)); } catch (eDel) { /* already expired */ } }
+      throw makeError('E_APPROVAL_EXPIRED',
+        'resume: the approval for run ' + runId + ' expired at ' +
+        new Date(Number(cp.expiresAt) || 0).toISOString());
+    }
+    var decision = String(opts.decision || '').toLowerCase();
+    if (!decision && opts.allow === true) decision = 'allow';
+    if (!decision && opts.allow === false) decision = 'deny';
+    if (decision !== 'allow' && decision !== 'deny') {
+      throw makeError('E_INVALID_ARGS', 'resume: decision must be \'allow\' or \'deny\'');
+    }
+    /* R7 drift check BEFORE consuming: a policy that no longer matches the
+     * originating run either narrows (safe but different) or widens (the
+     * thing the plan forbids). Refuse to guess; start a new run instead. */
+    var snap = policySnapshot();
+    if (cp.policySnapshot !== undefined && cp.policySnapshot !== snap) {
+      throw makeError('E_DENIED',
+        'resume: policy changed since the approval was parked; refusing to resume under a different R7 document');
+    }
+    /* Single-use: a consumed token cannot be replayed, even if the resumed
+     * run then fails. The checkpoint payload is already in memory. */
+    var store = approvalStore(opts);
+    if (!store) {
+      throw makeError('E_CAPABILITY', 'resume: sofuu.state is unavailable in this build');
+    }
+    store.delete(approvalKey(runId));
+
+    var profile = stricterProfile(cp.permissionProfile, PERMISSION_PROFILE);
+    /* An explicit resume profile is only ever allowed to narrow further;
+     * it cannot lift the snapshot taken when the run parked. */
+    if (opts.permissionProfile) profile = stricterProfile(profile, opts.permissionProfile);
+    var ropts = Object.assign({}, opts, {
+      resumeRunId: String(runId),
+      resumeFrom: {
+        step: cp.step, messages: cp.messages, task: cp.task,
+        model: cp.model, provider: cp.provider, tokens: cp.tokens
+      },
+      resumeBaseMessages: cp.baseMessages,
+      _resumeApproval: {
+        decision: decision,
+        pending: cp.pending,
+        approvalId: cp.approvalId
+      },
+      _approvedToolCallId: decision === 'allow' ? String(cp.pending && cp.pending.id || '') : '',
+      approvalMode: 'async',
+      permissionProfile: profile
+    });
+    if (cp.budget && typeof cp.budget === 'object') ropts.budget = cp.budget;
+    delete ropts.approvalId;
+    delete ropts.approvalToken;
+    delete ropts.decision;
+    return run(cp.agentName, cp.task, ropts);
+  }
+
   /* Phase 4: State reconstruction & execution replay */
   async function resume(runId, opts) {
     opts = opts || {};
+    var parked = loadApprovalCheckpoint(runId, opts);
+    if (parked) return resumeParkedApproval(parked, runId, opts);
     var trace = await getTrace(runId, opts);
     if (!trace || trace.length === 0) {
       throw makeError('E_TRACE_NOT_FOUND', 'No trace found for run: ' + runId);
@@ -6998,6 +7344,7 @@
           try {
             results[i] = await run(it.agent, it.task, it.opts || {});
           } catch (e) {
+            if (e && e._sofuuApprovalPark) throw e;
             results[i] = { runId: '', name: String(it.agent || ''), answer: '',
                            steps: 0, subRuns: [], usage: { promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, llmCalls: 0, toolCalls: 0 },
                            trace: [], stopped: 'error', error: String((e && e.message) || e) };
@@ -7454,7 +7801,12 @@
       var valFlags = {
         '--provider': 1, '-p': 1, '--model': 1, '-m': 1, '--api-key': 1,
         '--base-url': 1, '--profile': 1, '--models-config': 1, '--config': 1,
-        '-c': 1, '--arg': 1, '--edit-model': 1
+        '-c': 1, '--arg': 1, '--edit-model': 1,
+        '--channels-config': 1, '--channels': 1, '--channel': 1,
+        '--channel-name': 1, '--access-token': 1, '--phone-number-id': 1,
+        '--app-secret': 1, '--verify-token': 1, '--url': 1,
+        '--default-recipient': 1, '--allowed-senders': 1, '--network-mode': 1,
+        '--api-base': 1, '--type': 1, '--edit-channel': 1,
       };
       var positional = [];
       for (var ai = 0; ai < sofuu.args.length; ai++) {

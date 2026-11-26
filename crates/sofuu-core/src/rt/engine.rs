@@ -531,6 +531,14 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) -> Result<(), &'static
         crate::rt::policy::mod_policy_register(ctx);
     }
 
+    // PLAN-AUTONOMOUS-REACTIVE-RUNTIME P1: operational state
+    // (sofuu.state.*) — atomic cooldowns, cursors and rate windows, kept
+    // distinct from QTSQ/CMA semantic memory. Registered before the shipped
+    // drivers because triggers.js opens a namespace at registration time.
+    unsafe {
+        crate::rt::state::mod_state_register(ctx);
+    }
+
     // Phase 5 (agent loop): parse-only syntax gate (sofuu.parse) for the
     // edit tool's dry run - compiles the candidate, never executes it.
     unsafe {
@@ -585,6 +593,7 @@ unsafe fn engine_register_micro_builtins(eng: *mut SofuuEngine) {
         crate::rt::async_context::mod_async_context_register(ctx);
         crate::rt::sandbox::mod_sandbox_register(ctx);
         crate::rt::policy::mod_policy_register(ctx);
+        crate::rt::state::mod_state_register(ctx);
     }
     unsafe { build_sofuu_global(ctx) };
 }

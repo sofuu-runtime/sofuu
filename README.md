@@ -417,6 +417,36 @@ sofuu compile agent.kaze -o dist/kaze-agent
 
 ---
 
+## Messaging Channels & Network Boundary
+
+`sofuu.channels` is a platform-level messaging subsystem: Telegram, WhatsApp
+Cloud API, Slack/Discord/ntfy-style webhooks, and native desktop notifications,
+with verified two-way inbound messages routed into any agent. The transports are
+fully domain-agnostic — an adapter sends exactly the text it is handed.
+
+```js
+await sofuu.channels.send({ title: 'Alert', text: 'Threshold crossed.', severity: 'warn' });
+
+const sub = sofuu.channels.listen({
+  agent: 'ops_assistant',      // tagged external prompt, per-sender session
+  permissionProfile: 'plan',   // remote senders cannot write or run shell by default
+});
+```
+
+Configure with `channels.json` and the same discovery model as `models.json`:
+`--channels-config`, `SOFUU_CHANNELS_CONFIG`, `<binary>.channels.json`, then
+`channels.json`. Secrets accept `env:VAR_NAME`; the wizard writes `0600` files.
+Telegram inbound uses outbound long polling (zero open ports). WhatsApp and
+generic webhooks arrive through `sofuu gateway` or the `/webhooks/*` routes on
+`sofuu serve`, with constant-time HMAC/bearer checks, sender allowlists, body
+caps, replay deduplication and loopback-first binding. Public binds require
+`channels.inbound.allow_public_bind: true` in policy.
+
+See [CHANNELS.md](CHANNELS.md) for the full schema, API, security model and
+deployment guidance.
+
+---
+
 ## CLI Cheatsheet
 
 ```bash
@@ -430,6 +460,11 @@ sofuu agent run <name> "task"  # Run an autonomous agent headless
 sofuu script run <file.kaze>   # Run a pure Kaze agent routine
 sofuu compile <file.kaze|ts>   # Compile agent into standalone native binary (under 10 MB)
 sofuu daemon install|run       # Manage a supervisor daemon
+
+# Messaging Channels
+sofuu run agent.js --setup-channel   # Configure Telegram/WhatsApp/webhook/desktop
+sofuu run agent.js --list-channels   # Masked channel table + network mode
+sofuu gateway                        # Loopback webhook ingress (127.0.0.1:8788)
 
 # Model Context Protocol (MCP)
 sofuu mcp list                      # List configured MCP servers

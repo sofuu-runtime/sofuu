@@ -27,10 +27,12 @@ fn install_compiled_prelude(
     rt: &SofuuRuntime,
     brain: Option<&sofuu_core::compiler::MountedBrain>,
     resolved_models: &sofuu_core::model_config::ResolvedAgentModel,
+    resolved_channels: &sofuu_core::channel_config::ResolvedChannels,
 ) {
     let argv: Vec<String> = env::args().skip(1).collect();
     let argv_json = serde_json::to_string(&argv).unwrap_or_else(|_| "[]".to_string());
     let models_prelude = sofuu_core::model_config::js_prelude_for(resolved_models);
+    let channels_prelude = sofuu_core::channel_config::js_prelude_for(resolved_channels);
     let embedded = match brain {
         Some(b) => {
             let path = serde_json::to_string(&b.path).unwrap_or_else(|_| "\"\"".to_string());
@@ -42,9 +44,78 @@ fn install_compiled_prelude(
         None => String::new(),
     };
     let js = format!(
-        "{models_prelude}(function(){{var S=globalThis.sofuu;if(!S)return;try{{S.args={argv_json};}}catch(e){{}}if(!S.memory)return;{embedded}}})();"
+        "{models_prelude}{channels_prelude}(function(){{var S=globalThis.sofuu;if(!S)return;try{{S.args={argv_json};}}catch(e){{}}if(!S.memory)return;{embedded}}})();"
     );
     let _ = rt.eval_string(&js, "<compiled-prelude>");
+}
+
+/// Parse a `--every` value (`500ms`, `2s`, `1m`, `1h`, `1d`, or a bare
+/// millisecond count) into milliseconds. Mirrors the daemon CLI's parser and
+/// the JS `sofuu.triggers.parseDuration` contract.
+fn parse_every_ms(raw: &str) -> Option<u64> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mul) = if let Some(v) = s.strip_suffix("ms") {
+        (v, 1.0)
+    } else if let Some(v) = s.strip_suffix('s') {
+        (v, 1000.0)
+    } else if let Some(v) = s.strip_suffix('m') {
+        (v, 60_000.0)
+    } else if let Some(v) = s.strip_suffix('h') {
+        (v, 3_600_000.0)
+    } else if let Some(v) = s.strip_suffix('d') {
+        (v, 86_400_000.0)
+    } else {
+        (s.as_str(), 1.0)
+    };
+    let n: f64 = num.trim().parse().ok()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    Some((n * mul) as u64)
+}
+
+/// PLAN-AUTONOMOUS-REACTIVE-RUNTIME P2: make `--daemon` / `--every` reach
+/// `sofuu.triggers` in the embedded program.
+///
+/// A reactive agent is the same code under `sofuu run`, a compiled artifact
+/// and `sofuu daemon install`. The trigger driver reads
+/// `SOFUU_DAEMON_INTERVAL_MS` when a spec omits `every`, so the OS service
+/// manager's cadence is honoured without re-spawning a QuickJS process every
+/// few seconds. `SOFUU_DAEMON=1` lets an app detect the supervised mode.
+fn apply_daemon_env(args: &[String]) {
+    let mut daemon = false;
+    let mut every: Option<String> = None;
+    let mut i = 1usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            break;
+        }
+        if a == "--daemon" || a == "-d" {
+            daemon = true;
+        } else if (a == "--every" || a == "--interval") && i + 1 < args.len() {
+            every = Some(args[i + 1].clone());
+            i += 1;
+        } else if let Some(v) = a.strip_prefix("--every=") {
+            every = Some(v.to_string());
+        } else if let Some(v) = a.strip_prefix("--interval=") {
+            every = Some(v.to_string());
+        }
+        i += 1;
+    }
+    if daemon {
+        env::set_var("SOFUU_DAEMON", "1");
+    }
+    if let Some(raw) = every {
+        if let Some(ms) = parse_every_ms(&raw) {
+            env::set_var("SOFUU_DAEMON_INTERVAL_MS", ms.to_string());
+        } else {
+            eprintln!("Warning: --every '{raw}' is not a duration (use 500ms, 2s, 1m, 1h)");
+        }
+    }
 }
 
 
@@ -64,6 +135,25 @@ fn artifact_arg_gate(args: &[String], is_kaze: bool) -> Option<ExitCode> {
         "--api-key",
         "--base-url",
         "--profile",
+    ];
+    let channel_value_flags = [
+        "--channels-config",
+        "--channels",
+        "--channel",
+        "--type",
+        "--channel-type",
+        "--channel-name",
+        "--token",
+        "--access-token",
+        "--phone-number-id",
+        "--app-secret",
+        "--verify-token",
+        "--url",
+        "--default-recipient",
+        "--allowed-senders",
+        "--allowed-sender",
+        "--network-mode",
+        "--api-base",
     ];
     let mut i = 1usize;
     while i < args.len() {
@@ -92,11 +182,19 @@ fn artifact_arg_gate(args: &[String], is_kaze: bool) -> Option<ExitCode> {
                      \x20 --model, -m <name>       Override model name\n\
                      \x20 --api-key <key>          Override API key for this run\n\
                      \x20 --base-url <url>         Override endpoint base URL\n\n\
+                     Messaging Options (per-agent channels.json):\n\
+                     \x20 --setup-channel          Interactive wizard to add/configure a channel\n\
+                     \x20 --edit-channel [name]    Edit, switch, add, or remove configured channels\n\
+                     \x20 --list-channels          Show channels configured for this binary\n\
+                     \x20 --channels-config <path> Use a specific channels.json file\n\
+                     \x20 --channel <name>         Override the active channel for this run\n\n\
                      Runtime Options:\n\
                      \x20 --interactive, -i        Launch interactive session (when supported)\n\
                      \x20 --arg name=value         Bind one routine parameter (repeatable)\n\
                      \x20 --config <path>          JSON configuration file\n\
                      \x20 --json                   Machine-readable output where the program supports it\n\
+                     \x20 --daemon, -d             Run the program's reactive loop under a supervisor\n\
+                     \x20 --every <duration>       Loop cadence (500ms, 2s, 1m, 1h; SOFUU_DAEMON_INTERVAL_MS)\n\
                      \x20 --version, -V            Print the artifact version and exit\n\
                      \x20 --help, -h               This text\n\
                      \x20 --                       Pass everything after this through untouched\n",
@@ -106,7 +204,7 @@ fn artifact_arg_gate(args: &[String], is_kaze: bool) -> Option<ExitCode> {
             }
             _ => {}
         }
-        if model_value_flags.contains(&a) {
+        if model_value_flags.contains(&a) || channel_value_flags.contains(&a) {
             if i + 1 >= args.len() || args[i + 1].starts_with("--") {
                 eprintln!("Error: {} needs a value", a);
                 return Some(ExitCode::from(2));
@@ -114,7 +212,7 @@ fn artifact_arg_gate(args: &[String], is_kaze: bool) -> Option<ExitCode> {
             i += 2;
             continue;
         }
-        if a == "--edit-model" {
+        if a == "--edit-model" || a == "--edit-channel" {
             if i + 1 < args.len() && !args[i + 1].starts_with('-') {
                 i += 2;
             } else {
@@ -124,10 +222,18 @@ fn artifact_arg_gate(args: &[String], is_kaze: bool) -> Option<ExitCode> {
         }
         if a == "--setup-model"
             || a == "--list-models"
+            || a == "--setup-channel"
+            || a == "--list-channels"
+            || a == "--allow-anonymous"
+            || a == "--test-send"
             || a == "--interactive"
             || a == "-i"
             || a.starts_with("--edit-model=")
+            || a.starts_with("--edit-channel=")
             || model_value_flags
+                .iter()
+                .any(|f| a.strip_prefix(f).is_some_and(|rest| rest.starts_with('=')))
+            || channel_value_flags
                 .iter()
                 .any(|f| a.strip_prefix(f).is_some_and(|rest| rest.starts_with('=')))
         {
@@ -136,7 +242,8 @@ fn artifact_arg_gate(args: &[String], is_kaze: bool) -> Option<ExitCode> {
         }
         let takes_value = ["--arg", "--config", "-c", "--entry", "--cap", "--policy",
             "--pin", "--sim", "--fuel", "--every", "--interval"];
-        if is_kaze && takes_value.contains(&a) {
+        let artifact_every = a == "--every" || a == "--interval";
+        if (is_kaze || artifact_every) && takes_value.contains(&a) {
             if i + 1 >= args.len() || args[i + 1].starts_with("--") {
                 eprintln!("Error: {} needs a value", a);
                 return Some(ExitCode::from(2));
@@ -147,13 +254,17 @@ fn artifact_arg_gate(args: &[String], is_kaze: bool) -> Option<ExitCode> {
         let known_kaze = is_kaze && (takes_value.iter().any(|flag| a.strip_prefix(flag)
             .is_some_and(|rest| rest.starts_with('=')))
             || matches!(a, "--interactive" | "-i" | "--daemon" | "-d"));
-        let known = known_kaze || a.starts_with("--arg") || a.starts_with("--config") || a == "--json";
+        let known = known_kaze
+            || matches!(a, "--daemon" | "-d")
+            || a.strip_prefix("--every=").is_some_and(|rest| !rest.is_empty())
+            || a.strip_prefix("--interval=").is_some_and(|rest| !rest.is_empty())
+            || a.starts_with("--arg") || a.starts_with("--config") || a == "--json";
         if a.starts_with('-') && !known {
             eprintln!("Error: Unrecognized flag '{}'", a);
             if is_kaze {
                 eprintln!("  use --help for the Kaze agent options");
             } else {
-                eprintln!("  accepted: --setup-model, --edit-model, --list-models, --provider, --model, --config, --arg, --json, --version, --help, --");
+                eprintln!("  accepted: --setup-model, --edit-model, --list-models, --setup-channel, --edit-channel, --list-channels, --provider, --model, --channel, --config, --arg, --json, --version, --help, --");
             }
             return Some(ExitCode::from(2));
         }
@@ -166,7 +277,9 @@ fn run_compiled_payload(
     args: &[String],
     target: &sofuu_core::model_config::AgentTarget,
 ) -> ExitCode {
+    apply_daemon_env(args);
     let resolved_models = sofuu_core::model_config::apply_runtime_config(args, target);
+    let resolved_channels = sofuu_core::channel_config::apply_runtime_config(args, target);
     let rt = match SofuuRuntime::init() {
         Some(rt) => rt,
         None => {
@@ -181,7 +294,7 @@ fn run_compiled_payload(
             None
         }
     };
-    install_compiled_prelude(&rt, brain.as_ref(), &resolved_models);
+    install_compiled_prelude(&rt, brain.as_ref(), &resolved_models, &resolved_channels);
 
     // SAFETY: engine_ctx() is this runtime's live QuickJS context.
     let rc = unsafe {
@@ -208,6 +321,9 @@ fn main() -> ExitCode {
             }
             let target = sofuu_core::model_config::AgentTarget::binary(&args[0]);
             if let Some(code) = sofuu_core::model_config::handle_cli_command(&args, &target) {
+                return code;
+            }
+            if let Some(code) = sofuu_core::channel_config::handle_cli_command(&args, &target) {
                 return code;
             }
             let mut payload_argv: Vec<String> = Vec::with_capacity(args.len() + 1);
@@ -251,10 +367,12 @@ fn main() -> ExitCode {
         println!("  The entry script gets the agent runtime: sofuu.agent, sofuu.ai,");
         println!("  sofuu.tools and sofuu.memory, plus SOFUU_* / AGENT_* configuration.");
         println!("  A Kaze agent runs through: sofuu script run <agent.kaze>");
+        println!("  Reactive agents: --daemon --every 60s (or SOFUU_DAEMON_INTERVAL_MS).");
         return ExitCode::SUCCESS;
     }
 
     let script = &args[1];
+    apply_daemon_env(&args);
     let rt = match SofuuRuntime::init() {
         Some(rt) => rt,
         None => {

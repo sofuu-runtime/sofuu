@@ -542,6 +542,36 @@ unsafe extern "C" fn js_crypto_digest(
     text_result(ctx, &crate::rt::digest::hex(&crate::rt::digest::digest(alg, &data)))
 }
 
+/// sofuu.crypto.timingSafeEqual(a, b) -> boolean.
+///
+/// Constant-time for equal-length inputs and for length mismatches (the
+/// length is folded into the accumulator and the loop always runs max(len)).
+/// Channel HMAC checks and webhook verify tokens use this instead of `===`,
+/// which short-circuits on the first differing byte.
+pub fn timing_safe_equal(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u8;
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    diff == 0
+}
+
+unsafe extern "C" fn js_crypto_timing_safe_equal(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 2 {
+        return qjs::sofuu_js_new_bool(ctx, 0);
+    }
+    let (Some(a), Some(b)) = (arg_string(ctx, *argv), arg_string(ctx, *argv.add(1))) else {
+        return qjs::sofuu_js_new_bool(ctx, 0);
+    };
+    qjs::sofuu_js_new_bool(ctx, if timing_safe_equal(a.as_bytes(), b.as_bytes()) { 1 } else { 0 })
+}
+
 /// sofuu.crypto.hmac(alg, keyHex, dataHex) -> hex MAC (RFC 2104).
 ///
 /// The key is part of the computation; before JR-053 the shim dropped it and
@@ -740,10 +770,11 @@ pub unsafe fn mod_crypto_register(ctx: *mut JSContext) {
     let functions: [(
         &std::ffi::CStr,
         unsafe extern "C" fn(*mut JSContext, JSValueConst, c_int, *const JSValueConst) -> JSValue,
-    ); 8] = [
+    ); 9] = [
         (c"sha256", js_crypto_sha256),
         (c"digest", js_crypto_digest),
         (c"hmac", js_crypto_hmac),
+        (c"timingSafeEqual", js_crypto_timing_safe_equal),
         (c"base64urlEncode", js_crypto_base64url_encode),
         (c"base64urlDecode", js_crypto_base64url_decode),
         (c"verifyJWT", js_crypto_verify_jwt),
@@ -873,6 +904,14 @@ mod tests {
         });
         let error = validate_claims(&wrong, &options()).unwrap_err();
         assert_eq!(error.code, "azp_mismatch");
+    }
+
+    #[test]
+    fn timing_safe_equal_matches_bytes_and_rejects_length_mismatch() {
+        assert!(timing_safe_equal(b"sha256=abc", b"sha256=abc"));
+        assert!(!timing_safe_equal(b"sha256=abc", b"sha256=abd"));
+        assert!(!timing_safe_equal(b"abc", b"abcd"));
+        assert!(timing_safe_equal(b"", b""));
     }
 
     #[test]

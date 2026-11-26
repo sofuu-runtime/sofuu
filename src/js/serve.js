@@ -129,6 +129,8 @@
       port: num(opts.port, 8080),
       version: str(opts.version) || '0.1.0',
       project: str(opts.project) || str(opts.cwd),
+      /* P4: server-wide default for agent runs that do not name a mode. */
+      approvalMode: str(opts.approvalMode) || 'deny',
       /* SV-02: see the /health route — set by the Rust boot call from
        * --public-health. */
       publicHealth: opts.publicHealth === true,
@@ -703,9 +705,28 @@
     var wantStream = data.stream !== false;
     var id = 'run-' + Math.random().toString(36).slice(2, 12);
     var events = [];
+    var approval = null;
     var opts = {
       provider: 'local',
       model: modelPath,
+      /* P4 async HITL: opt in explicitly with {"approvalMode":"async"} (or a
+       * server-wide config). The token rides this authenticated response /
+       * SSE stream only; it is never written to the event log. */
+      approvalMode: str(data.approvalMode) || cfg.approvalMode || 'deny',
+      onApprovalRequest: function (req) {
+        approval = req;
+        if (wantStream) {
+          try {
+            sseData(res, {
+              run_id: req.runId, awaiting_approval: {
+                run_id: req.runId, approval_id: req.approvalId,
+                approval_token: req.approvalToken, tool: req.tool,
+                args: req.args, expires_at: new Date(req.expiresAt).toISOString()
+              }
+            });
+          } catch (eW) { /* the checkpoint is durable; the client can poll the run id. */ }
+        }
+      },
       onStep: function (ev) {
         events.push(ev);
         if (wantStream) {
@@ -716,24 +737,36 @@
     if (wantStream) sseHead(res);
     try {
       var result = await sofuu.agent.run(def, task, opts);
+      var realId = (result && result.runId) || id;
+      var awaiting = null;
+      if (result && result.stopped === 'awaiting_approval' && approval) {
+        awaiting = {
+          run_id: realId, approval_id: approval.approvalId,
+          approval_token: approval.approvalToken, tool: approval.tool,
+          args: approval.args,
+          expires_at: new Date(approval.expiresAt).toISOString()
+        };
+      }
       if (wantStream) {
         sseData(res, {
-          run_id: id,
+          run_id: realId,
           done: true,
           answer: result && result.answer,
           usage: (result && result.usage) || null,
           steps: (result && result.steps) || events.length,
           stopped: !!(result && result.stopped),
+          awaiting_approval: awaiting || undefined,
         });
         res.write('data: [DONE]\n\n');
         res.end();
       } else {
         send(res, 200, {
-          run_id: id,
+          run_id: realId,
           answer: result && result.answer,
           usage: (result && result.usage) || null,
           steps: (result && result.steps) || events.length,
           stopped: !!(result && result.stopped),
+          awaiting_approval: awaiting || undefined,
         });
       }
     } catch (eR) {
@@ -813,6 +846,7 @@
         var path = String(req.url || '/').split('?')[0];
         var method = String(req.method || 'GET').toUpperCase();
         heavy = path.indexOf('/v1/') === 0
+          || path.indexOf('/webhooks/') === 0
           || path === '/chat/completions' || path === '/completions'
           || path === '/infer' || path === '/remember' || path === '/recall'
           || path === '/memories' || path === '/forget' || path === '/share';
@@ -882,6 +916,21 @@
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(typeof caps === 'string' ? caps : JSON.stringify(caps));
           return;
+        }
+
+        /* Generalized messaging channels: WhatsApp Cloud API verification and
+         * signed event delivery, generic webhook ingress, Telegram webhook
+         * mode. These endpoints authenticate their own caller (HMAC over the
+         * raw body, verify-token handshake, X-Telegram-Bot-Api-Secret-Token),
+         * so an external provider — which cannot present the serve bearer —
+         * can reach them. The driver fails closed when a secret is missing and
+         * answers its own HTTP status; anything it does not own falls through
+         * to the normal 404 after the bearer gate below. */
+        if (path.indexOf('/webhooks/') === 0 &&
+            typeof sofuu !== 'undefined' && sofuu.channels &&
+            typeof sofuu.channels.handleWebhook === 'function') {
+          var chHandled = await sofuu.channels.handleWebhook(req, res, path);
+          if (chHandled) return;
         }
 
         if (authMode() !== 'none') {
@@ -1045,6 +1094,41 @@
             return;
           }
           await agentRun(cfg, req, res, adata, amp);
+          return;
+        }
+
+        /* P4 async HITL: POST /v1/agent/runs/:id/approve
+         * Body: { approvalId, approvalToken, decision: 'allow' | 'deny' }.
+         * The token is validated in constant time by the agent driver; an
+         * expired or consumed checkpoint fails closed. */
+        var approveMatch = /^\/v1\/agent\/runs\/([^/]+)\/approve$/.exec(path);
+        if (method === 'POST' && approveMatch) {
+          var pbody = readJson(req);
+          if (!pbody.ok) { fail(res, 400, pbody.error, 'invalid_request_error', 'invalid_json'); return; }
+          var pdata = pbody.data || {};
+          var prun = '';
+          try { prun = decodeURIComponent(approveMatch[1]); }
+          catch (eDec) { prun = approveMatch[1]; }
+          try {
+            var pr = await sofuu.agent.resume(prun, {
+              approvalId: str(pdata.approvalId || pdata.approval_id),
+              approvalToken: str(pdata.approvalToken || pdata.approval_token),
+              decision: str(pdata.decision || (pdata.allow === true ? 'allow' : 'deny')),
+            });
+            send(res, 200, {
+              ok: true, run_id: prun, resumed: true,
+              answer: pr && pr.answer, stopped: pr && pr.stopped,
+              usage: (pr && pr.usage) || null, steps: (pr && pr.steps) || 0,
+            });
+          } catch (eAp) {
+            var apCode = String((eAp && eAp.code) || '');
+            var apStatus = apCode === 'E_APPROVAL_EXPIRED' ? 410
+              : (apCode === 'E_APPROVAL_TOKEN_INVALID' || apCode === 'E_DENIED') ? 403
+              : apCode === 'E_CAPABILITY' ? 501 : 400;
+            fail(res, apStatus, String((eAp && eAp.message) || eAp),
+              apStatus === 403 ? 'authentication_error' : 'invalid_request_error',
+              apCode || 'approval_failed');
+          }
           return;
         }
 

@@ -342,18 +342,34 @@ export async function loadAlgorithms(customDir, enabledIds = null) {
   if (customDir) {
     const absDir = path.resolve(process.cwd(), customDir);
     if (fs.existsSync(absDir)) {
-      const files = fs.readdirSync(absDir).filter((f) => f.endsWith('.js')).sort();
-      for (const file of files) {
-        const fullPath = path.join(absDir, file);
-        try {
-          const mod = await import(fullPath);
-          const candidate = mod.default || mod.algorithm || mod;
-          if (
-            candidate &&
-            typeof candidate.id === 'string' &&
-            typeof candidate.evaluate === 'function'
-          ) {
-            if (!allowSet || allowSet.has(candidate.id) || candidate.alwaysEnabled !== false) {
+      if (typeof sofuu !== 'undefined' && sofuu.evaluators) {
+        // The runtime validates each module's { id, evaluate } contract and
+        // reports a broken file without taking down the scan loop.
+        const loaded = await sofuu.evaluators.loadDir(absDir);
+        for (const err of loaded.errors) {
+          console.error(`[algos] Failed to load custom algorithm ${path.basename(err.file)}: ${err.error.message}`);
+        }
+        for (const ev of loaded.evaluators) {
+          active.push({
+            id: ev.id,
+            name: ev.name || ev.id,
+            builtin: false,
+            file: ev.file,
+            evaluate: ev.evaluate,
+          });
+        }
+      } else {
+        const files = fs.readdirSync(absDir).filter((f) => f.endsWith('.js')).sort();
+        for (const file of files) {
+          const fullPath = path.join(absDir, file);
+          try {
+            const mod = await import(fullPath);
+            const candidate = mod.default || mod.algorithm || mod;
+            if (
+              candidate &&
+              typeof candidate.id === 'string' &&
+              typeof candidate.evaluate === 'function'
+            ) {
               active.push({
                 id: candidate.id,
                 name: candidate.name || candidate.id,
@@ -362,9 +378,9 @@ export async function loadAlgorithms(customDir, enabledIds = null) {
                 evaluate: candidate.evaluate,
               });
             }
+          } catch (err) {
+            console.error(`[algos] Failed to load custom algorithm ${file}: ${err.message}`);
           }
-        } catch (err) {
-          console.error(`[algos] Failed to load custom algorithm ${file}: ${err.message}`);
         }
       }
     }

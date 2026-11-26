@@ -73,6 +73,32 @@ pub const STORAGE_JS: &str = include_str!("../../../src/js/storage.js");
 #[cfg(not(debug_assertions))]
 pub const STORAGE_JS: &str = "";
 pub const STORAGE_BC: &[u8] = include_bytes!("../../../src/js/storage.bc.gz");
+/// The operational-state driver — single source of truth is src/js/state.js
+/// (PLAN-AUTONOMOUS-REACTIVE-RUNTIME P1). Pure JS over the native
+/// __sofuu_state_* host functions; QTSQ/CMA stays semantic memory.
+#[cfg(debug_assertions)]
+pub const STATE_JS: &str = include_str!("../../../src/js/state.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const STATE_JS: &str = "";
+pub const STATE_BC: &[u8] = include_bytes!("../../../src/js/state.bc.gz");
+/// The deterministic evaluator loader — single source of truth is
+/// src/js/evaluators.js (PLAN-AUTONOMOUS-REACTIVE-RUNTIME P3).
+#[cfg(debug_assertions)]
+pub const EVALUATORS_JS: &str = include_str!("../../../src/js/evaluators.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const EVALUATORS_JS: &str = "";
+pub const EVALUATORS_BC: &[u8] = include_bytes!("../../../src/js/evaluators.bc.gz");
+/// The reactive trigger engine — single source of truth is src/js/triggers.js
+/// (PLAN-AUTONOMOUS-REACTIVE-RUNTIME P2). Eval'd after state/evaluators
+/// because a gate receives the StateStore and may score an evaluator suite.
+#[cfg(debug_assertions)]
+pub const TRIGGERS_JS: &str = include_str!("../../../src/js/triggers.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const TRIGGERS_JS: &str = "";
+pub const TRIGGERS_BC: &[u8] = include_bytes!("../../../src/js/triggers.bc.gz");
 /// The chat turn engine — single source of truth is src/js/chat.js
 /// (PLAN-DESKTOP C). Eval'd LAST: it builds on sofuu.agent/web/tools and
 /// exposes sofuu.chat.* for embedded hosts (the desktop app). Hosts that
@@ -93,6 +119,15 @@ pub const SERVE_JS: &str = include_str!("../../../src/js/serve.js");
 #[cfg(not(debug_assertions))]
 pub const SERVE_JS: &str = "";
 pub const SERVE_BC: &[u8] = include_bytes!("../../../src/js/serve.bc.gz");
+/// Generalized messaging channels (`sofuu.channels`). Pure JS over fetch,
+/// sofuu.crypto, sofuu.spawn, sofuu.state and sofuu.http; the Rust side only
+/// resolves channels.json and injects the process-local prelude.
+#[cfg(debug_assertions)]
+pub const CHANNELS_JS: &str = include_str!("../../../src/js/channels.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const CHANNELS_JS: &str = "";
+pub const CHANNELS_BC: &[u8] = include_bytes!("../../../src/js/channels.bc.gz");
 /// The recursive language model driver — single source of truth is src/js/rlm.js.
 #[cfg(debug_assertions)]
 pub const RLM_JS: &str = include_str!("../../../src/js/rlm.js");

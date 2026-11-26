@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub mod bridge;
 pub mod curl; // M4: fetch() over libcurl (multi-handle ↔ libuv bridge)
 pub mod http_parser; // M5: vendored http-parser (server req parsing)
+pub mod kaze; // Plan 14: libsofuu_kaze.a (pure Kaze-in-C compiler + C99 VM)
 pub mod qjs;
 pub mod qjs_rt;
 #[cfg(has_qtsq)]

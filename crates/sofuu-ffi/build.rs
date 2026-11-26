@@ -148,6 +148,30 @@ fn main() {
     cc.compile("sofuu_core");
     println!("cargo:rustc-link-search=native={}", out_dir.display());
 
+    // ── Kaze embedded engine (pure Kaze-in-C + C99 VM) ──────────
+    // The compiler, VM and runtime are one library shared with the standalone
+    // `kaze` CLI. No Rust code is inside it: build.rs only invokes the system
+    // C compiler, exactly as it does for QuickJS. KAZE_EMBEDDED suppresses the
+    // emitted compiler's process exits.
+    let kaze_dir = deps.join("kaze");
+    let mut kaze = cc::Build::new();
+    kaze.opt_level_str("s")
+        .warnings(false)
+        .include(&kaze_dir)
+        .define("KAZE_EMBEDDED", None)
+        .flag_if_supported("-std=c99")
+        .flag_if_supported("-Wno-unused-parameter")
+        .flag_if_supported("-Wno-unused-function");
+    for source in ["kaze_rt.c", "kaze_vm.c", "kaze_embed.c"] {
+        let path = kaze_dir.join(source);
+        kaze.file(&path);
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    for header in ["kaze_rt.h", "kaze_vm.h", "kaze_embed.h"] {
+        println!("cargo:rerun-if-changed={}", kaze_dir.join(header).display());
+    }
+    kaze.compile("sofuu_kaze");
+
     // ── Inference C++ Microkernels ──────────────────────────────
     // Hot SIMD GEMV kernels (Q4_0, Q8_0, F16, F32, RMSNorm, RoPE, SwiGLU)
     // compiled with full C++ optimization (-O3, -ffast-math) where C++

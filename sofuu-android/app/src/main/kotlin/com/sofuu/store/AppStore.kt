@@ -202,6 +202,11 @@ val runtimeEnv = RuntimeEnv(app)
     var activeHost: HostProfile? = null
         private set
 
+    /** Serializes host adoption: two quick taps on Connect used to build
+     *  two backends and fold every event twice. */
+    @Volatile
+    private var connectingHost = false
+
     /** Remote events are folded into the SAME reducer as local ones. */
     private val backendEvents = MutableSharedFlow<EngineEvent>(extraBufferCapacity = 512)
 
@@ -2433,51 +2438,62 @@ val runtimeEnv = RuntimeEnv(app)
             }
             return
         }
+        if (connectingHost) return
+        connectingHost = true
         viewModelScope.launch(Dispatchers.IO) {
-            val remote = RemoteChatBackend(profile, hostStore) { ev -> backendEvents.tryEmit(ev) }
-            val info = remote.checkHost()
-            if (info == null) {
-                remote.close()
-                withContext(Dispatchers.Main) {
-                    state = state.copy(hostStatus = "Could not reach ${profile.name}.")
-                    if (!quiet) systemRow("Host ${profile.displayAddress()} is unreachable — check the LAN address and token.")
-                }
-                return@launch
+            try {
+                adoptHost(profile, quiet)
+            } finally {
+                connectingHost = false
             }
-            withContext(Dispatchers.Main) {
-                if (state.streaming) saveCurrentSessionMessages()
-            }
-            // Closing flushes cursors to the encrypted store — Keystore
-            // work must never touch Main.
-            chat.close()
-            withContext(Dispatchers.Main) {
-                chat = remote
-                activeHost = profile
-                hostStore.setActiveId(profile.id)
-                hostStore.touch(profile)
-                state = state.copy(
-                    hosts = hostStore.hosts(),
-                    activeHostId = profile.id,
-                    hostConnected = true,
-                    hostStatus = null,
-                    hostModel = info.optString("model"),
-                    hostProvider = info.optString("provider"),
-                    permissions = info.optString("permissions").ifBlank { state.permissions },
-                    sessions = emptyList(),
-                    activeSessionId = null,
-                    messages = emptyList(),
-                    messageCache = emptyMap(),
-                    ctx = null,
-                    ctxCache = emptyMap(),
-                    approvals = emptyList(),
-                    streaming = false,
-                    phase = null,
-                    preview = null,
-                )
-                systemRow("Connected to ${profile.name} · ${profile.displayAddress()}")
-            }
-            refreshSessions(resumeNewest = true)
         }
+    }
+
+    /** Probe, then swap the backend and reset the visible transcript. */
+    private suspend fun adoptHost(profile: HostProfile, quiet: Boolean) {
+        val remote = RemoteChatBackend(profile, hostStore) { ev -> backendEvents.tryEmit(ev) }
+        val info = remote.checkHost()
+        if (info == null) {
+            remote.close()
+            withContext(Dispatchers.Main) {
+                state = state.copy(hostStatus = "Could not reach ${profile.name}.")
+                if (!quiet) systemRow("Host ${profile.displayAddress()} is unreachable — check the LAN address and token.")
+            }
+            return
+        }
+        withContext(Dispatchers.Main) {
+            if (state.streaming) saveCurrentSessionMessages()
+        }
+        // Closing flushes cursors to the encrypted store — Keystore
+        // work must never touch Main.
+        chat.close()
+        withContext(Dispatchers.Main) {
+            chat = remote
+            activeHost = profile
+            hostStore.setActiveId(profile.id)
+            hostStore.touch(profile)
+            state = state.copy(
+                hosts = hostStore.hosts(),
+                activeHostId = profile.id,
+                hostConnected = true,
+                hostStatus = null,
+                hostModel = info.optString("model"),
+                hostProvider = info.optString("provider"),
+                permissions = info.optString("permissions").ifBlank { state.permissions },
+                sessions = emptyList(),
+                activeSessionId = null,
+                messages = emptyList(),
+                messageCache = emptyMap(),
+                ctx = null,
+                ctxCache = emptyMap(),
+                approvals = emptyList(),
+                streaming = false,
+                phase = null,
+                preview = null,
+            )
+            systemRow("Connected to ${profile.name} · ${profile.displayAddress()}")
+        }
+        refreshSessions(resumeNewest = true)
     }
 
     fun disconnectHost() {

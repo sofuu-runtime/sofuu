@@ -498,6 +498,9 @@ fn print_host_help() {
                --model-id <id>        model id advertised to clients\n\
                --policy <file>        policy file applied before the host starts\n\
                --public-health        answer GET /health without a token\n\n\
+         \x1b[1mPairing administration:\x1b[0m\n\
+           sofuu host devices                 list paired phones and their ids\n\
+           sofuu host revoke <device-id>      drop that token (next request 401; a live host uses SOFUU_SERVE_TOKEN or ~/.sofuu/serve_token)\n\n\
          \x1b[1mRoutes:\x1b[0m\n\
            GET  /v1/host                          identity + live posture\n\
            GET  /v1/sessions                      chat sessions\n\
@@ -3275,6 +3278,116 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
 /// JS handler: chat-backed `/v1/sessions/*` routes, a replay ring, detached
 /// turns, pairing and paired-device tokens. Keeping ONE listener here means
 /// `sofuu serve` and `sofuu host` cannot drift on auth, policy or transport.
+/// `sofuu host devices` / `sofuu host revoke <id>` — pairing administration
+/// outside the request path. Reads the same `$HOME/.sofuu/state` namespace
+/// (`paired_devices`, 0600) the server uses; tokens are stored only as
+/// SHA-256 hashes, so this output can never leak a credential. Revoking
+/// while a host is live goes through its master-only route, because the
+/// running process would not see (and would later resurrect) a file delete.
+fn host_devices_cli(revoke: Option<String>) -> i32 {
+    let home = match sofuu_core::embed_config::home_dir() {
+        Some(h) => h,
+        None => {
+            eprintln!("\x1b[31mError:\x1b[0m $HOME is not set");
+            return 1;
+        }
+    };
+    let root = std::path::PathBuf::from(home).join(".sofuu").join("state");
+    let mut store = match sofuu_core::rt::state::StateStore::open(&root, "paired_devices") {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("\x1b[31mError:\x1b[0m {e}");
+            return 1;
+        }
+    };
+    if let Some(id) = revoke {
+        let key = format!("dev:{id}");
+        /* A live host first: its in-memory state handle would not see a
+         * file-only delete, and its next write would resurrect the entry. */
+        if let Some(port) = host_runtime_port() {
+            if host_port_open(port) {
+                let Some(token) = host_master_token() else {
+                    eprintln!("The host on port {port} is running but no master token was found.");
+                    eprintln!("Re-run with SOFUU_SERVE_TOKEN=<the token that host was started with>.");
+                    return 1;
+                };
+                match host_http_delete(port, &format!("/v1/host/devices/{id}"), &token) {
+                    Some(200) => {
+                        println!("revoked {id} on the running host (port {port})");
+                        return 0;
+                    }
+                    Some(404) => {
+                        eprintln!("\x1b[33mNo paired device '{id}'.\x1b[0m");
+                        return 1;
+                    }
+                    Some(401) | Some(403) => {
+                        eprintln!("The host on port {port} rejected the master token.");
+                        eprintln!("Re-run with SOFUU_SERVE_TOKEN=<the token that host was started with>.");
+                        return 1;
+                    }
+                    Some(other) => {
+                        eprintln!("The host on port {port} answered HTTP {other}; the store was not touched.");
+                        return 1;
+                    }
+                    None => { /* raced with shutdown — fall through to the file */ }
+                }
+            } else {
+                /* A killed host leaves host.json behind. */
+                host_clear_runtime();
+            }
+        }
+        return match store.delete(&key) {
+            Ok(true) => {
+                println!("revoked {id} — the phone's next request gets 401");
+                0
+            }
+            Ok(false) => {
+                eprintln!("\x1b[33mNo paired device '{id}'.\x1b[0m");
+                1
+            }
+            Err(e) => {
+                eprintln!("\x1b[31mError:\x1b[0m {e}");
+                1
+            }
+        };
+    }
+    let keys = match store.keys(Some("dev:")) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("\x1b[31mError:\x1b[0m {e}");
+            return 1;
+        }
+    };
+    if keys.is_empty() {
+        println!("no paired devices");
+        return 0;
+    }
+    println!("\x1b[1mPaired devices\x1b[0m");
+    for key in keys {
+        let id = key.strip_prefix("dev:").unwrap_or(&key);
+        let rec = store.get(&key).ok().flatten();
+        let field = |k: &str| {
+            rec.as_ref()
+                .and_then(|v| v.get(k))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+        };
+        let last = rec
+            .as_ref()
+            .and_then(|v| v.get("last_seen"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let name = field("name");
+        let platform = field("platform");
+        if last > 0 {
+            println!("  {id}  {name}  {platform}  last seen {last}");
+        } else {
+            println!("  {id}  {name}  {platform}");
+        }
+    }
+    0
+}
+
 fn host_rand_pin() -> String {
     let mut b = [0u8; 4];
     let ok = std::fs::File::open("/dev/urandom")
@@ -3325,7 +3438,128 @@ fn host_mdns(_name: &str, _port: &str) -> Option<()> {
     None
 }
 
+/* ── host runtime discovery (for `sofuu host devices|revoke`) ─────────
+ * A running host owns an in-memory state handle, so a second process
+ * deleting the JSON file would be invisible to it (and later resurrected
+ * by its next write). `sofuu host` records its port here; the admin
+ * subcommands call the host's own master-only route when it answers, and
+ * only edit the file when no host is listening. */
+
+fn host_runtime_path() -> Option<std::path::PathBuf> {
+    sofuu_core::embed_config::home_dir()
+        .map(|h| std::path::PathBuf::from(h).join(".sofuu").join("host.json"))
+}
+
+fn host_write_runtime(port: &str, name: &str) {
+    let Some(path) = host_runtime_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body = serde_json::json!({
+        "port": port.parse::<u16>().unwrap_or(7707),
+        "name": name,
+        "pid": std::process::id(),
+        "started_at": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    });
+    if std::fs::write(&path, body.to_string()).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+}
+
+fn host_runtime_port() -> Option<u16> {
+    let raw = std::fs::read_to_string(host_runtime_path()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("port")
+        .and_then(|p| p.as_u64())
+        .and_then(|p| u16::try_from(p).ok())
+}
+
+fn host_clear_runtime() {
+    let Some(path) = host_runtime_path() else { return };
+    let ours = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| v.get("pid").and_then(|p| p.as_u64()))
+        .map(|pid| pid == std::process::id() as u64)
+        .unwrap_or(false);
+    if ours {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+fn host_master_token() -> Option<String> {
+    if let Ok(t) = std::env::var("SOFUU_SERVE_TOKEN") {
+        let t = t.trim().to_string();
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+    let home = sofuu_core::embed_config::home_dir()?;
+    let raw = std::fs::read_to_string(
+        std::path::PathBuf::from(home).join(".sofuu").join("serve_token"),
+    )
+    .ok()?;
+    let t = raw.trim().to_string();
+    if t.is_empty() { None } else { Some(t) }
+}
+
+fn host_port_open(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(400),
+    )
+    .is_ok()
+}
+
+/// Minimal loopback DELETE — this binary links no HTTP client, and the
+/// admin path must stay dependency-free.
+fn host_http_delete(port: u16, path: &str, token: &str) -> Option<u16> {
+    use std::io::{Read, Write};
+    let mut sock = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(800),
+    )
+    .ok()?;
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(3)));
+    let req = format!(
+        "DELETE {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    sock.write_all(req.as_bytes()).ok()?;
+    let mut buf = [0u8; 256];
+    let n = sock.read(&mut buf).ok()?;
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.lines().next()?.split_whitespace().nth(1)?.parse().ok()
+}
+
 fn cmd_host(rt: &SofuuRuntime, args: &[String]) -> i32 {
+    /* Pairing administration runs without booting the listener: a phone
+     * may need revoking while the host is down (or before it ever starts).
+     * These subcommands touch only the 0600 state document the server
+     * reads, so they are safe alongside a running host too (the store
+     * re-reads before every write and the kernel serialises the rename). */
+    if args.len() >= 3 {
+        match args[2].as_str() {
+            "devices" | "list" => return host_devices_cli(None),
+            "revoke" => {
+                if args.len() < 4 || args[3].starts_with('-') {
+                    eprintln!("\x1b[31mError:\x1b[0m `sofuu host revoke` needs a device id");
+                    eprintln!("  sofuu host devices          list paired phones");
+                    eprintln!("  sofuu host revoke <id>      drop that token (401 on next request)");
+                    return 1;
+                }
+                return host_devices_cli(Some(args[3].clone()));
+            }
+            _ => {}
+        }
+    }
+
     let mut port = "7707".to_string();
     let mut host = "0.0.0.0".to_string();
     let mut token = String::new();
@@ -3436,7 +3670,12 @@ fn cmd_host(rt: &SofuuRuntime, args: &[String]) -> i32 {
     eprintln!();
 
     let _mdns = host_mdns(&name, &port);
-    cmd_serve(rt, &synth)
+    /* Lets `sofuu host devices|revoke` find (and administer) this live
+     * host instead of editing a file the running process ignores. */
+    host_write_runtime(&port, &name);
+    let rc = cmd_serve(rt, &synth);
+    host_clear_runtime();
+    rc
 }
 
 /// `sofuu bundle <entry> [-o <out>]` — bundle to a single file.

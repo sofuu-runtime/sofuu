@@ -356,11 +356,15 @@ pub fn segmented(
 }
 
 pub fn button(id: impl Into<String>, label: impl Into<String>) -> Node {
+    button_toned(id, label, Tone::Neutral)
+}
+
+pub fn button_toned(id: impl Into<String>, label: impl Into<String>, tone: Tone) -> Node {
     Node::new(
         id,
         NodeKind::Button {
             label: label.into(),
-            tone: Tone::Neutral,
+            tone,
         },
     )
 }

@@ -2561,6 +2561,24 @@ export interface SofuuUi {
       highlights?: UiCodeHighlight[];
     },
   ): UiNode;
+  enableAuto(enabled: boolean): void;
+  onPrompt(handler: ((prompt: string, composer: UiAutoComposer) => void) | null): void;
+  autoComposer(opts?: {
+    title?: string;
+    theme?: UiThemeMode;
+    agentName?: string;
+    profile?: string;
+  }): UiAutoComposer;
+}
+
+export interface UiAutoComposer {
+  readonly view: UiView;
+  buildScene(): UiScene;
+  mount(): UiAutoComposer;
+  ingestEvent(event: Record<string, unknown>): void;
+  updateTriggers(stats: Array<Record<string, unknown>>): void;
+  updateStateRows(rows: UiTableRow[]): void;
+  clearApproval(id: string): void;
 }
 
 /** What the running binary was compiled with — the probe-free half of the manifest. */

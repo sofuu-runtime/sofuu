@@ -220,3 +220,52 @@ fn js_showcase_json_schema_and_patches_roundtrip_into_ui_engine() {
     assert!(!dl.quads.is_empty());
     let _: Scene = serde_json::from_str(&serde_json::to_string(&engine.scene).unwrap()).unwrap();
 }
+
+#[test]
+fn auto_composer_scene_and_patches_roundtrip_via_json_wire() {
+    use sofuu_ui::{AutoAgentEvent, AutoComposer, AutoTriggerStat, PendingApproval, ThemeMode};
+
+    let mut composer = AutoComposer::new("Sofuu // Wire Parity", ThemeMode::Light);
+    let scene = composer.build_scene();
+    let wire_scene: Scene = serde_json::from_str(&serde_json::to_string(&scene).unwrap()).unwrap();
+    let mut engine = UiEngine::new(wire_scene, [1280.0, 800.0]);
+
+    for p in composer.ingest_event(AutoAgentEvent {
+        run_id: "r_auto".into(),
+        agent_name: "planner".into(),
+        chain: vec!["planner".into(), "executor".into()],
+        kind: "approval_request".into(),
+        tool: Some("kv_put".into()),
+        tokens: Some(256),
+        elapsed_ms: Some(15),
+        approval: Some(PendingApproval {
+            id: "ap-99".into(),
+            tool: "kv_put".into(),
+            args_preview: "k=state".into(),
+            mode: "interactive".into(),
+        }),
+        ..AutoAgentEvent::default()
+    }) {
+        let round: ScenePatch = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert!(engine.apply_patch(round));
+    }
+
+    for p in composer.update_triggers(&[AutoTriggerStat {
+        id: "watch_1".into(),
+        kind: "watch".into(),
+        running: true,
+        ticks: 4,
+        gate_hits: 2,
+        gate_skips: 2,
+        ai_calls: 2,
+        errors: 0,
+        last_duration_ms: 4,
+    }]) {
+        let round: ScenePatch = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert!(engine.apply_patch(round));
+    }
+
+    let mut dl = DrawList::default();
+    let _ = engine.tick_and_compile(1.0 / 60.0, &mut dl);
+    assert!(!dl.quads.is_empty());
+}

@@ -3125,6 +3125,14 @@
       throw makeError('E_CAPABILITY', 'The checkpoint was redacted or incomplete and cannot be resumed safely; start a new run with the required inputs.');
     }
     var d = applyAgentModelDefaults(resolveDef(target), opts);
+    /* When `--ui` is attached and the caller did not set an approval channel,
+     * enable interactive approvals so HITL gates surface in the GPU UI bar. */
+    if (opts.approveInteractive === undefined && !opts.approvalMode && !d.approvalMode &&
+        typeof opts.onApproval !== 'function' &&
+        typeof sofuu !== 'undefined' && sofuu.ui &&
+        typeof sofuu.ui.isAttached === 'function' && sofuu.ui.isAttached()) {
+      opts = Object.assign({}, opts, { approveInteractive: true });
+    }
     /* SPEC §3: resolve the error policy BEFORE the run registers itself
      * (ACTIVE/SIGNALS/run counter) — an unknown mode is REFUSED here, so a
      * typo can never leave a half-open run behind or silently mean some
@@ -3631,6 +3639,22 @@
       if (opts.onStep) {
         try { opts.onStep({ runId: runId, name: d.name, depth: depth, t: e.t, kind: kind, payload: payload }); }
         catch (e2) { /* an onStep observer that throws must not abort the run it is observing. */ }
+      }
+      if (typeof sofuu !== 'undefined' && sofuu.ui && typeof sofuu.ui._onAgentStep === 'function') {
+        try {
+          var uiProf = null;
+          try { uiProf = getModelConfig().active || null; } catch (eMc) {}
+          sofuu.ui._onAgentStep({
+            runId: runId,
+            agentName: d.name,
+            profile: uiProf,
+            depth: depth,
+            chain: chain,
+            t: e.t,
+            kind: kind,
+            payload: payload
+          });
+        } catch (eUi) { /* UI auto-composer telemetry must never abort the agent run. */ }
       }
     }
     /* P1-18: the supervisor was trained with ONE tool call per LLM turn
@@ -7791,6 +7815,14 @@
   async function interact(target, opts) {
     opts = opts || {};
     var d = applyAgentModelDefaults(resolveDef(target), opts);
+    /* When `--ui` is attached and the caller did not set an approval channel,
+     * enable interactive approvals so HITL gates surface in the GPU UI bar. */
+    if (opts.approveInteractive === undefined && !opts.approvalMode && !d.approvalMode &&
+        typeof opts.onApproval !== 'function' &&
+        typeof sofuu !== 'undefined' && sofuu.ui &&
+        typeof sofuu.ui.isAttached === 'function' && sofuu.ui.isAttached()) {
+      opts = Object.assign({}, opts, { approveInteractive: true });
+    }
     var tui = createTUI(opts);
     var promptFn = (typeof globalThis !== 'undefined' && typeof globalThis.__prompt === 'function')
       ? globalThis.__prompt

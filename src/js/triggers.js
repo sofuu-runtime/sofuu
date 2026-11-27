@@ -702,6 +702,11 @@
      * .sofuu/state/triggers.json. Throttled on the success path (a 1s loop
      * must not fsync twice a second for a metric), immediate on failure. */
     _publishHealth(force) {
+      if (global.sofuu && global.sofuu.ui && typeof global.sofuu.ui._onTriggerTick === 'function') {
+        try {
+          global.sofuu.ui._onTriggerTick(Object.keys(RUNNERS).map(function (k) { return RUNNERS[k].stats(); }));
+        } catch (eUiT) { /* UI telemetry never blocks trigger scheduling. */ }
+      }
       if (!this.state) return;
       var t = nowMs();
       if (!force && t - this._healthAt < 5000) return;

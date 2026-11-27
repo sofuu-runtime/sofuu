@@ -4,6 +4,7 @@
 //! Compiles domain-agnostic Scene IR + 120Hz springs + SDF typography into flat `#[repr(C)]`
 //! GPU instance buffers consumed directly by Metal, OpenGL/GLES, and Vulkan backends in `sofuu-gpu`.
 
+pub mod auto_compose;
 pub mod compiler;
 pub mod components;
 pub mod draw;
@@ -14,6 +15,8 @@ pub mod spring;
 pub mod text;
 pub mod theme;
 pub mod ui;
+
+pub use auto_compose::{AutoAgentEvent, AutoComposer, AutoTriggerStat, PendingApproval};
 
 pub use compiler::{CompileStatus, UiEngine};
 pub use components::code::{CodeData, CodeHighlight};

@@ -188,16 +188,12 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
                     ) {
                         TABS.forEach { t ->
                             val active = t == tab
-                            // Active tab: accent wash under the film (the old
-                            // solid accent pill); inactive: plain glass.
+                            // Ghost mode: no pill behind the tab, so the
+                            // active state is an accent label in bold.
                             SoapBubbleButton(
                                 onClick = { tab = t; store.setSettingsTab(t) },
-                                settings = if (active) {
-                                    LocalSoapBubbleSettings.current.copy(tint = c.accent.toCssRgb(), opacity = 0.85f)
-                                } else {
-                                    LocalSoapBubbleSettings.current
-                                },
-                                contentColor = if (active) c.accentContrast else c.textMuted,
+                                settings = LocalSoapBubbleSettings.current,
+                                contentColor = if (active) c.accent else c.textMuted,
                                 fontSize = 13.5.sp,
                                 minHeight = 34.dp,
                                 fillWidth = false,
@@ -208,7 +204,7 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
                                     t.replaceFirstChar { it.uppercase() },
                                     fontSize = 13.5.sp,
                                     fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
-                                    color = if (active) c.accentContrast else c.textMuted,
+                                    color = if (active) c.accent else c.textMuted,
                                 )
                             }
                         }
@@ -304,16 +300,12 @@ private fun Segmented(options: List<String>, selected: String, onSelect: (String
                 "local" -> "Local"
                 else -> o.replaceFirstChar { it.uppercase() }
             }
-            // Selected segment: accent wash under the film (the reference's
-            // .btn-toggle); the rest are plain glass in the same track.
+            // Selected segment: accent label, no fill. The flat track still
+            // groups the choices; the bold accent word marks the selection.
             SoapBubbleButton(
                 onClick = { onSelect(o) },
-                settings = if (active) {
-                    LocalSoapBubbleSettings.current.copy(tint = c.accent.toCssRgb(), opacity = 0.85f)
-                } else {
-                    LocalSoapBubbleSettings.current
-                },
-                contentColor = if (active) c.accentContrast else c.textMuted,
+                settings = LocalSoapBubbleSettings.current,
+                contentColor = if (active) c.accent else c.textMuted,
                 fontSize = 13.sp,
                 minHeight = 32.dp,
                 fillWidth = false,
@@ -325,7 +317,7 @@ private fun Segmented(options: List<String>, selected: String, onSelect: (String
                     label,
                     fontSize = 13.sp,
                     fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
-                    color = if (active) c.accentContrast else c.textMuted,
+                    color = if (active) c.accent else c.textMuted,
                 )
             }
         }
@@ -415,8 +407,8 @@ private fun AppliedFieldRow(
         }
         SoapBubbleButton(
             onClick = { onApply(text) },
-            settings = LocalSoapBubbleSettings.current.copy(tint = c.accent.toCssRgb(), opacity = 0.9f),
-            contentColor = c.accentContrast,
+            settings = LocalSoapBubbleSettings.current,
+            contentColor = c.accent,
             fontSize = 13.5.sp,
             minHeight = 44.dp,
             fillWidth = false,
@@ -427,7 +419,7 @@ private fun AppliedFieldRow(
                 "Apply",
                 fontSize = 13.5.sp,
                 fontWeight = FontWeight.Bold,
-                color = c.accentContrast,
+                color = c.accent,
             )
         }
     }
@@ -687,15 +679,15 @@ private fun GeneralPane(store: AppStore) {
                                 }
                             }
                         },
-                        settings = LocalSoapBubbleSettings.current.copy(tint = c.accent.toCssRgb(), opacity = 0.9f),
-                        contentColor = c.accentContrast,
+                        settings = LocalSoapBubbleSettings.current,
+                        contentColor = c.accent,
                         fontSize = 13.sp,
                         minHeight = 36.dp,
                         fillWidth = false,
                         radius = 8f,
                         contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                     ) {
-                        Text("Grant access", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = c.accentContrast)
+                        Text("Grant access", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = c.accent)
                     }
                 }
             })
@@ -1112,21 +1104,21 @@ private fun ModelsPane(store: AppStore) {
             Spacer(Modifier.height(12.dp))
             SoapBubbleButton(
                 onClick = { pickModelFile.launch(arrayOf("*/*")) },
-                settings = LocalSoapBubbleSettings.current.copy(tint = c.accent.toCssRgb(), opacity = 0.9f),
-                contentColor = c.accentContrast,
+                settings = LocalSoapBubbleSettings.current,
+                contentColor = c.accent,
                 fontSize = 13.5.sp,
                 minHeight = 44.dp,
                 fillWidth = true,
                 radius = 8f,
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons2.Folder, null, tint = c.accentContrast, modifier = Modifier.size(18.dp))
+                    Icon(Icons2.Folder, null, tint = c.accent, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(
                         "Import a model (.gguf)",
                         fontSize = 13.5.sp,
                         fontWeight = FontWeight.Bold,
-                        color = c.accentContrast,
+                        color = c.accent,
                     )
                 }
             }
@@ -1294,14 +1286,14 @@ private fun ProvidersPane(store: AppStore) {
                         addError = null
                     }
                 },
-                settings = LocalSoapBubbleSettings.current.copy(tint = c.accent.toCssRgb(), opacity = 0.9f),
-                contentColor = c.accentContrast,
+                settings = LocalSoapBubbleSettings.current,
+                contentColor = c.accent,
                 fontSize = 14.sp,
                 minHeight = 44.dp,
                 fillWidth = true,
                 radius = 8f,
             ) {
-                Text("Add Provider", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.accentContrast)
+                Text("Add Provider", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = c.accent)
             }
             addError?.let {
                 Text(it, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = c.errStrong, modifier = Modifier.padding(top = 8.dp))
@@ -2116,11 +2108,24 @@ private fun SpaceLine(text: Color, err: Color, faint: Color, label: String, dim:
 
 @Composable
 private fun SmallButton(bg: Color, fg: Color, label: String, onClick: () -> Unit) {
-    // The old solid tile colour becomes a tinted wash under the film.
+    val c = LocalSofuuColors.current
+    val transparent = LocalSoapBubbleSettings.current.transparent
+    // Ghost mode drops the fill, so the old "on colour" foreground (white on
+    // accent, cream on warn) has to become the action colour itself.
+    val ink = if (!transparent) {
+        fg
+    } else when (fg) {
+        c.accentContrast, c.bgApp -> when (bg) {
+            c.warn -> c.warn
+            c.errStrong -> c.errStrong
+            else -> c.accent
+        }
+        else -> fg
+    }
     SoapBubbleButton(
         onClick = onClick,
         settings = LocalSoapBubbleSettings.current.copy(tint = bg.toCssRgb(), opacity = 0.8f),
-        contentColor = fg,
+        contentColor = ink,
         fontSize = 13.sp,
         minHeight = 38.dp,
         fillWidth = false,
@@ -2131,7 +2136,7 @@ private fun SmallButton(bg: Color, fg: Color, label: String, onClick: () -> Unit
             label,
             fontSize = 13.sp,
             fontWeight = FontWeight.Bold,
-            color = fg,
+            color = ink,
         )
     }
 }

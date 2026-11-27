@@ -1,6 +1,7 @@
 package com.sofuu.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -117,18 +118,29 @@ private fun SheetTitle(t: String, onClose: (() -> Unit)? = null) {
 
 @Composable
 private fun SheetButton(label: String, bg: Color, fg: Color, onClick: () -> Unit) {
-    // The old solid pill colour becomes a tinted wash under the film.
+    val c = LocalSofuuColors.current
+    val transparent = LocalSoapBubbleSettings.current.transparent
+    val ink = if (!transparent) {
+        fg
+    } else when (fg) {
+        c.accentContrast, c.bgApp, Color.White -> when (bg) {
+            c.warn -> c.warn
+            c.errStrong -> c.errStrong
+            else -> c.accent
+        }
+        else -> fg
+    }
     SoapBubbleButton(
         onClick = onClick,
         settings = LocalSoapBubbleSettings.current.copy(tint = bg.toCssRgb(), opacity = 0.8f),
-        contentColor = fg,
+        contentColor = ink,
         fontSize = 13.sp,
         minHeight = 40.dp,
         fillWidth = false,
         radius = 999f,
         contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
     ) {
-        Text(label, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = fg)
+        Text(label, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = ink)
     }
 }
 
@@ -136,8 +148,8 @@ private fun SheetButton(label: String, bg: Color, fg: Color, onClick: () -> Unit
 private fun SheetRow(label: String, hint: String?, selected: Boolean, onClick: () -> Unit) {
     val c = LocalSofuuColors.current
     val s = LocalSoapBubbleSettings.current
-    // Selected rows carry a soft accent body under the film (the reference's
-    // selected-chip treatment); unselected rows are plain glass.
+    // Selected rows carry an accent label + check; unselected rows are plain
+    // text now that ghost mode has removed the row plate.
     val rowSettings = if (selected) s.copy(tint = c.accent.toCssRgb(), opacity = 0.55f) else s
     SoapBubbleSurface(
         onClick = onClick,
@@ -149,7 +161,7 @@ private fun SheetRow(label: String, hint: String?, selected: Boolean, onClick: (
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.weight(1f)) {
-                Text(label, fontSize = 14.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold, color = c.text)
+                Text(label, fontSize = 14.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.SemiBold, color = if (selected) c.accent else c.text)
                 if (hint != null) Text(hint, fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint)
             }
             if (selected) Text("✓", color = c.accent, fontSize = 14.sp, fontWeight = FontWeight.Bold)
@@ -231,25 +243,20 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
                 cursorBrush = androidx.compose.ui.graphics.SolidColor(c.accent),
                 modifier = Modifier.fillMaxWidth(),
                 decorationBox = { inner ->
-                    SoapBubbleSurface(
-                        modifier = Modifier.fillMaxWidth().height(44.dp),
-                        radius = 8f,
-                        interactive = false,
-                        settings = LocalSoapBubbleSettings.current.copy(
-                            tint = c.monoFieldBg.toCssRgb(),
-                            opacity = 0.9f,
-                        ),
-                        contentPadding = PaddingValues(horizontal = 12.dp),
+                    androidx.compose.foundation.layout.Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(44.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(c.monoFieldBg)
+                            .border(1.dp, c.border, RoundedCornerShape(8.dp))
+                            .padding(horizontal = 12.dp),
+                        contentAlignment = Alignment.CenterStart,
                     ) {
-                        androidx.compose.foundation.layout.Box(
-                            modifier = Modifier.fillMaxWidth().height(44.dp),
-                            contentAlignment = Alignment.CenterStart,
-                        ) {
-                            if (search.isEmpty()) {
-                                Text("Search models…", color = c.textFaint, fontSize = 13.5.sp, fontWeight = FontWeight.Medium)
-                            }
-                            inner()
+                        if (search.isEmpty()) {
+                            Text("Search models…", color = c.textFaint, fontSize = 13.5.sp, fontWeight = FontWeight.Medium)
                         }
+                        inner()
                     }
                 },
             )
@@ -305,23 +312,18 @@ private fun ModelSheet(store: AppStore, onClose: () -> Unit = {}) {
                 cursorBrush = androidx.compose.ui.graphics.SolidColor(c.accent),
                 modifier = Modifier.fillMaxWidth(),
                 decorationBox = { inner ->
-                    SoapBubbleSurface(
-                        modifier = Modifier.fillMaxWidth().height(44.dp),
-                        radius = 8f,
-                        interactive = false,
-                        settings = LocalSoapBubbleSettings.current.copy(
-                            tint = c.monoFieldBg.toCssRgb(),
-                            opacity = 0.9f,
-                        ),
-                        contentPadding = PaddingValues(horizontal = 12.dp),
+                    androidx.compose.foundation.layout.Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(44.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(c.monoFieldBg)
+                            .border(1.dp, c.border, RoundedCornerShape(8.dp))
+                            .padding(horizontal = 12.dp),
+                        contentAlignment = Alignment.CenterStart,
                     ) {
-                        androidx.compose.foundation.layout.Box(
-                            modifier = Modifier.fillMaxWidth().height(44.dp),
-                            contentAlignment = Alignment.CenterStart,
-                        ) {
-                            if (manual.isEmpty()) Text("Type a model name…", color = c.textFaint, fontSize = 13.5.sp, fontWeight = FontWeight.Medium)
-                            inner()
-                        }
+                        if (manual.isEmpty()) Text("Type a model name…", color = c.textFaint, fontSize = 13.5.sp, fontWeight = FontWeight.Medium)
+                        inner()
                     }
                 },
             )

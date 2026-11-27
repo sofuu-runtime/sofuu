@@ -10,6 +10,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
@@ -17,6 +18,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.LineHeightStyle
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.sp
 import com.sofuu.R
 
@@ -180,13 +182,19 @@ val DarkColors = SofuuColors(
 // Geist Mono everywhere. Static faces are bundled in res/font (the same
 // OFL typeface the web properties ship); declaring every weight keeps
 // minSdk 24 from synthesising a different family.
+//
+// UI type runs one step heavier than requested: Normal resolves to the
+// Medium face, Medium to SemiBold, SemiBold to Bold. That makes every
+// explicit `fontWeight` in the app heavier without touching 200 call sites.
 val GeistMono = FontFamily(
-    Font(R.font.geist_mono_regular, FontWeight.Normal, FontStyle.Normal),
-    Font(R.font.geist_mono_medium, FontWeight.Medium, FontStyle.Normal),
-    Font(R.font.geist_mono_semibold, FontWeight.SemiBold, FontStyle.Normal),
+    Font(R.font.geist_mono_medium, FontWeight.Normal, FontStyle.Normal),
+    Font(R.font.geist_mono_semibold, FontWeight.Medium, FontStyle.Normal),
+    Font(R.font.geist_mono_bold, FontWeight.SemiBold, FontStyle.Normal),
     Font(R.font.geist_mono_bold, FontWeight.Bold, FontStyle.Normal),
-    Font(R.font.geist_mono_italic, FontWeight.Normal, FontStyle.Italic),
+    Font(R.font.geist_mono_medium_italic, FontWeight.Normal, FontStyle.Italic),
     Font(R.font.geist_mono_medium_italic, FontWeight.Medium, FontStyle.Italic),
+    Font(R.font.geist_mono_medium_italic, FontWeight.SemiBold, FontStyle.Italic),
+    Font(R.font.geist_mono_medium_italic, FontWeight.Bold, FontStyle.Italic),
 )
 
 private val BaseMonoStyle = TextStyle(
@@ -197,6 +205,9 @@ private val BaseMonoStyle = TextStyle(
         trim = LineHeightStyle.Trim.Both,
     ),
 )
+
+/** App-wide type size bump. 1.15 = +15% on every sp value. */
+private const val UI_FONT_SCALE = 1.15f
 
 val SofuuTypography = Typography(
     displayLarge = BaseMonoStyle.copy(fontSize = 32.sp, fontWeight = FontWeight.Bold, lineHeight = 40.sp),
@@ -225,6 +236,10 @@ fun SofuuTheme(
     content: @Composable () -> Unit,
 ) {
     val colors = if (dark) DarkColors else LightColors
+    // Scale text only: dp layout, touch targets, and icon sizes are unchanged.
+    // Multiplying the system fontScale keeps the user's accessibility choice.
+    val density = LocalDensity.current
+    val scaledDensity = Density(density.density, density.fontScale * UI_FONT_SCALE)
     val scheme = if (dark) {
         darkColorScheme(
             primary = colors.accent,
@@ -255,6 +270,7 @@ fun SofuuTheme(
     CompositionLocalProvider(
         LocalSofuuColors provides colors,
         LocalTextStyle provides BaseMonoStyle.copy(color = colors.text),
+        LocalDensity provides scaledDensity,
     ) {
         MaterialTheme(colorScheme = scheme, typography = SofuuTypography, content = content)
     }

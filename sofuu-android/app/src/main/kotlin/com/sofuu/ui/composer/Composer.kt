@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -18,6 +19,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.Icon
@@ -32,6 +34,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.layout.onSizeChanged
@@ -159,7 +162,17 @@ fun Composer(
                             modifier = Modifier.size(18.dp).align(Alignment.TopEnd),
                             contentAlignment = Alignment.Center,
                         ) {
-                            Icon(Icons2.Close, "Remove", tint = androidx.compose.ui.graphics.Color.White, modifier = Modifier.size(10.dp))
+                            // The one deliberate scrim left: a bare 10dp glyph
+                            // over an arbitrary photo needs a dark seat to stay
+                            // visible. It is a flat disc, not film.
+                            Box(
+                                Modifier
+                                    .fillMaxSize()
+                                    .background(Color.Black.copy(alpha = 0.45f), CircleShape),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                Icon(Icons2.Close, "Remove", tint = androidx.compose.ui.graphics.Color.White, modifier = Modifier.size(10.dp))
+                            }
                         }
                     }
                 }
@@ -382,8 +395,9 @@ private fun Pill(
 
 @Composable
 private fun SendButton(icon: androidx.compose.ui.graphics.vector.ImageVector, tint: androidx.compose.ui.graphics.Color, onClick: () -> Unit) {
-    // A strongly tinted bubble: the accent (or stop-red) wash reads like the
-    // old solid circle while the film still lenses and swells.
+    // Ghost mode: no coloured disc, so the glyph itself carries the accent
+    // (or stop-red) ink.
+    val transparent = LocalSoapBubbleSettings.current.transparent
     SoapBubbleSurface(
         onClick = onClick,
         role = Role.Button,
@@ -395,7 +409,7 @@ private fun SendButton(icon: androidx.compose.ui.graphics.vector.ImageVector, ti
         Icon(
             icon,
             null,
-            tint = androidx.compose.ui.graphics.Color.White,
+            tint = if (transparent) tint else androidx.compose.ui.graphics.Color.White,
             modifier = Modifier.size(20.dp),
         )
     }
@@ -465,13 +479,19 @@ private fun SlashPalette(commands: List<com.sofuu.store.SlashCommand>, activeIdx
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text("/${cmd.name}", color = c.accent, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, fontFamily = GeistMono)
+                        Text(
+                            "/${cmd.name}",
+                            color = c.accent,
+                            fontSize = 13.sp,
+                            fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
+                            fontFamily = GeistMono,
+                        )
                         if (cmd.arg != null) {
                             Spacer(Modifier.width(4.dp))
                             Text(cmd.arg, color = c.textFaint, fontSize = 13.sp, fontFamily = GeistMono)
                         }
                         Spacer(Modifier.width(8.dp))
-                        Text(cmd.desc, color = c.textMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        Text(cmd.desc, color = if (active) c.textMuted else c.textFaint, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                 }
             }

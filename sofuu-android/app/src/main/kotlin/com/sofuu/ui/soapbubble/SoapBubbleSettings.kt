@@ -74,6 +74,18 @@ data class SoapBubbleSettings(
      *  oil coating. Sofuu's dark theme sets this; the reference default is
      *  light (its app was light-only). */
     val dark: Boolean = false,
+    /**
+     * Ghost mode. When true the renderer is skipped entirely for this
+     * surface: no plate, no border, no refraction/reflection — only the
+     * caller's icon/text remains, with a short opacity dim on press.
+     *
+     * Sofuu sets this on the root material so every bubble control is
+     * transparent. Components that need a body to be usable (switches,
+     * slider tracks, search fields, popup panels) draw a flat one
+     * themselves instead of the film. Flip it back to false to restore the
+     * soap film.
+     */
+    val transparent: Boolean = false,
 ) {
     fun normalized(): SoapBubbleSettings = copy(
         radius = radius.clamp(0f, 9999f, 9999f),

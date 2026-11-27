@@ -28,25 +28,19 @@ import com.sofuu.ui.theme.SofuuTheme
 import java.io.File
 
 /**
- * The film runs CLEAR — the developer's call after seeing the port live
- * (2026-11-11): no rainbow iridescence, no chromatic edge fringes, while
- * the lens effect itself stays (bevel, refraction, white key highlights,
- * press swell). Mechanism: at iridescence 0 the shader's film term
- * collapses to neutral Fresnel gray (colour = vec3(incoherent) at strength
- * 0), and dispersion 0 zeroes the 0.12·glass·dispersion RGB edge split.
+ * Ghost mode: no soap film at all. The developer's call (2026-11-26) after
+ * the clear film shipped — the controls are now just their icon or label on
+ * the page, with a short dim on press. `transparent = true` makes
+ * [com.sofuu.ui.soapbubble.SoapBubbleSurface] skip registration, the film
+ * draw, the white rim and the press-wobble; the GLES renderer is never
+ * started, so there is no refraction/reflection left anywhere.
  *
- * wobble is calmed from the web's 0.4 to 0.15: on formal rows/cards the
- * ambient breathing read as wavy, misaligned borders on the device.
- * Press swell is a separate mechanism and keeps the exact web physics.
+ * The old clear-film values stay on the presets so flipping `transparent`
+ * back to false restores the approved look without retuning.
  *
- * ClearDark additionally sets dark=true: the renderer then refracts a
- * dark page wash and runs the shader's dark-theme path, so cream text
- * stays legible on the film (the reference hardcoded light because its
- * app was light-only).
- *
- * Both are pure settings overrides — the ported shader/component logic
- * is untouched, and the selected-state tint washes (accent on active
- * rows, send button) are deliberate and remain.
+ * ClearDark additionally sets dark=true: if the film is ever turned back
+ * on, the renderer refracts a dark page wash and runs the shader's
+ * dark-theme path, so cream text stays legible.
  */
 private val ClearLight = SoapBubbleSettings.lightPreset.copy(
     iridescence = 0f,
@@ -55,12 +49,14 @@ private val ClearLight = SoapBubbleSettings.lightPreset.copy(
     bottomShade = false,
     tint = "#ffffffff",
     opacity = 0.9f,
+    transparent = true,
 )
 private val ClearDark = SoapBubbleSettings().copy(
     iridescence = 0f,
     dispersion = 0f,
     wobble = 0f,
     dark = true,
+    transparent = true,
 )
 
 /**

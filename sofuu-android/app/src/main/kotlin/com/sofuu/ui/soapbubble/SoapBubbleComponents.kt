@@ -5,6 +5,9 @@ import android.database.ContentObserver
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -46,7 +49,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -102,6 +105,7 @@ private data class BubbleColors(
     val cardShade: Color,
     val muted: Color,
     val accentDeep: Color,
+    val border: Color,
     val isDark: Boolean,
 )
 
@@ -115,6 +119,7 @@ private object SofuuBubble {
                 cardShade = it.bgCardHover,
                 muted = it.textMuted,
                 accentDeep = it.accent,
+                border = it.border,
                 isDark = it.dark,
             )
         }
@@ -216,9 +221,23 @@ fun SoapBubbleSurface(
     val density = LocalDensity.current
     val view = LocalView.current
     val reduced = rememberReducedMotion()
+    val transparent = settings.transparent
     val controller = remember { SoapBubbleController(SoapBubbleIds.newId()) }
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
+    // Ghost mode drops the film, so the only feedback left is a short dim —
+    // a tap still has to read as a tap. Disabled controls sit dimmer still.
+    val pressAlpha by animateFloatAsState(
+        targetValue = when {
+            // Only a real, disabled control dims; inert rows (onClick == null)
+            // keep full contrast for reading.
+            onClick != null && !enabled -> 0.38f
+            pressed -> 0.5f
+            else -> 1f
+        },
+        animationSpec = if (reduced) snap() else tween(durationMillis = 90),
+        label = "soap-bubble-ghost-alpha",
+    )
     val fontPx = with(density) { fontSize.toPx() }
     val bleedPx = max(with(density) { 12.dp.toPx() }, fontPx)
 
@@ -231,11 +250,13 @@ fun SoapBubbleSurface(
     controller.interactive = interactive
     controller.visible = true
 
-    DisposableEffect(controller) {
-        SoapBubbleGl.register(controller)
-        onDispose { SoapBubbleGl.unregister(controller) }
+    DisposableEffect(controller, transparent) {
+        if (!transparent) SoapBubbleGl.register(controller)
+        onDispose { if (!transparent) SoapBubbleGl.unregister(controller) }
     }
-    LaunchedEffect(pressed) { controller.press(pressed) }
+    LaunchedEffect(pressed, transparent) {
+        if (!transparent) controller.press(pressed)
+    }
 
     val clickModifier = if (onClick != null) {
         Modifier.clickable(
@@ -247,7 +268,7 @@ fun SoapBubbleSurface(
         )
     } else Modifier
 
-    val pointerModifier = if (interactive) {
+    val pointerModifier = if (interactive && !transparent) {
         Modifier.pointerInput(controller, enabled) {
             awaitPointerEventScope {
                 while (true) {
@@ -282,7 +303,7 @@ fun SoapBubbleSurface(
     val shape = remember(radius) {
         if (radius >= 999f) CircleShape else RoundedCornerShape(radius.dp)
     }
-    val borderModifier = if (outline && !colors.isDark) {
+    val borderModifier = if (outline && !colors.isDark && !transparent) {
         Modifier.border(1.dp, Color.White.copy(alpha = 0.95f), shape)
     } else Modifier
 
@@ -319,20 +340,24 @@ fun SoapBubbleSurface(
                 controller.visible = bounds.width > 0f && bounds.height > 0f &&
                     bounds.bottom > 0f && bounds.top < view.height
                 // A return from off-screen has to restart the shared loop.
-                SoapBubbleGl.invalidate()
+                if (!transparent) SoapBubbleGl.invalidate()
             }
             .then(clickModifier)
             .then(pointerModifier)
-            .drawBehind {
-                drawSoapBubble(
-                    controller = controller,
-                    radiusDp = radius,
-                    colors = colors,
-                    fallback = fallback,
-                    layoutWidth = size.width,
-                    layoutHeight = size.height,
-                )
-            }
+            .then(
+                if (transparent) Modifier
+                else Modifier.drawBehind {
+                    drawSoapBubble(
+                        controller = controller,
+                        radiusDp = radius,
+                        colors = colors,
+                        fallback = fallback,
+                        layoutWidth = size.width,
+                        layoutHeight = size.height,
+                    )
+                },
+            )
+            .then(if (transparent) Modifier.alpha(pressAlpha) else Modifier)
             .padding(contentPadding),
         contentAlignment = contentAlignment,
         content = content,
@@ -496,8 +521,8 @@ fun SoapBubbleIconButton(
 /* ------------------------------------------------------------------ */
 
 /**
- * The track is flat and the thumb is a real bubble lens, swelling while
- * pressed or moving, as the web switch's thumb does.
+ * A flat switch: solid track, plain thumb. It never used the soap film, and
+ * it stays deliberately ordinary now that the rest of the UI is ghosted.
  */
 @Composable
 fun SoapBubbleToggle(
@@ -541,10 +566,6 @@ fun SoapBubbleToggle(
             .size(trackW, trackH)
             .clip(CircleShape)
             .background(animatedTrackColor)
-            .then(
-                if (!isDark) Modifier.border(1.dp, Color.White.copy(alpha = 0.85f), CircleShape)
-                else Modifier.border(1.dp, Color(0xFF4A4336), CircleShape)
-            )
             .clickable(
                 enabled = enabled,
                 role = Role.Switch,
@@ -561,13 +582,8 @@ fun SoapBubbleToggle(
             modifier = Modifier
                 .offset(x = inset + animatedOffset, y = inset)
                 .size(thumbSize)
-                .shadow(elevation = 2.dp, shape = CircleShape)
                 .clip(CircleShape)
                 .background(Color.White)
-                .then(
-                    if (!isDark) Modifier.border(0.5.dp, Color.White, CircleShape)
-                    else Modifier
-                )
         )
     }
 }
@@ -585,6 +601,7 @@ fun SoapBubbleSlider(
     scale: Float = 1f,
 ) {
     val density = LocalDensity.current
+    val transparent = LocalSoapBubbleSettings.current.transparent
     val s = scale.coerceIn(0.5f, 12f)
     val thumbW = (38f * s).dp
     val thumbH = (26f * s).dp
@@ -617,7 +634,7 @@ fun SoapBubbleSlider(
                 from = from.toCssRgb(),
             )
         }
-        if (!SoapBubbleGl.ready.value) {
+        if (transparent || !SoapBubbleGl.ready.value) {
             Box(
                 Modifier
                     .fillMaxWidth()
@@ -696,13 +713,24 @@ fun SoapBubbleSearch(
     textStyle: TextStyle = MaterialTheme.typography.bodyMedium,
 ) {
     val colors = SofuuBubble.colors
+    val transparent = LocalSoapBubbleSettings.current.transparent
     SoapBubbleSurface(
         modifier = modifier.fillMaxWidth().height(44.dp),
         radius = 9999f,
         interactive = true,
     ) {
         Row(
-            Modifier.fillMaxWidth().height(44.dp).padding(start = 12.dp, end = 18.dp),
+            Modifier
+                .fillMaxWidth()
+                .height(44.dp)
+                .then(
+                    if (transparent) {
+                        Modifier
+                            .background(colors.cardShade, CircleShape)
+                            .border(1.dp, colors.border, CircleShape)
+                    } else Modifier,
+                )
+                .padding(start = 12.dp, end = 18.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(9.dp),
         ) {
@@ -750,6 +778,8 @@ fun SoapBubbleMenu(
     triggerLabel: String? = null,
     round: Boolean = false,
 ) {
+    val colors = SofuuBubble.colors
+    val transparent = LocalSoapBubbleSettings.current.transparent
     var open by remember { mutableStateOf(false) }
     var active by remember { mutableStateOf(-1) }
     Box(modifier) {
@@ -779,7 +809,15 @@ fun SoapBubbleMenu(
                 offset = IntOffset(0, 48),
             ) {
                 SoapBubbleSurface(
-                    modifier = Modifier.width(220.dp),
+                    modifier = Modifier
+                        .width(220.dp)
+                        .then(
+                            if (transparent) {
+                                Modifier
+                                    .background(colors.card, RoundedCornerShape(24.dp))
+                                    .border(1.dp, colors.border, RoundedCornerShape(24.dp))
+                            } else Modifier,
+                        ),
                     radius = 24f,
                     interactive = false,
                 ) {

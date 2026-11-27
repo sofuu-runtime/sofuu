@@ -34,15 +34,23 @@ the slash-command surface, and the same cream/warm-dark design language.
 └──────────────────────────────────────────────────────────┘
 ```
 
-Every clickable control — buttons, icon buttons, pills, toggles, segmented
-controls, and list/option rows — is a **soap bubble**: a shared offscreen
-GLES3 renderer (`ui/soapbubble/`, ported from the ReactDrops soap-bubble
-component) draws each control as an iridescent film into one atlas, and
-Compose crops the regions. Light theme uses the light-glass preset, dark
-theme the rainbow defaults; a frosted card wash renders before GL is ready
-and motion freezes under the system's reduced-motion setting (animator
-scale 0). Scrim taps, panel click-absorbers, markdown links, and message
-long-press selection stay non-bubble on purpose.
+Every clickable control — buttons, icon buttons, pills, segmented controls,
+and list/option rows — runs in **ghost mode**: the control is just its icon
+or label on whatever surface it sits on, with a short opacity dim on press.
+The soap-bubble renderer (`ui/soapbubble/`, ported from the ReactDrops
+soap-bubble component) is still in the tree but is switched off by
+`transparent = true` on both presets, so no film, refraction, reflection,
+rim, or press-wobble is ever drawn and the GLES loop never starts. Flip that
+flag back to false to restore the clear film. Switches, sliders, text fields,
+cards, and popup panels draw flat functional bodies instead so they remain
+usable; scrim taps, markdown links, and message long-press selection stay
+non-bubble on purpose.
+
+Typography is Geist Mono app-wide, rendered at **+15% size** with every
+weight resolved **one step heavier** (Normal→Medium, Medium→SemiBold,
+SemiBold→Bold). Both are set once in `ui/theme/Color.kt`
+(`UI_FONT_SCALE` and the `GeistMono` font-family mapping), so every explicit
+`fontSize`/`fontWeight` in the UI inherits the bump.
 
 Turn driving mirrors the desktop backend but without the WebView:
 `sofuu.chat.submit(text, {onEvent})` is fired as a promise; a pump

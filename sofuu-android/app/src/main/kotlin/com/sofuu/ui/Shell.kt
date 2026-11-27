@@ -257,7 +257,7 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                                 label,
                                 fontSize = 13.sp,
                                 fontWeight = if (active) FontWeight.Bold else FontWeight.SemiBold,
-                                color = if (active) c.text else (if (c.dark) c.textMuted else c.text),
+                                color = if (active) c.accent else c.textMuted,
                                 maxLines = 1,
                             )
                             if (active && sid != null) {
@@ -962,18 +962,31 @@ private fun ApprovalSheet(approval: Approval, queued: Int = 0, onResolve: (Boole
 
 @Composable
 private fun SheetButton(label: String, bg: Color, fg: Color, onClick: () -> Unit) {
-    // The old solid pill colour becomes a tinted wash under the film.
+    val c = LocalSofuuColors.current
+    val transparent = LocalSoapBubbleSettings.current.transparent
+    // Ghost mode: the fill is gone, so the on-fill foreground becomes the
+    // action colour (accent / warn / error) instead of white or cream.
+    val ink = if (!transparent) {
+        fg
+    } else when (fg) {
+        c.accentContrast, c.bgApp, Color.White -> when (bg) {
+            c.warn -> c.warn
+            c.errStrong -> c.errStrong
+            else -> c.accent
+        }
+        else -> fg
+    }
     SoapBubbleButton(
         onClick = onClick,
         settings = LocalSoapBubbleSettings.current.copy(tint = bg.toCssRgb(), opacity = 0.8f),
-        contentColor = fg,
+        contentColor = ink,
         fontSize = 13.sp,
         minHeight = 38.dp,
         fillWidth = false,
         radius = 999f,
         contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
     ) {
-        Text(label, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = fg)
+        Text(label, fontSize = 13.sp, fontWeight = FontWeight.Bold, color = ink)
     }
 }
 

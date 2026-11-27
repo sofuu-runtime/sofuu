@@ -52,6 +52,8 @@ kz_compiler_t *kz_embed_compiler_new(size_t arena_bytes);
 void           kz_embed_compiler_free(kz_compiler_t *c);
 
 kz_embed_result_t kz_embed_check(kz_compiler_t *c, const char *src, size_t len);
+/* The same check for a file: relative `use` imports resolve against its real path. */
+kz_embed_result_t kz_embed_check_path(kz_compiler_t *c, const char *path, size_t len);
 /* Lowercase hex, exactly the bytes `kaze compile` prints. */
 kz_embed_result_t kz_embed_compile(kz_compiler_t *c, const char *src, size_t len);
 kz_embed_result_t kz_embed_emit_c(kz_compiler_t *c, const char *src, size_t len, bool standalone);

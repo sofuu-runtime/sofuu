@@ -21,6 +21,7 @@ import {
   synthesizeAlertWithAI,
   defineMarketAgent,
 } from './lib/agent.js';
+import { createMarketDashboard } from './lib/ui.js';
 
 function defaultWatchlistPath() {
   const local = path.resolve(process.cwd(), 'watchlist.json');
@@ -56,6 +57,8 @@ Watch & Notification Options:
   --force-alert            Ignore cooldowns during --once scan
   --no-ai                  Skip LLM synthesis (pure deterministic algo scan)
   --json                   Output structured JSON (for --once)
+  --ui                     Open the native 2D GPU dashboard (sofuu run --ui ...)
+  --auto-ui                Use Zero-Boilerplate Auto-Composer instead of custom UI
 
 Model & Provider Options (shared Sofuu generalized system):
   --setup-model            Configure provider & model into models.json
@@ -90,6 +93,7 @@ function parseCli(rawArgs) {
     forceAlert: false,
     noAi: false,
     json: false,
+    autoUi: false,
     listen: false,
     addSymbol: null,
     removeSymbol: null,
@@ -140,6 +144,10 @@ function parseCli(rawArgs) {
     }
     if (a === '--json') {
       args.json = true;
+      continue;
+    }
+    if (a === '--auto-ui') {
+      args.autoUi = true;
       continue;
     }
     if (a === '--watchlist' && i + 1 < rawArgs.length) {
@@ -240,10 +248,12 @@ export async function scanWatchlist(watchlistPath, cliArgs) {
     alerts: [],
   };
   const pending = [];
+  const snapshots = Object.create(null);
 
   for (const asset of wl.assets || []) {
     try {
       const marketData = await fetchAssetData(asset);
+      snapshots[marketData.symbol] = marketData;
       const evalRes = await evaluateAssetAlgorithms(marketData, algos, threshold);
       const triggers = detectTriggers(asset, evalRes, {
         cooldownMinutes: cooldownMin,
@@ -295,13 +305,13 @@ export async function scanWatchlist(watchlistPath, cliArgs) {
     }
   }
 
-  return { report: cycleReport, pending, notifications: wl.notifications || {} };
+  return { report: cycleReport, pending, notifications: wl.notifications || {}, snapshots };
 }
 
 /**
  * Second stage: synthesize and dispatch the alerts a gate let through.
  */
-export async function deliverAlerts(pending, report, notifications, modelOpts, cliArgs) {
+export async function deliverAlerts(pending, report, notifications, modelOpts, cliArgs, uiDashboard) {
   for (const item of pending) {
     let aiBriefing = '';
     if (!cliArgs.noAi && modelOpts.provider && modelOpts.model) {
@@ -323,15 +333,17 @@ export async function deliverAlerts(pending, report, notifications, modelOpts, c
       silent: cliArgs.json,
     });
     report.alerts.push(item.alertPacket);
+    if (uiDashboard) uiDashboard.pushAlertBriefing(item.alertPacket);
   }
 }
 
 /**
  * Executes one full live market scan cycle across all watchlist assets.
  */
-export async function runScanCycle(watchlistPath, modelOpts, cliArgs) {
-  const { report, pending, notifications } = await scanWatchlist(watchlistPath, cliArgs);
-  await deliverAlerts(pending, report, notifications, modelOpts, cliArgs);
+export async function runScanCycle(watchlistPath, modelOpts, cliArgs, uiDashboard) {
+  const { report, pending, notifications, snapshots } = await scanWatchlist(watchlistPath, cliArgs);
+  if (uiDashboard) uiDashboard.updateFromScan({ report, snapshots });
+  await deliverAlerts(pending, report, notifications, modelOpts, cliArgs, uiDashboard);
   return report;
 }
 
@@ -481,13 +493,57 @@ async function main() {
     return;
   }
 
+  const uiAttached =
+    typeof sofuu !== 'undefined' && sofuu.ui && typeof sofuu.ui.isAttached === 'function' && sofuu.ui.isAttached();
+
+  let uiDashboard = null;
+  let activeRunner = null;
+  const triggerScanNow = async () => runScanCycle(cliArgs.watchlist, modelOpts, cliArgs, uiDashboard);
+
+  if (uiAttached && !cliArgs.autoUi) {
+    try { defineMarketAgent(cliArgs.watchlist); } catch (_) {}
+    uiDashboard = createMarketDashboard({
+      liveEnabled: cliArgs.mode === 'watch',
+      onScanNow: triggerScanNow,
+      onClose: () => {
+        if (activeRunner) activeRunner.stop('ui_closed');
+      },
+      onAsk: async (question, dash) => {
+        if (question.toLowerCase() === 'scan') {
+          await triggerScanNow();
+          return;
+        }
+        if (cliArgs.noAi || !modelOpts.provider || !modelOpts.model) {
+          dash.pushFeed(
+            'AGENT',
+            'info',
+            'AI model disabled or unset (--no-ai or empty models.json)',
+            'Configure a model with --setup-model or use "scan" to run a live scan cycle.'
+          );
+          return;
+        }
+        const res = await sofuu.agent.run('market_sentinel', question, {
+          permissionProfile: 'plan',
+          provider: modelOpts.provider || undefined,
+          model: modelOpts.model || undefined,
+          apiKey: modelOpts.apiKey || undefined,
+          baseUrl: modelOpts.baseUrl || undefined,
+        });
+        dash.pushFeed('AGENT', 'ok', 'Market Sentinel Answer', (res && res.answer) || 'No answer.');
+      },
+    });
+  }
+
   // Single Scan (--once)
   if (cliArgs.mode === 'once') {
-    const report = await runScanCycle(cliArgs.watchlist, modelOpts, cliArgs);
+    const report = await runScanCycle(cliArgs.watchlist, modelOpts, cliArgs, uiDashboard);
     if (cliArgs.json) {
       console.log(JSON.stringify(report, null, 2));
     } else {
       printCycleSummary(report);
+    }
+    if (uiDashboard) {
+      await uiDashboard.waitUntilClosed();
     }
     return;
   }
@@ -510,6 +566,7 @@ async function main() {
   console.log(`• Watchlist    : ${cliArgs.watchlist} (${(wl.assets || []).length} assets)`);
   console.log(`• Poll Interval: ${Math.round(intervalMs / 1000)}s`);
   console.log(`• AI Engine    : ${modelOpts.provider || 'disabled'} / ${modelOpts.model || 'none'}`);
+  if (uiDashboard) console.log('• GPU UI       : Attached (native 2D window)');
   console.log('• Press Ctrl+C to stop');
   console.log('─────────────────────────────────────────────────────────────────────────────');
 
@@ -525,20 +582,31 @@ async function main() {
     jitterPct: 10,
     backoff: { initialMs: 2000, maxMs: 60_000, multiplier: 2 },
     async gate() {
+      if (uiDashboard && !uiDashboard.isLiveEnabled()) return null;
       const scan = await scanWatchlist(cliArgs.watchlist, cliArgs);
       printCycleSummary(scan.report);
+      if (uiDashboard) uiDashboard.updateFromScan({ report: scan.report, snapshots: scan.snapshots });
       if (scan.pending.length === 0) return null;
       return scan;
     },
     async onTrigger(payload) {
-      await deliverAlerts(payload.pending, payload.report, payload.notifications, modelOpts, cliArgs);
+      await deliverAlerts(payload.pending, payload.report, payload.notifications, modelOpts, cliArgs, uiDashboard);
     },
     onError(err) {
       console.error(`[Market Sentinel] Cycle error (will retry): ${err.message}`);
+      if (uiDashboard) uiDashboard.pushFeed('ERR', 'danger', `Cycle error: ${err.message}`);
     },
   });
+  activeRunner = runner;
 
-  await runner.start();
+  if (uiDashboard) {
+    // Perform immediate initial cycle so candlesticks & watchlist appear instantly on window open.
+    await runner._fire({ kind: 'initial', triggerId: runner.id, tick: 0, nowMs: Date.now() });
+    await Promise.race([runner.start(), uiDashboard.waitUntilClosed()]);
+    runner.stop('ui_closed');
+  } else {
+    await runner.start();
+  }
   console.log('\n[Market Sentinel] Shutting down 24/7 monitor cleanly...');
 }
 

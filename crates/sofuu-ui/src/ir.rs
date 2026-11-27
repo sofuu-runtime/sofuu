@@ -7,10 +7,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::components::code::{CodeData, CodeHighlight};
 use crate::components::feed::{FeedData, FeedItem};
-use crate::components::graph::GraphData;
-use crate::components::plot::{CandlePoint, PlotData, PlotPoint};
+use crate::components::graph::{GraphData, GraphEdge, GraphNode};
+use crate::components::plot::{
+    CandlePoint, PlotData, PlotPane, PlotPoint, PlotSeries, PlotSeriesKind, PlotThreshold,
+};
 use crate::components::stat::StatData;
-use crate::components::table::{sort_table_rows, TableData};
+use crate::components::table::{reapply_table_sort, sort_table_rows, TableData, TableRow};
 use crate::theme::{ThemeMode, Tone};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -738,8 +740,143 @@ impl Scene {
                 }
                 false
             }
+            ScenePatch::SetTableRows {
+                id,
+                rows,
+                selected_row,
+            } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Table(table) = &mut node.kind {
+                        let mut changed = table.rows != rows;
+                        if changed {
+                            table.rows = rows;
+                            // Preserve the user's sort selection: re-order the
+                            // new rows by the current column/direction instead
+                            // of resetting `sort_col`/`sort_dir`.
+                            reapply_table_sort(table);
+                        }
+                        if let Some(sel) = selected_row {
+                            if table.selected_row != sel {
+                                table.selected_row = sel;
+                                changed = true;
+                            }
+                        }
+                        return changed;
+                    }
+                }
+                false
+            }
+            ScenePatch::SetPlotData {
+                id,
+                title,
+                subtitle,
+                series,
+                panes,
+                thresholds,
+            } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Plot(plot) = &mut node.kind {
+                        let old_shape = plot_shape(plot);
+                        if let Some(t) = title {
+                            plot.title = t;
+                        }
+                        if let Some(st) = subtitle {
+                            plot.subtitle = st;
+                        }
+                        if let Some(s) = series {
+                            plot.series = s;
+                        }
+                        if let Some(p) = panes {
+                            plot.panes = p;
+                        }
+                        if let Some(th) = thresholds {
+                            plot.thresholds = th;
+                        }
+                        // The node's bounds are untouched, so a compatible
+                        // data swap keeps the user's zoom window. Only a
+                        // structural change (series/pane count or candle vs
+                        // point layout) clears it.
+                        if old_shape != plot_shape(plot) {
+                            plot.view_range = None;
+                        }
+                        return true;
+                    }
+                }
+                false
+            }
+            ScenePatch::SetGraph {
+                id,
+                title,
+                nodes,
+                edges,
+                selected_node,
+            } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Graph(graph) = &mut node.kind {
+                        let mut changed = false;
+                        if let Some(t) = title {
+                            if graph.title != t {
+                                graph.title = t;
+                                changed = true;
+                            }
+                        }
+                        if graph.nodes != nodes {
+                            graph.nodes = nodes;
+                            changed = true;
+                        }
+                        if graph.edges != edges {
+                            graph.edges = edges;
+                            changed = true;
+                        }
+                        if let Some(sel) = selected_node {
+                            if graph.selected_node != sel {
+                                graph.selected_node = sel;
+                                changed = true;
+                            }
+                        }
+                        return changed;
+                    }
+                }
+                false
+            }
+            ScenePatch::SetChildren { id, children } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    match &mut node.kind {
+                        NodeKind::Container {
+                            children: current, ..
+                        }
+                        | NodeKind::Grid {
+                            children: current, ..
+                        } => {
+                            if *current != children {
+                                *current = children;
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                false
+            }
         }
     }
+}
+
+/// Structural fingerprint used by [`ScenePatch::SetPlotData`] to decide whether
+/// the existing zoom window is still valid (`PlotSeriesKind`, series count,
+/// pane count, and whether each series carries points or candles).
+fn plot_shape(plot: &PlotData) -> (usize, usize, Vec<(PlotSeriesKind, bool, bool)>) {
+    fn push(out: &mut Vec<(PlotSeriesKind, bool, bool)>, series: &[PlotSeries]) {
+        for s in series {
+            out.push((s.kind, !s.points.is_empty(), !s.candles.is_empty()));
+        }
+    }
+    let mut out = Vec::new();
+    push(&mut out, &plot.series);
+    for pane in &plot.panes {
+        push(&mut out, &pane.series);
+    }
+    (out.len(), plot.panes.len(), out)
 }
 
 fn find_plot_series_mut<'a>(
@@ -787,6 +924,42 @@ pub enum ScenePatch {
         highlights: Option<Vec<CodeHighlight>>,
     },
     ReplaceNode { id: String, node: Node },
+    /// Replace a table's rows while preserving `sort_col`/`sort_dir` and the
+    /// engine's kinetic scroll state. `selected_row` omitted = keep selection.
+    SetTableRows {
+        id: String,
+        rows: Vec<TableRow>,
+        #[serde(default)]
+        selected_row: Option<Option<String>>,
+    },
+    /// Swap a plot's data while keeping the outer node bounds and (when the
+    /// series/pane shape is compatible) the user's zoom window.
+    SetPlotData {
+        id: String,
+        #[serde(default)]
+        title: Option<Option<String>>,
+        #[serde(default)]
+        subtitle: Option<Option<String>>,
+        #[serde(default)]
+        series: Option<Vec<PlotSeries>>,
+        #[serde(default)]
+        panes: Option<Vec<PlotPane>>,
+        #[serde(default)]
+        thresholds: Option<Vec<PlotThreshold>>,
+    },
+    /// Replace a graph's nodes/edges while preserving its style and bounds.
+    SetGraph {
+        id: String,
+        #[serde(default)]
+        title: Option<Option<String>>,
+        nodes: Vec<GraphNode>,
+        edges: Vec<GraphEdge>,
+        #[serde(default)]
+        selected_node: Option<Option<String>>,
+    },
+    /// Replace the children of a container or grid, keeping its id, gap,
+    /// alignment, fold width, padding and style untouched.
+    SetChildren { id: String, children: Vec<Node> },
     UpdateStat {
         id: String,
         #[serde(default)]
@@ -875,5 +1048,180 @@ mod tests {
         assert_eq!(scene.root.priority, 100);
         assert!(scene.root.visible);
         assert_eq!(scene.root.width, SizeSpec::Auto);
+    }
+
+    fn container(children: Vec<Node>) -> Node {
+        Node::new(
+            "root",
+            NodeKind::Container {
+                axis: Axis::Column,
+                align: Align::Stretch,
+                gap: 8.0,
+                fold_width: None,
+                scrollable: false,
+                style: None,
+                children,
+            },
+        )
+    }
+
+    fn row_text(id: &str, text: &str) -> TableRow {
+        TableRow::new(id, vec![crate::components::table::TableCell::new(text)])
+    }
+
+    #[test]
+    fn incremental_table_rows_reapply_existing_sort_without_resetting_it() {
+        use crate::components::table::{TableColumn, TableSortDir};
+
+        let table = Node::new(
+            "tbl",
+            NodeKind::Table(TableData {
+                columns: vec![TableColumn::new("n", "N")],
+                rows: vec![row_text("a", "2"), row_text("b", "10")],
+                sort_col: Some(0),
+                sort_dir: TableSortDir::Desc,
+                ..TableData::default()
+            }),
+        );
+        let mut scene = Scene::new("T", ThemeMode::Light, container(vec![table]));
+
+        let patch: ScenePatch = serde_json::from_str(
+            r#"{"op":"set_table_rows","id":"tbl","rows":[{"id":"c","cells":[{"text":"5"}]},{"id":"d","cells":[{"text":"1"}]},{"id":"e","cells":[{"text":"9"}]}]}"#,
+        )
+        .expect("set_table_rows json");
+        assert!(scene.apply_patch(patch));
+
+        let NodeKind::Table(table) = &scene.root.find_mut("tbl").unwrap().kind else {
+            panic!("table missing");
+        };
+        assert_eq!(table.sort_col, Some(0));
+        assert_eq!(table.sort_dir, TableSortDir::Desc);
+        let values: Vec<&str> = table.rows.iter().map(|r| r.cells[0].text.as_str()).collect();
+        assert_eq!(values, vec!["9", "5", "1"]);
+
+        // Selected-row is only touched when the patch asks for it.
+        assert_eq!(table.selected_row, None);
+        let select: ScenePatch =
+            serde_json::from_str(r#"{"op":"set_table_rows","id":"tbl","rows":[],"selected_row":"d"}"#)
+                .expect("selected_row json");
+        assert!(scene.apply_patch(select));
+        let NodeKind::Table(table) = &scene.root.find_mut("tbl").unwrap().kind else {
+            panic!("table missing");
+        };
+        assert_eq!(table.selected_row.as_deref(), Some("d"));
+    }
+
+    fn line_series(id: &str) -> PlotSeries {
+        PlotSeries {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: PlotSeriesKind::Line,
+            color: None,
+            secondary_color: None,
+            visible: true,
+            dashed: false,
+            stroke_width: None,
+            points: vec![PlotPoint {
+                x: 0.0,
+                y: 1.0,
+                y2: None,
+                label: None,
+            }],
+            candles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn incremental_plot_data_keeps_compatible_zoom_and_resets_on_shape_change() {
+        let plot = Node::new(
+            "p1",
+            NodeKind::Plot(PlotData {
+                series: vec![line_series("price")],
+                view_range: Some([0.2, 0.8]),
+                ..PlotData::default()
+            }),
+        );
+        let mut scene = Scene::new("T", ThemeMode::Light, container(vec![plot]));
+
+        let compatible: ScenePatch = serde_json::from_str(
+            r#"{"op":"set_plot_data","id":"p1","title":"Updated","series":[{"id":"price","name":"Price","kind":"line","points":[{"x":0,"y":2}]}]}"#,
+        )
+        .expect("set_plot_data json");
+        assert!(scene.apply_patch(compatible));
+        let NodeKind::Plot(plot) = &scene.root.find_mut("p1").unwrap().kind else {
+            panic!("plot missing");
+        };
+        assert_eq!(plot.title.as_deref(), Some("Updated"));
+        assert_eq!(plot.view_range, Some([0.2, 0.8]));
+
+        let incompatible: ScenePatch = serde_json::from_str(
+            r#"{"op":"set_plot_data","id":"p1","series":[{"id":"price","name":"Price","kind":"line","points":[{"x":0,"y":2}]},{"id":"vol","name":"Volume","kind":"histogram","points":[{"x":0,"y":3}]}]}"#,
+        )
+        .expect("set_plot_data shape json");
+        assert!(scene.apply_patch(incompatible));
+        let NodeKind::Plot(plot) = &scene.root.find_mut("p1").unwrap().kind else {
+            panic!("plot missing");
+        };
+        assert_eq!(plot.view_range, None);
+        assert_eq!(plot.series.len(), 2);
+    }
+
+    #[test]
+    fn incremental_set_children_preserves_grid_geometry() {
+        let grid = Node::new(
+            "g",
+            NodeKind::Grid {
+                columns: 3,
+                min_col_width: 150.0,
+                gap: 7.0,
+                style: None,
+                children: vec![Node::new("old", NodeKind::Spacer)],
+            },
+        )
+        .with_size(SizeSpec::Fill(1.0), SizeSpec::Px(220.0));
+        let mut scene = Scene::new("T", ThemeMode::Light, container(vec![grid]));
+
+        let patch: ScenePatch = serde_json::from_str(
+            r#"{"op":"set_children","id":"g","children":[{"id":"n1","kind":{"type":"spacer"}}]}"#,
+        )
+        .expect("set_children json");
+        assert!(scene.apply_patch(patch));
+        let NodeKind::Grid { gap, columns, min_col_width, children, .. } =
+            &scene.root.find_mut("g").unwrap().kind
+        else {
+            panic!("grid missing");
+        };
+        assert_eq!(*gap, 7.0);
+        assert_eq!(*columns, 3);
+        assert_eq!(*min_col_width, 150.0);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].id, "n1");
+    }
+
+    #[test]
+    fn incremental_graph_swap_keeps_style_and_title_control() {
+        let graph = Node::new(
+            "dag",
+            NodeKind::Graph(GraphData {
+                title: Some("Old".into()),
+                nodes: vec![GraphNode::new("a", "A")],
+                edges: Vec::new(),
+                ..GraphData::default()
+            }),
+        );
+        let mut scene = Scene::new("T", ThemeMode::Light, container(vec![graph]));
+        let patch: ScenePatch = serde_json::from_str(
+            r#"{"op":"set_graph","id":"dag","title":null,"nodes":[{"id":"b","label":"B"}],"edges":[{"from":"b","to":"a"}]}"#,
+        )
+        .expect("set_graph json");
+        assert!(scene.apply_patch(patch));
+        let NodeKind::Graph(graph) = &scene.root.find_mut("dag").unwrap().kind else {
+            panic!("graph missing");
+        };
+        // `title: null` deserializes to "leave unchanged" under Option<Option<_>>.
+        assert_eq!(graph.title.as_deref(), Some("Old"));
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.nodes[0].id, "b");
+        assert_eq!(graph.edges.len(), 1);
     }
 }

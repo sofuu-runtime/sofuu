@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use crate::components::code::CodeHighlight;
 use crate::components::feed::FeedItem;
@@ -74,16 +75,226 @@ pub struct AutoTriggerStat {
     pub running: bool,
     #[serde(default)]
     pub ticks: u64,
-    #[serde(default)]
+    #[serde(default, alias = "gateSkips")]
     pub gate_skips: u64,
-    #[serde(default)]
+    #[serde(default, alias = "gateHits")]
     pub gate_hits: u64,
-    #[serde(default)]
+    #[serde(default, alias = "aiCalls")]
     pub ai_calls: u64,
     #[serde(default)]
     pub errors: u64,
-    #[serde(default)]
+    #[serde(default, alias = "lastDurationMs")]
     pub last_duration_ms: u64,
+}
+
+impl AutoAgentEvent {
+    /// Parse either the canonical snake_case shape or the camelCase
+    /// `{runId,agentName,chain,t,kind,payload}` stream shape emitted by
+    /// `sofuu_rt_call_stream("agent.run", …)`, normalizing payload fields
+    /// (tool/title/detail/tokens/elapsed_ms/approval) into this struct.
+    pub fn from_runtime_json(raw: &str) -> Option<Self> {
+        let value: JsonValue = serde_json::from_str(raw).ok()?;
+        if !value.is_object() {
+            return None;
+        }
+        let canonical = value.get("payload").is_none()
+            && value.get("runId").is_none()
+            && value.get("agentName").is_none();
+        if canonical {
+            if let Ok(ev) = serde_json::from_value(value.clone()) {
+                return Some(ev);
+            }
+        }
+        Some(normalize_runtime_event(&value))
+    }
+}
+
+fn normalize_runtime_event(value: &JsonValue) -> AutoAgentEvent {
+    let obj = value.as_object().cloned().unwrap_or_default();
+    let payload = obj
+        .get("payload")
+        .and_then(JsonValue::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let kind = obj
+        .get("kind")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("event")
+        .to_string();
+
+    let mut out = JsonMap::new();
+    let run_id = obj
+        .get("run_id")
+        .or_else(|| obj.get("runId"))
+        .or_else(|| obj.get("turn_id"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    out.insert("run_id".into(), JsonValue::String(run_id.into()));
+
+    let agent_name = obj
+        .get("agent_name")
+        .or_else(|| obj.get("agentName"))
+        .or_else(|| obj.get("name"))
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    out.insert("agent_name".into(), JsonValue::String(agent_name.into()));
+
+    if let Some(profile) = obj.get("profile") {
+        let name = match profile {
+            JsonValue::String(s) => Some(s.clone()),
+            JsonValue::Object(o) => ["name", "model", "id"]
+                .iter()
+                .find_map(|k| o.get(*k).and_then(JsonValue::as_str))
+                .map(str::to_string),
+            _ => None,
+        };
+        if let Some(name) = name {
+            out.insert("profile".into(), JsonValue::String(name));
+        }
+    }
+
+    if let Some(depth) = obj.get("depth").and_then(JsonValue::as_u64) {
+        out.insert("depth".into(), JsonValue::from(depth));
+    }
+    if let Some(chain) = obj.get("chain").and_then(JsonValue::as_array) {
+        out.insert("chain".into(), JsonValue::Array(chain.clone()));
+    }
+    out.insert("kind".into(), JsonValue::String(kind.clone()));
+
+    let tool = obj
+        .get("tool")
+        .and_then(JsonValue::as_str)
+        .or_else(|| payload.get("name").and_then(JsonValue::as_str))
+        .or_else(|| payload.get("tool").and_then(JsonValue::as_str));
+    if let Some(tool) = tool {
+        out.insert("tool".into(), JsonValue::String(tool.into()));
+    }
+
+    let title = obj
+        .get("title")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            ["task", "step", "answer", "error", "result", "text"]
+                .iter()
+                .find_map(|k| payload.get(*k).and_then(JsonValue::as_str))
+                .map(str::to_string)
+        });
+    if let Some(title) = title {
+        out.insert("title".into(), JsonValue::String(title));
+    }
+
+    let detail = obj
+        .get("detail")
+        .and_then(JsonValue::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            payload.get("args").map(|args| {
+                args.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| args.to_string())
+            })
+        });
+    if let Some(detail) = detail {
+        out.insert("detail".into(), JsonValue::String(detail));
+    }
+
+    let tokens = obj
+        .get("tokens")
+        .and_then(JsonValue::as_u64)
+        .or_else(|| payload.get("tokens").and_then(JsonValue::as_u64))
+        .or_else(|| {
+            payload
+                .get("usage")
+                .or_else(|| obj.get("usage"))
+                .and_then(usage_tokens)
+        });
+    if let Some(tokens) = tokens {
+        out.insert("tokens".into(), JsonValue::from(tokens));
+    }
+
+    let elapsed_ms = obj
+        .get("elapsed_ms")
+        .or_else(|| obj.get("elapsedMs"))
+        .or_else(|| obj.get("duration_ms"))
+        .and_then(JsonValue::as_u64)
+        .or_else(|| payload.get("duration").and_then(JsonValue::as_u64))
+        .or_else(|| payload.get("duration_ms").and_then(JsonValue::as_u64));
+    if let Some(ms) = elapsed_ms {
+        out.insert("elapsed_ms".into(), JsonValue::from(ms));
+    }
+
+    if let Some(label) = obj
+        .get("time_label")
+        .or_else(|| obj.get("timeLabel"))
+        .and_then(JsonValue::as_str)
+    {
+        out.insert("time_label".into(), JsonValue::String(label.into()));
+    }
+    if let Some(tone) = obj.get("tone").cloned() {
+        out.insert("tone".into(), tone);
+    }
+
+    let approval = obj
+        .get("approval")
+        .cloned()
+        .or_else(|| build_approval(&kind, &payload));
+    if let Some(approval) = approval {
+        out.insert("approval".into(), approval);
+    }
+
+    serde_json::from_value(JsonValue::Object(out)).unwrap_or_else(|_| AutoAgentEvent {
+        kind,
+        ..AutoAgentEvent::default()
+    })
+}
+
+fn usage_tokens(usage: &JsonValue) -> Option<u64> {
+    if let Some(total) = usage
+        .get("total_tokens")
+        .or_else(|| usage.get("totalTokens"))
+        .and_then(JsonValue::as_u64)
+    {
+        return Some(total);
+    }
+    let input = ["input_tokens", "prompt_tokens", "promptTokens"]
+        .iter()
+        .find_map(|k| usage.get(*k).and_then(JsonValue::as_u64))
+        .unwrap_or(0);
+    let output = ["output_tokens", "completion_tokens", "completionTokens"]
+        .iter()
+        .find_map(|k| usage.get(*k).and_then(JsonValue::as_u64))
+        .unwrap_or(0);
+    if input + output > 0 {
+        Some(input + output)
+    } else {
+        None
+    }
+}
+
+fn build_approval(kind: &str, payload: &JsonMap<String, JsonValue>) -> Option<JsonValue> {
+    if kind != "approval_request" && kind != "approval_resolved" {
+        return None;
+    }
+    let id = payload.get("id").and_then(JsonValue::as_str)?;
+    let tool = payload
+        .get("tool")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    let args_preview = payload
+        .get("args")
+        .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+        .unwrap_or_default();
+    let mode = payload
+        .get("mode")
+        .and_then(JsonValue::as_str)
+        .unwrap_or("");
+    Some(serde_json::json!({
+        "id": id,
+        "tool": tool,
+        "args_preview": args_preview,
+        "mode": mode,
+    }))
 }
 
 /// Stateful Auto-Composer converting runtime event/stat streams into a retained
@@ -315,9 +526,12 @@ impl AutoComposer {
 
         // Update execution topology graph from chain / tool / delegate nodes.
         self.record_topology(&ev);
-        patches.push(ScenePatch::ReplaceNode {
+        patches.push(ScenePatch::SetGraph {
             id: "auto_graph".to_string(),
-            node: self.build_graph_node(),
+            title: None,
+            nodes: self.graph_order.iter().filter_map(|id| self.graph_nodes.get(id).cloned()).collect(),
+            edges: self.graph_edges.clone(),
+            selected_node: None,
         });
 
         // Update feed stream.
@@ -424,9 +638,10 @@ impl AutoComposer {
                 push_sparkline: None,
                 sparkline_max_len: None,
             },
-            ScenePatch::ReplaceNode {
+            ScenePatch::SetTableRows {
                 id: "auto_state_table".to_string(),
-                node: self.build_table_node(),
+                rows: self.build_table_rows(),
+                selected_row: None,
             },
         ]
     }
@@ -434,9 +649,10 @@ impl AutoComposer {
     /// Update generic operational state rows displayed alongside triggers in `auto_state_table`.
     pub fn update_state_rows(&mut self, rows: Vec<TableRow>) -> Vec<ScenePatch> {
         self.state_rows = rows;
-        vec![ScenePatch::ReplaceNode {
+        vec![ScenePatch::SetTableRows {
             id: "auto_state_table".to_string(),
-            node: self.build_table_node(),
+            rows: self.build_table_rows(),
+            selected_row: None,
         }]
     }
 
@@ -619,7 +835,7 @@ impl AutoComposer {
         b.into()
     }
 
-    fn build_table_node(&self) -> Node {
+    fn build_table_rows(&self) -> Vec<TableRow> {
         let mut rows = Vec::new();
         for t in &self.triggers {
             let status_txt = if t.running { "LIVE" } else { "STOP" };
@@ -641,6 +857,10 @@ impl AutoComposer {
             ));
         }
         rows.extend(self.state_rows.clone());
+        rows
+    }
+
+    fn build_table_node(&self) -> Node {
         Node::new(
             "auto_state_table",
             NodeKind::Table(TableData {
@@ -651,7 +871,7 @@ impl AutoComposer {
                     TableColumn::new("hits", "Hits / Ticks").align(TableAlign::Right),
                     TableColumn::new("dur", "Last / Detail").align(TableAlign::Right),
                 ],
-                rows,
+                rows: self.build_table_rows(),
                 empty_text: Some("No triggers or state rows active yet".to_string()),
                 ..TableData::default()
             }),

@@ -222,6 +222,119 @@ fn js_showcase_json_schema_and_patches_roundtrip_into_ui_engine() {
 }
 
 #[test]
+fn v2_handle_builder_patch_stream_roundtrips() {
+    // Shape emitted by the V2 builders: auto/explicit ids, handle patches and
+    // `ui.signal`-driven updates (`set_table_rows`, `set_plot_data`,
+    // `set_graph`, `set_children`).
+    let scene_json = r#"{
+        "op": "replace_scene",
+        "title": "V2 Handles",
+        "theme": "light",
+        "root": {
+            "id": "root",
+            "kind": {
+                "type": "container",
+                "axis": "column",
+                "align": "stretch",
+                "gap": 12,
+                "fold_width": null,
+                "scrollable": false,
+                "style": null,
+                "children": [
+                    {
+                        "id": "grid",
+                        "kind": {
+                            "type": "grid",
+                            "columns": 0,
+                            "min_col_width": 210,
+                            "gap": 12,
+                            "style": null,
+                            "children": [
+                                { "id": "stat_btc", "kind": { "type": "stat", "label": "BTC", "value": 100.0, "variant": "compact", "sparkline": [] } },
+                                { "id": "plot", "kind": { "type": "plot", "title": "Price", "series": [], "panes": [] } },
+                                {
+                                    "id": "table",
+                                    "kind": {
+                                        "type": "table",
+                                        "columns": [{ "key": "sym", "label": "Asset" }],
+                                        "rows": [{ "id": "btc", "cells": [{ "text": "BTC" }] }]
+                                    }
+                                },
+                                { "id": "graph", "kind": { "type": "graph", "nodes": [], "edges": [] } }
+                            ]
+                        }
+                    },
+                    {
+                        "id": "row",
+                        "kind": {
+                            "type": "container",
+                            "axis": "row",
+                            "align": "center",
+                            "gap": 10,
+                            "fold_width": 680,
+                            "scrollable": false,
+                            "style": null,
+                            "children": [{ "id": "row_text", "kind": { "type": "text", "content": "row", "size": 14, "color": null, "mono": false, "wrap": false } }]
+                        }
+                    },
+                    { "id": "feed", "kind": { "type": "feed", "items": [], "max_items": 150 } }
+                ]
+            }
+        }
+    }"#;
+
+    let patch: ScenePatch = serde_json::from_str(scene_json).expect("parse replace_scene");
+    let ScenePatch::ReplaceScene(scene) = patch else {
+        panic!("expected ReplaceScene");
+    };
+    let mut engine = UiEngine::new(scene, [1280.0, 800.0]);
+
+    let follow_ups = [
+        r#"{"op":"set_table_rows","id":"table","rows":[{"id":"btc","cells":[{"text":"BTC"}]},{"id":"eth","cells":[{"text":"ETH"}]}],"selected_row":"eth"}"#,
+        r#"{"op":"set_plot_data","id":"plot","title":"BTC","series":[{"id":"s","name":"S","kind":"line","points":[{"x":0,"y":1}]}],"panes":[]}"#,
+        r#"{"op":"set_graph","id":"graph","nodes":[{"id":"n","label":"N"}],"edges":[],"selected_node":"n"}"#,
+        r#"{"op":"set_children","id":"row","children":[{"id":"stat_row","kind":{"type":"stat","label":"ROW","value":2.0}}]}"#,
+        r#"{"op":"append_feed_item","id":"feed","item":{"id":"f1","title":"scan"}}"#,
+    ];
+    for pjson in follow_ups {
+        let p: ScenePatch = serde_json::from_str(pjson).unwrap_or_else(|e| panic!("bad patch {pjson}: {e}"));
+        assert!(engine.apply_patch(p), "patch did not apply: {pjson}");
+    }
+
+    let table = &engine.scene.root.find_mut("table").expect("table").kind;
+    let sofuu_ui::NodeKind::Table(table) = table else {
+        panic!("table kind");
+    };
+    assert_eq!(table.rows.len(), 2);
+    assert_eq!(table.selected_row.as_deref(), Some("eth"));
+
+    let plot = &engine.scene.root.find_mut("plot").expect("plot").kind;
+    let sofuu_ui::NodeKind::Plot(plot) = plot else {
+        panic!("plot kind");
+    };
+    assert_eq!(plot.title.as_deref(), Some("BTC"));
+    assert_eq!(plot.series[0].id, "s");
+
+    let graph = &engine.scene.root.find_mut("graph").expect("graph").kind;
+    let sofuu_ui::NodeKind::Graph(graph) = graph else {
+        panic!("graph kind");
+    };
+    assert_eq!(graph.selected_node.as_deref(), Some("n"));
+
+    let row = &engine.scene.root.find_mut("row").expect("row").kind;
+    let sofuu_ui::NodeKind::Container { children, gap, .. } = row else {
+        panic!("row kind");
+    };
+    assert_eq!(*gap, 10.0);
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].id, "stat_row");
+
+    let mut dl = DrawList::default();
+    let _ = engine.tick_and_compile(1.0 / 60.0, &mut dl);
+    assert!(!dl.quads.is_empty());
+}
+
+#[test]
 fn auto_composer_scene_and_patches_roundtrip_via_json_wire() {
     use sofuu_ui::{AutoAgentEvent, AutoComposer, AutoTriggerStat, PendingApproval, ThemeMode};
 

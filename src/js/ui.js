@@ -1,9 +1,4 @@
-/* src/js/ui.js — Declarative GPU UI builders, incremental patches, and event bridge (`sofuu.ui`).
- *
- * Keeps `sofuu-core` 100% free of UI bloat: emits plain JSON Scene/ScenePatch envelopes to
- * `__sofuu_ui_push_patch` (backed by dynamically-loaded `libsofuu_gpu`) and polls semantic
- * `UIEvent`s via `__sofuu_ui_poll_event`. Zero domain schemas, zero hardcoding.
- */
+/* src/js/ui.js — declarative GPU UI builders + event bridge (`sofuu.ui`). */
 (function () {
   'use strict';
 
@@ -15,6 +10,22 @@
   var ui = {};
   ui._loaded = true;
 
+  var uidSeq = 0;
+  var mounted = false;
+  var nodeHandlers = Object.create(null);
+
+  function isObj(v) {
+    return v !== null && typeof v === 'object' && !Array.isArray(v);
+  }
+
+  function autoId() {
+    return '_u' + (++uidSeq);
+  }
+
+  function nodeId(id, o) {
+    return String(id || (o && o.id) || autoId());
+  }
+
   function sizeSpec(v) {
     if (v === undefined || v === null || v === 'auto') return 'auto';
     if (typeof v === 'number') return { px: v };
@@ -24,6 +35,19 @@
 
   function fillSize(v) {
     return { fill: (typeof v === 'number' && v > 0) ? v : 1.0 };
+  }
+
+  function sizeOf(o, key, alias) {
+    var v = (o[key] !== undefined) ? o[key] : (alias ? o[alias] : undefined);
+    if (v !== undefined) return sizeSpec(v);
+    var flex = (o.flex !== undefined) ? o.flex : o.grow;
+    if (flex !== undefined) return fillSize(flex);
+    return o.fill ? fillSize(o.fill) : 'auto';
+  }
+
+  function put(n, k, v) {
+    Object.defineProperty(n, k, { value: v, configurable: true, writable: true });
+    return n;
   }
 
   function makeNode(id, kind, opts) {
@@ -41,17 +65,28 @@
         };
       }
     }
-    return {
-      id: String(id || 'node'),
+    var n = {
+      id: nodeId(id, o),
       priority: (o.priority !== undefined) ? Number(o.priority) : 100,
       visible: (o.visible !== undefined) ? !!o.visible : true,
-      width: (o.width !== undefined) ? sizeSpec(o.width) : (o.fill ? fillSize(o.fill) : 'auto'),
-      height: (o.height !== undefined) ? sizeSpec(o.height) : (o.fill ? fillSize(o.fill) : 'auto'),
+      width: sizeOf(o, 'width', 'w'),
+      height: sizeOf(o, 'height', 'h'),
       min_width: (o.minWidth !== undefined) ? Number(o.minWidth) : 0,
       min_height: (o.minHeight !== undefined) ? Number(o.minHeight) : 0,
       padding: pad,
       kind: kind,
     };
+    put(n, 'toNode', function () { return n; });
+    put(n, 'setVisible', function (v) {
+      n.visible = !!v;
+      if (mounted) sendPatch({ op: 'set_visible', id: n.id, visible: !!v });
+      return n;
+    });
+    if (o.onClick || o.onChange || o.onSubmit || o.onSelect || o.onSort ||
+        o.onItemClick || o.onNodeClick) {
+      nodeHandlers[n.id] = { n: n, o: o };
+    }
+    return n;
   }
 
   function unwrapNode(x) {
@@ -66,83 +101,109 @@
     return t === 'stat' || t === 'plot' || t === 'table' || t === 'feed' || t === 'graph' || t === 'code_text';
   }
 
-  // ── Node & Component Builders ────────────────────────────────────────────
+  function containerNode(id, children, opts, kindFn) {
+    var o, kids;
+    if (Array.isArray(id)) { o = children || {}; kids = id; id = null; }
+    else { o = opts || {}; kids = children || []; }
+    var n = makeNode(id, Object.assign({ children: kids.map(unwrapNode).filter(Boolean) }, kindFn(o)), o);
+    return put(n, 'setChildren', function (list) {
+      var next = (list || []).map(unwrapNode).filter(Boolean);
+      n.kind.children = next;
+      if (mounted) sendPatch({ op: 'set_children', id: n.id, children: next });
+      return n;
+    });
+  }
 
   ui.row = function (id, children, opts) {
-    var o = opts || {};
-    var kids = (children || []).map(unwrapNode).filter(Boolean);
-    return makeNode(id, {
-      type: 'container',
-      axis: 'row',
-      align: o.align || (o.fill ? 'stretch' : 'center'),
-      gap: (o.gap !== undefined) ? Number(o.gap) : 10.0,
-      fold_width: (o.foldBelow !== undefined) ? o.foldBelow : 680.0,
-      scrollable: !!o.scrollable,
-      style: o.style || null,
-      children: kids,
-    }, o);
+    return containerNode(id, children, opts, function (o) {
+      return {
+        type: 'container',
+        axis: 'row',
+        align: o.align || (o.fill ? 'stretch' : 'center'),
+        gap: (o.gap !== undefined) ? Number(o.gap) : 10.0,
+        fold_width: (o.foldBelow !== undefined) ? o.foldBelow : 680.0,
+        scrollable: !!o.scrollable,
+        style: o.style || null,
+      };
+    });
   };
 
   ui.col = function (id, children, opts) {
-    var o = opts || {};
-    var kids = (children || []).map(unwrapNode).filter(Boolean);
-    return makeNode(id, {
-      type: 'container',
-      axis: 'column',
-      align: o.align || 'stretch',
-      gap: (o.gap !== undefined) ? Number(o.gap) : 12.0,
-      fold_width: null,
-      scrollable: !!o.scrollable,
-      style: o.style || null,
-      children: kids,
-    }, o);
+    return containerNode(id, children, opts, function (o) {
+      return {
+        type: 'container',
+        axis: 'column',
+        align: o.align || 'stretch',
+        gap: (o.gap !== undefined) ? Number(o.gap) : 12.0,
+        fold_width: null,
+        scrollable: !!o.scrollable,
+        style: o.style || null,
+      };
+    });
   };
 
   ui.grid = function (id, children, opts) {
-    var o = opts || {};
-    var kids = (children || []).map(unwrapNode).filter(Boolean);
-    return makeNode(id, {
-      type: 'grid',
-      columns: (o.columns !== undefined) ? Number(o.columns) : 0,
-      min_col_width: (o.minColWidth !== undefined) ? Number(o.minColWidth) : 220.0,
-      gap: (o.gap !== undefined) ? Number(o.gap) : 12.0,
-      style: o.style || null,
-      children: kids,
-    }, o);
+    return containerNode(id, children, opts, function (o) {
+      return {
+        type: 'grid',
+        columns: (o.columns !== undefined) ? Number(o.columns) : 0,
+        min_col_width: (o.minColWidth !== undefined) ? Number(o.minColWidth) : 220.0,
+        gap: (o.gap !== undefined) ? Number(o.gap) : 12.0,
+        style: o.style || null,
+      };
+    });
   };
 
-  ui.tabs = function (id, items, opts) {
-    var o = opts || {};
-    var list = (items || []).map(function (it) {
-      return { label: String(it.label || ''), child: unwrapNode(it.child) };
+  function activeMethod(n, op) {
+    return put(n, 'setActive', function (i) {
+      n.kind.active = Number(i) || 0;
+      if (mounted) sendPatch({ op: op, id: n.id, active: n.kind.active });
+      return n;
     });
-    return makeNode(id, {
+  }
+
+  ui.tabs = function (id, items, opts) {
+    var o, list;
+    if (Array.isArray(id)) { o = items || {}; list = id; id = null; }
+    else { o = opts || {}; list = items || []; }
+    var n = makeNode(id, {
       type: 'tabs',
       active: Number(o.active || 0),
-      items: list,
+      items: list.map(function (it) {
+        return { label: String(it.label || ''), child: unwrapNode(it.child) };
+      }),
     }, o);
+    return activeMethod(n, 'set_tab');
   };
 
   ui.text = function (id, content, opts) {
-    var o = opts || {};
-    return makeNode(id, {
+    var o, txt;
+    if (typeof content === 'string') { o = opts || {}; txt = content; }
+    else { o = content || {}; txt = id; id = null; }
+    var n = makeNode(id, {
       type: 'text',
-      content: String(content !== undefined && content !== null ? content : ''),
+      content: String(txt !== undefined && txt !== null ? txt : ''),
       size: Number(o.size || 14.0),
       color: (o.color !== undefined) ? o.color : null,
       mono: !!o.mono,
       wrap: !!o.wrap,
     }, o);
+    return put(n, 'set', function (v) {
+      n.kind.content = String(v !== undefined && v !== null ? v : '');
+      if (mounted) sendPatch({ op: 'set_text', id: n.id, content: n.kind.content });
+      return n;
+    });
   };
 
   ui.title = function (content, opts) {
     var o = Object.assign({ size: 18.0, width: { fill: 1.0 } }, opts || {});
-    return ui.text(o.id || 'title', content, o);
+    return ui.text(o.id || null, content, o);
   };
 
   ui.rule = function (id, opts) {
-    var o = opts || {};
-    return makeNode(id || 'rule', {
+    var o = isObj(id) ? id : (opts || {});
+    if (isObj(id)) id = null;
+    return makeNode(id, {
       type: 'rule',
       thickness: Number(o.thickness || 1.0),
       color: (o.color !== undefined) ? o.color : null,
@@ -150,58 +211,92 @@
   };
 
   ui.spacer = function (id, opts) {
-    return makeNode(id || 'spacer', { type: 'spacer' }, Object.assign({ width: { fill: 1.0 } }, opts || {}));
+    var o = isObj(id) ? id : (opts || {});
+    if (isObj(id)) id = null;
+    return makeNode(id, { type: 'spacer' }, Object.assign({ width: { fill: 1.0 } }, o));
   };
 
   ui.themeToggle = function (id, opts) {
-    var o = opts || {};
-    return makeNode(id || 'theme_toggle', {
+    var o = isObj(id) ? id : (opts || {});
+    if (isObj(id)) id = null;
+    return makeNode(id, {
       type: 'theme_toggle',
       size: Number(o.size || 34.0),
     }, o);
   };
 
   ui.segmented = function (id, options, active, opts) {
-    return makeNode(id, {
+    var o, arr, act;
+    if (Array.isArray(id)) {
+      arr = id;
+      if (isObj(options)) { o = options; act = 0; }
+      else { act = options; o = isObj(active) ? active : (opts || {}); }
+      id = null;
+    } else { o = opts || {}; arr = options || []; act = active; }
+    var n = makeNode(id, {
       type: 'segmented',
-      active: Number(active || 0),
-      options: (options || []).map(String),
-    }, opts);
+      active: Number(act || 0),
+      options: (arr || []).map(String),
+    }, o);
+    return activeMethod(n, 'set_segmented');
   };
 
   ui.button = function (id, label, opts) {
-    var o = opts || {};
+    var o, lbl;
+    if (typeof label === 'string') { o = opts || {}; lbl = label; }
+    else { o = isObj(label) ? label : (opts || {}); lbl = id; id = null; }
     return makeNode(id, {
       type: 'button',
-      label: String(label || ''),
+      label: String(lbl || ''),
       tone: o.tone || 'neutral',
     }, o);
   };
 
   ui.switch = function (id, checked, label, opts) {
-    var o = opts || {};
-    return makeNode(id, {
+    var o, chk, lbl;
+    if (typeof id === 'boolean') {
+      chk = id;
+      if (isObj(checked)) { o = checked; lbl = null; }
+      else { o = isObj(label) ? label : (opts || {}); lbl = checked; }
+      id = null;
+    } else { o = opts || {}; chk = checked; lbl = label; }
+    var n = makeNode(id, {
       type: 'switch',
-      checked: !!checked,
-      label: (label !== undefined && label !== null) ? String(label) : null,
+      checked: !!chk,
+      label: (lbl !== undefined && lbl !== null) ? String(lbl) : null,
       tone: o.tone || 'neutral',
     }, o);
+    Object.defineProperty(n, 'checked', {
+      configurable: true,
+      get: function () { return !!n.kind.checked; },
+    });
+    return put(n, 'setChecked', function (v) {
+      n.kind.checked = !!v;
+      if (mounted) sendPatch({ op: 'set_switch', id: n.id, checked: n.kind.checked });
+      return n;
+    });
   };
 
   ui.input = function (id, placeholder, opts) {
-    var o = Object.assign({ height: 34.0 }, opts || {});
-    return makeNode(id, {
+    var o, ph;
+    if (typeof placeholder === 'string') { o = Object.assign({ height: 34.0 }, opts || {}); ph = placeholder; }
+    else if (isObj(placeholder)) { o = Object.assign({ height: 34.0 }, placeholder); ph = id; id = null; }
+    else { o = Object.assign({ height: 34.0 }, opts || {}); ph = ''; }
+    var n = makeNode(id, {
       type: 'input',
       value: String(o.value || ''),
-      placeholder: String(placeholder || ''),
+      placeholder: String(ph || ''),
       tone: o.tone || 'neutral',
     }, o);
+    return put(n, 'setValue', function (v) {
+      n.kind.value = String(v);
+      if (mounted) sendPatch({ op: 'set_input', id: n.id, value: n.kind.value });
+      return n;
+    });
   };
 
-  ui.stat = function (id, label, value, opts) {
-    var o = opts || {};
-    var variant = o.variant || (o.range ? 'range_bar' : (o.sparkline ? 'sparkline' : 'compact'));
-    return makeNode(id, {
+  function statKind(label, value, o) {
+    return {
       type: 'stat',
       label: String(label || ''),
       value: Number(value || 0),
@@ -213,12 +308,55 @@
       delta: (o.delta !== undefined) ? o.delta : null,
       caption: (o.caption !== undefined) ? o.caption : null,
       tone: o.tone || 'neutral',
-      variant: variant,
+      variant: o.variant || (o.range ? 'range_bar' : (o.sparkline ? 'sparkline' : 'compact')),
       sparkline: Array.isArray(o.sparkline) ? o.sparkline.map(Number) : [],
       range_bounds: Array.isArray(o.range) && o.range.length === 2 ? [Number(o.range[0]), Number(o.range[1])] : null,
       interactive: !!o.interactive,
-    }, o);
+    };
+  }
+
+  function statPatch(id, f) {
+    var p = { op: 'update_stat', id: id };
+    if (f.value !== undefined) p.value = Number(f.value);
+    if (f.valueText !== undefined) p.value_text = f.valueText;
+    if (f.delta !== undefined) p.delta = f.delta;
+    if (f.tone !== undefined) p.tone = f.tone;
+    if (f.caption !== undefined) p.caption = f.caption;
+    if (f.pushSparkline !== undefined) p.push_sparkline = Number(f.pushSparkline);
+    if (f.sparklineMaxLen !== undefined) p.sparkline_max_len = Number(f.sparklineMaxLen);
+    return p;
+  }
+
+  ui.stat = function (id, label, value, opts) {
+    var o, lbl, val;
+    if (typeof label === 'number') { lbl = id; val = label; o = isObj(value) ? value : {}; id = null; }
+    else { o = opts || {}; lbl = label; val = value; }
+    var n = makeNode(id, statKind(lbl, val, o), o);
+    return put(n, 'update', function (f) {
+      var k = n.kind, x = f || {};
+      if (x.value !== undefined) k.value = Number(x.value);
+      if (x.valueText !== undefined) k.value_text = x.valueText;
+      if (x.delta !== undefined) k.delta = x.delta;
+      if (x.tone !== undefined) k.tone = x.tone;
+      if (x.caption !== undefined) k.caption = x.caption;
+      if (x.pushSparkline !== undefined) {
+        k.sparkline.push(Number(x.pushSparkline));
+        var lim = Number(x.sparklineMaxLen || 48);
+        if (k.sparkline.length > lim) k.sparkline.splice(0, k.sparkline.length - lim);
+      }
+      if (mounted) sendPatch(statPatch(n.id, x));
+      return n;
+    });
   };
+
+  function liveSeries(k, sid) {
+    var groups = [k.series || []], i, j;
+    for (i = 0; i < (k.panes || []).length; i++) groups.push(k.panes[i].series || []);
+    for (i = 0; i < groups.length; i++) {
+      for (j = 0; j < groups[i].length; j++) if (groups[i][j].id === sid) return groups[i][j];
+    }
+    return null;
+  }
 
   function normalizeSeries(s) {
     var x = s || {};
@@ -252,9 +390,20 @@
     };
   };
 
+  function plotDataPatch(id, d) {
+    var p = { op: 'set_plot_data', id: id }, any = false;
+    if (d.title !== undefined) { p.title = d.title; any = true; }
+    if (d.subtitle !== undefined) { p.subtitle = d.subtitle; any = true; }
+    if (d.series !== undefined) { p.series = (d.series || []).map(normalizeSeries); any = true; }
+    if (d.panes !== undefined) { p.panes = d.panes || []; any = true; }
+    if (d.thresholds !== undefined) { p.thresholds = d.thresholds || []; any = true; }
+    return any ? p : null;
+  }
+
   ui.plot = function (id, opts) {
-    var o = opts || {};
-    return makeNode(id, {
+    var o;
+    if (isObj(id)) { o = id; id = null; } else { o = opts || {}; }
+    var n = makeNode(id, {
       type: 'plot',
       title: (o.title !== undefined) ? o.title : null,
       subtitle: (o.subtitle !== undefined) ? o.subtitle : null,
@@ -271,11 +420,46 @@
       y_precision: (o.yPrecision !== undefined) ? Number(o.yPrecision) : null,
       empty_text: (o.emptyText !== undefined) ? o.emptyText : null,
     }, o);
+    put(n, 'append', function (sid, point, maxPoints) {
+      var p = { op: 'append_plot_point', id: n.id, series_id: String(sid), point: point };
+      if (maxPoints !== undefined) p.max_points = Number(maxPoints);
+      var ser = liveSeries(n.kind, String(sid));
+      if (ser) {
+        ser.points.push(point);
+        var lm = Number(maxPoints || 0);
+        if (lm > 0 && ser.points.length > lm) ser.points.splice(0, ser.points.length - lm);
+      }
+      if (mounted) sendPatch(p);
+      return n;
+    });
+    put(n, 'upsertCandle', function (sid, candle, maxCandles) {
+      var p = { op: 'upsert_candle', id: n.id, series_id: String(sid), candle: candle };
+      if (maxCandles !== undefined) p.max_candles = Number(maxCandles);
+      var ser = liveSeries(n.kind, String(sid));
+      if (ser) {
+        var last = ser.candles[ser.candles.length - 1];
+        if (last && Math.abs(last.x - candle.x) < 1e-6) ser.candles[ser.candles.length - 1] = candle;
+        else ser.candles.push(candle);
+        var cap = Number(maxCandles || 500);
+        if (ser.candles.length > cap) ser.candles.splice(0, ser.candles.length - cap);
+      }
+      if (mounted) sendPatch(p);
+      return n;
+    });
+    return put(n, 'setData', function (d) {
+      var x = d || {}, p = plotDataPatch(n.id, x);
+      if (x.title !== undefined) n.kind.title = x.title;
+      if (x.subtitle !== undefined) n.kind.subtitle = x.subtitle;
+      if (x.series !== undefined) n.kind.series = (x.series || []).map(normalizeSeries);
+      if (x.panes !== undefined) n.kind.panes = x.panes || [];
+      if (x.thresholds !== undefined) n.kind.thresholds = x.thresholds || [];
+      if (p && mounted) sendPatch(p);
+      return n;
+    });
   };
 
-  ui.table = function (id, opts) {
-    var o = opts || {};
-    var cols = (o.columns || []).map(function (c) {
+  function normalizeColumns(cols) {
+    return (cols || []).map(function (c) {
       return {
         key: String(c.key || ''),
         label: String(c.label || c.key || ''),
@@ -284,7 +468,10 @@
         sortable: (c.sortable !== undefined) ? !!c.sortable : true,
       };
     });
-    var rows = (o.rows || []).map(function (r) {
+  }
+
+  function normalizeRows(rows) {
+    return (rows || []).map(function (r) {
       return {
         id: String(r.id || ''),
         tone: r.tone || null,
@@ -300,21 +487,43 @@
         }),
       };
     });
-    return makeNode(id, {
+  }
+
+  ui.table = function (id, opts) {
+    var o;
+    if (isObj(id)) { o = id; id = null; } else { o = opts || {}; }
+    var n = makeNode(id, {
       type: 'table',
       title: (o.title !== undefined) ? o.title : null,
-      columns: cols,
-      rows: rows,
+      columns: normalizeColumns(o.columns),
+      rows: normalizeRows(o.rows),
       selected_row: o.selectedRow || null,
       row_height: Number(o.rowHeight || 32.0),
       striped: (o.striped !== undefined) ? !!o.striped : true,
       empty_text: (o.emptyText !== undefined) ? o.emptyText : null,
     }, o);
+    put(n, 'setRows', function (rows, selectedRow) {
+      var rr = normalizeRows(rows);
+      n.kind.rows = rr;
+      var p = { op: 'set_table_rows', id: n.id, rows: rr };
+      if (selectedRow !== undefined) {
+        n.kind.selected_row = selectedRow === null ? null : String(selectedRow);
+        p.selected_row = n.kind.selected_row;
+      }
+      if (mounted) sendPatch(p);
+      return n;
+    });
+    return put(n, 'selectRow', function (rowId) {
+      n.kind.selected_row = rowId === undefined || rowId === null ? null : String(rowId);
+      if (mounted) sendPatch({ op: 'select_table_row', id: n.id, row_id: n.kind.selected_row });
+      return n;
+    });
   };
 
   ui.feed = function (id, opts) {
-    var o = opts || {};
-    return makeNode(id, {
+    var o;
+    if (isObj(id)) { o = id; id = null; } else { o = opts || {}; }
+    var n = makeNode(id, {
       type: 'feed',
       title: (o.title !== undefined) ? o.title : null,
       items: Array.isArray(o.items) ? o.items : [],
@@ -322,11 +531,24 @@
       newest_first: (o.newestFirst !== undefined) ? !!o.newestFirst : true,
       empty_text: (o.emptyText !== undefined) ? o.emptyText : null,
     }, o);
+    return put(n, 'append', function (item, maxItems) {
+      var it = item || {};
+      n.kind.items.push(it);
+      var max = Number(maxItems || o.maxItems || 200);
+      if (n.kind.items.length > max) n.kind.items.splice(0, n.kind.items.length - max);
+      if (mounted) {
+        var p = { op: 'append_feed_item', id: n.id, item: it };
+        if (maxItems !== undefined) p.max_items = Number(maxItems);
+        sendPatch(p);
+      }
+      return n;
+    });
   };
 
   ui.graph = function (id, opts) {
-    var o = opts || {};
-    return makeNode(id, {
+    var o;
+    if (isObj(id)) { o = id; id = null; } else { o = opts || {}; }
+    var n = makeNode(id, {
       type: 'graph',
       title: (o.title !== undefined) ? o.title : null,
       nodes: Array.isArray(o.nodes) ? o.nodes : [],
@@ -334,21 +556,48 @@
       selected_node: o.selectedNode || null,
       empty_text: (o.emptyText !== undefined) ? o.emptyText : null,
     }, o);
+    put(n, 'setGraph', function (d) {
+      var x = d || {};
+      var p = { op: 'set_graph', id: n.id, nodes: x.nodes || [], edges: x.edges || [] };
+      if (x.title !== undefined) p.title = x.title;
+      if (x.selectedNode !== undefined) p.selected_node = x.selectedNode;
+      n.kind.nodes = p.nodes;
+      n.kind.edges = p.edges;
+      if (x.title !== undefined) n.kind.title = x.title;
+      if (x.selectedNode !== undefined) n.kind.selected_node = x.selectedNode;
+      if (mounted) sendPatch(p);
+      return n;
+    });
+    return put(n, 'selectNode', function (nodeId) {
+      n.kind.selected_node = nodeId === undefined || nodeId === null ? null : String(nodeId);
+      if (mounted) sendPatch({ op: 'select_graph_node', id: n.id, node_id: n.kind.selected_node });
+      return n;
+    });
   };
 
   ui.code = function (id, content, opts) {
-    var o = opts || {};
-    return makeNode(id, {
+    var o, src;
+    if (typeof content === 'string') { o = opts || {}; src = content; }
+    else { o = content || {}; src = id; id = null; }
+    var n = makeNode(id, {
       type: 'code_text',
       title: (o.title !== undefined) ? o.title : null,
       language: (o.language !== undefined) ? o.language : null,
-      content: String(content !== undefined && content !== null ? content : ''),
+      content: String(src !== undefined && src !== null ? src : ''),
       show_line_numbers: (o.lineNumbers !== undefined) ? !!o.lineNumbers : true,
       highlights: Array.isArray(o.highlights) ? o.highlights : [],
     }, o);
+    return put(n, 'setContent', function (v, highlights) {
+      n.kind.content = String(v !== undefined && v !== null ? v : '');
+      if (highlights !== undefined) n.kind.highlights = highlights;
+      if (mounted) {
+        var p = { op: 'set_code', id: n.id, content: n.kind.content };
+        if (highlights !== undefined) p.highlights = highlights;
+        sendPatch(p);
+      }
+      return n;
+    });
   };
-
-  // ── App Scene Builder ────────────────────────────────────────────────────
 
   ui.app = function (title, opts) {
     var o = opts || {};
@@ -428,8 +677,6 @@
     return b;
   };
 
-  // ── Live Host Bridge (`View`) ────────────────────────────────────────────
-
   var listeners = [];
   var closedResolvers = [];
   var pollTimer = null;
@@ -442,6 +689,40 @@
     }
   }
 
+  function routeHandlers(ev) {
+    var h = nodeHandlers[ev.id];
+    if (!h) return;
+    var k = h.n.kind, o = h.o;
+    try {
+      if (ev.type === 'click') {
+        if (o.onClick) o.onClick(ev);
+      } else if (ev.type === 'switch_toggled') {
+        k.checked = !!ev.checked;
+        if (o.onChange) o.onChange(!!ev.checked, ev);
+      } else if (ev.type === 'text_changed' || ev.type === 'input_submitted') {
+        k.value = String(ev.value || '');
+        var cb = ev.type === 'text_changed' ? o.onChange : o.onSubmit;
+        if (cb) cb(String(ev.value || ''), ev);
+      } else if (ev.type === 'segmented_changed') {
+        k.active = ev.index;
+        if (o.onChange) o.onChange(ev.index, (k.options || [])[ev.index], ev);
+      } else if (ev.type === 'tab_changed') {
+        k.active = ev.index;
+        if (o.onChange) o.onChange(ev.index, ((k.items || [])[ev.index] || {}).label, ev);
+      } else if (ev.type === 'row_selected') {
+        k.selected_row = ev.row_id;
+        if (o.onSelect) o.onSelect(ev.row_id, ev);
+      } else if (ev.type === 'table_sorted') {
+        if (o.onSort) o.onSort(ev.col_index, ev.asc, ev);
+      } else if (ev.type === 'feed_item_clicked') {
+        if (o.onItemClick) o.onItemClick(ev.item_id, ev);
+      } else if (ev.type === 'graph_node_clicked') {
+        k.selected_node = ev.node_id;
+        if (o.onNodeClick) o.onNodeClick(ev.node_id, ev);
+      }
+    } catch (e) { /* one handler must not break the event pump. */ }
+  }
+
   function drainEventsOnce() {
     if (typeof g.__sofuu_ui_poll_event !== 'function') return;
     while (true) {
@@ -449,6 +730,7 @@
       if (!raw) break;
       var ev = null;
       try { ev = JSON.parse(raw); } catch (e) { continue; }
+      if (ev && ev.id) routeHandlers(ev);
       for (var i = 0; i < listeners.length; i++) {
         try { listeners[i](ev); } catch (e2) {}
       }
@@ -473,9 +755,36 @@
     return typeof g.__sofuu_ui_is_attached === 'function' && !!g.__sofuu_ui_is_attached();
   };
 
+  ui.signal = function (initial) {
+    var value = initial, subs = [];
+    var s = {
+      get: function () { return value; },
+      set: function (next) {
+        if (next === value) return value;
+        value = next;
+        var list = subs.slice();
+        for (var i = 0; i < list.length; i++) {
+          try { list[i](value); } catch (e) { /* one subscriber must not break the rest. */ }
+        }
+        return value;
+      },
+      update: function (fn) { return s.set(fn(value)); },
+      subscribe: function (fn, immediate) {
+        if (typeof fn !== 'function') return function () {};
+        subs.push(fn);
+        if (immediate) { try { fn(value); } catch (e) {} }
+        return function () {
+          subs = subs.filter(function (f) { return f !== fn; });
+        };
+      },
+    };
+    return s;
+  };
+
   var userMounted = false;
   var autoEnabled = true;
   var autoInstance = null;
+  var autoSeen = false;
   var promptHandler = null;
   var activeAgentHint = null;
 
@@ -493,6 +802,7 @@
       id: String(id || 'main'),
       mount: function (sceneOrNode) {
         if (!isInternalAuto) userMounted = true;
+        mounted = true;
         var target = unwrapNode(sceneOrNode);
         var scene;
         if (target && target.root) {
@@ -510,6 +820,7 @@
           theme: scene.theme,
           root: scene.root,
         });
+        ensurePump();
         return view;
       },
       patch: function (p) { return sendPatch(p); },
@@ -558,6 +869,68 @@
       setInput: function (inputId, value) {
         return sendPatch({ op: 'set_input', id: String(inputId), value: String(value) });
       },
+      setSegmented: function (nodeId, active) {
+        return sendPatch({ op: 'set_segmented', id: String(nodeId), active: Number(active) || 0 });
+      },
+      setTab: function (nodeId, active) {
+        return sendPatch({ op: 'set_tab', id: String(nodeId), active: Number(active) || 0 });
+      },
+      selectTableRow: function (tableId, rowId) {
+        return sendPatch({
+          op: 'select_table_row',
+          id: String(tableId),
+          row_id: (rowId === undefined || rowId === null) ? null : String(rowId),
+        });
+      },
+      setTableRows: function (tableId, rows, selectedRow) {
+        var p = { op: 'set_table_rows', id: String(tableId), rows: normalizeRows(rows) };
+        if (selectedRow !== undefined) {
+          p.selected_row = selectedRow === null ? null : String(selectedRow);
+        }
+        return sendPatch(p);
+      },
+      setPlotData: function (plotId, data) {
+        var p = plotDataPatch(String(plotId), data || {});
+        return p ? sendPatch(p) : 0;
+      },
+      setGraph: function (graphId, data) {
+        var x = data || {};
+        var p = { op: 'set_graph', id: String(graphId), nodes: x.nodes || [], edges: x.edges || [] };
+        if (x.title !== undefined) p.title = x.title;
+        if (x.selectedNode !== undefined) p.selected_node = x.selectedNode;
+        return sendPatch(p);
+      },
+      setChildren: function (nodeId, children) {
+        return sendPatch({
+          op: 'set_children',
+          id: String(nodeId),
+          children: (children || []).map(unwrapNode).filter(Boolean),
+        });
+      },
+      bindTrigger: function (runner, binds) {
+        var b = binds || {};
+        var sw = b.liveSwitch || null;
+        var paused = false;
+        if (sw) {
+          paused = sw.checked === false;
+          var baseGate = runner.gate;
+          runner.gate = function (payload, ctx) {
+            if (paused) return false;
+            return baseGate(payload, ctx);
+          };
+          view.onEvent(function (ev) {
+            if (ev && ev.type === 'switch_toggled' && ev.id === sw.id) paused = !ev.checked;
+          });
+        }
+        view.onEvent(function (ev) {
+          if (ev && ev.type === 'window_closed') {
+            try { runner.stop('ui_closed'); } catch (e) {}
+          }
+        });
+        var done = Promise.allSettled([runner.start(), view.waitUntilClosed()]);
+        done.isPaused = function () { return paused; };
+        return done;
+      },
       onEvent: function (fn) {
         if (typeof fn === 'function') {
           listeners.push(fn);
@@ -588,379 +961,95 @@
     promptHandler = (typeof fn === 'function') ? fn : null;
   };
 
-  // ── Zero-Boilerplate Auto-Composer ───────────────────────────────────────
-
   ui.autoComposer = function (opts) {
     var o = opts || {};
-    var MAX_FEED = 200;
-    var MAX_GRAPH_NODES = 24;
-    var state = {
-      title: String(o.title || 'Sofuu Agent Runtime'),
-      theme: (o.theme === 'dark') ? 'dark' : 'light',
-      agentName: String(o.agentName || 'agent'),
-      profile: String(o.profile || 'default'),
-      runs: 0,
-      steps: 0,
-      tokens: 0,
-      toolCalls: 0,
-      toolErrors: 0,
-      eventSeq: 0,
-      promptValue: '',
-      pendingApprovals: [],
-      triggers: [],
-      stateRows: [],
-      graphOrder: [],
-      graphNodes: Object.create(null),
-      graphEdges: [],
-      feedItems: [],
-      latestCode: '// Waiting for agent steps or trigger ticks...',
-      mounted: false,
-      wiredEvents: false,
-    };
+    var title = String(o.title || 'Sofuu Agent Runtime');
+    var theme = o.theme === 'dark' ? 'dark' : 'light';
+    var view = createSurface('auto_main_surface', { title: title, theme: theme }, true);
+    var pending = [];
+    var promptValue = '';
 
-    function evTone(kind, custom) {
-      if (custom) return custom;
-      if (kind === 'answer' || kind === 'ok' || kind === 'approval_resolved') return 'ok';
-      if (kind === 'approval_request' || kind === 'warn') return 'warn';
-      if (kind === 'error' || kind === 'stop') return 'danger';
-      if (kind === 'start' || kind === 'tool' || kind === 'delegate' || kind === 'llm') return 'info';
-      return 'neutral';
+    function forward(name, payload) {
+      var fn = g[name];
+      if (typeof fn !== 'function') return -2;
+      return fn(JSON.stringify(payload));
     }
 
-    function upsertGraphNode(id, label, subtitle, tone) {
-      if (!state.graphNodes[id]) {
-        if (state.graphOrder.length >= MAX_GRAPH_NODES) {
-          var dropped = state.graphOrder.shift();
-          delete state.graphNodes[dropped];
-          state.graphEdges = state.graphEdges.filter(function (e) { return e.from !== dropped && e.to !== dropped; });
-        }
-        state.graphOrder.push(id);
-      }
-      state.graphNodes[id] = { id: id, label: label, subtitle: subtitle || null, tone: tone || 'neutral', pos: null };
-    }
-
-    function upsertGraphEdge(from, to, label, active, tone) {
-      for (var i = 0; i < state.graphEdges.length; i++) {
-        var e = state.graphEdges[i];
-        if (e.from === from && e.to === to) {
-          e.label = label || null;
-          e.active = !!active;
-          e.tone = tone || null;
-          return;
-        }
-        e.active = false;
-      }
-      state.graphEdges.push({ from: from, to: to, label: label || null, active: !!active, tone: tone || null });
-    }
-
-    function buildGraphNode() {
-      var nodes = state.graphOrder.map(function (k) { return state.graphNodes[k]; }).filter(Boolean);
-      return ui.graph('auto_graph', {
-        title: 'Execution Topology',
-        fill: true,
-        minHeight: 210,
-        nodes: nodes,
-        edges: state.graphEdges,
-      });
-    }
-
-    function buildTableNode() {
-      var rows = [];
-      for (var i = 0; i < state.triggers.length; i++) {
-        var t = state.triggers[i];
-        var stText = t.running ? 'LIVE' : 'STOP';
-        var stTone = (t.errors > 0) ? 'warn' : (t.running ? 'ok' : 'neutral');
-        rows.push({
-          id: 'trg:' + t.id,
-          cells: [
-            String(t.id),
-            { text: stText, tone: stTone, badge: true },
-            String(t.gateHits || 0) + '/' + String(t.ticks || 0),
-            String(t.lastDurationMs || 0) + ' ms',
-          ],
-        });
-      }
-      for (var j = 0; j < state.stateRows.length; j++) rows.push(state.stateRows[j]);
-      return ui.table('auto_state_table', {
-        title: 'Triggers & Operational State',
-        fill: true,
-        columns: [
-          { key: 'id', label: 'Runner / Key', align: 'left' },
-          { key: 'state', label: 'Status', align: 'center' },
-          { key: 'hits', label: 'Hits / Ticks', align: 'right' },
-          { key: 'dur', label: 'Last / Detail', align: 'right' },
-        ],
-        rows: rows,
-        emptyText: 'No triggers or state rows active yet',
-      });
-    }
-
-    function triggerSummary() {
-      if (!state.triggers.length) return { rate: 0, delta: 'idle', tone: 'neutral' };
-      var ticks = 0, hits = 0, errs = 0, running = 0;
-      for (var i = 0; i < state.triggers.length; i++) {
-        var t = state.triggers[i];
-        ticks += Number(t.ticks || 0);
-        hits += Number(t.gateHits || 0);
-        errs += Number(t.errors || 0);
-        if (t.running) running++;
-      }
-      var pct = ticks > 0 ? (hits * 100.0) / ticks : 0;
-      var delta = errs > 0 ? (running + ' live · ' + errs + ' err') : (running + ' live · ' + ticks + ' ticks');
-      var tone = errs > 0 ? 'warn' : (running > 0 ? 'ok' : 'neutral');
-      return { rate: pct, delta: delta, tone: tone };
-    }
-
-    function hitlSummaryText(ap) {
-      if (!ap) return 'No pending approval';
-      return ap.args ? ('Approval required: `' + ap.tool + '` · ' + ap.args) : ('Approval required: `' + ap.tool + '` (' + ap.id + ')');
-    }
-
-    function buildScene() {
-      var ts = triggerSummary();
-      var errTone = state.toolErrors > 0 ? 'warn' : 'ok';
-      var statusTxt = 'agent: ' + state.agentName + '  ·  profile: ' + state.profile + '  ·  steps: ' + state.steps;
-      var hdr = ui.row('auto_hdr', [
-        ui.title(state.title, { id: 'auto_title' }),
-        ui.text('auto_status', statusTxt, { size: 12.5 }),
-        ui.themeToggle('theme_toggle'),
-      ], { gap: 10, foldBelow: 680, align: 'center' });
-
-      var stats = [
-        ui.stat('auto_stat_runs', 'Runs / Steps', state.steps, {
-          precision: 0, badge: 'LIVE', delta: state.runs + ' runs', tone: 'info', variant: 'compact',
-        }),
-        ui.stat('auto_stat_tokens', 'Tokens', state.tokens, {
-          precision: 0, badge: 'LLM', caption: 'Profile: ' + state.profile, sparkline: [],
-        }),
-        ui.stat('auto_stat_gates', 'Trigger Pass', ts.rate, {
-          suffix: '%', precision: 1, badge: 'GATE', delta: ts.delta, tone: ts.tone, variant: 'compact',
-        }),
-        ui.stat('auto_stat_tools', 'Tool Calls', state.toolCalls, {
-          precision: 0, badge: 'EXEC',
-          delta: state.toolErrors > 0 ? (state.toolErrors + ' err') : '0 err',
-          tone: errTone, sparkline: [],
-        }),
-      ];
-
-      var graphNode = buildGraphNode();
-      var feedNode = ui.feed('auto_feed', {
-        title: 'Runtime Stream',
-        width: { fill: 1.25 },
-        height: { fill: 1.0 },
-        minHeight: 210,
-        maxItems: MAX_FEED,
-        items: state.feedItems,
-        emptyText: 'Waiting for agent or trigger telemetry...',
-      });
-
-      var mainSplit = ui.row('auto_main', [graphNode, feedNode], {
-        gap: 12, foldBelow: 740, align: 'stretch', height: { fill: 1.0 }, minHeight: 220,
-      });
-
-      var tabsNode = ui.tabs('auto_bottom_tabs', [
-        { label: 'Triggers & State', child: buildTableNode() },
-        { label: 'Latest Payload', child: ui.code('auto_trace_code', state.latestCode, {
-          title: 'Latest Event Payload', language: 'JSON', fill: true, highlights: [{ line: 1, tone: 'info' }],
-        }) },
-      ], { width: { fill: 1.0 }, height: 196 });
-
-      var frontAp = state.pendingApprovals[0] || null;
-      var hitlBar = ui.row('auto_hitl_bar', [
-        ui.text('auto_hitl_label', hitlSummaryText(frontAp), { size: 13, width: { fill: 1.0 }, minWidth: 160 }),
-        ui.button('auto_approve_btn', 'Approve', { tone: 'ok' }),
-        ui.button('auto_always_btn', 'Always', { tone: 'info' }),
-        ui.button('auto_deny_btn', 'Deny', { tone: 'danger' }),
-      ], { gap: 8, foldBelow: 600, align: 'center', visible: !!frontAp });
-
-      var promptRow = ui.row('auto_prompt_row', [
-        ui.input('auto_prompt', 'Send task or follow-up prompt...', { width: { fill: 1.0 } }),
-        ui.button('auto_run_btn', 'Run', { tone: 'info' }),
-      ], { gap: 10, foldBelow: 520, align: 'center' });
-
-      return ui.app(state.title, { theme: state.theme })
-        .header(hdr)
-        .stats(stats)
-        .add(mainSplit)
-        .add(tabsNode)
-        .add(hitlBar)
-        .add(promptRow)
-        .build();
-    }
-
-    var view = createSurface('auto_main_surface', { title: state.title, theme: state.theme }, true);
-
-    function syncHitlBar() {
-      var front = state.pendingApprovals[0] || null;
-      if (front) {
-        view.setText('auto_hitl_label', hitlSummaryText(front));
-        view.setVisible('auto_hitl_bar', true);
-      } else {
-        view.setVisible('auto_hitl_bar', false);
-      }
-    }
-
-    function resolvePending(allow, always) {
-      var front = state.pendingApprovals[0] || null;
+    function resolve(allow, always) {
+      var front = pending.shift();
       if (!front) return;
       if (g.sofuu && g.sofuu.agent && typeof g.sofuu.agent.resolveApproval === 'function') {
         g.sofuu.agent.resolveApproval(front.id, allow, always);
       }
-      state.pendingApprovals.shift();
-      syncHitlBar();
+      forward('__sofuu_ui_auto_event', {
+        kind: 'approval_resolved',
+        approval: { id: front.id, tool: front.tool || '', args_preview: '', mode: '' },
+      });
     }
 
-    function submitPrompt(raw) {
-      var text = String(raw !== undefined ? raw : state.promptValue).trim();
+    function submit(raw) {
+      var text = String(raw !== undefined ? raw : promptValue).trim();
       if (!text) return;
-      state.promptValue = '';
+      promptValue = '';
       view.setInput('auto_prompt', '');
       if (promptHandler) {
         try { promptHandler(text, composer); } catch (eP) {}
         return;
       }
       var ag = g.sofuu && g.sofuu.agent;
-      if (ag && typeof ag.run === 'function') {
-        var target = activeAgentHint || state.agentName;
-        if (!target || target === 'agent') {
-          var defs = (typeof ag.list === 'function') ? ag.list() : [];
-          if (defs && defs.length && defs[0]) target = defs[0].name || defs[0];
-        }
-        if (target) {
-          Promise.resolve(ag.run(target, text, { approveInteractive: true })).catch(function () {});
-        }
+      if (activeAgentHint && ag && typeof ag.run === 'function') {
+        Promise.resolve(ag.run(activeAgentHint, text, { approveInteractive: true })).catch(function () {});
       }
     }
 
-    function ensureWired() {
-      if (state.wiredEvents) return;
-      state.wiredEvents = true;
-      view.onEvent(function (ev) {
-        if (!ev) return;
-        if (ev.type === 'text_changed' && ev.id === 'auto_prompt') {
-          state.promptValue = String(ev.value || '');
-        } else if (ev.type === 'input_submitted' && ev.id === 'auto_prompt') {
-          submitPrompt(ev.value);
-        } else if (ev.type === 'click' && ev.id === 'auto_run_btn') {
-          submitPrompt();
-        } else if (ev.type === 'click' && ev.id === 'auto_approve_btn') {
-          resolvePending(true, false);
-        } else if (ev.type === 'click' && ev.id === 'auto_always_btn') {
-          resolvePending(true, true);
-        } else if (ev.type === 'click' && ev.id === 'auto_deny_btn') {
-          resolvePending(false, false);
-        }
-      });
-    }
+    view.onEvent(function (ev) {
+      if (!ev) return;
+      if (ev.type === 'text_changed' && ev.id === 'auto_prompt') {
+        promptValue = String(ev.value || '');
+      } else if ((ev.type === 'input_submitted' && ev.id === 'auto_prompt') ||
+                 (ev.type === 'click' && ev.id === 'auto_run_btn')) {
+        submit(ev.value);
+      } else if (ev.type === 'click' && ev.id === 'auto_approve_btn') {
+        resolve(true, false);
+      } else if (ev.type === 'click' && ev.id === 'auto_always_btn') {
+        resolve(true, true);
+      } else if (ev.type === 'click' && ev.id === 'auto_deny_btn') {
+        resolve(false, false);
+      }
+    });
 
     var composer = {
       view: view,
-      buildScene: buildScene,
+      buildScene: function () { return JSON.parse(g.__sofuu_ui_auto_scene()); },
       mount: function () {
-        state.mounted = true;
-        ensureWired();
-        view.mount(buildScene());
+        forward('__sofuu_ui_auto_mount', { title: title, theme: theme });
         return composer;
       },
       clearApproval: function (id) {
-        state.pendingApprovals = state.pendingApprovals.filter(function (p) { return p.id !== id; });
-        if (state.mounted) syncHitlBar();
+        pending = pending.filter(function (p) { return p.id !== String(id); });
+        forward('__sofuu_ui_auto_event', {
+          kind: 'approval_resolved',
+          approval: { id: String(id), tool: '', args_preview: '', mode: '' },
+        });
       },
       updateTriggers: function (list) {
-        state.triggers = Array.isArray(list) ? list : [];
-        if (!state.mounted) return;
-        var ts = triggerSummary();
-        view.updateStat('auto_stat_gates', { value: ts.rate, delta: ts.delta, tone: ts.tone });
-        view.patch({ op: 'replace_node', id: 'auto_state_table', node: buildTableNode() });
+        forward('__sofuu_ui_auto_triggers', Array.isArray(list) ? list : []);
       },
       updateStateRows: function (rows) {
-        state.stateRows = Array.isArray(rows) ? rows : [];
-        if (state.mounted) {
-          view.patch({ op: 'replace_node', id: 'auto_state_table', node: buildTableNode() });
-        }
+        forward('__sofuu_ui_auto_rows', Array.isArray(rows) ? rows : []);
       },
       ingestEvent: function (ev) {
         if (!ev) return;
-        state.eventSeq++;
-        if (ev.agentName) {
-          state.agentName = String(ev.agentName);
-          activeAgentHint = state.agentName;
-        }
-        if (ev.profile) state.profile = String(ev.profile);
-        var kind = String(ev.kind || 'event');
+        if (ev.agentName) activeAgentHint = String(ev.agentName);
+        var kind = String(ev.kind || '');
         var pl = ev.payload || {};
-        if (kind === 'start') state.runs++;
-        if (kind === 'start' || kind === 'plan' || kind === 'think' || kind === 'thought' ||
-            kind === 'tool' || kind === 'tool_result' || kind === 'llm' || kind === 'delegate' ||
-            kind === 'answer' || kind === 'stop' || kind === 'error') {
-          state.steps++;
-        }
-        if (kind === 'tool') state.toolCalls++;
-        if (kind === 'error') state.toolErrors++;
-        var tokDelta = 0;
-        if (kind === 'llm' && pl.usage) {
-          tokDelta = Number(pl.usage.input_tokens || 0) + Number(pl.usage.output_tokens || 0);
-          state.tokens += tokDelta;
-        }
-        var elapsedMs = (pl.duration !== undefined) ? Number(pl.duration) : undefined;
-        var tone = evTone(kind, null);
-
-        var chain = (Array.isArray(ev.chain) && ev.chain.length) ? ev.chain : [state.agentName];
-        for (var i = 0; i < chain.length; i++) {
-          var agNodeId = 'ag:' + chain[i];
-          var isLeaf = i + 1 === chain.length;
-          upsertGraphNode(agNodeId, String(chain[i]), isLeaf ? kind : 'supervisor', isLeaf ? tone : 'info');
-          if (i > 0) upsertGraphEdge('ag:' + chain[i - 1], agNodeId, 'delegate', isLeaf, 'info');
-        }
-        var toolName = pl.name || pl.tool;
-        if (toolName) {
-          var leafId = 'ag:' + String(chain[chain.length - 1]);
-          var tlId = 'tl:' + String(toolName);
-          upsertGraphNode(tlId, String(toolName), 'tool', tone);
-          upsertGraphEdge(leafId, tlId, kind, (kind === 'tool' || kind === 'approval_request'), tone);
-        }
-
-        var summary = pl.task || pl.step || pl.answer || pl.error || pl.result || pl.text || (toolName ? (kind + ' · ' + toolName) : (kind + ' (' + state.agentName + ')'));
-        var feedItem = {
-          id: 'auto_ev_' + state.eventSeq,
-          time: new Date().toTimeString().slice(0, 8),
-          badge: kind.toUpperCase(),
-          tone: tone,
-          title: String(summary).slice(0, 140),
-          body: (pl && typeof pl === 'object' && pl.name && pl.args) ? String(pl.args).slice(0, 180) : null,
-        };
-        if (state.feedItems.length >= MAX_FEED) state.feedItems.shift();
-        state.feedItems.push(feedItem);
-
-        try {
-          state.latestCode = JSON.stringify({ runId: ev.runId, agent: state.agentName, kind: kind, payload: pl }, null, 2);
-        } catch (eJ) {}
-
-        if (kind === 'approval_request' && pl.id) {
-          if (!state.pendingApprovals.some(function (p) { return p.id === pl.id; })) {
-            state.pendingApprovals.push({ id: String(pl.id), tool: String(pl.tool || 'tool'), args: String(pl.args || '') });
-          }
+        if (kind === 'approval_request' && pl.id &&
+            !pending.some(function (p) { return p.id === String(pl.id); })) {
+          pending.push({ id: String(pl.id), tool: String(pl.tool || '') });
         } else if (kind === 'approval_resolved' && pl.id) {
-          state.pendingApprovals = state.pendingApprovals.filter(function (p) { return p.id !== pl.id; });
+          pending = pending.filter(function (p) { return p.id !== String(pl.id); });
         }
-
-        if (!state.mounted) return;
-        view.setText('auto_status', 'agent: ' + state.agentName + '  ·  profile: ' + state.profile + '  ·  steps: ' + state.steps);
-        view.updateStat('auto_stat_runs', { value: state.steps, delta: state.runs + ' runs' });
-        var tokUpd = { value: state.tokens, caption: 'Profile: ' + state.profile };
-        if (tokDelta > 0) { tokUpd.pushSparkline = state.tokens; tokUpd.sparklineMaxLen = 48; }
-        view.updateStat('auto_stat_tokens', tokUpd);
-        var toolUpd = {
-          value: state.toolCalls,
-          delta: state.toolErrors > 0 ? (state.toolErrors + ' err') : '0 err',
-          tone: state.toolErrors > 0 ? 'warn' : 'ok',
-        };
-        if (elapsedMs !== undefined && isFinite(elapsedMs)) { toolUpd.pushSparkline = elapsedMs; toolUpd.sparklineMaxLen = 48; }
-        view.updateStat('auto_stat_tools', toolUpd);
-        view.patch({ op: 'replace_node', id: 'auto_graph', node: buildGraphNode() });
-        view.appendFeed('auto_feed', feedItem, MAX_FEED);
-        view.setCode('auto_trace_code', state.latestCode, [{ line: 1, tone: tone }]);
-        if (kind === 'approval_request' || kind === 'approval_resolved') syncHitlBar();
+        forward('__sofuu_ui_auto_event', ev);
       },
     };
     return composer;
@@ -975,14 +1064,40 @@
   }
 
   ui._onAgentStep = function (ev) {
+    autoSeen = true;
     var ac = ensureAutoInstance(ev && ev.agentName ? ('Sofuu // ' + ev.agentName) : null);
     if (ac) ac.ingestEvent(ev);
   };
 
   ui._onTriggerTick = function (stats) {
+    autoSeen = true;
     var ac = ensureAutoInstance('Sofuu // Reactive Runtime');
     if (ac) ac.updateTriggers(stats);
   };
+
+  function consoleEvent(level, text) {
+    if (userMounted || autoSeen) return;
+    var sink = g.__sofuu_ui_auto_event;
+    if (typeof sink === 'function') sink(JSON.stringify({
+      kind: level, title: text,
+      tone: level === 'error' ? 'danger' : (level === 'warn' ? 'warn' : 'info'),
+    }));
+  }
+
+  function bootConsole() {
+    if (!ui.isAttached() || !g.console) return;
+    var levels = ['log', 'info', 'warn', 'error'];
+    for (var i = 0; i < levels.length; i++) (function (level) {
+      var orig = g.console[level];
+      if (typeof orig !== 'function') return;
+      g.console[level] = function () {
+        consoleEvent(level, [].join.call(arguments, ' '));
+        return orig.apply(g.console, arguments);
+      };
+    })(levels[i]);
+  }
+
+  bootConsole();
 
   sofuu.ui = ui;
 })();

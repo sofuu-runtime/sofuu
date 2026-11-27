@@ -563,7 +563,22 @@ pub fn sort_table_rows(data: &mut TableData, col_index: usize) {
         data.sort_col = Some(col_index);
         data.sort_dir = TableSortDir::Asc;
     }
-    let asc = data.sort_dir == TableSortDir::Asc;
+    sort_rows_by(data, col_index, data.sort_dir == TableSortDir::Asc);
+}
+
+/// Re-apply the table's existing `sort_col`/`sort_dir` to freshly supplied rows
+/// without toggling the direction (used by incremental row patches).
+pub fn reapply_table_sort(data: &mut TableData) {
+    let Some(col_index) = data.sort_col else {
+        return;
+    };
+    if col_index >= data.columns.len() {
+        return;
+    }
+    sort_rows_by(data, col_index, data.sort_dir == TableSortDir::Asc);
+}
+
+fn sort_rows_by(data: &mut TableData, col_index: usize, asc: bool) {
     data.rows.sort_by(|a, b| {
         let ta = a.cells.get(col_index).map(|c| c.text.trim()).unwrap_or("");
         let tb = b.cells.get(col_index).map(|c| c.text.trim()).unwrap_or("");

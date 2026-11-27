@@ -1003,6 +1003,68 @@ mod tests {
     }
 
     #[test]
+    fn set_table_rows_preserves_kinetic_scroll_interaction_state() {
+        use crate::components::table::{TableColumn, TableCell, TableData, TableRow, TableSortDir};
+        use crate::hit_test::KineticScroll;
+
+        let table = Node::new(
+            "tbl",
+            NodeKind::Table(TableData {
+                columns: vec![TableColumn::new("n", "N")],
+                rows: vec![TableRow::new("a", vec![TableCell::new("1")])],
+                sort_col: Some(0),
+                sort_dir: TableSortDir::Desc,
+                ..TableData::default()
+            }),
+        );
+        let scene = Scene::new(
+            "T",
+            ThemeMode::Light,
+            Node::new(
+                "root",
+                NodeKind::Container {
+                    axis: Axis::Column,
+                    align: Align::Stretch,
+                    gap: 8.0,
+                    fold_width: None,
+                    scrollable: false,
+                    style: None,
+                    children: vec![table],
+                },
+            ),
+        );
+        let mut engine = UiEngine::new(scene, [640.0, 480.0]);
+        engine.interaction.scrolls.insert(
+            "tbl".into(),
+            KineticScroll {
+                offset_y: 42.0,
+                velocity_y: 0.0,
+                max_y: 300.0,
+            },
+        );
+
+        assert!(engine.apply_patch(ScenePatch::SetTableRows {
+            id: "tbl".into(),
+            rows: vec![
+                TableRow::new("a", vec![TableCell::new("2")]),
+                TableRow::new("b", vec![TableCell::new("10")]),
+            ],
+            selected_row: None,
+        }));
+
+        assert_eq!(
+            engine.interaction.scrolls.get("tbl").map(|s| s.offset_y),
+            Some(42.0)
+        );
+        let NodeKind::Table(table) = &engine.scene.root.find_mut("tbl").unwrap().kind else {
+            panic!("table missing");
+        };
+        assert_eq!(table.sort_dir, TableSortDir::Desc);
+        let values: Vec<&str> = table.rows.iter().map(|r| r.cells[0].text.as_str()).collect();
+        assert_eq!(values, vec!["10", "2"]);
+    }
+
+    #[test]
     fn stat_and_plot_adapt_to_extreme_sizes_cardinalities_and_streaming_patches() {
         use crate::components::plot::{CandlePoint, PlotData, PlotPoint, PlotSeries, PlotSeriesKind};
         use crate::components::stat::StatData;

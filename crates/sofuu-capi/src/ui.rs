@@ -530,6 +530,11 @@ pub unsafe extern "C" fn sofuu_ui_session_set_safe_insets(
         let mut render = lock(&inner.render);
         render.engine.set_top_inset(top);
         render.bottom_inset = bottom;
+        drop(render);
+        // An inset change reflows the top/bottom safe area. Wake a host that
+        // paused its display link once the scene settled (keyboard opened,
+        // rotation, split-screen resize) so the reflow is actually compiled.
+        inner.wake();
         OK
     })
 }
@@ -1646,6 +1651,34 @@ mod tests {
             assert!(!pixels.is_null());
             assert!(w > 0 && h > 0);
             assert!(px_range > 0.0);
+            sofuu_ui_session_free(ui);
+        }
+    }
+
+    #[test]
+    fn safe_insets_wake_the_host() {
+        use std::sync::atomic::AtomicUsize;
+
+        static WAKE_COUNT: AtomicUsize = AtomicUsize::new(0);
+        extern "C" fn count_wake(_opaque: *mut c_void) {
+            WAKE_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+
+        unsafe {
+            WAKE_COUNT.store(0, Ordering::SeqCst);
+            let ui = sofuu_ui_session_new(ptr::null(), ptr::null_mut());
+            assert!(!ui.is_null());
+            assert_eq!(
+                sofuu_ui_session_set_wake_cb(ui, Some(count_wake), ptr::null_mut()),
+                OK
+            );
+            // A paused display link must resume for a keyboard/rotation inset.
+            assert_eq!(sofuu_ui_session_set_safe_insets(ui, 24.0, 8.0), OK);
+            assert!(
+                WAKE_COUNT.load(Ordering::SeqCst) >= 1,
+                "safe-inset changes must fire the host wake hook"
+            );
+            assert_eq!(sofuu_ui_session_set_wake_cb(ui, None, ptr::null_mut()), OK);
             sofuu_ui_session_free(ui);
         }
     }

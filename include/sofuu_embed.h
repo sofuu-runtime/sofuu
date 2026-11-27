@@ -549,7 +549,8 @@ int             sofuu_ui_session_set_wake_cb(SofuuUiSession *ui,
 /* Top inset (macOS transparent titlebar traffic lights, iOS Dynamic Island /
  * notch, Android status-bar cutouts) while keeping root background full-bleed
  * from (0,0). `bottom_px` is recorded for hosts/backends; the current layout
- * engine consumes the top inset. Negative values clamp to 0. */
+ * engine consumes the top inset. Negative values clamp to 0. An inset change
+ * wakes a host whose display link is paused so the reflow is compiled. */
 int sofuu_ui_session_set_safe_insets(SofuuUiSession *ui,
                                      float top_px, float bottom_px);
 

@@ -4,6 +4,7 @@
 //! and maintains isolated spring & hit-test namespaces so controls never conflict with
 //! neighboring components or each other.
 
+use crate::components::fit_text;
 use crate::draw::{lerp_rgba8, scale_alpha, ClipRect, DrawList, QuadInstance, StrokeInstance};
 use crate::hit_test::{HitKind, InteractionState};
 use crate::ir::TabItem;
@@ -163,7 +164,7 @@ pub fn emit_segmented(
     let mut widths = Vec::with_capacity(options.len());
     let mut raw_sum = 0.0f32;
     for o in options {
-        let w = atlas.measure(o, 12.0, true).0 + 18.0;
+        let w = atlas.measure(o, 12.0, false).0 + 18.0;
         widths.push(w);
         raw_sum += w;
     }
@@ -215,7 +216,7 @@ pub fn emit_segmented(
         } else {
             theme.text_secondary
         };
-        atlas.layout_centered(opt, bx, rect.y + pad, bw, item_h, 12.0, col, true, dl);
+        atlas.layout_centered(opt, bx, rect.y + pad, bw, item_h, 12.0, col, false, dl);
     }
 
     dl.pop_clip();
@@ -270,7 +271,7 @@ pub fn emit_button(
         clip_id: 0,
         _pad: [0; 3],
     });
-    atlas.layout_centered(label, rect.x, rect.y, rect.w, rect.h, 12.0, fg, true, dl);
+    atlas.layout_centered(label, rect.x, rect.y, rect.w, rect.h, 12.0, fg, false, dl);
 
     dl.pop_clip();
 }
@@ -360,11 +361,237 @@ pub fn emit_tabs_bar(
             bar_h - pad * 2.0,
             13.0,
             color,
-            true,
+            false,
             dl,
         );
     }
 
     dl.pop_clip();
     Some(active_clamped)
+}
+
+/// Borderless, shadowless animated pill toggle switch with optional label.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_switch(
+    id: &str,
+    checked: bool,
+    label: Option<&str>,
+    tone: Tone,
+    rect: ComputedRect,
+    theme: &Theme,
+    atlas: &GlyphAtlas,
+    springs: &mut SpringBank,
+    interaction: &mut InteractionState,
+    dl: &mut DrawList,
+) {
+    if rect.w < 28.0 || rect.h < 18.0 {
+        return;
+    }
+    let hit_key = format!("switch::{id}");
+    let hovered = interaction.hovered_key.as_deref() == Some(hit_key.as_str());
+    let on_t = springs.animate(
+        &hit_key,
+        "checked",
+        if checked { 1.0 } else { 0.0 },
+        SpringConfig::SNAPPY,
+    );
+    let hover_t = springs.animate(
+        &hit_key,
+        "hover",
+        if hovered { 1.0 } else { 0.0 },
+        SpringConfig::SNAPPY,
+    );
+    interaction.push_hit(rect, HitKind::Switch { id: id.to_string() });
+
+    dl.push_clip(ClipRect::new(rect.x, rect.y, rect.w, rect.h));
+
+    let track_h = rect.h.clamp(18.0, 22.0);
+    let track_w = (track_h * 1.82).min(rect.w);
+    let tx = rect.x;
+    let ty = rect.y + (rect.h - track_h) * 0.5;
+
+    let active_col = if tone == Tone::Neutral {
+        theme.accent
+    } else {
+        theme.tone_color(tone)
+    };
+    let off_col = lerp_rgba8(theme.surface_2, theme.surface_3, hover_t * 0.7);
+    let track_col = lerp_rgba8(off_col, active_col, on_t);
+
+    dl.push_quad(QuadInstance {
+        rect: [tx, ty, track_w, track_h],
+        radii: [track_h * 0.5; 4],
+        color_top: track_col,
+        color_bottom: track_col,
+        border_color: 0,
+        shadow_color: 0,
+        params: [0.0, 0.0, 0.0, 1.0],
+        clip_id: 0,
+        _pad: [0; 3],
+    });
+
+    let pad = 3.0;
+    let knob_d = (track_h - pad * 2.0).max(8.0);
+    let kx = tx + pad + (track_w - knob_d - pad * 2.0) * on_t;
+    let ky = ty + pad;
+    let knob_col = lerp_rgba8(theme.surface_0, 0xFF_FF_FF_FF, on_t * 0.85);
+    dl.push_quad(QuadInstance {
+        rect: [kx, ky, knob_d, knob_d],
+        radii: [knob_d * 0.5; 4],
+        color_top: knob_col,
+        color_bottom: knob_col,
+        border_color: 0,
+        shadow_color: 0,
+        params: [0.0, 0.0, 0.0, 1.0],
+        clip_id: 0,
+        _pad: [0; 3],
+    });
+
+    if let Some(lbl) = label.filter(|l| !l.is_empty()) {
+        let lx = tx + track_w + 8.0;
+        let lw = (rect.x + rect.w - lx).max(0.0);
+        if lw > 12.0 {
+            let fitted = fit_text(atlas, lbl, 12.0, false, lw);
+            let py = atlas.centered_pen_y(rect.y, rect.h, 12.0);
+            atlas.layout_dl(&fitted, lx, py, 12.0, theme.text_primary, false, None, dl);
+        }
+    }
+
+    dl.pop_clip();
+}
+
+/// Interactive single-line monospace text input field with focus ring & live caret.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_input(
+    id: &str,
+    value: &str,
+    placeholder: &str,
+    tone: Tone,
+    rect: ComputedRect,
+    theme: &Theme,
+    atlas: &GlyphAtlas,
+    springs: &mut SpringBank,
+    interaction: &mut InteractionState,
+    dl: &mut DrawList,
+) {
+    if rect.w < 36.0 || rect.h < 22.0 {
+        return;
+    }
+    let hit_key = format!("input::{id}");
+    let hovered = interaction.hovered_key.as_deref() == Some(hit_key.as_str());
+    let focused = interaction.focused_key.as_deref() == Some(hit_key.as_str());
+    let state_target = if focused {
+        1.0
+    } else if hovered {
+        0.55
+    } else {
+        0.0
+    };
+    let state_t = springs.animate(&hit_key, "focus", state_target, SpringConfig::SNAPPY);
+    interaction.push_hit(rect, HitKind::Input { id: id.to_string() });
+
+    dl.push_clip(ClipRect::new(rect.x, rect.y, rect.w, rect.h));
+
+    let focus_col = if tone == Tone::Neutral {
+        theme.accent
+    } else {
+        theme.tone_color(tone)
+    };
+    let bg = lerp_rgba8(theme.surface_1, theme.surface_2, state_t * 0.7);
+    dl.push_quad(QuadInstance {
+        rect: [rect.x, rect.y, rect.w, rect.h],
+        radii: [theme.radius_control; 4],
+        color_top: bg,
+        color_bottom: bg,
+        border_color: if focused { focus_col } else { 0 },
+        shadow_color: 0,
+        params: [if focused { 1.2 } else { 0.0 }, 0.0, 0.0, 1.0],
+        clip_id: 0,
+        _pad: [0; 3],
+    });
+
+    let pad_x = 10.0;
+    let inner_w = (rect.w - pad_x * 2.0).max(8.0);
+    let px = 12.5;
+    let py = atlas.centered_pen_y(rect.y, rect.h, px);
+
+    if value.is_empty() {
+        let fitted_ph = fit_text(atlas, placeholder, px, false, inner_w);
+        atlas.layout_dl(
+            &fitted_ph,
+            rect.x + pad_x,
+            py,
+            px,
+            theme.text_muted,
+            false,
+            None,
+            dl,
+        );
+        if focused {
+            let caret_h = (rect.h - 14.0).clamp(12.0, 18.0);
+            let caret_y = rect.y + (rect.h - caret_h) * 0.5;
+            dl.push_quad(QuadInstance {
+                rect: [rect.x + pad_x, caret_y, 1.6, caret_h],
+                radii: [0.8; 4],
+                color_top: focus_col,
+                color_bottom: focus_col,
+                border_color: 0,
+                shadow_color: 0,
+                params: [0.0, 0.0, 0.0, 1.0],
+                clip_id: 0,
+                _pad: [0; 3],
+            });
+        }
+    } else {
+        // Keep trailing characters visible when value exceeds field width so active typing stays in view
+        let caret_reserve = if focused { 4.0 } else { 0.0 };
+        let visible = fit_tail_text(atlas, value, px, false, (inner_w - caret_reserve).max(4.0));
+        atlas.layout_dl(
+            &visible,
+            rect.x + pad_x,
+            py,
+            px,
+            theme.text_primary,
+            false,
+            None,
+            dl,
+        );
+        if focused {
+            let (vw, _) = atlas.measure(&visible, px, false);
+            let caret_h = (rect.h - 14.0).clamp(12.0, 18.0);
+            let caret_y = rect.y + (rect.h - caret_h) * 0.5;
+            dl.push_quad(QuadInstance {
+                rect: [rect.x + pad_x + vw + 1.0, caret_y, 1.6, caret_h],
+                radii: [0.8; 4],
+                color_top: focus_col,
+                color_bottom: focus_col,
+                border_color: 0,
+                shadow_color: 0,
+                params: [0.0, 0.0, 0.0, 1.0],
+                clip_id: 0,
+                _pad: [0; 3],
+            });
+        }
+    }
+
+    dl.pop_clip();
+}
+
+fn fit_tail_text(atlas: &GlyphAtlas, text: &str, px: f32, mono: bool, max_w: f32) -> String {
+    let (w, _) = atlas.measure(text, px, mono);
+    if w <= max_w {
+        return text.to_string();
+    }
+    let mut chars: Vec<char> = text.chars().collect();
+    let mut acc = 0.0f32;
+    let mut start = chars.len();
+    for i in (0..chars.len()).rev() {
+        let cw = atlas.char_advance_em(chars[i], mono) * px;
+        if acc + cw > max_w {
+            break;
+        }
+        acc += cw;
+        start = i;
+    }
+    chars.drain(start..).collect()
 }

@@ -3,9 +3,13 @@
 //! Zero generic wrappers: every component emits precision `QuadInstance`, `StrokeInstance`,
 //! and `GlyphInstance` buffers tailored to its bounds, data cardinality, scale, and input state.
 
+pub mod code;
 pub mod controls;
+pub mod feed;
+pub mod graph;
 pub mod plot;
 pub mod stat;
+pub mod table;
 
 use crate::text::GlyphAtlas;
 

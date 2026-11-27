@@ -5,8 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::components::code::{CodeData, CodeHighlight};
+use crate::components::feed::{FeedData, FeedItem};
+use crate::components::graph::GraphData;
 use crate::components::plot::{CandlePoint, PlotData, PlotPoint};
 use crate::components::stat::StatData;
+use crate::components::table::{sort_table_rows, TableData};
 use crate::theme::{ThemeMode, Tone};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -238,8 +242,14 @@ impl Node {
             | NodeKind::ThemeToggle { .. }
             | NodeKind::Segmented { .. }
             | NodeKind::Button { .. }
+            | NodeKind::Switch { .. }
+            | NodeKind::Input { .. }
             | NodeKind::Stat(_)
-            | NodeKind::Plot(_) => {}
+            | NodeKind::Plot(_)
+            | NodeKind::Table(_)
+            | NodeKind::Feed(_)
+            | NodeKind::Graph(_)
+            | NodeKind::CodeText(_) => {}
         }
         None
     }
@@ -309,10 +319,34 @@ pub enum NodeKind {
         #[serde(default)]
         tone: Tone,
     },
+    /// Borderless animated pill toggle switch with optional label.
+    Switch {
+        checked: bool,
+        #[serde(default)]
+        label: Option<String>,
+        #[serde(default)]
+        tone: Tone,
+    },
+    /// Interactive single-line monospace text input field.
+    Input {
+        value: String,
+        #[serde(default)]
+        placeholder: String,
+        #[serde(default)]
+        tone: Tone,
+    },
     /// Adaptive KPI metric tile with counter spring, delta pill, sparkline/range bar.
     Stat(StatData),
     /// Multi-series / multi-pane GPU chart (Line, Area, StackedArea, Band, Candles, Histogram).
     Plot(PlotData),
+    /// Virtualized GPU data table with sortable columns and row selection.
+    Table(TableData),
+    /// Chronological event/alert stream with arrival highlights and kinetic scroll.
+    Feed(FeedData),
+    /// Topological node-edge DAG visualizer with auto-layout and active Bezier edges.
+    Graph(GraphData),
+    /// Monospace syntax-tinted code/log viewer with line gutter and highlights.
+    CodeText(CodeData),
 }
 
 /// Complete scene root held by `UiEngine`.
@@ -558,6 +592,136 @@ impl Scene {
                 }
                 false
             }
+            ScenePatch::SetSwitch { id, checked } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Switch { checked: cur, .. } = &mut node.kind {
+                        if *cur != checked {
+                            *cur = checked;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SetInput { id, value } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Input { value: cur, .. } = &mut node.kind {
+                        if *cur != value {
+                            *cur = value;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SortTable { id, col_index } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Table(table) = &mut node.kind {
+                        if col_index < table.columns.len() {
+                            sort_table_rows(table, col_index);
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SelectTableRow { id, row_id } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Table(table) = &mut node.kind {
+                        if table.selected_row != row_id {
+                            table.selected_row = row_id;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::AppendFeedItem {
+                id,
+                item,
+                max_items,
+            } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Feed(feed) = &mut node.kind {
+                        let cap = max_items.unwrap_or(feed.max_items).max(1);
+                        if feed.newest_first {
+                            feed.items.insert(0, item);
+                            if feed.items.len() > cap {
+                                feed.items.truncate(cap);
+                            }
+                        } else {
+                            feed.items.push(item);
+                            if feed.items.len() > cap {
+                                let excess = feed.items.len() - cap;
+                                feed.items.drain(0..excess);
+                            }
+                        }
+                        feed.update_seq = feed.update_seq.wrapping_add(1);
+                        return true;
+                    }
+                }
+                false
+            }
+            ScenePatch::SelectGraphNode { id, node_id } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Graph(graph) = &mut node.kind {
+                        if graph.selected_node != node_id {
+                            graph.selected_node = node_id;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SetGraphNodeTone { id, node_id, tone } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Graph(graph) = &mut node.kind {
+                        if let Some(gn) = graph.nodes.iter_mut().find(|n| n.id == node_id) {
+                            if gn.tone != tone {
+                                gn.tone = tone;
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SetGraphEdgeActive {
+                id,
+                from,
+                to,
+                active,
+            } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Graph(graph) = &mut node.kind {
+                        let mut changed = false;
+                        for edge in &mut graph.edges {
+                            if edge.from == from && edge.to == to && edge.active != active {
+                                edge.active = active;
+                                changed = true;
+                            }
+                        }
+                        return changed;
+                    }
+                }
+                false
+            }
+            ScenePatch::SetCode {
+                id,
+                content,
+                highlights,
+            } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::CodeText(code) = &mut node.kind {
+                        code.content = content;
+                        if let Some(hl) = highlights {
+                            code.highlights = hl;
+                        }
+                        return true;
+                    }
+                }
+                false
+            }
         }
     }
 }
@@ -587,6 +751,25 @@ pub enum ScenePatch {
     SetVisible { id: String, visible: bool },
     SetTab { id: String, active: usize },
     SetSegmented { id: String, active: usize },
+    SetSwitch { id: String, checked: bool },
+    SetInput { id: String, value: String },
+    SortTable { id: String, col_index: usize },
+    SelectTableRow { id: String, row_id: Option<String> },
+    AppendFeedItem {
+        id: String,
+        item: FeedItem,
+        #[serde(default)]
+        max_items: Option<usize>,
+    },
+    SelectGraphNode { id: String, node_id: Option<String> },
+    SetGraphNodeTone { id: String, node_id: String, tone: Tone },
+    SetGraphEdgeActive { id: String, from: String, to: String, active: bool },
+    SetCode {
+        id: String,
+        content: String,
+        #[serde(default)]
+        highlights: Option<Vec<CodeHighlight>>,
+    },
     ReplaceNode { id: String, node: Node },
     UpdateStat {
         id: String,

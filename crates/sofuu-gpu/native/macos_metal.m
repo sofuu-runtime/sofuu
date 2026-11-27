@@ -15,6 +15,7 @@ typedef enum {
     SOFUU_EV_RESIZE = 5,
     SOFUU_EV_CLOSE = 6,
     SOFUU_EV_KEY_DOWN = 7,
+    SOFUU_EV_TEXT_CHAR = 8,
 } SofuuEvKind;
 
 typedef void (*SofuuEventCallback)(
@@ -155,6 +156,17 @@ typedef struct {
 - (void)keyDown:(NSEvent*)event {
     if (!self.callback) return;
     self.callback(self.userCtx, SOFUU_EV_KEY_DOWN, 0.0f, 0.0f, 0.0f, 0.0f, (uint32_t)event.keyCode);
+    NSEventModifierFlags mods = event.modifierFlags;
+    if ((mods & (NSEventModifierFlagCommand | NSEventModifierFlagControl)) == 0) {
+        NSString* chars = event.characters;
+        NSUInteger n = chars.length;
+        for (NSUInteger i = 0; i < n; i++) {
+            unichar c = [chars characterAtIndex:i];
+            if (c >= 0x20 && c != 0x7F && !(c >= 0xF700 && c <= 0xF8FF)) {
+                self.callback(self.userCtx, SOFUU_EV_TEXT_CHAR, 0.0f, 0.0f, 0.0f, 0.0f, (uint32_t)c);
+            }
+        }
+    }
 }
 
 @end

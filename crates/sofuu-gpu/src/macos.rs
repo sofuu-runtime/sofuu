@@ -17,6 +17,7 @@ const EV_SCROLL: u32 = 4;
 const EV_RESIZE: u32 = 5;
 const EV_CLOSE: u32 = 6;
 const EV_KEY_DOWN: u32 = 7;
+const EV_TEXT_CHAR: u32 = 8;
 
 #[repr(C)]
 struct SofuuMacWindow {
@@ -124,6 +125,13 @@ extern "C" fn on_native_event(
                 key: format!("keycode:{u}"),
                 modifiers: 0,
             });
+        }
+        EV_TEXT_CHAR => {
+            if let Some(ch) = char::from_u32(u) {
+                state.raw_events.push(InputEvent::TextInput {
+                    text: ch.to_string(),
+                });
+            }
         }
         _ => {}
     }

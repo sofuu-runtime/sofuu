@@ -176,7 +176,7 @@ fragment float4 quad_frag(
     float2 center = in.rect.xy + half_size;
     float2 p = in.logical_pos - center;
 
-    float aa = 0.65 / max(u.scale_factor, 1.0);
+    float aa = 0.5 / max(u.scale_factor, 1.0);
     float border_w = max(in.params.x, 0.0);
     float shadow_blur = max(in.params.y, 0.0);
     float shadow_off_y = in.params.z;
@@ -387,10 +387,13 @@ fragment float4 glyph_frag(
         discard_fragment();
     }
     float sd = atlas.sample(atlas_sampler, in.uv).r - 0.5;
-    float2 tex_dx = dfdx(in.uv) * u.atlas_size.x;
-    float2 tex_dy = dfdy(in.uv) * u.atlas_size.y;
-    float screen_px_range = max(0.5 * dot(float2(in.px_range), float2(1.0) / max(abs(tex_dx) + abs(tex_dy), float2(1e-4))), 1.0);
-    float alpha = clamp(sd * screen_px_range + 0.5, 0.0, 1.0) * in.color.a;
+    float2 unit_range = float2(in.px_range) / max(u.atlas_size, float2(1.0));
+    float2 screen_tex_size = float2(1.0) / max(fwidth(in.uv), float2(1e-5));
+    float screen_px_range = max(0.5 * dot(unit_range, screen_tex_size), 1.0);
+    // Natural contour-centered Regular-weight SDF AA without stroke bloat or low-opacity fading.
+    float px_dist = sd * screen_px_range;
+    float cov = smoothstep(-0.48, 0.44, px_dist);
+    float alpha = cov * in.color.a;
     if (alpha <= 0.002) {
         discard_fragment();
     }

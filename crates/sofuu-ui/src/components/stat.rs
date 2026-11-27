@@ -217,25 +217,25 @@ pub fn emit_stat(
     let hero_str = format!("{}{}{}", data.prefix, formatted_core, data.suffix);
 
     if rect.h < 80.0 {
-        let label_s = fit_text(atlas, &data.label, 12.0, true, iw * 0.45);
+        let label_s = fit_text(atlas, &data.label, 12.0, false, iw * 0.45);
         atlas.layout_dl(
             &label_s,
             ix,
             atlas.centered_pen_y(iy, ih, 12.0),
             12.0,
             theme.text_secondary,
-            true,
+            false,
             None,
             dl,
         );
-        let (vw, _) = atlas.measure(&hero_str, 17.0, true);
+        let (vw, _) = atlas.measure(&hero_str, 17.0, false);
         atlas.layout_dl(
             &hero_str,
             ix + iw - vw,
             atlas.centered_pen_y(iy, ih, 17.0),
             17.0,
             theme.text_primary,
-            true,
+            false,
             None,
             dl,
         );
@@ -247,22 +247,22 @@ pub fn emit_stat(
     let mut right_used_w = 0.0f32;
     if let Some(delta) = &data.delta {
         if !delta.is_empty() {
-            let (dw, _) = atlas.measure(delta, 11.5, true);
+            let (dw, _) = atlas.measure(delta, 11.5, false);
             let pill_w = (dw + 14.0).min(iw * 0.55);
             let pill_x = ix + iw - pill_w;
             let pill_y = iy;
             dl.push_quad(QuadInstance {
                 rect: [pill_x, pill_y, pill_w, header_row_h],
                 radii: [theme.radius_pill; 4],
-                color_top: scale_alpha(tone_col, 0.14),
-                color_bottom: scale_alpha(tone_col, 0.14),
+                color_top: scale_alpha(tone_col, 0.18),
+                color_bottom: scale_alpha(tone_col, 0.18),
                 border_color: 0,
                 shadow_color: 0,
                 params: [0.0, 0.0, 0.0, 1.0],
                 clip_id: 0,
                 _pad: [0; 3],
             });
-            let fitted_d = fit_text(atlas, delta, 11.5, true, pill_w - 8.0);
+            let fitted_d = fit_text(atlas, delta, 11.5, false, pill_w - 8.0);
             atlas.layout_centered(
                 &fitted_d,
                 pill_x,
@@ -271,7 +271,7 @@ pub fn emit_stat(
                 header_row_h,
                 11.5,
                 tone_col,
-                true,
+                false,
                 dl,
             );
             right_used_w += pill_w + 6.0;
@@ -280,7 +280,7 @@ pub fn emit_stat(
 
     if let Some(badge) = &data.badge {
         if !badge.is_empty() && rect.w - pad_x * 2.0 - right_used_w > 95.0 {
-            let (bw, _) = atlas.measure(badge, 10.5, true);
+            let (bw, _) = atlas.measure(badge, 10.5, false);
             let pill_w = bw + 12.0;
             let pill_x = ix + iw - right_used_w - pill_w;
             let pill_y = iy;
@@ -303,7 +303,7 @@ pub fn emit_stat(
                 header_row_h,
                 10.5,
                 theme.text_muted,
-                true,
+                false,
                 dl,
             );
             right_used_w += pill_w + 6.0;
@@ -311,14 +311,14 @@ pub fn emit_stat(
     }
 
     let label_max_w = (iw - right_used_w).max(24.0);
-    let label_str = fit_text(atlas, &data.label, 12.5, true, label_max_w);
+    let label_str = fit_text(atlas, &data.label, 12.5, false, label_max_w);
     atlas.layout_dl(
         &label_str,
         ix,
         atlas.centered_pen_y(iy, header_row_h, 12.5),
         12.5,
         theme.text_secondary,
-        true,
+        false,
         None,
         dl,
     );
@@ -332,19 +332,19 @@ pub fn emit_stat(
     } else {
         24.0
     };
-    while hero_px > 14.0 && atlas.measure(&hero_str, hero_px, true).0 > iw {
+    while hero_px > 14.0 && atlas.measure(&hero_str, hero_px, false).0 > iw {
         hero_px -= 1.5;
     }
-    let fitted_hero = fit_text(atlas, &hero_str, hero_px, true, iw);
+    let fitted_hero = fit_text(atlas, &hero_str, hero_px, false, iw);
     let hero_y = iy + if rect.h >= 210.0 { 30.0 } else { 25.0 };
-    let (_, hero_h) = atlas.measure(&fitted_hero, hero_px, true);
+    let (_, hero_h) = atlas.measure(&fitted_hero, hero_px, false);
     atlas.layout_dl(
         &fitted_hero,
         ix,
         hero_y,
         hero_px,
         theme.text_primary,
-        true,
+        false,
         None,
         dl,
     );
@@ -408,14 +408,14 @@ pub fn emit_stat(
             let cap_y = atlas
                 .centered_pen_y(iy + ih - 14.0, 14.0, 11.5)
                 .max(cursor_y + 2.0);
-            let fitted_cap = fit_text(atlas, cap, 11.5, true, iw);
+            let fitted_cap = fit_text(atlas, cap, 11.5, false, iw);
             atlas.layout_dl(
                 &fitted_cap,
                 ix,
                 cap_y,
                 11.5,
                 theme.text_muted,
-                true,
+                false,
                 None,
                 dl,
             );
@@ -601,7 +601,7 @@ fn emit_range_bar(
 
     let lo_txt = format!("{}{}{}", prefix, format_number(lo, precision), suffix);
     let hi_txt = format!("{}{}{}", prefix, format_number(hi, precision), suffix);
-    let (hw, _) = atlas.measure(&hi_txt, 10.5, true);
-    atlas.layout_dl(&lo_txt, x, track_y + 11.0, 10.5, theme.text_muted, true, None, dl);
-    atlas.layout_dl(&hi_txt, x + w - hw, track_y + 11.0, 10.5, theme.text_muted, true, None, dl);
+    let (hw, _) = atlas.measure(&hi_txt, 10.5, false);
+    atlas.layout_dl(&lo_txt, x, track_y + 11.0, 10.5, theme.text_muted, false, None, dl);
+    atlas.layout_dl(&hi_txt, x + w - hw, track_y + 11.0, 10.5, theme.text_muted, false, None, dl);
 }

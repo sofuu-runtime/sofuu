@@ -28,6 +28,13 @@ pub enum UIEvent {
     TabChanged { id: String, index: usize },
     SegmentedChanged { id: String, index: usize },
     ThemeChanged { id: String, mode: ThemeMode },
+    SwitchToggled { id: String, checked: bool },
+    TextChanged { id: String, value: String },
+    InputSubmitted { id: String, value: String },
+    TableSorted { id: String, col_index: usize, asc: bool },
+    RowSelected { id: String, row_id: String },
+    FeedItemClicked { id: String, item_id: String },
+    GraphNodeClicked { id: String, node_id: String },
     SeriesToggled { id: String, series_index: usize },
     Scrolled { id: String, offset_y: f32 },
     WindowClosed,
@@ -41,6 +48,12 @@ pub enum HitKind {
     SegmentedItem { seg_id: String, index: usize },
     Button { id: String },
     ThemeToggle { id: String },
+    Switch { id: String },
+    Input { id: String },
+    TableHeader { table_id: String, col_index: usize },
+    TableRow { table_id: String, row_id: String },
+    FeedItem { feed_id: String, item_id: String },
+    GraphNode { graph_id: String, node_id: String },
     PlotArea { id: String },
     PlotLegendChip { plot_id: String, series_index: usize },
     ScrollContainer { id: String, max_scroll_y: f32 },
@@ -98,6 +111,7 @@ pub struct InteractionState {
     pub pointer: [f32; 2],
     pub hovered_key: Option<String>,
     pub pressed_key: Option<String>,
+    pub focused_key: Option<String>,
     pub hits: Vec<HitRegion>,
     pub scrolls: HashMap<String, KineticScroll>,
     pub plot_hover: HashMap<String, [f32; 2]>,
@@ -131,6 +145,21 @@ impl InteractionState {
                 }
                 HitKind::Button { id } => return Some((format!("btn::{id}"), &region.kind)),
                 HitKind::ThemeToggle { id } => return Some((format!("toggle::{id}"), &region.kind)),
+                HitKind::Switch { id } => return Some((format!("switch::{id}"), &region.kind)),
+                HitKind::Input { id } => return Some((format!("input::{id}"), &region.kind)),
+                HitKind::TableHeader {
+                    table_id,
+                    col_index,
+                } => return Some((format!("{table_id}::th::{col_index}"), &region.kind)),
+                HitKind::TableRow { table_id, row_id } => {
+                    return Some((format!("{table_id}::tr::{row_id}"), &region.kind))
+                }
+                HitKind::FeedItem { feed_id, item_id } => {
+                    return Some((format!("{feed_id}::feed::{item_id}"), &region.kind))
+                }
+                HitKind::GraphNode { graph_id, node_id } => {
+                    return Some((format!("{graph_id}::node::{node_id}"), &region.kind))
+                }
                 HitKind::PlotLegendChip {
                     plot_id,
                     series_index,

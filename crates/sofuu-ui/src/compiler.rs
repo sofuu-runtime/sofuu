@@ -1,8 +1,14 @@
 //! Scene compiler: turns Scene IR + Layout + 120Hz Springs into flat GPU `DrawList` buffers.
 
-use crate::components::controls::{emit_button, emit_segmented, emit_tabs_bar, emit_theme_toggle};
+use crate::components::code::emit_code;
+use crate::components::controls::{
+    emit_button, emit_input, emit_segmented, emit_switch, emit_tabs_bar, emit_theme_toggle,
+};
+use crate::components::feed::emit_feed;
+use crate::components::graph::emit_graph;
 use crate::components::plot::emit_plot;
 use crate::components::stat::emit_stat;
+use crate::components::table::{emit_table, TableSortDir};
 use crate::draw::{lerp_rgba8, scale_alpha, ClipRect, DrawList, QuadInstance};
 use crate::hit_test::{HitKind, InputEvent, InteractionState, KineticScroll, UIEvent};
 use crate::ir::{BoxStyle, Node, NodeKind, Scene, ScenePatch};
@@ -148,12 +154,21 @@ impl UiEngine {
                     let hit = self
                         .interaction
                         .hit_topmost_interactive(x, y)
-                        .map(|(k, _)| k);
-                    if hit != self.interaction.pressed_key {
-                        self.interaction.pressed_key = hit.clone();
+                        .map(|(k, kind)| (k, matches!(kind, HitKind::Input { .. })));
+                    let new_focus = match &hit {
+                        Some((k, true)) => Some(k.clone()),
+                        _ => None,
+                    };
+                    if self.interaction.focused_key != new_focus {
+                        self.interaction.focused_key = new_focus;
                         self.dirty = true;
                     }
-                    if hit.is_none() {
+                    let hit_key = hit.map(|(k, _)| k);
+                    if hit_key != self.interaction.pressed_key {
+                        self.interaction.pressed_key = hit_key.clone();
+                        self.dirty = true;
+                    }
+                    if hit_key.is_none() {
                         if let Some((pid, prect)) = self.interaction.hit_plot_area(x, y) {
                             self.interaction.dragging_plot = Some((pid, x, prect.w));
                         }
@@ -203,6 +218,73 @@ impl UiEngine {
                                         };
                                         let _ = self.apply_patch(ScenePatch::SetTheme(next));
                                         out.push(UIEvent::ThemeChanged { id, mode: next });
+                                    }
+                                    HitKind::Switch { id } => {
+                                        if let Some(node) = self.scene.root.find_mut(&id) {
+                                            if let NodeKind::Switch { checked, .. } = &mut node.kind
+                                            {
+                                                let next = !*checked;
+                                                *checked = next;
+                                                self.dirty = true;
+                                                out.push(UIEvent::SwitchToggled {
+                                                    id,
+                                                    checked: next,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    HitKind::Input { .. } => {}
+                                    HitKind::TableHeader {
+                                        table_id,
+                                        col_index,
+                                    } => {
+                                        if self.apply_patch(ScenePatch::SortTable {
+                                            id: table_id.clone(),
+                                            col_index,
+                                        }) {
+                                            let asc = self
+                                                .scene
+                                                .root
+                                                .find_mut(&table_id)
+                                                .and_then(|n| match &n.kind {
+                                                    NodeKind::Table(t) => {
+                                                        Some(t.sort_dir == TableSortDir::Asc)
+                                                    }
+                                                    _ => None,
+                                                })
+                                                .unwrap_or(true);
+                                            out.push(UIEvent::TableSorted {
+                                                id: table_id,
+                                                col_index,
+                                                asc,
+                                            });
+                                        }
+                                    }
+                                    HitKind::TableRow { table_id, row_id } => {
+                                        let _ = self.apply_patch(ScenePatch::SelectTableRow {
+                                            id: table_id.clone(),
+                                            row_id: Some(row_id.clone()),
+                                        });
+                                        out.push(UIEvent::RowSelected {
+                                            id: table_id,
+                                            row_id,
+                                        });
+                                    }
+                                    HitKind::FeedItem { feed_id, item_id } => {
+                                        out.push(UIEvent::FeedItemClicked {
+                                            id: feed_id,
+                                            item_id,
+                                        });
+                                    }
+                                    HitKind::GraphNode { graph_id, node_id } => {
+                                        let _ = self.apply_patch(ScenePatch::SelectGraphNode {
+                                            id: graph_id.clone(),
+                                            node_id: Some(node_id.clone()),
+                                        });
+                                        out.push(UIEvent::GraphNodeClicked {
+                                            id: graph_id,
+                                            node_id,
+                                        });
                                     }
                                     HitKind::PlotLegendChip {
                                         plot_id,
@@ -254,7 +336,62 @@ impl UiEngine {
             InputEvent::CloseRequested => {
                 out.push(UIEvent::WindowClosed);
             }
-            InputEvent::KeyDown { .. } | InputEvent::TextInput { .. } => {}
+            InputEvent::KeyDown { key, .. } => {
+                if let Some(fkey) = self.interaction.focused_key.clone() {
+                    if let Some(input_id) = fkey.strip_prefix("input::") {
+                        if matches!(
+                            key.as_str(),
+                            "keycode:51" | "Backspace" | "\u{8}" | "\u{7f}"
+                        ) {
+                            if let Some(node) = self.scene.root.find_mut(input_id) {
+                                if let NodeKind::Input { value, .. } = &mut node.kind {
+                                    if value.pop().is_some() {
+                                        self.dirty = true;
+                                        out.push(UIEvent::TextChanged {
+                                            id: input_id.to_string(),
+                                            value: value.clone(),
+                                        });
+                                    }
+                                }
+                            }
+                        } else if matches!(
+                            key.as_str(),
+                            "keycode:36" | "keycode:76" | "Enter" | "Return" | "\r" | "\n"
+                        ) {
+                            if let Some(node) = self.scene.root.find_mut(input_id) {
+                                if let NodeKind::Input { value, .. } = &node.kind {
+                                    out.push(UIEvent::InputSubmitted {
+                                        id: input_id.to_string(),
+                                        value: value.clone(),
+                                    });
+                                }
+                            }
+                        } else if matches!(key.as_str(), "keycode:53" | "Escape") {
+                            self.interaction.focused_key = None;
+                            self.dirty = true;
+                        }
+                    }
+                }
+            }
+            InputEvent::TextInput { text } => {
+                if let Some(fkey) = self.interaction.focused_key.clone() {
+                    if let Some(input_id) = fkey.strip_prefix("input::") {
+                        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                        if !clean.is_empty() {
+                            if let Some(node) = self.scene.root.find_mut(input_id) {
+                                if let NodeKind::Input { value, .. } = &mut node.kind {
+                                    value.push_str(&clean);
+                                    self.dirty = true;
+                                    out.push(UIEvent::TextChanged {
+                                        id: input_id.to_string(),
+                                        value: value.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
         out
     }
@@ -557,6 +694,42 @@ impl UiEngine {
                     dl,
                 );
             }
+            NodeKind::Switch {
+                checked,
+                label,
+                tone,
+            } => {
+                emit_switch(
+                    &node.id,
+                    *checked,
+                    label.as_deref(),
+                    *tone,
+                    rect,
+                    &self.theme,
+                    &self.atlas,
+                    &mut self.springs,
+                    &mut self.interaction,
+                    dl,
+                );
+            }
+            NodeKind::Input {
+                value,
+                placeholder,
+                tone,
+            } => {
+                emit_input(
+                    &node.id,
+                    value,
+                    placeholder,
+                    *tone,
+                    rect,
+                    &self.theme,
+                    &self.atlas,
+                    &mut self.springs,
+                    &mut self.interaction,
+                    dl,
+                );
+            }
             NodeKind::Stat(data) => {
                 emit_stat(
                     &node.id,
@@ -571,6 +744,54 @@ impl UiEngine {
             }
             NodeKind::Plot(data) => {
                 emit_plot(
+                    &node.id,
+                    data,
+                    rect,
+                    &self.theme,
+                    &self.atlas,
+                    &mut self.springs,
+                    &mut self.interaction,
+                    dl,
+                );
+            }
+            NodeKind::Table(data) => {
+                emit_table(
+                    &node.id,
+                    data,
+                    rect,
+                    &self.theme,
+                    &self.atlas,
+                    &mut self.springs,
+                    &mut self.interaction,
+                    dl,
+                );
+            }
+            NodeKind::Feed(data) => {
+                emit_feed(
+                    &node.id,
+                    data,
+                    rect,
+                    &self.theme,
+                    &self.atlas,
+                    &mut self.springs,
+                    &mut self.interaction,
+                    dl,
+                );
+            }
+            NodeKind::Graph(data) => {
+                emit_graph(
+                    &node.id,
+                    data,
+                    rect,
+                    &self.theme,
+                    &self.atlas,
+                    &mut self.springs,
+                    &mut self.interaction,
+                    dl,
+                );
+            }
+            NodeKind::CodeText(data) => {
+                emit_code(
                     &node.id,
                     data,
                     rect,
@@ -1334,5 +1555,218 @@ mod tests {
         });
         assert!(engine.interaction.plot_hover.contains_key("plot_left"));
         assert!(!engine.interaction.plot_hover.contains_key("plot_right"));
+    }
+
+    #[test]
+    fn table_virtualizes_large_rows_and_sorts_and_selects() {
+        use crate::components::table::{TableCell, TableColumn, TableRow};
+        use crate::ui;
+
+        let rows: Vec<TableRow> = (0..5_000)
+            .map(|i| TableRow::new(format!("r{i}"), vec![TableCell::new(format!("{}", 5_000 - i))]))
+            .collect();
+        let scene = ui::app("Table Test")
+            .add(
+                ui::table("tbl")
+                    .title("Queue")
+                    .columns([TableColumn::new("val", "Val")])
+                    .rows(rows),
+            )
+            .build();
+
+        let mut engine = UiEngine::new(scene, [600.0, 360.0]);
+        let mut dl = DrawList::new();
+        let st = engine.tick_and_compile(1.0 / 120.0, &mut dl);
+        assert!(st.compiled);
+        // Virtualized: 5,000 rows must emit only visible viewport rows (< 60 quads total)
+        assert!(dl.quads.len() < 60, "expected virtualized quads < 60, got {}", dl.quads.len());
+
+        // Find column header hit rect & click to sort Asc
+        let hdr_rect = engine
+            .interaction
+            .hits
+            .iter()
+            .find_map(|h| match &h.kind {
+                HitKind::TableHeader { col_index: 0, .. } => Some(h.rect),
+                _ => None,
+            })
+            .unwrap();
+        let hx = hdr_rect.x + hdr_rect.w * 0.5;
+        let hy = hdr_rect.y + hdr_rect.h * 0.5;
+        let _ = engine.handle_input(InputEvent::PointerDown { x: hx, y: hy, button: 0 });
+        let evs = engine.handle_input(InputEvent::PointerUp { x: hx, y: hy, button: 0 });
+        assert!(matches!(
+            evs.as_slice(),
+            [UIEvent::TableSorted { id, col_index: 0, asc: true }] if id == "tbl"
+        ));
+
+        // First row after ascending numeric sort must be "1" (r4999)
+        if let Some(node) = engine.scene.root.find_mut("tbl") {
+            if let NodeKind::Table(t) = &node.kind {
+                assert_eq!(t.rows[0].cells[0].text, "1");
+            }
+        }
+    }
+
+    #[test]
+    fn feed_appends_and_clicks_items() {
+        use crate::components::feed::FeedItem;
+        use crate::ui;
+
+        let scene = ui::app("Feed Test")
+            .add(
+                ui::feed("fd")
+                    .title("Events")
+                    .item(FeedItem::new("i1", "Initial event").badge("OK").tone(crate::theme::Tone::Ok)),
+            )
+            .build();
+        let mut engine = UiEngine::new(scene, [520.0, 360.0]);
+        let mut dl = DrawList::new();
+        let _ = engine.tick_and_compile(1.0 / 120.0, &mut dl);
+
+        assert!(engine.apply_patch(ScenePatch::AppendFeedItem {
+            id: "fd".into(),
+            item: FeedItem::new("i2", "Newest event").body("Details"),
+            max_items: Some(50),
+        }));
+        let _ = engine.tick_and_compile(1.0 / 120.0, &mut dl);
+
+        let item_rect = engine
+            .interaction
+            .hits
+            .iter()
+            .find_map(|h| match &h.kind {
+                HitKind::FeedItem { item_id, .. } if item_id == "i2" => Some(h.rect),
+                _ => None,
+            })
+            .unwrap();
+        let x = item_rect.x + 12.0;
+        let y = item_rect.y + 12.0;
+        let _ = engine.handle_input(InputEvent::PointerDown { x, y, button: 0 });
+        let evs = engine.handle_input(InputEvent::PointerUp { x, y, button: 0 });
+        assert!(matches!(
+            evs.as_slice(),
+            [UIEvent::FeedItemClicked { id, item_id }] if id == "fd" && item_id == "i2"
+        ));
+    }
+
+    #[test]
+    fn graph_auto_layouts_dag_and_emits_node_click() {
+        use crate::components::graph::{GraphEdge, GraphNode};
+        use crate::ui;
+
+        let scene = ui::app("Graph Test")
+            .add(
+                ui::graph("g1")
+                    .title("DAG")
+                    .node(GraphNode::new("a", "Start"))
+                    .node(GraphNode::new("b", "Step"))
+                    .edge(GraphEdge::new("a", "b").active(true)),
+            )
+            .build();
+        let mut engine = UiEngine::new(scene, [640.0, 360.0]);
+        let mut dl = DrawList::new();
+        let _ = engine.tick_and_compile(1.0 / 120.0, &mut dl);
+        assert!(dl.strokes.len() >= 18, "expected Bezier curve + arrow strokes");
+
+        let nb_rect = engine
+            .interaction
+            .hits
+            .iter()
+            .find_map(|h| match &h.kind {
+                HitKind::GraphNode { node_id, .. } if node_id == "b" => Some(h.rect),
+                _ => None,
+            })
+            .unwrap();
+        let x = nb_rect.x + nb_rect.w * 0.5;
+        let y = nb_rect.y + nb_rect.h * 0.5;
+        let _ = engine.handle_input(InputEvent::PointerDown { x, y, button: 0 });
+        let evs = engine.handle_input(InputEvent::PointerUp { x, y, button: 0 });
+        assert!(matches!(
+            evs.as_slice(),
+            [UIEvent::GraphNodeClicked { id, node_id }] if id == "g1" && node_id == "b"
+        ));
+    }
+
+    #[test]
+    fn code_text_renders_gutter_highlights_and_updates() {
+        use crate::ui;
+
+        let scene = ui::app("Code Test")
+            .add(
+                ui::code("c1", "let x = 42;\nreturn x;")
+                    .title("main.js")
+                    .language("JS")
+                    .highlight(1, crate::theme::Tone::Ok),
+            )
+            .build();
+        let mut engine = UiEngine::new(scene, [580.0, 320.0]);
+        let mut dl = DrawList::new();
+        let st = engine.tick_and_compile(1.0 / 120.0, &mut dl);
+        assert!(st.compiled);
+        assert!(!dl.glyphs.is_empty());
+
+        assert!(engine.apply_patch(ScenePatch::SetCode {
+            id: "c1".into(),
+            content: "const ok = true;".into(),
+            highlights: None,
+        }));
+    }
+
+    #[test]
+    fn switch_toggles_and_input_accepts_typing_backspace_and_submit() {
+        use crate::ui;
+
+        let row_n: Node = ui::row("ctrl_row")
+            .fold_below(0.0)
+            .add(ui::switch("sw1", false, Some("Enable")))
+            .add(ui::input("in1", "Type here"))
+            .into();
+        let scene = Scene::new("Controls", ThemeMode::Light, row_n);
+
+        let mut engine = UiEngine::new(scene, [600.0, 200.0]);
+        let mut dl = DrawList::new();
+        let _ = engine.tick_and_compile(1.0 / 120.0, &mut dl);
+
+        // Toggle switch
+        let sw_r = engine.layout.get("sw1").unwrap();
+        let sx = sw_r.x + 12.0;
+        let sy = sw_r.y + sw_r.h * 0.5;
+        let _ = engine.handle_input(InputEvent::PointerDown { x: sx, y: sy, button: 0 });
+        let sw_ev = engine.handle_input(InputEvent::PointerUp { x: sx, y: sy, button: 0 });
+        assert!(matches!(
+            sw_ev.as_slice(),
+            [UIEvent::SwitchToggled { id, checked: true }] if id == "sw1"
+        ));
+
+        // Focus Input -> Type "ab" -> Backspace -> Enter
+        let in_r = engine.layout.get("in1").unwrap();
+        let ix = in_r.x + in_r.w * 0.5;
+        let iy = in_r.y + in_r.h * 0.5;
+        let _ = engine.handle_input(InputEvent::PointerDown { x: ix, y: iy, button: 0 });
+        let _ = engine.handle_input(InputEvent::PointerUp { x: ix, y: iy, button: 0 });
+        assert_eq!(engine.interaction.focused_key.as_deref(), Some("input::in1"));
+
+        let t_ev = engine.handle_input(InputEvent::TextInput { text: "ab".into() });
+        assert!(matches!(
+            t_ev.as_slice(),
+            [UIEvent::TextChanged { id, value }] if id == "in1" && value == "ab"
+        ));
+        let bs_ev = engine.handle_input(InputEvent::KeyDown {
+            key: "keycode:51".into(),
+            modifiers: 0,
+        });
+        assert!(matches!(
+            bs_ev.as_slice(),
+            [UIEvent::TextChanged { id, value }] if id == "in1" && value == "a"
+        ));
+        let sub_ev = engine.handle_input(InputEvent::KeyDown {
+            key: "keycode:36".into(),
+            modifiers: 0,
+        });
+        assert!(matches!(
+            sub_ev.as_slice(),
+            [UIEvent::InputSubmitted { id, value }] if id == "in1" && value == "a"
+        ));
     }
 }

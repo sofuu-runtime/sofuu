@@ -292,15 +292,15 @@ pub fn emit_plot(
                 } else {
                     iw
                 };
-                let fitted = fit_text(atlas, title, title_px, true, max_t);
-                let (tw, _) = atlas.measure(&fitted, title_px, true);
+                let fitted = fit_text(atlas, title, title_px, false, max_t);
+                let (tw, _) = atlas.measure(&fitted, title_px, false);
                 atlas.layout_dl(
                     &fitted,
                     ix,
                     atlas.centered_pen_y(iy, 24.0, title_px),
                     title_px,
                     theme.text_primary,
-                    true,
+                    false,
                     None,
                     dl,
                 );
@@ -311,7 +311,7 @@ pub fn emit_plot(
         let sub_budget = (iw * 0.65 - title_w_used).max(0.0);
         if has_sub && rect.w >= 560.0 && sub_budget >= 60.0 {
             if let Some(sub) = &data.subtitle {
-                let sub_fit = fit_text(atlas, sub, 11.0, true, sub_budget);
+                let sub_fit = fit_text(atlas, sub, 11.0, false, sub_budget);
                 if !sub_fit.is_empty() {
                     atlas.layout_dl(
                         &sub_fit,
@@ -319,7 +319,7 @@ pub fn emit_plot(
                         atlas.centered_pen_y(iy, 24.0, 11.0),
                         11.0,
                         theme.text_muted,
-                        true,
+                        false,
                         None,
                         dl,
                     );
@@ -340,15 +340,15 @@ pub fn emit_plot(
         let cy = iy + header_h + (ih - header_h) * 0.5;
         dl.push_stroke(StrokeInstance::solid([ix, cy], [ix + iw, cy], 1.0, 0.75, theme.border, 0));
         let empty_msg = data.empty_text.as_deref().unwrap_or("No data");
-        let msg = fit_text(atlas, empty_msg, 12.5, true, iw);
-        let (mw, mh) = atlas.measure(&msg, 12.5, true);
+        let msg = fit_text(atlas, empty_msg, 12.5, false, iw);
+        let (mw, mh) = atlas.measure(&msg, 12.5, false);
         atlas.layout_dl(
             &msg,
             ix + (iw - mw) * 0.5,
             cy - mh - 8.0,
             12.5,
             theme.text_muted,
-            true,
+            false,
             None,
             dl,
         );
@@ -436,7 +436,7 @@ pub fn emit_plot(
                 format_number(val, pane.y_precision),
                 pane.y_suffix
             );
-            let (tw, _) = atlas.measure(&txt, 10.5, true);
+            let (tw, _) = atlas.measure(&txt, 10.5, false);
             max_gutter = max_gutter.max(tw + 14.0);
             ticks.push((frac as f32, txt));
         }
@@ -773,9 +773,9 @@ pub fn emit_plot(
             let bar_h = 24.0;
             let ry_txt = atlas.centered_pen_y(pane_rect.y, bar_h, 10.5);
             if let Some(plabel) = &pl.pane.label {
-                let pf = fit_text(atlas, plabel, 10.5, true, 120.0);
-                let (pw, _) = atlas.measure(&pf, 10.5, true);
-                atlas.layout_dl(&pf, rx, ry_txt, 10.5, theme.text_muted, true, None, dl);
+                let pf = fit_text(atlas, plabel, 10.5, false, 120.0);
+                let (pw, _) = atlas.measure(&pf, 10.5, false);
+                atlas.layout_dl(&pf, rx, ry_txt, 10.5, theme.text_muted, false, None, dl);
                 rx += pw + 12.0;
             }
             for (seg_txt, seg_col) in &readout_lines {
@@ -795,9 +795,9 @@ pub fn emit_plot(
                     _pad: [0; 3],
                 });
                 rx += 9.0;
-                let fitted = fit_text(atlas, seg_txt, 10.5, true, avail);
-                let (sw, _) = atlas.measure(&fitted, 10.5, true);
-                atlas.layout_dl(&fitted, rx, ry_txt, 10.5, *seg_col, true, None, dl);
+                let fitted = fit_text(atlas, seg_txt, 10.5, false, avail);
+                let (sw, _) = atlas.measure(&fitted, 10.5, false);
+                atlas.layout_dl(&fitted, rx, ry_txt, 10.5, *seg_col, false, None, dl);
                 rx += sw + 12.0;
             }
         }
@@ -842,8 +842,8 @@ pub fn emit_plot(
                     format_number(ly, pl.pane.y_precision),
                     pl.pane.y_suffix
                 );
-                let fitted_b = fit_text(atlas, &btxt, 10.5, true, gutter_r - 8.0);
-                let (bw, _) = atlas.measure(&fitted_b, 10.5, true);
+                let fitted_b = fit_text(atlas, &btxt, 10.5, false, gutter_r - 8.0);
+                let (bw, _) = atlas.measure(&fitted_b, 10.5, false);
                 let pill_w = (bw + 10.0).min(gutter_r + 2.0);
                 dl.push_quad(QuadInstance {
                     rect: [plot_x + plot_w + 4.0, top, pill_w, pill_h],
@@ -864,7 +864,7 @@ pub fn emit_plot(
                     pill_h,
                     10.5,
                     theme.bg,
-                    true,
+                    false,
                     dl,
                 );
             }
@@ -885,8 +885,8 @@ pub fn emit_plot(
                     .label
                     .clone()
                     .unwrap_or_else(|| format_number(th.value, pl.pane.y_precision));
-                let fitted_t = fit_text(atlas, &ttxt, 10.0, true, gutter_r - 8.0);
-                let (tw, _) = atlas.measure(&fitted_t, 10.0, true);
+                let fitted_t = fit_text(atlas, &ttxt, 10.0, false, gutter_r - 8.0);
+                let (tw, _) = atlas.measure(&fitted_t, 10.0, false);
                 let pill_w = (tw + 10.0).min(gutter_r);
                 let badge_col = th.color.unwrap_or(theme.surface_3);
                 dl.push_quad(QuadInstance {
@@ -908,7 +908,7 @@ pub fn emit_plot(
                     th_h,
                     10.0,
                     theme.text_primary,
-                    true,
+                    false,
                     dl,
                 );
             }
@@ -923,14 +923,14 @@ pub fn emit_plot(
                 if overlaps(&occupied_y, top, bot, 4.5) {
                     continue;
                 }
-                let fitted_y = fit_text(atlas, label, 10.5, true, gutter_r - 6.0);
+                let fitted_y = fit_text(atlas, label, 10.5, false, gutter_r - 6.0);
                 atlas.layout_dl(
                     &fitted_y,
                     plot_x + plot_w + 8.0,
                     atlas.centered_pen_y(gy - 8.0, 16.0, 10.5),
                     10.5,
                     theme.text_muted,
-                    true,
+                    false,
                     None,
                     dl,
                 );
@@ -940,8 +940,8 @@ pub fn emit_plot(
         // Paint hovered cursor badge cleanly on top
         if let Some((clamped_hy, ytxt)) = hover_badge {
             let top = clamped_hy - pill_h * 0.5;
-            let fitted_y = fit_text(atlas, &ytxt, 10.5, true, gutter_r - 8.0);
-            let (yw, _) = atlas.measure(&fitted_y, 10.5, true);
+            let fitted_y = fit_text(atlas, &ytxt, 10.5, false, gutter_r - 8.0);
+            let (yw, _) = atlas.measure(&fitted_y, 10.5, false);
             let pill_w = (yw + 10.0).min(gutter_r + 2.0);
             dl.push_quad(QuadInstance {
                 rect: [plot_x + plot_w + 4.0, top, pill_w, pill_h],
@@ -962,7 +962,7 @@ pub fn emit_plot(
                 pill_h,
                 10.5,
                 theme.text_primary,
-                true,
+                false,
                 dl,
             );
         }
@@ -974,7 +974,7 @@ pub fn emit_plot(
         let axis_h = 18.0f32;
         let mut prev_right = plot_x - 20.0;
         for (gx, lbl) in &x_grid_xs {
-            let (lw, _) = atlas.measure(lbl, 10.5, true);
+            let (lw, _) = atlas.measure(lbl, 10.5, false);
             let lx = (gx - lw * 0.5).clamp(plot_x, (plot_x + plot_w - lw).max(plot_x));
             if lx > prev_right + 14.0 {
                 atlas.layout_dl(
@@ -983,7 +983,7 @@ pub fn emit_plot(
                     atlas.centered_pen_y(axis_y, axis_h, 10.5),
                     10.5,
                     theme.text_muted,
-                    true,
+                    false,
                     None,
                     dl,
                 );
@@ -992,7 +992,7 @@ pub fn emit_plot(
         }
 
         if let (Some(sx), Some(slbl)) = (hovered_snap_x, hovered_snap_lbl) {
-            let (sw, _) = atlas.measure(&slbl, 10.5, true);
+            let (sw, _) = atlas.measure(&slbl, 10.5, false);
             let pw = sw + 12.0;
             let px = (sx - pw * 0.5).clamp(plot_x, (plot_x + plot_w - pw).max(plot_x));
             dl.push_quad(QuadInstance {
@@ -1006,7 +1006,7 @@ pub fn emit_plot(
                 clip_id: 0,
                 _pad: [0; 3],
             });
-            atlas.layout_centered(&slbl, px, axis_y, pw, axis_h, 10.5, theme.text_primary, true, dl);
+            atlas.layout_centered(&slbl, px, axis_y, pw, axis_h, 10.5, theme.text_primary, false, dl);
         }
     }
 
@@ -1029,11 +1029,11 @@ fn emit_legend_chips(
     let mut chips: Vec<(usize, String, f32, u32, bool)> = Vec::new();
     let mut total_w = 0.0f32;
     for (idx, s) in series.iter().enumerate() {
-        let name = fit_text(atlas, &s.name, 11.0, true, 120.0);
+        let name = fit_text(atlas, &s.name, 11.0, false, 120.0);
         if name.is_empty() {
             continue;
         }
-        let (nw, _) = atlas.measure(&name, 11.0, true);
+        let (nw, _) = atlas.measure(&name, 11.0, false);
         let cw = nw + 22.0;
         if total_w + cw > iw * (if right_aligned { 0.54 } else { 1.0 }) && !chips.is_empty() {
             break;
@@ -1096,7 +1096,7 @@ fn emit_legend_chips(
             22.0,
             11.0,
             if vis { theme.text_primary } else { theme.text_muted },
-            true,
+            false,
             dl,
         );
         cx += cw + 6.0;

@@ -16,11 +16,17 @@ pub mod theme;
 pub mod ui;
 
 pub use compiler::{CompileStatus, UiEngine};
+pub use components::code::{CodeData, CodeHighlight};
+pub use components::feed::{FeedData, FeedItem};
+pub use components::graph::{GraphData, GraphEdge, GraphNode};
 pub use components::plot::{
     CandlePoint, PlotData, PlotPane, PlotPoint, PlotSeries, PlotSeriesKind, PlotThreshold,
     ReadoutMode,
 };
 pub use components::stat::{StatData, StatVariant};
+pub use components::table::{
+    TableAlign, TableCell, TableColumn, TableData, TableRow, TableSortDir,
+};
 pub use draw::{
     hex_rgba, lerp_rgba8, rgba8, scale_alpha, unpack_rgba8, with_alpha, ClipRect, DrawCmd,
     DrawList, FrameUniforms, GlyphInstance, QuadInstance, RibbonInstance, StrokeInstance,

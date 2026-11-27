@@ -20,8 +20,11 @@ pub struct GlyphMetrics {
     pub quad_w_em: f32,
     /// Quad height as a multiple of `px_size`.
     pub quad_h_em: f32,
-    /// Horizontal pen advance as a multiple of `px_size`.
+    /// Horizontal pen advance as a multiple of `px_size` (strict tabular monospace grid).
     pub advance_em: f32,
+    /// Optical UI horizontal offset & advance computed dynamically from baked SDF ink bounds.
+    pub prop_offset_x_em: f32,
+    pub prop_advance_em: f32,
 }
 
 /// CPU-owned SDF texture atlas ready to upload once to an `R8Unorm` GPU texture.
@@ -89,10 +92,13 @@ impl GlyphAtlas {
                 quad_w_em: read_f32(base + 24),
                 quad_h_em: read_f32(base + 28),
                 advance_em,
+                prop_offset_x_em: read_f32(base + 16),
+                prop_advance_em: advance_em,
             });
         }
 
         let pixels = data[32 + entry_bytes..32 + entry_bytes + pixel_bytes].to_vec();
+        derive_all_optical_metrics(width, height, &pixels, &mut metrics, advance_em);
         let (cap_top_em, cap_center_em) =
             measure_cap_optics(width, height, &pixels, &metrics, ascender_em);
         Ok(Self {
@@ -155,33 +161,46 @@ impl GlyphAtlas {
         m
     }
 
-    /// Compatibility alias returning `(em_advance, mono_em_advance)`.
+    /// Horizontal advance for `ch` in `em`: fixed grid when `mono == true`, optical UI rules when `mono == false`.
     #[inline]
-    pub fn char_advance_em(&self, ch: char, _mono: bool) -> f32 {
-        self.metrics(ch).advance_em
+    pub fn char_advance_em(&self, ch: char, mono: bool) -> f32 {
+        let m = self.metrics(ch);
+        if mono {
+            m.advance_em
+        } else {
+            m.prop_advance_em
+        }
     }
 
     /// Measure single-line or multi-line (`\n`) text block in logical pixels.
-    pub fn measure(&self, text: &str, px_size: f32, _mono: bool) -> (f32, f32) {
+    pub fn measure(&self, text: &str, px_size: f32, mono: bool) -> (f32, f32) {
         let line_h = px_size * self.line_height_em;
         let mut max_w: f32 = 0.0;
         let mut cur_w: f32 = 0.0;
         let mut lines = 1usize;
+        let mut prev: Option<char> = None;
 
         for ch in text.chars() {
             if ch == '\n' {
                 max_w = max_w.max(cur_w);
                 cur_w = 0.0;
                 lines += 1;
+                prev = None;
                 continue;
             }
             if ch == '\r' {
                 continue;
             }
-            cur_w += self.metrics(ch).advance_em * px_size;
+            let kern = if mono {
+                0.0
+            } else {
+                prev.map_or(0.0, |p| pair_kern_em(p, ch))
+            };
+            cur_w += (self.char_advance_em(ch, mono) + kern) * px_size;
+            prev = Some(ch);
         }
         max_w = max_w.max(cur_w);
-        (max_w, lines as f32 * line_h)
+        (max_w.max(0.0), lines as f32 * line_h)
     }
 
     /// Emit `GlyphInstance` quads directly into a `DrawList` and record an ordered glyph batch.
@@ -213,38 +232,56 @@ impl GlyphAtlas {
         y: f32,
         px_size: f32,
         color: u32,
-        _mono: bool,
+        mono: bool,
         max_width: Option<f32>,
         out: &mut Vec<GlyphInstance>,
         clip_id: u32,
     ) {
         let line_h = px_size * self.line_height_em;
-        let mut pen_x = x;
-        let mut pen_y = y;
+        let origin_x = snap_half_px(x);
+        let mut pen_x = origin_x;
+        let mut pen_y = snap_half_px(y);
+        let mut prev: Option<char> = None;
 
         for ch in text.chars() {
             if ch == '\n' {
-                pen_x = x;
-                pen_y += line_h;
+                pen_x = origin_x;
+                pen_y = snap_half_px(pen_y + line_h);
+                prev = None;
                 continue;
             }
             if ch == '\r' {
                 continue;
             }
             let m = self.metrics(ch);
-            let adv = m.advance_em * px_size;
+            let kern = if mono {
+                0.0
+            } else {
+                prev.map_or(0.0, |p| pair_kern_em(p, ch))
+            };
+            let adv_em = if mono { m.advance_em } else { m.prop_advance_em };
+            let off_x_em = if mono {
+                m.quad_offset_x_em
+            } else {
+                m.prop_offset_x_em
+            };
+            let adv = adv_em * px_size;
+            let kpx = kern * px_size;
+
             if let Some(limit) = max_width {
-                if (pen_x - x) + adv > limit && pen_x > x {
-                    pen_x = x;
-                    pen_y += line_h;
+                if (pen_x - origin_x) + kpx + adv > limit && pen_x > origin_x {
+                    pen_x = origin_x;
+                    pen_y = snap_half_px(pen_y + line_h);
+                    prev = None;
                 }
             }
+            pen_x += if prev.is_some() { kpx } else { 0.0 };
+
             if ch != ' ' {
+                let gx = pen_x + off_x_em * px_size;
+                let gy = pen_y + m.quad_offset_y_em * px_size;
                 out.push(GlyphInstance {
-                    pos: [
-                        pen_x + m.quad_offset_x_em * px_size,
-                        pen_y + m.quad_offset_y_em * px_size,
-                    ],
+                    pos: [gx, gy],
                     size: [m.quad_w_em * px_size, m.quad_h_em * px_size],
                     uv: m.uv,
                     color,
@@ -254,6 +291,109 @@ impl GlyphAtlas {
                 });
             }
             pen_x += adv;
+            prev = Some(ch);
+        }
+    }
+}
+
+#[inline]
+fn snap_half_px(v: f32) -> f32 {
+    (v * 2.0).round() * 0.5
+}
+
+/// Mild class-based optical pair kerning rules (digits never kern to preserve tabular columns).
+#[inline]
+fn pair_kern_em(prev: char, cur: char) -> f32 {
+    if prev.is_ascii_digit() && cur.is_ascii_digit() {
+        return 0.0;
+    }
+    let tight_after_overhang = matches!(prev, 'T' | 'V' | 'W' | 'Y' | 'P' | 'F');
+    if tight_after_overhang && matches!(cur, '.' | ',' | ':' | ';') {
+        return -0.018;
+    }
+    if matches!(prev, 'T' | 'V' | 'W' | 'Y')
+        && matches!(cur, 'a' | 'e' | 'o' | 'u')
+    {
+        return -0.014;
+    }
+    0.0
+}
+
+/// Inspect every glyph cell's actual SDF ink pixels once at atlas load to derive balanced
+/// optical UI spacing & centered punctuation bounds without hardcoded per-font tables.
+fn derive_all_optical_metrics(
+    atlas_w: u32,
+    atlas_h: u32,
+    pixels: &[u8],
+    metrics: &mut [GlyphMetrics],
+    base_advance_em: f32,
+) {
+    for (idx, m) in metrics.iter_mut().enumerate() {
+        let code = 0x20 + idx as u32;
+        let ch = char::from_u32(code).unwrap_or(' ');
+        if ch == ' ' {
+            m.prop_advance_em = 0.38;
+            m.prop_offset_x_em = m.quad_offset_x_em;
+            continue;
+        }
+        if ch.is_ascii_digit() {
+            // Digits stay uniformly tabular (`0.55em`) so numbers align cleanly with clear gap.
+            let tab_adv = (base_advance_em * 0.92).clamp(0.52, 0.58);
+            m.prop_advance_em = tab_adv;
+            m.prop_offset_x_em = m.quad_offset_x_em + (tab_adv - base_advance_em) * 0.5;
+            continue;
+        }
+
+        let x0 = (m.uv[0] * atlas_w as f32).round() as u32;
+        let y0 = (m.uv[1] * atlas_h as f32).round() as u32;
+        let x1 = (m.uv[2] * atlas_w as f32).round().min(atlas_w as f32) as u32;
+        let y1 = (m.uv[3] * atlas_h as f32).round().min(atlas_h as f32) as u32;
+        let cell_w = x1.saturating_sub(x0).max(1) as f32;
+
+        let mut min_col = u32::MAX;
+        let mut max_col = 0u32;
+        for py in y0..y1 {
+            for px in x0..x1 {
+                if pixels[(py * atlas_w + px) as usize] >= 128 {
+                    let rel = px - x0;
+                    min_col = min_col.min(rel);
+                    max_col = max_col.max(rel);
+                }
+            }
+        }
+
+        if min_col > max_col {
+            m.prop_advance_em = base_advance_em * 0.72;
+            m.prop_offset_x_em = m.quad_offset_x_em;
+            continue;
+        }
+
+        let lsb_em = m.quad_offset_x_em + (min_col as f32 / cell_w) * m.quad_w_em;
+        let ink_w_em = ((max_col - min_col + 1) as f32 / cell_w) * m.quad_w_em;
+
+        if matches!(ch, '.' | ',' | ':' | ';' | '!' | '\'' | '"' | '|') {
+            let prop_adv = (ink_w_em + 0.16).clamp(0.28, 0.44);
+            let target_lsb = (prop_adv - ink_w_em) * 0.5;
+            m.prop_advance_em = prop_adv;
+            m.prop_offset_x_em = m.quad_offset_x_em + target_lsb - lsb_em;
+        } else if matches!(ch, '(' | ')' | '[' | ']' | '{' | '}' | '/' | '\\' | '-' | '_') {
+            let prop_adv = (ink_w_em + 0.15).clamp(0.36, 0.56);
+            let target_lsb = (prop_adv - ink_w_em) * 0.5;
+            m.prop_advance_em = prop_adv;
+            m.prop_offset_x_em = m.quad_offset_x_em + target_lsb - lsb_em;
+        } else if matches!(ch, 'i' | 'j' | 'l' | 'r' | 't' | 'f' | 'I') {
+            let side = 0.056;
+            let prop_adv = (ink_w_em + side * 2.0).clamp(0.42, base_advance_em);
+            let target_lsb = (prop_adv - ink_w_em) * 0.5;
+            m.prop_advance_em = prop_adv;
+            m.prop_offset_x_em = m.quad_offset_x_em + target_lsb - lsb_em;
+        } else {
+            // Clear ~0.068em breathing room on each side (~1.6px inter-glyph gap at 12px)
+            let side = 0.068;
+            let prop_adv = (ink_w_em + side * 2.0).clamp(0.46, base_advance_em * 1.04);
+            let target_lsb = (prop_adv - ink_w_em) * 0.5;
+            m.prop_advance_em = prop_adv;
+            m.prop_offset_x_em = m.quad_offset_x_em + target_lsb - lsb_em;
         }
     }
 }
@@ -339,5 +479,16 @@ mod tests {
             0,
         );
         assert_eq!(instances.len(), 10);
+
+        // Optical rules (mono = false): tighter punctuation/word spacing while digits stay tabular
+        let (w_opt, _) = atlas.measure("23:50:12", 12.0, false);
+        let (w_mono, _) = atlas.measure("23:50:12", 12.0, true);
+        assert!(
+            w_opt < w_mono,
+            "optical punctuation spacing must be tighter than monospace grid: {w_opt} vs {w_mono}"
+        );
+        let d0 = atlas.char_advance_em('0', false);
+        let d1 = atlas.char_advance_em('1', false);
+        assert!((d0 - d1).abs() < 1e-5, "digits must remain uniform tabular width");
     }
 }

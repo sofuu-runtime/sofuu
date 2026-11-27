@@ -6,8 +6,12 @@
 
 use std::collections::HashMap;
 
+use crate::components::code::measure_code;
+use crate::components::feed::measure_feed;
+use crate::components::graph::measure_graph;
 use crate::components::plot::measure_plot;
 use crate::components::stat::measure_stat;
+use crate::components::table::measure_table;
 use crate::ir::{Align, Axis, Node, NodeKind, SizeSpec};
 use crate::text::GlyphAtlas;
 
@@ -123,17 +127,34 @@ impl LayoutMap {
             NodeKind::Segmented { options, .. } => {
                 let mut total = 8.0f32;
                 for o in options {
-                    let (ow, _) = atlas.measure(o, 12.0, true);
+                    let (ow, _) = atlas.measure(o, 12.0, false);
                     total += ow + 20.0;
                 }
                 (total.max(80.0), 34.0)
             }
             NodeKind::Button { label, .. } => {
-                let (lw, _) = atlas.measure(label, 12.5, true);
+                let (lw, _) = atlas.measure(label, 12.5, false);
                 (lw + 24.0, 34.0)
+            }
+            NodeKind::Switch { label, .. } => {
+                let lw = label
+                    .as_deref()
+                    .filter(|l| !l.is_empty())
+                    .map(|l| atlas.measure(l, 12.0, false).0 + 10.0)
+                    .unwrap_or(0.0);
+                ((42.0 + lw).min(inner_avail_w.max(42.0)), 28.0)
+            }
+            NodeKind::Input { value, placeholder, .. } => {
+                let txt = if value.is_empty() { placeholder } else { value };
+                let (tw, _) = atlas.measure(txt, 12.5, false);
+                ((tw + 28.0).clamp(160.0, 260.0), 34.0)
             }
             NodeKind::Stat(data) => measure_stat(data, inner_avail_w),
             NodeKind::Plot(data) => measure_plot(data, inner_avail_w),
+            NodeKind::Table(data) => measure_table(data, inner_avail_w),
+            NodeKind::Feed(data) => measure_feed(data, inner_avail_w),
+            NodeKind::Graph(data) => measure_graph(data, inner_avail_w),
+            NodeKind::CodeText(data) => measure_code(data, inner_avail_w),
             NodeKind::Surface { child, .. } => {
                 if let Some(c) = child {
                     self.measure_intrinsic(c, inner_avail_w, atlas)
@@ -322,8 +343,14 @@ impl LayoutMap {
             | NodeKind::ThemeToggle { .. }
             | NodeKind::Segmented { .. }
             | NodeKind::Button { .. }
+            | NodeKind::Switch { .. }
+            | NodeKind::Input { .. }
             | NodeKind::Stat(_)
-            | NodeKind::Plot(_) => {
+            | NodeKind::Plot(_)
+            | NodeKind::Table(_)
+            | NodeKind::Feed(_)
+            | NodeKind::Graph(_)
+            | NodeKind::CodeText(_) => {
                 let (_, mh) = self.measure_intrinsic(node, w, atlas);
                 content_h = mh;
             }

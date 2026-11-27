@@ -4,11 +4,15 @@
 //! multi-pane dashboards in a few lines with zero layout boilerplate. Defaults to `ThemeMode::Light`
 //! unless `.dark()` is explicitly selected, and auto-adapts sizing when few or solo components exist.
 
+use crate::components::code::{CodeData, CodeHighlight};
+use crate::components::feed::{FeedData, FeedItem};
+use crate::components::graph::{GraphData, GraphEdge, GraphNode};
 use crate::components::plot::{
     CandlePoint, PlotData, PlotPane, PlotPoint, PlotSeries, PlotSeriesKind, PlotThreshold,
     ReadoutMode,
 };
 use crate::components::stat::{StatData, StatVariant};
+use crate::components::table::{TableCell, TableColumn, TableData, TableRow};
 use crate::ir::{Align, Axis, Insets, Node, NodeKind, Scene, SizeSpec};
 use crate::theme::{ThemeMode, Tone};
 
@@ -127,13 +131,20 @@ impl AppBuilder {
             root_items.push(grid);
         }
 
-        let solo_stat_child =
-            root_items.is_empty() && self.children.len() == 1 && matches!(self.children[0].kind, NodeKind::Stat(_));
+        let solo_content_child = self.children.len() == 1
+            && matches!(
+                self.children[0].kind,
+                NodeKind::Stat(_)
+                    | NodeKind::Table(_)
+                    | NodeKind::Feed(_)
+                    | NodeKind::Graph(_)
+                    | NodeKind::CodeText(_)
+            );
 
         for mut c in self.children {
             if matches!(c.kind, NodeKind::Plot(_)) && c.height == SizeSpec::Auto {
                 c.height = SizeSpec::Fill(1.0);
-            } else if solo_stat_child && c.height == SizeSpec::Auto {
+            } else if solo_content_child && c.height == SizeSpec::Auto {
                 c.height = SizeSpec::Fill(1.0);
             }
             root_items.push(c);
@@ -236,7 +247,7 @@ impl From<TextBuilder> for Node {
                 content: b.content,
                 size: b.size,
                 color: b.color,
-                mono: true,
+                mono: false,
                 wrap: b.wrap,
             },
         );
@@ -254,6 +265,7 @@ pub fn row(id: impl Into<String>) -> ContainerBuilder {
         align: Align::Center,
         gap: 10.0,
         fold_width: Some(680.0),
+        fill_h: false,
         children: Vec::new(),
     }
 }
@@ -265,6 +277,7 @@ pub fn col(id: impl Into<String>) -> ContainerBuilder {
         align: Align::Stretch,
         gap: 12.0,
         fold_width: None,
+        fill_h: false,
         children: Vec::new(),
     }
 }
@@ -275,6 +288,7 @@ pub struct ContainerBuilder {
     align: Align,
     gap: f32,
     fold_width: Option<f32>,
+    fill_h: bool,
     children: Vec<Node>,
 }
 
@@ -294,6 +308,12 @@ impl ContainerBuilder {
         self
     }
 
+    pub fn fill(mut self) -> Self {
+        self.fill_h = true;
+        self.align = Align::Stretch;
+        self
+    }
+
     pub fn add(mut self, child: impl Into<Node>) -> Self {
         self.children.push(child.into());
         self
@@ -302,7 +322,7 @@ impl ContainerBuilder {
 
 impl From<ContainerBuilder> for Node {
     fn from(b: ContainerBuilder) -> Self {
-        Node::new(
+        let mut n = Node::new(
             b.id,
             NodeKind::Container {
                 axis: b.axis,
@@ -313,7 +333,11 @@ impl From<ContainerBuilder> for Node {
                 style: None,
                 children: b.children,
             },
-        )
+        );
+        if b.fill_h {
+            n.height = SizeSpec::Fill(1.0);
+        }
+        n
     }
 }
 
@@ -343,6 +367,30 @@ pub fn button(id: impl Into<String>, label: impl Into<String>) -> Node {
 
 pub fn theme_toggle(id: impl Into<String>) -> Node {
     Node::new(id, NodeKind::ThemeToggle { size: 34.0 })
+}
+
+pub fn switch(id: impl Into<String>, checked: bool, label: Option<&str>) -> Node {
+    Node::new(
+        id,
+        NodeKind::Switch {
+            checked,
+            label: label.map(ToString::to_string),
+            tone: Tone::Neutral,
+        },
+    )
+}
+
+pub fn input(id: impl Into<String>, placeholder: impl Into<String>) -> Node {
+    let mut n = Node::new(
+        id,
+        NodeKind::Input {
+            value: String::new(),
+            placeholder: placeholder.into(),
+            tone: Tone::Neutral,
+        },
+    );
+    n.height = SizeSpec::Px(34.0);
+    n
 }
 
 // ── Fluent Stat Builder ────────────────────────────────────────────────────────────────────────
@@ -716,6 +764,241 @@ impl PaneBuilder {
 impl From<PaneBuilder> for PlotPane {
     fn from(b: PaneBuilder) -> Self {
         b.pane
+    }
+}
+
+// ── Fluent Table Builder ───────────────────────────────────────────────────────────────────────
+
+pub fn table(id: impl Into<String>) -> TableBuilder {
+    TableBuilder {
+        id: id.into(),
+        data: TableData::default(),
+        fill_both: false,
+    }
+}
+
+pub struct TableBuilder {
+    id: String,
+    data: TableData,
+    fill_both: bool,
+}
+
+impl TableBuilder {
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.data.title = Some(title.into());
+        self
+    }
+
+    pub fn col(mut self, col: TableColumn) -> Self {
+        self.data.columns.push(col);
+        self
+    }
+
+    pub fn columns(mut self, cols: impl IntoIterator<Item = TableColumn>) -> Self {
+        self.data.columns.extend(cols);
+        self
+    }
+
+    pub fn row(
+        mut self,
+        id: impl Into<String>,
+        cells: impl IntoIterator<Item = TableCell>,
+    ) -> Self {
+        self.data
+            .rows
+            .push(TableRow::new(id, cells.into_iter().collect()));
+        self
+    }
+
+    pub fn rows(mut self, rows: impl IntoIterator<Item = TableRow>) -> Self {
+        self.data.rows.extend(rows);
+        self
+    }
+
+    pub fn empty_text(mut self, msg: impl Into<String>) -> Self {
+        self.data.empty_text = Some(msg.into());
+        self
+    }
+
+    pub fn fill(mut self) -> Self {
+        self.fill_both = true;
+        self
+    }
+}
+
+impl From<TableBuilder> for Node {
+    fn from(b: TableBuilder) -> Self {
+        let mut n = Node::new(b.id, NodeKind::Table(b.data));
+        if b.fill_both {
+            n.width = SizeSpec::Fill(1.0);
+            n.height = SizeSpec::Fill(1.0);
+        }
+        n
+    }
+}
+
+// ── Fluent Feed Builder ────────────────────────────────────────────────────────────────────────
+
+pub fn feed(id: impl Into<String>) -> FeedBuilder {
+    FeedBuilder {
+        id: id.into(),
+        data: FeedData::default(),
+        fill_both: false,
+    }
+}
+
+pub struct FeedBuilder {
+    id: String,
+    data: FeedData,
+    fill_both: bool,
+}
+
+impl FeedBuilder {
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.data.title = Some(title.into());
+        self
+    }
+
+    pub fn item(mut self, item: FeedItem) -> Self {
+        self.data.items.push(item);
+        self
+    }
+
+    pub fn items(mut self, items: impl IntoIterator<Item = FeedItem>) -> Self {
+        self.data.items.extend(items);
+        self
+    }
+
+    pub fn max_items(mut self, cap: usize) -> Self {
+        self.data.max_items = cap.max(1);
+        self
+    }
+
+    pub fn empty_text(mut self, msg: impl Into<String>) -> Self {
+        self.data.empty_text = Some(msg.into());
+        self
+    }
+
+    pub fn fill(mut self) -> Self {
+        self.fill_both = true;
+        self
+    }
+}
+
+impl From<FeedBuilder> for Node {
+    fn from(b: FeedBuilder) -> Self {
+        let mut n = Node::new(b.id, NodeKind::Feed(b.data));
+        if b.fill_both {
+            n.width = SizeSpec::Fill(1.0);
+            n.height = SizeSpec::Fill(1.0);
+        }
+        n
+    }
+}
+
+// ── Fluent Graph Builder ───────────────────────────────────────────────────────────────────────
+
+pub fn graph(id: impl Into<String>) -> GraphBuilder {
+    GraphBuilder {
+        id: id.into(),
+        data: GraphData::default(),
+        fill_both: false,
+    }
+}
+
+pub struct GraphBuilder {
+    id: String,
+    data: GraphData,
+    fill_both: bool,
+}
+
+impl GraphBuilder {
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.data.title = Some(title.into());
+        self
+    }
+
+    pub fn node(mut self, node: GraphNode) -> Self {
+        self.data.nodes.push(node);
+        self
+    }
+
+    pub fn edge(mut self, edge: GraphEdge) -> Self {
+        self.data.edges.push(edge);
+        self
+    }
+
+    pub fn fill(mut self) -> Self {
+        self.fill_both = true;
+        self
+    }
+}
+
+impl From<GraphBuilder> for Node {
+    fn from(b: GraphBuilder) -> Self {
+        let mut n = Node::new(b.id, NodeKind::Graph(b.data));
+        if b.fill_both {
+            n.width = SizeSpec::Fill(1.0);
+            n.height = SizeSpec::Fill(1.0);
+        }
+        n
+    }
+}
+
+// ── Fluent CodeText Builder ────────────────────────────────────────────────────────────────────
+
+pub fn code(id: impl Into<String>, content: impl Into<String>) -> CodeBuilder {
+    CodeBuilder {
+        id: id.into(),
+        data: CodeData {
+            content: content.into(),
+            ..CodeData::default()
+        },
+        fill_both: false,
+    }
+}
+
+pub struct CodeBuilder {
+    id: String,
+    data: CodeData,
+    fill_both: bool,
+}
+
+impl CodeBuilder {
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.data.title = Some(title.into());
+        self
+    }
+
+    pub fn language(mut self, lang: impl Into<String>) -> Self {
+        self.data.language = Some(lang.into());
+        self
+    }
+
+    pub fn line_numbers(mut self, show: bool) -> Self {
+        self.data.show_line_numbers = show;
+        self
+    }
+
+    pub fn highlight(mut self, line: usize, tone: Tone) -> Self {
+        self.data.highlights.push(CodeHighlight { line, tone });
+        self
+    }
+
+    pub fn fill(mut self) -> Self {
+        self.fill_both = true;
+        self
+    }
+}
+
+impl From<CodeBuilder> for Node {
+    fn from(b: CodeBuilder) -> Self {
+        let mut n = Node::new(b.id, NodeKind::CodeText(b.data));
+        if b.fill_both {
+            n.width = SizeSpec::Fill(1.0);
+            n.height = SizeSpec::Fill(1.0);
+        }
+        n
     }
 }
 

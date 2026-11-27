@@ -2410,11 +2410,15 @@
         res = await s.spec.onToolCall.call(s.spec, evt);
       } catch (e) {
         /* The ONLY intentional block path: typed, and it names the service
-         * so a blocked tool_result is diagnosable in the run log. */
+         * so a blocked tool_result is diagnosable in the run log. A service
+         * that already carries a structured code (lease conflict, schema
+         * veto, ...) keeps it: rewriting every block to E_DENIED erased the
+         * one field a caller needs to react correctly. */
         throw makeError(
-          'E_DENIED',
+          (e && typeof e.code === 'string' && e.code) ? e.code : 'E_DENIED',
           'Blocked by service "' + s.name + '": ' + String((e && e.message) || e),
-          { service: s.name, tool: evt.tool, turnId: evt.turnId }
+          { service: s.name, tool: evt.tool, turnId: evt.turnId,
+            cause: (e && e.details) ? e.details : undefined }
         );
       }
       mergeServiceResult(evt, res, false);

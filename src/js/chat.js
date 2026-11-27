@@ -941,6 +941,21 @@
     p.resolve(!!allow);
     return { ok: true };
   }
+  /* Hosts that reconnect mid-approval need the pending rows, not just the
+   * count state() reports. Arguments are copied so a host cannot mutate the
+   * live gate. */
+  function pendingApprovals() {
+    var out = [];
+    for (var id in S.pendingApprovals) {
+      var p = S.pendingApprovals[id];
+      if (!p) continue;
+      var args = {};
+      try { args = JSON.parse(JSON.stringify(p.args || {})); }
+      catch (eA) { args = {}; }
+      out.push({ id: String(id), tool: String(p.tool || 'tool'), args: args, risky: true });
+    }
+    return out;
+  }
 
   function compactParamSchema(schema) {
     if (!schema || typeof schema !== 'object') return { type: 'object', properties: {} };
@@ -2632,6 +2647,10 @@
       streaming: S.streaming,
       historyTurns: Math.floor(S.history.length / 2),
       contextTokens: S.totalTk,
+      /* The window that `contextTokens` is a fraction of. Hosts use it to
+       * seed the meter after a reconnect, when the ring's ctx event is
+       * already behind the client's cursor. */
+      contextWindow: ctxWindow(),
       sessionTokens: S.totalTk,
       sessionSpendUsd: S.sessionSpendUsd || 0,
       permissions: S.permissions,
@@ -2870,6 +2889,7 @@
     clear: clearHistory,
     resume: resume,
     resolveApproval: resolveApproval,
+    pendingApprovals: pendingApprovals,
     state: state,
     sessions: sessions,
     usage: usage,

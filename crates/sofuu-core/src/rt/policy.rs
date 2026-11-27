@@ -168,6 +168,36 @@ const POLICY_SCHEMA: &[(&str, Ty)] = &[
         ]),
     ),
     ("memory", Ty::Section(&[("write", Ty::OneOf(&["on", "off"]))])),
+    /* PLAN-MULTI-AGENT-COLLAB-PLUGIN §5: coordination knobs read by the
+     * `collab` service. The section is optional; when absent the plugin's
+     * own defaults apply. Every key is coordination-policy only — no
+     * project/domain vocabulary belongs here. */
+    (
+        "collab",
+        Ty::Section(&[
+            ("enabled", Ty::Bool),
+            (
+                "enforcement",
+                Ty::OneOf(&["strict_lease", "auto_claim", "advisory", "off"]),
+            ),
+            ("max_lease_ttl_ms", Ty::Num),
+            ("maxLeaseTtlMs", Ty::Num),
+            ("default_lease_ttl_ms", Ty::Num),
+            ("defaultLeaseTtlMs", Ty::Num),
+            ("auto_claim_ttl_ms", Ty::Num),
+            ("autoClaimTtlMs", Ty::Num),
+            ("inject_max_bytes", Ty::Num),
+            ("injectMaxBytes", Ty::Num),
+            ("inject_sub_agents", Ty::Bool),
+            ("injectSubAgents", Ty::Bool),
+            ("board_max_bytes", Ty::Num),
+            ("boardMaxBytes", Ty::Num),
+            ("auto_publish", Ty::Bool),
+            ("autoPublish", Ty::Bool),
+            ("allow_worktrees", Ty::Bool),
+            ("allowWorktrees", Ty::Bool),
+        ]),
+    ),
     /* PLAN-GENERALIZED-CHANNELS §3.2: the messaging surface. `allow` is the
      * transport allowlist checked before any adapter runs; `inbound` carries
      * the fail-closed sender/loopback/rate rules enforced by channels.js. */
@@ -2353,6 +2383,62 @@ mod tests {
         assert!(validate_policy(&serde_json::json!({"approval":{"mode":"sometimes"}})).is_err());
         /* A non-object policy. */
         assert!(validate_policy(&serde_json::json!(["off"])).is_err());
+    }
+
+    /* ── PLAN-MULTI-AGENT-COLLAB-PLUGIN §5: the `collab` section ──── */
+
+    #[test]
+    fn collab_section_accepts_the_documented_shapes() {
+        /* Snake_case is the canonical spelling. */
+        assert!(validate_policy(&serde_json::json!({
+            "collab": {
+                "enabled": true,
+                "enforcement": "auto_claim",
+                "max_lease_ttl_ms": 300000,
+                "default_lease_ttl_ms": 120000,
+                "auto_claim_ttl_ms": 30000,
+                "inject_max_bytes": 4000,
+                "inject_sub_agents": true,
+                "board_max_bytes": 2097152,
+                "auto_publish": true,
+                "allow_worktrees": false,
+            }
+        }))
+        .is_ok());
+        /* camelCase aliases are accepted for the same knobs, matching the
+         * other sections that expose both spellings. */
+        assert!(validate_policy(&serde_json::json!({
+            "collab": {
+                "enforcement": "strict_lease",
+                "maxLeaseTtlMs": 60000,
+                "defaultLeaseTtlMs": 60000,
+                "autoClaimTtlMs": 15000,
+                "injectMaxBytes": 0,
+                "injectSubAgents": false,
+                "boardMaxBytes": 4096,
+                "autoPublish": false,
+                "allowWorktrees": true,
+            }
+        }))
+        .is_ok());
+        /* Every enforcement mode the plugin implements. */
+        for mode in ["strict_lease", "auto_claim", "advisory", "off"] {
+            assert!(
+                validate_policy(&serde_json::json!({"collab":{"enforcement":mode}})).is_ok(),
+                "{mode} must be accepted"
+            );
+        }
+        /* A typo would silently fall back to auto_claim, so refuse it at set
+         * time instead of guessing the operator's intent. */
+        let e = validate_policy(&serde_json::json!({"collab":{"enforcement":"strict"}}))
+            .expect_err("unknown enforcement must be refused");
+        assert!(e.contains("collab.enforcement"), "{e}");
+        let e = validate_policy(&serde_json::json!({"collab":{"enforce":true}}))
+            .expect_err("an unknown collab key must be refused");
+        assert!(e.contains("collab.enforce"), "{e}");
+        let e = validate_policy(&serde_json::json!({"collab":{"max_lease_ttl_ms":"5m"}}))
+            .expect_err("a string TTL must be refused");
+        assert!(e.contains("collab.max_lease_ttl_ms"), "{e}");
     }
 
     /* ── PLAN-DRONES-MAVLINK §4.3: the `hardware` section ─────────── */

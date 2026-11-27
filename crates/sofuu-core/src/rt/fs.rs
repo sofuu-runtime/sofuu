@@ -1131,6 +1131,44 @@ unsafe extern "C" fn js_mkdir_sync(
     qjs::sofuu_js_undefined()
 }
 
+/// Atomic replace primitive. `std::fs::rename` is atomic on POSIX when both
+/// paths live on the same filesystem, which is the one property a caller
+/// needs to swap a fully-written temp file into place. Both ends are jailed
+/// as writes, so a rename can never move data out of (or into) the native
+/// root. Kept generic on purpose: no caller-specific semantics live here.
+unsafe extern "C" fn js_rename_sync(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 2 {
+        return qjs::JS_ThrowTypeError(ctx, c"renameSync: from and to required".as_ptr());
+    }
+    let from = match fs_path_arg(ctx, *argv, "renameSync", crate::rt::policy::FsKind::Write) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let to = match fs_path_arg(
+        ctx,
+        *argv.add(1),
+        "renameSync",
+        crate::rt::policy::FsKind::Write,
+    ) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    if std::fs::rename(
+        from.to_string_lossy().as_ref(),
+        to.to_string_lossy().as_ref(),
+    )
+    .is_err()
+    {
+        return qjs::JS_ThrowInternalError(ctx, c"renameSync failed".as_ptr());
+    }
+    qjs::sofuu_js_undefined()
+}
+
 unsafe extern "C" fn js_unlink_sync(
     ctx: *mut JSContext,
     _this: JSValueConst,
@@ -1326,6 +1364,12 @@ pub unsafe extern "C" fn mod_fs_register(ctx: *mut JSContext) {
         fs,
         c"statSync".as_ptr(),
         qjs::sofuu_js_new_cfunction(ctx, js_stat_sync, c"statSync".as_ptr(), 1),
+    );
+    qjs::sofuu_js_set_property_str(
+        ctx,
+        fs,
+        c"renameSync".as_ptr(),
+        qjs::sofuu_js_new_cfunction(ctx, js_rename_sync, c"renameSync".as_ptr(), 2),
     );
 
     qjs::sofuu_js_set_property_str(ctx, sofuu_obj, c"fs".as_ptr(), fs);

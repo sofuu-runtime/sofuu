@@ -31,6 +31,9 @@ use std::sync::Mutex;
 use serde_json::Value as JsonValue;
 use sofuu_ffi::qjs;
 
+#[cfg(feature = "ui")]
+pub mod ui;
+
 // ── Opaque handle ─────────────────────────────────────────────────
 
 /// The host's runtime handle. Created by sofuu_rt_new, freed by sofuu_rt_free.
@@ -640,6 +643,14 @@ unsafe fn sofuu_rt_free_impl(rt: *mut CapiRuntime) {
         // E2: drop host tools with the runtime — the host's opaque pointers
         // must never be called after it freed the runtime that owned them.
         HOST_TOOLS.with(|m| m.borrow_mut().clear());
+        // PLAN-EMBEDDED-NATIVE-HOST-C-ABI §5.2: clear the per-context UI
+        // attachment BEFORE the QuickJS context dies. The session itself stays
+        // alive (the host owns it); only the JS bridge is tombstoned.
+        #[cfg(feature = "ui")]
+        {
+            let ctx = (*rt).ffi_rt.engine_ctx() as *mut qjs::JSContext;
+            crate::ui::detach_ctx_for_runtime_free(ctx);
+        }
         drop(Box::from_raw(rt));
     }
 }
@@ -660,7 +671,10 @@ pub unsafe extern "C" fn sofuu_free(ptr: *mut c_void) {
 /// `args_json` is either a JSON object (passed as a single options arg) or
 /// a JSON array (spread as positional args); NULL/"" means no arguments.
 ///
-/// Blocks until the feature's promise settles (the event loop is drained).
+/// Blocks until the feature's promise settles. With no UI session attached
+/// that means draining libuv until idle; an attached session keeps a 16 ms
+/// `sofuu.ui` pump alive, so the call runs one libuv round at a time and
+/// returns as soon as its envelope lands.
 /// On return, *out_json (when non-NULL) is a malloc'd JSON envelope the
 /// host frees with sofuu_free(). Returns SOFUU_OK or a SOFUU_ERR_*.
 #[no_mangle]
@@ -802,7 +816,9 @@ unsafe fn sofuu_rt_call_impl(
 /// Evaluate arbitrary JS (the eval escape hatch). The source is evaluated
 /// as a global script. For async work, the result is the Promise object
 /// itself — use sofuu_rt_call for features that return promises.
-/// The event loop is drained after evaluation.
+/// The event loop is drained after evaluation, except when a UI session is
+/// attached: a mounted `sofuu.ui` view keeps a 16 ms pump alive, so that
+/// case performs ONE non-blocking tick (the sofuu_rt_eval_nb contract).
 /// Returns SOFUU_OK or a SOFUU_ERR_*.
 #[no_mangle]
 #[no_mangle]
@@ -894,8 +910,15 @@ unsafe fn sofuu_rt_eval_impl(
         return -4; // SOFUU_ERR_JS_EXCEPTION
     }
 
-    // Drain microtasks + event loop.
-    drain_loop(ctx);
+    // Drain microtasks + event loop. An attached embedded UI session keeps a
+    // 16 ms JS event pump alive, so the until-idle drain used by one-shot
+    // hosts would never return. A single non-blocking tick (same contract as
+    // sofuu_rt_eval_nb) lets the host drive the pump on its own loop.
+    if runtime_has_ui(ctx) {
+        sofuu_core::rt::event_loop::sofuu_loop_tick_nb(ctx);
+    } else {
+        drain_loop(ctx);
+    }
 
     // The result is the envelope object {ok:true, result:...} or
     // {ok:false, error:{...}}. JSON.stringify it and return.
@@ -1818,7 +1841,14 @@ unsafe fn rt_call_and_capture(
     qjs::sofuu_js_free_value(ctx, result);
 
     // Drain the event loop (libuv + JS microtasks) until the promise settles.
-    drain_loop(ctx);
+    // An attached embedded UI session runs `src/js/ui.js`'s 16 ms event pump,
+    // so `drain_loop`'s until-idle contract never completes; wait on the
+    // funnel's `__capi_r` envelope instead.
+    if runtime_has_ui(ctx) {
+        drain_call_result(ctx);
+    } else {
+        drain_loop(ctx);
+    }
 
     // Read __capi_r — the envelope set by the .then/.catch handler.
     let read_expr = c"JSON.stringify(__capi_r)";
@@ -1889,6 +1919,66 @@ unsafe fn drain_loop(ctx: *mut qjs::JSContext) {
     // the linker includes sofuu-core, which provides the no_mangle
     // engine symbols (sofuu_init, sofuu_destroy, sofuu_engine_ctx, etc.).
     sofuu_core::rt::event_loop::sofuu_loop_run(ctx);
+}
+
+/// Whether this context drives an embedded UI session. Always false in the
+/// headless build, where the whole `ui` module is compiled out.
+unsafe fn runtime_has_ui(ctx: *mut qjs::JSContext) -> bool {
+    #[cfg(feature = "ui")]
+    {
+        crate::ui::runtime_is_attached(ctx)
+    }
+    #[cfg(not(feature = "ui"))]
+    {
+        let _ = ctx;
+        false
+    }
+}
+
+/// True once the funnel wrapper in `rt_call_and_capture` has stored its
+/// completed `{ok, ...}` (or `{ok:false, ...}`) envelope in `__capi_r`.
+unsafe fn call_result_ready(ctx: *mut qjs::JSContext) -> bool {
+    let probe = c"(__capi_r !== null && __capi_r !== undefined)";
+    let value = qjs::JS_Eval(
+        ctx,
+        probe.as_ptr(),
+        probe.to_bytes().len(),
+        c"<capi-wait>".as_ptr(),
+        qjs::JS_EVAL_TYPE_GLOBAL,
+    );
+    if qjs::is_exception(value) {
+        let exc = qjs::JS_GetException(ctx);
+        qjs::sofuu_js_free_value(ctx, exc);
+        qjs::sofuu_js_free_value(ctx, value);
+        return false;
+    }
+    let ready = qjs::JS_ToBool(ctx, value) != 0;
+    qjs::sofuu_js_free_value(ctx, value);
+    ready
+}
+
+/// Drain until the funnel promise stores `__capi_r`, even when a mounted UI
+/// view's 16 ms pump keeps libuv permanently alive.
+///
+/// Each round is `UV_RUN_ONCE`, so the pump still runs while a blocked call
+/// (an `agent.run` parked on HITL approval) waits — the host's click reaches
+/// JS and resolves the promise. If the loop dies before the envelope lands,
+/// stop rather than spinning on an empty loop; the reader then reports the
+/// same "internal" failure it would have produced for an unsettled call.
+unsafe fn drain_call_result(ctx: *mut qjs::JSContext) {
+    loop {
+        // Always run a round first: an awaited sync method has a pending
+        // microtask but no live handles, and only the flush can set
+        // `__capi_r`. UV_RUN_ONCE is a no-op (returns immediately) on an
+        // empty loop.
+        sofuu_core::rt::event_loop::sofuu_loop_round_blocking(ctx);
+        if call_result_ready(ctx) {
+            break;
+        }
+        if !sofuu_core::rt::event_loop::sofuu_loop_alive() {
+            break;
+        }
+    }
 }
 
 // ── Vector embedding ABI (PLAN-MULTIMODAL-EMBEDDINGS H-E1) ──────
@@ -4666,6 +4756,156 @@ mod tests {
         let envelope: JsonValue = serde_json::from_str(&json)
             .unwrap_or_else(|e| panic!("eval result is not JSON ({e}): {json}"));
         envelope.get("result").cloned().unwrap_or(JsonValue::Null)
+    }
+
+    /// Non-blocking variant of [`eval_json`] for UI tests.
+    ///
+    /// `src/js/ui.js`'s `view.mount()` starts a 16 ms `setInterval` event pump,
+    /// so the blocking `sofuu_rt_eval` (which drains until libuv is idle) can
+    /// never return once a scene is mounted. Embedded hosts evaluate sync
+    /// snippets with `sofuu_rt_eval_nb`; this helper mirrors that contract.
+    #[cfg(feature = "ui")]
+    fn eval_json_nb(rt: *mut CapiRuntime, src: &str) -> JsonValue {
+        let s = CString::new(src).unwrap();
+        let mut out: *mut c_char = ptr::null_mut();
+        let rc = unsafe { sofuu_rt_eval_nb(rt, s.as_ptr(), &mut out) };
+        assert_eq!(rc, 0, "non-blocking eval should succeed");
+        let json = unsafe { CStr::from_ptr(out) }.to_string_lossy().into_owned();
+        unsafe { sofuu_free(out as *mut c_void) };
+        let envelope: JsonValue = serde_json::from_str(&json)
+            .unwrap_or_else(|e| panic!("eval result is not JSON ({e}): {json}"));
+        envelope.get("result").cloned().unwrap_or(JsonValue::Null)
+    }
+
+    /// PLAN-EMBEDDED-NATIVE-HOST-C-ABI §6: attaching a session must replace
+    /// the loader-backed `__sofuu_ui_*` globals with the embedded bridge, and
+    /// freeing the session first must tombstone them (never dereference freed
+    /// memory).
+    #[cfg(feature = "ui")]
+    #[test]
+    fn ui_attach_binds_js_globals_and_survives_session_first_free() {
+        use crate::ui::{
+            sofuu_ui_attach_runtime, sofuu_ui_detach_runtime, sofuu_ui_poll_draw_list,
+            sofuu_ui_session_free, sofuu_ui_session_new, SofuuUiDrawList,
+        };
+
+        let _g = lock();
+        unsafe {
+            let rt = sofuu_rt_new(ptr::null());
+            assert!(!rt.is_null());
+            let ui = sofuu_ui_session_new(ptr::null(), ptr::null_mut());
+            assert!(!ui.is_null());
+
+            assert_eq!(sofuu_ui_attach_runtime(rt, ui), 0);
+            assert_eq!(
+                eval_json_nb(rt, "sofuu.ui.isAttached()"),
+                JsonValue::Bool(true),
+                "the embedded session must be visible as attached"
+            );
+
+            // No scene is mounted yet, so no 16 ms pump exists and the loop
+            // is empty. A blocking funnel call must still settle its awaited
+            // continuation (microtask-only) instead of reading a null
+            // envelope from a dead loop.
+            assert_eq!(
+                call(rt, "ui.isAttached", ""),
+                JsonValue::Bool(true),
+                "a call on an attached-but-idle runtime must settle"
+            );
+
+            // The JS builder goes through __sofuu_ui_push_patch into the
+            // session queue; one poll must compile it.
+            let mounted = eval_json_nb(
+                rt,
+                r#"(function(){
+                    var v = sofuu.ui.app('C-ABI')
+                        .add(sofuu.ui.button('go', 'Go'))
+                        .mount();
+                    return typeof v.mount === 'function';
+                })()"#,
+            );
+            assert_eq!(mounted, JsonValue::Bool(true));
+
+            // A blocking funnel call must also settle while the mounted
+            // view's 16 ms event pump keeps libuv permanently alive.
+            assert_eq!(
+                call(rt, "ui.isAttached", ""),
+                JsonValue::Bool(true),
+                "sofuu_rt_call must not wait for the UI pump to stop"
+            );
+
+            let mut dl = SofuuUiDrawList::default();
+            assert_eq!(
+                sofuu_ui_poll_draw_list(ui, 1.0 / 60.0, 800.0, 600.0, 1.0, &mut dl),
+                0
+            );
+            assert!(dl.quad_count > 0, "mounted JS scene must reach the DrawList");
+
+            // Zero-boilerplate Auto-Composer: ui.js's autoComposer() forwards
+            // to the session's Rust composer through the __sofuu_ui_auto_*
+            // globals; no libsofuu_gpu is loaded in this test process.
+            assert_eq!(
+                eval_json_nb(
+                    rt,
+                    r#"(function(){
+                        sofuu.ui.autoComposer({title:'Auto C-ABI', theme:'dark'}).mount();
+                        return JSON.parse(__sofuu_ui_auto_scene()).title;
+                    })()"#,
+                ),
+                JsonValue::String("Auto C-ABI".into()),
+                "autoComposer().mount() must seed the Rust dashboard"
+            );
+            assert_eq!(
+                eval_json_nb(
+                    rt,
+                    r#"(function(){
+                        sofuu.ui._onAgentStep({runId:'r1', agentName:'researcher',
+                            kind:'tool', payload:{name:'web.search', duration:12}});
+                        sofuu.ui._onTriggerTick([{id:'t1', kind:'timer', running:true, ticks:3}]);
+                        return [
+                            __sofuu_ui_auto_event(JSON.stringify({
+                                runId:'r2', agentName:'researcher', kind:'done', payload:{}
+                            })),
+                            __sofuu_ui_auto_triggers(JSON.stringify([
+                                {id:'t2', kind:'timer', running:false, ticks:4}
+                            ])),
+                            __sofuu_ui_auto_rows(JSON.stringify([
+                                {id:'row1', cells:[{text:'ok'}]}
+                            ]))
+                        ];
+                    })()"#,
+                ),
+                serde_json::json!([0, 0, 0]),
+                "auto_event / auto_triggers / auto_rows must accept their wire shapes"
+            );
+            assert_eq!(
+                sofuu_ui_poll_draw_list(ui, 1.0 / 60.0, 800.0, 600.0, 1.0, &mut dl),
+                0
+            );
+            assert!(
+                dl.quad_count > 0,
+                "Auto-Composer ingestion must keep a drawable scene"
+            );
+
+            // Free the session BEFORE the runtime. The globals must answer
+            // detached instead of touching freed memory.
+            sofuu_ui_session_free(ui);
+            assert_eq!(
+                eval_json_nb(rt, "sofuu.ui.isAttached()"),
+                JsonValue::Bool(false)
+            );
+            assert_eq!(
+                eval_json_nb(
+                    rt,
+                    r#"__sofuu_ui_push_patch(JSON.stringify({op:'set_text',id:'x',content:'y'}))"#
+                ),
+                JsonValue::from(-2),
+                "a freed session must report detached (-2), not crash"
+            );
+
+            assert_eq!(sofuu_ui_detach_runtime(rt), 0);
+            sofuu_rt_free(rt);
+        }
     }
 
     #[test]

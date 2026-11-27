@@ -13,8 +13,8 @@ set_target_properties(sofuu PROPERTIES
 add_library(sofuu_embed INTERFACE)
 target_include_directories(sofuu_embed INTERFACE ${CMAKE_SOURCE_DIR}/include)
 
-add_library(sofuu_jni SHARED jni_bridge.c)
-target_link_libraries(sofuu_jni sofuu sofuu_embed log)
+add_library(sofuu_jni SHARED jni_bridge.c ui_gles.c)
+target_link_libraries(sofuu_jni sofuu sofuu_embed log GLESv3)
 
 # targetSdk 35 requires every .so in the APK to load on Android 15+ devices
 # with a 16 KiB page size (most current Pixels). The NDK toolchain only

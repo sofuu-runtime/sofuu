@@ -12,9 +12,24 @@ description = "libsofuu — the embeddable Sofuu C ABI (PLAN-HEADLESS H1)"
 name = "sofuu_capi"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# UI embedding (PLAN-EMBEDDED-NATIVE-HOST-C-ABI) is ON by default so the
+# shipped libsofuu carries `sofuu_ui_*`; server/headless consumers build with
+# `--no-default-features` and get exactly the frozen v2 surface.
+default = ["ui"]
+ui = ["dep:sofuu-ui"]
+# Platform-accelerated Mode B backends. They are additive aliases today: the
+# Direct Surface renderer lands with PLAN-CROSS-PLATFORM-GPU-WINDOW-BACKENDS;
+# until then `sofuu_ui_surface_*` returns SOFUU_ERR_NOT_IMPL (-2) while the
+# Mode A zero-copy DrawList ABI stays fully functional.
+ui-metal = ["ui"]
+ui-gles = ["ui"]
+ui-surface = ["ui"]
+
 [dependencies]
 sofuu-core = { path = "../sofuu-core" }
 sofuu-ffi = { path = "../sofuu-ffi" }
+sofuu-ui = { path = "../sofuu-ui", optional = true }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 libc = "0.2"
 

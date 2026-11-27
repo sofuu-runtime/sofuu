@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug-only host activity for the embedded GPU canvas instrumentation
+     test. It is merged into debug builds only; release never sees it. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <activity
+            android:name=".render.SofuuCanvasTestActivity"
+            android:exported="false" />
+    </application>
+</manifest>

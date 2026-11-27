@@ -23,6 +23,25 @@ final class SofuuBridge {
     /// The ABI version this library implements.
     var abiVersion: Int { Int(sofuu_embed_abi_version()) }
 
+    // ── Embedded GPU UI (PLAN-EMBEDDED-NATIVE-HOST-C-ABI) ──────────────
+    //
+    // The UI session lives on the render thread; only the binding call runs
+    // here, on the runtime's owning thread. `sofuu_rt_free` unbinds it
+    // automatically, and a session freed first is a safe tombstone.
+
+    /// Raw runtime pointer for additive C surfaces (UI embedding, host tools).
+    var runtimePointer: OpaquePointer { rtPtr }
+
+    /// Bind a `SofuuUiSession *` to this runtime's QuickJS context.
+    func attachUISession(_ session: OpaquePointer) -> Int32 {
+        sofuu_ui_attach_runtime(rtPtr, session)
+    }
+
+    /// Unbind the embedded UI session (safe to call twice).
+    func detachUISession() -> Int32 {
+        sofuu_ui_detach_runtime(rtPtr)
+    }
+
     private init(rtPtr: OpaquePointer) {
         self.rtPtr = rtPtr
     }

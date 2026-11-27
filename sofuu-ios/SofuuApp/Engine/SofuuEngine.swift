@@ -272,6 +272,23 @@ final class SofuuEngine: @unchecked Sendable {
         }
     }
 
+    /// Bind an embedded `GpuUiMetalView` to the runtime on the engine thread.
+    /// The view itself lives on the UI thread; only this binding (and detach)
+    /// crosses over, matching the one-runtime-one-thread ABI contract.
+    func attachUISession(_ session: OpaquePointer) {
+        onEngine { [weak self] rt in
+            let rc = rt.attachUISession(session)
+            if rc != 0 { self?.log("ui: attach failed rc=\(rc)") }
+        }
+    }
+
+    /// Unbind the embedded canvas. Safe to call when nothing is attached.
+    func detachUISession() {
+        onEngine { rt in
+            _ = rt.detachUISession()
+        }
+    }
+
     // ── Event pump ───────────────────────────────────────────────────
 
     /// Drain both JS queues; deliver events to observers and complete pending

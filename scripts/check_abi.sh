@@ -24,8 +24,8 @@ fi
 # Extract exported symbols (T = text segment = exported functions).
 # On macOS, symbols are prefixed with _; on Linux they're not.
 # We normalize by stripping the leading _ and filtering to the PUBLIC API
-# surface only (sofuu_rt_*, sofuu_embed_*, sofuu_voice_*, sofuu_free, and the
-# legacy sofuu_init/eval/run/destroy/loop symbols). Internal helpers
+# surface only (sofuu_rt_*, sofuu_embed_*, sofuu_voice_*, sofuu_ui_*,
+# sofuu_free, and the legacy sofuu_init/eval/run/destroy/loop symbols). Internal helpers
 # (sofuu_cma_*, sofuu_js_*, sofuu_tui_*, sofuu_uv_*, etc.) are NOT part of the
 # ABI contract.
 #
@@ -35,7 +35,7 @@ fi
 # disagreed — it reported the voice functions as "removed from library"
 # on a build that exports them. Any prefix listed in abi_symbols.txt MUST
 # also be listed here; assert_abi_prefix_coverage (below) enforces that.
-PUBLIC_RE='^(sofuu_rt_|sofuu_embed_|sofuu_voice_|sofuu_free|sofuu_init|sofuu_destroy|sofuu_eval|sofuu_run_jobs|sofuu_get_engine|sofuu_engine_ctx|sofuu_flush_jobs|sofuu_loop_)'
+PUBLIC_RE='^(sofuu_rt_|sofuu_embed_|sofuu_voice_|sofuu_ui_|sofuu_free|sofuu_init|sofuu_destroy|sofuu_eval|sofuu_run_jobs|sofuu_get_engine|sofuu_engine_ctx|sofuu_flush_jobs|sofuu_loop_)'
 
 SYMBOLS_FILE=$(mktemp)
 BASELINE_SORTED=$(mktemp)

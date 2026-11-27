@@ -162,7 +162,11 @@ void sofuu_rt_free(SofuuRuntime *rt);
  *
  * On return, *out_json (when non-NULL) is a malloc'd JSON envelope the host
  * frees with sofuu_free(). The call blocks until the feature's promise
- * settles (the event loop is drained). Returns SOFUU_OK or a SOFUU_ERR_*. */
+ * settles. While no UI session is attached, that means draining libuv until
+ * it is idle; with a session attached (sofuu_ui_attach_runtime), `sofuu.ui`
+ * keeps a 16 ms event pump alive, so the call instead runs one libuv round at
+ * a time and returns as soon as the feature's envelope lands. Returns
+ * SOFUU_OK or a SOFUU_ERR_*. */
 int sofuu_rt_call(SofuuRuntime *rt, const char *method,
                   const char *args_json, char **out_json);
 
@@ -306,8 +310,13 @@ int sofuu_rt_eval_nb(SofuuRuntime *rt, const char *source, char **out_json);
 /* Evaluate arbitrary JS (full power when the funnel isn't enough). The
  * source is evaluated as a global script, the event loop is drained, and
  * the synchronous completion value is JSON-stringified into *out_json.
- * For async work, drive it through sofuu_rt_call or manage your own
- * globals + a follow-up read. Returns SOFUU_OK or a SOFUU_ERR_*. */
+ * When a UI session is attached (sofuu_ui_attach_runtime), a mounted
+ * `sofuu.ui` view keeps a 16 ms event pump alive, so "drained" means ONE
+ * non-blocking tick (the sofuu_rt_eval_nb contract) instead of waiting for
+ * an idle loop that never arrives; drive subsequent work with
+ * sofuu_rt_call / sofuu_rt_eval_nb. For async work, drive it through
+ * sofuu_rt_call or manage your own globals + a follow-up read. Returns
+ * SOFUU_OK or a SOFUU_ERR_*. */
 int sofuu_rt_eval(SofuuRuntime *rt, const char *source, char **out_json);
 
 /* ── Vector embeddings (H-E1 text, M1 image) ─────────────────────── */
@@ -350,6 +359,260 @@ int sofuu_voice_transcribe(SofuuRuntime *rt, const char *audio_b64,
                            const char *opts_json, char **out_json);
 int sofuu_voice_speak(SofuuRuntime *rt, const char *text,
                       const char *opts_json, char **out_json);
+
+/* ── Embedded GPU UI (PLAN-EMBEDDED-NATIVE-HOST-C-ABI) ──────────────
+ *
+ * Tier 2 additive symbols: `sofuu_ui_*` extends the frozen v2 ABI without
+ * changing a single existing signature. A host that links a headless build
+ * (`--no-default-features`) simply has no UI symbols; the rest of this header
+ * is unchanged.
+ *
+ * Mode A (always available): the host owns the Metal/GLES/Vulkan device and
+ * pulls a zero-copy `SofuuUiDrawList` every display-link/Choreographer tick.
+ * The six instance pointers borrow the session's double-buffered `DrawList`
+ * vectors and stay valid until the next `sofuu_ui_poll_draw_list()` (or
+ * `sofuu_ui_session_free()`) on the SAME session.
+ *
+ * Mode B (build with Cargo feature `ui-surface`): `sofuu_ui_surface_*` draws
+ * directly onto a host `MTLDevice`/`CAMetalLayer`/`EGLSurface`. On builds
+ * without the backend those calls return SOFUU_ERR_NOT_IMPL (-2); Mode A is
+ * never affected.
+ *
+ * Threading (SofuuRuntime is still owned by ONE thread, Thread R):
+ *   sofuu_ui_session_new/free,
+ *   sofuu_ui_session_get_atlas,
+ *   sofuu_ui_session_set_safe_insets,
+ *   sofuu_ui_poll_draw_list,
+ *   sofuu_ui_surface_*            host UI/render thread (Thread U)
+ *   sofuu_ui_session_set_wake_cb  any thread; stored atomically
+ *   sofuu_ui_push_patch_json,
+ *   sofuu_ui_ingest_agent_event_json,
+ *   sofuu_ui_dispatch_input,
+ *   sofuu_ui_poll_event_json      ANY thread (lock-protected queues)
+ *   sofuu_ui_attach_runtime       Thread R (it registers JS globals)
+ *   sofuu_ui_detach_runtime       Thread R
+ *
+ * Every entry contains Rust panics and returns SOFUU_ERR_PANIC (-10) instead
+ * of unwinding into the host. `sofuu_ui_session_new` returns NULL on panic.
+ */
+
+/* Packed GPU instance structs — byte-identical to sofuu-ui::draw and the
+ * Metal/GLSL/SPIR-V vertex layouts (verified by crates/sofuu-capi tests). */
+
+typedef struct {
+    float viewport_size[2];
+    float atlas_size[2];
+    float scale_factor;
+    float time_sec;
+    float _pad[2];
+} SofuuUiFrameUniforms; /* 32 bytes */
+
+typedef struct {
+    float x, y, w, h;
+} SofuuUiClipRect; /* 16 bytes */
+
+#define SOFUU_DRAW_KIND_QUAD   0u
+#define SOFUU_DRAW_KIND_RIBBON 1u
+#define SOFUU_DRAW_KIND_STROKE 2u
+#define SOFUU_DRAW_KIND_GLYPH  3u
+
+typedef struct {
+    uint32_t kind;   /* SOFUU_DRAW_KIND_* */
+    uint32_t start;  /* instance start index */
+    uint32_t count;  /* instance count */
+    uint32_t _pad;
+} SofuuUiDrawCmd; /* 16 bytes */
+
+typedef struct {
+    float    rect[4];       /* x, y, w, h (logical px) */
+    float    radii[4];      /* tl, tr, br, bl */
+    uint32_t color_top;
+    uint32_t color_bottom;
+    uint32_t border_color;
+    uint32_t shadow_color;
+    float    params[4];     /* border_width, shadow_blur, shadow_offset_y, opacity */
+    uint32_t clip_id;
+    uint32_t _pad[3];
+} SofuuUiQuadInstance; /* 80 bytes */
+
+typedef struct {
+    float    x0, y0_top, y0_bot;
+    float    x1, y1_top, y1_bot;
+    uint32_t color_top;
+    uint32_t color_bottom;
+    uint32_t clip_id;
+    uint32_t _pad[3];
+} SofuuUiRibbonInstance; /* 48 bytes */
+
+typedef struct {
+    float    p0[2];
+    float    p1[2];
+    float    width;
+    float    feather;
+    float    dash_len;
+    float    gap_len;
+    uint32_t color;
+    uint32_t clip_id;
+    uint32_t _pad[2];
+} SofuuUiStrokeInstance; /* 48 bytes */
+
+typedef struct {
+    float    pos[2];
+    float    size[2];
+    float    uv[4];
+    uint32_t color;
+    float    px_range;
+    uint32_t clip_id;
+    uint32_t _pad;
+} SofuuUiGlyphInstance; /* 48 bytes */
+
+/* One frame, zero-copy. `quads`..`clips` point into the session and are
+ * borrowed, not owned — never free them and never read them after the next
+ * poll/free. `recompiled` says geometry was regenerated this tick (upload and
+ * draw); `needs_next_frame` is 1 while springs/kinetic scroll or queued
+ * mutations remain, 0 when the host may pause its display link (0% GPU idle). */
+typedef struct {
+    SofuuUiFrameUniforms          uniforms;
+    const SofuuUiQuadInstance*    quads;
+    uint32_t                      quad_count;
+    const SofuuUiRibbonInstance*  ribbons;
+    uint32_t                      ribbon_count;
+    const SofuuUiStrokeInstance*  strokes;
+    uint32_t                      stroke_count;
+    const SofuuUiGlyphInstance*   glyphs;
+    uint32_t                      glyph_count;
+    const SofuuUiDrawCmd*         cmds;
+    uint32_t                      cmd_count;
+    const SofuuUiClipRect*        clips;
+    uint32_t                      clip_count;
+    uint8_t                       recompiled;       /* 1 if geometry regenerated this tick */
+    uint8_t                       needs_next_frame; /* 1 while springs/kinetic scroll active */
+    uint8_t                       theme_is_dark;    /* 0 = Light, 1 = Dark */
+    uint8_t                       _reserved;
+} SofuuUiDrawList;
+
+/* ── Input events (`SofuuUiInputEvent`) ──────────────────────────── */
+#define SOFUU_INPUT_POINTER_MOVE    1u
+#define SOFUU_INPUT_POINTER_DOWN    2u
+#define SOFUU_INPUT_POINTER_UP      3u
+#define SOFUU_INPUT_SCROLL          4u
+#define SOFUU_INPUT_KEY_DOWN        5u
+#define SOFUU_INPUT_TEXT_INPUT      6u
+#define SOFUU_INPUT_RESIZE          7u
+#define SOFUU_INPUT_CLOSE_REQUESTED 8u
+
+#define SOFUU_MOD_SHIFT (1u << 0)
+#define SOFUU_MOD_CTRL  (1u << 1)
+#define SOFUU_MOD_ALT   (1u << 2)
+#define SOFUU_MOD_META  (1u << 3)
+
+/* Pointer/scroll/resize calls never allocate. `text_utf8` is borrowed for the
+ * duration of the call: a key name for KEY_DOWN, a UTF-8 string for
+ * TEXT_INPUT, NULL otherwise. Coordinates are logical (not physical) pixels. */
+typedef struct {
+    uint32_t    kind;         /* SOFUU_INPUT_* */
+    float       x;            /* logical px */
+    float       y;            /* logical px */
+    float       dx;           /* scroll delta_x or resize width */
+    float       dy;           /* scroll delta_y or resize height */
+    float       scale_factor; /* display DPI factor on RESIZE */
+    uint32_t    button;       /* pointer button index (0 = primary/touch) */
+    uint32_t    modifiers;    /* SOFUU_MOD_* bitmask */
+    const char* text_utf8;    /* key name (KEY_DOWN) or UTF-8 string (TEXT_INPUT), else NULL */
+} SofuuUiInputEvent;
+
+/* ── Session handle & function surface ──────────────────────────── */
+typedef struct SofuuUiSession SofuuUiSession;
+
+/* Host wake callback: invoked (possibly from background runtime threads!)
+ * whenever ScenePatches arrive or input triggers animation, so the host can
+ * resume CADisplayLink/CVDisplayLink/Choreographer immediately from 0% idle
+ * sleep. Pass cb = NULL to clear. The callback must be quick and must not
+ * call back into this session on the same thread that is pushing (queue
+ * locks are released before the callback runs). */
+typedef void (*sofuu_ui_wake_cb)(void *opaque);
+
+/* Create a UI session. config_json (NULL/"" = defaults) is a JSON object:
+ *   { "title": "Sofuu",        // initial window/root title
+ *     "auto_title": "…",       // Auto-Composer title (default: title)
+ *     "theme": "light"|"dark",
+ *     "width": 1024, "height": 680 }
+ * On success returns a session; on failure returns NULL and, when out_err_json
+ * is non-NULL, writes a malloc'd {"ok":false,...} envelope (sofuu_free it). */
+SofuuUiSession *sofuu_ui_session_new(const char *config_json,
+                                     char **out_err_json);
+void            sofuu_ui_session_free(SofuuUiSession *ui);
+int             sofuu_ui_session_set_wake_cb(SofuuUiSession *ui,
+                                             sofuu_ui_wake_cb cb,
+                                             void *opaque);
+
+/* Top inset (macOS transparent titlebar traffic lights, iOS Dynamic Island /
+ * notch, Android status-bar cutouts) while keeping root background full-bleed
+ * from (0,0). `bottom_px` is recorded for hosts/backends; the current layout
+ * engine consumes the top inset. Negative values clamp to 0. */
+int sofuu_ui_session_set_safe_insets(SofuuUiSession *ui,
+                                     float top_px, float bottom_px);
+
+/* Font atlas descriptor: a single-channel R8 signed-distance atlas to upload
+ * once as an R8Unorm GPU texture. *out_pixels_r8 borrows session memory and
+ * is valid until sofuu_ui_session_free() (the atlas never changes). Any out
+ * pointer may be NULL. */
+int sofuu_ui_session_get_atlas(SofuuUiSession *ui,
+                               const uint8_t **out_pixels_r8,
+                               uint32_t *out_width,
+                               uint32_t *out_height,
+                               float *out_px_range);
+
+/* Bind/unbind an embedded SofuuRuntime on the runtime's owning thread.
+ * Installs JS host globals (`__sofuu_ui_is_attached`, `__sofuu_ui_push_patch`,
+ * `__sofuu_ui_poll_event`, plus the five `__sofuu_ui_auto_*` Auto-Composer
+ * funnels) pointing to lock-protected queues/state inside `ui`, so
+ * `sofuu.ui.*` and the JS Auto-Composer work identically to `sofuu run --ui`
+ * without loading libsofuu_gpu.
+ * sofuu_rt_free(rt) automatically unbinds; a freed session is a tombstone that
+ * makes the JS globals report detached (-2 / false) with no use-after-free. */
+int sofuu_ui_attach_runtime(SofuuRuntime *rt, SofuuUiSession *ui);
+int sofuu_ui_detach_runtime(SofuuRuntime *rt);
+
+/* Scene mutation / telemetry ingestion (thread-safe). `patch_json` is a
+ * `ScenePatch` object (`{"op":"set_text",...}` or a full
+ * `{"op":"replace_scene",...}`). len == 0 means NUL-terminated. A malformed
+ * patch is rejected with SOFUU_ERR_INVALID_ARG and never enters the queue.
+ * `event_json` is a generic `AutoAgentEvent`; the first event seeds the
+ * session's Rust Auto-Composer dashboard, later events patch it in place. */
+int sofuu_ui_push_patch_json(SofuuUiSession *ui, const char *patch_json,
+                             size_t len);
+int sofuu_ui_ingest_agent_event_json(SofuuUiSession *ui,
+                                     const char *event_json);
+
+/* Queue an OS input event / pop the next semantic event (thread-safe).
+ * poll_event_json writes a malloc'd JSON object (`{"type":"click",...}`,
+ * freeing via sofuu_free) and returns 1; it returns 0 with *out_event_json =
+ * NULL when the queue is empty. */
+int sofuu_ui_dispatch_input(SofuuUiSession *ui, const SofuuUiInputEvent *evt);
+int sofuu_ui_poll_event_json(SofuuUiSession *ui, char **out_event_json);
+
+/* Mode A: render-thread frame evaluation. Drains queued patches/input, advances
+ * 120Hz springs, and fills `out_list` (zero heap alloc in steady state). Call
+ * with the display-link delta in seconds and the logical viewport. The first
+ * call compiles geometry; subsequent idle calls are O(1). */
+int sofuu_ui_poll_draw_list(SofuuUiSession *ui,
+                            float dt_sec,
+                            float width_px,
+                            float height_px,
+                            float scale_factor,
+                            SofuuUiDrawList *out_list);
+
+/* Mode B (Cargo feature `ui-surface`): Sofuu-managed GPU rendering onto a
+ * host layer/surface. Without the backend these return SOFUU_ERR_NOT_IMPL. */
+int sofuu_ui_surface_attach_metal(SofuuUiSession *ui, void *mtl_device,
+                                  void *ca_metal_layer);
+int sofuu_ui_surface_attach_egl(SofuuUiSession *ui, void *egl_display,
+                                void *egl_surface, void *egl_context);
+int sofuu_ui_surface_render(SofuuUiSession *ui, float dt_sec,
+                            uint32_t width_px, uint32_t height_px,
+                            float scale_factor);
+int sofuu_ui_surface_detach(SofuuUiSession *ui);
 
 /* ── Memory ────────────────────────────────────────────────────── */
 /* Free a buffer handed out by this library (out_json strings). NULL-safe. */

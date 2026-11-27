@@ -1,5 +1,7 @@
 package com.sofuu.engine
 
+import com.sofuu.render.SofuuUiNative
+
 /**
  * Kotlin/JNI wrapper around the libsofuu C ABI (v2).
  *
@@ -101,6 +103,19 @@ class SofuuBridge private constructor(private val rtPtr: Long) {
 
     /** Called once from [close]; never call native methods after. */
     fun close() = nativeRtFree(rtPtr)
+
+    // ── Embedded GPU UI (PLAN-EMBEDDED-NATIVE-HOST-C-ABI) ──────────────
+    //
+    // The UI session is created and rendered on the host's UI thread; only
+    // this binding crosses onto the runtime thread. sofuu_rt_free unbinds
+    // it automatically, and a session freed first is a safe tombstone.
+
+    /** Bind a `SofuuUiSession *` to this runtime's QuickJS context. */
+    fun attachUISession(session: Long): Int =
+        SofuuUiNative.nativeAttachRuntime(rtPtr, session)
+
+    /** Unbind the embedded UI session (safe to call twice). */
+    fun detachUISession(): Int = SofuuUiNative.nativeDetachRuntime(rtPtr)
 
     /** Host for streaming events (runs on the engine thread). */
     interface StreamListener {

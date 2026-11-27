@@ -42,7 +42,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
         deps scoreboard scoreboard-check cuda-check \
         libsofuu libsofuu-linux-x86_64 zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
-        headless-test abi-check dist-macos dist-linux dist-ios dist-android dist-all \
+        headless-test abi-check ui-gates dist-macos dist-linux dist-ios dist-android dist-all \
         sdk-jvm-check android-sdk android-aar android-publish-local \
         desktop desktop-dev desktop-clean \
         ios-engine ios-engine-deps ios-project ios-typecheck ios-app ios-sim
@@ -510,6 +510,11 @@ protocol-test: $(TARGET)
 serve-test: $(TARGET)
 	@SOFUU_BIN=$(TARGET) bash scripts/preflight.sh serve
 
+# `sofuu host` acceptance: real HTTP, real replay ring, deterministic mock
+# provider. No weights are downloaded; the mock is the peer, not the subject.
+host-test: $(TARGET)
+	@SOFUU=$(TARGET) tests/host_e2e.sh
+
 # ─── Cross-compilation (cargo + zig; local convenience) ────────────
 # Uses Zig as a zero-dependency cross-compiler (no Docker needed).
 # First run:  make zig-install
@@ -752,6 +757,15 @@ abi-check: libsofuu
 	 elif [ -f dist/libsofuu.so ]; then LIB=dist/libsofuu.so; \
 	 else echo "\033[31m✗ No shared lib in dist/\033[0m"; exit 1; fi; \
 	bash scripts/check_abi.sh $$LIB
+
+# Embedded UI gates (PLAN-EMBEDDED-NATIVE-HOST-C-ABI Phase C5):
+#  • headless `libsofuu` (--no-default-features) exports none of the additive
+#    sofuu_ui_* surface and has no sofuu-ui dependency in its graph;
+#  • 10k DrawList frames hold steady-state RSS flat (no per-frame allocation).
+ui-gates:
+	@bash scripts/check_ui_c_abi.sh
+	@bash scripts/check_ui_headless.sh
+	@cargo test -p sofuu-capi --lib ui_10k_frame_rss_gate -- --ignored --nocapture
 
 # ── Sofuu macOS (SwiftUI app over the C ABI) ───────────────────────
 # Engine artifact + typecheck for the native Mac app. Additive targets —

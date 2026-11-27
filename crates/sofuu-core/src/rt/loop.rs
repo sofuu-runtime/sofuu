@@ -423,6 +423,37 @@ pub unsafe extern "C" fn sofuu_loop_tick_nb(ctx: *mut JSContext) {
     sofuu_flush_jobs_bounded(ctx, batch);
 }
 
+/// One blocking engine-loop round for a host waiting on a specific JS
+/// result (the C-ABI funnel's `__capi_r` envelope) while a long-lived
+/// timer keeps the loop alive — the embedded UI `setInterval` event pump.
+///
+/// `sofuu_loop_run`'s "drain until libuv is idle" contract can never be
+/// satisfied once `src/js/ui.js` mounts a view, so the blocking call path
+/// uses this primitive between envelope probes instead.
+///
+/// # Safety
+/// `ctx` must be the live runtime context (loop thread).
+pub unsafe fn sofuu_loop_round_blocking(ctx: *mut JSContext) {
+    if loop_ptr().is_null() {
+        return;
+    }
+    let batch = adaptive_microtask_batch(loop_ptr());
+    sofuu_flush_jobs_bounded(ctx, batch);
+    uv::uv_run(loop_ptr(), UV_RUN_ONCE);
+    process_dispatch_pending_signals();
+    sofuu_flush_jobs_bounded(ctx, batch);
+}
+
+/// True while the process event loop still has active handles. A caller
+/// waiting on a JS promise uses this to tell "not settled yet" from
+/// "settled or abandoned" instead of spinning on an empty loop.
+pub fn sofuu_loop_alive() -> bool {
+    unsafe {
+        let lp = loop_ptr();
+        !lp.is_null() && uv::uv_loop_alive(lp) != 0
+    }
+}
+
 /// Walk callback: closes any handle that is still active.
 unsafe extern "C" fn walk_close_cb(handle: *mut UvHandle, _arg: *mut c_void) {
     // SAFETY: handle is a live handle visited by uv_walk.

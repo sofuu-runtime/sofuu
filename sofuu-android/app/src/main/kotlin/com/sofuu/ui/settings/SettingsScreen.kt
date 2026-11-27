@@ -74,7 +74,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
-private val TABS = listOf("general", "appearance", "models", "providers", "agents", "brain", "usage")
+private val TABS = listOf("general", "appearance", "models", "providers", "agents", "brain", "host", "usage")
 
 /** Full-screen settings — the same panes as the desktop modal, minus
  *  Shortcuts (deliberately dropped on mobile). */
@@ -122,6 +122,7 @@ fun SettingsScreen(store: AppStore, onClose: () -> Unit) {
                 "providers" -> ProvidersPane(store)
                 "agents" -> AgentsPane(store)
                 "brain" -> BrainPane(store)
+                "host" -> HostPane(store)
                 "usage" -> UsagePane(store)
             }
         }
@@ -2102,6 +2103,107 @@ private fun SpaceLine(text: Color, err: Color, faint: Color, label: String, dim:
         Text(
             if (available) "$dim-dim" else "artifact unavailable",
             fontSize = 12.sp, fontWeight = FontWeight.Medium, color = if (available) faint else err,
+        )
+    }
+}
+
+@Composable
+private fun HostPane(store: AppStore) {
+    val c = LocalSofuuColors.current
+    val state = store.state
+    var name by remember { mutableStateOf("") }
+    var address by remember { mutableStateOf("") }
+    var token by remember { mutableStateOf("") }
+    var pin by remember { mutableStateOf("") }
+    var pairMode by remember { mutableStateOf(false) }
+
+    val active = state.hosts.firstOrNull { it.id == state.activeHostId }
+
+    Section("Connection", isFirst = true)
+    SettingsCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    active?.name ?: "This device",
+                    fontSize = 14.5.sp, fontWeight = FontWeight.Bold, color = c.text,
+                )
+                Text(
+                    when {
+                        active == null -> "Chats run on this phone's engine."
+                        state.hostConnected -> "Connected · ${active.displayAddress()}"
+                        else -> state.hostStatus ?: "Not connected"
+                    },
+                    fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+            }
+            if (active != null) {
+                SmallButton(c.bgCardHover, c.text, "Disconnect") { store.disconnectHost() }
+            }
+        }
+        if (state.hosts.isNotEmpty()) {
+            CardDivider()
+            state.hosts.forEach { h ->
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(h.name, fontSize = 13.5.sp, fontWeight = FontWeight.Bold, color = c.text)
+                        Text(h.displayAddress(), fontSize = 11.5.sp, color = c.textFaint, fontFamily = GeistMono)
+                        if (h.lastSeen > 0) {
+                            Text(
+                                "last seen " + java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.US)
+                                    .format(java.util.Date(h.lastSeen * 1000)),
+                                fontSize = 10.5.sp, color = c.textFaint,
+                            )
+                        }
+                    }
+                    if (h.id == state.activeHostId && state.hostConnected) {
+                        Text("Active", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = c.accent)
+                    } else {
+                        SmallButton(c.bgCardHover, c.text, "Connect") { store.connectHost(h.id) }
+                    }
+                    SmallButton(c.bgCardHover, c.text, "Test") { store.testHost(h.id) }
+                    SmallButton(c.bgCardHover, c.err, "Forget") { store.forgetHost(h.id) }
+                }
+            }
+        }
+    }
+
+    Section("Add a Mac")
+    SettingsCard {
+        TextFieldRow("name", name, "MacBook Pro", { name = it })
+        TextFieldRow("address", address, "192.168.1.10:7707", { address = it })
+        if (pairMode) {
+            TextFieldRow("pin", pin, "6-digit PIN from `sofuu host --pair`", { pin = it })
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                SmallButton(c.accent, c.accentContrast, "Pair and connect") {
+                    store.pairHost(name, address, pin)
+                }
+                SmallButton(c.bgCardHover, c.text, "Use a token") { pairMode = false }
+            }
+        } else {
+            TextFieldRow("token", token, "master token (or a paired device token)", { token = it })
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                SmallButton(c.accent, c.accentContrast, "Connect") {
+                    store.addHost(name, address, token)
+                }
+                SmallButton(c.bgCardHover, c.text, "Pair with PIN") { pairMode = true }
+            }
+        }
+        state.hostStatus?.let {
+            Text(
+                it, fontSize = 12.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
+                modifier = Modifier.padding(top = 10.dp),
+            )
+        }
+        Text(
+            "Host mode is plain LAN HTTP in this version (token-authenticated). " +
+                "Pairing mints a revocable device token; the master token never leaves the Mac.",
+            fontSize = 11.5.sp, fontWeight = FontWeight.Medium, color = c.textFaint,
+            modifier = Modifier.padding(top = 10.dp),
         )
     }
 }

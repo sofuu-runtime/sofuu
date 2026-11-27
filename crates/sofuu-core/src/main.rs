@@ -208,6 +208,7 @@ fn print_help() {
     println!("  sofuu brain restore <b> <d> Rebuild a healthy brain store from an archive backup");
     println!("  sofuu brain migrate <path> Convert legacy v1 flat .qtsq file to v2 segmented store");
     println!("  sofuu serve --brain <p>  Serve cognitive memory and agent APIs over HTTP/SSE (--port, --host, --token)");
+    println!("  sofuu host               Chat host for the Android app: sessions, replay, approvals (--pair, --workspace)");
     println!("  sofuu gateway            Loopback webhook ingress for channels.json (--port, --host)");
     println!();
     println!("\x1b[1mRobotics, Drones & Physical Computing:\x1b[0m");
@@ -340,6 +341,7 @@ fn wants_help(args: &[String]) -> bool {
 fn print_subcommand_help(cmd: &str) -> bool {
     match cmd {
         "serve" => print_serve_help(),
+        "host" => print_host_help(),
         "gateway" => print_gateway_help(),
         "infer" => print_infer_help(),
         "dev" | "web" => print_dev_help(),
@@ -476,8 +478,47 @@ fn print_serve_help() {
     );
 }
 
-fn print_gateway_help() {
+fn print_host_help() {
     println!(
+        "\x1b[1mUsage:\x1b[0m sofuu host [options]\n\n\
+         Run this Mac as a chat host for the Android app. Host mode serves\n\
+         chat-backed sessions (not the OpenAI-shaped H3 sessions): a client\n\
+         submits a turn, streams /v1/sessions/:id/events, reconnects from its\n\
+         cursor, and resolves approvals across disconnects.\n\n\
+         \x1b[1mOptions:\x1b[0m\n\
+           -p, --port <n>             listen port 0-65535 (default: 7707)\n\
+               --host <addr>          listen address (default: 0.0.0.0)\n\
+           -w, --workspace <path>     workspace the chat engine opens (default: cwd)\n\
+               --name <name>          host name shown on the phone\n\
+               --pair                 print a 6-digit pairing PIN (valid 10 min)\n\
+               --approval-timeout <s> approval ceiling for tool calls (default: 900)\n\
+           -t, --token <secret>       master bearer token; SOFUU_SERVE_TOKEN wins\n\
+           -m, --model <path>         local GGUF model for the inference routes\n\
+           -b, --brain <path>         brain store path\n\
+               --model-id <id>        model id advertised to clients\n\
+               --policy <file>        policy file applied before the host starts\n\
+               --public-health        answer GET /health without a token\n\n\
+         \x1b[1mRoutes:\x1b[0m\n\
+           GET  /v1/host                          identity + live posture\n\
+           GET  /v1/sessions                      chat sessions\n\
+           POST /v1/sessions                      create a session\n\
+           GET  /v1/sessions/:id/snapshot         turns + cursor window + approvals\n\
+           GET  /v1/sessions/:id/events?after_seq=N&follow=1\n\
+           POST /v1/sessions/:id/runs             start a detached turn (202)\n\
+           POST /v1/sessions/:id/runs/:run/cancel cancel the active turn\n\
+           POST /v1/sessions/:id/approve          resolve a pending approval\n\
+           POST /v1/pair                          exchange a PIN for a device token\n\n\
+         \x1b[1mEnvironment:\x1b[0m\n\
+           SOFUU_SERVE_TOKEN          master token (takes precedence over --token)\n\
+           SOFUU_HTTP_HEADERS_MS      pre-auth header deadline (default: 30000)\n\
+           SOFUU_HTTP_IDLE_MS         post-request idle deadline (default: 0 = none)\n\n\
+         Without a token one is generated and written to ~/.sofuu/serve_token (0600).\n\
+         \x1b[90mThis page is documentation only: `sofuu host --help` starts no\n\
+         listener and creates no token.\x1b[0m\n"
+    );
+}
+
+fn print_gateway_help() {    println!(
         "\x1b[1mUsage:\x1b[0m sofuu gateway [options]\n\n\
          Run the channel webhook ingress for channels.json. WhatsApp Cloud API\n\
          verification and signed event delivery arrive here; validated messages\n\
@@ -2955,6 +2996,10 @@ fn cmd_gateway(rt: &SofuuRuntime, args: &[String], load_layered_policy: bool) ->
 }
 
 fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
+    /* Host mode boots the same listener with chat-backed routes enabled.
+     * `cmd_host` sets these env vars and calls this function, so both
+     * commands share one auth/policy/transport path. */
+    let host_mode = std::env::var("SOFUU_HOST_MODE").ok().as_deref() == Some("1");
     // Local-inference prefill on large models can legitimately produce no
     // response bytes for many minutes (e.g. a 27B ternary prompt decode) —
     // SOFUU_HTTP_IDLE_MS stays 0 (no deadline at all once a request is in).
@@ -3142,9 +3187,11 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
         }
     }
 
-    // Remote binding requires a user-chosen token (security). The old
-    // prefix check ("sofuu-") let any --token sofuu-anything through.
-    if (host != "127.0.0.1" && host != "localhost") && auto_token {
+    // Remote binding requires a user-chosen token (security). Host mode is
+    // exempt only because paired-device tokens are minted through a
+    // short-lived PIN and the master token never leaves this machine; the
+    // auto token is still generated and persisted 0600.
+    if (host != "127.0.0.1" && host != "localhost") && auto_token && !host_mode {
         eprintln!("\x1b[31mError:\x1b[0m remote binding requires an explicit --token");
         eprintln!("  Use: sofuu serve --host {} --token <your-secret>\n", host);
         eprintln!("  Prefer: SOFUU_SERVE_TOKEN=<secret> sofuu serve --host {}", host);
@@ -3155,7 +3202,11 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
     }
 
     eprintln!("\x1b[1;36m  ┌─────────────────────────────────┐");
-    eprintln!("  │   Sofuu Edge Server             │");
+    if host_mode {
+        eprintln!("  │   Sofuu Chat Host  (host mode)  │");
+    } else {
+        eprintln!("  │   Sofuu Edge Server             │");
+    }
     eprintln!("  │   v{:<31}│", VERSION);
     eprintln!("  └─────────────────────────────────┘\x1b[0m");
     if !model_path.is_empty() {
@@ -3204,9 +3255,188 @@ fn cmd_serve(rt: &SofuuRuntime, args: &[String]) -> i32 {
         "port": port,
         "version": VERSION,
         "publicHealth": public_health,
+        "hostMode": host_mode,
+        "hostName": std::env::var("SOFUU_HOST_NAME").unwrap_or_default(),
+        "workspace": std::env::var("SOFUU_HOST_WORKSPACE").unwrap_or_default(),
+        "stateRoot": std::env::var("SOFUU_HOST_STATE_ROOT").unwrap_or_default(),
+        "pairPin": std::env::var("SOFUU_HOST_PAIR_PIN").unwrap_or_default(),
+        "approvalTimeoutMs": std::env::var("SOFUU_HOST_APPROVAL_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(900_000),
     });
     let serve_js = format!("sofuu.serve.start({});", cfg);
     rt.eval_string(&serve_js, "<serve>")
+}
+
+/// `sofuu host` — chat host for the Android app (PLAN-ANDROID-REMOTE-HOST-RECONNECT).
+///
+/// Host mode is the same HTTP/SSE edge server with `hostMode` enabled in the
+/// JS handler: chat-backed `/v1/sessions/*` routes, a replay ring, detached
+/// turns, pairing and paired-device tokens. Keeping ONE listener here means
+/// `sofuu serve` and `sofuu host` cannot drift on auth, policy or transport.
+fn host_rand_pin() -> String {
+    let mut b = [0u8; 4];
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b));
+    if ok.is_err() {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(42);
+        return format!("{:06}", (t % 1_000_000) as u32);
+    }
+    format!("{:06}", u32::from_le_bytes(b) % 1_000_000)
+}
+
+fn host_lan_ip() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    /* UDP connect() sends no packets; it only asks the routing table which
+     * local address would reach the internet. */
+    sock.connect("1.1.1.1:53").ok()?;
+    sock.local_addr().ok().map(|a| a.ip().to_string())
+}
+
+#[cfg(target_os = "macos")]
+struct HostMdnsGuard(std::process::Child);
+#[cfg(target_os = "macos")]
+impl Drop for HostMdnsGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn host_mdns(name: &str, port: &str) -> Option<HostMdnsGuard> {
+    /* Best-effort Bonjour advertisement. A missing dns-sd binary is not an
+     * error: manual IP entry stays the supported path. */
+    std::process::Command::new("dns-sd")
+        .args(["-R", name, "_sofuu._tcp", ".", port])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()
+        .map(HostMdnsGuard)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_mdns(_name: &str, _port: &str) -> Option<()> {
+    None
+}
+
+fn cmd_host(rt: &SofuuRuntime, args: &[String]) -> i32 {
+    let mut port = "7707".to_string();
+    let mut host = "0.0.0.0".to_string();
+    let mut token = String::new();
+    let mut workspace = String::new();
+    let mut name = String::new();
+    let mut pair = false;
+    let mut approval_ms = "900000".to_string();
+    let mut passthrough: Vec<(String, Option<String>)> = Vec::new();
+
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" | "--port" => match value_arg(args, i) {
+                Some(v) => { port = v; i += 2; }
+                None => { eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]); return 1; }
+            },
+            "--host" => match value_arg(args, i) {
+                Some(v) => { host = v; i += 2; }
+                None => { eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]); return 1; }
+            },
+            "--lan" => { host = "0.0.0.0".to_string(); i += 1; }
+            "-w" | "--workspace" => match value_arg(args, i) {
+                Some(v) => { workspace = v; i += 2; }
+                None => { eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]); return 1; }
+            },
+            "--name" => match value_arg(args, i) {
+                Some(v) => { name = v; i += 2; }
+                None => { eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]); return 1; }
+            },
+            "--pair" => { pair = true; i += 1; }
+            "--approval-timeout" => match value_arg(args, i) {
+                Some(v) => {
+                    match v.parse::<u64>() {
+                        Ok(secs) if secs >= 60 => approval_ms = (secs * 1000).to_string(),
+                        _ => eprintln!("\x1b[33mWarning:\x1b[0m --approval-timeout wants seconds >= 60; keeping 900"),
+                    }
+                    i += 2;
+                }
+                None => { eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]); return 1; }
+            },
+            "-t" | "--token" => match value_arg(args, i) {
+                Some(v) => { token = v; i += 2; }
+                None => { eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]); return 1; }
+            },
+            "-m" | "--model" | "-b" | "--brain" | "--model-id" => match value_arg(args, i) {
+                Some(v) => { passthrough.push((args[i].clone(), Some(v))); i += 2; }
+                None => { eprintln!("\x1b[31mError:\x1b[0m {} needs a value", args[i]); return 1; }
+            },
+            "--public-health" => { passthrough.push((args[i].clone(), None)); i += 1; }
+            _ => i += 1,
+        }
+    }
+
+    if workspace.is_empty() {
+        workspace = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".to_string());
+    }
+    if name.is_empty() {
+        name = std::env::var("HOSTNAME").unwrap_or_else(|_| "sofuu-host".to_string());
+        // macOS sets HOSTNAME only in some shells; hostname(1) is the truth.
+        if name.is_empty() || name == "sofuu-host" {
+            if let Ok(out) = std::process::Command::new("hostname").output() {
+                let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !h.is_empty() { name = h; }
+            }
+        }
+    }
+
+    std::env::set_var("SOFUU_HOST_MODE", "1");
+    std::env::set_var("SOFUU_HOST_WORKSPACE", &workspace);
+    std::env::set_var("SOFUU_HOST_NAME", &name);
+    std::env::set_var("SOFUU_HOST_APPROVAL_MS", &approval_ms);
+    if let Some(home) = sofuu_core::embed_config::home_dir() {
+        std::env::set_var("SOFUU_HOST_STATE_ROOT", format!("{home}/.sofuu/state"));
+    }
+    if pair {
+        let pin = host_rand_pin();
+        std::env::set_var("SOFUU_HOST_PAIR_PIN", pin.clone());
+        eprintln!("\x1b[1;32m  pairing PIN: {pin}\x1b[0m \x1b[2m(valid 10 minutes; enter it in the app)\x1b[0m");
+    }
+
+    /* Reuse the serve parser/boot path: this is the ONLY place that builds
+     * the listener, the token and the JS boot config. */
+    let mut synth = vec![args[0].clone(), "serve".to_string()];
+    synth.push("--host".into());
+    synth.push(host.clone());
+    synth.push("--port".into());
+    synth.push(port.clone());
+    if !token.is_empty() {
+        synth.push("--token".into());
+        synth.push(token);
+    }
+    for (flag, val) in passthrough {
+        synth.push(flag);
+        if let Some(v) = val { synth.push(v); }
+    }
+
+    eprintln!("\x1b[1;36m  Sofuu Chat Host\x1b[0m");
+    eprintln!("\x1b[2m  name:      {name}\x1b[0m");
+    eprintln!("\x1b[2m  workspace: {workspace}\x1b[0m");
+    if !host.starts_with("127.") && host != "localhost" {
+        if let Some(ip) = host_lan_ip() {
+            eprintln!("\x1b[2m  phone URL: http://{ip}:{port}\x1b[0m");
+        }
+    }
+    eprintln!("\x1b[2m  events:    GET /v1/sessions/:id/events?after_seq=N&follow=1\x1b[0m");
+    eprintln!();
+
+    let _mdns = host_mdns(&name, &port);
+    cmd_serve(rt, &synth)
 }
 
 /// `sofuu bundle <entry> [-o <out>]` — bundle to a single file.
@@ -4673,6 +4903,28 @@ fn main() -> ExitCode {
                 }
             }
             let rc = cmd_serve(&rt, &clean);
+            if rc == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        "host" => {
+            let (policy, clean) = take_policy_arg(&args);
+            let rt = match SofuuRuntime::init() {
+                Some(rt) => rt,
+                None => {
+                    eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Some(p) = policy {
+                if let Err(e) = apply_policy_file(&rt, &p) {
+                    eprintln!("\x1b[31mError:\x1b[0m {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            let rc = cmd_host(&rt, &clean);
             if rc == 0 {
                 ExitCode::SUCCESS
             } else {

@@ -326,7 +326,11 @@ unsafe extern "C" fn on_write_done(req: *mut UvWriteReq, status: c_int) {
     drop(Box::from_raw(wr));
     if status < 0 {
         /* R-32: a failed write IS the abort surfacing (EPIPE/ECONNRESET) —
-         * log it before the close fence runs. */
+         * log it before the close fence runs. Mark the peer closed so a
+         * streaming handler polling res.closed() (SSE heartbeats / host
+         * subscriber pruning) stops writing into a dead socket instead of
+         * waiting for the next read EOF. */
+        (*c).peer_closed = 1;
         log_client_gone(c, "write failed");
     }
     if close_after != 0 && (*c).closing == 0 {
@@ -364,6 +368,9 @@ unsafe fn queue_write(c: *mut Client, buf: *mut c_char, len: usize, close_after:
     let rc = uv::uv_write(wreq, (*c).tcp as *mut UvStream, &b, 1, Some(on_write_done));
     if rc < 0 {
         // libuv never fires on_write_done on sync failure — free here.
+        // The peer is gone by definition (EBADF/EPIPE/ECONNRESET); mirror
+        // the async path so res.closed() sees it immediately.
+        (*c).peer_closed = 1;
         libc::free(buf as *mut c_void);
         libc::free(wreq as *mut c_void);
         drop(Box::from_raw(wr));

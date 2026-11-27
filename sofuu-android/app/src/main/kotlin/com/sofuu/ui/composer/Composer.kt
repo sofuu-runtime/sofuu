@@ -87,6 +87,9 @@ fun Composer(
     onMentionsConsumed: () -> Unit,
     onSheet: (ComposerSheet) -> Unit,
     onTextFieldHeightChanged: (Int) -> Unit = {},
+    /** True when the visible engine is a paired host: model/provider,
+     *  attachments and dictation are local-only in v1. */
+    remote: Boolean = false,
 ) {
     val c = LocalSofuuColors.current
     var text by remember { mutableStateOf("") }
@@ -99,7 +102,7 @@ fun Composer(
     }
 
     val model = config?.model?.takeIf { it.isNotEmpty() }?.let { modelLabel(it, localModelLabels) }
-        ?: (if (config?.providers?.isNotEmpty() == true) "Choose model" else "No model")
+        ?: (if (remote) "default model" else if (config?.providers?.isNotEmpty() == true) "Choose model" else "No model")
     val effortValue = config?.effort.orEmpty()
     // Mirror the Effort sheet's truth: an empty effort IS off (pickLocalModel
     // clears it for non-thinking models), so the pill must not read "High"
@@ -255,24 +258,40 @@ fun Composer(
                     // weight(1f, fill=false): a local-model label derives from a
                     // long file path and must never push the send button off
                     // the right edge — cap the pill, ellipsize its text.
-                    Pill(
-                        model, Icons2.Spark,
-                        modifier = Modifier.weight(1f, fill = false),
-                        flexibleLabel = true,
-                    ) { onSheet(ComposerSheet.Model) }
-                    Spacer(Modifier.width(12.dp))
-                    Pill(effortLabel, null) { onSheet(ComposerSheet.Effort) }
+                    if (remote) {
+                        Text(
+                            "Host · $model",
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = c.textFaint,
+                            fontFamily = GeistMono,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f, fill = false),
+                        )
+                    } else {
+                        Pill(
+                            model, Icons2.Spark,
+                            modifier = Modifier.weight(1f, fill = false),
+                            flexibleLabel = true,
+                        ) { onSheet(ComposerSheet.Model) }
+                        Spacer(Modifier.width(12.dp))
+                        Pill(effortLabel, null) { onSheet(ComposerSheet.Effort) }
+                    }
                     Spacer(Modifier.weight(1f))
-                    IconAction(Icons2.Attach, "Attach") { onAttach() }
-                    Spacer(Modifier.width(12.dp))
-                    IconAction(Icons2.Layers, "Context layers") { onSheet(ComposerSheet.Layers) }
-                    Spacer(Modifier.width(12.dp))
+                    if (!remote) {
+                        IconAction(Icons2.Attach, "Attach") { onAttach() }
+                        Spacer(Modifier.width(12.dp))
+                        IconAction(Icons2.Layers, "Context layers") { onSheet(ComposerSheet.Layers) }
+                        Spacer(Modifier.width(12.dp))
+                    }
                     // Dictation. Shown only when the active provider could
                     // actually serve audio — Anthropic and local models have
                     // no audio API, so offering the mic there would be a
                     // button that fails 100% of the time. While recording it
-                    // turns into a stop affordance and stops sending.
-                    if (voiceCapable && !streaming) {
+                    // turns into a stop affordance and stops sending. A
+                    // remote host is text-only in v1.
+                    if (voiceCapable && !streaming && !remote) {
                         IconAction(
                             if (dictating) Icons2.Stop else Icons2.Mic,
                             if (dictating) "Stop dictation" else "Dictate",

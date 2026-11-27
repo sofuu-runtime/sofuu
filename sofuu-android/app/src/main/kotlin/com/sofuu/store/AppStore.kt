@@ -2,6 +2,8 @@ package com.sofuu.store
 
 import android.app.Application
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Environment
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -10,7 +12,14 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.sofuu.engine.EngineEvent
 import com.sofuu.engine.SofuuEngine
+import com.sofuu.engine.ChatBackend
+import com.sofuu.engine.LocalChatBackend
+import com.sofuu.engine.remote.HostProfile
+import com.sofuu.engine.remote.HostHttpClient
+import com.sofuu.engine.remote.HostStore
+import com.sofuu.engine.remote.RemoteChatBackend
 import com.sofuu.engine.Usage as EngineUsage
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import org.json.JSONArray
@@ -64,6 +73,15 @@ data class AppState(
     /** path → display label ("Llama 3.2 1B Instruct · Q8_0"), read from the
      *  GGUF header on refresh. Companion to [localModels]. */
     val localModelLabels: Map<String, String> = emptyMap(),
+
+    /** Paired `sofuu host` machines (Settings › Host). */
+    val hosts: List<HostProfile> = emptyList(),
+    val activeHostId: String? = null,
+    val hostConnected: Boolean = false,
+    val hostStatus: String? = null,
+    /** Model/provider the host reports — the composer shows the truth. */
+    val hostModel: String = "",
+    val hostProvider: String = "",
 )
 
 /** One provider's cached model listing (the desktop's model cache). */
@@ -108,6 +126,7 @@ class AppStore(app: Application) : AndroidViewModel(app) {
 
     val configs = ConfigStore(app)
     private val uiPrefs = UiPrefs(app)
+    val hostStore = HostStore(app)
 
 /** The library's env-var knobs, applied before the runtime boots. */
 val runtimeEnv = RuntimeEnv(app)
@@ -169,6 +188,26 @@ val runtimeEnv = RuntimeEnv(app)
         appContext = app,
     )
 
+    /** The local engine behind the shared chat interface. */
+    private val localChat: ChatBackend by lazy { LocalChatBackend(engine) }
+
+    /** The backend every chat call goes through — local unless a host is
+     *  connected. Swapped on the Main dispatcher, read from Default/IO. */
+    @Volatile
+    var chat: ChatBackend = localChat
+        private set
+
+    /** The connected host profile (null = this device). */
+    @Volatile
+    var activeHost: HostProfile? = null
+        private set
+
+    /** Remote events are folded into the SAME reducer as local ones. */
+    private val backendEvents = MutableSharedFlow<EngineEvent>(extraBufferCapacity = 512)
+
+    private val chatNamespace: String
+        get() = activeHost?.let { "host-${it.id}" } ?: "local"
+
     var state by mutableStateOf(
         AppState(
             permissions = uiPrefs.permissions,
@@ -178,6 +217,8 @@ val runtimeEnv = RuntimeEnv(app)
             chatFontSize = uiPrefs.chatFontSize,
             workspaces = configs.workspaces(),
             projectDir = configs.projectDir() ?: File(app.filesDir, "workspace").absolutePath,
+            hosts = hostStore.hosts(),
+            activeHostId = hostStore.activeId(),
         )
     )
         private set
@@ -204,6 +245,10 @@ val runtimeEnv = RuntimeEnv(app)
             // call here doubled the engine round-trips per turn.
             engine.events.collect { ev -> handleEvent(ev) }
         }
+        // Remote host events use the same reducer and the same Main scope.
+        viewModelScope.launch {
+            backendEvents.collect { ev -> handleEvent(ev) }
+        }
         // Load config + state immediately (cheap, no engine). Repair runs
         // first: an entry saved as a bare base URL before normalization
         // existed would otherwise fail every turn with "stream ended
@@ -224,6 +269,42 @@ val runtimeEnv = RuntimeEnv(app)
                 "warning: no system CA certificates were readable — HTTPS " +
                     "providers will fail certificate verification.",
             )
+        }
+        // Resume the last paired host. The probe is asynchronous, so the app
+        // opens locally first and swaps in when the LAN answers.
+        hostStore.activeId()?.let { id ->
+            if (hostStore.hosts().any { it.id == id }) connectHost(id, quiet = true)
+        }
+        registerNetworkWatch()
+    }
+
+    /** Wi-Fi AP changes, airplane mode, and tailnet flaps all land here.
+     *  The host loop backs off on its own, but a callback re-probes the
+     *  moment a network exists again instead of waiting out the 8 s cap. */
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            if (!chat.isRemote) return
+            viewModelScope.launch(Dispatchers.IO) {
+                (chat as? RemoteChatBackend)?.reconnect()
+            }
+        }
+    }
+
+    private fun registerNetworkWatch() {
+        try {
+            getApplication<Application>()
+                .getSystemService(ConnectivityManager::class.java)
+                ?.registerDefaultNetworkCallback(networkCallback)
+        } catch (_: Exception) { /* no callback is a slower reconnect, not a failure */ }
+    }
+
+    /** Called by the activity's onResume: a phone that was asleep for an
+     *  hour should re-attach immediately, not after the read timeout. */
+    fun onForeground() {
+        foreground = true
+        if (!chat.isRemote) return
+        viewModelScope.launch(Dispatchers.IO) {
+            (chat as? RemoteChatBackend)?.reconnect()
         }
     }
 
@@ -267,8 +348,8 @@ val runtimeEnv = RuntimeEnv(app)
                     if (pt > 0 || ct > 0) {
                         val entry = UsageLedger.Entry(
                             t = now(),
-                            model = state.config?.model.orEmpty(),
-                            provider = state.config?.provider.orEmpty(),
+                            model = if (chat.isRemote) state.hostModel else state.config?.model.orEmpty(),
+                            provider = if (chat.isRemote) state.hostProvider else state.config?.provider.orEmpty(),
                             pt = pt,
                             ct = ct,
                             cost = u.costUsd ?: 0.0,
@@ -330,6 +411,78 @@ val runtimeEnv = RuntimeEnv(app)
                 if (ev.kind == "recall") noteRecall(ev.raw)
                 applyStep(ev.kind, ev.raw)
             }
+            is EngineEvent.SessionSnapshot -> applySnapshot(ev)
+            is EngineEvent.RemoteStatus -> {
+                state = state.copy(hostConnected = ev.connected, hostStatus = ev.detail)
+            }
+        }
+    }
+
+    /** Rebuild the visible transcript from a host snapshot. Used when the
+     *  replay cursor is outside the host's ring (host restart/eviction), so
+     *  the client can never apply a delta onto a transcript it no longer
+     *  has in full. */
+    private fun applySnapshot(ev: EngineEvent.SessionSnapshot) {
+        val current = state.activeSessionId
+        if (current != null && current != ev.sessionId) return
+        // Any buffered deltas belong to the transcript being replaced. A
+        // flush after the reset would append them AGAIN onto the seeded
+        // partial bubble (and metrics from before the gap are meaningless).
+        deltaFlush?.cancel()
+        deltaFlush = null
+        pendingDelta.setLength(0)
+        resetTurnMetrics()
+        val msgs = SessionMessageStore.turnsToMessages(ev.turns).toMutableList()
+        if (ev.streaming) {
+            msgs.add(
+                ChatMessage(
+                    id = nextId("m"),
+                    role = MsgRole.ASSISTANT,
+                    content = ev.partialAnswer,
+                    status = "streaming",
+                )
+            )
+        }
+        val approvals = ArrayList<Approval>()
+        for (i in 0 until ev.pendingApprovals.length()) {
+            val o = ev.pendingApprovals.optJSONObject(i) ?: continue
+            val id = o.optString("id")
+            if (id.isEmpty()) continue
+            approvals.add(
+                Approval(
+                    id = id,
+                    tool = o.optString("tool").ifBlank { "tool" },
+                    args = o.optJSONObject("args") ?: JSONObject(),
+                    risky = o.opt("risky") != false,
+                )
+            )
+        }
+        val cache = state.messageCache.toMutableMap()
+        cache[ev.sessionId] = msgs
+        val ns = chatNamespace
+        viewModelScope.launch(Dispatchers.IO) {
+            SessionMessageStore.save(getApplication(), ev.sessionId, msgs, ns)
+        }
+        state = state.copy(
+            activeSessionId = ev.sessionId,
+            messages = msgs,
+            messageCache = cache,
+            streaming = ev.streaming,
+            phase = if (ev.streaming) (state.phase ?: "Generating") else null,
+            approvals = approvals,
+            // A Mac-side model switch must reach the Composer's "Host ·"
+            // pill; the connect-time /v1/host snapshot is only the seed.
+            hostModel = if (ev.model.isNotBlank()) ev.model else state.hostModel,
+            hostProvider = if (ev.provider.isNotBlank()) ev.provider else state.hostProvider,
+        )
+        // A reconnect can restore an approval the phone never saw arrive
+        // (the request landed while the socket was dead). Surface it the
+        // same way a live `approval_request` does.
+        if (approvals.isNotEmpty() && !foreground) {
+            notifier?.invoke(
+                "Sofuu needs your approval",
+                "${approvals.first().tool} is waiting for approval",
+            )
         }
     }
 
@@ -605,8 +758,8 @@ val runtimeEnv = RuntimeEnv(app)
             }
             "allocgate" -> {
                 val bits = ArrayList<String>()
-                if (p.has("fit")) bits += p.opt("fit").toString()
-                if (p.has("actions")) bits += p.opt("actions").toString()
+                if (p.has("fit")) bits += p.opt("fit")?.toString().orEmpty()
+                if (p.has("actions")) bits += p.opt("actions")?.toString().orEmpty()
                 if (p.optString("action") == "learned_limit") bits += "learned ${p.optString("kind", "limit")} for ${p.optString("model", "model")}"
                 TimelineEntry(nextId("tl"), "allocgate", "Context gate", detail = if (bits.isNotEmpty()) bits.joinToString(" — ") else null, t = t)
             }
@@ -664,24 +817,31 @@ val runtimeEnv = RuntimeEnv(app)
             try {
                 var activeId = state.activeSessionId
                 if (activeId == null) {
-                    val minted = engine.newSession().get()
+                    val minted = chat.newSession()
                     val id = minted?.optString("sessionId").orEmpty()
-                    if (id.isNotEmpty()) {
-                        val sessionInfo = makeSessionInfo(id, task = userText.take(40).replace("\n", " "))
-                        withContext(Dispatchers.Main) {
-                            state = state.copy(sessions = listOf(sessionInfo) + state.sessions, activeSessionId = id)
-                            saveCurrentSessionMessages()
-                        }
-                        activeId = id
+                    if (id.isEmpty()) {
+                        throw IllegalStateException(
+                            minted?.optString("error").orEmpty()
+                                .ifBlank { "could not create a new session" },
+                        )
                     }
+                    val sessionInfo = makeSessionInfo(id, task = userText.take(40).replace("\n", " "))
+                    withContext(Dispatchers.Main) {
+                        state = state.copy(sessions = listOf(sessionInfo) + state.sessions, activeSessionId = id)
+                        saveCurrentSessionMessages()
+                    }
+                    activeId = id
                 }
                 withContext(Dispatchers.Main) {
                     saveCurrentSessionMessages()
                 }
-                engine.submitTurn(trimmed, noTools = state.mode == "chat", images = images)
+                chat.submitTurn(trimmed, noTools = state.mode == "chat", images = images)
             } catch (e: Exception) {
-                patchAssistant { m -> m.copy(status = "error", error = e.message) }
-                state = state.copy(streaming = false, phase = null)
+                // This coroutine is on Default; state is Main-owned.
+                withContext(Dispatchers.Main) {
+                    patchAssistant { m -> m.copy(status = "error", error = e.message) }
+                    state = state.copy(streaming = false, phase = null)
+                }
             }
         }
     }
@@ -710,12 +870,27 @@ val runtimeEnv = RuntimeEnv(app)
         // Default, not Main.immediate: every branch below blocks on an
         // engine future (bounded at 30 s), and on Main that is an ANR.
         viewModelScope.launch(Dispatchers.Default) {
+            // v1 remote surface: session + turn control only. The local
+            // settings/tooling commands would edit THIS device while the
+            // visible engine is a Mac, so say that instead of lying.
+            if (chat.isRemote) {
+                val localOnly = when (cmd) {
+                    "maxout", "model", "provider", "effort", "brain", "remember",
+                    "why", "tools", "agents", "rlm", "ml", "context" -> true
+                    "ctx" -> arg.isNotEmpty()
+                    else -> false
+                }
+                if (localOnly) {
+                    systemRow("/$cmd is not available on a remote host in this version.")
+                    return@launch
+                }
+            }
             when (cmd) {
                 "help", "commands" -> systemRow(help)
                 "new", "clear" -> newChat()
                 "compact" -> {
                     systemRow("Compacting…")
-                    val r = engine.compactSession().get()
+                    val r = chat.compactSession()
                     systemRow(if (r?.optBoolean("ok") == true) "Compacted." else "Compact failed" + (r?.optString("error")?.let { ": $it" } ?: ""))
                 }
                 "ctx" -> {
@@ -894,7 +1069,7 @@ val runtimeEnv = RuntimeEnv(app)
                     } else systemRow("Usage: /ml [on|off|info] — learn/adopt/discard/reset stay CLI-only for now.")
                 }
                 "sessions" -> {
-                    val sessions = engine.sessions().get()?.let { SessionInfo.fromJsonArray(it) } ?: emptyList()
+                    val sessions = chat.sessions()?.let { SessionInfo.fromJsonArray(it) } ?: emptyList()
                     systemRow(
                         if (sessions.isNotEmpty()) sessions.joinToString("\n") { "${it.id} · ${it.model.ifEmpty { "?" }} · ${if (it.ended) "ended" else "live"}" }
                         else "No sessions in this workspace yet."
@@ -905,24 +1080,24 @@ val runtimeEnv = RuntimeEnv(app)
                     systemRow(if (r?.optBoolean("ok") == true) "Context: ${(r.opt("state") ?: "{}").toString().take(2000)}" else "context: ${r?.optString("error") ?: "unavailable"}")
                 }
                 "cost" -> {
-                    val st = engine.chatState().get()
+                    val st = chat.chatState()
                     systemRow("Session: ${"%04f".format(st?.optDouble("sessionSpendUsd") ?: 0.0)} USD · ${"%,d".format((st?.optDouble("sessionTokens") ?: 0.0).toLong())} tokens")
                 }
                 "resume" -> {
                     if (arg.isEmpty()) {
-                        val sessions = engine.sessions().get()?.let { SessionInfo.fromJsonArray(it) } ?: emptyList()
+                        val sessions = chat.sessions()?.let { SessionInfo.fromJsonArray(it) } ?: emptyList()
                         systemRow(
                             if (sessions.isNotEmpty()) sessions.take(10).joinToString("\n") { "${it.id} · ${it.model.ifEmpty { "?" }} · ${if (it.ended) "ended" else "live"}" } + "\n/resume <id> to open one"
                             else "No sessions in this workspace yet."
                         )
                     } else {
-                        val r = engine.resumeSession(arg).get()
+                        val r = chat.resumeSession(arg)
                         systemRow(if (r?.optBoolean("ok") == true) "Resumed $arg." else "Resume failed" + (r?.optString("error")?.let { ": $it" } ?: ""))
                     }
                 }
                 "permissions" -> {
                     if (arg.isNotEmpty()) {
-                        val r = engine.setPermissions(arg).get()
+                        val r = chat.setPermissions(arg)
                         systemRow(if (r?.optBoolean("ok") == true) "Permissions → ${r.optString("permissions")}" else "Failed${r?.optString("error")?.let { ": $it" } ?: ""}")
                         setPermissions(arg)
                     } else systemRow("Permissions: ${state.permissions} (full | edit | plan | prompt)")
@@ -940,8 +1115,8 @@ val runtimeEnv = RuntimeEnv(app)
     private fun makeSessionInfo(id: String, task: String? = null): SessionInfo = SessionInfo(
         id = id,
         cwd = state.projectDir ?: "",
-        model = state.config?.model ?: "",
-        provider = state.config?.provider ?: "",
+        model = if (chat.isRemote) state.hostModel else state.config?.model ?: "",
+        provider = if (chat.isRemote) state.hostProvider else state.config?.provider ?: "",
         startedAt = System.currentTimeMillis() / 1000,
         lastSeen = System.currentTimeMillis() / 1000,
         task = task,
@@ -963,7 +1138,9 @@ val runtimeEnv = RuntimeEnv(app)
     private fun onEngineReady() {
         touchEngineUse()
         refreshSessions()
-        engine.setPermissions(state.permissions)
+        // The host owns its own permission profile; don't overwrite the
+        // local engine with it just because the UI is showing the host.
+        if (!chat.isRemote) engine.setPermissions(state.permissions)
         // Seed the ring denominator from config: the engine's boot ctx event
         // fires inside chat.init, before this app's event sink exists, so a
         // fresh launch with a saved model showed an empty ring until the
@@ -1012,7 +1189,7 @@ val runtimeEnv = RuntimeEnv(app)
             while (true) {
                 kotlinx.coroutines.delay(60_000)
                 val idle = android.os.SystemClock.elapsedRealtime() - lastEngineUse
-                if (engine.isReady && !state.streaming && state.approvals.isEmpty() &&
+                if (!chat.isRemote && engine.isReady && !state.streaming && state.approvals.isEmpty() &&
                     idle > IDLE_UNLOAD_MS
                 ) {
                     systemRow("Idle ${IDLE_UNLOAD_MS / 60_000} min — unloading the model (memory back to baseline).")
@@ -1041,7 +1218,13 @@ val runtimeEnv = RuntimeEnv(app)
      *  Main thread for EVERY warning row. Batching is keyed by session id,
      *  so a switch still persists the old chat — only the burst within one
      *  chat is collapsed. */
-    private val pendingSaves = LinkedHashMap<String, List<ChatMessage>>()
+    private data class PendingSave(
+        val namespace: String,
+        val sessionId: String,
+        val messages: List<ChatMessage>,
+    )
+
+    private val pendingSaves = LinkedHashMap<String, PendingSave>()
     private var saveJob: kotlinx.coroutines.Job? = null
 
     fun saveCurrentSessionMessages() {
@@ -1051,7 +1234,11 @@ val runtimeEnv = RuntimeEnv(app)
         val cache = state.messageCache.toMutableMap()
         cache[sid] = msgs
         state = state.copy(messageCache = cache)
-        synchronized(pendingSaves) { pendingSaves[sid] = msgs }
+        // Capture the namespace with the batch: switching to a host between
+        // queueing and draining must not write local rows into host cache.
+        val ns = chatNamespace
+        val key = "$ns/$sid"
+        synchronized(pendingSaves) { pendingSaves[key] = PendingSave(ns, sid, msgs) }
         if (saveJob?.isActive == true) return
         saveJob = viewModelScope.launch(Dispatchers.IO) {
             kotlinx.coroutines.delay(250)
@@ -1075,8 +1262,13 @@ val runtimeEnv = RuntimeEnv(app)
                 copy
             }
             if (batch.isEmpty()) return
-            for ((sid, msgs) in batch) {
-                SessionMessageStore.save(getApplication(), sid, msgs)
+            for ((_, pending) in batch) {
+                SessionMessageStore.save(
+                    getApplication(),
+                    pending.sessionId,
+                    pending.messages,
+                    pending.namespace,
+                )
             }
         }
     }
@@ -1093,9 +1285,10 @@ val runtimeEnv = RuntimeEnv(app)
     suspend fun loadSessionMessages(sessionId: String): List<ChatMessage> {
         val mem = state.messageCache[sessionId]
         val pDir = state.projectDir ?: engine.projectDir
+        val ns = chatNamespace
 
         val turns = withContext(Dispatchers.Default) {
-            engine.sessionTurns(sessionId).get()
+            chat.sessionTurns(sessionId)
         }
         val fromEngine = if (turns != null && turns.length() > 0) {
             SessionMessageStore.turnsToMessages(turns)
@@ -1104,7 +1297,7 @@ val runtimeEnv = RuntimeEnv(app)
         }
 
         val cached = mem ?: withContext(Dispatchers.IO) {
-            SessionMessageStore.load(getApplication(), pDir, sessionId)
+            SessionMessageStore.load(getApplication(), pDir, sessionId, ns)
         }
         val cachedTurns = cached?.count { it.role == MsgRole.USER } ?: 0
         val engineTurns = turns?.length() ?: 0
@@ -1115,7 +1308,7 @@ val runtimeEnv = RuntimeEnv(app)
         if (msgs.isNotEmpty()) {
             if (useEngine) {
                 withContext(Dispatchers.IO) {
-                    SessionMessageStore.save(getApplication(), sessionId, msgs)
+                    SessionMessageStore.save(getApplication(), sessionId, msgs, ns)
                 }
             }
             val cache = state.messageCache.toMutableMap()
@@ -1127,29 +1320,32 @@ val runtimeEnv = RuntimeEnv(app)
 
     fun refreshSessions(resumeNewest: Boolean = false) {
         val ws = state.projectDir ?: engine.projectDir
+        val remote = chat.isRemote
         viewModelScope.launch {
             val fetched = withContext(Dispatchers.Default) {
-                engine.sessions().get()?.let { SessionInfo.fromJsonArray(it) }
+                chat.sessions()?.let { SessionInfo.fromJsonArray(it) }
             } ?: emptyList()
             // Merge, never clobber: the fetched list may be stale.
             val byId = LinkedHashMap<String, SessionInfo>()
             fetched.forEach { byId[it.id] = it }
             state.sessions.forEach { if (!byId.containsKey(it.id)) byId[it.id] = it }
 
-            // Discover locally saved sessions on disk. getSessionTask parses
-            // a whole transcript per id — disk work, so off Main.
-            val local = withContext(Dispatchers.IO) {
-                SessionMessageStore.getLocalSessionIds(getApplication(), ws).map { id ->
-                    val file = File(ws, ".sofuu/sessions/$id")
-                    val time = if (file.exists()) file.lastModified() / 1000 else System.currentTimeMillis() / 1000
-                    Triple(id, time, SessionMessageStore.getSessionTask(getApplication(), ws, id))
+            // Discover locally saved sessions on disk — local backend only;
+            // a host's transcripts are not part of this device's workspace.
+            if (!remote) {
+                val local = withContext(Dispatchers.IO) {
+                    SessionMessageStore.getLocalSessionIds(getApplication(), ws).map { id ->
+                        val file = File(ws, ".sofuu/sessions/$id")
+                        val time = if (file.exists()) file.lastModified() / 1000 else System.currentTimeMillis() / 1000
+                        Triple(id, time, SessionMessageStore.getSessionTask(getApplication(), ws, id))
+                    }
                 }
-            }
-            local.forEach { (id, time, taskName) ->
-                if (!byId.containsKey(id)) {
-                    byId[id] = SessionInfo(id = id, startedAt = time, lastSeen = time, task = taskName)
-                } else if (byId[id]?.task.isNullOrBlank() && !taskName.isNullOrBlank()) {
-                    byId[id] = byId[id]!!.copy(task = taskName)
+                local.forEach { (id, time, taskName) ->
+                    if (!byId.containsKey(id)) {
+                        byId[id] = SessionInfo(id = id, startedAt = time, lastSeen = time, task = taskName)
+                    } else if (byId[id]?.task.isNullOrBlank() && !taskName.isNullOrBlank()) {
+                        byId[id] = byId[id]!!.copy(task = taskName)
+                    }
                 }
             }
 
@@ -1195,9 +1391,10 @@ val runtimeEnv = RuntimeEnv(app)
                     }
                 }
             }
-            // Resume ONLY when explicitly asked:
+            // Resume ONLY when explicitly asked. Off Main: a remote resume
+            // is an HTTP round-trip.
             if (resumeNewest && nextActive != null) {
-                engine.resumeSession(nextActive)
+                withContext(Dispatchers.Default) { chat.resumeSession(nextActive) }
             }
         }
     }
@@ -1217,7 +1414,8 @@ val runtimeEnv = RuntimeEnv(app)
         state.activeSessionId?.let { state.ctx?.let { m -> ctxCache[it] = m } }
 
         val pDir = state.projectDir ?: engine.projectDir
-        val memMessages = id?.let { cache[it] } ?: id?.let { SessionMessageStore.load(getApplication(), pDir, it) }
+        val ns = chatNamespace
+        val memMessages = id?.let { cache[it] } ?: id?.let { SessionMessageStore.load(getApplication(), pDir, it, ns) }
         if (id != null && memMessages != null) {
             cache[id] = memMessages
         }
@@ -1232,8 +1430,8 @@ val runtimeEnv = RuntimeEnv(app)
         )
         if (id != null) {
             viewModelScope.launch {
-                engine.resumeSession(id)
-                if (memMessages.isNullOrEmpty()) {
+                val resumed = withContext(Dispatchers.Default) { chat.resumeSession(id) }
+                if (memMessages.isNullOrEmpty() || resumed?.optBoolean("ok") != true) {
                     val loaded = loadSessionMessages(id)
                     withContext(Dispatchers.Main) {
                         if (state.activeSessionId == id) {
@@ -1251,6 +1449,10 @@ val runtimeEnv = RuntimeEnv(app)
             return
         }
         saveCurrentSessionMessages()
+        // Detach a remote host's stream without cancelling its turn: the
+        // Mac keeps working, but a late snapshot must not repopulate the
+        // fresh chat with the previous session.
+        chat.leaveSession()
         val cache = state.messageCache.toMutableMap()
         state.activeSessionId?.let { cache[it] = state.messages }
         val ctxCache = state.ctxCache.toMutableMap()
@@ -1268,16 +1470,21 @@ val runtimeEnv = RuntimeEnv(app)
 
     fun deleteSession(id: String) {
         viewModelScope.launch(Dispatchers.Default) {
-            val r = engine.deleteSession(id).get()
+            val remote = chat.isRemote
+            val ns = chatNamespace
+            val r = chat.deleteSession(id)
             if (r?.optBoolean("ok") != true) return@launch
             // Remove the session's files from the ACTIVE project — the
             // engine's boot directory is the wrong one after a switch.
+            // A remote host's files are not ours to touch.
             val pDir = state.projectDir ?: engine.projectDir
             withContext(Dispatchers.IO) {
-                val base = File(pDir, ".sofuu/sessions")
-                File(base, id).deleteRecursively()
-                File(base, "$id.qtsq").delete()
-                SessionMessageStore.delete(getApplication(), pDir, id)
+                if (!remote) {
+                    val base = File(pDir, ".sofuu/sessions")
+                    File(base, id).deleteRecursively()
+                    File(base, "$id.qtsq").delete()
+                }
+                SessionMessageStore.delete(getApplication(), pDir, id, ns)
             }
             withContext(Dispatchers.Main) { applyDeleteSession(id) }
         }
@@ -1301,23 +1508,27 @@ val runtimeEnv = RuntimeEnv(app)
 
     fun clearSessions() {
         viewModelScope.launch(Dispatchers.Default) {
-            val r = engine.clearSessions().get()
+            val remote = chat.isRemote
+            val ns = chatNamespace
+            val r = chat.clearSessions()
             if (r?.optBoolean("ok") != true) return@launch
             val ids = r.optJSONArray("ids")
             val pDir = state.projectDir ?: engine.projectDir
             withContext(Dispatchers.IO) {
-                val base = File(pDir, ".sofuu/sessions")
-                ids?.let { arr ->
-                    for (i in 0 until arr.length()) {
-                        val sid = arr.optString(i)
-                        // Ids are engine-generated; never let a registry
-                        // entry turn into a traversal.
-                        if (sid.isEmpty() || sid.contains('/') || sid.contains('\\') || sid.startsWith('.')) continue
-                        File(base, sid).deleteRecursively()
-                        File(base, "$sid.qtsq").delete()
+                if (!remote) {
+                    val base = File(pDir, ".sofuu/sessions")
+                    ids?.let { arr ->
+                        for (i in 0 until arr.length()) {
+                            val sid = arr.optString(i)
+                            // Ids are engine-generated; never let a registry
+                            // entry turn into a traversal.
+                            if (sid.isEmpty() || sid.contains('/') || sid.contains('\\') || sid.startsWith('.')) continue
+                            File(base, sid).deleteRecursively()
+                            File(base, "$sid.qtsq").delete()
+                        }
                     }
                 }
-                SessionMessageStore.deleteAll(getApplication(), pDir)
+                SessionMessageStore.deleteAll(getApplication(), pDir, ns)
             }
             withContext(Dispatchers.Main) { applyClearSessions() }
         }
@@ -1333,7 +1544,8 @@ val runtimeEnv = RuntimeEnv(app)
     /** Load a past session's transcript for read-only viewing. */
     fun openPreview(session: SessionInfo) {
         viewModelScope.launch {
-            val loaded = SessionMessageStore.load(getApplication(), state.projectDir, session.id)
+            val ns = chatNamespace
+            val loaded = SessionMessageStore.load(getApplication(), state.projectDir, session.id, ns)
             val turns = if (!loaded.isNullOrEmpty()) {
                 val list = ArrayList<PreviewTurn>()
                 var curPrompt = ""
@@ -1348,7 +1560,7 @@ val runtimeEnv = RuntimeEnv(app)
                 list
             } else {
                 withContext(Dispatchers.Default) {
-                    engine.sessionTurns(session.id).get()?.let { arr ->
+                    chat.sessionTurns(session.id)?.let { arr ->
                         (0 until arr.length()).map { i ->
                             val o = arr.optJSONObject(i) ?: return@map PreviewTurn("", "")
                             PreviewTurn(o.optString("prompt"), o.optString("answer"))
@@ -1477,6 +1689,9 @@ val runtimeEnv = RuntimeEnv(app)
     }
 
     fun engineChatState(): JSONObject {
+        // A remote host's live state arrives through /v1/host + snapshots;
+        // the local engine cache must not masquerade as the visible chat.
+        if (chat.isRemote) return getOrBuildChatState()
         if (!engine.isReady) return cachedChatState ?: getOrBuildChatState()
         return try {
             val res = engine.chatState().get(2, TimeUnit.SECONDS)
@@ -1963,7 +2178,7 @@ val runtimeEnv = RuntimeEnv(app)
     // ── Approvals / cancel ────────────────────────────────────────
 
     fun approve(id: String, allow: Boolean, always: Boolean = false) {
-        engine.resolveApproval(id, allow, always)
+        chat.resolveApproval(id, allow, always)
         state = state.copy(approvals = state.approvals.filterNot { it.id == id })
     }
 
@@ -1988,16 +2203,19 @@ val runtimeEnv = RuntimeEnv(app)
             }
         }
         saveCurrentSessionMessages()
-        engine.cancelTurn()
+        chat.cancelTurn()
     }
 
     // ── UI toggles ────────────────────────────────────────────────
 
     fun setPermissions(p: String) {
         val v = if (p in listOf("full", "edit", "plan", "prompt")) p else "prompt"
-        uiPrefs.permissions = v
+        // A host has its own permission profile. Writing the local
+        // preference here would silently overwrite this device's choice
+        // with the Mac's on every pill tap.
+        if (!chat.isRemote) uiPrefs.permissions = v
         state = state.copy(permissions = v)
-        viewModelScope.launch { engine.setPermissions(v) }
+        viewModelScope.launch(Dispatchers.Default) { chat.setPermissions(v) }
     }
 
     fun setMode(m: String) {
@@ -2146,6 +2364,185 @@ val runtimeEnv = RuntimeEnv(app)
         state = state.copy(chatFontSize = uiPrefs.chatFontSize)
     }
 
+    // ── Paired hosts (remote chat) ────────────────────────────────
+
+    /** Save a host with a pasted master (or device) bearer token. */
+    fun addHost(name: String, address: String, token: String, connect: Boolean = true) {
+        if (address.isBlank() || token.isBlank()) {
+            state = state.copy(hostStatus = "Address and token are required.")
+            return
+        }
+        val profile = HostProfile.create(name, address, token)
+        hostStore.save(profile)
+        state = state.copy(
+            hosts = hostStore.hosts(),
+            hostStatus = "Saved ${profile.name}. Connecting…",
+        )
+        if (connect) connectHost(profile.id)
+    }
+
+    /** Exchange a short-lived pairing PIN for a device token, then adopt it. */
+    fun pairHost(name: String, address: String, pin: String) {
+        if (address.isBlank() || pin.isBlank()) {
+            state = state.copy(hostStatus = "Address and pairing PIN are required.")
+            return
+        }
+        state = state.copy(hostStatus = "Pairing…")
+        viewModelScope.launch(Dispatchers.IO) {
+            val base = HostProfile.create(name, address, "").baseUrl()
+            try {
+                val client = HostHttpClient(base, "")
+                val r = client.request(
+                    "POST",
+                    "/v1/pair",
+                    JSONObject()
+                        .put("pin", pin.trim())
+                        .put("name", android.os.Build.MODEL ?: "Android")
+                        .put("platform", "android"),
+                )
+                val token = r.optString("token")
+                if (token.isBlank()) throw IllegalStateException("host returned no device token")
+                val hostInfo = r.optJSONObject("host")
+                val label = name.ifBlank {
+                    hostInfo?.optString("name")?.ifBlank { null } ?: "Sofuu host"
+                }
+                val profile = HostProfile.create(label, address, token)
+                hostStore.save(profile)
+                withContext(Dispatchers.Main) {
+                    state = state.copy(
+                        hosts = hostStore.hosts(),
+                        hostStatus = "Paired with ${profile.name}.",
+                    )
+                }
+                connectHost(profile.id)
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    state = state.copy(hostStatus = "Pairing failed: ${e.message}")
+                }
+            }
+        }
+    }
+
+    fun connectHost(id: String, quiet: Boolean = false) {
+        val profile = hostStore.hosts().firstOrNull { it.id == id } ?: return
+        if (chat.isRemote && activeHost?.id == id) {
+            // Already on this host: re-probe instead of stacking a second
+            // backend on top of the one that is backing off.
+            viewModelScope.launch(Dispatchers.IO) {
+                (chat as? RemoteChatBackend)?.reconnect()
+            }
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val remote = RemoteChatBackend(profile, hostStore) { ev -> backendEvents.tryEmit(ev) }
+            val info = remote.checkHost()
+            if (info == null) {
+                remote.close()
+                withContext(Dispatchers.Main) {
+                    state = state.copy(hostStatus = "Could not reach ${profile.name}.")
+                    if (!quiet) systemRow("Host ${profile.displayAddress()} is unreachable — check the LAN address and token.")
+                }
+                return@launch
+            }
+            withContext(Dispatchers.Main) {
+                if (state.streaming) saveCurrentSessionMessages()
+            }
+            // Closing flushes cursors to the encrypted store — Keystore
+            // work must never touch Main.
+            chat.close()
+            withContext(Dispatchers.Main) {
+                chat = remote
+                activeHost = profile
+                hostStore.setActiveId(profile.id)
+                hostStore.touch(profile)
+                state = state.copy(
+                    hosts = hostStore.hosts(),
+                    activeHostId = profile.id,
+                    hostConnected = true,
+                    hostStatus = null,
+                    hostModel = info.optString("model"),
+                    hostProvider = info.optString("provider"),
+                    permissions = info.optString("permissions").ifBlank { state.permissions },
+                    sessions = emptyList(),
+                    activeSessionId = null,
+                    messages = emptyList(),
+                    messageCache = emptyMap(),
+                    ctx = null,
+                    ctxCache = emptyMap(),
+                    approvals = emptyList(),
+                    streaming = false,
+                    phase = null,
+                    preview = null,
+                )
+                systemRow("Connected to ${profile.name} · ${profile.displayAddress()}")
+            }
+            refreshSessions(resumeNewest = true)
+        }
+    }
+
+    fun disconnectHost() {
+        if (!chat.isRemote) return
+        saveCurrentSessionMessages()
+        viewModelScope.launch(Dispatchers.Main) {
+            withContext(Dispatchers.IO) { chat.close() }
+            chat = localChat
+            activeHost = null
+            hostStore.setActiveId(null)
+            state = state.copy(
+                activeHostId = null,
+                hostConnected = false,
+                hostStatus = null,
+                hostModel = "",
+                hostProvider = "",
+                permissions = uiPrefs.permissions,
+                sessions = emptyList(),
+                activeSessionId = null,
+                messages = emptyList(),
+                messageCache = emptyMap(),
+                ctx = null,
+                ctxCache = emptyMap(),
+                approvals = emptyList(),
+                streaming = false,
+                phase = null,
+                preview = null,
+            )
+            systemRow("Disconnected — back to this device.")
+            refreshSessions(resumeNewest = true)
+        }
+    }
+
+    fun forgetHost(id: String) {
+        val wasActive = activeHost?.id == id
+        if (wasActive) disconnectHost()
+        hostStore.remove(id)
+        state = state.copy(
+            hosts = hostStore.hosts(),
+            // disconnectHost() completes asynchronously; do not resurrect
+            // the just-forgotten id from the store in the meantime.
+            activeHostId = if (wasActive) null else hostStore.activeId(),
+        )
+    }
+
+    fun testHost(id: String) {
+        val profile = hostStore.hosts().firstOrNull { it.id == id } ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = try {
+                HostHttpClient(profile.baseUrl(), profile.token).request("GET", "/v1/host")
+                true
+            } catch (_: Exception) {
+                false
+            }
+            withContext(Dispatchers.Main) {
+                state = state.copy(
+                    hostStatus = if (ok) "${profile.name} answered /v1/host."
+                    else "${profile.name} did not answer.",
+                )
+                if (ok) hostStore.touch(profile)
+                state = state.copy(hosts = hostStore.hosts())
+            }
+        }
+    }
+
     fun openSettings(open: Boolean, tab: String? = null) {
         val t = if (open) (tab ?: "general") else "general"
         state = state.copy(settingsOpen = open, settingsTab = t)
@@ -2190,6 +2587,12 @@ val runtimeEnv = RuntimeEnv(app)
 
     override fun onCleared() {
         super.onCleared()
+        try {
+            getApplication<Application>()
+                .getSystemService(ConnectivityManager::class.java)
+                ?.unregisterNetworkCallback(networkCallback)
+        } catch (_: Exception) { /* not registered */ }
+        if (chat.isRemote) chat.close()
         engine.shutdown()
     }
 }

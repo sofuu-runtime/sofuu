@@ -10,6 +10,7 @@ security = "1.1.0-alpha06"
 junit = "4.13.2"
 androidxJunit = "1.2.1"
 espresso = "3.6.1"
+json = "20240303"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -28,6 +29,9 @@ androidx-security-crypto = { group = "androidx.security", name = "security-crypt
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidxJunit" }
 androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espresso" }
+# Real org.json for JVM unit tests: the mockable android.jar stubs every
+# method with a RuntimeException, which makes JSON parsing untestable.
+json = { group = "org.json", name = "json", version.ref = "json" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

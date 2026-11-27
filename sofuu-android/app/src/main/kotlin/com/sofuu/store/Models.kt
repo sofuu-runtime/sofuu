@@ -83,13 +83,30 @@ data class Usage(
     }
 
     companion object {
+        /** Reads BOTH spellings: live `done` events use camelCase
+         *  (`promptTokens`), while persisted session turns store compact
+         *  keys (`pt`, `ct`, `cost`, `model`). A host replay rebuilds from
+         *  the latter, so accepting only one silently dropped the meter. */
         fun fromJson(o: JSONObject): Usage = Usage(
-            promptTokens = if (o.has("promptTokens") && !o.isNull("promptTokens")) o.optLong("promptTokens") else null,
-            completionTokens = if (o.has("completionTokens") && !o.isNull("completionTokens")) o.optLong("completionTokens") else null,
-            costUsd = if (o.has("costUsd") && !o.isNull("costUsd")) o.optDouble("costUsd") else null,
+            promptTokens = longOrNull(o, "promptTokens", "pt"),
+            completionTokens = longOrNull(o, "completionTokens", "ct"),
+            costUsd = doubleOrNull(o, "costUsd", "cost"),
             steps = if (o.has("steps") && !o.isNull("steps")) o.optInt("steps") else null,
-            servedBy = o.optString("servedBy").takeIf { it.isNotEmpty() },
+            servedBy = o.optString("servedBy").takeIf { it.isNotEmpty() }
+                ?: o.optString("model").takeIf { it.isNotEmpty() },
         )
+
+        private fun longOrNull(o: JSONObject, a: String, b: String): Long? {
+            if (o.has(a) && !o.isNull(a)) return o.optLong(a)
+            if (o.has(b) && !o.isNull(b)) return o.optLong(b)
+            return null
+        }
+
+        private fun doubleOrNull(o: JSONObject, a: String, b: String): Double? {
+            if (o.has(a) && !o.isNull(a)) return o.optDouble(a)
+            if (o.has(b) && !o.isNull(b)) return o.optDouble(b)
+            return null
+        }
     }
 }
 

@@ -124,7 +124,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        store.foreground = true
+        store.onForeground()
     }
 
     override fun onPause() {

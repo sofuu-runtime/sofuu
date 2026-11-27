@@ -36,6 +36,7 @@ import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
@@ -198,6 +199,24 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
             verticalAlignment = Alignment.CenterVertically,
         ) {
             BarIcon(Icons2.Menu, "Workspaces") { store.setDrawer(true) }
+            // Host link dot: green while the paired Mac answers, amber while
+            // reconnecting. Tap opens Settings › Host.
+            if (state.activeHostId != null) {
+                Box(
+                    Modifier
+                        .size(24.dp)
+                        .clip(CircleShape)
+                        .clickable { store.openSettings(true, "host") },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(
+                        Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(if (state.hostConnected) c.accent else c.warn),
+                    )
+                }
+            }
             // Session pills strip (scrollable, active highlighted).
             Row(
                 Modifier
@@ -310,7 +329,20 @@ fun SofuuApp(store: AppStore, onPickFiles: () -> Unit, onRequestMic: () -> Boole
                     streaming = state.streaming,
                     mode = state.mode,
                     permissions = state.permissions,
-                    config = state.config,
+                    // A dropped link must NOT flip the composer back to the
+                    // local model: sends still go to the host the moment it
+                    // returns. Only an explicit Disconnect does that.
+                    remote = state.activeHostId != null,
+                    config = if (state.activeHostId != null) {
+                        // No local fallback: showing this phone's model
+                        // under "Host ·" would label a Mac turn with a
+                        // model the Mac is not running. Blank means the
+                        // host has not reported one yet.
+                        state.config?.copy(
+                            model = state.hostModel,
+                            provider = state.hostProvider,
+                        )
+                    } else state.config,
                     localModelLabels = state.localModelLabels,
                     ctx = state.ctx,
                     images = state.pickedImages,

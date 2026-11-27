@@ -1,10 +1,21 @@
 import java.util.Properties
+import org.gradle.api.tasks.Copy
 
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
 }
+
+// The embedded canvas compiles the canonical ES 3.0 UI shader from
+// crates/sofuu-gpu, not a stale in-app copy. Generating the asset at build
+// time keeps the APK in lock-step with the Rust GLES renderer.
+val uiShaderAssets = layout.buildDirectory.dir("generated/uiAssets")
+val syncUiShader = tasks.register<Copy>("syncUiShader") {
+    from(rootProject.file("../crates/sofuu-gpu/src/shaders/glsl/ui_shaders_es3.glsl"))
+    into(uiShaderAssets)
+}
+tasks.named("preBuild").configure { dependsOn(syncUiShader) }
 
 // Release signing. Optional on purpose: keystore.properties is not checked
 // in, so a fresh clone still configures and still runs `assembleDebug`.
@@ -103,6 +114,8 @@ android {
         compose = true
     }
 
+    sourceSets.getByName("main").assets.srcDir(uiShaderAssets)
+
     packaging {
         jniLibs.useLegacyPackaging = false
     }
@@ -123,6 +136,10 @@ dependencies {
     implementation(libs.androidx.security.crypto)
     debugImplementation(libs.androidx.ui.tooling)
     testImplementation(libs.junit)
+    // The Android mockable jar's org.json throws on every call; give unit
+    // tests the real implementation so host payloads parse for real.
+    testImplementation(libs.json)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation("androidx.test:core:1.6.1")
 }

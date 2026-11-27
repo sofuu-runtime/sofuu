@@ -1,9 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Dev-only: cleartext to the host machine from the emulator (10.0.2.2)
-     so the turn smoke test can reach a local mock. Everything else stays
-     HTTPS-only (usesCleartextTraffic=false in the manifest). -->
+<!-- LAN host mode (PLAN-ANDROID-REMOTE-HOST-RECONNECT) talks to a paired
+     `sofuu host` on the local network over plain HTTP + a bearer token.
+     Android's domain-config cannot express private CIDR ranges, so cleartext
+     is permitted app-wide; every host still requires a user-supplied address
+     and a paired/device token. Provider endpoints continue to use HTTPS.
+     TLS/pinning is the documented v1 non-goal. -->
 <network-security-config>
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="true">10.0.2.2</domain>
-    </domain-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
 </network-security-config>

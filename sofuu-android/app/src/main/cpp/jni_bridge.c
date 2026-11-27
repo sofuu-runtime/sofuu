@@ -17,6 +17,8 @@
  */
 
 #include <jni.h>
+#include <pthread.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -726,4 +728,325 @@ Java_com_sofuu_engine_SofuuBridge_nativeFreeHostTools(JNIEnv *env, jclass cls) {
     if (g_host_result != NULL) { free(g_host_result); g_host_result = NULL; g_host_result_cap = 0; }
     if (attached) (*g_jvm)->DetachCurrentThread(g_jvm);
     return n;
+}
+
+/* ── Embedded GPU UI (PLAN-EMBEDDED-NATIVE-HOST-C-ABI) ──────────────
+ *
+ * Thin JNI funnels to the additive `sofuu_ui_*` C surface. The renderer
+ * itself lives in `ui_gles.c` (host-owned GL context, zero-copy DrawList),
+ * so `libsofuu` keeps zero GPU/EGL linkage. Session creation and input are
+ * thread-safe; attach/detach must run on the runtime's owning thread.
+ */
+
+typedef struct SofuuUiWakeBinding {
+    jlong session;
+    jobject view;          /* global ref to the GLSurfaceView */
+    jmethodID wake_method; /* requestRender()V or postInvalidate()V */
+    struct SofuuUiWakeBinding *next;
+} SofuuUiWakeBinding;
+
+static SofuuUiWakeBinding *g_ui_wakes = NULL;
+static pthread_mutex_t g_ui_wake_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Runs on whatever thread pushed a patch / dispatched input. The session's
+ * wake slot has already released its locks, so re-entering JNI here is safe. */
+static void ui_wake_trampoline(void *opaque) {
+    jlong session = (jlong)(intptr_t)opaque;
+    JNIEnv *env = NULL;
+    int attached = 0;
+    if (g_jvm == NULL) return;
+
+    /* Hold the lock across the call: detach deletes the global ref, and a
+     * borrowed pointer surviving that DeleteGlobalRef would be a UAF. The
+     * wake method only flags the GL thread, so it never calls back in. */
+    pthread_mutex_lock(&g_ui_wake_mutex);
+    SofuuUiWakeBinding *b = g_ui_wakes;
+    while (b != NULL && b->session != session) b = b->next;
+    if (b == NULL || b->view == NULL || b->wake_method == NULL) {
+        pthread_mutex_unlock(&g_ui_wake_mutex);
+        return;
+    }
+    if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != JNI_OK) {
+            pthread_mutex_unlock(&g_ui_wake_mutex);
+            return;
+        }
+        attached = 1;
+    }
+    (*env)->CallVoidMethod(env, b->view, b->wake_method);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionClear(env);
+    }
+    if (attached) (*g_jvm)->DetachCurrentThread(g_jvm);
+    pthread_mutex_unlock(&g_ui_wake_mutex);
+}
+
+/* Drop the wake binding for one session. Returns the previous view ref so
+ * the caller can release it outside the lock (JNI calls may block). */
+static jobject ui_wake_unbind(JNIEnv *env, jlong session) {
+    jobject old = NULL;
+    pthread_mutex_lock(&g_ui_wake_mutex);
+    SofuuUiWakeBinding **link = &g_ui_wakes;
+    while (*link != NULL && (*link)->session != session) link = &(*link)->next;
+    if (*link != NULL) {
+        SofuuUiWakeBinding *dead = *link;
+        *link = dead->next;
+        old = dead->view;
+        free(dead);
+    }
+    pthread_mutex_unlock(&g_ui_wake_mutex);
+    if (old != NULL && env != NULL) (*env)->DeleteGlobalRef(env, old);
+    return old;
+}
+
+/* SofuuUiNative.nativeSessionNew(configJson) → session pointer (0 on error) */
+JNIEXPORT jlong JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativeSessionNew(JNIEnv *env, jobject thiz,
+                                                     jstring config_json) {
+    (void)thiz;
+    const char *config_c = NULL;
+    if (config_json != NULL) {
+        config_c = (*env)->GetStringUTFChars(env, config_json, NULL);
+        if (config_c == NULL) return 0;
+    }
+    char *err = NULL;
+    SofuuUiSession *ui = sofuu_ui_session_new(config_c, &err);
+    if (config_json != NULL && config_c != NULL) {
+        (*env)->ReleaseStringUTFChars(env, config_json, config_c);
+    }
+    if (err != NULL) {
+        __android_log_print(ANDROID_LOG_ERROR, "sofuu-ui", "session_new: %s", err);
+        sofuu_free(err);
+    }
+    return (jlong)(intptr_t)ui;
+}
+
+/* SofuuUiNative.nativeSessionFree(session) */
+JNIEXPORT void JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativeSessionFree(JNIEnv *env, jobject thiz,
+                                                      jlong session) {
+    (void)thiz;
+    if (session == 0) return;
+    ui_wake_unbind(env, session);
+    sofuu_ui_session_set_wake_cb((SofuuUiSession *)(intptr_t)session, NULL, NULL);
+    sofuu_ui_session_free((SofuuUiSession *)(intptr_t)session);
+}
+
+/* SofuuUiNative.nativeSetWakeView(session, view | null) → int */
+JNIEXPORT jint JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativeSetWakeView(JNIEnv *env, jobject thiz,
+                                                      jlong session, jobject view) {
+    (void)thiz;
+    if (session == 0) return SOFUU_ERR_INVALID_ARG;
+    if (view == NULL) {
+        ui_wake_unbind(env, session);
+        return sofuu_ui_session_set_wake_cb((SofuuUiSession *)(intptr_t)session,
+                                            NULL, NULL);
+    }
+
+    jclass cls = (*env)->GetObjectClass(env, view);
+    if (cls == NULL) return SOFUU_ERR_INVALID_ARG;
+    jmethodID mid = (*env)->GetMethodID(env, cls, "requestRender", "()V");
+    if (mid == NULL) {
+        /* Fall back for a plain View / a test double. postInvalidate is the
+         * one repaint request that is legal from any thread. */
+        (*env)->ExceptionClear(env);
+        mid = (*env)->GetMethodID(env, cls, "postInvalidate", "()V");
+    }
+    (*env)->DeleteLocalRef(env, cls);
+    if (mid == NULL) {
+        (*env)->ExceptionClear(env);
+        return SOFUU_ERR_INVALID_ARG;
+    }
+    jobject global = (*env)->NewGlobalRef(env, view);
+    if (global == NULL) return SOFUU_ERR_PANIC;
+
+    pthread_mutex_lock(&g_ui_wake_mutex);
+    SofuuUiWakeBinding *b = g_ui_wakes;
+    while (b != NULL && b->session != session) b = b->next;
+    jobject old = NULL;
+    if (b == NULL) {
+        b = (SofuuUiWakeBinding *)calloc(1, sizeof(SofuuUiWakeBinding));
+        if (b == NULL) {
+            pthread_mutex_unlock(&g_ui_wake_mutex);
+            (*env)->DeleteGlobalRef(env, global);
+            return SOFUU_ERR_PANIC;
+        }
+        b->session = session;
+        b->next = g_ui_wakes;
+        g_ui_wakes = b;
+    } else {
+        old = b->view;
+    }
+    b->view = global;
+    b->wake_method = mid;
+    pthread_mutex_unlock(&g_ui_wake_mutex);
+    if (old != NULL) (*env)->DeleteGlobalRef(env, old);
+
+    int rc = sofuu_ui_session_set_wake_cb((SofuuUiSession *)(intptr_t)session,
+                                          ui_wake_trampoline,
+                                          (void *)(intptr_t)session);
+    if (rc != SOFUU_OK) ui_wake_unbind(env, session);
+    return rc;
+}
+
+/* SofuuUiNative.nativeAttachRuntime(rt, session) → int */
+JNIEXPORT jint JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativeAttachRuntime(JNIEnv *env, jobject thiz,
+                                                        jlong rt_ptr, jlong session) {
+    (void)env; (void)thiz;
+    if (rt_ptr == 0 || session == 0) return SOFUU_ERR_INVALID_ARG;
+    return sofuu_ui_attach_runtime((SofuuRuntime *)(intptr_t)rt_ptr,
+                                   (SofuuUiSession *)(intptr_t)session);
+}
+
+/* SofuuUiNative.nativeDetachRuntime(rt) → int */
+JNIEXPORT jint JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativeDetachRuntime(JNIEnv *env, jobject thiz,
+                                                        jlong rt_ptr) {
+    (void)env; (void)thiz;
+    if (rt_ptr == 0) return SOFUU_ERR_INVALID_ARG;
+    return sofuu_ui_detach_runtime((SofuuRuntime *)(intptr_t)rt_ptr);
+}
+
+/* SofuuUiNative.nativeSetSafeInsets(session, topPx, bottomPx) → int */
+JNIEXPORT jint JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativeSetSafeInsets(JNIEnv *env, jobject thiz,
+                                                        jlong session, jfloat top,
+                                                        jfloat bottom) {
+    (void)env; (void)thiz;
+    if (session == 0) return SOFUU_ERR_INVALID_ARG;
+    return sofuu_ui_session_set_safe_insets((SofuuUiSession *)(intptr_t)session,
+                                            top, bottom);
+}
+
+/* SofuuUiNative.nativeGetAtlas(session, outMeta) → ByteArray?
+ * outMeta = [width, height, Float.floatToRawIntBits(px_range)]. */
+JNIEXPORT jbyteArray JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativeGetAtlas(JNIEnv *env, jobject thiz,
+                                                   jlong session, jintArray out_meta) {
+    (void)thiz;
+    if (session == 0) return NULL;
+    const uint8_t *pixels = NULL;
+    uint32_t width = 0, height = 0;
+    float px_range = 0.0f;
+    int rc = sofuu_ui_session_get_atlas((SofuuUiSession *)(intptr_t)session,
+                                        &pixels, &width, &height, &px_range);
+    if (rc != SOFUU_OK || pixels == NULL || width == 0 || height == 0) return NULL;
+    if (out_meta != NULL) {
+        union { float f; int32_t i; } bits;
+        bits.f = px_range;
+        jint meta[3] = {(jint)width, (jint)height, (jint)bits.i};
+        (*env)->SetIntArrayRegion(env, out_meta, 0, 3, meta);
+    }
+    jsize len = (jsize)((size_t)width * (size_t)height);
+    jbyteArray arr = (*env)->NewByteArray(env, len);
+    if (arr == NULL) return NULL;
+    (*env)->SetByteArrayRegion(env, arr, 0, len, (const jbyte *)pixels);
+    return arr;
+}
+
+/* SofuuUiNative.nativePushPatchJson(session, patch) → int */
+JNIEXPORT jint JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativePushPatchJson(JNIEnv *env, jobject thiz,
+                                                        jlong session, jstring patch) {
+    (void)thiz;
+    if (session == 0 || patch == NULL) return SOFUU_ERR_INVALID_ARG;
+    const char *json = (*env)->GetStringUTFChars(env, patch, NULL);
+    if (json == NULL) return SOFUU_ERR_PANIC;
+    int rc = sofuu_ui_push_patch_json((SofuuUiSession *)(intptr_t)session, json, 0);
+    (*env)->ReleaseStringUTFChars(env, patch, json);
+    return rc;
+}
+
+/* SofuuUiNative.nativeIngestAgentEventJson(session, event) → int */
+JNIEXPORT jint JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativeIngestAgentEventJson(JNIEnv *env, jobject thiz,
+                                                               jlong session, jstring event) {
+    (void)thiz;
+    if (session == 0 || event == NULL) return SOFUU_ERR_INVALID_ARG;
+    const char *json = (*env)->GetStringUTFChars(env, event, NULL);
+    if (json == NULL) return SOFUU_ERR_PANIC;
+    int rc = sofuu_ui_ingest_agent_event_json((SofuuUiSession *)(intptr_t)session, json);
+    (*env)->ReleaseStringUTFChars(env, event, json);
+    return rc;
+}
+
+/* SofuuUiNative.nativeDispatchPointer(...) → int */
+JNIEXPORT jint JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativeDispatchPointer(JNIEnv *env, jobject thiz,
+                                                          jlong session, jint kind,
+                                                          jfloat x, jfloat y,
+                                                          jfloat dx, jfloat dy,
+                                                          jfloat scale, jint button,
+                                                          jint modifiers) {
+    (void)env; (void)thiz;
+    if (session == 0) return SOFUU_ERR_INVALID_ARG;
+    SofuuUiInputEvent e;
+    memset(&e, 0, sizeof e);
+    e.kind = (uint32_t)kind;
+    e.x = x;
+    e.y = y;
+    e.dx = dx;
+    e.dy = dy;
+    e.scale_factor = scale;
+    e.button = (uint32_t)button;
+    e.modifiers = (uint32_t)modifiers;
+    return sofuu_ui_dispatch_input((SofuuUiSession *)(intptr_t)session, &e);
+}
+
+/* SofuuUiNative.nativeDispatchText(session, text) → int */
+JNIEXPORT jint JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativeDispatchText(JNIEnv *env, jobject thiz,
+                                                       jlong session, jstring text) {
+    (void)thiz;
+    if (session == 0 || text == NULL) return SOFUU_ERR_INVALID_ARG;
+    const char *utf = (*env)->GetStringUTFChars(env, text, NULL);
+    if (utf == NULL) return SOFUU_ERR_PANIC;
+    SofuuUiInputEvent e;
+    memset(&e, 0, sizeof e);
+    e.kind = SOFUU_INPUT_TEXT_INPUT;
+    e.text_utf8 = utf;
+    int rc = sofuu_ui_dispatch_input((SofuuUiSession *)(intptr_t)session, &e);
+    (*env)->ReleaseStringUTFChars(env, text, utf);
+    return rc;
+}
+
+/* SofuuUiNative.nativeDispatchKey(session, key, modifiers) → int */
+JNIEXPORT jint JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativeDispatchKey(JNIEnv *env, jobject thiz,
+                                                      jlong session, jstring key,
+                                                      jint modifiers) {
+    (void)thiz;
+    if (session == 0 || key == NULL) return SOFUU_ERR_INVALID_ARG;
+    const char *utf = (*env)->GetStringUTFChars(env, key, NULL);
+    if (utf == NULL) return SOFUU_ERR_PANIC;
+    SofuuUiInputEvent e;
+    memset(&e, 0, sizeof e);
+    e.kind = SOFUU_INPUT_KEY_DOWN;
+    e.text_utf8 = utf;
+    e.modifiers = (uint32_t)modifiers;
+    int rc = sofuu_ui_dispatch_input((SofuuUiSession *)(intptr_t)session, &e);
+    (*env)->ReleaseStringUTFChars(env, key, utf);
+    return rc;
+}
+
+/* SofuuUiNative.nativePollEventJson(session) → String?
+ * Competing with the JS side for the same queue is intentional: call this
+ * only from a native-orchestrated host, never alongside sofuu.ui's JS
+ * Auto-Composer loop (it polls __sofuu_ui_poll_event itself). */
+JNIEXPORT jstring JNICALL
+Java_com_sofuu_render_SofuuUiNative_nativePollEventJson(JNIEnv *env, jobject thiz,
+                                                        jlong session) {
+    (void)thiz;
+    if (session == 0) return NULL;
+    char *out = NULL;
+    int rc = sofuu_ui_poll_event_json((SofuuUiSession *)(intptr_t)session, &out);
+    if (rc != 1 || out == NULL) {
+        if (out != NULL) sofuu_free(out);
+        return NULL;
+    }
+    jstring result = (*env)->NewStringUTF(env, out);
+    sofuu_free(out);
+    return result;
 }

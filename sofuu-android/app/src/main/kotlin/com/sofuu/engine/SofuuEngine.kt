@@ -315,6 +315,25 @@ class SofuuEngine(
         })
     }
 
+    // ── Embedded GPU UI (PLAN-EMBEDDED-NATIVE-HOST-C-ABI) ──────────
+
+    /** Bind a [com.sofuu.render.SofuuGpuSurfaceView] session on the engine
+     *  thread. Safe to call from the UI thread; the view keeps rendering. */
+    fun attachUISession(session: Long) {
+        onEngine { rt ->
+            val rc = rt.attachUISession(session)
+            if (rc != 0) log("ui: attach failed rc=$rc")
+        }
+    }
+
+    /** Unbind the embedded canvas. Safe when nothing is attached. */
+    fun detachUISession() {
+        onEngine { rt ->
+            val rc = rt.detachUISession()
+            if (rc != 0) log("ui: detach failed rc=$rc")
+        }
+    }
+
     // ── Event pump ─────────────────────────────────────────────────
 
     /** Drain both JS queues; deliver events to the UI and complete
@@ -444,7 +463,7 @@ class SofuuEngine(
 
     private fun parseUsage(p: JSONObject): Usage? {
         val u = p.optJSONObject("usage") ?: p
-        val servedBy = u.optString("servedBy").ifEmpty { null }
+        val servedBy = u.optString("servedBy").ifEmpty { p.optString("servedBy") }.ifEmpty { null }
         val prompt = u.optLong("promptTokens", -1)
         val completion = u.optLong("completionTokens", -1)
         val cost = u.optDouble("costUsd", -1.0)
@@ -1006,6 +1025,26 @@ sealed class EngineEvent {
     data class ApprovalResolved(val id: String) : EngineEvent()
     data class Warn(val message: String) : EngineEvent()
     data class Step(val kind: String, val raw: JSONObject) : EngineEvent()
+
+    /**
+     * Remote-host transcript reset. Sent when a client's replay cursor is
+     * outside the host's in-memory ring (host restart / eviction): [turns]
+     * is the persisted truth, [partialAnswer] seeds an in-flight bubble,
+     * and [pendingApprovals] restores approvals that survived the socket.
+     */
+    data class SessionSnapshot(
+        val sessionId: String,
+        val turns: JSONArray,
+        val streaming: Boolean,
+        val partialAnswer: String,
+        val pendingApprovals: JSONArray,
+        val latestSeq: Long,
+        val model: String = "",
+        val provider: String = "",
+    ) : EngineEvent()
+
+    /** Host link state for the connection indicator. */
+    data class RemoteStatus(val connected: Boolean, val detail: String?) : EngineEvent()
 }
 
 data class Usage(

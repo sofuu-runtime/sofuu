@@ -539,6 +539,11 @@ unsafe fn engine_register_builtins(eng: *mut SofuuEngine) -> Result<(), &'static
         crate::rt::state::mod_state_register(ctx);
     }
 
+    // PLAN-CUSTOM-2D-GPU-UI-ENGINE: optional dlopen bridge globals (__sofuu_ui_*).
+    unsafe {
+        crate::ui_bridge::mod_ui_register(ctx);
+    }
+
     // Phase 5 (agent loop): parse-only syntax gate (sofuu.parse) for the
     // edit tool's dry run - compiles the candidate, never executes it.
     unsafe {

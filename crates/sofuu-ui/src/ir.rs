@@ -91,6 +91,7 @@ impl Insets {
 /// Borders and drop shadows are **disabled by default** (`border = None`, `shadow_blur = 0.0`)
 /// and only rendered when explicitly configured. `bg = None` resolves dynamically from the active `Theme`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BoxStyle {
     pub bg: Option<u32>,
     pub bg_bottom: Option<u32>,
@@ -166,16 +167,31 @@ const fn default_toggle_size() -> f32 {
     36.0
 }
 
+const fn default_node_priority() -> u8 {
+    100
+}
+
+const fn default_node_visible() -> bool {
+    true
+}
+
 /// Core retained Scene IR node.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Node {
     pub id: String,
+    #[serde(default = "default_node_priority")]
     pub priority: u8,
+    #[serde(default = "default_node_visible")]
     pub visible: bool,
+    #[serde(default)]
     pub width: SizeSpec,
+    #[serde(default)]
     pub height: SizeSpec,
+    #[serde(default)]
     pub min_width: f32,
+    #[serde(default)]
     pub min_height: f32,
+    #[serde(default)]
     pub padding: Insets,
     pub kind: NodeKind,
 }
@@ -372,7 +388,7 @@ impl Scene {
                 *self = scene;
                 true
             }
-            ScenePatch::SetTheme(mode) => {
+            ScenePatch::SetTheme { mode } => {
                 if self.theme != mode {
                     self.theme = mode;
                     true
@@ -746,7 +762,7 @@ fn find_plot_series_mut<'a>(
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum ScenePatch {
     ReplaceScene(Scene),
-    SetTheme(ThemeMode),
+    SetTheme { mode: ThemeMode },
     SetText { id: String, content: String },
     SetVisible { id: String, visible: bool },
     SetTab { id: String, active: usize },
@@ -818,4 +834,46 @@ pub enum ScenePatch {
     ResetPlotView {
         id: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minimal_node_json_deserializes_with_defaults() {
+        let json = r#"{
+            "title": "Boot",
+            "theme": "light",
+            "root": {
+                "id": "root",
+                "kind": {
+                    "type": "container",
+                    "axis": "column",
+                    "align": "stretch",
+                    "gap": 10.0,
+                    "fold_width": null,
+                    "scrollable": false,
+                    "style": null,
+                    "children": [
+                        {
+                            "id": "lbl",
+                            "kind": {
+                                "type": "text",
+                                "content": "Hello",
+                                "size": 14.0,
+                                "color": null,
+                                "mono": false,
+                                "wrap": false
+                            }
+                        }
+                    ]
+                }
+            }
+        }"#;
+        let scene: Scene = serde_json::from_str(json).expect("deserialize minimal scene");
+        assert_eq!(scene.root.priority, 100);
+        assert!(scene.root.visible);
+        assert_eq!(scene.root.width, SizeSpec::Auto);
+    }
 }

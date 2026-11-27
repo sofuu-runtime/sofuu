@@ -537,9 +537,13 @@ fn print_chat_help() {
 fn print_run_help(cmd: &str) {
     if cmd == "run" {
         println!(
-            "\x1b[1mUsage:\x1b[0m sofuu run <file.js|file.ts>\n\n\
+            "\x1b[1mUsage:\x1b[0m sofuu run <file.js|file.ts> [options]\n\n\
              Evaluate a file as an ES module on a fresh runtime, then drain the\n\
              event loop (timers, I/O, promise chains).\n\n\
+             \x1b[1mUI & runtime options:\x1b[0m\n\
+               --ui               open the native 2D GPU UI window (`sofuu.ui`)\n\
+               --policy <file>    enforce a capability policy file\n\
+               --read-only, --no-net, --confirm-all\n\n\
              \x1b[1mExit status:\x1b[0m\n\
                0    the script completed\n\
                1    an uncaught exception, an unhandled promise rejection, or a\n\
@@ -4325,21 +4329,31 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         "run" => {
-            /* R7.P2/P3: --policy and the shortcut guards are honoured on the
+            /* R7.P2/P3: --policy, --ui, and the shortcut guards are honoured on the
              * plain script runner too (they used to exist only on chat/agent),
              * and flags are stripped BEFORE the script path is read so
              * `sofuu run --read-only x.js` works as well as the trailing
              * form. */
             let (policy, clean) = take_policy_arg(&args);
             let (guard, clean) = take_guard_flags(&clean);
+            let (use_ui, clean) = sofuu_core::ui_bridge::take_ui_arg(&clean);
             if clean.len() < 3 {
                 eprintln!("\x1b[31mError:\x1b[0m 'sofuu run' requires a file argument");
                 eprintln!(
-                    "\x1b[90m  flags: --policy <file> --read-only --no-net --confirm-all --setup-model --edit-model --list-models\x1b[0m"
+                    "\x1b[90m  flags: --ui --policy <file> --read-only --no-net --confirm-all --setup-model --edit-model --list-models\x1b[0m"
                 );
                 return ExitCode::FAILURE;
             }
             let is_file_script = clean[2] != "-e" && clean[2] != "--eval" && clean[2] != "-";
+            let ui_title = if is_file_script {
+                std::path::Path::new(&clean[2])
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Sofuu UI")
+                    .to_string()
+            } else {
+                "Sofuu UI".to_string()
+            };
             let script_target = sofuu_core::model_config::AgentTarget::script(&clean[2]);
             let script_args: Vec<String> = clean[2..].to_vec();
             if is_file_script {
@@ -4354,72 +4368,98 @@ fn main() -> ExitCode {
                     return code;
                 }
             }
-            let rt = match SofuuRuntime::init() {
-                Some(rt) => rt,
-                None => {
-                    eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
-                    return ExitCode::FAILURE;
-                }
-            };
-            if is_file_script {
-                let resolved_models =
-                    sofuu_core::model_config::apply_runtime_config(&script_args, &script_target);
-                let _ = rt.eval_string(
-                    &sofuu_core::model_config::js_prelude_for(&resolved_models),
-                    "<models-config>",
-                );
-                let resolved_channels =
-                    sofuu_core::channel_config::apply_runtime_config(&script_args, &script_target);
-                let _ = rt.eval_string(
-                    &sofuu_core::channel_config::js_prelude_for(&resolved_channels),
-                    "<channels-config>",
-                );
-            }
-            if let Err(e) = install_command_policy(&rt, policy.as_deref(), guard) {
-                eprintln!("\x1b[31mError:\x1b[0m {e}");
-                return ExitCode::FAILURE;
-            }
-            /* PL-009 (AUDIT-2026-11-08): a program run through 'sofuu run' saw
-             * an empty plugin tree — ./plugins, ~/.sofuu/plugins and
-             * ./sofuu.json were only discovered by the agent and chat paths, so
-             * a script that used a project plugin got "unknown tool" while the
-             * same plugin worked under 'sofuu agent run'. Boot the tree here
-             * too (idempotent, bounded), and let SOFUU_NO_PLUGIN_AUTOLOAD=1
-             * turn it off for a sandboxed run. */
-            if std::env::var_os("SOFUU_NO_PLUGIN_AUTOLOAD").is_none() {
-                let _ = rt.eval_string(
-                    "(function(){try{if(sofuu.plugins&&typeof sofuu.plugins.autoload==='function'){sofuu.plugins.autoload().catch(function(e){console.error('\u{26a0} plugins: '+String((e&&e.message)||e));});}}catch(eP){}})();",
-                    "<plugins-autoload>",
-                );
-                rt.run_jobs();
-            }
-            /* CLI-037 (AUDIT-2026-11-08): 'sofuu run -' reads the program
-             * from standard input, the usual way to pipe a script in. */
-            /* CLI-023 (AUDIT-2026-11-08): 'sofuu run -e <code>' is the form
-             * every other script runner accepts, and the audit's own recipes
-             * used it. Same runtime path as a file, just an inline source. */
-            let rc = if clean[2] == "-e" || clean[2] == "--eval" {
-                match clean.get(3) {
-                    Some(code) => rt.eval_string(code, "<eval>"),
+            let exec_run = move || -> i32 {
+                let rt = match SofuuRuntime::init() {
+                    Some(rt) => rt,
                     None => {
-                        eprintln!("\x1b[31mError:\x1b[0m 'sofuu run -e' needs a code argument");
-                        return ExitCode::FAILURE;
+                        eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+                        return 1;
                     }
+                };
+                if is_file_script {
+                    let resolved_models =
+                        sofuu_core::model_config::apply_runtime_config(&script_args, &script_target);
+                    let _ = rt.eval_string(
+                        &sofuu_core::model_config::js_prelude_for(&resolved_models),
+                        "<models-config>",
+                    );
+                    let resolved_channels = sofuu_core::channel_config::apply_runtime_config(
+                        &script_args,
+                        &script_target,
+                    );
+                    let _ = rt.eval_string(
+                        &sofuu_core::channel_config::js_prelude_for(&resolved_channels),
+                        "<channels-config>",
+                    );
                 }
-            } else if clean[2] == "-" {
-                use std::io::Read as _;
-                let mut src = String::new();
-                match std::io::stdin().read_to_string(&mut src) {
-                    Ok(_) => rt.eval_string(&src, "<stdin>"),
-                    Err(e) => {
-                        eprintln!("\x1b[31mError:\x1b[0m cannot read stdin: {e}");
-                        1
+                if let Err(e) = install_command_policy(&rt, policy.as_deref(), guard) {
+                    eprintln!("\x1b[31mError:\x1b[0m {e}");
+                    return 1;
+                }
+                if std::env::var_os("SOFUU_NO_PLUGIN_AUTOLOAD").is_none() {
+                    let _ = rt.eval_string(
+                        "(function(){try{if(sofuu.plugins&&typeof sofuu.plugins.autoload==='function'){sofuu.plugins.autoload().catch(function(e){console.error('\u{26a0} plugins: '+String((e&&e.message)||e));});}}catch(eP){}})();",
+                        "<plugins-autoload>",
+                    );
+                    rt.run_jobs();
+                }
+                let rc = if clean[2] == "-e" || clean[2] == "--eval" {
+                    match clean.get(3) {
+                        Some(code) => rt.eval_string(code, "<eval>"),
+                        None => {
+                            eprintln!("\x1b[31mError:\x1b[0m 'sofuu run -e' needs a code argument");
+                            return 1;
+                        }
                     }
+                } else if clean[2] == "-" {
+                    use std::io::Read as _;
+                    let mut src = String::new();
+                    match std::io::stdin().read_to_string(&mut src) {
+                        Ok(_) => rt.eval_string(&src, "<stdin>"),
+                        Err(e) => {
+                            eprintln!("\x1b[31mError:\x1b[0m cannot read stdin: {e}");
+                            1
+                        }
+                    }
+                } else {
+                    cmd_run(&rt, &clean[2])
+                };
+                if rc == 0 {
+                    0
+                } else {
+                    let ctx = rt.engine_ctx() as *mut sofuu_ffi::qjs::JSContext;
+                    let code = unsafe {
+                        let global = sofuu_ffi::qjs::sofuu_js_get_global_object(ctx);
+                        let proc_obj = sofuu_ffi::qjs::sofuu_js_get_property_str(
+                            ctx,
+                            global,
+                            c"process".as_ptr(),
+                        );
+                        let ec = sofuu_ffi::qjs::sofuu_js_get_property_str(
+                            ctx,
+                            proc_obj,
+                            c"exitCode".as_ptr(),
+                        );
+                        let mut v: i32 = rc;
+                        let _ = sofuu_ffi::qjs::JS_ToInt32(ctx, &mut v, ec);
+                        sofuu_ffi::qjs::sofuu_js_free_value(ctx, ec);
+                        sofuu_ffi::qjs::sofuu_js_free_value(ctx, proc_obj);
+                        sofuu_ffi::qjs::sofuu_js_free_value(ctx, global);
+                        if v == 0 { 1 } else { v }
+                    };
+                    code
                 }
-            } else {
-                cmd_run(&rt, &clean[2])
             };
-            js_exit_code(&rt, rc)
+            if use_ui {
+                sofuu_core::ui_bridge::run_with_ui(&ui_title, exec_run)
+            } else {
+                let rc = exec_run();
+                if rc == 0 {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(rc.clamp(1, 255) as u8)
+                }
+            }
         }
         "bundle" => {
             let rt = match SofuuRuntime::init() {

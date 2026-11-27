@@ -12,15 +12,14 @@ use std::os::raw::{c_char, c_int};
 use std::process::ExitCode;
 use sofuu_ffi::SofuuRuntime;
 
-fn js_exit_code(rt: &SofuuRuntime, rc: i32) -> ExitCode {
+fn js_exit_code_i32(rt: &SofuuRuntime, rc: i32) -> i32 {
     let st = sofuu_core::rt::engine::run_status_raw(rt.engine_ctx());
-    let code = match (st.exit_code, rc, st.has_uncaught_error) {
+    match (st.exit_code, rc, st.has_uncaught_error) {
         (Some(chosen), _, _) => chosen,
         (None, rc, _) if rc != 0 => 1,
         (None, _, true) => 1,
         _ => 0,
-    };
-    ExitCode::from(code.clamp(0, 255) as u8)
+    }
 }
 
 fn install_compiled_prelude(
@@ -189,6 +188,7 @@ fn artifact_arg_gate(args: &[String], is_kaze: bool) -> Option<ExitCode> {
                      \x20 --channels-config <path> Use a specific channels.json file\n\
                      \x20 --channel <name>         Override the active channel for this run\n\n\
                      Runtime Options:\n\
+                     \x20 --ui                     Open native 2D GPU UI window (requires libsofuu_gpu)\n\
                      \x20 --interactive, -i        Launch interactive session (when supported)\n\
                      \x20 --arg name=value         Bind one routine parameter (repeatable)\n\
                      \x20 --config <path>          JSON configuration file\n\
@@ -255,7 +255,7 @@ fn artifact_arg_gate(args: &[String], is_kaze: bool) -> Option<ExitCode> {
             .is_some_and(|rest| rest.starts_with('=')))
             || matches!(a, "--interactive" | "-i" | "--daemon" | "-d"));
         let known = known_kaze
-            || matches!(a, "--daemon" | "-d")
+            || matches!(a, "--daemon" | "-d" | "--ui")
             || a.strip_prefix("--every=").is_some_and(|rest| !rest.is_empty())
             || a.strip_prefix("--interval=").is_some_and(|rest| !rest.is_empty())
             || a.starts_with("--arg") || a.starts_with("--config") || a == "--json";
@@ -264,7 +264,7 @@ fn artifact_arg_gate(args: &[String], is_kaze: bool) -> Option<ExitCode> {
             if is_kaze {
                 eprintln!("  use --help for the Kaze agent options");
             } else {
-                eprintln!("  accepted: --setup-model, --edit-model, --list-models, --setup-channel, --edit-channel, --list-channels, --provider, --model, --channel, --config, --arg, --json, --version, --help, --");
+                eprintln!("  accepted: --setup-model, --edit-model, --list-models, --setup-channel, --edit-channel, --list-channels, --provider, --model, --channel, --config, --arg, --ui, --json, --version, --help, --");
             }
             return Some(ExitCode::from(2));
         }
@@ -272,11 +272,11 @@ fn artifact_arg_gate(args: &[String], is_kaze: bool) -> Option<ExitCode> {
     }
     None
 }
-fn run_compiled_payload(
+fn run_compiled_payload_rc(
     payload: &sofuu_core::compiler::EmbeddedPayload,
     args: &[String],
     target: &sofuu_core::model_config::AgentTarget,
-) -> ExitCode {
+) -> i32 {
     apply_daemon_env(args);
     let resolved_models = sofuu_core::model_config::apply_runtime_config(args, target);
     let resolved_channels = sofuu_core::channel_config::apply_runtime_config(args, target);
@@ -284,7 +284,7 @@ fn run_compiled_payload(
         Some(rt) => rt,
         None => {
             eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
-            return ExitCode::FAILURE;
+            return 1;
         }
     };
     let brain = match sofuu_core::compiler::materialize_brain(payload) {
@@ -304,11 +304,28 @@ fn run_compiled_payload(
             &payload.entry,
         )
     };
-    js_exit_code(&rt, rc)
+    if rc == 0 {
+        0
+    } else {
+        let code = unsafe {
+            let ctx = rt.engine_ctx() as *mut sofuu_ffi::qjs::JSContext;
+            let global = sofuu_ffi::qjs::sofuu_js_get_global_object(ctx);
+            let proc_obj = sofuu_ffi::qjs::sofuu_js_get_property_str(ctx, global, c"process".as_ptr());
+            let ec = sofuu_ffi::qjs::sofuu_js_get_property_str(ctx, proc_obj, c"exitCode".as_ptr());
+            let mut val: i32 = rc;
+            let _ = sofuu_ffi::qjs::JS_ToInt32(ctx, &mut val, ec);
+            sofuu_ffi::qjs::sofuu_js_free_value(ctx, ec);
+            sofuu_ffi::qjs::sofuu_js_free_value(ctx, proc_obj);
+            sofuu_ffi::qjs::sofuu_js_free_value(ctx, global);
+            if val == 0 { 1 } else { val }
+        };
+        code
+    }
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    let raw_args: Vec<String> = env::args().collect();
+    let (use_ui, args) = sofuu_core::ui_bridge::take_ui_arg(&raw_args);
 
     // 1. Embedded Payload (Standalone compiled agent binary mode)
     match sofuu_core::compiler::detect_embedded_payload() {
@@ -342,7 +359,23 @@ fn main() -> ExitCode {
                     ptrs.as_mut_ptr(),
                 );
             }
-            return run_compiled_payload(&payload, &args, &target);
+            if use_ui {
+                let ui_title = std::path::Path::new(&args[0])
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("Sofuu Agent")
+                    .to_string();
+                let args_c = args.clone();
+                return sofuu_core::ui_bridge::run_with_ui(&ui_title, move || {
+                    run_compiled_payload_rc(&payload, &args_c, &target)
+                });
+            }
+            let rc = run_compiled_payload_rc(&payload, &args, &target);
+            return if rc == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(rc.clamp(1, 255) as u8)
+            };
         }
         Ok(None) => {}
         Err(e) => {
@@ -371,15 +404,28 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let script = &args[1];
-    apply_daemon_env(&args);
-    let rt = match SofuuRuntime::init() {
-        Some(rt) => rt,
-        None => {
-            eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
-            return ExitCode::FAILURE;
-        }
+    let script = args[1].clone();
+    let args_daemon = args.clone();
+    let exec_fallback = move || -> i32 {
+        apply_daemon_env(&args_daemon);
+        let rt = match SofuuRuntime::init() {
+            Some(rt) => rt,
+            None => {
+                eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+                return 1;
+            }
+        };
+        let rc = rt.eval_file(&script);
+        js_exit_code_i32(&rt, rc)
     };
-    let rc = rt.eval_file(script);
-    js_exit_code(&rt, rc)
+    if use_ui {
+        let ui_title = std::path::Path::new(&args[1])
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Sofuu Agent")
+            .to_string();
+        return sofuu_core::ui_bridge::run_with_ui(&ui_title, exec_fallback);
+    }
+    let code = exec_fallback();
+    ExitCode::from(code.clamp(0, 255) as u8)
 }

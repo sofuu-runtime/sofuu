@@ -2209,6 +2209,8 @@ export interface SofuuRuntime {
   sandbox: SofuuSandbox;
   /** Real-time mathematical context & brain health scouter (PLAN-SCOUTER). */
   scouter?: SofuuScouter;
+  /** Declarative custom 2D GPU UI builders & live window bridge (`--ui`). */
+  ui?: SofuuUi;
   /**
    * The manifest's `build` block, registered at startup: exactly
    * `capabilities().build`, without building the whole manifest (which probes
@@ -2256,6 +2258,309 @@ export interface SofuuKvCache {
 /** The KV-cache factory: `sofuu.kv.open(path, dimension)`. */
 export interface SofuuKvFactory {
   open(path: string, dimension: number): SofuuKvCache;
+}
+
+/* ==================================================================
+ * Native 2D GPU UI (`sofuu.ui`, enabled with `--ui`)
+ * ================================================================== */
+
+export type UiThemeMode = 'light' | 'dark';
+export type UiTone = 'neutral' | 'info' | 'ok' | 'warn' | 'danger';
+export type UiSizeSpec = 'auto' | number | { px: number } | { fill: number };
+export type UiInsets = number | { top?: number; right?: number; bottom?: number; left?: number };
+
+export interface UiNodeBaseOptions {
+  visible?: boolean;
+  priority?: number;
+  width?: UiSizeSpec;
+  height?: UiSizeSpec;
+  fill?: boolean | number;
+  minWidth?: number;
+  minHeight?: number;
+  padding?: UiInsets;
+}
+
+export interface UiNode {
+  id: string;
+  priority: number;
+  visible: boolean;
+  width: 'auto' | { px: number } | { fill: number };
+  height: 'auto' | { px: number } | { fill: number };
+  min_width: number;
+  min_height: number;
+  padding: { top: number; right: number; bottom: number; left: number };
+  kind: Record<string, unknown>;
+}
+
+export interface UiScene {
+  title: string;
+  theme: UiThemeMode;
+  root: UiNode;
+}
+
+export interface UiPlotPoint {
+  x: number;
+  y: number;
+  y2?: number | null;
+  label?: string | null;
+}
+
+export interface UiCandlePoint {
+  x: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  label?: string | null;
+}
+
+export interface UiPlotThreshold {
+  value: number;
+  label?: string | null;
+  color?: number | null;
+}
+
+export interface UiPlotSeries {
+  id: string;
+  name?: string;
+  kind?: 'line' | 'area' | 'stacked_area' | 'band' | 'candles' | 'histogram';
+  color?: number | null;
+  secondaryColor?: number | null;
+  visible?: boolean;
+  dashed?: boolean;
+  strokeWidth?: number | null;
+  points?: UiPlotPoint[];
+  candles?: UiCandlePoint[];
+}
+
+export interface UiPlotPane {
+  id: string;
+  label?: string | null;
+  height_weight: number;
+  series: Array<Record<string, unknown>>;
+  thresholds: UiPlotThreshold[];
+  stacked_percent: boolean;
+  y_prefix: string;
+  y_suffix: string;
+  y_precision: number | null;
+}
+
+export interface UiTableColumn {
+  key: string;
+  label?: string;
+  width?: number | null;
+  align?: 'left' | 'center' | 'right';
+  sortable?: boolean;
+}
+
+export interface UiTableCell {
+  text: string;
+  tone?: UiTone | null;
+  badge?: boolean;
+}
+
+export interface UiTableRow {
+  id: string;
+  tone?: UiTone | null;
+  cells: Array<string | number | UiTableCell>;
+}
+
+export interface UiFeedItem {
+  id: string;
+  time?: string;
+  badge?: string | null;
+  tone?: UiTone;
+  title: string;
+  body?: string | null;
+}
+
+export interface UiGraphNode {
+  id: string;
+  label: string;
+  subtitle?: string | null;
+  tone?: UiTone;
+  pos?: [number, number] | null;
+}
+
+export interface UiGraphEdge {
+  from: string;
+  to: string;
+  label?: string | null;
+  active?: boolean;
+  tone?: UiTone | null;
+}
+
+export interface UiCodeHighlight {
+  line: number;
+  tone: UiTone;
+}
+
+export type UiEvent =
+  | { type: 'click'; id: string }
+  | { type: 'tab_changed'; id: string; index: number }
+  | { type: 'segmented_changed'; id: string; index: number }
+  | { type: 'theme_changed'; id: string; mode: UiThemeMode }
+  | { type: 'switch_toggled'; id: string; checked: boolean }
+  | { type: 'text_changed'; id: string; value: string }
+  | { type: 'input_submitted'; id: string; value: string }
+  | { type: 'table_sorted'; id: string; col_index: number; asc: boolean }
+  | { type: 'row_selected'; id: string; row_id: string }
+  | { type: 'feed_item_clicked'; id: string; item_id: string }
+  | { type: 'graph_node_clicked'; id: string; node_id: string }
+  | { type: 'series_toggled'; id: string; series_index: number }
+  | { type: 'scrolled'; id: string; offset_y: number }
+  | { type: 'window_closed' };
+
+export interface UiView {
+  readonly id: string;
+  mount(sceneOrNode: UiScene | UiNode | { toNode(): UiNode }): UiView;
+  patch(patch: Record<string, unknown>): number;
+  setTheme(mode: UiThemeMode): number;
+  setText(nodeId: string, content: string): number;
+  setVisible(nodeId: string, visible: boolean): number;
+  updateStat(
+    nodeId: string,
+    fields: {
+      value?: number;
+      valueText?: string | null;
+      delta?: string | null;
+      tone?: UiTone;
+      caption?: string | null;
+      pushSparkline?: number;
+      sparklineMaxLen?: number;
+    },
+  ): number;
+  appendPlot(plotId: string, seriesId: string, point: UiPlotPoint, maxPoints?: number): number;
+  upsertCandle(plotId: string, seriesId: string, candle: UiCandlePoint, maxCandles?: number): number;
+  appendFeed(feedId: string, item: UiFeedItem, maxItems?: number): number;
+  setCode(codeId: string, content: string, highlights?: UiCodeHighlight[]): number;
+  setSwitch(switchId: string, checked: boolean): number;
+  setInput(inputId: string, value: string): number;
+  onEvent(listener: (event: UiEvent) => void): UiView;
+  waitUntilClosed(): Promise<void>;
+}
+
+export interface UiAppBuilder {
+  dark(): UiAppBuilder;
+  light(): UiAppBuilder;
+  header(node: UiNode): UiAppBuilder;
+  stats(list: UiNode[]): UiAppBuilder;
+  add(node: UiNode): UiAppBuilder;
+  build(): UiScene;
+  mount(): UiView;
+}
+
+export interface SofuuUi {
+  isAttached(): boolean;
+  app(title?: string, opts?: { theme?: UiThemeMode; padding?: number; gap?: number }): UiAppBuilder;
+  surface(id?: string, opts?: { title?: string; theme?: UiThemeMode }): UiView;
+  row(id: string, children: UiNode[], opts?: UiNodeBaseOptions & { align?: 'stretch' | 'start' | 'center' | 'end'; gap?: number; foldBelow?: number | null; scrollable?: boolean; style?: Record<string, unknown> | null }): UiNode;
+  col(id: string, children: UiNode[], opts?: UiNodeBaseOptions & { align?: 'stretch' | 'start' | 'center' | 'end'; gap?: number; scrollable?: boolean; style?: Record<string, unknown> | null }): UiNode;
+  grid(id: string, children: UiNode[], opts?: UiNodeBaseOptions & { columns?: number; minColWidth?: number; gap?: number; style?: Record<string, unknown> | null }): UiNode;
+  tabs(id: string, items: Array<{ label: string; child: UiNode }>, opts?: UiNodeBaseOptions & { active?: number }): UiNode;
+  text(id: string, content: string, opts?: UiNodeBaseOptions & { size?: number; color?: number | null; mono?: boolean; wrap?: boolean }): UiNode;
+  title(content: string, opts?: UiNodeBaseOptions & { id?: string; size?: number; color?: number | null; mono?: boolean; wrap?: boolean }): UiNode;
+  rule(id?: string, opts?: UiNodeBaseOptions & { thickness?: number; color?: number | null }): UiNode;
+  spacer(id?: string, opts?: UiNodeBaseOptions): UiNode;
+  themeToggle(id?: string, opts?: UiNodeBaseOptions & { size?: number }): UiNode;
+  segmented(id: string, options: string[], active?: number, opts?: UiNodeBaseOptions): UiNode;
+  button(id: string, label: string, opts?: UiNodeBaseOptions & { tone?: UiTone }): UiNode;
+  switch(id: string, checked?: boolean, label?: string | null, opts?: UiNodeBaseOptions & { tone?: UiTone }): UiNode;
+  input(id: string, placeholder?: string, opts?: UiNodeBaseOptions & { value?: string; tone?: UiTone }): UiNode;
+  stat(
+    id: string,
+    label: string,
+    value: number,
+    opts?: UiNodeBaseOptions & {
+      variant?: 'compact' | 'sparkline' | 'range_bar';
+      valueText?: string | null;
+      prefix?: string;
+      suffix?: string;
+      precision?: number | null;
+      badge?: string | null;
+      delta?: string | null;
+      caption?: string | null;
+      tone?: UiTone;
+      sparkline?: number[];
+      range?: [number, number];
+      interactive?: boolean;
+    },
+  ): UiNode;
+  pane(
+    id: string,
+    opts?: {
+      label?: string | null;
+      weight?: number;
+      heightWeight?: number;
+      series?: UiPlotSeries[];
+      thresholds?: UiPlotThreshold[];
+      percent?: boolean;
+      yPrefix?: string;
+      ySuffix?: string;
+      yPrecision?: number | null;
+    },
+  ): UiPlotPane;
+  plot(
+    id: string,
+    opts?: UiNodeBaseOptions & {
+      title?: string | null;
+      subtitle?: string | null;
+      panes?: UiPlotPane[];
+      series?: UiPlotSeries[];
+      thresholds?: UiPlotThreshold[];
+      showGrid?: boolean;
+      showCrosshair?: boolean;
+      showLegend?: boolean;
+      readoutMode?: 'header_bar' | 'floating';
+      percent?: boolean;
+      yPrefix?: string;
+      ySuffix?: string;
+      yPrecision?: number | null;
+      emptyText?: string | null;
+    },
+  ): UiNode;
+  table(
+    id: string,
+    opts?: UiNodeBaseOptions & {
+      title?: string | null;
+      columns?: UiTableColumn[];
+      rows?: UiTableRow[];
+      selectedRow?: string | null;
+      rowHeight?: number;
+      striped?: boolean;
+      emptyText?: string | null;
+    },
+  ): UiNode;
+  feed(
+    id: string,
+    opts?: UiNodeBaseOptions & {
+      title?: string | null;
+      items?: UiFeedItem[];
+      maxItems?: number;
+      newestFirst?: boolean;
+      emptyText?: string | null;
+    },
+  ): UiNode;
+  graph(
+    id: string,
+    opts?: UiNodeBaseOptions & {
+      title?: string | null;
+      nodes?: UiGraphNode[];
+      edges?: UiGraphEdge[];
+      selectedNode?: string | null;
+      emptyText?: string | null;
+    },
+  ): UiNode;
+  code(
+    id: string,
+    content: string,
+    opts?: UiNodeBaseOptions & {
+      title?: string | null;
+      language?: string | null;
+      lineNumbers?: boolean;
+      highlights?: UiCodeHighlight[];
+    },
+  ): UiNode;
 }
 
 /** What the running binary was compiled with — the probe-free half of the manifest. */

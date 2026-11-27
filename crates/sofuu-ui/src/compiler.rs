@@ -216,7 +216,7 @@ impl UiEngine {
                                             ThemeMode::Dark => ThemeMode::Light,
                                             ThemeMode::Light => ThemeMode::Dark,
                                         };
-                                        let _ = self.apply_patch(ScenePatch::SetTheme(next));
+                                        let _ = self.apply_patch(ScenePatch::SetTheme { mode: next });
                                         out.push(UIEvent::ThemeChanged { id, mode: next });
                                     }
                                     HitKind::Switch { id } => {
@@ -1155,7 +1155,7 @@ mod tests {
         assert!(st_stream.animating);
 
         // Theme toggles cleanly between Dark and Light at runtime.
-        assert!(engine.apply_patch(ScenePatch::SetTheme(ThemeMode::Light)));
+        assert!(engine.apply_patch(ScenePatch::SetTheme { mode: ThemeMode::Light }));
         let st_light = engine.tick_and_compile(1.0 / 120.0, &mut dl);
         assert!(st_light.compiled);
         // Zero default borders and zero default shadows on cards/plots/pills unless explicitly opted in.

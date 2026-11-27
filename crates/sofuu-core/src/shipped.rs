@@ -162,6 +162,14 @@ pub const OBSERVABILITY_JS: &str = include_str!("../../../src/js/observability.j
 #[cfg(not(debug_assertions))]
 pub const OBSERVABILITY_JS: &str = "";
 pub const OBSERVABILITY_BC: &[u8] = include_bytes!("../../../src/js/observability.bc.gz");
+/// Declarative GPU UI builders & host bridge (`sofuu.ui.*`).
+/// Pure JS over `__sofuu_ui_*` host functions in `ui_bridge.rs`; zero GPU deps in `sofuu-core`.
+#[cfg(debug_assertions)]
+pub const UI_JS: &str = include_str!("../../../src/js/ui.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const UI_JS: &str = "";
+pub const UI_BC: &[u8] = include_bytes!("../../../src/js/ui.bc.gz");
 
 /// The Kaze asynchronous driver — single source of truth is src/js/kaze_async.js.
 ///

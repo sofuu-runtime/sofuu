@@ -640,6 +640,13 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
             Some(crate::shipped::OBSERVABILITY_BC),
             "<observability-driver>",
         );
+        // PLAN-CUSTOM-2D-GPU-UI-ENGINE: declarative GPU UI builders + `--ui` host bridge.
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::UI_JS,
+            Some(crate::shipped::UI_BC),
+            "<ui-driver>",
+        );
     }
 }
 

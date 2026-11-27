@@ -172,6 +172,7 @@ pub mod drone_cmd; // PLAN-DRONES §4.6: `sofuu drone observe|status|send|why|in
 pub mod rt; // M1: event loop + promise bridge (replaces src/io/loop.c + promises.c)
 pub mod shipped; // shipped JS drivers beyond RLM: agent.js + web.js (PLAN-AGENTS)
 pub mod ts;
+pub mod ui_bridge; // PLAN-CUSTOM-2D-GPU-UI-ENGINE: optional dynamic dlopen loader + sofuu.ui host bridge
 
 /// Whether THIS build linked the QTSQ brain/KV codec (sofuu-core/build.rs).
 ///

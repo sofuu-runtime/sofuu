@@ -36,8 +36,10 @@ fn main() {
             let mut price = 94_210.50_f64;
             let mut step = 0u64;
             loop {
-                while let Ok(UIEvent::WindowClosed) = events.try_recv() {
-                    return;
+                while let Ok(event) = events.try_recv() {
+                    if matches!(event, UIEvent::WindowClosed) {
+                        return;
+                    }
                 }
                 thread::sleep(Duration::from_millis(800));
                 step += 1;

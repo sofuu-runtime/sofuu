@@ -11,10 +11,9 @@ use std::sync::mpsc;
 
 pub use sofuu_ui::{Scene, ScenePatch, UIEvent};
 
+pub mod backend;
 pub mod ffi;
-
-#[cfg(target_os = "macos")]
-mod macos;
+mod loop_core;
 
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
@@ -95,16 +94,12 @@ pub fn run_window<F>(config: WindowConfig, initial_scene: Scene, on_ready: F) ->
 where
     F: FnOnce(UiHandle),
 {
-    #[cfg(target_os = "macos")]
-    {
-        return macos::run_macos_window(config, initial_scene, on_ready);
-    }
+    loop_core::run(config, initial_scene, on_ready)
+}
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (config, initial_scene, on_ready);
-        Err("sofuu-gpu native windowing currently implements macOS Metal; Linux Vulkan/Wayland and Windows OpenGL/Win32 backends are queued next".to_string())
-    }
+/// Compile-time backend family for diagnostics (`metal`, `wayland/x11 + egl`, ...).
+pub const fn compiled_backend_family() -> &'static str {
+    backend::compiled_backend_family()
 }
 
 #[cfg(test)]

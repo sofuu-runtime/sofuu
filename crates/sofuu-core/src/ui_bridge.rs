@@ -23,7 +23,7 @@ use sofuu_ffi::bridge::{
 };
 use sofuu_ffi::qjs;
 
-pub const EXPECTED_UI_ABI_VERSION: u32 = 1;
+pub const EXPECTED_UI_ABI_VERSION: u32 = 2;
 
 type AbiVersionFn = unsafe extern "C" fn() -> u32;
 type WorkerCb = extern "C" fn(session: *mut c_void, user_ctx: *mut c_void);
@@ -40,10 +40,25 @@ type PushPatchJsonFn =
     unsafe extern "C" fn(session: *mut c_void, patch_json: *const u8, patch_len: usize) -> i32;
 type PollEventJsonFn =
     unsafe extern "C" fn(session: *mut c_void, out_buf: *mut u8, out_cap: usize) -> i64;
+type IngestAgentEventFn =
+    unsafe extern "C" fn(session: *mut c_void, event_json: *const u8, event_len: usize) -> i32;
+type UpdateTriggersFn =
+    unsafe extern "C" fn(session: *mut c_void, stats_json: *const u8, stats_len: usize) -> i32;
+type AutoStateRowsFn =
+    unsafe extern "C" fn(session: *mut c_void, rows_json: *const u8, rows_len: usize) -> i32;
+type AutoMountFn =
+    unsafe extern "C" fn(session: *mut c_void, config_json: *const u8, config_len: usize) -> i32;
+type AutoSceneFn =
+    unsafe extern "C" fn(session: *mut c_void, out_buf: *mut u8, out_cap: usize) -> i64;
 
 static ACTIVE_SESSION: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static ACTIVE_PUSH_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static ACTIVE_POLL_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static ACTIVE_AUTO_EVENT_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static ACTIVE_AUTO_TRIGGERS_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static ACTIVE_AUTO_ROWS_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static ACTIVE_AUTO_MOUNT_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static ACTIVE_AUTO_SCENE_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static UI_MOUNTED: AtomicBool = AtomicBool::new(false);
 static WINDOW_CLOSED_SEEN: AtomicBool = AtomicBool::new(false);
 
@@ -111,6 +126,11 @@ struct LoadedUiLib {
     run_json: RunJsonFn,
     push_patch_json: PushPatchJsonFn,
     poll_event_json: PollEventJsonFn,
+    auto_event: Option<IngestAgentEventFn>,
+    auto_triggers: Option<UpdateTriggersFn>,
+    auto_rows: Option<AutoStateRowsFn>,
+    auto_mount: Option<AutoMountFn>,
+    auto_scene: Option<AutoSceneFn>,
 }
 
 #[cfg(unix)]
@@ -188,12 +208,22 @@ fn load_ui_lib() -> Result<LoadedUiLib, String> {
         Ok(std::mem::transmute_copy(&ptr))
     }
 
+    unsafe fn opt_sym<T>(handle: *mut c_void, name: &CStr) -> Option<T> {
+        let ptr = libc::dlsym(handle, name.as_ptr());
+        if ptr.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute_copy(&ptr))
+        }
+    }
+
     let abi_fn: AbiVersionFn = unsafe { sym(handle, c"sofuu_ui_abi_version")? };
     let abi_ver = unsafe { abi_fn() };
-    if abi_ver != EXPECTED_UI_ABI_VERSION {
+    // v2 is additive: a v1 dylib keeps working without the auto-composer.
+    if abi_ver != 1 && abi_ver != EXPECTED_UI_ABI_VERSION {
         unsafe { libc::dlclose(handle) };
         return Err(format!(
-            "E_UI_ABI_MISMATCH: expected ABI v{EXPECTED_UI_ABI_VERSION}, got v{abi_ver}"
+            "E_UI_ABI_MISMATCH: expected ABI v1 or v{EXPECTED_UI_ABI_VERSION}, got v{abi_ver}"
         ));
     }
 
@@ -202,6 +232,11 @@ fn load_ui_lib() -> Result<LoadedUiLib, String> {
         run_json: unsafe { sym(handle, c"sofuu_ui_run_json")? },
         push_patch_json: unsafe { sym(handle, c"sofuu_ui_push_patch_json")? },
         poll_event_json: unsafe { sym(handle, c"sofuu_ui_poll_event_json")? },
+        auto_event: unsafe { opt_sym(handle, c"sofuu_ui_ingest_agent_event_json") },
+        auto_triggers: unsafe { opt_sym(handle, c"sofuu_ui_update_triggers_json") },
+        auto_rows: unsafe { opt_sym(handle, c"sofuu_ui_auto_state_rows_json") },
+        auto_mount: unsafe { opt_sym(handle, c"sofuu_ui_auto_mount_json") },
+        auto_scene: unsafe { opt_sym(handle, c"sofuu_ui_auto_scene_json") },
     })
 }
 
@@ -330,6 +365,14 @@ where
 
     ACTIVE_PUSH_FN.store(lib.push_patch_json as *mut c_void, Ordering::Release);
     ACTIVE_POLL_FN.store(lib.poll_event_json as *mut c_void, Ordering::Release);
+    fn opt_ptr(f: Option<*mut c_void>) -> *mut c_void {
+        f.unwrap_or(ptr::null_mut())
+    }
+    ACTIVE_AUTO_EVENT_FN.store(opt_ptr(lib.auto_event.map(|f| f as *mut c_void)), Ordering::Release);
+    ACTIVE_AUTO_TRIGGERS_FN.store(opt_ptr(lib.auto_triggers.map(|f| f as *mut c_void)), Ordering::Release);
+    ACTIVE_AUTO_ROWS_FN.store(opt_ptr(lib.auto_rows.map(|f| f as *mut c_void)), Ordering::Release);
+    ACTIVE_AUTO_MOUNT_FN.store(opt_ptr(lib.auto_mount.map(|f| f as *mut c_void)), Ordering::Release);
+    ACTIVE_AUTO_SCENE_FN.store(opt_ptr(lib.auto_scene.map(|f| f as *mut c_void)), Ordering::Release);
 
     let boot_scene = default_boot_scene_json(title);
     let title_c = CString::new(title).unwrap_or_else(|_| CString::new("Sofuu").unwrap());
@@ -355,6 +398,11 @@ where
     ACTIVE_SESSION.store(ptr::null_mut(), Ordering::Release);
     ACTIVE_PUSH_FN.store(ptr::null_mut(), Ordering::Release);
     ACTIVE_POLL_FN.store(ptr::null_mut(), Ordering::Release);
+    ACTIVE_AUTO_EVENT_FN.store(ptr::null_mut(), Ordering::Release);
+    ACTIVE_AUTO_TRIGGERS_FN.store(ptr::null_mut(), Ordering::Release);
+    ACTIVE_AUTO_ROWS_FN.store(ptr::null_mut(), Ordering::Release);
+    ACTIVE_AUTO_MOUNT_FN.store(ptr::null_mut(), Ordering::Release);
+    ACTIVE_AUTO_SCENE_FN.store(ptr::null_mut(), Ordering::Release);
 
     if ui_rc != 0 {
         eprintln!("\x1b[31mError:\x1b[0m E_UI_NO_DISPLAY: UI window exited with status {ui_rc}");
@@ -422,6 +470,115 @@ pub fn poll_event_raw() -> Result<Option<String>, i32> {
     Ok(Some(s))
 }
 
+fn auto_raw(fn_ptr: &AtomicPtr<c_void>, json: &str) -> i32 {
+    let sess = ACTIVE_SESSION.load(Ordering::Acquire);
+    let fp = fn_ptr.load(Ordering::Acquire);
+    if sess.is_null() || fp.is_null() {
+        return -2;
+    }
+    let f: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32 =
+        unsafe { std::mem::transmute(fp) };
+    let rc = unsafe { f(sess, json.as_ptr(), json.len()) };
+    if rc == 0 {
+        UI_MOUNTED.store(true, Ordering::Release);
+    }
+    rc
+}
+
+fn auto_scene_raw() -> Option<String> {
+    let sess = ACTIVE_SESSION.load(Ordering::Acquire);
+    let fp = ACTIVE_AUTO_SCENE_FN.load(Ordering::Acquire);
+    if sess.is_null() || fp.is_null() {
+        return None;
+    }
+    let f: AutoSceneFn = unsafe { std::mem::transmute(fp) };
+    let mut buf = vec![0u8; 4096];
+    let mut n = unsafe { f(sess, buf.as_mut_ptr(), buf.len()) };
+    if n < 0 {
+        let needed = (-n) as usize;
+        if needed == 0 || needed > 4 * 1024 * 1024 {
+            return None;
+        }
+        buf.resize(needed, 0);
+        n = unsafe { f(sess, buf.as_mut_ptr(), buf.len()) };
+    }
+    if n <= 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+unsafe fn first_string(
+    ctx: *mut JSContext,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> Option<String> {
+    if argc < 1 || argv.is_null() {
+        return None;
+    }
+    js_to_string(ctx, *argv)
+}
+
+unsafe extern "C" fn js_ui_auto_event(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    match first_string(ctx, argc, argv) {
+        Some(json) => qjs::sofuu_js_new_int32(ctx, auto_raw(&ACTIVE_AUTO_EVENT_FN, &json)),
+        None => qjs::sofuu_js_new_int32(ctx, -1),
+    }
+}
+
+unsafe extern "C" fn js_ui_auto_triggers(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    match first_string(ctx, argc, argv) {
+        Some(json) => qjs::sofuu_js_new_int32(ctx, auto_raw(&ACTIVE_AUTO_TRIGGERS_FN, &json)),
+        None => qjs::sofuu_js_new_int32(ctx, -1),
+    }
+}
+
+unsafe extern "C" fn js_ui_auto_rows(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    match first_string(ctx, argc, argv) {
+        Some(json) => qjs::sofuu_js_new_int32(ctx, auto_raw(&ACTIVE_AUTO_ROWS_FN, &json)),
+        None => qjs::sofuu_js_new_int32(ctx, -1),
+    }
+}
+
+unsafe extern "C" fn js_ui_auto_mount(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    match first_string(ctx, argc, argv) {
+        Some(json) => qjs::sofuu_js_new_int32(ctx, auto_raw(&ACTIVE_AUTO_MOUNT_FN, &json)),
+        None => qjs::sofuu_js_new_int32(ctx, -1),
+    }
+}
+
+unsafe extern "C" fn js_ui_auto_scene(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    match auto_scene_raw() {
+        Some(json) => js_new_string(ctx, &json),
+        None => qjs::sofuu_js_null(),
+    }
+}
+
 unsafe extern "C" fn js_ui_is_attached(
     ctx: *mut JSContext,
     _this: JSValueConst,
@@ -463,6 +620,15 @@ pub unsafe fn mod_ui_register(ctx: *mut JSContext) {
     register_global_fn(ctx, "__sofuu_ui_is_attached", js_ui_is_attached);
     register_global_fn(ctx, "__sofuu_ui_push_patch", js_ui_push_patch);
     register_global_fn(ctx, "__sofuu_ui_poll_event", js_ui_poll_event);
+    // ABI v2: only expose the Rust Auto-Composer bridge when the loaded
+    // libsofuu_gpu actually provides it, so JS can feature-detect cleanly.
+    if !ACTIVE_AUTO_EVENT_FN.load(Ordering::Acquire).is_null() {
+        register_global_fn(ctx, "__sofuu_ui_auto_event", js_ui_auto_event);
+        register_global_fn(ctx, "__sofuu_ui_auto_triggers", js_ui_auto_triggers);
+        register_global_fn(ctx, "__sofuu_ui_auto_rows", js_ui_auto_rows);
+        register_global_fn(ctx, "__sofuu_ui_auto_mount", js_ui_auto_mount);
+        register_global_fn(ctx, "__sofuu_ui_auto_scene", js_ui_auto_scene);
+    }
 }
 
 #[cfg(test)]

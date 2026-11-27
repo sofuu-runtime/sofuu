@@ -3321,6 +3321,7 @@ dependencies = [
  "serde_json",
  "sofuu-core",
  "sofuu-ffi",
+ "sofuu-ui",
 ]
 
 [[package]]

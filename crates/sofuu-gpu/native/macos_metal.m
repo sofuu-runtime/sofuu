@@ -193,25 +193,28 @@ typedef struct {
     uint32_t _pad;
 } SofuuDrawCmd;
 
-typedef struct SofuuMacWindow {
-    NSWindow* window;
-    SofuuMetalView* view;
-    SofuuWindowDelegate* delegate;
-    CAMetalLayer* metalLayer;
-    id<MTLDevice> device;
-    id<MTLCommandQueue> queue;
-    id<MTLRenderPipelineState> quadPipeline;
-    id<MTLRenderPipelineState> ribbonPipeline;
-    id<MTLRenderPipelineState> strokePipeline;
-    id<MTLRenderPipelineState> glyphPipeline;
-    id<MTLTexture> atlasTexture;
-    id<MTLSamplerState> atlasSampler;
-    id<MTLBuffer> clipBuf;
-    id<MTLBuffer> quadBuf;
-    id<MTLBuffer> ribbonBuf;
-    id<MTLBuffer> strokeBuf;
-    id<MTLBuffer> glyphBuf;
-} SofuuMacWindow;
+@interface SofuuMacWindow : NSObject
+@property (nonatomic, strong) NSWindow* window;
+@property (nonatomic, strong) SofuuMetalView* view;
+@property (nonatomic, strong) SofuuWindowDelegate* delegate;
+@property (nonatomic, strong) CAMetalLayer* metalLayer;
+@property (nonatomic, strong) id<MTLDevice> device;
+@property (nonatomic, strong) id<MTLCommandQueue> queue;
+@property (nonatomic, strong) id<MTLRenderPipelineState> quadPipeline;
+@property (nonatomic, strong) id<MTLRenderPipelineState> ribbonPipeline;
+@property (nonatomic, strong) id<MTLRenderPipelineState> strokePipeline;
+@property (nonatomic, strong) id<MTLRenderPipelineState> glyphPipeline;
+@property (nonatomic, strong) id<MTLTexture> atlasTexture;
+@property (nonatomic, strong) id<MTLSamplerState> atlasSampler;
+@property (nonatomic, strong) id<MTLBuffer> clipBuf;
+@property (nonatomic, strong) id<MTLBuffer> quadBuf;
+@property (nonatomic, strong) id<MTLBuffer> ribbonBuf;
+@property (nonatomic, strong) id<MTLBuffer> strokeBuf;
+@property (nonatomic, strong) id<MTLBuffer> glyphBuf;
+@end
+
+@implementation SofuuMacWindow
+@end
 
 static id<MTLRenderPipelineState> make_pipeline(
     id<MTLDevice> device,
@@ -242,23 +245,21 @@ static id<MTLRenderPipelineState> make_pipeline(
 
 static id<MTLBuffer> ensure_upload_buffer(
     id<MTLDevice> device,
-    __strong id<MTLBuffer>* slot,
+    id<MTLBuffer> buf,
     const void* data,
     NSUInteger bytes
 ) {
-    if (bytes == 0 || data == NULL) return nil;
-    id<MTLBuffer> buf = *slot;
+    if (bytes == 0 || data == NULL) return buf;
     if (!buf || buf.length < bytes) {
         NSUInteger cap = 4096;
         while (cap < bytes) cap *= 2;
         buf = [device newBufferWithLength:cap options:MTLResourceStorageModeShared];
-        *slot = buf;
     }
     memcpy(buf.contents, data, bytes);
     return buf;
 }
 
-SofuuMacWindow* sofuu_macos_create_window(
+void* sofuu_macos_create_window(
     const char* title_utf8,
     float width,
     float height,
@@ -326,6 +327,7 @@ SofuuMacWindow* sofuu_macos_create_window(
                                                        styleMask:style
                                                          backing:NSBackingStoreBuffered
                                                            defer:NO];
+        window.releasedWhenClosed = NO;
         window.title = title_utf8 ? [NSString stringWithUTF8String:title_utf8] : @"";
         window.titleVisibility = NSWindowTitleHidden;
         window.titlebarAppearsTransparent = YES;
@@ -370,47 +372,53 @@ SofuuMacWindow* sofuu_macos_create_window(
         [window makeFirstResponder:view];
         [NSApp activateIgnoringOtherApps:YES];
 
-        SofuuMacWindow* handle = (SofuuMacWindow*)calloc(1, sizeof(SofuuMacWindow));
-        handle->window = window;
-        handle->view = view;
-        handle->delegate = delegate;
-        handle->metalLayer = metalLayer;
-        handle->device = device;
-        handle->queue = [device newCommandQueue];
-        handle->quadPipeline = quadPipe;
-        handle->ribbonPipeline = ribbonPipe;
-        handle->strokePipeline = strokePipe;
-        handle->glyphPipeline = glyphPipe;
-        handle->atlasTexture = atlasTex;
-        handle->atlasSampler = atlasSampler;
-        return handle;
+        SofuuMacWindow* handle = [[SofuuMacWindow alloc] init];
+        handle.window = window;
+        handle.view = view;
+        handle.delegate = delegate;
+        handle.metalLayer = metalLayer;
+        handle.device = device;
+        handle.queue = [device newCommandQueue];
+        handle.quadPipeline = quadPipe;
+        handle.ribbonPipeline = ribbonPipe;
+        handle.strokePipeline = strokePipe;
+        handle.glyphPipeline = glyphPipe;
+        handle.atlasTexture = atlasTex;
+        handle.atlasSampler = atlasSampler;
+        return (__bridge_retained void*)handle;
     }
 }
 
-void sofuu_macos_destroy_window(SofuuMacWindow* win) {
-    if (!win) return;
+void sofuu_macos_destroy_window(void* winPtr) {
+    if (!winPtr) return;
     @autoreleasepool {
-        win->view.callback = NULL;
-        win->delegate.callback = NULL;
-        [win->window close];
-        win->clipBuf = nil;
-        win->quadBuf = nil;
-        win->ribbonBuf = nil;
-        win->strokeBuf = nil;
-        win->glyphBuf = nil;
-        win->atlasSampler = nil;
-        win->atlasTexture = nil;
-        win->quadPipeline = nil;
-        win->ribbonPipeline = nil;
-        win->strokePipeline = nil;
-        win->glyphPipeline = nil;
-        win->queue = nil;
-        win->device = nil;
-        win->metalLayer = nil;
-        win->view = nil;
-        win->delegate = nil;
-        win->window = nil;
-        free(win);
+        SofuuMacWindow* win = (__bridge_transfer SofuuMacWindow*)winPtr;
+        win.view.callback = NULL;
+        win.delegate.callback = NULL;
+        if (win.window) {
+            if (!win.delegate.closed) {
+                [win.window close];
+            }
+            win.window.delegate = nil;
+            win.window.contentView = nil;
+        }
+        win.clipBuf = nil;
+        win.quadBuf = nil;
+        win.ribbonBuf = nil;
+        win.strokeBuf = nil;
+        win.glyphBuf = nil;
+        win.atlasSampler = nil;
+        win.atlasTexture = nil;
+        win.quadPipeline = nil;
+        win.ribbonPipeline = nil;
+        win.strokePipeline = nil;
+        win.glyphPipeline = nil;
+        win.queue = nil;
+        win.device = nil;
+        win.metalLayer = nil;
+        win.view = nil;
+        win.delegate = nil;
+        win.window = nil;
     }
 }
 
@@ -430,10 +438,11 @@ void sofuu_macos_wake(void) {
     }
 }
 
-void sofuu_macos_get_metrics(SofuuMacWindow* win, float* out_w, float* out_h, float* out_scale) {
-    if (!win) return;
-    CGSize sz = win->view.bounds.size;
-    CGFloat scale = win->window.backingScaleFactor;
+void sofuu_macos_get_metrics(void* winPtr, float* out_w, float* out_h, float* out_scale) {
+    if (!winPtr) return;
+    SofuuMacWindow* win = (__bridge SofuuMacWindow*)winPtr;
+    CGSize sz = win.view.bounds.size;
+    CGFloat scale = win.window.backingScaleFactor;
     if (scale < 1.0) scale = 1.0;
     *out_w = (float)sz.width;
     *out_h = (float)sz.height;
@@ -441,7 +450,7 @@ void sofuu_macos_get_metrics(SofuuMacWindow* win, float* out_w, float* out_h, fl
 }
 
 void sofuu_macos_render(
-    SofuuMacWindow* win,
+    void* winPtr,
     const SofuuFrameUniforms* uniforms,
     const void* clips,
     uint32_t clips_count,
@@ -456,16 +465,24 @@ void sofuu_macos_render(
     const SofuuDrawCmd* cmds,
     uint32_t cmds_count
 ) {
-    if (!win || !win->metalLayer) return;
+    if (!winPtr) return;
+    SofuuMacWindow* win = (__bridge SofuuMacWindow*)winPtr;
+    if (!win.metalLayer || win.delegate.closed) return;
     @autoreleasepool {
-        id<CAMetalDrawable> drawable = [win->metalLayer nextDrawable];
+        id<CAMetalDrawable> drawable = [win.metalLayer nextDrawable];
         if (!drawable) return;
 
-        id<MTLBuffer> clipB = ensure_upload_buffer(win->device, &win->clipBuf, clips, (NSUInteger)clips_count * 16);
-        id<MTLBuffer> quadB = ensure_upload_buffer(win->device, &win->quadBuf, quads, (NSUInteger)quads_count * 80);
-        id<MTLBuffer> ribbonB = ensure_upload_buffer(win->device, &win->ribbonBuf, ribbons, (NSUInteger)ribbons_count * 48);
-        id<MTLBuffer> strokeB = ensure_upload_buffer(win->device, &win->strokeBuf, strokes, (NSUInteger)strokes_count * 48);
-        id<MTLBuffer> glyphB = ensure_upload_buffer(win->device, &win->glyphBuf, glyphs, (NSUInteger)glyphs_count * 48);
+        if (clips_count > 0) win.clipBuf = ensure_upload_buffer(win.device, win.clipBuf, clips, (NSUInteger)clips_count * 16);
+        if (quads_count > 0) win.quadBuf = ensure_upload_buffer(win.device, win.quadBuf, quads, (NSUInteger)quads_count * 80);
+        if (ribbons_count > 0) win.ribbonBuf = ensure_upload_buffer(win.device, win.ribbonBuf, ribbons, (NSUInteger)ribbons_count * 48);
+        if (strokes_count > 0) win.strokeBuf = ensure_upload_buffer(win.device, win.strokeBuf, strokes, (NSUInteger)strokes_count * 48);
+        if (glyphs_count > 0) win.glyphBuf = ensure_upload_buffer(win.device, win.glyphBuf, glyphs, (NSUInteger)glyphs_count * 48);
+
+        id<MTLBuffer> clipB = clips_count > 0 ? win.clipBuf : nil;
+        id<MTLBuffer> quadB = quads_count > 0 ? win.quadBuf : nil;
+        id<MTLBuffer> ribbonB = ribbons_count > 0 ? win.ribbonBuf : nil;
+        id<MTLBuffer> strokeB = strokes_count > 0 ? win.strokeBuf : nil;
+        id<MTLBuffer> glyphB = glyphs_count > 0 ? win.glyphBuf : nil;
 
         MTLRenderPassDescriptor* pass = [MTLRenderPassDescriptor renderPassDescriptor];
         pass.colorAttachments[0].texture = drawable.texture;
@@ -473,7 +490,7 @@ void sofuu_macos_render(
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         pass.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
 
-        id<MTLCommandBuffer> cmd = [win->queue commandBuffer];
+        id<MTLCommandBuffer> cmd = [win.queue commandBuffer];
         id<MTLRenderCommandEncoder> enc = [cmd renderCommandEncoderWithDescriptor:pass];
 
         [enc setVertexBytes:uniforms length:sizeof(SofuuFrameUniforms) atIndex:0];
@@ -481,8 +498,8 @@ void sofuu_macos_render(
         if (clipB) {
             [enc setFragmentBuffer:clipB offset:0 atIndex:1];
         }
-        [enc setFragmentTexture:win->atlasTexture atIndex:0];
-        [enc setFragmentSamplerState:win->atlasSampler atIndex:0];
+        [enc setFragmentTexture:win.atlasTexture atIndex:0];
+        [enc setFragmentSamplerState:win.atlasSampler atIndex:0];
 
         uint32_t last_kind = 0xffffffffu;
         for (uint32_t i = 0; i < cmds_count; i++) {
@@ -491,25 +508,25 @@ void sofuu_macos_render(
 
             if (dc.kind == 0 && quadB) {
                 if (last_kind != 0) {
-                    [enc setRenderPipelineState:win->quadPipeline];
+                    [enc setRenderPipelineState:win.quadPipeline];
                     last_kind = 0;
                 }
                 [enc setVertexBuffer:quadB offset:(NSUInteger)dc.start * 80 atIndex:1];
             } else if (dc.kind == 1 && ribbonB) {
                 if (last_kind != 1) {
-                    [enc setRenderPipelineState:win->ribbonPipeline];
+                    [enc setRenderPipelineState:win.ribbonPipeline];
                     last_kind = 1;
                 }
                 [enc setVertexBuffer:ribbonB offset:(NSUInteger)dc.start * 48 atIndex:1];
             } else if (dc.kind == 2 && strokeB) {
                 if (last_kind != 2) {
-                    [enc setRenderPipelineState:win->strokePipeline];
+                    [enc setRenderPipelineState:win.strokePipeline];
                     last_kind = 2;
                 }
                 [enc setVertexBuffer:strokeB offset:(NSUInteger)dc.start * 48 atIndex:1];
             } else if (dc.kind == 3 && glyphB) {
                 if (last_kind != 3) {
-                    [enc setRenderPipelineState:win->glyphPipeline];
+                    [enc setRenderPipelineState:win.glyphPipeline];
                     last_kind = 3;
                 }
                 [enc setVertexBuffer:glyphB offset:(NSUInteger)dc.start * 48 atIndex:1];
@@ -529,8 +546,10 @@ void sofuu_macos_render(
     }
 }
 
-int sofuu_macos_poll_or_wait(SofuuMacWindow* win, int wait_forever, double timeout_sec) {
-    if (!win || win->delegate.closed) return 0;
+int sofuu_macos_poll_or_wait(void* winPtr, int wait_forever, double timeout_sec) {
+    if (!winPtr) return 0;
+    SofuuMacWindow* win = (__bridge SofuuMacWindow*)winPtr;
+    if (win.delegate.closed) return 0;
     @autoreleasepool {
         NSDate* limit = wait_forever
             ? [NSDate distantFuture]
@@ -555,6 +574,6 @@ int sofuu_macos_poll_or_wait(SofuuMacWindow* win, int wait_forever, double timeo
             }
         }
         [NSApp updateWindows];
-        return win->delegate.closed ? 0 : 1;
+        return win.delegate.closed ? 0 : 1;
     }
 }

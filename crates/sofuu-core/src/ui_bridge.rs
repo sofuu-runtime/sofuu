@@ -36,6 +36,14 @@ type RunJsonFn = unsafe extern "C" fn(
     worker_cb: Option<WorkerCb>,
     user_ctx: *mut c_void,
 ) -> i32;
+type RunJsonExFn = unsafe extern "C" fn(
+    config_json: *const u8,
+    config_len: usize,
+    initial_scene_json: *const u8,
+    initial_scene_len: usize,
+    worker_cb: Option<WorkerCb>,
+    user_ctx: *mut c_void,
+) -> i32;
 type PushPatchJsonFn =
     unsafe extern "C" fn(session: *mut c_void, patch_json: *const u8, patch_len: usize) -> i32;
 type PollEventJsonFn =
@@ -50,10 +58,20 @@ type AutoMountFn =
     unsafe extern "C" fn(session: *mut c_void, config_json: *const u8, config_len: usize) -> i32;
 type AutoSceneFn =
     unsafe extern "C" fn(session: *mut c_void, out_buf: *mut u8, out_cap: usize) -> i64;
+type HostActionFn = unsafe extern "C" fn(out_buf: *mut u8, out_cap: usize) -> i64;
+type SendInputFn = unsafe extern "C" fn(session: *mut c_void, json: *const u8, len: usize) -> i32;
+type PauseFn = extern "C" fn(paused: i32) -> i32;
+type StepFn = extern "C" fn() -> i32;
+type BoundsFn = extern "C" fn(on: i32) -> i32;
 
 static ACTIVE_SESSION: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static ACTIVE_PUSH_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static ACTIVE_POLL_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static ACTIVE_HOST_ACTION_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static ACTIVE_SEND_INPUT_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static ACTIVE_PAUSE_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static ACTIVE_STEP_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+static ACTIVE_BOUNDS_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static ACTIVE_AUTO_EVENT_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static ACTIVE_AUTO_TRIGGERS_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static ACTIVE_AUTO_ROWS_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
@@ -61,6 +79,137 @@ static ACTIVE_AUTO_MOUNT_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut())
 static ACTIVE_AUTO_SCENE_FN: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static UI_MOUNTED: AtomicBool = AtomicBool::new(false);
 static WINDOW_CLOSED_SEEN: AtomicBool = AtomicBool::new(false);
+
+/// Events pulled off the GPU session by the interactive emulator's own pump
+/// loop. `sofuu ui emu` polls without running the uv loop (so it can also
+/// watch files), so the event is queued for the JS pump that runs next.
+static HOST_EVENTS: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Pending interactive screenshot request: 0 none, 1 clean, 2 annotated.
+static EMU_CAPTURE_REQUEST: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// Toolbar state (theme/orientation/keyboard/platform/device) captured with
+/// the request. The live loop uses it so `⌘S` reflects the window, not the
+/// flags the process started with.
+static EMU_CAPTURE_ENV: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Queue one already-parsed host event for the next `sofuu.ui.pump()`.
+pub fn queue_host_event(json: &str) {
+    let mut guard = HOST_EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.push_back(json.to_string());
+}
+
+fn host_poll_event() -> Option<String> {
+    let mut guard = HOST_EVENTS.lock().unwrap_or_else(|e| e.into_inner());
+    guard.pop_front()
+}
+
+/// True after the GPU window reported `window_closed` (or its session died).
+pub fn window_closed() -> bool {
+    WINDOW_CLOSED_SEEN.load(Ordering::Acquire)
+}
+
+/// Toolbar / ⌘S request raised from JS. The interactive loop turns it into a
+/// headless `sofuu ui snapshot` of the current profile.
+pub fn take_emu_capture_request() -> Option<&'static str> {
+    match EMU_CAPTURE_REQUEST.swap(0, Ordering::AcqRel) {
+        1 => Some("clean"),
+        2 => Some("annotated"),
+        _ => None,
+    }
+}
+
+/// Toolbar env queued with [`take_emu_capture_request`], if the shell sent one.
+pub fn take_emu_capture_env() -> Option<String> {
+    EMU_CAPTURE_ENV
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// Headless capture state used by `sofuu ui snapshot`.
+///
+/// The app runs through the ordinary `sofuu.ui` builders; the host functions
+/// below simply record every `ScenePatch` instead of forwarding it to a GPU
+/// window. `sofuu-emu` replays that patch stream through a real `UiEngine`,
+/// so layout, springs and the audit are identical to the interactive path.
+#[derive(Default)]
+struct HeadlessUi {
+    patches: Vec<String>,
+    events: std::collections::VecDeque<String>,
+    mounted: bool,
+}
+
+static HEADLESS_UI: std::sync::Mutex<Option<HeadlessUi>> = std::sync::Mutex::new(None);
+
+/// Start recording UI patches for a headless render. Returns false when a
+/// previous capture was still active (the caller decides whether to end it).
+pub fn begin_headless() -> bool {
+    let mut guard = HEADLESS_UI.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(HeadlessUi::default());
+    true
+}
+
+pub fn end_headless() {
+    let mut guard = HEADLESS_UI.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
+pub fn headless_active() -> bool {
+    HEADLESS_UI
+        .lock()
+        .map(|g| g.is_some())
+        .unwrap_or(false)
+}
+
+/// Take the recorded patch stream, keeping the recorder active for another
+/// action round.
+pub fn headless_take_patches() -> Vec<String> {
+    let mut guard = HEADLESS_UI.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_mut()
+        .map(|h| std::mem::take(&mut h.patches))
+        .unwrap_or_default()
+}
+
+/// True once any patch (usually `replace_scene`) has been recorded.
+pub fn headless_mounted() -> bool {
+    HEADLESS_UI
+        .lock()
+        .map(|g| g.as_ref().map(|h| h.mounted).unwrap_or(false))
+        .unwrap_or(false)
+}
+
+/// Queue a semantic `UIEvent` for the next `sofuu.ui.pump()`.
+pub fn headless_queue_event(json: &str) -> bool {
+    let mut guard = HEADLESS_UI.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = guard.as_mut() {
+        h.events.push_back(json.to_string());
+        true
+    } else {
+        false
+    }
+}
+
+fn headless_push_patch(json: &str) -> i32 {
+    let mut guard = HEADLESS_UI.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = guard.as_mut() {
+        h.mounted = true;
+        h.patches.push(json.to_string());
+        0
+    } else {
+        -2
+    }
+}
+
+fn headless_poll_event() -> Option<String> {
+    let mut guard = HEADLESS_UI.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_mut()
+        .and_then(|h| h.events.pop_front())
+}
 
 /// Strip `--ui` (before an optional `--` separator) and return `(enabled, remaining_args)`.
 pub fn take_ui_arg(args: &[String]) -> (bool, Vec<String>) {
@@ -124,8 +273,14 @@ struct LoadedUiLib {
     #[cfg(unix)]
     handle: *mut c_void,
     run_json: RunJsonFn,
+    run_json_ex: Option<RunJsonExFn>,
     push_patch_json: PushPatchJsonFn,
     poll_event_json: PollEventJsonFn,
+    host_action: Option<HostActionFn>,
+    send_input: Option<SendInputFn>,
+    set_paused: Option<PauseFn>,
+    step_frame: Option<StepFn>,
+    set_bounds: Option<BoundsFn>,
     auto_event: Option<IngestAgentEventFn>,
     auto_triggers: Option<UpdateTriggersFn>,
     auto_rows: Option<AutoStateRowsFn>,
@@ -230,8 +385,14 @@ fn load_ui_lib() -> Result<LoadedUiLib, String> {
     Ok(LoadedUiLib {
         handle,
         run_json: unsafe { sym(handle, c"sofuu_ui_run_json")? },
+        run_json_ex: unsafe { opt_sym(handle, c"sofuu_ui_run_json_ex") },
         push_patch_json: unsafe { sym(handle, c"sofuu_ui_push_patch_json")? },
         poll_event_json: unsafe { sym(handle, c"sofuu_ui_poll_event_json")? },
+        host_action: unsafe { opt_sym(handle, c"sofuu_ui_poll_host_action_json") },
+        send_input: unsafe { opt_sym(handle, c"sofuu_ui_send_input_json") },
+        set_paused: unsafe { opt_sym(handle, c"sofuu_ui_set_paused") },
+        step_frame: unsafe { opt_sym(handle, c"sofuu_ui_step_frame") },
+        set_bounds: unsafe { opt_sym(handle, c"sofuu_ui_set_bounds") },
         auto_event: unsafe { opt_sym(handle, c"sofuu_ui_ingest_agent_event_json") },
         auto_triggers: unsafe { opt_sym(handle, c"sofuu_ui_update_triggers_json") },
         auto_rows: unsafe { opt_sym(handle, c"sofuu_ui_auto_state_rows_json") },
@@ -350,8 +511,33 @@ extern "C" fn ui_worker_trampoline(session: *mut c_void, user_ctx: *mut c_void) 
     ACTIVE_SESSION.store(ptr::null_mut(), Ordering::Release);
 }
 
+/// Screen-exact window contract for the live emulator (E6). `None` keeps the
+/// legacy 1080×720 DevTools window for plain `--ui` apps.
+#[derive(Clone, Debug, Default)]
+pub struct UiWindowSpec {
+    pub width: f32,
+    pub height: f32,
+    pub decorations: bool,
+    pub resizable: bool,
+    pub scale: Option<f32>,
+    pub corner_radius: f32,
+    pub strip: bool,
+    pub reticle: bool,
+    pub platform: String,
+    pub device: String,
+    pub profiles_json: String,
+}
+
 /// Launch the native GPU UI window on Thread 0 and execute `worker` on Thread 1.
 pub fn run_with_ui<F>(title: &str, worker: F) -> ExitCode
+where
+    F: FnOnce() -> i32 + Send + 'static,
+{
+    run_with_ui_spec(title, None, worker)
+}
+
+/// Launch with an explicit screen-exact window contract (E6).
+pub fn run_with_ui_spec<F>(title: &str, spec: Option<&UiWindowSpec>, worker: F) -> ExitCode
 where
     F: FnOnce() -> i32 + Send + 'static,
 {
@@ -365,6 +551,26 @@ where
 
     ACTIVE_PUSH_FN.store(lib.push_patch_json as *mut c_void, Ordering::Release);
     ACTIVE_POLL_FN.store(lib.poll_event_json as *mut c_void, Ordering::Release);
+    ACTIVE_HOST_ACTION_FN.store(
+        lib.host_action.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        Ordering::Release,
+    );
+    ACTIVE_SEND_INPUT_FN.store(
+        lib.send_input.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        Ordering::Release,
+    );
+    ACTIVE_PAUSE_FN.store(
+        lib.set_paused.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        Ordering::Release,
+    );
+    ACTIVE_STEP_FN.store(
+        lib.step_frame.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        Ordering::Release,
+    );
+    ACTIVE_BOUNDS_FN.store(
+        lib.set_bounds.map_or(ptr::null_mut(), |f| f as *mut c_void),
+        Ordering::Release,
+    );
     fn opt_ptr(f: Option<*mut c_void>) -> *mut c_void {
         f.unwrap_or(ptr::null_mut())
     }
@@ -383,21 +589,56 @@ where
     });
     let worker_ptr = Box::into_raw(worker_box) as *mut c_void;
 
-    let ui_rc = unsafe {
-        (lib.run_json)(
-            title_c.as_ptr(),
-            1080.0,
-            720.0,
-            boot_scene.as_ptr(),
-            boot_scene.len(),
-            Some(ui_worker_trampoline),
-            worker_ptr,
-        )
+    let ui_rc = if let (Some(spec), Some(run_ex)) = (spec, lib.run_json_ex) {
+        let cfg = serde_json::json!({
+            "title": title,
+            "width": spec.width,
+            "height": spec.height,
+            "min_width": spec.width,
+            "min_height": spec.height,
+            "decorations": spec.decorations,
+            "resizable": spec.resizable,
+            "scale": spec.scale,
+            "corner_radius": spec.corner_radius,
+            "strip": spec.strip,
+            "reticle": spec.reticle,
+            "platform": spec.platform,
+            "device": spec.device,
+            "profiles_json": spec.profiles_json,
+        })
+        .to_string();
+        unsafe {
+            run_ex(
+                cfg.as_ptr(),
+                cfg.len(),
+                boot_scene.as_ptr(),
+                boot_scene.len(),
+                Some(ui_worker_trampoline),
+                worker_ptr,
+            )
+        }
+    } else {
+        unsafe {
+            (lib.run_json)(
+                title_c.as_ptr(),
+                spec.map_or(1080.0, |s| s.width),
+                spec.map_or(720.0, |s| s.height),
+                boot_scene.as_ptr(),
+                boot_scene.len(),
+                Some(ui_worker_trampoline),
+                worker_ptr,
+            )
+        }
     };
 
     ACTIVE_SESSION.store(ptr::null_mut(), Ordering::Release);
     ACTIVE_PUSH_FN.store(ptr::null_mut(), Ordering::Release);
     ACTIVE_POLL_FN.store(ptr::null_mut(), Ordering::Release);
+    ACTIVE_HOST_ACTION_FN.store(ptr::null_mut(), Ordering::Release);
+    ACTIVE_SEND_INPUT_FN.store(ptr::null_mut(), Ordering::Release);
+    ACTIVE_PAUSE_FN.store(ptr::null_mut(), Ordering::Release);
+    ACTIVE_STEP_FN.store(ptr::null_mut(), Ordering::Release);
+    ACTIVE_BOUNDS_FN.store(ptr::null_mut(), Ordering::Release);
     ACTIVE_AUTO_EVENT_FN.store(ptr::null_mut(), Ordering::Release);
     ACTIVE_AUTO_TRIGGERS_FN.store(ptr::null_mut(), Ordering::Release);
     ACTIVE_AUTO_ROWS_FN.store(ptr::null_mut(), Ordering::Release);
@@ -468,6 +709,64 @@ pub fn poll_event_raw() -> Result<Option<String>, i32> {
         WINDOW_CLOSED_SEEN.store(true, Ordering::Release);
     }
     Ok(Some(s))
+}
+
+/// Poll a native control-strip action (E6). Returns `None` when the strip is
+/// absent or idle. The JSON is `{"type":"emu_action","action":"..."}`.
+pub fn poll_host_action_raw() -> Option<String> {
+    let fp = ACTIVE_HOST_ACTION_FN.load(Ordering::Acquire);
+    if fp.is_null() {
+        return None;
+    }
+    let f: HostActionFn = unsafe { std::mem::transmute(fp) };
+    let mut buf = vec![0u8; 4096];
+    let n = unsafe { f(buf.as_mut_ptr(), buf.len()) };
+    if n <= 0 {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+/// Inject a synthetic input event into the live engine (E7). Returns `0` on
+/// success, `-2` when no live UI session is attached.
+pub fn send_input_raw(json: &str) -> i32 {
+    let sess = ACTIVE_SESSION.load(Ordering::Acquire);
+    let fp = ACTIVE_SEND_INPUT_FN.load(Ordering::Acquire);
+    if sess.is_null() || fp.is_null() {
+        return -2;
+    }
+    let f: SendInputFn = unsafe { std::mem::transmute(fp) };
+    unsafe { f(sess, json.as_ptr(), json.len()) }
+}
+
+/// Freeze/unfreeze the live engine clock (E7). Returns `0` on success.
+pub fn set_paused_raw(paused: bool) -> i32 {
+    let fp = ACTIVE_PAUSE_FN.load(Ordering::Acquire);
+    if fp.is_null() {
+        return -2;
+    }
+    let f: PauseFn = unsafe { std::mem::transmute(fp) };
+    f(if paused { 1 } else { 0 })
+}
+
+/// Advance a paused live engine by one 60 Hz frame (E7).
+pub fn step_frame_raw() -> i32 {
+    let fp = ACTIVE_STEP_FN.load(Ordering::Acquire);
+    if fp.is_null() {
+        return -2;
+    }
+    let f: StepFn = unsafe { std::mem::transmute(fp) };
+    f()
+}
+
+/// Toggle the live layout-bounds overlay (E6 strip "Bounds").
+pub fn set_bounds_raw(on: bool) -> i32 {
+    let fp = ACTIVE_BOUNDS_FN.load(Ordering::Acquire);
+    if fp.is_null() {
+        return -2;
+    }
+    let f: BoundsFn = unsafe { std::mem::transmute(fp) };
+    f(if on { 1 } else { 0 })
 }
 
 fn auto_raw(fn_ptr: &AtomicPtr<c_void>, json: &str) -> i32 {
@@ -585,7 +884,39 @@ unsafe extern "C" fn js_ui_is_attached(
     _argc: c_int,
     _argv: *const JSValueConst,
 ) -> JSValue {
-    js_new_bool(ctx, is_ui_attached())
+    js_new_bool(ctx, is_ui_attached() || headless_active())
+}
+
+unsafe extern "C" fn js_ui_headless(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    js_new_bool(ctx, headless_active())
+}
+
+/// `__sofuu_emu_request_capture('annotated'|'clean')` — the interactive
+/// toolbar/⌘S hook. The emulator loop performs the actual headless capture.
+unsafe extern "C" fn js_emu_request_capture(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let mode = if argc > 0 { js_to_string(ctx, *argv) } else { None };
+    let value = match mode.as_deref() {
+        Some("clean") => 1,
+        _ => 2,
+    };
+    let env = if argc > 1 {
+        js_to_string(ctx, *argv.add(1))
+    } else {
+        None
+    };
+    *EMU_CAPTURE_ENV.lock().unwrap_or_else(|e| e.into_inner()) = env;
+    EMU_CAPTURE_REQUEST.store(value, Ordering::Release);
+    js_new_bool(ctx, true)
 }
 
 unsafe extern "C" fn js_ui_push_patch(
@@ -600,8 +931,62 @@ unsafe extern "C" fn js_ui_push_patch(
     let Some(json) = js_to_string(ctx, *argv) else {
         return qjs::sofuu_js_new_int32(ctx, -1);
     };
-    let rc = push_patch_raw(&json);
+    let rc = if headless_active() {
+        headless_push_patch(&json)
+    } else {
+        push_patch_raw(&json)
+    };
     qjs::sofuu_js_new_int32(ctx, rc)
+}
+
+unsafe extern "C" fn js_ui_set_paused(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let mut flag = 0u32;
+    let paused = argc >= 1
+        && unsafe { qjs::sofuu_js_to_uint32(ctx, &mut flag, *argv) } == 0
+        && flag != 0;
+    qjs::sofuu_js_new_int32(ctx, set_paused_raw(paused))
+}
+
+unsafe extern "C" fn js_ui_step_frame(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    _argc: c_int,
+    _argv: *const JSValueConst,
+) -> JSValue {
+    qjs::sofuu_js_new_int32(ctx, step_frame_raw())
+}
+
+unsafe extern "C" fn js_ui_set_bounds(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    let mut flag = 0u32;
+    let on = argc >= 1
+        && unsafe { qjs::sofuu_js_to_uint32(ctx, &mut flag, *argv) } == 0
+        && flag != 0;
+    qjs::sofuu_js_new_int32(ctx, set_bounds_raw(on))
+}
+
+unsafe extern "C" fn js_ui_send_input(
+    ctx: *mut JSContext,
+    _this: JSValueConst,
+    argc: c_int,
+    argv: *const JSValueConst,
+) -> JSValue {
+    if argc < 1 {
+        return qjs::sofuu_js_new_int32(ctx, -1);
+    }
+    let Some(json) = js_to_string(ctx, *argv) else {
+        return qjs::sofuu_js_new_int32(ctx, -1);
+    };
+    qjs::sofuu_js_new_int32(ctx, send_input_raw(&json))
 }
 
 unsafe extern "C" fn js_ui_poll_event(
@@ -610,6 +995,14 @@ unsafe extern "C" fn js_ui_poll_event(
     _argc: c_int,
     _argv: *const JSValueConst,
 ) -> JSValue {
+    if headless_active() {
+        if let Some(json) = headless_poll_event() {
+            return js_new_string(ctx, &json);
+        }
+    }
+    if let Some(json) = host_poll_event() {
+        return js_new_string(ctx, &json);
+    }
     match poll_event_raw() {
         Ok(Some(json)) => js_new_string(ctx, &json),
         _ => qjs::sofuu_js_null(),
@@ -618,8 +1011,14 @@ unsafe extern "C" fn js_ui_poll_event(
 
 pub unsafe fn mod_ui_register(ctx: *mut JSContext) {
     register_global_fn(ctx, "__sofuu_ui_is_attached", js_ui_is_attached);
+    register_global_fn(ctx, "__sofuu_ui_headless", js_ui_headless);
+    register_global_fn(ctx, "__sofuu_emu_request_capture", js_emu_request_capture);
     register_global_fn(ctx, "__sofuu_ui_push_patch", js_ui_push_patch);
     register_global_fn(ctx, "__sofuu_ui_poll_event", js_ui_poll_event);
+    register_global_fn(ctx, "__sofuu_ui_send_input", js_ui_send_input);
+    register_global_fn(ctx, "__sofuu_ui_set_paused", js_ui_set_paused);
+    register_global_fn(ctx, "__sofuu_ui_step_frame", js_ui_step_frame);
+    register_global_fn(ctx, "__sofuu_ui_set_bounds", js_ui_set_bounds);
     // ABI v2: only expose the Rust Auto-Composer bridge when the loaded
     // libsofuu_gpu actually provides it, so JS can feature-detect cleanly.
     if !ACTIVE_AUTO_EVENT_FN.load(Ordering::Acquire).is_null() {

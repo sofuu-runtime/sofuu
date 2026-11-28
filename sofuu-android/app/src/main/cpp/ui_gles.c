@@ -9,7 +9,7 @@
  * completely free of GPU/EGL linkage (Phase C5 headless guarantee).
  *
  * The shader source is the canonical
- *   crates/sofuu-gpu/src/shaders/glsl/ui_shaders_es3.glsl
+ *   crates/sofuu-ui/shaders/glsl/ui_shaders_es3.glsl
  * compiled four times with SOFUU_PIPELINE_{QUAD,RIBBON,STROKE,GLYPH} and
  * SOFUU_VERTEX / SOFUU_FRAGMENT, exactly like crates/sofuu-gpu/backend/gles.rs.
  * Gradle syncs it into the APK assets; Kotlin passes the text in once.

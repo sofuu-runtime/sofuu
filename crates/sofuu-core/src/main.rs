@@ -165,6 +165,12 @@ fn print_help() {
     println!("  sofuu install            Install dependencies from ./package.json");
     println!("  sofuu add <pkg>          Install an npm package directly");
     println!();
+    println!("\x1b[1mGPU UI Emulator & AI Screenshot Verification:\x1b[0m");
+    println!("  sofuu ui snapshot <app>  Headless clean/annotated/filmstrip PNG + audit JSON (--platform, --mode)");
+    println!("  sofuu ui emu <app>       Interactive platform emulator shell (--platform, --watch)");
+    println!("  sofuu ui profiles        List the five platform profiles and device presets");
+    println!("  sofuu ui mcp             Serve persistent ui_emu_* tools over MCP stdio");
+    println!();
     println!("\x1b[1mAutonomous Agents & Observability:\x1b[0m");
     println!("  sofuu agent list         List registered agent definitions (~/.sofuu/agents/*.js)");
     println!("  sofuu agent run <n> <t>  Run agent headless on task (--json for structured output, --model <m>)");
@@ -356,6 +362,7 @@ fn print_subcommand_help(cmd: &str) -> bool {
              Bundle an ES module entry (npm resolution included) into one file.\n\
                -o, --out <out.js>   output path (default: printed to stdout)\n"
         ),
+        "ui" => println!("{}", sofuu_core::emu_cli::USAGE),
         "install" => println!("Usage: sofuu install\n\nInstall the dependencies from ./package.json.\n"),
         "add" => println!(
             "Usage: sofuu add <package>[@version] [<package>…]\n\n\
@@ -4796,6 +4803,24 @@ fn main() -> ExitCode {
                 }
             }
             ExitCode::SUCCESS
+        }
+        "ui" => {
+            /* PLAN-GPU-PLATFORM-UI-EMULATOR: headless AI screenshots + the
+             * interactive emulator shell. The core never links sofuu-ui; the
+             * `sofuu-emu` companion binary owns rendering and audit. */
+            let rt = match SofuuRuntime::init() {
+                Some(rt) => rt,
+                None => {
+                    eprintln!("\x1b[31mFatal:\x1b[0m runtime init failed");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let rc = sofuu_core::emu_cli::cmd_ui(&rt, &args);
+            if rc == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(rc.clamp(1, 255) as u8)
+            }
         }
         "run" => {
             /* R7.P2/P3: --policy, --ui, and the shortcut guards are honoured on the

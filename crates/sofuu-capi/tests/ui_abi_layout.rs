@@ -1,6 +1,6 @@
 //! Phase C1 gate — C header / Rust `#[repr(C)]` layout parity.
 //!
-//! The host compiles `ui_shaders.metal` (or GLSL/SPIR-V) once and uploads the
+//! The host compiles `sofuu_ui::shaders::METAL_SRC` (or GLSL/SPIR-V) once and uploads the
 //! session's flat arrays directly, so a single field drifting by four bytes is
 //! a corrupted frame, not a compile error. This test pins:
 //!
@@ -24,6 +24,8 @@ use sofuu_capi::ui::{
 fn rust_structs_match_sofuu_ui_draw_layout() {
     // Instance structs are type aliases of sofuu-ui::draw, so these also prove
     // the public Rust types and the C typedefs describe the same bytes.
+    // The extern header macro and the Rust constant are one contract.
+    assert_eq!(sofuu_capi::ui::SOFUU_DRAW_ABI_VERSION, 1);
     assert_eq!(size_of::<SofuuUiFrameUniforms>(), 32);
     assert_eq!(size_of::<SofuuUiClipRect>(), 16);
     assert_eq!(size_of::<SofuuUiDrawCmd>(), 16);
@@ -115,6 +117,7 @@ fn c_header_compiles_and_static_asserts_the_same_layout() {
 
 #define SOFUU_SA(cond, msg) _Static_assert((cond), msg)
 
+SOFUU_SA(SOFUU_UI_DRAW_ABI_VERSION == 1u, "draw-abi");
 SOFUU_SA(sizeof(SofuuUiFrameUniforms) == 32, "uniforms");
 SOFUU_SA(sizeof(SofuuUiClipRect) == 16, "clip");
 SOFUU_SA(sizeof(SofuuUiDrawCmd) == 16, "cmd");

@@ -7,12 +7,18 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-// The embedded canvas compiles the canonical ES 3.0 UI shader from
-// crates/sofuu-gpu, not a stale in-app copy. Generating the asset at build
-// time keeps the APK in lock-step with the Rust GLES renderer.
+// Compile the canonical ES 3.0 UI shader from the UI repository, never a
+// stale in-app copy. `deps/sofuu-ui` is the post-split submodule path;
+// `crates/sofuu-ui` is the pre-split in-tree path. Generating the asset at
+// build time keeps the APK in lock-step with the Rust GLES renderer.
+val uiShaderSource = sequenceOf(
+    rootProject.file("../deps/sofuu-ui/shaders/glsl/ui_shaders_es3.glsl"),
+    rootProject.file("../crates/sofuu-ui/shaders/glsl/ui_shaders_es3.glsl"),
+).firstOrNull { it.exists() }
+    ?: error("ui_shaders_es3.glsl not found (expected deps/sofuu-ui or crates/sofuu-ui)")
 val uiShaderAssets = layout.buildDirectory.dir("generated/uiAssets")
 val syncUiShader = tasks.register<Copy>("syncUiShader") {
-    from(rootProject.file("../crates/sofuu-gpu/src/shaders/glsl/ui_shaders_es3.glsl"))
+    from(uiShaderSource)
     into(uiShaderAssets)
 }
 tasks.named("preBuild").configure { dependsOn(syncUiShader) }

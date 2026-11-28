@@ -171,6 +171,25 @@ pub const UI_JS: &str = include_str!("../../../src/js/ui.js");
 pub const UI_JS: &str = "";
 pub const UI_BC: &[u8] = include_bytes!("../../../src/js/ui.bc.gz");
 
+/// Tier-2 composable app kit (`sofuu.uiKit.*`) built on the Tier-1 primitives.
+/// Loaded immediately after `ui.js` because it reads `sofuu.ui`.
+#[cfg(debug_assertions)]
+pub const UI_KIT_JS: &str = include_str!("../../../src/js/ui_kit.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const UI_KIT_JS: &str = "";
+pub const UI_KIT_BC: &[u8] = include_bytes!("../../../src/js/ui_kit.bc.gz");
+
+/// `sofuu.emu` — stateful headless emulator sessions + the `ui_emu_*` MCP
+/// tools (PLAN-GPU-PLATFORM-UI-EMULATOR E5). Drives the companion `sofuu-emu`
+/// binary through `sofuu.spawn`; zero GPU deps in `sofuu-core`.
+#[cfg(debug_assertions)]
+pub const EMU_JS: &str = include_str!("../../../src/js/emu.js");
+/// Release builds carry bytecode only - see the file header.
+#[cfg(not(debug_assertions))]
+pub const EMU_JS: &str = "";
+pub const EMU_BC: &[u8] = include_bytes!("../../../src/js/emu.bc.gz");
+
 /// The Kaze asynchronous driver — single source of truth is src/js/kaze_async.js.
 ///
 /// It rides the same gzip mechanism as the other single-path drivers: staged

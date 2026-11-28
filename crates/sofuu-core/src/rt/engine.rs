@@ -44,7 +44,9 @@ use crate::ml::mod_ml_register;
 use crate::rt::{
     ai::mod_ai_register,
     cjs::{cjs_to_esm, is_cjs, mod_cjs_register},
-    event_loop::{sofuu_loop_close, sofuu_loop_init, sofuu_loop_run},
+    event_loop::{
+        sofuu_loop_alive, sofuu_loop_close, sofuu_loop_init, sofuu_loop_run, sofuu_loop_tick_nb,
+    },
     fs::mod_fs_register,
     http_client::mod_http_client_register,
     http_sse::mod_http_sse_register,
@@ -56,6 +58,50 @@ use crate::rt::{
     timer::mod_timer_register,
 };
 use sofuu_ffi::qjs;
+
+/// Optional wall-clock budget for the event-loop drain performed by
+/// [`engine_eval_file`] and [`eval_source`]. Zero (the default) means "run
+/// until idle" — the normal CLI/agent semantics. `sofuu ui snapshot` sets a
+/// small budget so an app with a live `setInterval` (dashboards, market
+/// tickers) captures its first frames instead of blocking on the interval
+/// forever.
+static EVAL_DRAIN_BUDGET_MS: AtomicUsize = AtomicUsize::new(0);
+
+/// Bound event-loop drains performed by the eval entry points to `ms`
+/// milliseconds. Call with `0` to restore the normal run-until-idle contract.
+pub fn set_eval_drain_budget(ms: usize) {
+    EVAL_DRAIN_BUDGET_MS.store(ms, Ordering::SeqCst);
+}
+
+fn eval_drain_budget() -> Option<std::time::Duration> {
+    match EVAL_DRAIN_BUDGET_MS.load(Ordering::SeqCst) {
+        0 => None,
+        ms => Some(std::time::Duration::from_millis(ms as u64)),
+    }
+}
+
+/// Drain the event loop the way `sofuu run` does, or — when a budget is set —
+/// tick it for at most that long. The bounded mode uses non-blocking UV turns
+/// so a 5-second refresh timer cannot stretch a one-shot capture to 5 seconds;
+/// a 3 ms pause keeps the wall clock near-real-time for 16 ms animations.
+unsafe fn drain_event_loop(ctx: *mut qjs::JSContext) {
+    let Some(budget) = eval_drain_budget() else {
+        unsafe { sofuu_loop_run(ctx) };
+        return;
+    };
+    let started = Instant::now();
+    loop {
+        unsafe { sofuu_loop_tick_nb(ctx) };
+        if run_status(ctx).fatal || !sofuu_loop_alive() {
+            break;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= budget {
+            break;
+        }
+        std::thread::sleep((budget - elapsed).min(std::time::Duration::from_millis(3)));
+    }
+}
 
 /// The public runtime handle — mirrors `struct SofuuRuntime { SofuuEngine
 /// *engine; }` (src/sofuu.c). sofuu-ffi's `CSofuuRuntime` has the same
@@ -1613,14 +1659,17 @@ unsafe fn engine_eval_file(eng: *mut SofuuEngine, path_c: *const c_char) -> c_in
         if !handled {
             return 1;
         }
-        unsafe { sofuu_loop_run((*eng).ctx) };
+        unsafe { drain_event_loop((*eng).ctx) };
         return if run_status((*eng).ctx).has_uncaught_error { 1 } else { 0 };
     }
 
     // SAFETY: result is a live value.
     unsafe { qjs::sofuu_js_free_value((*eng).ctx, result) };
     // Run the libuv event loop — drains timers, I/O, and Promise chains.
-    unsafe { sofuu_loop_run((*eng).ctx) };
+    // A bounded budget keeps headless UI capture (which sets one) from
+    // waiting on an app's forever-repeating `setInterval`; the CLI leaves it
+    // unset and keeps run-until-idle semantics.
+    unsafe { drain_event_loop((*eng).ctx) };
     unsafe { crate::modules::process::emit_exit_hooks_once((*eng).ctx) };
     // An unhandled rejection (or a microtask overflow) surfaced during the
     // drain: the status flag is the CLI's exit-1 signal. process.exitCode, if
@@ -1780,7 +1829,7 @@ unsafe fn eval_source(
         return (if handled { 0 } else { 1 }, unsafe { qjs::sofuu_js_undefined() });
     }
 
-    unsafe { sofuu_loop_run(ctx) };
+    unsafe { drain_event_loop(ctx) };
     /* AUDIT-2026-11-08: exit handlers run once, after the loop drains — the
      * natural-exit half of Node's contract (process.exit() dispatches them
      * itself, and the once-flag keeps the two from doubling). */

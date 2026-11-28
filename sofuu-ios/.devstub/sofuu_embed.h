@@ -399,6 +399,11 @@ int sofuu_voice_speak(SofuuRuntime *rt, const char *text,
 /* Packed GPU instance structs — byte-identical to sofuu-ui::draw and the
  * Metal/GLSL/SPIR-V vertex layouts (verified by crates/sofuu-capi tests). */
 
+/* Wire version of the SofuuUi* draw structs and the bundled shaders.
+ * Must equal sofuu_ui::draw::SOFUU_DRAW_ABI_VERSION; the Rust side pins the
+ * match at compile time. */
+#define SOFUU_UI_DRAW_ABI_VERSION 1u
+
 typedef struct {
     float viewport_size[2];
     float atlas_size[2];
@@ -415,6 +420,7 @@ typedef struct {
 #define SOFUU_DRAW_KIND_RIBBON 1u
 #define SOFUU_DRAW_KIND_STROKE 2u
 #define SOFUU_DRAW_KIND_GLYPH  3u
+#define SOFUU_DRAW_KIND_SPRITE 4u
 
 typedef struct {
     uint32_t kind;   /* SOFUU_DRAW_KIND_* */
@@ -466,11 +472,24 @@ typedef struct {
     uint32_t _pad;
 } SofuuUiGlyphInstance; /* 48 bytes */
 
+/* Textured sprite: images (`tex_id >= 1`) or SDF icons (`tex_id == 0`).
+ * `flags` bit 0 = SDF icon mask, bit 1 = premultiplied RGBA image. */
+typedef struct {
+    float    rect[4];       /* x, y, w, h (logical px) */
+    float    uv[4];         /* u0, v0, u1, v1 */
+    float    radii[4];      /* tl, tr, br, bl */
+    uint32_t tint;          /* packed RGBA8 multiplier (0xFFFFFFFF = none) */
+    uint32_t tex_id;        /* 0 = icon atlas, 1..N = image atlas page */
+    uint32_t clip_id;
+    uint32_t flags;
+} SofuuUiSpriteInstance; /* 64 bytes */
+
 /* One frame, zero-copy. `quads`..`clips` point into the session and are
  * borrowed, not owned — never free them and never read them after the next
  * poll/free. `recompiled` says geometry was regenerated this tick (upload and
- * draw); `needs_next_frame` is 1 while springs/kinetic scroll or queued
- * mutations remain, 0 when the host may pause its display link (0% GPU idle). */
+ * draw); `needs_next_frame` is 1 while springs/kinetic scroll, effects, a
+ * caret-blink deadline or queued mutations remain, 0 when the host may pause
+ * its display link (0% GPU idle). */
 typedef struct {
     SofuuUiFrameUniforms          uniforms;
     const SofuuUiQuadInstance*    quads;
@@ -485,8 +504,10 @@ typedef struct {
     uint32_t                      cmd_count;
     const SofuuUiClipRect*        clips;
     uint32_t                      clip_count;
+    const SofuuUiSpriteInstance*  sprites;
+    uint32_t                      sprite_count;
     uint8_t                       recompiled;       /* 1 if geometry regenerated this tick */
-    uint8_t                       needs_next_frame; /* 1 while springs/kinetic scroll active */
+    uint8_t                       needs_next_frame; /* 1 while animation/deadline pending */
     uint8_t                       theme_is_dark;    /* 0 = Light, 1 = Dark */
     uint8_t                       _reserved;
 } SofuuUiDrawList;
@@ -563,6 +584,44 @@ int sofuu_ui_session_get_atlas(SofuuUiSession *ui,
                                uint32_t *out_width,
                                uint32_t *out_height,
                                float *out_px_range);
+
+/* Icon atlas descriptor: the same R8 SDF format, sampled by sprites whose
+ * `tex_id == 0`. Valid until sofuu_ui_session_free(). */
+int sofuu_ui_session_get_icon_atlas(SofuuUiSession *ui,
+                                    const uint8_t **out_pixels_r8,
+                                    uint32_t *out_width,
+                                    uint32_t *out_height,
+                                    float *out_px_range);
+
+/* Image atlas pages (`RGBA8`, premultiplied). Page `i` = sprite `tex_id i+1`.
+ * `*out_revision` bumps whenever the page is repacked, so hosts can skip
+ * re-uploading clean pages. Pointers are valid until the next poll/free. */
+int sofuu_ui_image_page_count(SofuuUiSession *ui);
+int sofuu_ui_session_get_image_page(SofuuUiSession *ui, uint32_t page,
+                                    const uint8_t **out_pixels_rgba,
+                                    uint32_t *out_width, uint32_t *out_height,
+                                    uint64_t *out_revision);
+
+/* Upload a decoded RGBA8 bitmap for an Image node's `src` string. Cuts the
+ * host's decode cost out of the render thread. */
+int sofuu_ui_set_image_rgba(SofuuUiSession *ui, const char *src,
+                            uint32_t width, uint32_t height,
+                            const uint8_t *pixels, size_t pixel_len);
+
+/* Accessibility semantic tree as a malloc'd JSON object (`sofuu_free` it). */
+int sofuu_ui_a11y_json(SofuuUiSession *ui, char **out_json);
+
+/* Soft-keyboard hint for the focused editable field, or SOFUU_KEYBOARD_NONE. */
+#define SOFUU_KEYBOARD_NONE    (-1)
+#define SOFUU_KEYBOARD_TEXT     0
+#define SOFUU_KEYBOARD_EMAIL    1
+#define SOFUU_KEYBOARD_NUMBER   2
+#define SOFUU_KEYBOARD_PHONE    3
+#define SOFUU_KEYBOARD_URL      4
+#define SOFUU_KEYBOARD_SEARCH   5
+#define SOFUU_KEYBOARD_PASSWORD 6
+#define SOFUU_KEYBOARD_DECIMAL  7
+int sofuu_ui_focused_keyboard_hint(SofuuUiSession *ui);
 
 /* Bind/unbind an embedded SofuuRuntime on the runtime's owning thread.
  * Installs JS host globals (`__sofuu_ui_is_attached`, `__sofuu_ui_push_patch`,

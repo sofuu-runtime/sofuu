@@ -41,7 +41,10 @@ use sofuu_ffi::bridge::{
 use sofuu_ffi::qjs;
 use sofuu_ui::auto_compose::{AutoAgentEvent, AutoComposer, AutoTriggerStat, PendingApproval};
 use sofuu_ui::components::table::TableRow;
-use sofuu_ui::draw::{ClipRect, DrawCmd, DrawList, GlyphInstance, QuadInstance, RibbonInstance, StrokeInstance};
+use sofuu_ui::draw::{
+    ClipRect, DrawCmd, DrawList, GlyphInstance, QuadInstance, RibbonInstance, SpriteInstance,
+    StrokeInstance,
+};
 use sofuu_ui::hit_test::{InputEvent, UIEvent};
 use sofuu_ui::ir::ScenePatch;
 use sofuu_ui::theme::ThemeMode;
@@ -49,6 +52,10 @@ use sofuu_ui::ui as kit;
 use sofuu_ui::UiEngine;
 
 use crate::CapiRuntime;
+
+/// Wire version of the `SofuuUi*` draw structs emitted by this module.
+/// Mirrors `SOFUU_UI_DRAW_ABI_VERSION` in `include/sofuu_embed.h`.
+pub use sofuu_ui::draw::SOFUU_DRAW_ABI_VERSION;
 
 // ── Return codes (mirror include/sofuu_embed.h) ───────────────────
 
@@ -73,6 +80,7 @@ pub type SofuuUiQuadInstance = QuadInstance;
 pub type SofuuUiRibbonInstance = RibbonInstance;
 pub type SofuuUiStrokeInstance = StrokeInstance;
 pub type SofuuUiGlyphInstance = GlyphInstance;
+pub type SofuuUiSpriteInstance = SpriteInstance;
 
 /// 32-byte per-frame GPU uniform block (`include/sofuu_embed.h`).
 #[repr(C)]
@@ -119,6 +127,9 @@ pub struct SofuuUiDrawList {
     pub cmd_count: u32,
     pub clips: *const SofuuUiClipRect,
     pub clip_count: u32,
+    /// Textured sprites (images + SDF icons); valid until the next poll/free.
+    pub sprites: *const SofuuUiSpriteInstance,
+    pub sprite_count: u32,
     pub recompiled: u8,
     pub needs_next_frame: u8,
     pub theme_is_dark: u8,
@@ -141,6 +152,8 @@ impl Default for SofuuUiDrawList {
             cmd_count: 0,
             clips: ptr::null(),
             clip_count: 0,
+            sprites: ptr::null(),
+            sprite_count: 0,
             recompiled: 0,
             needs_next_frame: 0,
             theme_is_dark: 0,
@@ -529,6 +542,10 @@ pub unsafe extern "C" fn sofuu_ui_session_set_safe_insets(
         let inner = &(*ui).inner;
         let mut render = lock(&inner.render);
         render.engine.set_top_inset(top);
+        let mut insets = render.engine.safe_insets;
+        insets.top = top;
+        insets.bottom = bottom;
+        render.engine.set_safe_insets(insets);
         render.bottom_inset = bottom;
         drop(render);
         // An inset change reflows the top/bottom safe area. Wake a host that
@@ -572,6 +589,188 @@ pub unsafe extern "C" fn sofuu_ui_session_get_atlas(
         }
         OK
     })
+}
+
+/// Borrow the R8 SDF icon atlas (`tex_id == 0` sprites). Valid until free.
+///
+/// # Safety
+/// `ui` must be a live session; each out pointer may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_ui_session_get_icon_atlas(
+    ui: *mut SofuuUiSession,
+    out_pixels_r8: *mut *const u8,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_px_range: *mut f32,
+) -> c_int {
+    guarded(|| {
+        if ui.is_null() {
+            return ERR_INVALID_ARG;
+        }
+        let inner = &(*ui).inner;
+        let render = lock(&inner.render);
+        let atlas = render.engine.icons.as_ref();
+        if !out_pixels_r8.is_null() {
+            *out_pixels_r8 = atlas.pixels.as_ptr();
+        }
+        if !out_width.is_null() {
+            *out_width = atlas.width;
+        }
+        if !out_height.is_null() {
+            *out_height = atlas.height;
+        }
+        if !out_px_range.is_null() {
+            *out_px_range = atlas.px_range;
+        }
+        OK
+    })
+}
+
+/// Number of `RGBA8` image-atlas pages. Page `i` maps to sprite `tex_id == i + 1`.
+///
+/// # Safety
+/// `ui` must be a live session.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_ui_image_page_count(ui: *mut SofuuUiSession) -> c_int {
+    guarded(|| {
+        if ui.is_null() {
+            return 0;
+        }
+        let inner = &(*ui).inner;
+        let render = lock(&inner.render);
+        render.engine.images.page_count() as c_int
+    })
+}
+
+/// Borrow image-atlas page pixels (`RGBA8`, row-major). `*out_revision` lets a
+/// host skip texture uploads when a page did not change.
+///
+/// # Safety
+/// `ui` must be a live session; each out pointer may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_ui_session_get_image_page(
+    ui: *mut SofuuUiSession,
+    page: u32,
+    out_pixels_rgba: *mut *const u8,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_revision: *mut u64,
+) -> c_int {
+    guarded(|| {
+        if ui.is_null() {
+            return ERR_INVALID_ARG;
+        }
+        let inner = &(*ui).inner;
+        let render = lock(&inner.render);
+        let Some(p) = render.engine.images.page(page as usize) else {
+            return ERR_INVALID_ARG;
+        };
+        if !out_pixels_rgba.is_null() {
+            *out_pixels_rgba = p.pixels.as_ptr();
+        }
+        if !out_width.is_null() {
+            *out_width = p.width;
+        }
+        if !out_height.is_null() {
+            *out_height = p.height;
+        }
+        if !out_revision.is_null() {
+            *out_revision = p.revision;
+        }
+        OK
+    })
+}
+
+/// Upload a decoded `RGBA8` bitmap for an `Image` node's `src` key.
+///
+/// # Safety
+/// `src` is a NUL-terminated UTF-8 string; `pixels` points to
+/// `width * height * 4` bytes for the duration of the call.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_ui_set_image_rgba(
+    ui: *mut SofuuUiSession,
+    src: *const c_char,
+    width: u32,
+    height: u32,
+    pixels: *const u8,
+    pixel_len: usize,
+) -> c_int {
+    guarded(|| {
+        if ui.is_null() || src.is_null() || pixels.is_null() {
+            return ERR_INVALID_ARG;
+        }
+        let Ok(src) = CStr::from_ptr(src).to_str() else {
+            return ERR_INVALID_ARG;
+        };
+        let expected = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
+        if width == 0 || height == 0 || expected == 0 || pixel_len < expected {
+            return ERR_INVALID_ARG;
+        }
+        let rgba = slice::from_raw_parts(pixels, expected).to_vec();
+        let Ok(image) = sofuu_ui::images::DecodedImage::new(width, height, rgba) else {
+            return ERR_INVALID_ARG;
+        };
+        let inner = &(*ui).inner;
+        let mut render = lock(&inner.render);
+        match render.engine.set_image(src, image) {
+            Ok(_) => {
+                drop(render);
+                inner.wake();
+                OK
+            }
+            Err(_) => ERR_INTERNAL,
+        }
+    })
+}
+
+/// Export the accessibility semantic tree as JSON (malloc'd; `sofuu_free` it).
+///
+/// # Safety
+/// `ui` must be a live session; `out_json` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_ui_a11y_json(
+    ui: *mut SofuuUiSession,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    guarded(|| {
+        if ui.is_null() || out_json.is_null() {
+            return ERR_INVALID_ARG;
+        }
+        *out_json = ptr::null_mut();
+        let inner = &(*ui).inner;
+        let render = lock(&inner.render);
+        let json = sofuu_ui::a11y::scene_tree_json(
+            &render.engine.scene,
+            &render.engine.layout,
+            &render.engine.interaction,
+        );
+        *out_json = crate::malloc_cstr(&json);
+        if (*out_json).is_null() {
+            ERR_INTERNAL
+        } else {
+            OK
+        }
+    })
+}
+
+/// Soft-keyboard hint for the focused editable (`SOFUU_KEYBOARD_*`), or -1.
+///
+/// # Safety
+/// `ui` must be a live session or null (null returns `SOFUU_KEYBOARD_NONE`).
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_ui_focused_keyboard_hint(ui: *mut SofuuUiSession) -> c_int {
+    if ui.is_null() {
+        return -1;
+    }
+    let inner = &(*ui).inner;
+    let render = lock(&inner.render);
+    render
+        .engine
+        .focused_keyboard_hint()
+        .map(|h| h.abi_code())
+        .unwrap_or(-1)
 }
 
 // ── Runtime attachment & JS globals ───────────────────────────────
@@ -1334,6 +1533,8 @@ fn fill_draw_list(
         out.cmd_count = dl.cmds.len() as u32;
         out.clips = dl.clips.as_ptr();
         out.clip_count = dl.clips.len() as u32;
+        out.sprites = dl.sprites.as_ptr() as *const SofuuUiSpriteInstance;
+        out.sprite_count = dl.sprites.len() as u32;
         out.recompiled = compiled as u8;
         out.needs_next_frame = needs_next_frame as u8;
         out.theme_is_dark = matches!(core.engine.scene.theme, ThemeMode::Dark) as u8;
@@ -1418,16 +1619,21 @@ pub unsafe extern "C" fn sofuu_ui_poll_draw_list(
         // Alternate buffers only when this tick actually compiled. An idle
         // tick must keep returning the last compiled geometry, not the other
         // (stale) buffer.
-        core.active ^= 1;
+        let ticked = core.active ^ 1;
+        core.active = ticked;
         let status = core
             .engine
-            .tick_and_compile(dt, &mut core.draw_lists[core.active]);
+            .tick_and_compile(dt, &mut core.draw_lists[ticked]);
         if !status.compiled {
             core.active ^= 1;
         }
 
+        // Read the schedule from the buffer that was just ticked: on an idle
+        // tick that is not the active geometry buffer, but it is the one that
+        // carries the fresh caret-blink deadline. Without this, a C host sees
+        // `needs_next_frame == 0` between caret toggles and the caret freezes.
         let pending = !lock(&inner.inbound).is_empty() || !lock(&inner.inputs).is_empty();
-        let needs_next_frame = status.animating || pending;
+        let needs_next_frame = core.draw_lists[ticked].needs_next_frame || pending;
         let dl = &core.draw_lists[core.active];
         fill_draw_list(core, dl, status.compiled, needs_next_frame, out_list);
         OK
@@ -1630,6 +1836,51 @@ mod tests {
             }
             assert!(saw_click, "pointer down/up must emit a click event");
             assert!(settled, "springs must settle to needs_next_frame == 0");
+
+            sofuu_ui_session_free(ui);
+        }
+    }
+
+    #[test]
+    fn a11y_json_exports_button_role_label_and_rect() {
+        unsafe {
+            let ui = sofuu_ui_session_new(ptr::null(), ptr::null_mut());
+            assert!(!ui.is_null());
+            let json = scene_patch_json();
+            assert_eq!(
+                sofuu_ui_push_patch_json(ui, json.as_ptr() as *const c_char, json.len()),
+                OK
+            );
+            let mut dl = SofuuUiDrawList::default();
+            assert_eq!(
+                sofuu_ui_poll_draw_list(ui, 1.0 / 60.0, 800.0, 600.0, 2.0, &mut dl),
+                OK
+            );
+
+            let mut out: *mut c_char = ptr::null_mut();
+            assert_eq!(sofuu_ui_a11y_json(ui, &mut out), OK);
+            assert!(!out.is_null());
+            let tree = CStr::from_ptr(out).to_string_lossy().into_owned();
+            crate::sofuu_free(out as *mut c_void);
+            let tree: serde_json::Value = serde_json::from_str(&tree).expect("a11y JSON");
+
+            fn find<'a>(node: &'a serde_json::Value, id: &str) -> Option<&'a serde_json::Value> {
+                if node.get("id").and_then(|v| v.as_str()) == Some(id) {
+                    return Some(node);
+                }
+                node.get("children")?
+                    .as_array()?
+                    .iter()
+                    .find_map(|c| find(c, id))
+            }
+
+            let button = find(&tree, "go").expect("button in a11y tree");
+            assert_eq!(button["role"], "button");
+            assert_eq!(button["label"], "Go");
+            assert!(button["focusable"].as_bool().unwrap_or(false));
+            let rect = button["rect"].as_array().expect("rect");
+            assert_eq!(rect.len(), 4);
+            assert!(rect[2].as_f64().unwrap_or(0.0) > 0.0);
 
             sofuu_ui_session_free(ui);
         }

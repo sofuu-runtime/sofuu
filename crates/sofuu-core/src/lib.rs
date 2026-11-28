@@ -21,6 +21,8 @@ pub mod compiler; // `sofuu compile`: append-trailer standalone agent binaries
 pub mod daemon_cmd; // `sofuu daemon`: 24/7 autonomous background agent supervisor
 pub mod embedding; // compact learned semantic projector for memory recall
 pub mod embed_config; // H2: process-global embedded-mode config (is_embedded, config_root, signals)
+pub mod emu_cli; // `sofuu ui snapshot|emu|profiles|mcp` — headless AI screenshots
+pub mod emu_mock; // backend-free fetch/sofuu.ai stubs for `sofuu ui --mock`
 pub mod ffi_exports; // C-ABI exports consumed by the remaining C core (Track D3)
 pub mod frontend; // AI-Native Frontend Engine (JSX/TSX transpiler + micro-runtime + dev server)
 

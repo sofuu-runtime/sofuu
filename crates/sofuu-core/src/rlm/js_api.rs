@@ -647,6 +647,23 @@ pub unsafe extern "C" fn sofuu_rust_register_engine_js(ctx: *mut c_void) {
             Some(crate::shipped::UI_BC),
             "<ui-driver>",
         );
+        // PLAN-APP-UI-LIBRARY-AND-FRAMEWORK F4: Tier-2 app kit (Card,
+        // ListTile, Dialog, Sheet, AdaptiveShell, ...) built atop `sofuu.ui`.
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::UI_KIT_JS,
+            Some(crate::shipped::UI_KIT_BC),
+            "<ui-kit-driver>",
+        );
+        // PLAN-GPU-PLATFORM-UI-EMULATOR E5: `sofuu.emu` sessions over the
+        // companion binary + the `ui_emu_*` MCP tools. Eval'd after the UI
+        // driver because sessions mount `sofuu.ui` surfaces.
+        crate::shipped::eval_shipped_with_bytecode(
+            ctx as *mut c_void,
+            crate::shipped::EMU_JS,
+            Some(crate::shipped::EMU_BC),
+            "<emu-driver>",
+        );
     }
 }
 

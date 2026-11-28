@@ -29,7 +29,7 @@ ui-surface = ["ui"]
 [dependencies]
 sofuu-core = { path = "../sofuu-core" }
 sofuu-ffi = { path = "../sofuu-ffi" }
-sofuu-ui = { path = "../sofuu-ui", optional = true }
+sofuu-ui = { workspace = true, optional = true }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 libc = "0.2"
 

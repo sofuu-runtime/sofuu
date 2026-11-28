@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- LAN host mode (PLAN-ANDROID-REMOTE-HOST-RECONNECT) talks to a paired
+     `sofuu host` on the local network over plain HTTP + a bearer token.
+     Android's domain-config cannot express private CIDR ranges, so cleartext
+     is permitted app-wide; every host still requires a user-supplied address
+     and a paired/device token. Provider endpoints continue to use HTTPS.
+     TLS/pinning is the documented v1 non-goal. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

@@ -1,0 +1,18 @@
+# Android build outputs
+build/
+.gradle/
+.kotlin/
+local.properties
+.idea/
+*.iml
+.cxx/
+app/build/
+captures/
+
+# Staged engine payload (unless a v2-specific directory is explicitly used).
+app/src/main/jniLibs/
+
+# Release signing — never checked in (contains the keystore password).
+keystore.properties
+*.jks
+*.keystore

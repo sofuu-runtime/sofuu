@@ -6,6 +6,7 @@ members = [
     "crates/sofuu-capi",
     "crates/sofuu-ui",
     "crates/sofuu-gpu",
+    "crates/sofuu-emu",
     "sofuu-desktop/src-tauri",
     "crates/ml-train",
 ]
@@ -22,7 +23,18 @@ default-members = [
     "crates/sofuu-core",
     "crates/sofuu-ffi",
     "crates/sofuu-capi",
+    # `sofuu ui snapshot|emu` shells out to this companion binary, so a bare
+    # `cargo build` must place it next to `sofuu`.
+    "crates/sofuu-emu",
 ]
+
+# The UI + effects crate is consumed through one workspace entry so the
+# repo-boundary cutover (PLAN-SPLIT-UI-EFFECTS-EXTERNAL-REPO §3.2) is two
+# lines: the `members` entry above and this path.
+#   members:            "crates/sofuu-ui" -> "deps/sofuu-ui"
+#   workspace.dependencies: path -> "deps/sofuu-ui"
+[workspace.dependencies]
+sofuu-ui = { path = "crates/sofuu-ui" }
 
 [workspace.package]
 version = "0.3.0-beta"

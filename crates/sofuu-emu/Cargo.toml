@@ -1,0 +1,22 @@
+[package]
+name = "sofuu-emu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-OS GPU UI emulator, geometric audit and AI-agent screenshot engine for Sofuu"
+
+[lib]
+name = "sofuu_emu"
+crate-type = ["rlib", "cdylib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sofuu-emu"
+path = "src/main.rs"
+
+[dependencies]
+sofuu-ui = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+png = "0.17"
+libc = "0.2"

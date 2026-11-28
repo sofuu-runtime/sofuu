@@ -1573,6 +1573,119 @@ export interface SofuuObservability {
  * The Sofuu runtime as a plugin sees it. Only namespaces the drivers actually
  * install are listed; anything else is undefined at runtime.
  */
+/* ==================================================================
+ * sofuu.emu — platform UI emulator (PLAN-GPU-PLATFORM-UI-EMULATOR E5)
+ * ================================================================== */
+
+/** One mocked HTTP endpoint for backend-free emulator sessions. */
+export interface SofuuEmuMockRoute {
+  /** Exact URL, or a prefix ending in `*`. */
+  url: string;
+  method?: string;
+  status?: number;
+  json?: unknown;
+  text?: string;
+  headers?: Record<string, string>;
+}
+
+/** `--mock-config` payload: local routes and the deterministic AI reply. */
+export interface SofuuEmuMockConfig {
+  routes?: SofuuEmuMockRoute[];
+  /** Unmatched requests reject with E_EMU_OFFLINE instead of returning {}. */
+  offline?: boolean;
+  /** Text returned by the sofuu.ai.complete/stream stub. */
+  ai_text?: string;
+}
+
+/** Emulator session geometry and behaviour. */
+export interface SofuuEmuOptions {
+  platform?: 'ios' | 'android' | 'macos' | 'windows' | 'linux';
+  device?: string;
+  theme?: 'light' | 'dark';
+  orientation?: 'portrait' | 'landscape';
+  keyboardOpen?: boolean;
+  scenario?: string;
+  props?: unknown;
+  /** false launches the interactive window; captures remain headless. */
+  headless?: boolean;
+  watch?: boolean;
+  scale?: number;
+  /** Stub fetch/sofuu.ai locally; mocked sessions never touch the network. */
+  mock?: boolean;
+  offline?: boolean;
+  mockConfig?: SofuuEmuMockConfig;
+  /** Interactive pump pacing (2 = half speed). */
+  slowmo?: number;
+  workDir?: string;
+}
+
+/** One layout/accessibility finding from an emulator capture. */
+export interface SofuuEmuIssue {
+  tag: number;
+  severity: 'error' | 'warning';
+  kind: string;
+  node_id: string;
+  rect: [number, number, number, number];
+  detail: string;
+  [extension: string]: unknown;
+}
+
+/** The AuditReport returned by every `screenshot()`. */
+export interface SofuuEmuAudit {
+  capture_png?: string;
+  mode?: string;
+  platform?: string;
+  device?: string;
+  viewport_px?: [number, number];
+  scale_factor?: number;
+  theme?: string;
+  keyboard_open?: boolean;
+  settled?: boolean;
+  frames_stepped?: number;
+  renderer?: string;
+  summary: { errors: number; warnings: number; interactive_nodes: number };
+  issues: SofuuEmuIssue[];
+  nodes?: Array<{ tag: number; id: string; kind: string; rect: [number, number, number, number]; clipped: boolean; [extension: string]: unknown }>;
+  [extension: string]: unknown;
+}
+
+/** A stateful, deterministic emulator session. Actions replay on capture. */
+export interface SofuuEmuSession {
+  readonly id: string;
+  readonly app: string;
+  interact(action: Record<string, unknown> | Array<Record<string, unknown>>): this;
+  tap(id: string): this;
+  type(id: string, text: string): this;
+  submit(id: string, text?: string): this;
+  toggle(id: string, checked?: boolean): this;
+  selectSegment(id: string, index: number): this;
+  selectTab(id: string, index: number): this;
+  selectRow(id: string, rowId: string): this;
+  /** Replay a deterministic scroll gesture on a scroll container. */
+  scroll(id: string, deltaY: number): this;
+  waitSettled(): this;
+  screenshot(path?: string, opts?: { mode?: 'clean' | 'annotated' | 'filmstrip'; auditJson?: string }): Promise<SofuuEmuAudit>;
+  setKeyboard(open: boolean): this;
+  setTheme(theme: 'light' | 'dark'): this;
+  setPlatform(platform: SofuuEmuOptions['platform']): this;
+  setDevice(device: string | null): this;
+  setOrientation(orientation: 'portrait' | 'landscape'): this;
+  rotate(): this;
+  setScenario(scenario: string | null): this;
+  setProps(props: unknown): this;
+  setEnv(env: Partial<SofuuEmuOptions>): this;
+  envInfo(): Record<string, unknown>;
+  close(): boolean;
+}
+
+export interface SofuuEmu {
+  open(app: string, opts?: SofuuEmuOptions): SofuuEmuSession;
+  screenshot(app: string, path?: string, opts?: SofuuEmuOptions & { mode?: 'clean' | 'annotated' | 'filmstrip'; auditJson?: string }): Promise<SofuuEmuAudit>;
+  profiles(): Promise<{ profiles: Array<Record<string, unknown>> }>;
+  /** Run the emulator's MCP server over stdio (served by `sofuu ui mcp`). */
+  mcp(opts?: { name?: string }): unknown;
+}
+
 export interface SofuuRuntime {
   plugins: SofuuPlugins;
   ai: SofuuAi;
@@ -1589,6 +1702,8 @@ export interface SofuuRuntime {
   storage?: SofuuStorage;
   /** The agent runtime (src/js/agent.js) and its error policy. */
   agent?: SofuuAgent;
+  /** Platform UI emulator sessions (src/js/emu.js, `sofuu ui`). */
+  emu?: SofuuEmu;
   /** Run logs, checkpoints and crash cards (src/js/observability.js). */
   observability?: SofuuObservability;
   /** The deterministic in-process execution sandbox (rt/sandbox.rs). */

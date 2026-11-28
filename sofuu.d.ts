@@ -2259,6 +2259,10 @@ export interface SofuuRuntime {
   scouter?: SofuuScouter;
   /** Declarative custom 2D GPU UI builders & live window bridge (`--ui`). */
   ui?: SofuuUi;
+  /** Opt-in GPU effects & choreography layered on top of `sofuu.ui`. */
+  fx?: SofuuFx;
+  /** Tier-2 composable app kit (`sofuu.uiKit`), loaded with `sofuu.ui`. */
+  uiKit?: SofuuUiKit;
   /**
    * The manifest's `build` block, registered at startup: exactly
    * `capabilities().build`, without building the whole manifest (which probes
@@ -2314,6 +2318,54 @@ export interface SofuuKvFactory {
 
 export type UiThemeMode = 'light' | 'dark';
 export type UiTone = 'neutral' | 'info' | 'ok' | 'warn' | 'danger';
+export type UiKeyboardHint =
+  | 'text' | 'email' | 'number' | 'phone' | 'url' | 'search' | 'password' | 'decimal';
+export type UiStackAlign =
+  | 'top_left' | 'top' | 'top_right'
+  | 'left' | 'center' | 'right'
+  | 'bottom_left' | 'bottom' | 'bottom_right';
+export type UiImageFit = 'cover' | 'contain' | 'fill' | 'scale_down';
+export type UiDragAxis = 'both' | 'horizontal' | 'vertical';
+
+/** Optional edge pinning inside a `Stack`/`Overlay`. */
+export interface UiInsetHint {
+  left?: number;
+  right?: number;
+  top?: number;
+  bottom?: number;
+}
+
+/** Opt-in per-node layout constraints (`Node.layout`). */
+export interface UiLayoutHints {
+  max_width?: number;
+  max_height?: number;
+  aspect_ratio?: number;
+  flex_shrink?: number;
+  align_self?: UiAlign;
+  inset?: UiInsetHint;
+  z?: number;
+}
+
+/** One inline styled run in a `RichText` node. */
+export interface UiTextSpan {
+  text: string;
+  color?: number | null;
+  weight?: number;
+  mono?: boolean;
+  size?: number | null;
+}
+
+export interface UiNavRoute {
+  id: string;
+  title?: string;
+  child: UiNode;
+}
+
+export interface UiListItem {
+  id: string;
+  height?: number | null;
+  child: UiNode;
+}
 export type UiSizeSpec = 'auto' | number | { px: number } | { fill: number };
 export type UiInsets = number | { top?: number; right?: number; bottom?: number; left?: number };
 export type UiAxis = 'row' | 'column';
@@ -2355,6 +2407,18 @@ export interface UiNodeBaseOptions {
   minWidth?: number;
   minHeight?: number;
   padding?: UiInsets;
+  /** Opt-in constraints / `Stack` positioning hints. */
+  layout?: UiLayoutHints;
+  /** Maximum size (aliases for `layout.max_*`). */
+  maxWidth?: number;
+  maxHeight?: number;
+  aspectRatio?: number;
+  flexShrink?: number;
+  alignSelf?: UiAlign;
+  /** Stack paint/hit order hint (lower paints first). */
+  z?: number;
+  /** Edge pinning inside a `Stack`/`Overlay`. */
+  inset?: UiInsetHint;
 }
 
 /* ------------------------------------------------------------------
@@ -2447,6 +2511,10 @@ export interface UiInputKind {
   value: string;
   placeholder: string;
   tone: UiTone;
+  keyboard: UiKeyboardHint;
+  prefix_icon: string | null;
+  clearable: boolean;
+  error: string | null;
 }
 
 export interface UiStatKind {
@@ -2553,6 +2621,133 @@ export interface UiCodeKind {
   shadow_offset_y: number;
 }
 
+export interface UiRichTextKind {
+  type: 'rich_text';
+  spans: UiTextSpan[];
+  size: number;
+  wrap: boolean;
+  line_height: number | null;
+}
+
+export interface UiIconKind {
+  type: 'icon';
+  name: string;
+  size: number;
+  color: number | null;
+}
+
+export interface UiImageKind {
+  type: 'image';
+  src: string;
+  fit: UiImageFit;
+  radius: [number, number, number, number];
+  tint: number | null;
+  placeholder: number | null;
+  alt: string;
+}
+
+export interface UiStackKind {
+  type: 'stack';
+  align: UiStackAlign;
+  gap: number;
+  style: UiBoxStyle | null;
+  children: UiNode[];
+}
+
+export interface UiSafeAreaKind {
+  type: 'safe_area';
+  insets: { top: number; right: number; bottom: number; left: number };
+  keyboard_avoidance: boolean;
+  keyboard_height: number;
+  child: UiNode | null;
+}
+
+export interface UiOverlayKind {
+  type: 'overlay';
+  scrim: number | null;
+  dismissable: boolean;
+  align: UiStackAlign;
+  style: UiBoxStyle | null;
+  child: UiNode | null;
+}
+
+export interface UiNavStackKind {
+  type: 'nav_stack';
+  routes: UiNavRoute[];
+  active: number;
+  progress: number;
+  swipe_back: boolean;
+}
+
+export interface UiListViewKind {
+  type: 'list_view';
+  items: UiListItem[];
+  estimated_height: number;
+  spacing: number;
+  overscan: number;
+  style: UiBoxStyle | null;
+}
+
+export interface UiTextAreaKind {
+  type: 'text_area';
+  value: string;
+  placeholder: string;
+  rows: number;
+  tone: UiTone;
+  secure: boolean;
+  max_len: number;
+  keyboard: UiKeyboardHint;
+}
+
+export interface UiSliderKind {
+  type: 'slider';
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  tone: UiTone;
+  label: string | null;
+  show_value: boolean;
+}
+
+export interface UiRangeSliderKind {
+  type: 'range_slider';
+  low: number;
+  high: number;
+  min: number;
+  max: number;
+  step: number;
+  tone: UiTone;
+  label: string | null;
+  show_value: boolean;
+}
+
+export type UiProgressVariant = 'linear' | 'circular';
+
+export interface UiProgressKind {
+  type: 'progress';
+  value: number;
+  variant: UiProgressVariant;
+  tone: UiTone;
+  label: string | null;
+  indeterminate: boolean;
+}
+
+export interface UiPressableKind {
+  type: 'pressable';
+  hit_slop: number;
+  disabled: boolean;
+  child: UiNode | null;
+}
+
+export interface UiDraggableKind {
+  type: 'draggable';
+  axis: UiDragAxis;
+  offset: [number, number];
+  inertia: boolean;
+  child: UiNode | null;
+}
+
 /** Exact serialized `NodeKind` union (matches `crates/sofuu-ui/src/ir.rs`). */
 export type UiNodeKind =
   | UiContainerKind
@@ -2572,7 +2767,21 @@ export type UiNodeKind =
   | UiTableKind
   | UiFeedKind
   | UiGraphKind
-  | UiCodeKind;
+  | UiCodeKind
+  | UiRichTextKind
+  | UiIconKind
+  | UiImageKind
+  | UiStackKind
+  | UiSafeAreaKind
+  | UiOverlayKind
+  | UiNavStackKind
+  | UiListViewKind
+  | UiTextAreaKind
+  | UiSliderKind
+  | UiRangeSliderKind
+  | UiProgressKind
+  | UiPressableKind
+  | UiDraggableKind;
 
 export interface UiNode {
   id: string;
@@ -2583,6 +2792,10 @@ export interface UiNode {
   min_width: number;
   min_height: number;
   padding: { top: number; right: number; bottom: number; left: number };
+  /** Opt-in `sofuu.fx` specs attached by the decorator builders. */
+  fx?: UiFxSpec[];
+  /** Extra constraints / `Stack` positioning hints. */
+  layout?: UiLayoutHints;
   kind: UiNodeKind;
   /** Present on builder-returned handles; returns the plain serializable node. */
   toNode?(): UiNode;
@@ -2762,6 +2975,13 @@ export type UiEvent =
   | { type: 'graph_node_clicked'; id: string; node_id: string }
   | { type: 'series_toggled'; id: string; series_index: number }
   | { type: 'scrolled'; id: string; offset_y: number }
+  | { type: 'value_changed'; id: string; value: number }
+  | { type: 'range_changed'; id: string; low: number; high: number }
+  | { type: 'list_item_clicked'; id: string; index: number; item_id: string }
+  | { type: 'back_requested'; id: string; route: string }
+  | { type: 'refresh_requested'; id: string }
+  | { type: 'dragged'; id: string; dx: number; dy: number }
+  | { type: 'copy_requested'; id: string; text: string }
   | { type: 'window_closed' };
 
 /* ------------------------------------------------------------------
@@ -2804,6 +3024,20 @@ export type UiScenePatch =
       selected_node?: string | null;
     }
   | { op: 'set_children'; id: string; children: UiNode[] }
+  | { op: 'set_list_items'; id: string; items: UiListItem[] }
+  | { op: 'set_rich_text'; id: string; spans: UiTextSpan[] }
+  | { op: 'set_icon'; id: string; name: string; color?: number | null }
+  | { op: 'set_image'; id: string; src: string }
+  | { op: 'set_slider'; id: string; value: number }
+  | { op: 'set_range_slider'; id: string; low: number; high: number }
+  | { op: 'set_progress'; id: string; value: number; indeterminate?: boolean }
+  | { op: 'set_text_area'; id: string; value: string }
+  | { op: 'set_draggable'; id: string; offset: [number, number] }
+  | { op: 'set_nav_progress'; id: string; progress: number }
+  | { op: 'nav_push'; id: string; route: UiNavRoute }
+  | { op: 'nav_pop'; id: string }
+  | { op: 'nav_replace'; id: string; route: UiNavRoute }
+  | { op: 'nav_pop_to_root'; id: string }
   | {
       op: 'update_stat';
       id: string;
@@ -2874,8 +3108,137 @@ export interface UiSwitchOptions extends UiNodeBaseOptions {
 export interface UiInputOptions extends UiNodeBaseOptions {
   value?: string;
   tone?: UiTone;
+  keyboard?: UiKeyboardHint;
+  inputMode?: UiKeyboardHint;
+  inputType?: UiKeyboardHint;
+  /** Leading SDF icon name (`search`, `mail`, …). */
+  prefixIcon?: string;
+  /** Show a `×` affordance that clears the field. */
+  clearable?: boolean;
+  /** Inline validation caption under the field (danger tone). */
+  error?: string | null;
   onChange?: (value: string, event: UiEvent) => void;
   onSubmit?: (value: string, event: UiEvent) => void;
+}
+
+export interface UiRichTextOptions extends UiNodeBaseOptions {
+  size?: number;
+  wrap?: boolean;
+  lineHeight?: number;
+  onChange?: (event: UiEvent) => void;
+}
+
+export interface UiIconOptions extends UiNodeBaseOptions {
+  size?: number;
+  color?: number | null;
+}
+
+export interface UiImageOptions extends UiNodeBaseOptions {
+  fit?: UiImageFit;
+  radius?: number | [number, number] | [number, number, number, number];
+  tint?: number | null;
+  placeholder?: number | null;
+  alt?: string;
+}
+
+export interface UiStackOptions extends UiNodeBaseOptions {
+  align?: UiStackAlign;
+  gap?: number;
+  style?: UiBoxStyle | null;
+  z?: number;
+}
+
+export interface UiSafeAreaOptions extends UiNodeBaseOptions {
+  insets?: UiInsetHint;
+  keyboardAvoidance?: boolean;
+  keyboardHeight?: number;
+}
+
+export interface UiOverlayOptions extends UiNodeBaseOptions {
+  scrim?: number | null;
+  dismissable?: boolean;
+  align?: UiStackAlign;
+  style?: UiBoxStyle | null;
+  onClick?: (event: UiEvent) => void;
+}
+
+export interface UiNavStackOptions extends UiNodeBaseOptions {
+  active?: number;
+  swipeBack?: boolean;
+  onBack?: (route: string, event: UiEvent) => void;
+}
+
+export interface UiListViewOptions extends UiNodeBaseOptions {
+  estimatedHeight?: number;
+  spacing?: number;
+  overscan?: number;
+  style?: UiBoxStyle | null;
+  onItemClick?: (index: number, itemId: string, event: UiEvent) => void;
+  onRefresh?: (event: UiEvent) => void;
+}
+
+export interface UiTextAreaOptions extends UiNodeBaseOptions {
+  value?: string;
+  rows?: number;
+  tone?: UiTone;
+  secure?: boolean;
+  maxLen?: number;
+  keyboard?: UiKeyboardHint;
+  inputMode?: UiKeyboardHint;
+  inputType?: UiKeyboardHint;
+  /** Leading SDF icon name (`search`, `mail`, …). */
+  prefixIcon?: string;
+  /** Show a `×` affordance that clears the field. */
+  clearable?: boolean;
+  /** Inline validation caption under the field (danger tone). */
+  error?: string | null;
+  onChange?: (value: string, event: UiEvent) => void;
+  onSubmit?: (value: string, event: UiEvent) => void;
+}
+
+export interface UiSliderOptions extends UiNodeBaseOptions {
+  value?: number;
+  min?: number;
+  max?: number;
+  step?: number;
+  tone?: UiTone;
+  label?: string | null;
+  showValue?: boolean;
+  onChange?: (value: number, event: UiEvent) => void;
+}
+
+export interface UiRangeSliderOptions extends UiNodeBaseOptions {
+  low?: number;
+  high?: number;
+  min?: number;
+  max?: number;
+  step?: number;
+  tone?: UiTone;
+  label?: string | null;
+  showValue?: boolean;
+  onChange?: (low: number, high: number, event: UiEvent) => void;
+}
+
+export interface UiProgressOptions extends UiNodeBaseOptions {
+  /** Fraction `0..1`, or `0..100` when greater than 1. */
+  value?: number;
+  variant?: UiProgressVariant;
+  tone?: UiTone;
+  label?: string | null;
+  indeterminate?: boolean;
+}
+
+export interface UiPressableOptions extends UiNodeBaseOptions {
+  hitSlop?: number;
+  disabled?: boolean;
+  onClick?: (event: UiEvent) => void;
+}
+
+export interface UiDraggableOptions extends UiNodeBaseOptions {
+  axis?: UiDragAxis;
+  offset?: [number, number];
+  inertia?: boolean;
+  onDrag?: (dx: number, dy: number, event: UiEvent) => void;
 }
 
 export interface UiStatOptions extends UiNodeBaseOptions {
@@ -3065,6 +3428,76 @@ export interface UiCodeHandle extends UiNodeHandle {
   setContent(content: string, highlights?: UiCodeHighlight[]): this;
 }
 
+export interface UiRichTextHandle extends UiNodeHandle {
+  kind: UiRichTextKind;
+  toNode(): UiRichTextHandle;
+  setSpans(spans: Array<string | UiTextSpan>): this;
+}
+
+export interface UiIconHandle extends UiNodeHandle {
+  kind: UiIconKind;
+  toNode(): UiIconHandle;
+  setIcon(name: string, color?: number | null): this;
+}
+
+export interface UiImageHandle extends UiNodeHandle {
+  kind: UiImageKind;
+  toNode(): UiImageHandle;
+  setSrc(src: string): this;
+}
+
+export interface UiStackHandle extends UiNodeHandle {
+  kind: UiStackKind;
+  toNode(): UiStackHandle;
+  setChildren(children: UiNode[]): this;
+}
+
+export interface UiNavStackHandle extends UiNodeHandle {
+  kind: UiNavStackKind;
+  toNode(): UiNavStackHandle;
+  push(route: UiNavRoute): this;
+  pop(): this;
+  replace(route: UiNavRoute): this;
+  popToRoot(): this;
+  setProgress(progress: number): this;
+}
+
+export interface UiListViewHandle extends UiNodeHandle {
+  kind: UiListViewKind;
+  toNode(): UiListViewHandle;
+  setItems(items: UiListItem[]): this;
+}
+
+export interface UiTextAreaHandle extends UiNodeHandle {
+  kind: UiTextAreaKind;
+  toNode(): UiTextAreaHandle;
+  setValue(value: string): this;
+}
+
+export interface UiSliderHandle extends UiNodeHandle {
+  kind: UiSliderKind;
+  toNode(): UiSliderHandle;
+  setValue(value: number): this;
+}
+
+export interface UiRangeSliderHandle extends UiNodeHandle {
+  kind: UiRangeSliderKind;
+  toNode(): UiRangeSliderHandle;
+  setValue(low: number, high?: number): this;
+}
+
+export interface UiProgressHandle extends UiNodeHandle {
+  kind: UiProgressKind;
+  toNode(): UiProgressHandle;
+  setValue(value: number, indeterminate?: boolean): this;
+}
+
+export interface UiDraggableHandle extends UiNodeHandle {
+  kind: UiDraggableKind;
+  toNode(): UiDraggableHandle;
+  setOffset(x: number, y: number): this;
+}
+
 /* ------------------------------------------------------------------
  * View / scene
  * ------------------------------------------------------------------ */
@@ -3104,6 +3537,15 @@ export interface UiView {
   setCode(codeId: string, content: string, highlights?: UiCodeHighlight[]): number;
   setSwitch(switchId: string, checked: boolean): number;
   setInput(inputId: string, value: string): number;
+  /** Replace a node's complete effect list (low-level bridge for `sofuu.fx`). */
+  setFx(nodeId: string, specs: UiFxSpec[]): number;
+  /** Fire a one-shot impulse (`confetti`, `spark_burst`, `shake`). */
+  triggerFx(
+    kind: UiFxKind,
+    opts?: { target?: UiNode | string; x?: number; y?: number; count?: number; seed?: number },
+  ): number;
+  /** Reactive `voice_orb` amplitude without rebuilding the scene. */
+  setFxAmplitude(nodeId: string, value: number): number;
   setSegmented(nodeId: string, active: number): number;
   setTab(nodeId: string, active: number): number;
   selectTableRow(tableId: string, rowId: string | null): number;
@@ -3143,8 +3585,277 @@ export interface UiSignal<T> {
   subscribe(fn: (value: T) => void, immediate?: boolean): () => void;
 }
 
+/* ------------------------------------------------------------------
+ * GPU UI effects & choreography (`sofuu.fx`)
+ * ------------------------------------------------------------------ */
+
+export type UiFxSpring = 'snappy' | 'default' | 'gentle';
+
+export type UiFxKind =
+  | 'enter'
+  | 'fade'
+  | 'slide'
+  | 'scale_pop'
+  | 'shake'
+  | 'number_roll'
+  | 'shared'
+  | 'shimmer'
+  | 'touch_ripple'
+  | 'border_beam'
+  | 'cursor_glow'
+  | 'aurora'
+  | 'pulse_ring'
+  | 'voice_orb'
+  | 'backdrop_blur'
+  | 'text_shimmer'
+  | 'text_scramble'
+  | 'typewriter'
+  | 'confetti'
+  | 'spark_burst';
+
+/** Exact wire shape of one opt-in effect (`Node.fx`). */
+export interface UiFxSpec {
+  kind: UiFxKind;
+  preset?: string;
+  spring?: UiFxSpring;
+  delay_ms?: number;
+  duration_ms?: number;
+  slide_x?: number;
+  slide_y?: number;
+  scale?: number;
+  from?: number;
+  to?: number;
+  precision?: number;
+  prefix?: string;
+  suffix?: string;
+  tone?: UiTone;
+  color0?: number;
+  color1?: number;
+  color2?: number;
+  speed?: number;
+  intensity?: number;
+  radius?: number;
+  width?: number;
+  amplitude?: number;
+  active?: boolean;
+  count?: number;
+  auto?: boolean;
+  shared_key?: string | null;
+  blur?: number;
+  rim?: number;
+  seed?: number;
+  exit?: boolean;
+}
+
+/** Camel-case authoring options accepted by the `sofuu.fx` decorators. */
+export interface UiFxOptions {
+  preset?: string;
+  spring?: UiFxSpring;
+  delayMs?: number;
+  durationMs?: number;
+  slideX?: number;
+  slideY?: number;
+  scale?: number;
+  from?: number;
+  to?: number;
+  precision?: number;
+  prefix?: string;
+  suffix?: string;
+  tone?: UiTone;
+  color0?: number;
+  color1?: number;
+  color2?: number;
+  speed?: number;
+  intensity?: number;
+  radius?: number;
+  width?: number;
+  amplitude?: number;
+  active?: boolean;
+  count?: number;
+  auto?: boolean;
+  sharedKey?: string;
+  blur?: number;
+  rim?: number;
+  seed?: number;
+  exit?: boolean;
+  /** `voiceOrb` convenience: rendered node edge in logical px. */
+  size?: number;
+  baseDelayMs?: number;
+}
+
+export interface SofuuFx {
+  spec(kind: UiFxKind, opts?: UiFxOptions): UiFxSpec;
+
+  enter<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  fade<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  slide<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  scalePop<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  stagger<T extends UiNode>(items: T[], opts?: UiFxOptions): T[];
+  shared<T extends UiNode>(key: string, node: T): T;
+  shared<T extends UiNode>(node: T, key: string): T;
+  shake<T extends UiNode>(node: T): T;
+
+  numberRoll<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  typewriter<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  scramble<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  textShimmer<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+
+  shimmer<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  touchRipple<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  borderBeam<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  cursorGlow<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  aurora<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  pulseRing<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  backdropBlur<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+  voiceOrb(opts: UiFxOptions & { amplitude?: number }): UiNode;
+  voiceOrb<T extends UiNode>(node: T, opts?: UiFxOptions): T;
+
+  burst(
+    kind: 'confetti' | 'spark_burst' | 'sparkBurst' | 'shake' | UiFxKind,
+    opts?: {
+      origin?: UiNode | { x: number; y: number };
+      target?: UiNode | string;
+      x?: number;
+      y?: number;
+      count?: number;
+      seed?: number;
+    },
+  ): unknown;
+  trigger: SofuuFx['burst'];
+  confetti(origin?: UiNode | { x: number; y: number }, opts?: UiFxOptions): unknown;
+  sparkBurst(origin?: UiNode | { x: number; y: number }, opts?: UiFxOptions): unknown;
+
+  set<T extends UiNode>(node: T, specs: UiFxSpec[]): T;
+  clear<T extends UiNode>(node: T): T;
+
+  motion: {
+    fade: SofuuFx['fade'];
+    slide: SofuuFx['slide'];
+    scalePop: SofuuFx['scalePop'];
+    enter: SofuuFx['enter'];
+    stagger: SofuuFx['stagger'];
+    shake: SofuuFx['shake'];
+    shared: SofuuFx['shared'];
+  };
+  text: {
+    numberRoll: SofuuFx['numberRoll'];
+    typewriter: SofuuFx['typewriter'];
+    scramble: SofuuFx['scramble'];
+    shimmer: SofuuFx['textShimmer'];
+  };
+  surface: {
+    shimmer: SofuuFx['shimmer'];
+    borderBeam: SofuuFx['borderBeam'];
+    cursorGlow: SofuuFx['cursorGlow'];
+    aurora: SofuuFx['aurora'];
+    backdropBlur: SofuuFx['backdropBlur'];
+  };
+  bursts: {
+    ripple: SofuuFx['touchRipple'];
+    pulseRing: SofuuFx['pulseRing'];
+    confetti: SofuuFx['confetti'];
+    sparkBurst: SofuuFx['sparkBurst'];
+    voiceOrb: SofuuFx['voiceOrb'];
+  };
+}
+
+export interface SofuuUiKit {
+  tokens: {
+    tones: Record<string, number>;
+    color(rgb: number, alpha?: number): number;
+    tone(name: string, alpha?: number): number;
+    radius(value?: number | number[]): [number, number, number, number];
+    modes: string[];
+  };
+  Card(id: string, body: UiNode | UiNode[] | null, opts?: UiStackOptions & {
+    title?: string;
+    titleSize?: number;
+    padding?: number;
+    gap?: number;
+    action?: UiNode;
+  }): UiNodeHandle;
+  ListTile(id: string, opts: UiPressableOptions & {
+    title: string;
+    subtitle?: string;
+    icon?: string;
+    leading?: UiNode;
+    trailing?: UiNode;
+    chevron?: boolean;
+    titleSize?: number;
+    subtitleSize?: number;
+    padding?: number;
+    iconColor?: number;
+  }): UiNodeHandle;
+  Badge(id: string, text: string, opts?: UiNodeBaseOptions & {
+    tone?: UiTone; bg?: number; color?: number; size?: number; padding?: number;
+  }): UiNodeHandle;
+  Chip(id: string, text: string, opts?: UiPressableOptions & {
+    selected?: boolean; tone?: UiTone; padding?: number;
+  }): UiNodeHandle;
+  Avatar(id: string, opts?: UiNodeBaseOptions & {
+    src?: string; name?: string; initials?: string; size?: number; tone?: UiTone; alt?: string;
+  }): UiNodeHandle;
+  Dialog(id: string, opts?: UiOverlayOptions & {
+    title?: string; body?: UiNode | UiNode[] | null;
+    actions?: Array<{ label: string; tone?: UiTone; width?: UiSizeSpec; onClick?: (event: UiEvent) => void }>;
+    visible?: boolean; width?: number; radius?: number; onDismiss?: (event: UiEvent) => void;
+  }): UiNodeHandle;
+  Toast(id: string, text: string, opts?: UiNodeBaseOptions & {
+    tone?: UiTone; bg?: number; color?: number; duration?: number; visible?: boolean; width?: number;
+  }): UiNodeHandle;
+  Sheet(id: string, body: UiNode | UiNode[] | null, opts?: UiOverlayOptions & {
+    title?: string; visible?: boolean; width?: number; onDismiss?: (event: UiEvent) => void;
+  }): UiNodeHandle;
+  Accordion(id: string, items: Array<{ title: string; body?: UiNode | UiNode[]; open?: boolean }>, opts?: {
+    gap?: number;
+  }): UiContainerHandle;
+  BottomNav(id: string, items: Array<{ icon?: string; label?: string }>, opts?: {
+    active?: number; activeTone?: UiTone; inactiveColor?: number | null; height?: number;
+    bg?: number; border?: number; radius?: number[];
+    onChange?: (index: number, item: { icon?: string; label?: string }, event: UiEvent) => void;
+  }): UiContainerHandle;
+  Sidebar(id: string, items: Array<{ label: string; icon?: string; active?: boolean; badge?: UiNode }>, opts?: {
+    width?: number; bg?: number; border?: number; radius?: number[]; iconColor?: number;
+    onSelect?: (index: number, item: { label: string; icon?: string; active?: boolean }, event: UiEvent) => void;
+  }): UiContainerHandle;
+  AppBar(id: string, opts?: {
+    title?: string; titleSize?: number; leading?: UiNode; back?: boolean; actions?: UiNode[];
+    height?: number; bg?: number; border?: number; radius?: number[]; shadowBlur?: number;
+    onBack?: (event: UiEvent) => void;
+  }): UiContainerHandle;
+  Checkbox(id: string, label?: string, opts?: UiPressableOptions & {
+    checked?: boolean; tone?: UiTone; radius?: number; onChange?: (checked: boolean, event: UiEvent) => void;
+  }): UiNodeHandle & { checked(): boolean; setChecked(value: boolean): UiNodeHandle };
+  Radio(id: string, label?: string, opts?: UiPressableOptions & {
+    checked?: boolean; tone?: UiTone; onChange?: (checked: boolean, event: UiEvent) => void;
+  }): UiNodeHandle & { checked(): boolean };
+  Slider(id: string, opts?: UiSliderOptions): UiSliderHandle;
+  RangeSlider(id: string, opts?: UiRangeSliderOptions): UiRangeSliderHandle;
+  Progress(id: string, opts?: UiProgressOptions): UiProgressHandle;
+  Spinner(id: string, opts?: UiNodeBaseOptions & { tone?: UiTone; size?: number }): UiProgressHandle;
+  Select(id: string, options: Array<{ label: string; value?: string }>, opts?: {
+    active?: number; placeholder?: string; width?: number; radius?: number; menuWidth?: number;
+    bg?: number; border?: number; menuBg?: number;
+    onChange?: (index: number, option: { label: string; value?: string }, event: UiEvent) => void;
+  }): UiNodeHandle & { setValue(index: number): UiNodeHandle };
+  Skeleton(id: string, opts?: UiNodeBaseOptions & {
+    width?: UiSizeSpec; height?: number; radius?: number; bg?: number; intensity?: number;
+  }): UiNodeHandle;
+  breakpoint(width: number): 'mobile' | 'tablet' | 'desktop';
+  AdaptiveShell(id: string, opts?: UiNodeBaseOptions & {
+    width?: number; mode?: 'mobile' | 'tablet' | 'desktop'; title?: string;
+    body?: UiNode | UiNode[]; appBar?: UiNode; bottomNav?: UiNode; sidebar?: UiNode; rail?: UiNode;
+    nav?: Array<{ label: string; icon?: string; active?: boolean }>;
+    tabs?: Array<{ icon?: string; active?: boolean }>;
+    actions?: UiNode[]; back?: boolean; onBack?: (event: UiEvent) => void;
+    sidebarWidth?: number;
+  }): UiContainerHandle;
+}
+
 export interface SofuuUi {
   isAttached(): boolean;
+  /** Theme of the active scene ("light" | "dark"); component kits use it to pick readable colors. */
+  theme(): UiThemeMode;
   app(title?: string, opts?: { theme?: UiThemeMode; padding?: number; gap?: number }): UiAppBuilder;
   surface(id?: string, opts?: { title?: string; theme?: UiThemeMode }): UiView;
 
@@ -3193,6 +3904,48 @@ export interface SofuuUi {
   input(placeholder?: string, opts?: UiInputOptions): UiInputHandle;
   input(id: string, placeholder?: string, opts?: UiInputOptions): UiInputHandle;
 
+  richText(spans: Array<string | UiTextSpan>, opts?: UiRichTextOptions): UiRichTextHandle;
+  richText(id: string, spans: Array<string | UiTextSpan>, opts?: UiRichTextOptions): UiRichTextHandle;
+
+  icon(name: string, opts?: UiIconOptions): UiIconHandle;
+  icon(id: string, name: string, opts?: UiIconOptions): UiIconHandle;
+
+  image(src: string, opts?: UiImageOptions): UiImageHandle;
+  image(id: string, src: string, opts?: UiImageOptions): UiImageHandle;
+
+  stack(children: UiNode[], opts?: UiStackOptions): UiStackHandle;
+  stack(id: string, children: UiNode[], opts?: UiStackOptions): UiStackHandle;
+
+  safeArea(child: UiNode | null, opts?: UiSafeAreaOptions): UiNodeHandle;
+  safeArea(id: string, child: UiNode | null, opts?: UiSafeAreaOptions): UiNodeHandle;
+
+  overlay(child: UiNode | null, opts?: UiOverlayOptions): UiNodeHandle;
+  overlay(id: string, child: UiNode | null, opts?: UiOverlayOptions): UiNodeHandle;
+
+  navStack(routes: UiNavRoute[], opts?: UiNavStackOptions): UiNavStackHandle;
+  navStack(id: string, routes: UiNavRoute[], opts?: UiNavStackOptions): UiNavStackHandle;
+
+  listView(items: UiListItem[], opts?: UiListViewOptions): UiListViewHandle;
+  listView(id: string, items: UiListItem[], opts?: UiListViewOptions): UiListViewHandle;
+
+  textArea(placeholder?: string, opts?: UiTextAreaOptions): UiTextAreaHandle;
+  textArea(id: string, placeholder?: string, opts?: UiTextAreaOptions): UiTextAreaHandle;
+
+  slider(opts?: UiSliderOptions): UiSliderHandle;
+  slider(id: string, opts?: UiSliderOptions): UiSliderHandle;
+
+  rangeSlider(opts?: UiRangeSliderOptions): UiRangeSliderHandle;
+  rangeSlider(id: string, opts?: UiRangeSliderOptions): UiRangeSliderHandle;
+
+  progress(opts?: UiProgressOptions): UiProgressHandle;
+  progress(id: string, opts?: UiProgressOptions): UiProgressHandle;
+
+  pressable(child: UiNode | null, opts?: UiPressableOptions): UiNodeHandle;
+  pressable(id: string, child: UiNode | null, opts?: UiPressableOptions): UiNodeHandle;
+
+  draggable(child: UiNode | null, opts?: UiDraggableOptions): UiDraggableHandle;
+  draggable(id: string, child: UiNode | null, opts?: UiDraggableOptions): UiDraggableHandle;
+
   stat(label: string, value: number, opts?: UiStatOptions): UiStatHandle;
   stat(id: string, label: string, value: number, opts?: UiStatOptions): UiStatHandle;
 
@@ -3215,6 +3968,10 @@ export interface SofuuUi {
 
   /** Dependency-free observable cell (`get` / `set` / `update` / `subscribe`). */
   signal<T>(initial: T): UiSignal<T>;
+  /** Derived cell, recomputed when any dependency changes. */
+  computed<T>(compute: () => T, deps?: Array<UiSignal<unknown>>): UiSignal<T>;
+  /** Run now and on every dependency change; the returned function disposes. */
+  effect(run: () => void | (() => void), deps?: Array<UiSignal<unknown>>): () => void;
 
   enableAuto(enabled: boolean): void;
   onPrompt(handler: ((prompt: string, composer: UiAutoComposer) => void) | null): void;

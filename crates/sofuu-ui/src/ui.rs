@@ -391,9 +391,13 @@ pub fn input(id: impl Into<String>, placeholder: impl Into<String>) -> Node {
             value: String::new(),
             placeholder: placeholder.into(),
             tone: Tone::Neutral,
+            keyboard: crate::ir::KeyboardHint::Text,
+            prefix_icon: None,
+            clearable: false,
+            error: None,
         },
     );
-    n.height = SizeSpec::Px(34.0);
+    n.height = SizeSpec::Px(48.0);
     n
 }
 

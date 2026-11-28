@@ -190,6 +190,178 @@ pub struct GlyphInstance {
     pub _pad: u32,
 }
 
+/// 64-byte instanced textured sprite quad (images, avatars, thumbnails, SDF icons).
+///
+/// The fragment shader branches on `flags`:
+/// - [`SPRITE_FLAG_SDF`]: sample the `R8` icon atlas as a distance field and
+///   derive coverage analytically, so one atlas stays crisp at `1x`/`2x`/`3x`.
+/// - [`SPRITE_FLAG_PREMULTIPLIED`]: sample an `RGBA8` image atlas page whose
+///   texels are already premultiplied.
+///
+/// `radii` clips rounded avatars/cards directly in the fragment shader; `tint`
+/// multiplies the sampled color, which recolors monochrome SDF icons for free.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpriteInstance {
+    /// Destination bounds `[x, y, w, h]` in logical pixels.
+    pub rect: [f32; 4],
+    /// Atlas or bound texture `[u0, v0, u1, v1]`.
+    pub uv: [f32; 4],
+    /// Corner radii `[tl, tr, br, bl]` clipped in the fragment shader.
+    pub radii: [f32; 4],
+    /// Multiplicative tint (packed RGBA8, `0xFFFFFFFF` = untinted).
+    pub tint: u32,
+    /// Texture slot (`0` = built-in SDF icon atlas, `1..N` = image atlas pages).
+    pub tex_id: u32,
+    pub clip_id: u32,
+    /// Shader flags: bit 0 = SDF icon mask, bit 1 = premultiplied RGBA image.
+    pub flags: u32,
+}
+
+/// Treat the sampled `R8` channel as a signed distance field.
+pub const SPRITE_FLAG_SDF: u32 = 1 << 0;
+/// Treat the sampled `RGBA8` texel as premultiplied alpha.
+pub const SPRITE_FLAG_PREMULTIPLIED: u32 = 1 << 1;
+
+impl SpriteInstance {
+    /// Opaque, unfiltered, untinted sprite of the whole bound texture.
+    pub const fn new(rect: [f32; 4], uv: [f32; 4]) -> Self {
+        Self {
+            rect,
+            uv,
+            radii: [0.0; 4],
+            tint: 0xffff_ffff,
+            tex_id: 0,
+            clip_id: 0,
+            flags: 0,
+        }
+    }
+
+    #[inline]
+    pub const fn with_radii(mut self, radii: [f32; 4]) -> Self {
+        self.radii = radii;
+        self
+    }
+
+    #[inline]
+    pub const fn with_tint(mut self, tint: u32) -> Self {
+        self.tint = tint;
+        self
+    }
+
+    #[inline]
+    pub const fn with_tex(mut self, tex_id: u32) -> Self {
+        self.tex_id = tex_id;
+        self
+    }
+
+    #[inline]
+    pub const fn with_flags(mut self, flags: u32) -> Self {
+        self.flags = flags;
+        self
+    }
+}
+
+/// 80-byte parameterized UI effect quad (shimmer, ripple, beam, glow, aurora, pulse, orb).
+///
+/// One fragment shader branches on `kind_and_clip` so every platform compiles a single effect
+/// pipeline instead of one state object per effect.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EffectQuadInstance {
+    /// `[x, y, width, height]` in logical pixels.
+    pub rect: [f32; 4],
+    /// Corner radii `[top_left, top_right, bottom_right, bottom_left]` in logical pixels.
+    pub radii: [f32; 4],
+    /// Effect-specific parameters (pointer origin, speed, band width, intensity, ...).
+    pub params0: [f32; 4],
+    /// Secondary parameters (timeline phase, ring radius, amplitude, seed, ...).
+    pub params1: [f32; 4],
+    pub color0: u32,
+    pub color1: u32,
+    pub color2: u32,
+    /// `[effect_kind: u16, clip_id: u16]` packed little-endian.
+    pub kind_and_clip: u32,
+}
+
+impl Default for EffectQuadInstance {
+    fn default() -> Self {
+        Self {
+            rect: [0.0; 4],
+            radii: [0.0; 4],
+            params0: [0.0; 4],
+            params1: [0.0; 4],
+            color0: 0,
+            color1: 0,
+            color2: 0,
+            kind_and_clip: 0,
+        }
+    }
+}
+
+/// 32-byte instanced particle (confetti ribbon, spark, ambient dot).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ParticleInstance {
+    /// Current center `[x, y]` in logical pixels.
+    pub pos: [f32; 2],
+    /// `[width, height]` in logical pixels (radius for circles).
+    pub size: [f32; 2],
+    /// 2D rotation in radians (confetti ribbons).
+    pub angle_rad: f32,
+    /// Packed RGBA8 with faded alpha.
+    pub color: u32,
+    /// Lower 4 bits: shape (`0=circle`, `1=ribbon`, `2=star/spark`); upper bits: `clip_id`.
+    pub shape_clip: u32,
+    pub _pad: u32,
+}
+
+impl Default for ParticleInstance {
+    fn default() -> Self {
+        Self {
+            pos: [0.0; 2],
+            size: [0.0; 2],
+            angle_rad: 0.0,
+            color: 0,
+            shape_clip: 0,
+            _pad: 0,
+        }
+    }
+}
+
+/// 64-byte backdrop partition marker: blur everything painted before this point, then composite
+/// the frosted region (tint + specular rim) before normal foreground drawing resumes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BackdropRegion {
+    /// `[x, y, width, height]` in logical pixels.
+    pub rect: [f32; 4],
+    /// Corner radii `[top_left, top_right, bottom_right, bottom_left]` in logical pixels.
+    pub radii: [f32; 4],
+    /// Surface tint composited over the blurred backdrop.
+    pub tint: u32,
+    /// Inner 1px specular rim color.
+    pub rim: u32,
+    /// `[blur_radius, rim_width, grain, opacity]`.
+    pub params: [f32; 4],
+    pub clip_id: u32,
+    pub _pad: u32,
+}
+
+impl Default for BackdropRegion {
+    fn default() -> Self {
+        Self {
+            rect: [0.0; 4],
+            radii: [0.0; 4],
+            tint: 0,
+            rim: 0,
+            params: [18.0, 1.0, 0.012, 1.0],
+            clip_id: 0,
+            _pad: 0,
+        }
+    }
+}
+
 /// 16-byte scissor / analytic clip rectangle in logical pixels.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -220,11 +392,31 @@ impl ClipRect {
     }
 }
 
+/// Wire version of the `#[repr(C)]` draw structs and their shader contract.
+///
+/// Bump this whenever the byte layout of [`QuadInstance`], [`RibbonInstance`],
+/// [`StrokeInstance`], [`GlyphInstance`], [`SpriteInstance`],
+/// [`EffectQuadInstance`], [`ParticleInstance`], [`BackdropRegion`],
+/// [`ClipRect`], [`DrawCmd`] or [`FrameUniforms`] changes, or when a
+/// `DRAW_KIND_*` id is renumbered. `sofuu-gpu` pins the value with a compile
+/// time assertion, and the bundled shader sources in [`crate::shaders`] are
+/// the other half of the same contract. Additive kinds/fields still bump it:
+/// a host built against the old struct must fail loudly rather than read the
+/// wrong stride.
+pub const SOFUU_DRAW_ABI_VERSION: u32 = 1;
+
 /// Pipeline kind identifier for ordered GPU command batches (`DrawCmd::kind`).
 pub const DRAW_KIND_QUAD: u32 = 0;
 pub const DRAW_KIND_RIBBON: u32 = 1;
 pub const DRAW_KIND_STROKE: u32 = 2;
 pub const DRAW_KIND_GLYPH: u32 = 3;
+/// Parameterized `EffectQuadInstance` batch.
+pub const DRAW_KIND_EFFECT: u32 = 5;
+/// `ParticleInstance` batch.
+pub const DRAW_KIND_PARTICLE: u32 = 6;
+/// Backdrop partition marker (`start` indexes `DrawList::backdrops`, `count == 1`).
+pub const DRAW_KIND_BACKDROP: u32 = 7;
+pub const DRAW_KIND_SPRITE: u32 = 4;
 
 /// 16-byte GPU draw batch preserving exact painter's order across shader pipelines.
 #[repr(C)]
@@ -258,9 +450,20 @@ pub struct DrawList {
     pub ribbons: Vec<RibbonInstance>,
     pub strokes: Vec<StrokeInstance>,
     pub glyphs: Vec<GlyphInstance>,
+    pub sprites: Vec<SpriteInstance>,
+    pub effects: Vec<EffectQuadInstance>,
+    pub particles: Vec<ParticleInstance>,
+    pub backdrops: Vec<BackdropRegion>,
     pub cmds: Vec<DrawCmd>,
     pub clips: Vec<ClipRect>,
     clip_stack: Vec<u32>,
+    /// Set by `UiEngine::tick_and_compile`: the host should present another
+    /// frame now. A settled list keeps this `false`, which is the 0%-idle
+    /// contract every host loop reads instead of reaching into engine state.
+    pub needs_next_frame: bool,
+    /// Engine-clock seconds at which a *timed* wake is due (caret blink).
+    /// `None` means only input/animations can wake the loop.
+    pub next_wake_s: Option<f64>,
 }
 
 impl DrawList {
@@ -276,6 +479,10 @@ impl DrawList {
         self.ribbons.clear();
         self.strokes.clear();
         self.glyphs.clear();
+        self.sprites.clear();
+        self.effects.clear();
+        self.particles.clear();
+        self.backdrops.clear();
         self.cmds.clear();
         self.clips.clear();
         self.clip_stack.clear();
@@ -287,18 +494,7 @@ impl DrawList {
 
     #[inline]
     fn record_cmd(&mut self, kind: u32, start: usize) {
-        if let Some(last) = self.cmds.last_mut() {
-            if last.kind == kind && (last.start + last.count) as usize == start {
-                last.count += 1;
-                return;
-            }
-        }
-        self.cmds.push(DrawCmd {
-            kind,
-            start: start as u32,
-            count: 1,
-            _pad: 0,
-        });
+        self.record_batch(kind, start, 1);
     }
 
     #[inline]
@@ -362,17 +558,73 @@ impl DrawList {
     /// Record a batch of `count` glyphs already appended directly to `self.glyphs`.
     #[inline]
     pub fn record_glyph_batch(&mut self, start: usize, count: usize) {
+        self.record_batch(DRAW_KIND_GLYPH, start, count);
+    }
+
+    #[inline]
+    pub fn push_sprite(&mut self, mut sprite: SpriteInstance) {
+        sprite.clip_id = self.current_clip_id();
+        let idx = self.sprites.len();
+        self.sprites.push(sprite);
+        self.record_cmd(DRAW_KIND_SPRITE, idx);
+    }
+
+    /// Record a batch of `count` sprites already appended directly to `self.sprites`.
+    #[inline]
+    pub fn record_sprite_batch(&mut self, start: usize, count: usize) {
+        self.record_batch(DRAW_KIND_SPRITE, start, count);
+    }
+
+    #[inline]
+    pub fn push_effect(&mut self, mut effect: EffectQuadInstance) {
+        let clip = self.current_clip_id();
+        let kind = (effect.kind_and_clip & 0xffff) as u16;
+        effect.kind_and_clip = (kind as u32) | (clip << 16);
+        let idx = self.effects.len();
+        self.effects.push(effect);
+        self.record_cmd(DRAW_KIND_EFFECT, idx);
+    }
+
+    #[inline]
+    pub fn push_particle(&mut self, mut particle: ParticleInstance) {
+        let clip = self.current_clip_id();
+        let shape = particle.shape_clip & 0xf;
+        particle.shape_clip = shape | (clip << 4);
+        let idx = self.particles.len();
+        self.particles.push(particle);
+        self.record_cmd(DRAW_KIND_PARTICLE, idx);
+    }
+
+    /// Append a backdrop partition marker. Unlike instance batches, two adjacent markers must
+    /// never merge: each one blurs the framebuffer state at that exact painter position.
+    #[inline]
+    pub fn push_backdrop(&mut self, mut region: BackdropRegion) {
+        region.clip_id = self.current_clip_id();
+        let idx = self.backdrops.len();
+        self.backdrops.push(region);
+        self.cmds.push(DrawCmd {
+            kind: DRAW_KIND_BACKDROP,
+            start: idx as u32,
+            count: 1,
+            _pad: 0,
+        });
+    }
+
+    /// Merge a contiguous run of one pipeline into the previous command when
+    /// painter order allows it, avoiding one `DrawCmd` per glyph/sprite.
+    #[inline]
+    fn record_batch(&mut self, kind: u32, start: usize, count: usize) {
         if count == 0 {
             return;
         }
         if let Some(last) = self.cmds.last_mut() {
-            if last.kind == DRAW_KIND_GLYPH && (last.start + last.count) as usize == start {
+            if last.kind == kind && (last.start + last.count) as usize == start {
                 last.count += count as u32;
                 return;
             }
         }
         self.cmds.push(DrawCmd {
-            kind: DRAW_KIND_GLYPH,
+            kind,
             start: start as u32,
             count: count as u32,
             _pad: 0,
@@ -391,6 +643,10 @@ mod tests {
         assert_eq!(size_of::<RibbonInstance>(), 48);
         assert_eq!(size_of::<StrokeInstance>(), 48);
         assert_eq!(size_of::<GlyphInstance>(), 48);
+        assert_eq!(size_of::<SpriteInstance>(), 64);
+        assert_eq!(size_of::<EffectQuadInstance>(), 80);
+        assert_eq!(size_of::<ParticleInstance>(), 32);
+        assert_eq!(size_of::<BackdropRegion>(), 64);
         assert_eq!(size_of::<ClipRect>(), 16);
         assert_eq!(size_of::<DrawCmd>(), 16);
         assert_eq!(size_of::<FrameUniforms>(), 32);
@@ -398,6 +654,25 @@ mod tests {
         assert!(align_of::<RibbonInstance>() >= 4);
         assert!(align_of::<StrokeInstance>() >= 4);
         assert!(align_of::<GlyphInstance>() >= 4);
+        assert!(align_of::<SpriteInstance>() >= 4);
+    }
+
+    #[test]
+    fn sprite_batches_preserve_painter_order_and_merge_runs() {
+        let mut dl = DrawList::new();
+        dl.reset([400.0, 300.0]);
+        dl.push_quad(QuadInstance::default());
+        dl.push_sprite(SpriteInstance::new([1.0, 2.0, 3.0, 4.0], [0.0, 0.0, 1.0, 1.0]));
+        dl.push_sprite(SpriteInstance::new([5.0, 6.0, 7.0, 8.0], [0.0, 0.0, 1.0, 1.0]));
+        dl.push_quad(QuadInstance::default());
+
+        assert_eq!(dl.sprites.len(), 2);
+        assert_eq!(
+            dl.cmds.iter().map(|c| (c.kind, c.start, c.count)).collect::<Vec<_>>(),
+            vec![(DRAW_KIND_QUAD, 0, 1), (DRAW_KIND_SPRITE, 0, 2), (DRAW_KIND_QUAD, 1, 1)]
+        );
+        // The current clip is stamped onto each sprite automatically.
+        assert_eq!(dl.sprites[0].clip_id, 0);
     }
 
     #[test]
@@ -415,6 +690,47 @@ mod tests {
         dl.pop_clip();
         dl.pop_clip();
         assert_eq!(dl.current_clip_id(), 0);
+    }
+
+    /// Independent of the C header gate: this pins the Rust half of the
+    /// draw ABI so a field insertion cannot silently change an instance
+    /// stride between `sofuu-ui` and `sofuu-gpu`.
+    #[test]
+    fn draw_abi_layout_is_pinned() {
+        use std::mem::{align_of, size_of};
+
+        assert_eq!(SOFUU_DRAW_ABI_VERSION, 1, "bump the shaders with the ABI");
+        assert_eq!(size_of::<FrameUniforms>(), 32);
+        assert_eq!(size_of::<ClipRect>(), 16);
+        assert_eq!(size_of::<DrawCmd>(), 16);
+        assert_eq!(size_of::<QuadInstance>(), 80);
+        assert_eq!(size_of::<RibbonInstance>(), 48);
+        assert_eq!(size_of::<StrokeInstance>(), 48);
+        assert_eq!(size_of::<GlyphInstance>(), 48);
+        assert_eq!(size_of::<SpriteInstance>(), 64);
+        assert_eq!(size_of::<EffectQuadInstance>(), 80);
+        assert_eq!(size_of::<ParticleInstance>(), 32);
+        assert_eq!(size_of::<BackdropRegion>(), 64);
+        for align in [
+            align_of::<FrameUniforms>(),
+            align_of::<QuadInstance>(),
+            align_of::<SpriteInstance>(),
+        ] {
+            assert_eq!(align, 4);
+        }
+        assert_eq!(
+            [
+                DRAW_KIND_QUAD,
+                DRAW_KIND_RIBBON,
+                DRAW_KIND_STROKE,
+                DRAW_KIND_GLYPH,
+                DRAW_KIND_SPRITE,
+                DRAW_KIND_EFFECT,
+                DRAW_KIND_PARTICLE,
+                DRAW_KIND_BACKDROP,
+            ],
+            [0, 1, 2, 3, 4, 5, 6, 7]
+        );
     }
 
     #[test]

@@ -12,3 +12,5 @@ path = "src/lib.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
+png = { version = "0.17", default-features = false }
+jpeg-decoder = { version = "0.3", default-features = false }

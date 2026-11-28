@@ -13,6 +13,8 @@ use crate::components::plot::{
 };
 use crate::components::stat::StatData;
 use crate::components::table::{reapply_table_sort, sort_table_rows, TableData, TableRow};
+use crate::fx::{FxKind, FxSpec};
+use crate::images::ImageFit;
 use crate::theme::{ThemeMode, Tone};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -165,6 +167,373 @@ pub struct TabItem {
     pub child: Node,
 }
 
+/// Alignment used by `Stack` / `Overlay` children that are smaller than the stack.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StackAlign {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    #[default]
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+impl StackAlign {
+    /// Resolve child origin inside a stack `(x, y, w, h)` for a child size.
+    #[inline]
+    pub fn place(self, stack: [f32; 4], child: [f32; 2]) -> [f32; 2] {
+        let [x, y, w, h] = stack;
+        let (cw, ch) = (child[0], child[1]);
+        let cx = match self {
+            Self::TopLeft | Self::Left | Self::BottomLeft => x,
+            Self::Top | Self::Center | Self::Bottom => x + (w - cw) * 0.5,
+            Self::TopRight | Self::Right | Self::BottomRight => x + w - cw,
+        };
+        let cy = match self {
+            Self::TopLeft | Self::Top | Self::TopRight => y,
+            Self::Left | Self::Center | Self::Right => y + (h - ch) * 0.5,
+            Self::BottomLeft | Self::Bottom | Self::BottomRight => y + h - ch,
+        };
+        [cx, cy]
+    }
+
+    /// Cross-axis `Align` equivalent for leaf layout.
+    #[inline]
+    pub fn cross_align(self) -> Align {
+        match self {
+            Self::TopLeft | Self::Left | Self::BottomLeft => Align::Start,
+            Self::Top | Self::Center | Self::Bottom => Align::Center,
+            Self::TopRight | Self::Right | Self::BottomRight => Align::End,
+        }
+    }
+}
+
+/// Optional edge pinning for a child inside a `Stack`/`Overlay`.
+///
+/// Omitted edges keep the stack alignment on that axis; specifying both
+/// `left` and `right` stretches (or overrides the width).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InsetHint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub left: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bottom: Option<f32>,
+}
+
+/// Extra per-node layout constraints (all opt-in, zero cost when unset).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LayoutHints {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_width: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_height: Option<f32>,
+    /// `width / height`; the cross axis is derived from the resolved main axis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<f32>,
+    /// Flex shrink weight (`0` = never shrink, `1` = default).
+    pub flex_shrink: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align_self: Option<Align>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inset: Option<InsetHint>,
+    /// Paint/hit order hint inside a `Stack` (lower paints first).
+    pub z: i32,
+}
+
+impl Default for LayoutHints {
+    fn default() -> Self {
+        Self {
+            max_width: None,
+            max_height: None,
+            aspect_ratio: None,
+            flex_shrink: 1.0,
+            align_self: None,
+            inset: None,
+            z: 0,
+        }
+    }
+}
+
+/// One inline run in a rich text node.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextSpan {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<u32>,
+    #[serde(default = "default_span_weight")]
+    pub weight: u16,
+    #[serde(default)]
+    pub mono: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<f32>,
+}
+
+const fn default_span_weight() -> u16 {
+    400
+}
+
+/// Rich text payload: styled runs sharing one line box.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RichTextData {
+    pub spans: Vec<TextSpan>,
+    #[serde(default = "default_rich_size")]
+    pub size: f32,
+    #[serde(default)]
+    pub wrap: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_height: Option<f32>,
+}
+
+const fn default_rich_size() -> f32 {
+    14.0
+}
+
+/// One named route inside a `NavStack`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NavRoute {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    pub child: Node,
+}
+
+/// One virtualized list row. `height` omitted means "use the estimate".
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ListItem {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<f32>,
+    pub child: Node,
+}
+
+impl ListItem {
+    /// Explicit height, or the list's estimate (clamped to a usable row).
+    #[inline]
+    pub fn estimated_or(&self, estimate: f32) -> f32 {
+        self.height.unwrap_or(estimate).max(1.0)
+    }
+}
+
+/// Virtualized heterogeneous-height list payload.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ListViewData {
+    pub items: Vec<ListItem>,
+    #[serde(default = "default_item_height")]
+    pub estimated_height: f32,
+    #[serde(default)]
+    pub spacing: f32,
+    /// Extra screen-heights to keep measured above/below the viewport.
+    #[serde(default = "default_overscan")]
+    pub overscan: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<BoxStyle>,
+}
+
+const fn default_item_height() -> f32 {
+    56.0
+}
+
+const fn default_overscan() -> f32 {
+    1.0
+}
+
+/// Mobile/desktop soft-keyboard type for an editable field. Purely a host
+/// hint: the renderer never changes its glyphs or layout based on it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyboardHint {
+    #[default]
+    Text,
+    Email,
+    Number,
+    Phone,
+    Url,
+    Search,
+    Password,
+    Decimal,
+}
+
+impl KeyboardHint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeyboardHint::Text => "text",
+            KeyboardHint::Email => "email",
+            KeyboardHint::Number => "number",
+            KeyboardHint::Phone => "phone",
+            KeyboardHint::Url => "url",
+            KeyboardHint::Search => "search",
+            KeyboardHint::Password => "password",
+            KeyboardHint::Decimal => "decimal",
+        }
+    }
+
+    /// Stable wire code for the C ABI (`SOFUU_KEYBOARD_*`).
+    pub fn abi_code(self) -> i32 {
+        match self {
+            KeyboardHint::Text => 0,
+            KeyboardHint::Email => 1,
+            KeyboardHint::Number => 2,
+            KeyboardHint::Phone => 3,
+            KeyboardHint::Url => 4,
+            KeyboardHint::Search => 5,
+            KeyboardHint::Password => 6,
+            KeyboardHint::Decimal => 7,
+        }
+    }
+}
+
+/// Multi-line editable text payload.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextAreaData {
+    #[serde(default)]
+    pub value: String,
+    #[serde(default)]
+    pub placeholder: String,
+    #[serde(default = "default_text_rows")]
+    pub rows: u32,
+    #[serde(default)]
+    pub tone: Tone,
+    #[serde(default)]
+    pub secure: bool,
+    #[serde(default)]
+    pub max_len: usize,
+    #[serde(default)]
+    pub keyboard: KeyboardHint,
+}
+
+const fn default_text_rows() -> u32 {
+    3
+}
+
+/// Horizontal slider payload.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SliderData {
+    pub value: f32,
+    #[serde(default)]
+    pub min: f32,
+    #[serde(default = "default_slider_max")]
+    pub max: f32,
+    /// `0` = continuous.
+    #[serde(default)]
+    pub step: f32,
+    #[serde(default)]
+    pub tone: Tone,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default = "default_true")]
+    pub show_value: bool,
+}
+
+const fn default_slider_max() -> f32 {
+    1.0
+}
+
+/// Dual-handle value slider (`RangeSlider`) — a min/max pair on one track.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RangeSliderData {
+    pub low: f32,
+    #[serde(default = "default_slider_max")]
+    pub high: f32,
+    #[serde(default)]
+    pub min: f32,
+    #[serde(default = "default_slider_max")]
+    pub max: f32,
+    /// `0` = continuous.
+    #[serde(default)]
+    pub step: f32,
+    #[serde(default)]
+    pub tone: Tone,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default = "default_true")]
+    pub show_value: bool,
+}
+
+impl RangeSliderData {
+    /// Clamp both handles into `min..=max` and keep `low <= high`.
+    pub fn clamped(&self) -> (f32, f32) {
+        let lo = self.min.min(self.max);
+        let hi = self.max.max(self.min);
+        let low = snap(self.low.clamp(lo, hi), lo, self.step);
+        let high = snap(self.high.clamp(lo, hi), lo, self.step);
+        if low <= high {
+            (low, high)
+        } else {
+            (high, low)
+        }
+    }
+}
+
+/// Snap `v` to the nearest `step` multiple offset from `origin` (`0` = continuous).
+#[inline]
+pub fn snap(v: f32, origin: f32, step: f32) -> f32 {
+    if step > 0.0 {
+        origin + ((v - origin) / step).round() * step
+    } else {
+        v
+    }
+}
+
+/// Visual shape of a `Progress` meter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressVariant {
+    #[default]
+    Linear,
+    /// Ring/spinner drawn into a square box.
+    Circular,
+}
+
+/// Deterministic progress meter (linear bar or circular ring).
+///
+/// `indeterminate` renders a moving sweep instead of a fraction; the sweep is
+/// driven by the engine clock, so it animates only while visible.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProgressData {
+    /// Completion fraction `0.0..=1.0`.
+    #[serde(default)]
+    pub value: f32,
+    #[serde(default)]
+    pub variant: ProgressVariant,
+    #[serde(default)]
+    pub tone: Tone,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub indeterminate: bool,
+}
+
+impl ProgressData {
+    #[inline]
+    pub fn fraction(&self) -> f32 {
+        self.value.clamp(0.0, 1.0)
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+/// Axis lock for `Draggable`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DragAxis {
+    #[default]
+    Both,
+    Horizontal,
+    Vertical,
+}
+
 const fn default_toggle_size() -> f32 {
     36.0
 }
@@ -195,6 +564,17 @@ pub struct Node {
     pub min_height: f32,
     #[serde(default)]
     pub padding: Insets,
+    /// Optional GPU effects / choreography attached to this node (opt-in, zero cost when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fx: Vec<FxSpec>,
+    /// Extra constraints and `Stack` positioning hints.
+    #[serde(default)]
+    pub layout: LayoutHints,
+    /// Keep the current text-field focus when this node is tapped. Used by
+    /// on-screen keyboards and other auxiliary controls that must not blur the
+    /// field they are typing into.
+    #[serde(default)]
+    pub preserve_focus: bool,
     pub kind: NodeKind,
 }
 
@@ -209,6 +589,9 @@ impl Node {
             min_width: 0.0,
             min_height: 0.0,
             padding: Insets::ZERO,
+            fx: Vec::new(),
+            layout: LayoutHints::default(),
+            preserve_focus: false,
             kind,
         }
     }
@@ -227,6 +610,56 @@ impl Node {
     pub fn with_priority(mut self, priority: u8) -> Self {
         self.priority = priority;
         self
+    }
+
+    /// Replace the layout hint block (builder convenience).
+    pub fn with_layout(mut self, layout: LayoutHints) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    /// Constrain the node's maximum size.
+    pub fn with_max_size(mut self, max_width: Option<f32>, max_height: Option<f32>) -> Self {
+        self.layout.max_width = max_width;
+        self.layout.max_height = max_height;
+        self
+    }
+
+    /// Lock an aspect ratio (`width / height`).
+    pub fn with_aspect_ratio(mut self, ratio: f32) -> Self {
+        self.layout.aspect_ratio = (ratio > 0.0).then_some(ratio);
+        self
+    }
+
+    /// Pin this node inside a `Stack`/`Overlay`.
+    pub fn with_inset(mut self, inset: InsetHint) -> Self {
+        self.layout.inset = Some(inset);
+        self
+    }
+
+    /// Immutable lookup by node id (used by hot-reload state preservation).
+    pub fn find(&self, id: &str) -> Option<&Node> {
+        if self.id == id {
+            return Some(self);
+        }
+        match &self.kind {
+            NodeKind::Container { children, .. }
+            | NodeKind::Grid { children, .. }
+            | NodeKind::Stack { children, .. } => {
+                children.iter().find_map(|c| c.find(id))
+            }
+            NodeKind::Tabs { items, .. } => items.iter().find_map(|i| i.child.find(id)),
+            NodeKind::Surface { child, .. }
+            | NodeKind::SafeArea { child, .. }
+            | NodeKind::Overlay { child, .. }
+            | NodeKind::Pressable { child, .. }
+            | NodeKind::Draggable { child, .. } => child.as_deref().and_then(|c| c.find(id)),
+            NodeKind::NavStack { routes, .. } => {
+                routes.iter().find_map(|r| r.child.find(id))
+            }
+            NodeKind::ListView(list) => list.items.iter().find_map(|i| i.child.find(id)),
+            _ => None,
+        }
     }
 
     /// Recursively visit all nodes mutably to apply targeted incremental patches.
@@ -249,12 +682,44 @@ impl Node {
                     }
                 }
             }
-            NodeKind::Surface { child, .. } => {
+            NodeKind::Surface { child, .. }
+            | NodeKind::SafeArea { child, .. }
+            | NodeKind::Overlay { child, .. }
+            | NodeKind::Pressable { child, .. }
+            | NodeKind::Draggable { child, .. } => {
                 if let Some(c) = child {
                     return c.find_mut(id);
                 }
             }
-            NodeKind::Text { .. }
+            NodeKind::Stack { children, .. } => {
+                for c in children {
+                    if let Some(found) = c.find_mut(id) {
+                        return Some(found);
+                    }
+                }
+            }
+            NodeKind::NavStack { routes, .. } => {
+                for route in routes {
+                    if let Some(found) = route.child.find_mut(id) {
+                        return Some(found);
+                    }
+                }
+            }
+            NodeKind::ListView(list) => {
+                for item in &mut list.items {
+                    if let Some(found) = item.child.find_mut(id) {
+                        return Some(found);
+                    }
+                }
+            }
+            NodeKind::RichText(_)
+            | NodeKind::Icon { .. }
+            | NodeKind::Image { .. }
+            | NodeKind::TextArea(_)
+            | NodeKind::Slider(_)
+            | NodeKind::RangeSlider(_)
+            | NodeKind::Progress(_)
+            | NodeKind::Text { .. }
             | NodeKind::Rule { .. }
             | NodeKind::Spacer
             | NodeKind::ThemeToggle { .. }
@@ -352,6 +817,17 @@ pub enum NodeKind {
         placeholder: String,
         #[serde(default)]
         tone: Tone,
+        #[serde(default)]
+        keyboard: KeyboardHint,
+        /// Optional leading SDF icon name (see `icons.rs`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prefix_icon: Option<String>,
+        /// Show a `×` affordance that clears the field.
+        #[serde(default)]
+        clearable: bool,
+        /// Inline validation message drawn under the field (danger tone).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     /// Adaptive KPI metric tile with counter spring, delta pill, sparkline/range bar.
     Stat(StatData),
@@ -365,6 +841,112 @@ pub enum NodeKind {
     Graph(GraphData),
     /// Monospace syntax-tinted code/log viewer with line gutter and highlights.
     CodeText(CodeData),
+    // ── Wave 1 app surfaces (additive: never renumbers existing variants) ──
+    /// Inline rich text with per-run color, weight, family and size.
+    RichText(RichTextData),
+    /// Crisp SDF vector icon from the built-in/custom icon atlas.
+    Icon {
+        name: String,
+        #[serde(default = "default_icon_size")]
+        size: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        color: Option<u32>,
+    },
+    /// Decoded bitmap (`UiEngine::images` key) drawn through the sprite pipeline.
+    Image {
+        /// Stable cache key: `https://…`, `file://…`, `asset:<id>` or any app id.
+        src: String,
+        #[serde(default)]
+        fit: ImageFit,
+        #[serde(default)]
+        radius: [f32; 4],
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tint: Option<u32>,
+        /// Shimmer color while the image is not decoded yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<u32>,
+        #[serde(default)]
+        alt: String,
+    },
+    /// Layered Z container; children overlap inside the shared bounds.
+    Stack {
+        #[serde(default)]
+        align: StackAlign,
+        #[serde(default)]
+        gap: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<BoxStyle>,
+        children: Vec<Node>,
+    },
+    /// Applies platform safe-area insets and optional soft-keyboard avoidance.
+    SafeArea {
+        #[serde(default)]
+        insets: Insets,
+        #[serde(default = "default_true")]
+        keyboard_avoidance: bool,
+        #[serde(default)]
+        keyboard_height: f32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child: Option<Box<Node>>,
+    },
+    /// Modal/backdrop surface that traps input behind it.
+    Overlay {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scrim: Option<u32>,
+        #[serde(default)]
+        dismissable: bool,
+        #[serde(default)]
+        align: StackAlign,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<BoxStyle>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child: Option<Box<Node>>,
+    },
+    /// Route stack with a horizontal slide transition and edge-swipe back.
+    NavStack {
+        routes: Vec<NavRoute>,
+        #[serde(default)]
+        active: usize,
+        /// `0.0` = settled on `active`, `1.0` = previous route fully visible.
+        #[serde(default)]
+        progress: f32,
+        #[serde(default = "default_true")]
+        swipe_back: bool,
+    },
+    /// Virtualized heterogeneous-height list (compiles only the visible window).
+    ListView(ListViewData),
+    /// Multi-line editable text field.
+    TextArea(TextAreaData),
+    /// Horizontal value slider.
+    Slider(SliderData),
+    /// Dual-handle range slider.
+    RangeSlider(RangeSliderData),
+    /// Linear or circular progress meter.
+    Progress(ProgressData),
+    /// Headless pressable wrapper (hover/press springs + semantic click).
+    Pressable {
+        #[serde(default)]
+        hit_slop: f32,
+        #[serde(default)]
+        disabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child: Option<Box<Node>>,
+    },
+    /// Headless drag primitive with persistent offset.
+    Draggable {
+        #[serde(default)]
+        axis: DragAxis,
+        #[serde(default)]
+        offset: [f32; 2],
+        #[serde(default)]
+        inertia: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child: Option<Box<Node>>,
+    },
+}
+
+const fn default_icon_size() -> f32 {
+    20.0
 }
 
 /// Complete scene root held by `UiEngine`.
@@ -632,6 +1214,30 @@ impl Scene {
                 }
                 false
             }
+            ScenePatch::SetFx { id, fx } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if node.fx != fx {
+                        node.fx = fx;
+                        return true;
+                    }
+                }
+                false
+            }
+            ScenePatch::SetFxAmplitude { id, value } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    let clamped = value.clamp(0.0, 1.0);
+                    let mut changed = false;
+                    for spec in &mut node.fx {
+                        if spec.kind == FxKind::VoiceOrb && (spec.amplitude - clamped).abs() > 1e-4 {
+                            spec.amplitude = clamped;
+                            changed = true;
+                        }
+                    }
+                    return changed;
+                }
+                false
+            }
+            ScenePatch::FxTrigger { .. } => false,
             ScenePatch::SortTable { id, col_index } => {
                 if let Some(node) = self.root.find_mut(&id) {
                     if let NodeKind::Table(table) = &mut node.kind {
@@ -839,6 +1445,223 @@ impl Scene {
                 }
                 false
             }
+            ScenePatch::SetListItems { id, items } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::ListView(data) = &mut node.kind {
+                        if data.items != items {
+                            data.items = items;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SetRichText { id, spans } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::RichText(data) = &mut node.kind {
+                        if data.spans != spans {
+                            data.spans = spans;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SetIcon { id, name, color } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Icon {
+                        name: old_name,
+                        color: old_color,
+                        ..
+                    } = &mut node.kind
+                    {
+                        let mut changed = *old_name != name;
+                        *old_name = name;
+                        if color.is_some() && *old_color != color {
+                            *old_color = color;
+                            changed = true;
+                        }
+                        return changed;
+                    }
+                }
+                false
+            }
+            ScenePatch::SetImage { id, src } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Image { src: old, .. } = &mut node.kind {
+                        if *old != src {
+                            *old = src;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SetSlider { id, value } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Slider(data) = &mut node.kind {
+                        let v = value.clamp(
+                            data.min.min(data.max),
+                            data.min.max(data.max),
+                        );
+                        if (data.value - v).abs() > 1e-6 {
+                            data.value = v;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SetTextArea { id, value } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::TextArea(data) = &mut node.kind {
+                        if data.value != value {
+                            data.value = value;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SetRangeSlider { id, low, high } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::RangeSlider(data) = &mut node.kind {
+                        let probe = RangeSliderData {
+                            low,
+                            high,
+                            ..data.clone()
+                        };
+                        let (lo, hi) = probe.clamped();
+                        if (data.low - lo).abs() > 1e-6 || (data.high - hi).abs() > 1e-6 {
+                            data.low = lo;
+                            data.high = hi;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SetProgress {
+                id,
+                value,
+                indeterminate,
+            } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Progress(data) = &mut node.kind {
+                        let v = value.clamp(0.0, 1.0);
+                        let mut changed = false;
+                        if (data.value - v).abs() > 1e-6 {
+                            data.value = v;
+                            changed = true;
+                        }
+                        if let Some(ind) = indeterminate {
+                            if data.indeterminate != ind {
+                                data.indeterminate = ind;
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SetDraggable { id, offset } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::Draggable { offset: old, .. } = &mut node.kind {
+                        if *old != offset {
+                            *old = offset;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::SetNavProgress { id, progress } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::NavStack {
+                        progress: old, ..
+                    } = &mut node.kind
+                    {
+                        let p = progress.clamp(0.0, 1.0);
+                        if (*old - p).abs() > 1e-4 {
+                            *old = p;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::NavPush { id, route } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::NavStack {
+                        routes,
+                        active,
+                        progress,
+                        ..
+                    } = &mut node.kind
+                    {
+                        routes.truncate((*active).saturating_add(1));
+                        routes.push(route);
+                        *active = routes.len().saturating_sub(1);
+                        *progress = 0.0;
+                        return true;
+                    }
+                }
+                false
+            }
+            ScenePatch::NavPop { id } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::NavStack {
+                        routes,
+                        active,
+                        progress,
+                        ..
+                    } = &mut node.kind
+                    {
+                        if *active > 0 && !routes.is_empty() {
+                            routes.remove(*active);
+                            *active = active.saturating_sub(1);
+                            *progress = 0.0;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::NavReplace { id, route } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::NavStack { routes, active, .. } = &mut node.kind {
+                        if let Some(slot) = routes.get_mut(*active) {
+                            let mut route = route;
+                            route.id = slot.id.clone();
+                            *slot = route;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            ScenePatch::NavPopToRoot { id } => {
+                if let Some(node) = self.root.find_mut(&id) {
+                    if let NodeKind::NavStack {
+                        routes,
+                        active,
+                        progress,
+                        ..
+                    } = &mut node.kind
+                    {
+                        if *active > 0 {
+                            routes.truncate(1);
+                            *active = 0;
+                            *progress = 0.0;
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
             ScenePatch::SetChildren { id, children } => {
                 if let Some(node) = self.root.find_mut(&id) {
                     match &mut node.kind {
@@ -906,6 +1729,33 @@ pub enum ScenePatch {
     SetSegmented { id: String, active: usize },
     SetSwitch { id: String, checked: bool },
     SetInput { id: String, value: String },
+    /// Move both handles of a `RangeSlider` (clamped and ordered by the engine).
+    SetRangeSlider { id: String, low: f32, high: f32 },
+    /// Set a `Progress` fraction `0.0..=1.0` (and optionally clear `indeterminate`).
+    SetProgress {
+        id: String,
+        value: f32,
+        #[serde(default)]
+        indeterminate: Option<bool>,
+    },
+    /// Attach/replace a node's opt-in effect list (`sofuu.fx`).
+    SetFx { id: String, #[serde(default)] fx: Vec<FxSpec> },
+    /// Update a `voice_orb` amplitude without rebuilding the scene.
+    SetFxAmplitude { id: String, value: f32 },
+    /// Fire an impulse effect (`confetti`, `spark_burst`, `shake`) at a target/origin.
+    FxTrigger {
+        #[serde(default)]
+        target: Option<String>,
+        kind: FxKind,
+        #[serde(default)]
+        count: Option<usize>,
+        #[serde(default)]
+        x: Option<f32>,
+        #[serde(default)]
+        y: Option<f32>,
+        #[serde(default)]
+        seed: Option<u32>,
+    },
     SortTable { id: String, col_index: usize },
     SelectTableRow { id: String, row_id: Option<String> },
     AppendFeedItem {
@@ -1007,6 +1857,55 @@ pub enum ScenePatch {
     ResetPlotView {
         id: String,
     },
+    // ── Wave 1 app surfaces ──
+    SetListItems {
+        id: String,
+        items: Vec<ListItem>,
+    },
+    SetRichText {
+        id: String,
+        spans: Vec<TextSpan>,
+    },
+    SetIcon {
+        id: String,
+        name: String,
+        #[serde(default)]
+        color: Option<u32>,
+    },
+    SetImage {
+        id: String,
+        src: String,
+    },
+    SetSlider {
+        id: String,
+        value: f32,
+    },
+    SetTextArea {
+        id: String,
+        value: String,
+    },
+    SetDraggable {
+        id: String,
+        offset: [f32; 2],
+    },
+    SetNavProgress {
+        id: String,
+        progress: f32,
+    },
+    NavPush {
+        id: String,
+        route: NavRoute,
+    },
+    NavPop {
+        id: String,
+    },
+    NavReplace {
+        id: String,
+        route: NavRoute,
+    },
+    NavPopToRoot {
+        id: String,
+    },
 }
 
 #[cfg(test)]
@@ -1048,6 +1947,33 @@ mod tests {
         assert_eq!(scene.root.priority, 100);
         assert!(scene.root.visible);
         assert_eq!(scene.root.width, SizeSpec::Auto);
+    }
+
+    #[test]
+    fn input_and_textarea_keyboard_hints_are_backward_compatible() {
+        let legacy: Node = serde_json::from_str(
+            r#"{"id":"mail","kind":{"type":"input","value":"a@b.c","placeholder":"Email","tone":"neutral"}}"#,
+        )
+        .expect("legacy input without keyboard");
+        match legacy.kind {
+            NodeKind::Input { keyboard, .. } => assert_eq!(keyboard, KeyboardHint::Text),
+            other => panic!("unexpected kind {other:?}"),
+        }
+
+        let typed: Node = serde_json::from_str(
+            r#"{"id":"mail","kind":{"type":"input","value":"","placeholder":"Email","tone":"neutral","keyboard":"email"}}"#,
+        )
+        .expect("input with keyboard hint");
+        match typed.kind {
+            NodeKind::Input { keyboard, .. } => assert_eq!(keyboard, KeyboardHint::Email),
+            other => panic!("unexpected kind {other:?}"),
+        }
+
+        let area: TextAreaData = serde_json::from_str(
+            r#"{"value":"","placeholder":"Note","rows":2,"tone":"neutral"}"#,
+        )
+        .expect("legacy textarea");
+        assert_eq!(area.keyboard, KeyboardHint::Text);
     }
 
     fn container(children: Vec<Node>) -> Node {

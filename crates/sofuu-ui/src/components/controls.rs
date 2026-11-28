@@ -6,11 +6,11 @@
 
 use crate::components::fit_text;
 use crate::draw::{lerp_rgba8, scale_alpha, ClipRect, DrawList, QuadInstance, StrokeInstance};
-use crate::hit_test::{HitKind, InteractionState};
+use crate::hit_test::{HitKind, InteractionState, TextEditState};
 use crate::ir::TabItem;
 use crate::layout::ComputedRect;
 use crate::spring::{SpringBank, SpringConfig};
-use crate::text::GlyphAtlas;
+use crate::text::{GlyphAtlas, LineBreak, TextStyle, WEIGHT_REGULAR};
 use crate::theme::{Theme, ThemeMode, Tone};
 
 /// Theme Toggle icon button: displays Sun icon in Light mode and Crescent Moon icon in Dark mode.
@@ -462,18 +462,35 @@ pub fn emit_switch(
 
 /// Interactive single-line monospace text input field with focus ring & live caret.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn emit_input(
     id: &str,
     value: &str,
     placeholder: &str,
     tone: Tone,
+    prefix_icon: Option<&str>,
+    clearable: bool,
+    error: Option<&str>,
     rect: ComputedRect,
     theme: &Theme,
     atlas: &GlyphAtlas,
+    icons: &crate::icons::IconAtlas,
     springs: &mut SpringBank,
     interaction: &mut InteractionState,
     dl: &mut DrawList,
 ) {
+    // The caption lives inside the node box, under the chrome.
+    let caption_h = if error.is_some_and(|e| !e.is_empty()) {
+        16.0
+    } else {
+        0.0
+    };
+    let field = ComputedRect {
+        content_h: (rect.h - caption_h).max(20.0),
+        folded: rect.folded,
+        ..rect
+    };
+    let rect = field;
     if rect.w < 36.0 || rect.h < 22.0 {
         return;
     }
@@ -510,11 +527,60 @@ pub fn emit_input(
         _pad: [0; 3],
     });
 
-    let pad_x = 10.0;
-    let inner_w = (rect.w - pad_x * 2.0).max(8.0);
+    let mut pad_x = 10.0;
     let px = 12.5;
     let py = atlas.centered_pen_y(rect.y, rect.h, px);
 
+    // Leading icon occupies a 22pt gutter; without one the text starts flush.
+    if let Some(name) = prefix_icon.filter(|n| !n.is_empty()) {
+        let gutter = 24.0;
+        crate::components::media::emit_icon(
+            icons,
+            name,
+            ComputedRect {
+                x: rect.x + 8.0,
+                y: rect.y + (rect.h - gutter) * 0.5,
+                w: gutter,
+                h: gutter,
+                ..rect
+            },
+            16.0,
+            theme.text_muted,
+            dl,
+        );
+        pad_x += gutter - 4.0;
+    }
+    let show_clear = clearable && !value.is_empty();
+    let clear_w = if show_clear { 24.0 } else { 0.0 };
+    let inner_w = (rect.w - pad_x - 10.0 - clear_w).max(8.0);
+    if show_clear {
+        let box_rect = ComputedRect {
+            x: rect.x + rect.w - 10.0 - clear_w,
+            y: rect.y + (rect.h - clear_w) * 0.5,
+            w: clear_w,
+            h: clear_w,
+            ..rect
+        };
+        // Pushed after the field hit region so it wins inside its own box.
+        interaction.push_hit(box_rect, HitKind::InputClear { id: id.to_string() });
+        crate::components::media::emit_icon(
+            icons,
+            "x",
+            box_rect,
+            14.0,
+            theme.text_muted,
+            dl,
+        );
+    }
+
+    let caret_reserve = if focused { 4.0 } else { 0.0 };
+    let (shown_start, visible) = tail_window(
+        atlas,
+        value,
+        px,
+        false,
+        (inner_w - caret_reserve).max(4.0),
+    );
     if value.is_empty() {
         let fitted_ph = fit_text(atlas, placeholder, px, false, inner_w);
         atlas.layout_dl(
@@ -527,27 +593,10 @@ pub fn emit_input(
             None,
             dl,
         );
-        if focused {
-            let caret_h = (rect.h - 14.0).clamp(12.0, 18.0);
-            let caret_y = rect.y + (rect.h - caret_h) * 0.5;
-            dl.push_quad(QuadInstance {
-                rect: [rect.x + pad_x, caret_y, 1.6, caret_h],
-                radii: [0.8; 4],
-                color_top: focus_col,
-                color_bottom: focus_col,
-                border_color: 0,
-                shadow_color: 0,
-                params: [0.0, 0.0, 0.0, 1.0],
-                clip_id: 0,
-                _pad: [0; 3],
-            });
-        }
     } else {
         // Keep trailing characters visible when value exceeds field width so active typing stays in view
-        let caret_reserve = if focused { 4.0 } else { 0.0 };
-        let visible = fit_tail_text(atlas, value, px, false, (inner_w - caret_reserve).max(4.0));
         atlas.layout_dl(
-            &visible,
+            visible,
             rect.x + pad_x,
             py,
             px,
@@ -556,42 +605,755 @@ pub fn emit_input(
             None,
             dl,
         );
-        if focused {
-            let (vw, _) = atlas.measure(&visible, px, false);
-            let caret_h = (rect.h - 14.0).clamp(12.0, 18.0);
-            let caret_y = rect.y + (rect.h - caret_h) * 0.5;
-            dl.push_quad(QuadInstance {
-                rect: [rect.x + pad_x + vw + 1.0, caret_y, 1.6, caret_h],
-                radii: [0.8; 4],
-                color_top: focus_col,
-                color_bottom: focus_col,
-                border_color: 0,
-                shadow_color: 0,
-                params: [0.0, 0.0, 0.0, 1.0],
-                clip_id: 0,
-                _pad: [0; 3],
-            });
-        }
+    }
+    if focused {
+        emit_edit_affordances(
+            value,
+            visible,
+            shown_start,
+            rect.x + pad_x,
+            py,
+            inner_w,
+            px,
+            interaction.edit.as_ref(),
+            &hit_key,
+            value.len(),
+            focus_col,
+            interaction.caret_visible,
+            atlas,
+            dl,
+        );
     }
 
     dl.pop_clip();
+
+    if caption_h > 0.0 {
+        let msg = error.unwrap_or_default();
+        let fitted = fit_text(atlas, msg, 11.5, false, rect.w);
+        atlas.layout_dl(
+            &fitted,
+            rect.x + 2.0,
+            rect.y + rect.h + 2.0,
+            11.5,
+            theme.tone_color(Tone::Danger),
+            false,
+            None,
+            dl,
+        );
+    }
 }
 
-fn fit_tail_text(atlas: &GlyphAtlas, text: &str, px: f32, mono: bool, max_w: f32) -> String {
+/// Visible tail of a one-line value: `(start_byte, slice)`.
+fn tail_window<'a>(
+    atlas: &GlyphAtlas,
+    text: &'a str,
+    px: f32,
+    mono: bool,
+    max_w: f32,
+) -> (usize, &'a str) {
     let (w, _) = atlas.measure(text, px, mono);
     if w <= max_w {
-        return text.to_string();
+        return (0, text);
     }
-    let mut chars: Vec<char> = text.chars().collect();
     let mut acc = 0.0f32;
-    let mut start = chars.len();
-    for i in (0..chars.len()).rev() {
-        let cw = atlas.char_advance_em(chars[i], mono) * px;
+    let mut start = text.len();
+    for (i, ch) in text.char_indices().rev() {
+        let cw = atlas.char_advance_em(ch, mono) * px;
         if acc + cw > max_w {
             break;
         }
         acc += cw;
         start = i;
     }
-    chars.drain(start..).collect()
+    (start, &text[start..])
+}
+
+/// Draw the selection highlight and caret for a focused editable.
+///
+/// `shown` is what the renderer actually paints (a tail window for one-line
+/// inputs, bullets for secure text areas); `shown_start` maps its first byte
+/// back into `raw`. `fallback_caret` keeps a caret visible when focus came
+/// from somewhere other than a click (programmatic focus, Tab).
+#[allow(clippy::too_many_arguments)]
+fn emit_edit_affordances(
+    raw: &str,
+    shown: &str,
+    shown_start: usize,
+    origin_x: f32,
+    origin_y: f32,
+    max_w: f32,
+    px: f32,
+    edit: Option<&TextEditState>,
+    hit_key: &str,
+    fallback_caret: usize,
+    focus_col: u32,
+    caret_visible: bool,
+    atlas: &GlyphAtlas,
+    dl: &mut DrawList,
+) {
+    let style = TextStyle::sans(px, WEIGHT_REGULAR);
+    let line_h = px * atlas.line_height_em;
+    let (caret_raw, selection) = match edit.filter(|e| e.id == hit_key) {
+        Some(e) => (e.caret.min(raw.len()), Some(e.selection())),
+        None => (fallback_caret.min(raw.len()), None),
+    };
+    let to_local = |idx: usize| -> usize {
+        if shown_start > 0 {
+            return floor_byte(shown, idx.saturating_sub(shown_start).min(shown.len()));
+        }
+        if raw.len() == shown.len() {
+            return floor_byte(shown, idx.min(shown.len()));
+        }
+        // Masked rendering keeps the character count but changes byte widths.
+        let chars = raw[..floor_byte(raw, idx)].chars().count();
+        shown
+            .char_indices()
+            .nth(chars)
+            .map(|(i, _)| i)
+            .unwrap_or(shown.len())
+    };
+
+    if let Some((a, b)) = selection {
+        let a = to_local(a);
+        let b = to_local(b);
+        if a < b {
+            let laid = atlas.layout_text(
+                shown,
+                style,
+                Some(max_w),
+                usize::MAX,
+                LineBreak::CharWrap,
+            );
+            let bg = scale_alpha(focus_col, 0.32);
+            for (li, line) in laid.lines.iter().enumerate() {
+                if b <= line.start || a > line.end {
+                    continue;
+                }
+                let s = a.max(line.start);
+                let e = b.min(line.end);
+                let x0 = if s <= line.start {
+                    0.0
+                } else {
+                    atlas
+                        .x_for_char_index(shown, s, style, Some(max_w), LineBreak::CharWrap)
+                        .0
+                };
+                let x1 = if e >= line.end {
+                    // Extend a few px over the newline so a full-line selection
+                    // reads as continuous.
+                    line.width + if b > line.end { 4.0 } else { 0.0 }
+                } else {
+                    atlas
+                        .x_for_char_index(shown, e, style, Some(max_w), LineBreak::CharWrap)
+                        .0
+                };
+                if x1 > x0 {
+                    dl.push_quad(QuadInstance {
+                        rect: [origin_x + x0, origin_y + li as f32 * line_h + 1.0, x1 - x0, line_h - 2.0],
+                        radii: [2.0; 4],
+                        color_top: bg,
+                        color_bottom: bg,
+                        border_color: 0,
+                        shadow_color: 0,
+                        params: [0.0, 0.0, 0.0, 1.0],
+                        clip_id: 0,
+                        _pad: [0; 3],
+                    });
+                }
+            }
+        }
+    }
+
+    if !caret_visible {
+        return;
+    }
+    let (cx, line_idx) = atlas.x_for_char_index(
+        shown,
+        to_local(caret_raw),
+        style,
+        Some(max_w),
+        LineBreak::CharWrap,
+    );
+    let cy = origin_y + line_idx as f32 * line_h;
+    dl.push_quad(QuadInstance {
+        rect: [origin_x + cx, cy + 1.0, 1.6, (line_h - 2.0).max(10.0)],
+        radii: [0.8; 4],
+        color_top: focus_col,
+        color_bottom: focus_col,
+        border_color: 0,
+        shadow_color: 0,
+        params: [0.0, 0.0, 0.0, 1.0],
+        clip_id: 0,
+        _pad: [0; 3],
+    });
+}
+
+#[inline]
+fn floor_byte(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// Horizontal slider with a filled track, thumb, optional label and value readout.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_slider(
+    id: &str,
+    data: &crate::ir::SliderData,
+    rect: ComputedRect,
+    theme: &Theme,
+    atlas: &GlyphAtlas,
+    springs: &mut SpringBank,
+    interaction: &mut InteractionState,
+    dl: &mut DrawList,
+) {
+    if rect.w < 60.0 || rect.h < 18.0 {
+        return;
+    }
+    let accent = if data.tone == Tone::Neutral {
+        theme.accent
+    } else {
+        theme.tone_color(data.tone)
+    };
+    let hit_key = format!("slider::{id}");
+    let hovered = interaction.hovered_key.as_deref() == Some(hit_key.as_str());
+    let active = interaction.slider_drag.as_deref() == Some(id);
+    let target = if active {
+        1.0
+    } else if hovered {
+        0.6
+    } else {
+        0.0
+    };
+    let t = springs.animate(&hit_key, "hover", target, SpringConfig::SNAPPY);
+    interaction.push_hit(rect, HitKind::Slider { id: id.to_string() });
+
+    let label_h = if data.label.is_some() || data.show_value {
+        18.0
+    } else {
+        0.0
+    };
+    /* Labels sit on the glyph baseline box that can extend a hair above
+     * `rect.y`; draw them before the track clip so the ascender is never cut. */
+    if let Some(label) = data.label.as_deref().filter(|l| !l.is_empty()) {
+        atlas.layout_dl(
+            label,
+            rect.x,
+            rect.y,
+            12.0,
+            theme.text_secondary,
+            false,
+            None,
+            dl,
+        );
+    }
+    let value_text = format_slider_value(data);
+    if data.show_value {
+        let (vw, _) = atlas.measure(&value_text, 12.0, false);
+        atlas.layout_dl(
+            &value_text,
+            rect.x + rect.w - vw,
+            rect.y,
+            12.0,
+            theme.text_primary,
+            false,
+            None,
+            dl,
+        );
+    }
+    dl.push_clip(ClipRect::new(rect.x, rect.y, rect.w, rect.h));
+    let track_y = rect.y + label_h + (rect.h - label_h) * 0.5 - 2.0;
+    let track_h = 4.0 + t * 1.5;
+    let knob_r = (7.0 + t * 1.5).min(rect.h * 0.5);
+    let x0 = rect.x + knob_r;
+    let x1 = rect.x + rect.w - knob_r;
+    let span = (data.max - data.min).abs().max(1e-6);
+    let frac = ((data.value - data.min) / span).clamp(0.0, 1.0);
+    let knob_x = x0 + (x1 - x0) * frac;
+
+    dl.push_quad(QuadInstance {
+        rect: [x0, track_y, (x1 - x0).max(1.0), track_h],
+        radii: [track_h * 0.5; 4],
+        color_top: theme.surface_3,
+        color_bottom: theme.surface_3,
+        border_color: 0,
+        shadow_color: 0,
+        params: [0.0, 0.0, 0.0, 1.0],
+        clip_id: 0,
+        _pad: [0; 3],
+    });
+    dl.push_quad(QuadInstance {
+        rect: [x0, track_y, (knob_x - x0).max(0.0), track_h],
+        radii: [track_h * 0.5; 4],
+        color_top: accent,
+        color_bottom: accent,
+        border_color: 0,
+        shadow_color: 0,
+        params: [0.0, 0.0, 0.0, 1.0],
+        clip_id: 0,
+        _pad: [0; 3],
+    });
+    dl.push_quad(QuadInstance {
+        rect: [
+            knob_x - knob_r,
+            track_y + track_h * 0.5 - knob_r,
+            knob_r * 2.0,
+            knob_r * 2.0,
+        ],
+        radii: [knob_r; 4],
+        color_top: theme.surface_1,
+        color_bottom: theme.surface_1,
+        border_color: accent,
+        shadow_color: 0,
+        params: [2.0, 0.0, 0.0, 1.0],
+        clip_id: 0,
+        _pad: [0; 3],
+    });
+    dl.pop_clip();
+}
+
+fn format_slider_value(data: &crate::ir::SliderData) -> String {
+    if data.step >= 1.0 {
+        format!("{}", data.value.round() as i64)
+    } else {
+        format!("{:.2}", data.value)
+    }
+}
+
+/// Apply one pointer x position to a slider's value (step-snapped and clamped).
+pub fn slider_value_at(data: &crate::ir::SliderData, rect: ComputedRect, x: f32) -> f32 {
+    let knob_r = 7.0;
+    let x0 = rect.x + knob_r;
+    let x1 = rect.x + rect.w - knob_r;
+    let frac = ((x - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0);
+    let span = data.max - data.min;
+    let mut v = data.min + span * frac;
+    if data.step > 0.0 {
+        v = (v / data.step).round() * data.step;
+    }
+    v.clamp(data.min.min(data.max), data.max.max(data.min))
+}
+
+/// Dual-handle range slider: one track, two thumbs, inclusive span highlighted.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_range_slider(
+    id: &str,
+    data: &crate::ir::RangeSliderData,
+    rect: ComputedRect,
+    theme: &Theme,
+    atlas: &GlyphAtlas,
+    springs: &mut SpringBank,
+    interaction: &mut InteractionState,
+    dl: &mut DrawList,
+) {
+    if rect.w < 60.0 || rect.h < 18.0 {
+        return;
+    }
+    let accent = if data.tone == Tone::Neutral {
+        theme.accent
+    } else {
+        theme.tone_color(data.tone)
+    };
+    let hit_key = format!("range::{id}");
+    let hovered = interaction.hovered_key.as_deref() == Some(hit_key.as_str());
+    let active = interaction
+        .range_drag
+        .as_ref()
+        .is_some_and(|(rid, _)| rid == id);
+    let target = if active {
+        1.0
+    } else if hovered {
+        0.6
+    } else {
+        0.0
+    };
+    let t = springs.animate(&hit_key, "hover", target, SpringConfig::SNAPPY);
+    interaction.push_hit(rect, HitKind::RangeSlider { id: id.to_string() });
+
+    let label_h = if data.label.is_some() || data.show_value {
+        18.0
+    } else {
+        0.0
+    };
+    if let Some(label) = data.label.as_deref().filter(|l| !l.is_empty()) {
+        atlas.layout_dl(
+            label,
+            rect.x,
+            rect.y,
+            12.0,
+            theme.text_secondary,
+            false,
+            None,
+            dl,
+        );
+    }
+    let (low, high) = data.clamped();
+    let value_text = format_range_value(data, low, high);
+    if data.show_value {
+        let (vw, _) = atlas.measure(&value_text, 12.0, false);
+        atlas.layout_dl(
+            &value_text,
+            rect.x + rect.w - vw,
+            rect.y,
+            12.0,
+            theme.text_primary,
+            false,
+            None,
+            dl,
+        );
+    }
+    dl.push_clip(ClipRect::new(rect.x, rect.y, rect.w, rect.h));
+    let track_y = rect.y + label_h + (rect.h - label_h) * 0.5 - 2.0;
+    let track_h = 4.0 + t * 1.5;
+    let knob_r = (7.0 + t * 1.5).min(rect.h * 0.5);
+    let x0 = rect.x + knob_r;
+    let x1 = rect.x + rect.w - knob_r;
+    let (lo_x, hi_x) = range_thumb_x(data, rect, low, high);
+
+    dl.push_quad(QuadInstance {
+        rect: [x0, track_y, (x1 - x0).max(1.0), track_h],
+        radii: [track_h * 0.5; 4],
+        color_top: theme.surface_3,
+        color_bottom: theme.surface_3,
+        border_color: 0,
+        shadow_color: 0,
+        params: [0.0, 0.0, 0.0, 1.0],
+        clip_id: 0,
+        _pad: [0; 3],
+    });
+    dl.push_quad(QuadInstance {
+        rect: [lo_x, track_y, (hi_x - lo_x).max(0.0), track_h],
+        radii: [track_h * 0.5; 4],
+        color_top: accent,
+        color_bottom: accent,
+        border_color: 0,
+        shadow_color: 0,
+        params: [0.0, 0.0, 0.0, 1.0],
+        clip_id: 0,
+        _pad: [0; 3],
+    });
+    for thumb_x in [lo_x, hi_x] {
+        dl.push_quad(QuadInstance {
+            rect: [
+                thumb_x - knob_r,
+                track_y + track_h * 0.5 - knob_r,
+                knob_r * 2.0,
+                knob_r * 2.0,
+            ],
+            radii: [knob_r; 4],
+            color_top: theme.surface_1,
+            color_bottom: theme.surface_1,
+            border_color: accent,
+            shadow_color: 0,
+            params: [2.0, 0.0, 0.0, 1.0],
+            clip_id: 0,
+            _pad: [0; 3],
+        });
+    }
+    dl.pop_clip();
+}
+
+fn format_range_value(data: &crate::ir::RangeSliderData, low: f32, high: f32) -> String {
+    if data.step >= 1.0 {
+        format!("{} – {}", low.round() as i64, high.round() as i64)
+    } else {
+        format!("{low:.2} – {high:.2}")
+    }
+}
+
+/// Screen x of the two thumbs, in `(low, high)` order.
+fn range_thumb_x(
+    data: &crate::ir::RangeSliderData,
+    rect: ComputedRect,
+    low: f32,
+    high: f32,
+) -> (f32, f32) {
+    let knob_r = 7.0;
+    let x0 = rect.x + knob_r;
+    let x1 = rect.x + rect.w - knob_r;
+    let span = (data.max - data.min).abs().max(1e-6);
+    let lo = ((low - data.min) / span).clamp(0.0, 1.0);
+    let hi = ((high - data.min) / span).clamp(0.0, 1.0);
+    (
+        x0 + (x1 - x0) * lo,
+        x0 + (x1 - x0) * hi.max(lo),
+    )
+}
+
+/// Which thumb a pointer at `x` should grab, plus the value it maps to.
+///
+/// Ties go to the nearer thumb; a click outside the pair moves the closer one.
+pub fn range_thumb_at(
+    data: &crate::ir::RangeSliderData,
+    rect: ComputedRect,
+    x: f32,
+) -> (u8, f32) {
+    let (low, high) = data.clamped();
+    let (lo_x, hi_x) = range_thumb_x(data, rect, low, high);
+    let value = |x: f32| -> f32 {
+        let knob_r = 7.0;
+        let x0 = rect.x + knob_r;
+        let x1 = rect.x + rect.w - knob_r;
+        let frac = ((x - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0);
+        let span = data.max - data.min;
+        crate::ir::snap(data.min + span * frac, data.min, data.step)
+            .clamp(data.min.min(data.max), data.max.max(data.min))
+    };
+    let v = value(x);
+    let d_lo = (x - lo_x).abs();
+    let d_hi = (x - hi_x).abs();
+    // Outside the span there is only one sensible answer.
+    if v < low {
+        return (0, v);
+    }
+    if v > high {
+        return (1, v);
+    }
+    if d_lo <= d_hi {
+        (0, v.min(high))
+    } else {
+        (1, v.max(low))
+    }
+}
+
+/// Progress meter: a linear bar or circular ring, deterministic or sweeping.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_progress(
+    data: &crate::ir::ProgressData,
+    rect: ComputedRect,
+    theme: &Theme,
+    atlas: &GlyphAtlas,
+    now_s: f64,
+    dl: &mut DrawList,
+) {
+    if rect.w < 24.0 || rect.h < 4.0 {
+        return;
+    }
+    let accent = if data.tone == Tone::Neutral {
+        theme.accent
+    } else {
+        theme.tone_color(data.tone)
+    };
+    let frac = data.fraction();
+    let label = data.label.clone().filter(|l| !l.is_empty());
+    let label_h = if label.is_some() { 18.0 } else { 0.0 };
+    if let Some(text) = label.as_deref() {
+        atlas.layout_dl(
+            text,
+            rect.x,
+            rect.y,
+            12.0,
+            theme.text_secondary,
+            false,
+            None,
+            dl,
+        );
+        if !data.indeterminate {
+            let pct = format!("{}%", (frac * 100.0).round() as i64);
+            let (pw, _) = atlas.measure(&pct, 12.0, false);
+            atlas.layout_dl(
+                &pct,
+                rect.x + rect.w - pw,
+                rect.y,
+                12.0,
+                theme.text_primary,
+                false,
+                None,
+                dl,
+            );
+        }
+    }
+
+    match data.variant {
+        crate::ir::ProgressVariant::Linear => {
+            let track_h = 6.0_f32.min(rect.h - label_h).max(3.0);
+            let track_y = rect.y + label_h + (rect.h - label_h - track_h) * 0.5;
+            dl.push_quad(QuadInstance {
+                rect: [rect.x, track_y, rect.w, track_h],
+                radii: [track_h * 0.5; 4],
+                color_top: theme.surface_3,
+                color_bottom: theme.surface_3,
+                border_color: 0,
+                shadow_color: 0,
+                params: [0.0, 0.0, 0.0, 1.0],
+                clip_id: 0,
+                _pad: [0; 3],
+            });
+            let (fx, fw) = if data.indeterminate {
+                // 28% sweep sliding across the track on a 1.6 s loop.
+                let span = rect.w * 0.72;
+                let phase = ((now_s / 1.6) % 1.0) as f32;
+                (rect.x + span * phase, rect.w * 0.28)
+            } else {
+                (rect.x, rect.w * frac)
+            };
+            if fw > 0.5 {
+                dl.push_quad(QuadInstance {
+                    rect: [fx, track_y, fw, track_h],
+                    radii: [track_h * 0.5; 4],
+                    color_top: accent,
+                    color_bottom: accent,
+                    border_color: 0,
+                    shadow_color: 0,
+                    params: [0.0, 0.0, 0.0, 1.0],
+                    clip_id: 0,
+                    _pad: [0; 3],
+                });
+            }
+        }
+        crate::ir::ProgressVariant::Circular => {
+            let avail_h = (rect.h - label_h).max(4.0);
+            let side = avail_h.min(rect.w).max(4.0);
+            let cx = rect.x + rect.w * 0.5;
+            let cy = rect.y + label_h + avail_h * 0.5;
+            let r = (side * 0.5 - 2.0).max(2.0);
+            let thickness = (side * 0.11).clamp(2.0, 6.0);
+            arc(dl, cx, cy, r, thickness, 0.0, 1.0, theme.surface_3);
+            if data.indeterminate {
+                // A quarter-turn arc chasing around the ring on a 1.2 s loop.
+                let phase = ((now_s / 1.2) % 1.0) as f32;
+                arc(dl, cx, cy, r, thickness, phase, 0.25, accent);
+            } else if frac > 0.001 {
+                arc(dl, cx, cy, r, thickness, 0.0, frac, accent);
+            }
+        }
+    }
+}
+
+/// Stroke a circular arc as short chords. `from`/`span` are fractions of a turn,
+/// starting at 12 o'clock and sweeping clockwise.
+fn arc(
+    dl: &mut DrawList,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    width: f32,
+    from: f32,
+    span: f32,
+    color: u32,
+) {
+    let span = span.clamp(0.0, 1.0);
+    if span <= 0.0 || r <= 0.0 {
+        return;
+    }
+    // One chord per ~12 degrees keeps the ring smooth at 3x without many quads.
+    let steps = ((span * 30.0).ceil() as usize).max(2);
+    let step = span / steps as f32;
+    let angle = |t: f32| {
+        let a = -std::f32::consts::FRAC_PI_2 + t * std::f32::consts::TAU;
+        (cx + a.cos() * r, cy + a.sin() * r)
+    };
+    for k in 0..steps {
+        let t0 = from + step * k as f32;
+        let t1 = t0 + step;
+        let (x0, y0) = angle(t0);
+        let (x1, y1) = angle(t1);
+        dl.push_stroke(StrokeInstance::solid(
+            [x0, y0],
+            [x1, y1],
+            width,
+            0.7,
+            color,
+            0,
+        ));
+    }
+}
+
+/// Multi-line editable text area with focus ring, caret and placeholder.
+#[allow(clippy::too_many_arguments)]
+pub fn emit_textarea(
+    id: &str,
+    data: &crate::ir::TextAreaData,
+    rect: ComputedRect,
+    theme: &Theme,
+    atlas: &GlyphAtlas,
+    springs: &mut SpringBank,
+    interaction: &mut InteractionState,
+    dl: &mut DrawList,
+) {
+    if rect.w < 40.0 || rect.h < 24.0 {
+        return;
+    }
+    let hit_key = format!("textarea::{id}");
+    let hovered = interaction.hovered_key.as_deref() == Some(hit_key.as_str());
+    let focused = interaction.focused_key.as_deref() == Some(hit_key.as_str());
+    let target = if focused {
+        1.0
+    } else if hovered {
+        0.5
+    } else {
+        0.0
+    };
+    let t = springs.animate(&hit_key, "focus", target, SpringConfig::SNAPPY);
+    interaction.push_hit(rect, HitKind::TextArea { id: id.to_string() });
+
+    dl.push_clip(ClipRect::new(rect.x, rect.y, rect.w, rect.h));
+    let focus_col = if data.tone == Tone::Neutral {
+        theme.accent
+    } else {
+        theme.tone_color(data.tone)
+    };
+    let bg = lerp_rgba8(theme.surface_1, theme.surface_2, t * 0.65);
+    dl.push_quad(QuadInstance {
+        rect: [rect.x, rect.y, rect.w, rect.h],
+        radii: [theme.radius_control; 4],
+        color_top: bg,
+        color_bottom: bg,
+        border_color: if focused { focus_col } else { 0 },
+        shadow_color: 0,
+        params: [if focused { 1.2 } else { 0.0 }, 0.0, 0.0, 1.0],
+        clip_id: 0,
+        _pad: [0; 3],
+    });
+
+    let pad = 10.0;
+    let px = 12.5;
+    let inner_w = (rect.w - pad * 2.0).max(8.0);
+    let _inner_h = (rect.h - pad * 2.0).max(8.0);
+    let shown = if data.secure {
+        "•".repeat(data.value.chars().count())
+    } else {
+        data.value.clone()
+    };
+    let body = if shown.is_empty() {
+        data.placeholder.clone()
+    } else {
+        shown.clone()
+    };
+    let color = if shown.is_empty() {
+        theme.text_muted
+    } else {
+        theme.text_primary
+    };
+    atlas.layout_dl(
+        &body,
+        rect.x + pad,
+        rect.y + pad,
+        px,
+        color,
+        false,
+        Some(inner_w),
+        dl,
+    );
+    if focused {
+        emit_edit_affordances(
+            &data.value,
+            &shown,
+            0,
+            rect.x + pad,
+            rect.y + pad,
+            inner_w,
+            px,
+            interaction.edit.as_ref(),
+            &hit_key,
+            data.value.len(),
+            focus_col,
+            interaction.caret_visible,
+            atlas,
+            dl,
+        );
+    }
+    dl.pop_clip();
 }

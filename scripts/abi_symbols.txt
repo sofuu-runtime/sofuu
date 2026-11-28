@@ -49,3 +49,9 @@ sofuu_ui_surface_detach
 sofuu_ui_surface_render
 sofuu_voice_speak
 sofuu_voice_transcribe
+sofuu_ui_a11y_json
+sofuu_ui_focused_keyboard_hint
+sofuu_ui_image_page_count
+sofuu_ui_session_get_icon_atlas
+sofuu_ui_session_get_image_page
+sofuu_ui_set_image_rgba

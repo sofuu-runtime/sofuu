@@ -42,7 +42,7 @@ QTSQ_LIB_GUARD = $(firstword $(wildcard $(SOFUU_QTSQ_DIR)/libqtsq.a $(SOFUU_QTSQ
         deps scoreboard scoreboard-check cuda-check \
         libsofuu libsofuu-linux-x86_64 zig-install linux linux-x86_64 linux-arm64 windows-x86_64 \
         release-archives dist \
-        headless-test abi-check ui-gates dist-macos dist-linux dist-ios dist-android dist-all \
+        headless-test abi-check ui-gates ui-shaders-check ui-js-sync-check sync-ui-js sync-ui-dts ui-update dist-macos dist-linux dist-ios dist-android dist-all \
         sdk-jvm-check android-sdk android-aar android-publish-local \
         desktop desktop-dev desktop-clean \
         ios-engine ios-engine-deps ios-project ios-typecheck ios-app ios-sim
@@ -87,6 +87,9 @@ cargo-build:
 		echo "    QTSQ is a mandatory core component of Sofuu."; \
 		exit 1; \
 	fi
+	@# E2b: build the offscreen GPU backend as a dylib. `sofuu`/`sofuu-emu`
+	@# load it at runtime via dlopen, so this does not link it into the CLI.
+	RUSTFLAGS="$(SOFUU_REMAP_FLAGS) $(SOFUU_LINK_FLAGS) $$RUSTFLAGS" cargo build --release -p sofuu-gpu
 	RUSTFLAGS="$(SOFUU_REMAP_FLAGS) $(SOFUU_LINK_FLAGS) $$RUSTFLAGS" cargo build --release
 
 $(TARGET): cargo-build
@@ -103,6 +106,21 @@ $(TARGET): cargo-build
 		rm -f sofuu-micro && cp target/release/sofuu-micro sofuu-micro; \
 		if [ "$$(uname -s)" = "Darwin" ]; then strip sofuu-micro 2>/dev/null || true; codesign --force --sign - sofuu-micro 2>/dev/null || true; fi; \
 		echo "  \033[32mBuilt:\033[0m ./sofuu-micro ($$(du -sh sofuu-micro | cut -f1))"; \
+	fi
+
+	@if [ -f target/release/sofuu-emu ]; then \
+		rm -f sofuu-emu && cp target/release/sofuu-emu sofuu-emu; \
+		if [ "$$(uname -s)" = "Darwin" ]; then strip sofuu-emu 2>/dev/null || true; codesign --force --sign - sofuu-emu 2>/dev/null || true; fi; \
+		echo "  \033[32mBuilt:\033[0m ./sofuu-emu ($$(du -sh sofuu-emu | cut -f1))"; \
+	fi
+	@# E2b: the emulator loads the GPU offscreen backend at runtime; keep the
+	@# dylib next to the binary so `sofuu ui snapshot` finds it without env vars.
+	@if [ -f target/release/libsofuu_gpu.dylib ]; then \
+		cp target/release/libsofuu_gpu.dylib ./libsofuu_gpu.dylib; \
+		echo "  \033[32mBuilt:\033[0m ./libsofuu_gpu.dylib (GPU offscreen capture)"; \
+	elif [ -f target/release/libsofuu_gpu.so ]; then \
+		cp target/release/libsofuu_gpu.so ./libsofuu_gpu.so; \
+		echo "  \033[32mBuilt:\033[0m ./libsofuu_gpu.so (GPU offscreen capture)"; \
 	fi
 
 # ── Legacy pure-C build ─────────────────────────────────────────
@@ -348,6 +366,11 @@ libsofuu: header-sync
 install: $(TARGET)
 	@echo "  Installing sofuu to /usr/local/bin/"
 	cp $(TARGET) /usr/local/bin/$(TARGET)
+	@if [ -f sofuu-emu ]; then cp sofuu-emu /usr/local/bin/sofuu-emu; fi
+	@# E2b: install the offscreen GPU backend where the loader searches.
+	@mkdir -p $$HOME/.sofuu/lib
+	@if [ -f libsofuu_gpu.dylib ]; then cp libsofuu_gpu.dylib $$HOME/.sofuu/lib/; fi
+	@if [ -f libsofuu_gpu.so ]; then cp libsofuu_gpu.so $$HOME/.sofuu/lib/; fi
 	@echo "  Done. Run: sofuu help"
 
 clean:
@@ -762,10 +785,39 @@ abi-check: libsofuu
 #  • headless `libsofuu` (--no-default-features) exports none of the additive
 #    sofuu_ui_* surface and has no sofuu-ui dependency in its graph;
 #  • 10k DrawList frames hold steady-state RSS flat (no per-frame allocation).
-ui-gates:
+ui-gates: ui-js-sync-check ui-shaders-check
 	@bash scripts/check_ui_c_abi.sh
 	@bash scripts/check_ui_headless.sh
 	@cargo test -p sofuu-capi --lib ui_10k_frame_rss_gate -- --ignored --nocapture
+
+# ── sofuu-ui repo boundary (PLAN-SPLIT-UI-EFFECTS-EXTERNAL-REPO) ───
+#
+# Pre-split, `src/js/{ui,ui_kit}.js` is canonical and the same bytes are
+# staged at `crates/sofuu-ui/js/`. After `deps/sofuu-ui` exists (or
+# `SOFUU_UI_DIR` points at a checkout) the direction flips: the external
+# `js/` is canonical, `src/js/` is generated, and the bytecode snapshots are
+# rebuilt in the same step. The drift gate runs in `ui-gates`.
+ui-shaders-check:
+	@bash scripts/check_ui_shaders.sh
+
+ui-js-sync-check:
+	@bash scripts/check_ui_js_sync.sh
+
+sync-ui-js:
+	@bash scripts/sync_ui_js.sh
+
+sync-ui-dts:
+	@bash scripts/sync_ui_dts.sh
+
+ui-update:
+	@if [ ! -f .gitmodules ] || ! grep -q 'deps/sofuu-ui' .gitmodules; then \
+		echo "ui-update: deps/sofuu-ui is not a submodule yet (pre-split)"; \
+		echo "  seed/publish it first; see docs/plans/PLAN-SPLIT-UI-EFFECTS-EXTERNAL-REPO.md"; \
+		exit 1; \
+	fi
+	@git submodule update --remote deps/sofuu-ui
+	@$(MAKE) sync-ui-js
+	@$(MAKE) ui-gates
 
 # ── Sofuu macOS (SwiftUI app over the C ABI) ───────────────────────
 # Engine artifact + typecheck for the native Mac app. Additive targets —

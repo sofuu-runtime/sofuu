@@ -8,6 +8,9 @@
 /sofuu
 /sofuu-agent
 /sofuu-micro
+/sofuu-emu
+/libsofuu_gpu.dylib
+/libsofuu_gpu.so
 /dist/
 /build/
 bin/
@@ -79,6 +82,7 @@ ascii-art.png
 
 # ── Session mesh state (per-project, machine-local) ──
 .sofuu/
+.sofu/
 
 # ── Agent/CLI tool state (machine-local) ──────────
 .commandcode/

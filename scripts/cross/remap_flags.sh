@@ -88,4 +88,16 @@ add "${TMPDIR:-}" "/tmp"
 # ── 4. this checkout — last, so it wins over $HOME ───────────────────────
 add "$root" "."
 
+# ── 5. an external sofuu-ui checkout (PLAN-SPLIT-UI... §3.3) ─────────────
+# `SOFUU_UI_DIR=~/projects/sofuu-ui` is outside the workspace, so the `$HOME`
+# rule above would publish it as `./projects/sofuu-ui/...`. Attribute it to
+# the submodule path it replaces instead. A path already under $root needs
+# no extra rule (it is covered by step 4).
+if [ -n "${SOFUU_UI_DIR:-}" ]; then
+    ui_dir="$(cd "$SOFUU_UI_DIR" 2>/dev/null && pwd || true)"
+    if [ -n "$ui_dir" ] && ! under "$ui_dir" "$root"; then
+        add "$ui_dir" "deps/sofuu-ui"
+    fi
+fi
+
 printf '%s' "${flags[*]:-}"

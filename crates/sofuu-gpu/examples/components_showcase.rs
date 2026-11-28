@@ -161,6 +161,7 @@ fn main() {
         height: 820.0,
         min_width: 680.0,
         min_height: 520.0,
+        ..WindowConfig::default()
     };
 
     if let Err(err) = run_window(cfg, build_showcase_scene(), |ui_handle| {

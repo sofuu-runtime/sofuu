@@ -28,6 +28,7 @@ fn main() {
         height: 360.0,
         min_width: 240.0,
         min_height: 160.0,
+        ..WindowConfig::default()
     };
 
     let _ = run_window(cfg, scene, |handle| {

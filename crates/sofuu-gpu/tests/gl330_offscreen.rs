@@ -16,7 +16,8 @@ use std::ffi::{c_void, CString};
 
 use sofuu_gpu::backend::gles::{GlesRenderer, GlslFlavor};
 use sofuu_ui::{
-    rgba8, ClipRect, DrawCmd, DrawList, FrameUniforms, GlyphAtlas, QuadInstance,
+    rgba8, BackdropRegion, ClipRect, DrawCmd, DrawList, EffectQuadInstance, FrameUniforms,
+    GlyphAtlas, ParticleInstance, QuadInstance,
 };
 
 type CGLPixelFormatObj = *mut c_void;
@@ -202,13 +203,13 @@ fn gl330_offscreen_geometry_clips_and_blending() {
     renderer.render(&u, &dl).expect("clip render");
     renderer.read_offscreen(w, h, &mut pixels).expect("read clip");
     assert_near(
-        pixel(&pixels, w, h, 32, 64),
+        pixel(&pixels, w, h, 32 * 2, 64 * 2),
         [200, 40, 40, 255],
         1,
         "clipped left half",
     );
     assert_near(
-        pixel(&pixels, w, h, 96, 64),
+        pixel(&pixels, w, h, 96 * 2, 64 * 2),
         [0, 0, 0, 0],
         1,
         "clipped right half",
@@ -231,13 +232,13 @@ fn gl330_offscreen_geometry_clips_and_blending() {
     renderer.render(&u, &dl).expect("clip-window render");
     renderer.read_offscreen(w, h, &mut pixels).expect("read clip windows");
     assert_near(
-        pixel(&pixels, w, h, 32, 64),
+        pixel(&pixels, w, h, 32 * 2, 64 * 2),
         [220, 30, 30, 255],
         1,
         "300-clip first window",
     );
     assert_near(
-        pixel(&pixels, w, h, 96, 64),
+        pixel(&pixels, w, h, 96 * 2, 64 * 2),
         [30, 30, 220, 255],
         1,
         "300-clip second window",
@@ -257,6 +258,86 @@ fn gl330_offscreen_geometry_clips_and_blending() {
         [64, 0, 128, 192],
         2,
         "premultiplied blend",
+    );
+
+    // 5. Effect pipeline: cursor glow centred in the rect renders its primary colour at full
+    // alpha. This exercises the 80-byte effect instance layout and kind 5 dispatch.
+    let mut dl = DrawList::new();
+    dl.reset([128.0, 128.0]);
+    dl.effects.push(EffectQuadInstance {
+        rect: [0.0, 0.0, 128.0, 128.0],
+        radii: [0.0; 4],
+        params0: [64.0, 64.0, 48.0, 1.0],
+        params1: [0.0; 4],
+        color0: rgba8(255, 128, 64, 255),
+        color1: rgba8(0, 0, 0, 0),
+        color2: 0,
+        kind_and_clip: 3,
+    });
+    dl.cmds.push(DrawCmd { kind: 5, start: 0, count: 1, _pad: 0 });
+    renderer.render(&u, &dl).expect("effect render");
+    renderer.read_offscreen(w, h, &mut pixels).expect("read effect");
+    assert_near(
+        pixel(&pixels, w, h, 128, 128),
+        [255, 128, 64, 255],
+        2,
+        "cursor glow centre",
+    );
+
+    // 6. Particle pipeline: a circle at the same centre must keep its exact colour.
+    let mut dl = DrawList::new();
+    dl.reset([128.0, 128.0]);
+    dl.particles.push(ParticleInstance {
+        pos: [64.0, 64.0],
+        size: [30.0, 30.0],
+        angle_rad: 0.0,
+        color: rgba8(0, 200, 80, 255),
+        shape_clip: 0,
+        _pad: 0,
+    });
+    dl.cmds.push(DrawCmd { kind: 6, start: 0, count: 1, _pad: 0 });
+    renderer.render(&u, &dl).expect("particle render");
+    renderer.read_offscreen(w, h, &mut pixels).expect("read particle");
+    assert_near(
+        pixel(&pixels, w, h, 128, 128),
+        [0, 200, 80, 255],
+        2,
+        "particle circle centre",
+    );
+
+    // 7. Backdrop marker: after painting a red field, a frosted pane must sample the blurred
+    // framebuffer (uniform red stays red) and leave the surrounding field untouched.
+    let mut dl = DrawList::new();
+    dl.reset([128.0, 128.0]);
+    dl.quads.push(quad(
+        [0.0, 0.0, 128.0, 128.0],
+        rgba8(200, 40, 40, 255),
+        0,
+    ));
+    dl.backdrops.push(BackdropRegion {
+        rect: [32.0, 32.0, 64.0, 64.0],
+        radii: [8.0; 4],
+        tint: rgba8(0, 0, 0, 0),
+        rim: rgba8(255, 255, 255, 0),
+        params: [18.0, 1.0, 0.0, 1.0],
+        clip_id: 0,
+        _pad: 0,
+    });
+    dl.cmds.push(cmd(0, 1));
+    dl.cmds.push(DrawCmd { kind: 7, start: 0, count: 1, _pad: 0 });
+    renderer.render(&u, &dl).expect("backdrop render");
+    renderer.read_offscreen(w, h, &mut pixels).expect("read backdrop");
+    assert_near(
+        pixel(&pixels, w, h, 128, 128),
+        [200, 40, 40, 255],
+        4,
+        "backdrop blurred pane",
+    );
+    assert_near(
+        pixel(&pixels, w, h, 16, 16),
+        [200, 40, 40, 255],
+        2,
+        "backdrop outside pane",
     );
 
     renderer.destroy_offscreen_target(fbo, tex);

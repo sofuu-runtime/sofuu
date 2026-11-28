@@ -15,10 +15,10 @@ fn main() {
     println!("cargo:rerun-if-changed=native/linux_wayland_egl.c");
     println!("cargo:rerun-if-changed=native/windows_win32_gl.c");
     println!("cargo:rerun-if-changed=native/android_egl.c");
-    println!("cargo:rerun-if-changed=src/shaders/msl/ui_shaders.metal");
-    println!("cargo:rerun-if-changed=src/shaders/glsl/ui_shaders_330.glsl");
-    println!("cargo:rerun-if-changed=src/shaders/glsl/ui_shaders_es3.glsl");
-    println!("cargo:rerun-if-changed=src/shaders/glsl/ui_shaders_450.glsl");
+    // Canonical shader sources live in `sofuu-ui` and are compiled into that
+    // crate with `include_str!`, so rustc's dep-info already rebuilds us when
+    // they change (no path here needs to know the crate's location). Only the
+    // backend-local generated SPIR-V needs an explicit watch.
     println!("cargo:rerun-if-changed=src/shaders/spirv");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();

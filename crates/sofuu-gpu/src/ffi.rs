@@ -11,7 +11,10 @@ use std::slice;
 use std::sync::mpsc;
 use std::sync::Mutex;
 
-use sofuu_ui::{AutoAgentEvent, AutoComposer, AutoTriggerStat, Scene, ScenePatch, TableRow, ThemeMode, UIEvent};
+use sofuu_ui::{
+    AutoAgentEvent, AutoComposer, AutoTriggerStat, InputEvent, Scene, ScenePatch, TableRow,
+    ThemeMode, UIEvent,
+};
 
 use crate::{run_window, UiPatchSender, WindowConfig};
 
@@ -105,6 +108,82 @@ pub unsafe extern "C" fn sofuu_ui_run_json(
     }
 }
 
+/// Extended launcher (E6): the config JSON carries the screen-exact window
+/// contract (`decorations`, `resizable`, `scale`, `corner_radius`, `strip`,
+/// platform/device/profiles) so the live emulator window is exactly the
+/// simulated screen. Additive ABI; `sofuu_ui_run_json` keeps working.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_ui_run_json_ex(
+    config_json: *const u8,
+    config_len: usize,
+    initial_scene_json: *const u8,
+    initial_scene_len: usize,
+    worker_cb: Option<SofuuUiWorkerFn>,
+    user_ctx: *mut c_void,
+) -> i32 {
+    if config_json.is_null() || config_len == 0 || initial_scene_json.is_null() || initial_scene_len == 0 {
+        return -1;
+    }
+    let cfg_bytes = slice::from_raw_parts(config_json, config_len);
+    let cfg: serde_json::Value = match serde_json::from_slice(cfg_bytes) {
+        Ok(v) => v,
+        Err(_) => return -2,
+    };
+    let scene_bytes = slice::from_raw_parts(initial_scene_json, initial_scene_len);
+    let scene: Scene = match serde_json::from_slice(scene_bytes) {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+    let f = |k: &str, d: f32| cfg.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(d);
+    let b = |k: &str, d: bool| cfg.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
+    let s = |k: &str| cfg.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    let emulator = match (s("platform"), s("device"), s("profiles_json")) {
+        (Some(platform), Some(device), Some(profiles_json)) => Some(crate::EmulatorWindow {
+            platform,
+            device,
+            profiles_json,
+        }),
+        _ => None,
+    };
+    let window = WindowConfig {
+        title: s("title").unwrap_or_else(|| scene.title.clone()),
+        width: f("width", 1024.0).max(100.0),
+        height: f("height", 680.0).max(100.0),
+        min_width: f("min_width", 360.0),
+        min_height: f("min_height", 280.0),
+        decorations: b("decorations", true),
+        resizable: b("resizable", true),
+        scale: cfg.get("scale").and_then(|v| v.as_f64()).map(|v| v as f32),
+        corner_radius: f("corner_radius", 18.0),
+        strip: b("strip", false),
+        reticle: b("reticle", false),
+        emulator,
+    };
+
+    let user_ctx_addr = user_ctx as usize;
+    let mut worker_join: Option<std::thread::JoinHandle<()>> = None;
+    let res = run_window(window, scene, |handle| {
+        if let Some(cb) = worker_cb {
+            let (sender, events) = handle.split();
+            worker_join = Some(std::thread::spawn(move || {
+                let mut session = SofuuUiSession {
+                    sender,
+                    events,
+                    auto: Mutex::new(AutoUiState::default()),
+                };
+                cb(&mut session, user_ctx_addr as *mut c_void);
+            }));
+        }
+    });
+    if let Some(jh) = worker_join {
+        let _ = jh.join();
+    }
+    match res {
+        Ok(()) => 0,
+        Err(_) => -3,
+    }
+}
+
 /// Enqueue a JSON [`ScenePatch`] from Thread 1 and wake Thread 0 immediately.
 /// Returns `0` on success, `-1` on null/invalid JSON, `-2` if window already closed.
 #[no_mangle]
@@ -123,6 +202,51 @@ pub unsafe extern "C" fn sofuu_ui_push_patch_json(
         Err(_) => return -1,
     };
     if sess.sender.push_patch(patch) {
+        0
+    } else {
+        -2
+    }
+}
+
+/// Freeze/unfreeze the engine clock (E7 step-frame). Additive ABI.
+#[no_mangle]
+pub extern "C" fn sofuu_ui_set_paused(paused: i32) -> i32 {
+    crate::set_paused(paused != 0);
+    0
+}
+
+/// Advance a paused engine by exactly one 60 Hz frame. Additive ABI.
+#[no_mangle]
+pub extern "C" fn sofuu_ui_step_frame() -> i32 {
+    crate::step_frame();
+    0
+}
+
+/// Toggle the live layout-bounds overlay. Additive ABI (E6 strip "Bounds").
+#[no_mangle]
+pub extern "C" fn sofuu_ui_set_bounds(on: i32) -> i32 {
+    crate::set_bounds(on != 0);
+    0
+}
+
+/// Inject a synthetic [`InputEvent`] (on-screen keyboard, agent gesture) into
+/// Thread 0. Additive ABI (E7); returns `0` on success.
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_ui_send_input_json(
+    session: *mut SofuuUiSession,
+    input_json: *const u8,
+    input_len: usize,
+) -> i32 {
+    if session.is_null() || input_json.is_null() || input_len == 0 {
+        return -1;
+    }
+    let sess = &*session;
+    let bytes = slice::from_raw_parts(input_json, input_len);
+    let event: InputEvent = match serde_json::from_slice(bytes) {
+        Ok(e) => e,
+        Err(_) => return -1,
+    };
+    if sess.sender.send_input(event) {
         0
     } else {
         -2
@@ -154,6 +278,34 @@ pub unsafe extern "C" fn sofuu_ui_poll_event_json(
     }
     ptr::copy_nonoverlapping(json.as_ptr(), out_buf, json.len());
     json.len() as i64
+}
+
+/// Poll a native control-strip action (`{"type":"emu_action","action":"rotate"}`).
+/// Returns `0` when the queue is empty, a positive byte count on success, or
+/// `-needed` when the caller's buffer is too small. Additive ABI (E6).
+#[no_mangle]
+pub unsafe extern "C" fn sofuu_ui_poll_host_action_json(
+    out_buf: *mut u8,
+    out_cap: usize,
+) -> i64 {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(action) = crate::backend::macos_metal::take_strip_action() {
+            let json = serde_json::json!({
+                "type": "emu_action",
+                "action": action,
+            })
+            .to_string();
+            let bytes = json.as_bytes();
+            if out_buf.is_null() || bytes.len() > out_cap {
+                return -(bytes.len() as i64);
+            }
+            ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+            return bytes.len() as i64;
+        }
+    }
+    let _ = (out_buf, out_cap);
+    0
 }
 
 // ── ABI v2: session-backed Auto-Composer ────────────────────────────────
@@ -338,7 +490,7 @@ pub unsafe extern "C" fn sofuu_ui_auto_scene_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sofuu_ui::{Axis, Align, Node, NodeKind, ThemeMode};
+    use sofuu_ui::{Align, Axis, Node, NodeKind, ThemeMode};
 
     #[test]
     fn abi_version_and_json_patch_schema_roundtrip() {

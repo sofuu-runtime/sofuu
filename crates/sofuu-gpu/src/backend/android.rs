@@ -40,7 +40,12 @@ type EventCb = extern "C" fn(*mut c_void, u32, f32, f32, f32, f32, u32);
 
 extern "C" {
     fn sofuu_android_attach_window(native_window: *mut c_void, width: f32, height: f32, scale: f32);
-    fn sofuu_android_surface_changed(native_window: *mut c_void, width: f32, height: f32, scale: f32);
+    fn sofuu_android_surface_changed(
+        native_window: *mut c_void,
+        width: f32,
+        height: f32,
+        scale: f32,
+    );
     fn sofuu_android_create_window(
         title_utf8: *const libc::c_char,
         width: f32,
@@ -74,6 +79,7 @@ extern "C" {
     fn sofuu_android_context_lost(win: *mut SofuuAndroidWindow) -> libc::c_int;
     fn sofuu_android_recover(win: *mut SofuuAndroidWindow) -> libc::c_int;
     fn sofuu_android_window_handle(win: *mut SofuuAndroidWindow) -> *mut c_void;
+    fn sofuu_android_window_generation(win: *mut SofuuAndroidWindow) -> u64;
     fn sofuu_android_last_error() -> *const libc::c_char;
 }
 
@@ -83,15 +89,7 @@ struct EventCollector {
     closed: bool,
 }
 
-extern "C" fn on_native_event(
-    ctx: *mut c_void,
-    kind: u32,
-    x: f32,
-    y: f32,
-    a: f32,
-    b: f32,
-    u: u32,
-) {
+extern "C" fn on_native_event(ctx: *mut c_void, kind: u32, x: f32, y: f32, a: f32, b: f32, u: u32) {
     if ctx.is_null() {
         return;
     }
@@ -151,8 +149,8 @@ pub struct AndroidBackend {
     win: *mut SofuuAndroidWindow,
     collector: Box<EventCollector>,
     presenter: Option<Presenter>,
-    /// `ANativeWindow` the current `VkSurfaceKHR` was created from.
-    vulkan_window: *mut c_void,
+    /// Host attach generation the current `VkSurfaceKHR` was created from.
+    vulkan_generation: u64,
 }
 
 unsafe impl Send for AndroidBackend {}
@@ -229,16 +227,16 @@ impl AndroidBackend {
             }
         };
 
-        let vulkan_window = if matches!(presenter, Presenter::Vulkan(_)) {
-            unsafe { sofuu_android_window_handle(win) }
+        let vulkan_generation = if matches!(presenter, Presenter::Vulkan(_)) {
+            unsafe { sofuu_android_window_generation(win) }
         } else {
-            std::ptr::null_mut()
+            0
         };
         let mut backend = Self {
             win,
             collector,
             presenter: Some(presenter),
-            vulkan_window,
+            vulkan_generation,
         };
         let (_, _, scale) = backend.metrics();
         backend.collector.scale_factor = scale.max(1.0);
@@ -271,11 +269,7 @@ impl NativeWindowBackend for AndroidBackend {
         out_events: &mut Vec<InputEvent>,
     ) -> bool {
         let alive = unsafe {
-            sofuu_android_poll_or_wait(
-                self.win,
-                if wait_forever { 1 } else { 0 },
-                timeout_sec,
-            )
+            sofuu_android_poll_or_wait(self.win, if wait_forever { 1 } else { 0 }, timeout_sec)
         };
         for ev in self.collector.raw_events.drain(..) {
             if let InputEvent::Resize { scale_factor, .. } = &ev {
@@ -318,7 +312,15 @@ impl NativeWindowBackend for AndroidBackend {
     fn context_lost(&self) -> bool {
         match self.presenter.as_ref().unwrap() {
             Presenter::Gles(_) => unsafe { sofuu_android_context_lost(self.win) != 0 },
-            Presenter::Vulkan(vk) => vk.context_lost(),
+            Presenter::Vulkan(vk) => {
+                // A host `attach_window` (rotation/new SurfaceView) changes the native window
+                // before the old VkSurface is destroyed; recover before rendering into it.
+                // A NULL window means the host backgrounded the app: keep the old swapchain
+                // instead of recreating a surface we cannot use yet.
+                let window = unsafe { sofuu_android_window_handle(self.win) };
+                let generation = unsafe { sofuu_android_window_generation(self.win) };
+                vk.context_lost() || (!window.is_null() && generation != self.vulkan_generation)
+            }
         }
     }
 
@@ -333,7 +335,12 @@ impl NativeWindowBackend for AndroidBackend {
             }
             Presenter::Vulkan(vk) => {
                 let window = unsafe { sofuu_android_window_handle(self.win) };
-                if window != self.vulkan_window {
+                if window.is_null() {
+                    // Backgrounded: wait for the host to attach a real ANativeWindow.
+                    return;
+                }
+                let generation = unsafe { sofuu_android_window_generation(self.win) };
+                if generation != self.vulkan_generation {
                     // Rotation / SurfaceView recreation invalidates the old VkSurfaceKHR.
                     let surface = super::vulkan::NativeSurface {
                         kind: super::vulkan::SurfaceKind::Android,
@@ -341,7 +348,7 @@ impl NativeWindowBackend for AndroidBackend {
                         window,
                     };
                     match unsafe { vk.recreate_surface(surface) } {
-                        Ok(()) => self.vulkan_window = window,
+                        Ok(()) => self.vulkan_generation = generation,
                         Err(err) => eprintln!("sofuu-gpu: Vulkan surface recreation failed: {err}"),
                     }
                 } else {
@@ -357,6 +364,9 @@ pub fn wake_main_loop() {
 }
 
 // ── Additive host FFI (Java/Kotlin or Mode B native glue) ─────────────────────────────────
+/// Attach the host's `ANativeWindow`. `width`/`height` are logical (dp) units and `scale` is
+/// the display density; the native surface must be `width * scale` by `height * scale` physical
+/// pixels (the host's surface size).
 #[no_mangle]
 pub unsafe extern "C" fn sofuu_ui_android_attach_surface(
     native_window: *mut c_void,

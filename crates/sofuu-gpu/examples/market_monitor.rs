@@ -207,6 +207,7 @@ fn main() {
         height: 780.0,
         min_width: 360.0,
         min_height: 340.0,
+        ..WindowConfig::default()
     };
 
     let initial_seed = generate_series(96, 0.65);

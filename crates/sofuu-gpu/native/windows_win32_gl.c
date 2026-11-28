@@ -124,7 +124,23 @@ static void apply_client_size(SofuuWindowsWindow* w, float logical_w, float logi
     if (cw < 1) cw = 1;
     if (ch < 1) ch = 1;
     RECT rc = {0, 0, cw, ch};
-    AdjustWindowRectEx(&rc, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    // Per-Monitor DPIv2 non-client metrics differ from system DPI; prefer the DPI-aware
+    // AdjustWindowRectExForDpi (Win10 1607+) so the client area is exactly logical * scale.
+    typedef BOOL(WINAPI* PFN_AdjustWindowRectExForDpi)(LPRECT, DWORD, BOOL, DWORD, UINT);
+    static PFN_AdjustWindowRectExForDpi adjust_for_dpi = NULL;
+    static int resolved = 0;
+    if (!resolved) {
+        HMODULE user32 = GetModuleHandleW(L"user32.dll");
+        if (user32) {
+            adjust_for_dpi = (PFN_AdjustWindowRectExForDpi)GetProcAddress(
+                user32, "AdjustWindowRectExForDpi");
+        }
+        resolved = 1;
+    }
+    if (!adjust_for_dpi ||
+        !adjust_for_dpi(&rc, WS_OVERLAPPEDWINDOW, FALSE, 0, (UINT)(w->scale * 96.0f + 0.5f))) {
+        AdjustWindowRectEx(&rc, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    }
     SetWindowPos(w->hwnd, NULL, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
                  SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
@@ -263,7 +279,7 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DPICHANGED:
             if (w) {
                 w->scale = (float)HIWORD(wp) / 96.0f;
-                if (w->scale < 0.5f) w->scale = 1.0f;
+                if (w->scale < 1.0f) w->scale = 1.0f;
                 RECT* suggested = (RECT*)lp;
                 if (suggested) {
                     SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
@@ -499,6 +515,7 @@ void* sofuu_windows_create_window(const char* title_utf8, float width, float hei
     // DPI awareness is enabled before the window exists, so the system DPI approximates the
     // monitor the window will open on. WM_DPICHANGED refines it after the window is placed.
     w->scale = current_system_scale();
+    if (w->scale < 1.0f) w->scale = 1.0f;
     if (!register_class(w->instance)) {
         free(w);
         return NULL;
@@ -533,7 +550,7 @@ void* sofuu_windows_create_window(const char* title_utf8, float width, float hei
         return NULL;
     }
     w->scale = current_scale(w->hwnd, w->hdc);
-    if (w->scale < 0.5f) w->scale = 1.0f;
+    if (w->scale < 1.0f) w->scale = 1.0f;
     if (!create_gl_context(w)) {
         ReleaseDC(w->hwnd, w->hdc);
         DestroyWindow(w->hwnd);
@@ -586,7 +603,11 @@ int sofuu_windows_poll_or_wait(void* handle, int wait_forever, double timeout_se
         if (ms > 1000.0) ms = 1000.0;
         timeout = (DWORD)(ms + 0.5);
     }
-    MsgWaitForMultipleObjectsEx(0, NULL, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    DWORD wait = MsgWaitForMultipleObjectsEx(0, NULL, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    if (wait == WAIT_FAILED) {
+        w->closed = 1;
+        return 0;
+    }
     MSG msg;
     while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
         if (msg.message == WM_QUIT) {

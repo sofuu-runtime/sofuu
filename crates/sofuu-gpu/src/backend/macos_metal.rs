@@ -12,7 +12,7 @@ use sofuu_ui::{DrawList, FrameUniforms, GlyphAtlas, InputEvent};
 use crate::backend::NativeWindowBackend;
 use crate::WindowConfig;
 
-const MSL_SOURCE: &str = concat!(include_str!("../shaders/msl/ui_shaders.metal"), "\0");
+pub(crate) const MSL_SOURCE: &str = sofuu_ui::shaders::METAL_SRC_NUL;
 
 const EV_POINTER_MOVE: u32 = 1;
 const EV_POINTER_DOWN: u32 = 2;
@@ -29,20 +29,51 @@ struct SofuuMacWindow {
 }
 
 type EventCb = extern "C" fn(*mut c_void, u32, f32, f32, f32, f32, u32);
+type StripCb = extern "C" fn(*mut c_void, *const libc::c_char);
+
+static STRIP_ACTIONS: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+extern "C" fn on_strip_action(_ctx: *mut c_void, action: *const libc::c_char) {
+    if action.is_null() {
+        return;
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(action) }
+        .to_string_lossy()
+        .into_owned();
+    if let Ok(mut q) = STRIP_ACTIONS.lock() {
+        q.push_back(text);
+    }
+}
+
+/// Pop the oldest native strip action (`platform:ios`, `rotate`, ...).
+pub fn take_strip_action() -> Option<String> {
+    STRIP_ACTIONS.lock().ok().and_then(|mut q| q.pop_front())
+}
 
 extern "C" {
-    fn sofuu_macos_create_window(
+    fn sofuu_macos_create_window_ex(
         title_utf8: *const libc::c_char,
         width: f32,
         height: f32,
         min_w: f32,
         min_h: f32,
+        decorations: libc::c_int,
+        resizable: libc::c_int,
+        scale_cap: f32,
+        corner_radius: f32,
+        strip: libc::c_int,
+        platform_utf8: *const libc::c_char,
+        device_utf8: *const libc::c_char,
+        profiles_json: *const libc::c_char,
         msl_source_utf8: *const libc::c_char,
         atlas_pixels: *const u8,
         atlas_w: u32,
         atlas_h: u32,
         cb: EventCb,
         user_ctx: *mut c_void,
+        strip_cb: Option<StripCb>,
+        strip_ctx: *mut c_void,
     ) -> *mut SofuuMacWindow;
     fn sofuu_macos_destroy_window(win: *mut SofuuMacWindow);
     fn sofuu_macos_wake();
@@ -65,9 +96,18 @@ extern "C" {
         strokes_count: u32,
         glyphs: *const c_void,
         glyphs_count: u32,
+        effects: *const c_void,
+        effects_count: u32,
+        particles: *const c_void,
+        particles_count: u32,
+        backdrops: *const c_void,
+        backdrops_count: u32,
         cmds: *const c_void,
         cmds_count: u32,
     );
+    fn sofuu_macos_window_focused(win: *mut SofuuMacWindow) -> libc::c_int;
+    fn sofuu_macos_reduce_motion() -> libc::c_int;
+    fn sofuu_macos_strip_set_collapsed(collapsed: libc::c_int);
     fn sofuu_macos_poll_or_wait(
         win: *mut SofuuMacWindow,
         wait_forever: libc::c_int,
@@ -81,15 +121,7 @@ struct EventCollector {
     closed: bool,
 }
 
-extern "C" fn on_native_event(
-    ctx: *mut c_void,
-    kind: u32,
-    x: f32,
-    y: f32,
-    a: f32,
-    b: f32,
-    u: u32,
-) {
+extern "C" fn on_native_event(ctx: *mut c_void, kind: u32, x: f32, y: f32, a: f32, b: f32, u: u32) {
     if ctx.is_null() {
         return;
     }
@@ -144,6 +176,8 @@ extern "C" fn on_native_event(
 pub struct MacosMetalBackend {
     win: *mut SofuuMacWindow,
     collector: Box<EventCollector>,
+    /// Frameless emulator screens have no traffic lights, so no top inset.
+    decorations: bool,
 }
 
 // The backend is created and used exclusively on Thread 0 (the AppKit main thread).
@@ -153,6 +187,18 @@ impl MacosMetalBackend {
     pub fn new(config: &WindowConfig, atlas: &GlyphAtlas) -> Result<Self, String> {
         let title_c =
             CString::new(config.title.as_str()).unwrap_or_else(|_| CString::new("Sofuu").unwrap());
+        let platform_c = config
+            .emulator
+            .as_ref()
+            .and_then(|e| CString::new(e.platform.as_str()).ok());
+        let device_c = config
+            .emulator
+            .as_ref()
+            .and_then(|e| CString::new(e.device.as_str()).ok());
+        let profiles_c = config
+            .emulator
+            .as_ref()
+            .and_then(|e| CString::new(e.profiles_json.as_str()).ok());
         let collector = Box::new(EventCollector {
             raw_events: Vec::with_capacity(32),
             scale_factor: 1.0,
@@ -160,18 +206,32 @@ impl MacosMetalBackend {
         });
 
         let win = unsafe {
-            sofuu_macos_create_window(
+            sofuu_macos_create_window_ex(
                 title_c.as_ptr(),
                 config.width,
                 config.height,
                 config.min_width,
                 config.min_height,
+                if config.decorations { 1 } else { 0 },
+                if config.resizable { 1 } else { 0 },
+                config.scale.unwrap_or(0.0),
+                config.corner_radius,
+                if config.strip { 1 } else { 0 },
+                platform_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                device_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                profiles_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
                 MSL_SOURCE.as_ptr() as *const libc::c_char,
                 atlas.pixels.as_ptr(),
                 atlas.width,
                 atlas.height,
                 on_native_event,
                 (&*collector as *const EventCollector as *mut EventCollector).cast(),
+                if config.strip {
+                    Some(on_strip_action as StripCb)
+                } else {
+                    None
+                },
+                std::ptr::null_mut(),
             )
         };
         if win.is_null() {
@@ -180,7 +240,11 @@ impl MacosMetalBackend {
             );
         }
 
-        let mut backend = Self { win, collector };
+        let mut backend = Self {
+            win,
+            collector,
+            decorations: config.decorations,
+        };
         let (_, _, scale) = backend.metrics();
         backend.collector.scale_factor = scale.max(1.0);
         Ok(backend)
@@ -210,11 +274,7 @@ impl NativeWindowBackend for MacosMetalBackend {
         out_events: &mut Vec<InputEvent>,
     ) -> bool {
         let alive = unsafe {
-            sofuu_macos_poll_or_wait(
-                self.win,
-                if wait_forever { 1 } else { 0 },
-                timeout_sec,
-            )
+            sofuu_macos_poll_or_wait(self.win, if wait_forever { 1 } else { 0 }, timeout_sec)
         };
         for ev in self.collector.raw_events.drain(..) {
             if let InputEvent::Resize { scale_factor, .. } = &ev {
@@ -240,6 +300,12 @@ impl NativeWindowBackend for MacosMetalBackend {
                 dl.strokes.len() as u32,
                 dl.glyphs.as_ptr().cast(),
                 dl.glyphs.len() as u32,
+                dl.effects.as_ptr().cast(),
+                dl.effects.len() as u32,
+                dl.particles.as_ptr().cast(),
+                dl.particles.len() as u32,
+                dl.backdrops.as_ptr().cast(),
+                dl.backdrops.len() as u32,
                 dl.cmds.as_ptr().cast(),
                 dl.cmds.len() as u32,
             );
@@ -247,7 +313,19 @@ impl NativeWindowBackend for MacosMetalBackend {
     }
 
     fn top_inset(&self) -> f32 {
-        28.0
+        if self.decorations {
+            28.0
+        } else {
+            0.0
+        }
+    }
+
+    fn focused(&self) -> bool {
+        unsafe { sofuu_macos_window_focused(self.win) != 0 }
+    }
+
+    fn reduce_motion(&self) -> bool {
+        unsafe { sofuu_macos_reduce_motion() != 0 }
     }
 
     fn backend_name(&self) -> &'static str {
@@ -255,6 +333,21 @@ impl NativeWindowBackend for MacosMetalBackend {
     }
 }
 
+/// Destroy an offscreen renderer handle (same allocation shape as a window).
+pub(crate) unsafe fn destroy_raw(handle: *mut std::ffi::c_void) {
+    sofuu_macos_destroy_window(handle.cast());
+}
+
 pub fn wake_main_loop() {
     unsafe { sofuu_macos_wake() };
+}
+
+impl crate::backend::StripHost for MacosMetalBackend {
+    fn supported(&self) -> bool {
+        true
+    }
+
+    fn set_collapsed(&mut self, collapsed: bool) {
+        unsafe { sofuu_macos_strip_set_collapsed(if collapsed { 1 } else { 0 }) };
+    }
 }

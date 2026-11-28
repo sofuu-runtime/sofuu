@@ -6,7 +6,7 @@
 //! the platform window shim (`eglGetProcAddress` / `wglGetProcAddress` / `dlsym`), so the
 //! shared library never hard-links a GPU driver. Four instanced pipelines consume the exact
 //! `#[repr(C)]` `sofuu-ui` arrays; all geometry, SDF and alpha math mirrors
-//! `shaders/msl/ui_shaders.metal` line-for-line.
+//! `sofuu_ui::shaders::METAL_SRC` line-for-line.
 //!
 //! ## Layout contract
 //! - QuadInstance 80 B: `vec4 rect`, `vec4 radii`, `uvec4 colors`, `vec4 params`, `uint clip`, 3 pad
@@ -65,6 +65,7 @@ const GL_UNSIGNED_BYTE: GLenum = 0x1401;
 const GL_UNPACK_ALIGNMENT: GLenum = 0x0CF5;
 const GL_TEXTURE_2D: GLenum = 0x0DE1;
 const GL_TEXTURE0: GLenum = 0x84C0;
+const GL_FRAMEBUFFER_BINDING: GLenum = 0x8CA6;
 const GL_TEXTURE_MIN_FILTER: GLenum = 0x2801;
 const GL_TEXTURE_MAG_FILTER: GLenum = 0x2800;
 const GL_TEXTURE_WRAP_S: GLenum = 0x2802;
@@ -180,6 +181,8 @@ gl_api! {
     fn glFramebufferTexture2D(target: GLenum, attachment: GLenum, textarget: GLenum, texture: GLuint, level: GLint) -> ();
     fn glCheckFramebufferStatus(target: GLenum) -> GLenum;
     fn glDeleteFramebuffers(n: GLsizei, fbs: *const GLuint) -> ();
+    fn glGetIntegerv(pname: GLenum, out: *mut GLint) -> ();
+    fn glCopyTexSubImage2D(target: GLenum, level: GLint, xoffset: GLint, yoffset: GLint, x: GLint, y: GLint, width: GLsizei, height: GLsizei) -> ();
     fn glReadPixels(x: GLint, y: GLint, w: GLsizei, h: GLsizei, format: GLenum, ty: GLenum, out: *mut c_void) -> ();
 }
 
@@ -196,6 +199,8 @@ struct Program {
     loc_atlas_size: GLint,
     loc_scale: GLint,
     loc_time: GLint,
+    loc_texel: GLint,
+    loc_offset: GLint,
 }
 
 struct StreamingBuffer {
@@ -205,11 +210,21 @@ struct StreamingBuffer {
 
 impl StreamingBuffer {
     fn new() -> Self {
-        Self {
-            id: 0,
-            capacity: 0,
-        }
+        Self { id: 0, capacity: 0 }
     }
+}
+
+/// Half-resolution Kawase blur scratch targets. `copy_tex` snapshots the framebuffer at the
+/// backdrop marker; `tex_a`/`tex_b` ping-pong the downsample and blur passes.
+#[derive(Clone, Copy)]
+struct BlurTargets {
+    width: u32,
+    height: u32,
+    copy_tex: GLuint,
+    tex_a: GLuint,
+    tex_b: GLuint,
+    fbo_a: GLuint,
+    fbo_b: GLuint,
 }
 
 /// Shared GL/GLES renderer. Construction and every draw happen on the thread that owns the
@@ -221,6 +236,12 @@ pub struct GlesRenderer {
     vaos: [GLuint; 4],
     corner_vbo: GLuint,
     instance_vbos: [StreamingBuffer; 4],
+    /// Effect, particle and backdrop programs (draw kinds 5, 6, 7).
+    fx_programs: [Program; 3],
+    fx_vaos: [GLuint; 3],
+    fx_vbos: [StreamingBuffer; 3],
+    blur_program: Program,
+    blur_targets: Option<BlurTargets>,
     clip_ubo: GLuint,
     atlas_tex: GLuint,
     atlas_w: u32,
@@ -240,16 +261,15 @@ impl GlesRenderer {
         let mut renderer = Self {
             api,
             flavor,
-            programs: [
-                Program {
-                    id: 0,
-                    loc_viewport: -1,
-                    loc_atlas_size: -1,
-                    loc_scale: -1,
-                    loc_time: -1,
-                };
-                4
-            ],
+            programs: [Program {
+                id: 0,
+                loc_viewport: -1,
+                loc_atlas_size: -1,
+                loc_scale: -1,
+                loc_time: -1,
+                loc_texel: -1,
+                loc_offset: -1,
+            }; 4],
             vaos: [0; 4],
             corner_vbo: 0,
             instance_vbos: [
@@ -258,6 +278,31 @@ impl GlesRenderer {
                 StreamingBuffer::new(),
                 StreamingBuffer::new(),
             ],
+            fx_programs: [Program {
+                id: 0,
+                loc_viewport: -1,
+                loc_atlas_size: -1,
+                loc_scale: -1,
+                loc_time: -1,
+                loc_texel: -1,
+                loc_offset: -1,
+            }; 3],
+            fx_vaos: [0; 3],
+            fx_vbos: [
+                StreamingBuffer::new(),
+                StreamingBuffer::new(),
+                StreamingBuffer::new(),
+            ],
+            blur_program: Program {
+                id: 0,
+                loc_viewport: -1,
+                loc_atlas_size: -1,
+                loc_scale: -1,
+                loc_time: -1,
+                loc_texel: -1,
+                loc_offset: -1,
+            },
+            blur_targets: None,
             clip_ubo: 0,
             atlas_tex: 0,
             atlas_w: atlas.width,
@@ -302,6 +347,10 @@ impl GlesRenderer {
             for (i, name) in ["QUAD", "RIBBON", "STROKE", "GLYPH"].iter().enumerate() {
                 self.programs[i] = self.make_program(name)?;
             }
+            for (i, name) in ["EFFECT", "PARTICLE", "BACKDROP"].iter().enumerate() {
+                self.fx_programs[i] = self.make_program(name)?;
+            }
+            self.blur_program = self.make_program("BLUR")?;
 
             let mut corner = [0.0f32; 8];
             corner[2] = 1.0;
@@ -325,6 +374,12 @@ impl GlesRenderer {
                 self.instance_vbos[i].id = ids[0];
                 self.instance_vbos[i].capacity = 0;
             }
+            for i in 0..3 {
+                let mut ids = [0u32; 1];
+                GlApi::req(api.glGenBuffers, "glGenBuffers")?(1, ids.as_mut_ptr());
+                self.fx_vbos[i].id = ids[0];
+                self.fx_vbos[i].capacity = 0;
+            }
 
             for (i, program) in self.programs.iter().enumerate() {
                 let mut vao = 0u32;
@@ -347,6 +402,25 @@ impl GlesRenderer {
                 );
                 self.configure_attributes(i, 0)?;
                 let _ = program;
+            }
+
+            for i in 0..3 {
+                let mut vao = 0u32;
+                GlApi::req(api.glGenVertexArrays, "glGenVertexArrays")?(1, &mut vao);
+                self.fx_vaos[i] = vao;
+                GlApi::req(api.glBindVertexArray, "glBindVertexArray")?(vao);
+                GlApi::req(api.glBindBuffer, "glBindBuffer")?(GL_ARRAY_BUFFER, self.corner_vbo);
+                GlApi::req(api.glEnableVertexAttribArray, "glEnableVertexAttribArray")?(0);
+                GlApi::req(api.glVertexAttribPointer, "glVertexAttribPointer")?(
+                    0,
+                    2,
+                    GL_FLOAT,
+                    0,
+                    8,
+                    std::ptr::null(),
+                );
+                GlApi::req(api.glBindBuffer, "glBindBuffer")?(GL_ARRAY_BUFFER, self.fx_vbos[i].id);
+                self.configure_attributes(5 + i, 0)?;
             }
 
             let mut clips = 0u32;
@@ -378,10 +452,26 @@ impl GlesRenderer {
                 GL_UNSIGNED_BYTE,
                 self.atlas_pixels.as_ptr().cast(),
             );
-            GlApi::req(api.glTexParameteri, "glTexParameteri")?(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR as GLint);
-            GlApi::req(api.glTexParameteri, "glTexParameteri")?(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR as GLint);
-            GlApi::req(api.glTexParameteri, "glTexParameteri")?(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE as GLint);
-            GlApi::req(api.glTexParameteri, "glTexParameteri")?(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE as GLint);
+            GlApi::req(api.glTexParameteri, "glTexParameteri")?(
+                GL_TEXTURE_2D,
+                GL_TEXTURE_MIN_FILTER,
+                GL_LINEAR as GLint,
+            );
+            GlApi::req(api.glTexParameteri, "glTexParameteri")?(
+                GL_TEXTURE_2D,
+                GL_TEXTURE_MAG_FILTER,
+                GL_LINEAR as GLint,
+            );
+            GlApi::req(api.glTexParameteri, "glTexParameteri")?(
+                GL_TEXTURE_2D,
+                GL_TEXTURE_WRAP_S,
+                GL_CLAMP_TO_EDGE as GLint,
+            );
+            GlApi::req(api.glTexParameteri, "glTexParameteri")?(
+                GL_TEXTURE_2D,
+                GL_TEXTURE_WRAP_T,
+                GL_CLAMP_TO_EDGE as GLint,
+            );
 
             GlApi::req(api.glDisable, "glDisable")?(0x0B71); // GL_DEPTH_TEST
             GlApi::req(api.glEnable, "glEnable")?(GL_BLEND);
@@ -395,7 +485,9 @@ impl GlesRenderer {
             GlApi::req(api.glBindVertexArray, "glBindVertexArray")?(0);
             let err = api.glGetError.map(|f| f()).unwrap_or(0);
             if err != GL_NO_ERROR {
-                return Err(format!("E_UI_GL_INIT: OpenGL error 0x{err:04x} during resource setup"));
+                return Err(format!(
+                    "E_UI_GL_INIT: OpenGL error 0x{err:04x} during resource setup"
+                ));
             }
         }
         self.initialized = true;
@@ -407,7 +499,8 @@ impl GlesRenderer {
         let (vert_src, frag_src) = shader_sources(self.flavor, pipeline);
         unsafe {
             let vs = compile_shader(api, GL_VERTEX_SHADER, &vert_src, pipeline, "vertex")?;
-            let fs = match compile_shader(api, GL_FRAGMENT_SHADER, &frag_src, pipeline, "fragment") {
+            let fs = match compile_shader(api, GL_FRAGMENT_SHADER, &frag_src, pipeline, "fragment")
+            {
                 Ok(s) => s,
                 Err(e) => {
                     let _ = api.glDeleteShader.map(|f| f(vs));
@@ -454,12 +547,16 @@ impl GlesRenderer {
                 loc_atlas_size: loc("u_atlas_size"),
                 loc_scale: loc("u_scale_factor"),
                 loc_time: loc("u_time_sec"),
+                loc_texel: loc("u_texel"),
+                loc_offset: loc("u_offset"),
             };
             if let Some(f) = api.glUseProgram {
                 f(program);
             }
             if let Some(f) = api.glUniform1i {
                 f(loc("u_atlas"), 0);
+                f(loc("u_blur_tex"), 0);
+                f(loc("u_blur_src"), 0);
             }
             Ok(p)
         }
@@ -472,6 +569,9 @@ impl GlesRenderer {
             0 => QUAD_STRIDE,
             1 => RIBBON_STRIDE,
             2 => STROKE_STRIDE,
+            5 => 80,
+            6 => 32,
+            7 => 64,
             _ => GLYPH_STRIDE,
         } as GLsizei;
         let ptr = |o: usize| (offset + o) as *const c_void;
@@ -482,49 +582,128 @@ impl GlesRenderer {
         let _ = b;
         match kind {
             0 => {
-                en(1); f(1, 4, GL_FLOAT, 0, stride, ptr(0));
-                en(2); f(2, 4, GL_FLOAT, 0, stride, ptr(16));
-                en(3); i(3, 4, GL_UNSIGNED_INT, stride, ptr(32));
-                en(4); f(4, 4, GL_FLOAT, 0, stride, ptr(48));
-                en(5); i(5, 1, GL_UNSIGNED_INT, stride, ptr(64));
-                d(1, 1); d(2, 1); d(3, 1); d(4, 1); d(5, 1);
+                en(1);
+                f(1, 4, GL_FLOAT, 0, stride, ptr(0));
+                en(2);
+                f(2, 4, GL_FLOAT, 0, stride, ptr(16));
+                en(3);
+                i(3, 4, GL_UNSIGNED_INT, stride, ptr(32));
+                en(4);
+                f(4, 4, GL_FLOAT, 0, stride, ptr(48));
+                en(5);
+                i(5, 1, GL_UNSIGNED_INT, stride, ptr(64));
+                d(1, 1);
+                d(2, 1);
+                d(3, 1);
+                d(4, 1);
+                d(5, 1);
             }
             1 => {
-                en(1); f(1, 4, GL_FLOAT, 0, stride, ptr(0));
-                en(2); f(2, 2, GL_FLOAT, 0, stride, ptr(16));
-                en(3); i(3, 4, GL_UNSIGNED_INT, stride, ptr(24));
-                d(1, 1); d(2, 1); d(3, 1);
+                en(1);
+                f(1, 4, GL_FLOAT, 0, stride, ptr(0));
+                en(2);
+                f(2, 2, GL_FLOAT, 0, stride, ptr(16));
+                en(3);
+                i(3, 4, GL_UNSIGNED_INT, stride, ptr(24));
+                d(1, 1);
+                d(2, 1);
+                d(3, 1);
             }
             2 => {
-                en(1); f(1, 4, GL_FLOAT, 0, stride, ptr(0));
-                en(2); f(2, 4, GL_FLOAT, 0, stride, ptr(16));
-                en(3); i(3, 4, GL_UNSIGNED_INT, stride, ptr(32));
-                d(1, 1); d(2, 1); d(3, 1);
+                en(1);
+                f(1, 4, GL_FLOAT, 0, stride, ptr(0));
+                en(2);
+                f(2, 4, GL_FLOAT, 0, stride, ptr(16));
+                en(3);
+                i(3, 4, GL_UNSIGNED_INT, stride, ptr(32));
+                d(1, 1);
+                d(2, 1);
+                d(3, 1);
+            }
+            5 => {
+                en(1);
+                f(1, 4, GL_FLOAT, 0, stride, ptr(0));
+                en(2);
+                f(2, 4, GL_FLOAT, 0, stride, ptr(16));
+                en(3);
+                f(3, 4, GL_FLOAT, 0, stride, ptr(32));
+                en(4);
+                f(4, 4, GL_FLOAT, 0, stride, ptr(48));
+                en(5);
+                i(5, 4, GL_UNSIGNED_INT, stride, ptr(64));
+                d(1, 1);
+                d(2, 1);
+                d(3, 1);
+                d(4, 1);
+                d(5, 1);
+            }
+            6 => {
+                en(1);
+                f(1, 4, GL_FLOAT, 0, stride, ptr(0));
+                en(2);
+                f(2, 1, GL_FLOAT, 0, stride, ptr(16));
+                en(3);
+                i(3, 1, GL_UNSIGNED_INT, stride, ptr(20));
+                en(4);
+                i(4, 1, GL_UNSIGNED_INT, stride, ptr(24));
+                d(1, 1);
+                d(2, 1);
+                d(3, 1);
+                d(4, 1);
+            }
+            7 => {
+                en(1);
+                f(1, 4, GL_FLOAT, 0, stride, ptr(0));
+                en(2);
+                f(2, 4, GL_FLOAT, 0, stride, ptr(16));
+                en(3);
+                i(3, 2, GL_UNSIGNED_INT, stride, ptr(32));
+                en(4);
+                f(4, 4, GL_FLOAT, 0, stride, ptr(40));
+                en(5);
+                i(5, 1, GL_UNSIGNED_INT, stride, ptr(56));
+                d(1, 1);
+                d(2, 1);
+                d(3, 1);
+                d(4, 1);
+                d(5, 1);
             }
             _ => {
-                en(1); f(1, 4, GL_FLOAT, 0, stride, ptr(0));
-                en(2); f(2, 4, GL_FLOAT, 0, stride, ptr(16));
-                en(3); i(3, 1, GL_UNSIGNED_INT, stride, ptr(32));
-                en(4); f(4, 1, GL_FLOAT, 0, stride, ptr(36));
-                en(5); i(5, 1, GL_UNSIGNED_INT, stride, ptr(40));
-                d(1, 1); d(2, 1); d(3, 1); d(4, 1); d(5, 1);
+                en(1);
+                f(1, 4, GL_FLOAT, 0, stride, ptr(0));
+                en(2);
+                f(2, 4, GL_FLOAT, 0, stride, ptr(16));
+                en(3);
+                i(3, 1, GL_UNSIGNED_INT, stride, ptr(32));
+                en(4);
+                f(4, 1, GL_FLOAT, 0, stride, ptr(36));
+                en(5);
+                i(5, 1, GL_UNSIGNED_INT, stride, ptr(40));
+                d(1, 1);
+                d(2, 1);
+                d(3, 1);
+                d(4, 1);
+                d(5, 1);
             }
         }
         Ok(())
     }
 
-    unsafe fn upload_streaming(
-        &mut self,
-        kind: usize,
-        bytes: &[u8],
-    ) -> Result<(), String> {
+    unsafe fn upload_streaming(&mut self, kind: usize, bytes: &[u8]) -> Result<(), String> {
         if bytes.is_empty() {
             return Ok(());
         }
         let api = self.api;
-        let buf = &mut self.instance_vbos[kind];
+        let buf = match kind {
+            5 => &mut self.fx_vbos[0],
+            6 => &mut self.fx_vbos[1],
+            7 => &mut self.fx_vbos[2],
+            _ => &mut self.instance_vbos[kind],
+        };
         if buf.id == 0 {
-            return Err(format!("E_UI_GL_BUFFER: instance buffer {kind} is not allocated"));
+            return Err(format!(
+                "E_UI_GL_BUFFER: instance buffer {kind} is not allocated"
+            ));
         }
         let target = GL_ARRAY_BUFFER;
         GlApi::req(api.glBindBuffer, "glBindBuffer")?(target, buf.id);
@@ -559,7 +738,12 @@ impl GlesRenderer {
         Ok(())
     }
 
-    unsafe fn upload_clips(&mut self, clips: &[sofuu_ui::ClipRect], base: usize, count: usize) -> Result<(), String> {
+    unsafe fn upload_clips(
+        &mut self,
+        clips: &[sofuu_ui::ClipRect],
+        base: usize,
+        count: usize,
+    ) -> Result<(), String> {
         let api = self.api;
         let mut raw = vec![[0.0f32; 4]; count];
         for (i, c) in clips.iter().skip(base).take(count).enumerate() {
@@ -614,6 +798,9 @@ impl GlesRenderer {
             self.upload_streaming(1, rbytes)?;
             self.upload_streaming(2, sbytes)?;
             self.upload_streaming(3, gbytes)?;
+            self.upload_streaming(5, bytes_of(&dl.effects))?;
+            self.upload_streaming(6, bytes_of(&dl.particles))?;
+            self.upload_streaming(7, bytes_of(&dl.backdrops))?;
 
             GlApi::req(api.glActiveTexture, "glActiveTexture")?(GL_TEXTURE0);
             GlApi::req(api.glBindTexture, "glBindTexture")?(GL_TEXTURE_2D, self.atlas_tex);
@@ -625,19 +812,45 @@ impl GlesRenderer {
                 GL_ONE_MINUS_SRC_ALPHA,
             );
 
+            // Backdrop markers blur the framebuffer at their exact painter position. When a
+            // scene needs more than one clip window the painter order is already partitioned;
+            // skip backdrop compositing there rather than blurring partially drawn windows.
+            let backdrop_ok = dl.clips.len() <= MAX_CLIPS;
+
             for (base, count) in clip_windows(dl.clips.len()) {
                 self.upload_clips(&dl.clips, base, count)?;
-                GlApi::req(api.glBindBufferBase, "glBindBufferBase")?(GL_UNIFORM_BUFFER, 0, self.clip_ubo);
+                GlApi::req(api.glBindBufferBase, "glBindBufferBase")?(
+                    GL_UNIFORM_BUFFER,
+                    0,
+                    self.clip_ubo,
+                );
 
                 for cmd in &dl.cmds {
                     if cmd.count == 0 {
                         continue;
                     }
                     let kind = cmd.kind as usize;
-                    if kind > 3 {
+                    if kind == 7 {
+                        if backdrop_ok {
+                            let first = cmd.start as usize;
+                            if first < dl.backdrops.len() {
+                                let scale = (dl.backdrops[first].params[0] / 18.0).clamp(0.5, 3.0);
+                                self.apply_backdrop(uniforms, fb_w, fb_h, first, scale)?;
+                            }
+                        }
                         continue;
                     }
-                    let stride = [QUAD_STRIDE, RIBBON_STRIDE, STROKE_STRIDE, GLYPH_STRIDE][kind];
+                    if kind == 4 || kind > 7 {
+                        continue;
+                    }
+                    let stride = match kind {
+                        0 => QUAD_STRIDE,
+                        1 => RIBBON_STRIDE,
+                        2 => STROKE_STRIDE,
+                        3 => GLYPH_STRIDE,
+                        5 => 80,
+                        _ => 32,
+                    };
                     let (array_len, start, count_i) =
                         (cmd.start as usize, cmd.start as usize, cmd.count as usize);
                     let end = start.saturating_add(count_i);
@@ -645,7 +858,9 @@ impl GlesRenderer {
                         0 => dl.quads.len(),
                         1 => dl.ribbons.len(),
                         2 => dl.strokes.len(),
-                        _ => dl.glyphs.len(),
+                        3 => dl.glyphs.len(),
+                        5 => dl.effects.len(),
+                        _ => dl.particles.len(),
                     };
                     if start >= max_len || end > max_len {
                         continue;
@@ -665,7 +880,9 @@ impl GlesRenderer {
                                     if let Some(id) = remap(inst.clip_id) {
                                         let mut copy = *inst;
                                         copy.clip_id = id;
-                                        out.extend_from_slice(bytes_of(std::slice::from_ref(&copy)));
+                                        out.extend_from_slice(bytes_of(std::slice::from_ref(
+                                            &copy,
+                                        )));
                                     }
                                 }
                             }
@@ -674,7 +891,9 @@ impl GlesRenderer {
                                     if let Some(id) = remap(inst.clip_id) {
                                         let mut copy = *inst;
                                         copy.clip_id = id;
-                                        out.extend_from_slice(bytes_of(std::slice::from_ref(&copy)));
+                                        out.extend_from_slice(bytes_of(std::slice::from_ref(
+                                            &copy,
+                                        )));
                                     }
                                 }
                             }
@@ -683,16 +902,45 @@ impl GlesRenderer {
                                     if let Some(id) = remap(inst.clip_id) {
                                         let mut copy = *inst;
                                         copy.clip_id = id;
-                                        out.extend_from_slice(bytes_of(std::slice::from_ref(&copy)));
+                                        out.extend_from_slice(bytes_of(std::slice::from_ref(
+                                            &copy,
+                                        )));
                                     }
                                 }
                             }
-                            _ => {
+                            3 => {
                                 for inst in &dl.glyphs[start..end] {
                                     if let Some(id) = remap(inst.clip_id) {
                                         let mut copy = *inst;
                                         copy.clip_id = id;
-                                        out.extend_from_slice(bytes_of(std::slice::from_ref(&copy)));
+                                        out.extend_from_slice(bytes_of(std::slice::from_ref(
+                                            &copy,
+                                        )));
+                                    }
+                                }
+                            }
+                            5 => {
+                                for inst in &dl.effects[start..end] {
+                                    let clip = inst.kind_and_clip >> 16;
+                                    if let Some(id) = remap(clip) {
+                                        let mut copy = *inst;
+                                        copy.kind_and_clip =
+                                            (copy.kind_and_clip & 0xffff) | (id << 16);
+                                        out.extend_from_slice(bytes_of(std::slice::from_ref(
+                                            &copy,
+                                        )));
+                                    }
+                                }
+                            }
+                            _ => {
+                                for inst in &dl.particles[start..end] {
+                                    let clip = inst.shape_clip >> 4;
+                                    if let Some(id) = remap(clip) {
+                                        let mut copy = *inst;
+                                        copy.shape_clip = (copy.shape_clip & 0xf) | (id << 4);
+                                        out.extend_from_slice(bytes_of(std::slice::from_ref(
+                                            &copy,
+                                        )));
                                     }
                                 }
                             }
@@ -707,16 +955,28 @@ impl GlesRenderer {
                         self.upload_streaming(kind, filtered)?;
                     }
 
-                    let program = &self.programs[kind];
+                    let program = if kind >= 5 {
+                        &self.fx_programs[kind - 5]
+                    } else {
+                        &self.programs[kind]
+                    };
                     GlApi::req(api.glUseProgram, "glUseProgram")?(program.id);
                     if program.loc_viewport >= 0 {
                         if let Some(f) = api.glUniform2f {
-                            f(program.loc_viewport, uniforms.viewport_size[0], uniforms.viewport_size[1]);
+                            f(
+                                program.loc_viewport,
+                                uniforms.viewport_size[0],
+                                uniforms.viewport_size[1],
+                            );
                         }
                     }
                     if program.loc_atlas_size >= 0 {
                         if let Some(f) = api.glUniform2f {
-                            f(program.loc_atlas_size, uniforms.atlas_size[0], uniforms.atlas_size[1]);
+                            f(
+                                program.loc_atlas_size,
+                                uniforms.atlas_size[0],
+                                uniforms.atlas_size[1],
+                            );
                         }
                     }
                     if program.loc_scale >= 0 {
@@ -730,11 +990,13 @@ impl GlesRenderer {
                         }
                     }
 
-                    GlApi::req(api.glBindVertexArray, "glBindVertexArray")?(self.vaos[kind]);
-                    GlApi::req(api.glBindBuffer, "glBindBuffer")?(
-                        GL_ARRAY_BUFFER,
-                        self.instance_vbos[kind].id,
-                    );
+                    let (vao, vbo) = if kind >= 5 {
+                        (self.fx_vaos[kind - 5], self.fx_vbos[kind - 5].id)
+                    } else {
+                        (self.vaos[kind], self.instance_vbos[kind].id)
+                    };
+                    GlApi::req(api.glBindVertexArray, "glBindVertexArray")?(vao);
+                    GlApi::req(api.glBindBuffer, "glBindBuffer")?(GL_ARRAY_BUFFER, vbo);
                     let (offset, draw_count) = match &filtered {
                         Some(filtered) => (0, (filtered.len() / stride) as GLsizei),
                         None => (array_len * stride, count_i as GLsizei),
@@ -792,6 +1054,7 @@ impl GlesRenderer {
 
     fn delete_resources(&mut self) {
         let api = self.api;
+        self.destroy_blur_targets();
         unsafe {
             if let Some(f) = api.glDeleteTextures {
                 if self.atlas_tex != 0 {
@@ -810,9 +1073,19 @@ impl GlesRenderer {
                         f(1, &b.id);
                     }
                 }
+                for b in &self.fx_vbos {
+                    if b.id != 0 {
+                        f(1, &b.id);
+                    }
+                }
             }
             if let Some(f) = api.glDeleteVertexArrays {
                 for v in &self.vaos {
+                    if *v != 0 {
+                        f(1, v);
+                    }
+                }
+                for v in &self.fx_vaos {
                     if *v != 0 {
                         f(1, v);
                     }
@@ -824,6 +1097,14 @@ impl GlesRenderer {
                         f(p.id);
                     }
                 }
+                for p in &self.fx_programs {
+                    if p.id != 0 {
+                        f(p.id);
+                    }
+                }
+                if self.blur_program.id != 0 {
+                    f(self.blur_program.id);
+                }
             }
         }
         self.atlas_tex = 0;
@@ -834,17 +1115,280 @@ impl GlesRenderer {
             b.id = 0;
             b.capacity = 0;
         }
-        self.programs = [
-            Program {
-                id: 0,
-                loc_viewport: -1,
-                loc_atlas_size: -1,
-                loc_scale: -1,
-                loc_time: -1,
-            };
-            4
-        ];
+        self.fx_vaos = [0; 3];
+        for b in &mut self.fx_vbos {
+            b.id = 0;
+            b.capacity = 0;
+        }
+        self.programs = [Program {
+            id: 0,
+            loc_viewport: -1,
+            loc_atlas_size: -1,
+            loc_scale: -1,
+            loc_time: -1,
+            loc_texel: -1,
+            loc_offset: -1,
+        }; 4];
+        self.fx_programs = [Program {
+            id: 0,
+            loc_viewport: -1,
+            loc_atlas_size: -1,
+            loc_scale: -1,
+            loc_time: -1,
+            loc_texel: -1,
+            loc_offset: -1,
+        }; 3];
+        self.blur_program = Program {
+            id: 0,
+            loc_viewport: -1,
+            loc_atlas_size: -1,
+            loc_scale: -1,
+            loc_time: -1,
+            loc_texel: -1,
+            loc_offset: -1,
+        };
         self.initialized = false;
+    }
+
+    /// Release the half-resolution Kawase scratch targets (context loss, resize).
+    fn destroy_blur_targets(&mut self) {
+        if let Some(b) = self.blur_targets.take() {
+            unsafe {
+                if let Some(f) = self.api.glDeleteFramebuffers {
+                    f(1, &b.fbo_a);
+                    f(1, &b.fbo_b);
+                }
+                if let Some(f) = self.api.glDeleteTextures {
+                    f(1, &b.copy_tex);
+                    f(1, &b.tex_a);
+                    f(1, &b.tex_b);
+                }
+            }
+        }
+    }
+
+    /// Allocate full-res snapshot + two half-res ping-pong textures and their FBOs.
+    fn ensure_blur_targets(&mut self, width: u32, height: u32) -> Result<(), String> {
+        if let Some(b) = &self.blur_targets {
+            if b.width == width && b.height == height {
+                return Ok(());
+            }
+        }
+        self.destroy_blur_targets();
+        let api = self.api;
+        let hw = (width / 2).max(1);
+        let hh = (height / 2).max(1);
+        unsafe {
+            let make_tex = |w: u32, h: u32| -> Result<GLuint, String> {
+                let mut tex = 0u32;
+                GlApi::req(api.glGenTextures, "glGenTextures")?(1, &mut tex);
+                GlApi::req(api.glBindTexture, "glBindTexture")?(GL_TEXTURE_2D, tex);
+                GlApi::req(api.glTexImage2D, "glTexImage2D")?(
+                    GL_TEXTURE_2D,
+                    0,
+                    GL_RGBA8 as GLint,
+                    w as GLsizei,
+                    h as GLsizei,
+                    0,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    std::ptr::null(),
+                );
+                GlApi::req(api.glTexParameteri, "glTexParameteri")?(
+                    GL_TEXTURE_2D,
+                    GL_TEXTURE_MIN_FILTER,
+                    GL_LINEAR as GLint,
+                );
+                GlApi::req(api.glTexParameteri, "glTexParameteri")?(
+                    GL_TEXTURE_2D,
+                    GL_TEXTURE_MAG_FILTER,
+                    GL_LINEAR as GLint,
+                );
+                GlApi::req(api.glTexParameteri, "glTexParameteri")?(
+                    GL_TEXTURE_2D,
+                    GL_TEXTURE_WRAP_S,
+                    GL_CLAMP_TO_EDGE as GLint,
+                );
+                GlApi::req(api.glTexParameteri, "glTexParameteri")?(
+                    GL_TEXTURE_2D,
+                    GL_TEXTURE_WRAP_T,
+                    GL_CLAMP_TO_EDGE as GLint,
+                );
+                Ok(tex)
+            };
+            let copy_tex = make_tex(width, height)?;
+            let tex_a = make_tex(hw, hh)?;
+            let tex_b = make_tex(hw, hh)?;
+            let make_fbo = |tex: GLuint| -> Result<GLuint, String> {
+                let mut fbo = 0u32;
+                GlApi::req(api.glGenFramebuffers, "glGenFramebuffers")?(1, &mut fbo);
+                GlApi::req(api.glBindFramebuffer, "glBindFramebuffer")?(GL_FRAMEBUFFER, fbo);
+                GlApi::req(api.glFramebufferTexture2D, "glFramebufferTexture2D")?(
+                    GL_FRAMEBUFFER,
+                    GL_COLOR_ATTACHMENT0,
+                    GL_TEXTURE_2D,
+                    tex,
+                    0,
+                );
+                let status = GlApi::req(api.glCheckFramebufferStatus, "glCheckFramebufferStatus")?(
+                    GL_FRAMEBUFFER,
+                );
+                if status != GL_FRAMEBUFFER_COMPLETE {
+                    return Err(format!(
+                        "E_UI_GL_FBO: blur framebuffer incomplete (0x{status:04x})"
+                    ));
+                }
+                Ok(fbo)
+            };
+            let fbo_a = make_fbo(tex_a)?;
+            let fbo_b = make_fbo(tex_b)?;
+            self.blur_targets = Some(BlurTargets {
+                width,
+                height,
+                copy_tex,
+                tex_a,
+                tex_b,
+                fbo_a,
+                fbo_b,
+            });
+        }
+        Ok(())
+    }
+
+    /// Run one 4-tap Kawase pass from `src_tex` into `fbo`/`dst_tex`.
+    unsafe fn draw_blur_pass(
+        &mut self,
+        fbo: GLuint,
+        src_tex: GLuint,
+        dst_size: (u32, u32),
+        src_size: (u32, u32),
+        offset: f32,
+    ) -> Result<(), String> {
+        let api = self.api;
+        GlApi::req(api.glBindFramebuffer, "glBindFramebuffer")?(GL_FRAMEBUFFER, fbo);
+        GlApi::req(api.glViewport, "glViewport")?(
+            0,
+            0,
+            dst_size.0 as GLsizei,
+            dst_size.1 as GLsizei,
+        );
+        GlApi::req(api.glUseProgram, "glUseProgram")?(self.blur_program.id);
+        if self.blur_program.loc_texel >= 0 {
+            if let Some(f) = api.glUniform2f {
+                f(
+                    self.blur_program.loc_texel,
+                    1.0 / src_size.0.max(1) as f32,
+                    1.0 / src_size.1.max(1) as f32,
+                );
+            }
+        }
+        if self.blur_program.loc_offset >= 0 {
+            if let Some(f) = api.glUniform1f {
+                f(self.blur_program.loc_offset, offset);
+            }
+        }
+        GlApi::req(api.glActiveTexture, "glActiveTexture")?(GL_TEXTURE0);
+        GlApi::req(api.glBindTexture, "glBindTexture")?(GL_TEXTURE_2D, src_tex);
+        GlApi::req(api.glBindVertexArray, "glBindVertexArray")?(self.vaos[0]);
+        GlApi::req(api.glDrawArraysInstanced, "glDrawArraysInstanced")?(GL_TRIANGLE_STRIP, 0, 4, 1);
+        Ok(())
+    }
+
+    /// Snapshot the framebuffer at a backdrop marker, blur it at half resolution and composite
+    /// the SDF-clipped frosted pane back in painter order.
+    fn apply_backdrop(
+        &mut self,
+        uniforms: &FrameUniforms,
+        fb_w: GLsizei,
+        fb_h: GLsizei,
+        first: usize,
+        blur_scale: f32,
+    ) -> Result<(), String> {
+        if fb_w <= 0 || fb_h <= 0 {
+            return Ok(());
+        }
+        let api = self.api;
+        // Save the scene framebuffer before scratch-target creation rebinding it.
+        let mut target: GLint = 0;
+        unsafe {
+            GlApi::req(api.glGetIntegerv, "glGetIntegerv")?(GL_FRAMEBUFFER_BINDING, &mut target);
+        }
+        self.ensure_blur_targets(fb_w as u32, fb_h as u32)?;
+        let b = match self.blur_targets {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+        let hw = (b.width / 2).max(1);
+        let hh = (b.height / 2).max(1);
+        unsafe {
+            GlApi::req(api.glActiveTexture, "glActiveTexture")?(GL_TEXTURE0);
+            GlApi::req(api.glBindTexture, "glBindTexture")?(GL_TEXTURE_2D, b.copy_tex);
+            GlApi::req(api.glCopyTexSubImage2D, "glCopyTexSubImage2D")?(
+                GL_TEXTURE_2D,
+                0,
+                0,
+                0,
+                0,
+                0,
+                fb_w,
+                fb_h,
+            );
+            GlApi::req(api.glDisable, "glDisable")?(GL_BLEND);
+            self.draw_blur_pass(
+                b.fbo_a,
+                b.copy_tex,
+                (hw, hh),
+                (b.width, b.height),
+                0.5 * blur_scale,
+            )?;
+            self.draw_blur_pass(b.fbo_b, b.tex_a, (hw, hh), (hw, hh), 1.5 * blur_scale)?;
+            self.draw_blur_pass(b.fbo_a, b.tex_b, (hw, hh), (hw, hh), 2.5 * blur_scale)?;
+
+            GlApi::req(api.glBindFramebuffer, "glBindFramebuffer")?(
+                GL_FRAMEBUFFER,
+                target as GLuint,
+            );
+            GlApi::req(api.glViewport, "glViewport")?(0, 0, fb_w, fb_h);
+            GlApi::req(api.glEnable, "glEnable")?(GL_BLEND);
+            GlApi::req(api.glBlendFuncSeparate, "glBlendFuncSeparate")?(
+                GL_ONE,
+                GL_ONE_MINUS_SRC_ALPHA,
+                GL_ONE,
+                GL_ONE_MINUS_SRC_ALPHA,
+            );
+            GlApi::req(api.glActiveTexture, "glActiveTexture")?(GL_TEXTURE0);
+            GlApi::req(api.glBindTexture, "glBindTexture")?(GL_TEXTURE_2D, b.tex_a);
+
+            let program = &self.fx_programs[2];
+            GlApi::req(api.glUseProgram, "glUseProgram")?(program.id);
+            if program.loc_viewport >= 0 {
+                if let Some(f) = api.glUniform2f {
+                    f(
+                        program.loc_viewport,
+                        uniforms.viewport_size[0],
+                        uniforms.viewport_size[1],
+                    );
+                }
+            }
+            if program.loc_scale >= 0 {
+                if let Some(f) = api.glUniform1f {
+                    f(program.loc_scale, uniforms.scale_factor);
+                }
+            }
+            GlApi::req(api.glBindVertexArray, "glBindVertexArray")?(self.fx_vaos[2]);
+            GlApi::req(api.glBindBuffer, "glBindBuffer")?(GL_ARRAY_BUFFER, self.fx_vbos[2].id);
+            self.configure_attributes(7, first * 64)?;
+            GlApi::req(api.glDrawArraysInstanced, "glDrawArraysInstanced")?(
+                GL_TRIANGLE_STRIP,
+                0,
+                4,
+                1,
+            );
+
+            // Glyph sampling expects the atlas on unit 0 for subsequent commands.
+            GlApi::req(api.glBindTexture, "glBindTexture")?(GL_TEXTURE_2D, self.atlas_tex);
+        }
+        Ok(())
     }
 
     /// Offscreen FBO helper used by the macOS/EGL golden parity harness.
@@ -869,8 +1413,16 @@ impl GlesRenderer {
                 GL_UNSIGNED_BYTE,
                 std::ptr::null(),
             );
-            GlApi::req(api.glTexParameteri, "glTexParameteri")?(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR as GLint);
-            GlApi::req(api.glTexParameteri, "glTexParameteri")?(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR as GLint);
+            GlApi::req(api.glTexParameteri, "glTexParameteri")?(
+                GL_TEXTURE_2D,
+                GL_TEXTURE_MIN_FILTER,
+                GL_LINEAR as GLint,
+            );
+            GlApi::req(api.glTexParameteri, "glTexParameteri")?(
+                GL_TEXTURE_2D,
+                GL_TEXTURE_MAG_FILTER,
+                GL_LINEAR as GLint,
+            );
             let mut fbo = 0u32;
             GlApi::req(api.glGenFramebuffers, "glGenFramebuffers")?(1, &mut fbo);
             GlApi::req(api.glBindFramebuffer, "glBindFramebuffer")?(GL_FRAMEBUFFER, fbo);
@@ -881,7 +1433,9 @@ impl GlesRenderer {
                 tex,
                 0,
             );
-            let status = GlApi::req(api.glCheckFramebufferStatus, "glCheckFramebufferStatus")?(GL_FRAMEBUFFER);
+            let status = GlApi::req(api.glCheckFramebufferStatus, "glCheckFramebufferStatus")?(
+                GL_FRAMEBUFFER,
+            );
             if status != GL_FRAMEBUFFER_COMPLETE {
                 return Err(format!(
                     "E_UI_GL_FBO: offscreen framebuffer incomplete (0x{status:04x})"
@@ -952,7 +1506,9 @@ fn program_log(api: &GlApi, program: GLuint) -> String {
         if let Some(f) = api.glGetProgramInfoLog {
             f(program, len, std::ptr::null_mut(), buf.as_mut_ptr().cast());
         }
-        String::from_utf8_lossy(&buf).trim_end_matches('\0').to_string()
+        String::from_utf8_lossy(&buf)
+            .trim_end_matches('\0')
+            .to_string()
     }
 }
 
@@ -969,7 +1525,9 @@ fn shader_log(api: &GlApi, shader: GLuint) -> String {
         if let Some(f) = api.glGetShaderInfoLog {
             f(shader, len, std::ptr::null_mut(), buf.as_mut_ptr().cast());
         }
-        String::from_utf8_lossy(&buf).trim_end_matches('\0').to_string()
+        String::from_utf8_lossy(&buf)
+            .trim_end_matches('\0')
+            .to_string()
     }
 }
 
@@ -1025,21 +1583,17 @@ fn clip_in_window(clip: u32, base: usize, count: usize) -> Option<u32> {
 
 fn shader_sources(flavor: GlslFlavor, pipeline: &str) -> (String, String) {
     let body = match flavor {
-        GlslFlavor::Desktop330 => include_str!("../shaders/glsl/ui_shaders_330.glsl"),
-        GlslFlavor::Es300 => include_str!("../shaders/glsl/ui_shaders_es3.glsl"),
+        GlslFlavor::Desktop330 => sofuu_ui::shaders::GLSL_330_SRC,
+        GlslFlavor::Es300 => sofuu_ui::shaders::GLSL_ES3_SRC,
     };
     let vertex = body.replacen(
         "// __SOFUU_PIPELINE_DEFINES__",
-        &format!(
-            "#define SOFUU_PIPELINE_{pipeline}\n#define SOFUU_VERTEX\n"
-        ),
+        &format!("#define SOFUU_PIPELINE_{pipeline}\n#define SOFUU_VERTEX\n"),
         1,
     );
     let fragment = body.replacen(
         "// __SOFUU_PIPELINE_DEFINES__",
-        &format!(
-            "#define SOFUU_PIPELINE_{pipeline}\n#define SOFUU_FRAGMENT\n"
-        ),
+        &format!("#define SOFUU_PIPELINE_{pipeline}\n#define SOFUU_FRAGMENT\n"),
         1,
     );
     (vertex, fragment)
@@ -1055,6 +1609,9 @@ mod tests {
         assert_eq!(std::mem::size_of::<RibbonInstance>(), RIBBON_STRIDE);
         assert_eq!(std::mem::size_of::<StrokeInstance>(), STROKE_STRIDE);
         assert_eq!(std::mem::size_of::<sofuu_ui::GlyphInstance>(), GLYPH_STRIDE);
+        assert_eq!(std::mem::size_of::<sofuu_ui::EffectQuadInstance>(), 80);
+        assert_eq!(std::mem::size_of::<sofuu_ui::ParticleInstance>(), 32);
+        assert_eq!(std::mem::size_of::<sofuu_ui::BackdropRegion>(), 64);
         assert_eq!(std::mem::size_of::<sofuu_ui::ClipRect>(), 16);
     }
 
@@ -1069,8 +1626,12 @@ mod tests {
                 assert!(v.contains("#version"));
                 assert!(f.contains("void main()"));
                 // The prose header mentions the marker; the actual placeholder line must be gone.
-                assert!(!v.lines().any(|l| l.trim() == "// __SOFUU_PIPELINE_DEFINES__"));
-                assert!(!f.lines().any(|l| l.trim() == "// __SOFUU_PIPELINE_DEFINES__"));
+                assert!(!v
+                    .lines()
+                    .any(|l| l.trim() == "// __SOFUU_PIPELINE_DEFINES__"));
+                assert!(!f
+                    .lines()
+                    .any(|l| l.trim() == "// __SOFUU_PIPELINE_DEFINES__"));
             }
         }
     }

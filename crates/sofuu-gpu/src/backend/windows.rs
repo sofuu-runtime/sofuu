@@ -69,15 +69,7 @@ struct EventCollector {
     closed: bool,
 }
 
-extern "C" fn on_native_event(
-    ctx: *mut c_void,
-    kind: u32,
-    x: f32,
-    y: f32,
-    a: f32,
-    b: f32,
-    u: u32,
-) {
+extern "C" fn on_native_event(ctx: *mut c_void, kind: u32, x: f32, y: f32, a: f32, b: f32, u: u32) {
     if ctx.is_null() {
         return;
     }
@@ -250,11 +242,7 @@ impl NativeWindowBackend for WindowsBackend {
         out_events: &mut Vec<InputEvent>,
     ) -> bool {
         let alive = unsafe {
-            sofuu_windows_poll_or_wait(
-                self.win,
-                if wait_forever { 1 } else { 0 },
-                timeout_sec,
-            )
+            sofuu_windows_poll_or_wait(self.win, if wait_forever { 1 } else { 0 }, timeout_sec)
         };
         for ev in self.collector.raw_events.drain(..) {
             if let InputEvent::Resize { scale_factor, .. } = &ev {

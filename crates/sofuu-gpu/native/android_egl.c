@@ -115,6 +115,9 @@ typedef struct {
 static SofuuAndroidWindow* g_window = NULL;
 static char g_last_error[512];
 static void* g_attached_window = NULL;
+// Bumped on every host attach. Vulkan uses it to notice a SurfaceView recreation even when
+// the allocator hands back the same ANativeWindow address.
+static uint64_t g_attached_generation = 1;
 static float g_attached_w = 1.0f;
 static float g_attached_h = 1.0f;
 static float g_attached_scale = 1.0f;
@@ -231,18 +234,27 @@ static int create_surface_and_context(SofuuAndroidWindow* w) {
 }
 
 void sofuu_android_attach_window(void* native_window, float width, float height, float scale) {
+    ++g_attached_generation;
     g_attached_window = native_window;
-    g_attached_w = width > 1.0f ? width : 1.0f;
-    g_attached_h = height > 1.0f ? height : 1.0f;
-    g_attached_scale = (scale >= 0.5f && scale <= 4.0f) ? scale : 1.0f;
+    // A NULL window means the host backgrounded the app; keep the last logical size so the
+    // scene does not reflow to 1x1 while there is nothing to draw into.
+    if (native_window) {
+        g_attached_w = width > 1.0f ? width : 1.0f;
+        g_attached_h = height > 1.0f ? height : 1.0f;
+        if (!(scale >= 1.0f)) scale = 1.0f; // also catches NaN
+        if (scale > 4.0f) scale = 4.0f;
+        g_attached_scale = scale;
+    }
     if (g_window) {
         g_window->native_window = native_window;
-        g_window->logical_w = g_attached_w;
-        g_window->logical_h = g_attached_h;
-        g_window->scale = g_attached_scale;
         g_window->surface_lost = 1;
+        if (native_window) {
+            g_window->logical_w = g_attached_w;
+            g_window->logical_h = g_attached_h;
+            g_window->scale = g_attached_scale;
+        }
     }
-    if (g_queue_write_fd >= 0) {
+    if (native_window && g_queue_write_fd >= 0) {
         SofuuAndroidEvent ev = {EV_RESIZE, g_attached_w, g_attached_h, g_attached_scale, 0, 0};
         ssize_t ignored = write(g_queue_write_fd, &ev, sizeof(ev));
         (void)ignored;
@@ -283,6 +295,7 @@ void* sofuu_android_create_window(const char* title, float width, float height,
     w->queue_fd = g_queue_fd;
     w->queue_write_fd = g_queue_write_fd;
     if (!create_surface_and_context(w)) {
+        destroy_egl(w);
         free(w);
         set_error("E_UI_NO_DISPLAY: failed to create an Android EGL/GLES 3.0 surface");
         return NULL;
@@ -317,6 +330,7 @@ int sofuu_android_poll_or_wait(void* handle, int wait_forever, double timeout_se
         int r = poll(&fd, 1, timeout_ms);
         if (r < 0) {
             if (errno == EINTR) continue;
+            w->closed = 1;
             break;
         }
         if (r == 0) break;
@@ -474,6 +488,11 @@ void* sofuu_android_display_handle(void* handle) {
 void* sofuu_android_window_handle(void* handle) {
     SofuuAndroidWindow* w = (SofuuAndroidWindow*)handle;
     return w ? w->native_window : g_attached_window;
+}
+
+uint64_t sofuu_android_window_generation(void* handle) {
+    (void)handle;
+    return g_attached_generation;
 }
 
 const char* sofuu_android_last_error(void) { return g_last_error; }

@@ -204,6 +204,27 @@ static const struct wl_interface wp_fractional_scale_v1_interface = {
     "wp_fractional_scale_v1", 1, 1, fractional_scale_requests, 1, fractional_scale_events,
 };
 
+// wp_viewporter: lets a fractional-scale client render a `logical * scale` buffer and still
+// declare the surface's logical destination size, so the compositor downsamples/upsamples it
+// instead of treating the larger buffer as a window resize.
+struct wp_viewporter;
+struct wp_viewport;
+static const struct wl_message viewporter_requests[] = {
+    {"destroy", "", NULL},
+    {"get_viewport", "no", NULL},
+};
+static const struct wl_interface wp_viewporter_interface = {
+    "wp_viewporter", 1, 2, viewporter_requests, 0, NULL,
+};
+static const struct wl_message viewport_requests[] = {
+    {"destroy", "", NULL},
+    {"set_source", "ffff", NULL},
+    {"set_destination", "ii", NULL},
+};
+static const struct wl_interface wp_viewport_interface = {
+    "wp_viewport", 1, 3, viewport_requests, 0, NULL,
+};
+
 struct wl_array;
 
 // Listener signatures (opaque object pointers).
@@ -478,6 +499,7 @@ typedef struct {
     int (*flush)(Display*);
     int (*pending)(Display*);
     int (*next_event)(Display*, SofuuXEvent*);
+    int (*filter_event)(void*, unsigned long);
     int (*connection_number)(Display*);
     int (*send_event)(Display*, Window, int, long, void*);
     int (*move_resize_window)(Display*, Window, int, int, unsigned, unsigned);
@@ -528,6 +550,8 @@ typedef struct SofuuLinuxWindow {
     struct wl_output* wl_output;
     struct wp_fractional_scale_manager_v1* wl_fractional_manager;
     struct wp_fractional_scale_v1* wl_fractional;
+    struct wp_viewporter* wl_viewporter;
+    struct wp_viewport* wl_viewport;
     struct wl_surface* wl_surface;
     struct xdg_surface* wl_xdg_surface;
     struct xdg_toplevel* wl_toplevel;
@@ -767,6 +791,10 @@ static void wl_registry_global(void* data, struct wl_registry* registry, uint32_
     } else if (strcmp(iface, "wl_output") == 0 && !w->wl_output) {
         uint32_t v = version < 3 ? version : 3;
         w->wl_output = (struct wl_output*)w->wl.registry_bind(registry, name, w->wl.output_interface, v);
+    } else if (strcmp(iface, "wp_viewporter") == 0 && !w->wl_viewporter) {
+        uint32_t v = version < 1 ? version : 1;
+        w->wl_viewporter = (struct wp_viewporter*)w->wl.registry_bind(
+            registry, name, &wp_viewporter_interface, v);
     } else if (strcmp(iface, "wp_fractional_scale_manager_v1") == 0 && !w->wl_fractional_manager) {
         uint32_t v = version < 1 ? version : 1;
         w->wl_fractional_manager = (struct wp_fractional_scale_manager_v1*)w->wl.registry_bind(
@@ -789,22 +817,59 @@ static void xdg_wm_base_ping(void* data, struct xdg_wm_base* base, uint32_t seri
 
 static const struct xdg_wm_base_listener wm_base_listener = {xdg_wm_base_ping};
 
-// Wayland buffers cover `logical * scale` device pixels. Fractional scale keeps buffer_scale=1
-// and lets the compositor downsample; integer scale uses set_buffer_scale for exact pixels.
-static void wayland_set_buffer_scale(SofuuLinuxWindow* w) {
+// Wayland buffers cover `logical * scale` device pixels. With fractional-scale-v1 the protocol
+// requires buffer_scale=1, so the viewport destination declares the logical size and the
+// compositor performs the fractional downsample. Without it, integer scales use
+// set_buffer_scale for 1:1 sampling.
+static int wayland_scale_is_integer(float scale) {
+    // Exact comparisons: 1.999 must use the viewport path, otherwise the rounded
+    // buffer_scale would not match the `logical * 1.999` buffer size.
+    return fabsf(scale - (float)lroundf(scale)) < 1e-6f;
+}
+
+static void wayland_set_buffer_scale(SofuuLinuxWindow* w, int32_t value) {
     if (!w->wl_surface || !w->wl.proxy_marshal_flags || !w->wl.proxy_get_version) return;
     uint32_t version = w->wl.proxy_get_version((struct wl_proxy*)w->wl_surface);
     if (version < 3) return;
-    int32_t s = w->wl_fractional ? 1 : (int32_t)lroundf(w->scale);
-    if (s < 1) s = 1;
-    w->wl.proxy_marshal_flags((struct wl_proxy*)w->wl_surface, 8, NULL, version, 0, s);
+    if (value < 1) value = 1;
+    w->wl.proxy_marshal_flags((struct wl_proxy*)w->wl_surface, 8, NULL, version, 0, value);
+}
+
+// Pass -1,-1 to unset the viewport destination; set_destination is double-buffered.
+static void wayland_set_destination(SofuuLinuxWindow* w, int32_t width, int32_t height) {
+    if (!w->wl_viewport || !w->wl.proxy_marshal_flags || !w->wl.proxy_get_version) return;
+    uint32_t version = w->wl.proxy_get_version((struct wl_proxy*)w->wl_viewport);
+    w->wl.proxy_marshal_flags((struct wl_proxy*)w->wl_viewport, 2, NULL, version, 0,
+        width, height);
+}
+
+static void wayland_apply_scale(SofuuLinuxWindow* w) {
+    if (!w->wl_viewport) {
+        wayland_set_buffer_scale(w, (int32_t)lroundf(w->scale));
+        return;
+    }
+    // A surface with a wp_fractional_scale_v1 object must keep buffer_scale=1; the viewport
+    // destination carries the logical size for both integer and fractional preferred scales.
+    if (w->wl_fractional || !wayland_scale_is_integer(w->scale)) {
+        int32_t lw = (int32_t)lroundf(w->logical_w);
+        int32_t lh = (int32_t)lroundf(w->logical_h);
+        if (lw < 1) lw = 1;
+        if (lh < 1) lh = 1;
+        wayland_set_buffer_scale(w, 1);
+        wayland_set_destination(w, lw, lh);
+    } else {
+        wayland_set_buffer_scale(w, (int32_t)lroundf(w->scale));
+        wayland_set_destination(w, -1, -1);
+    }
 }
 
 static float wayland_env_scale_override(float fallback) {
     const char* scale_env = getenv("SOFUU_UI_SCALE");
     if (scale_env && *scale_env) {
         float s = (float)atof(scale_env);
-        if (s >= 0.5f && s <= 4.0f) return s;
+        if (!(s >= 1.0f)) s = 1.0f; // also catches NaN
+        if (s > 4.0f) s = 4.0f;
+        return s;
     }
     return fallback;
 }
@@ -818,6 +883,7 @@ static void apply_configured_size(SofuuLinuxWindow* w) {
     w->logical_h = lh;
     if (w->wl_egl_window && w->wl.egl_window_resize) {
         w->wl.egl_window_resize(w->wl_egl_window, (int)lroundf(lw * w->scale), (int)lroundf(lh * w->scale), 0, 0);
+        wayland_apply_scale(w);
     }
     emit_event(EV_RESIZE, lw, lh, w->scale, 0, 0);
 }
@@ -1008,10 +1074,19 @@ static void wl_output_scale(void* data, struct wl_output* output, int32_t factor
     SofuuLinuxWindow* w = (SofuuLinuxWindow*)data;
     if (factor <= 0 || factor == w->output_scale) return;
     w->output_scale = factor;
-    if (w->wl_fractional) return; // fractional scale takes precedence when advertised
+    // With fractional-scale-v1 + wp_viewporter the preferred-scale event is exact; the
+    // integer output scale is only a fallback when viewporter is unavailable.
+    if (w->wl_fractional && w->wl_viewport) return;
     if (w->wl_egl_window && w->wl.egl_window_resize) {
-        w->scale = wayland_env_scale_override((float)factor);
-        wayland_set_buffer_scale(w);
+        float next = wayland_env_scale_override((float)factor);
+        if (!w->wl_viewport) {
+            // Without viewporter the buffer size is the surface size; an integer buffer_scale
+            // must match the render scale exactly.
+            next = (float)lroundf(next);
+        }
+        if (next < 1.0f) next = 1.0f;
+        w->scale = next;
+        wayland_apply_scale(w);
         w->wl.egl_window_resize(w->wl_egl_window,
             (int)lroundf(w->logical_w * w->scale), (int)lroundf(w->logical_h * w->scale), 0, 0);
         emit_event(EV_RESIZE, w->logical_w, w->logical_h, w->scale, 0, 0);
@@ -1027,8 +1102,18 @@ static void fractional_scale_preferred(void* data, struct wp_fractional_scale_v1
     SofuuLinuxWindow* w = (SofuuLinuxWindow*)data;
     float factor = (float)scale_120 / 120.0f;
     if (factor < 0.5f || factor > 8.0f) return;
-    w->scale = wayland_env_scale_override(factor);
+    factor = wayland_env_scale_override(factor);
+    if (!w->wl_viewport) {
+        // Without viewporter the buffer stays at scale 1 but cannot describe its logical size,
+        // which can cause a configure/resize feedback loop. Fall back to an integer scale.
+        factor = (float)(w->output_scale > 0 ? w->output_scale : 1);
+        factor = wayland_env_scale_override(factor);
+        factor = (float)lroundf(factor);
+    }
+    if (factor < 1.0f) factor = 1.0f;
+    w->scale = factor;
     if (w->wl_egl_window && w->wl.egl_window_resize) {
+        wayland_apply_scale(w);
         w->wl.egl_window_resize(w->wl_egl_window,
             (int)lroundf(w->logical_w * w->scale), (int)lroundf(w->logical_h * w->scale), 0, 0);
         emit_event(EV_RESIZE, w->logical_w, w->logical_h, w->scale, 0, 0);
@@ -1104,6 +1189,11 @@ static int wayland_init(SofuuLinuxWindow* w, const char* title, float width, flo
         w->wl.surface_interface, w->wl.proxy_get_version((struct wl_proxy*)w->wl_compositor), 0, NULL);
     if (!w->wl_surface) return 0;
     w->wl_surface_created = 1;
+    if (w->wl_viewporter) {
+        w->wl_viewport = (struct wp_viewport*)w->wl.proxy_marshal_flags(
+            (struct wl_proxy*)w->wl_viewporter, 1, &wp_viewport_interface,
+            w->wl.proxy_get_version((struct wl_proxy*)w->wl_viewporter), 0, NULL, w->wl_surface);
+    }
 
     w->wl_xdg_surface = (struct xdg_surface*)w->wl.proxy_marshal_flags((struct wl_proxy*)w->wl_wm_base, 2,
         &xdg_surface_interface, w->wl.proxy_get_version((struct wl_proxy*)w->wl_wm_base), 0, NULL, w->wl_surface);
@@ -1136,9 +1226,11 @@ static int wayland_init(SofuuLinuxWindow* w, const char* title, float width, flo
         }
     }
     w->scale = wayland_env_scale_override((float)(w->output_scale > 0 ? w->output_scale : 1));
+    if (!w->wl_viewport) w->scale = (float)lroundf(w->scale);
+    if (w->scale < 1.0f) w->scale = 1.0f;
     w->logical_w = width;
     w->logical_h = height;
-    wayland_set_buffer_scale(w);
+    wayland_apply_scale(w);
     w->wl_egl_window = w->wl.egl_window_create(w->wl_surface,
         (int)lroundf(width * w->scale), (int)lroundf(height * w->scale));
     if (!w->wl_egl_window) return 0;
@@ -1174,7 +1266,11 @@ static int wayland_poll(SofuuLinuxWindow* w, int wait_forever, double timeout_se
     int timeout_ms = wait_forever ? -1 : (int)ceil(timeout_sec * 1000.0);
     if (timeout_ms < 0 && !wait_forever) timeout_ms = 0;
     int r = poll(fds, 2, timeout_ms);
-    if (r < 0 && errno == EINTR) return 1;
+    if (r < 0) {
+        if (errno == EINTR) return 1;
+        w->closed = 1;
+        return 0;
+    }
     if (fds[1].revents & POLLIN) drain_wake();
     // A vanished compositor reports POLLHUP/POLLERR without POLLIN; treat it as a closed
     // window instead of spinning on an always-ready fd.
@@ -1218,7 +1314,9 @@ static int x11_scale_from_display(SofuuLinuxWindow* w) {
     const char* scale_env = getenv("SOFUU_UI_SCALE");
     if (scale_env && *scale_env) {
         float s = (float)atof(scale_env);
-        if (s >= 0.5f && s <= 4.0f) return (int)lroundf(s * 96.0f);
+        if (!(s >= 1.0f)) s = 1.0f; // also catches NaN
+        if (s > 4.0f) s = 4.0f;
+        return (int)lroundf(s * 96.0f);
     }
     if (w->x11.get_default) {
         char* dpi = w->x11.get_default(w->x11_display, "Xft", "dpi");
@@ -1287,6 +1385,9 @@ static void x11_handle_event(SofuuLinuxWindow* w, const SofuuXEvent* e) {
             return;
         }
         // KeyPress
+        if (w->x11_has_xim && w->x11.filter_event && w->x11.filter_event((void*)e, w->x11_window)) {
+            return; // consumed by XIM (compose/dead keys/IME preedit)
+        }
         uint32_t keycode = *(const uint32_t*)(p + X11_OFF_BUTTON);
         KeySym sym = 0;
         char text[64] = {0};
@@ -1377,6 +1478,7 @@ static int x11_init(SofuuLinuxWindow* w, const char* title, float width, float h
     SYM(flush, "XFlush");
     SYM(pending, "XPending");
     SYM(next_event, "XNextEvent");
+    SYM(filter_event, "XFilterEvent");
     SYM(connection_number, "XConnectionNumber");
     SYM(send_event, "XSendEvent");
     SYM(move_resize_window, "XMoveResizeWindow");
@@ -1402,7 +1504,7 @@ static int x11_init(SofuuLinuxWindow* w, const char* title, float width, float h
     w->x11_root = root;
     int scale_dpi = x11_scale_from_display(w);
     w->scale = (float)scale_dpi / 96.0f;
-    if (w->scale < 0.5f || w->scale > 4.0f) w->scale = 1.0f;
+    if (w->scale < 1.0f || w->scale > 4.0f) w->scale = 1.0f;
     w->logical_w = width;
     w->logical_h = height;
     unsigned pw = (unsigned)lroundf(width * w->scale);
@@ -1471,7 +1573,12 @@ static int x11_poll(SofuuLinuxWindow* w, int wait_forever, double timeout_sec) {
     int timeout_ms = wait_forever ? -1 : (int)ceil(timeout_sec * 1000.0);
     if (timeout_ms < 0 && !wait_forever) timeout_ms = 0;
     int r = poll(fds, 2, timeout_ms);
-    if (r < 0 && errno == EINTR) return 1;
+    if (r < 0) {
+        if (errno == EINTR) return 1;
+        w->closed = 1;
+        emit_event(EV_CLOSE, 0, 0, 0, 0, 0);
+        return 0;
+    }
     if (fds[1].revents & POLLIN) drain_wake();
     // The X connection died (server shutdown / kill): report closure rather than spinning.
     if (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {

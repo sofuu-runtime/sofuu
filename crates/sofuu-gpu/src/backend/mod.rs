@@ -34,6 +34,22 @@ pub mod gles;
 ))]
 pub mod vulkan;
 
+/// Attached emulator control strip (E6).
+///
+/// The strip is host chrome: it lives in its own non-activating OS window and
+/// is never part of the app `Scene`/`DrawList`, so headless captures cannot
+/// contain it. Backends that cannot create a separate non-activating window
+/// report `supported() == false` and the caller keeps the hotkey-only path.
+pub trait StripHost {
+    /// Whether this backend can attach a native strip.
+    fn supported(&self) -> bool {
+        false
+    }
+
+    /// Collapse/expand the strip (`⌘.` / `Ctrl+.`).
+    fn set_collapsed(&mut self, _collapsed: bool) {}
+}
+
 /// Window + swapchain plus input-event pumping contract implemented by every OS/GPU backend.
 pub trait NativeWindowBackend {
     /// Current logical size and DPI scale factor `(w_px, h_px, scale)`.
@@ -57,6 +73,18 @@ pub trait NativeWindowBackend {
     /// Reserved top safe-area inset (macOS frameless traffic lights); `0.0` elsewhere.
     fn top_inset(&self) -> f32 {
         0.0
+    }
+
+    /// Whether the window currently owns keyboard focus. Ambient effects pause when it does
+    /// not so a backgrounded app does not keep waking the GPU.
+    fn focused(&self) -> bool {
+        true
+    }
+
+    /// OS accessibility preference (`reduce motion`). Ambient effects freeze into a static
+    /// refined style while one-shot transitions still settle.
+    fn reduce_motion(&self) -> bool {
+        false
     }
 
     /// Synchronize the native title bar / chrome with the active [`sofuu_ui::ThemeMode`].
@@ -134,7 +162,9 @@ pub fn create_window(
 ) -> Result<Box<dyn NativeWindowBackend>, String> {
     #[cfg(target_os = "macos")]
     {
-        Ok(Box::new(macos_metal::MacosMetalBackend::new(config, atlas)?))
+        Ok(Box::new(macos_metal::MacosMetalBackend::new(
+            config, atlas,
+        )?))
     }
 
     #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
